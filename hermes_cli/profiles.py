@@ -136,6 +136,7 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+_DELETED_PROFILES_DIR = ".deleted"
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
@@ -301,6 +302,36 @@ def _get_active_profile_path() -> Path:
 def _get_wrapper_dir() -> Path:
     """Return the directory for wrapper scripts."""
     return Path.home() / ".local" / "bin"
+
+
+def _deleted_profile_marker(name: str) -> Path:
+    return _get_profiles_root() / _DELETED_PROFILES_DIR / name
+
+
+def is_profile_deletion_marked(name: str) -> bool:
+    """Whether an explicit delete is still authoritative for this profile."""
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    return canon != "default" and _deleted_profile_marker(canon).is_file()
+
+
+def _mark_profile_deleted(name: str) -> None:
+    marker = _deleted_profile_marker(name)
+    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(marker.parent, 0o700)
+    except OSError:
+        pass
+    marker.write_text("deleted\n", encoding="utf-8")
+
+
+def _clear_profile_deleted(name: str) -> None:
+    marker = _deleted_profile_marker(name)
+    marker.unlink(missing_ok=True)
+    try:
+        marker.parent.rmdir()
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1053,8 @@ def list_profiles() -> List[ProfileInfo]:
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            if is_profile_deletion_marked(name):
+                continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
             if alias_name:
@@ -1106,6 +1139,8 @@ def profiles_to_serve(
             if name == "default":
                 continue  # default is the built-in entry already added above
             if not _PROFILE_ID_RE.match(name):
+                continue
+            if is_profile_deletion_marked(name):
                 continue
             if allowed is not None and name not in allowed:
                 continue
@@ -1312,6 +1347,11 @@ def create_profile(
     # / launchd / windows) this is a no-op — the existing per-profile
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
+
+    # Creation is the explicit opt-in that supersedes an earlier delete. Keep
+    # the marker through bootstrap so multiplex workers cannot observe and act
+    # on a half-created profile.
+    _clear_profile_deleted(canon)
 
     return profile_dir
 
@@ -1764,9 +1804,15 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             else:
                 raise
 
+        # Publish deletion intent outside the directory before removing it.
+        # Long-lived multiplex workers may still hold this Path from startup;
+        # the marker keeps their next authoritative scan from writing cron
+        # heartbeats back into a profile the user just deleted.
+        _mark_profile_deleted(canon)
         _rmtree_with_retry(profile_dir, _make_writable)
         print(f"✓ Removed {profile_dir}")
     except Exception as e:
+        _clear_profile_deleted(canon)
         print(f"⚠ Could not remove {profile_dir}: {e}")
         remove_error = e
 
@@ -2363,6 +2409,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
 
         shutil.move(str(final_source), str(profile_dir))
 
+    _clear_profile_deleted(canon)
     return profile_dir
 
 
@@ -2493,6 +2540,7 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     except Exception:
         pass
 
+    _clear_profile_deleted(new_canon)
     return new_dir
 
 

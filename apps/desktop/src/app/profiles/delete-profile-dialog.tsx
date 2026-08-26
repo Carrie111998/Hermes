@@ -1,6 +1,7 @@
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { deleteProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { $activeConnectionId, forgetLastProfileForConnection } from '@/store/connections'
 import { retireLocalProfileGateways } from '@/store/gateway'
 import { $activeGatewayProfile, normalizeProfileKey, selectProfile, setActiveProfile } from '@/store/profile'
 
@@ -49,8 +50,13 @@ export function DeleteProfileDialog({
         // onDeleted refresh so our reset is the last write — a refreshActiveProfile
         // racing the (still-dying) backend can't clobber the pill back to it.
         const wasActive = normalizeProfileKey(profile.name) === normalizeProfileKey($activeGatewayProfile.get())
+        const deletionConnectionId = $activeConnectionId.get()
         retireLocalProfileGateways(profile.name)
         await deleteProfile(profile.name)
+        // A non-active profile can still be this source's persisted boot target.
+        // Clear it only after deletion succeeds, and preserve same-named profiles
+        // remembered for other machines.
+        forgetLastProfileForConnection(deletionConnectionId, profile.name)
         await onDeleted?.()
 
         if (wasActive) {

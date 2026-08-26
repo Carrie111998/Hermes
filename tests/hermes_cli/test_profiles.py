@@ -25,7 +25,9 @@ from hermes_cli.profiles import (
     get_profile_dir,
     create_profile,
     delete_profile,
+    is_profile_deletion_marked,
     list_profiles,
+    profiles_to_serve,
     set_active_profile,
     get_active_profile,
     get_active_profile_name,
@@ -283,7 +285,27 @@ class TestDeleteProfile:
                 delete_profile("coder", yes=True)
 
         assert profile_dir.is_dir()
+        assert not is_profile_deletion_marked("coder")
         assert get_active_profile() == "default"
+
+    def test_delete_tombstone_blocks_ghost_until_explicit_recreate(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+
+        with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._maybe_unregister_gateway_service"), \
+             patch("hermes_cli.profiles._stop_profile_backends"):
+            delete_profile("coder", yes=True)
+
+        assert is_profile_deletion_marked("coder")
+        (profile_dir / "cron").mkdir(parents=True)
+        assert "coder" not in {name for name, _home in profiles_to_serve(True)}
+        assert "coder" not in {profile.name for profile in list_profiles()}
+
+        shutil.rmtree(profile_dir)
+        recreated = create_profile("coder", no_alias=True)
+        assert recreated == profile_dir
+        assert not is_profile_deletion_marked("coder")
+        assert "coder" in {name for name, _home in profiles_to_serve(True)}
 
 
 

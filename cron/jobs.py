@@ -123,6 +123,7 @@ class _CronStorePaths:
     cron_dir: Path
     jobs_file: Path
     output_dir: Path
+    require_existing_home: bool = False
 
 
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
@@ -170,14 +171,22 @@ def _current_cron_store() -> _CronStorePaths:
 
 
 @contextlib.contextmanager
-def use_cron_store(home: Union[str, Path]):
-    """Route cron storage to ``home`` without mutating process globals."""
+def use_cron_store(
+    home: Union[str, Path], *, require_existing_home: bool = False
+):
+    """Route cron storage to ``home`` without mutating process globals.
+
+    ``require_existing_home`` is for long-lived multiplex schedulers whose
+    membership can race profile deletion. In that mode cron may create its
+    children, but must never recreate a profile root that disappeared.
+    """
     cron_dir = Path(home).expanduser().resolve() / "cron"
     token = _cron_store_override.set(
         _CronStorePaths(
             cron_dir=cron_dir,
             jobs_file=cron_dir / "jobs.json",
             output_dir=cron_dir / "output",
+            require_existing_home=require_existing_home,
         )
     )
     try:
@@ -189,6 +198,49 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def ensure_cron_dir(cron_dir: Optional[Path] = None) -> Path:
+    """Create and return the active cron directory without reviving its home."""
+    store = _current_cron_store()
+    # A guarded scope is authoritative: callers cannot accidentally bypass
+    # its profile-home boundary by supplying a path resolved elsewhere.
+    target = (
+        store.cron_dir
+        if store.require_existing_home
+        else (cron_dir or store.cron_dir)
+    )
+    return ensure_profile_dir(target)
+
+
+def ensure_profile_dir(path: Path) -> Path:
+    """Create a profile-owned directory without reviving a guarded home."""
+    store = _current_cron_store()
+    target = Path(path).expanduser().resolve()
+    if not store.require_existing_home:
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    home = store.cron_dir.parent.resolve()
+    try:
+        relative = target.relative_to(home)
+    except ValueError as exc:
+        raise ValueError(f"Cron path escapes guarded profile home: {target}") from exc
+
+    # parents=False at every level makes concurrent profile deletion terminal:
+    # the next mkdir fails instead of rebuilding the removed profile root.
+    current = home
+    if not current.is_dir():
+        raise FileNotFoundError(f"Guarded profile home no longer exists: {home}")
+    for part in relative.parts:
+        current = current / part
+        current.mkdir(exist_ok=True)
+    return target
+
+
+def cron_store_requires_existing_home() -> bool:
+    """Whether the active cron scope must not recreate its profile home."""
+    return _current_cron_store().require_existing_home
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -698,8 +750,8 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
-    store.cron_dir.mkdir(parents=True, exist_ok=True)
-    store.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_cron_dir()
+    ensure_profile_dir(store.output_dir)
     _secure_dir(store.cron_dir)
     _secure_dir(store.output_dir)
 
@@ -1051,7 +1103,7 @@ def _record_persisted_error_recovery(job: Dict[str, Any], previous_next_run: str
     del _persisted_error_recoveries_recent[:-_PERSISTED_ERROR_RECOVERY_HISTORY]
     try:
         path = _current_cron_store().cron_dir / "persisted_error_recoveries.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_cron_dir(path.parent)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except Exception as exc:  # never let telemetry break a tick
@@ -3898,7 +3950,7 @@ def save_job_output(job_id: str, output: str):
     """Save job output to file."""
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
-    job_output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_profile_dir(job_output_dir)
     _secure_dir(job_output_dir)
 
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")

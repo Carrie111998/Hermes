@@ -30,6 +30,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+from cron.jobs import ensure_cron_dir
 
 NOTEPAD_FILE = get_hermes_home().resolve() / "cron" / "notepad.db"
 MAX_VALUE_BYTES = 16 * 1024
@@ -39,7 +40,7 @@ _lock = threading.RLock()
 
 
 def _connect() -> sqlite3.Connection:
-    NOTEPAD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ensure_cron_dir(NOTEPAD_FILE.parent)
     return sqlite3.connect(NOTEPAD_FILE, timeout=5)
 
 

@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from queue import Empty, SimpleQueue
+import shutil
 import threading
 
 import pytest
@@ -125,6 +126,40 @@ def test_create_registers_scheduler_inside_target_profile(
     assert captured["runtime_home"] == worker_home
     assert captured["jobs_file"] == worker_home / "cron" / "jobs.json"
     assert job["profile"] == "worker_alpha"
+
+
+def test_dashboard_cron_call_does_not_recreate_deleted_profile(
+    isolated_profiles,
+    monkeypatch,
+):
+    from cron import jobs as cron_jobs
+    from hermes_cli import web_server
+
+    worker_home = isolated_profiles["worker_alpha"]
+
+    def delete_then_load(*_args, **_kwargs):
+        shutil.rmtree(worker_home)
+        return cron_jobs.load_jobs()
+
+    monkeypatch.setattr(cron_jobs, "list_jobs", delete_then_load)
+
+    with pytest.raises(FileNotFoundError):
+        web_server._call_cron_for_profile("worker_alpha", "list_jobs", True)
+
+    assert not worker_home.exists()
+
+
+def test_cron_profile_home_rejects_deletion_marked_ghost(isolated_profiles):
+    from hermes_cli import profiles, web_server
+
+    worker_home = isolated_profiles["worker_alpha"]
+    profiles._mark_profile_deleted("worker_alpha")
+    assert worker_home.is_dir()
+
+    with pytest.raises(HTTPException) as exc_info:
+        web_server._cron_profile_home("worker_alpha")
+
+    assert exc_info.value.status_code == 404
 
 
 def test_dashboard_create_reports_saved_but_unregistered(

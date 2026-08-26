@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -650,18 +651,32 @@ class InProcessCronScheduler(CronScheduler):
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
         logger = logging.getLogger("cron.scheduler_provider")
+
+        def current_profile_homes():
+            entries = profile_homes() if callable(profile_homes) else profile_homes
+            return list(entries)
+
+        try:
+            initial_profile_homes = current_profile_homes()
+        except BaseException as e:
+            logger.error("Cron profile membership error: %s", e, exc_info=True)
+            initial_profile_homes = []
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
-            len(profile_homes),
-            [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+            len(initial_profile_homes),
+            [p[0] if isinstance(p, tuple) else p for p in initial_profile_homes],
         )
 
         # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
+        for entry in initial_profile_homes:
+            profile_name = entry[0] if isinstance(entry, tuple) else None
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
-                with use_cron_store(home):
+                with use_cron_store(
+                    home,
+                    require_existing_home=profile_name != "default",
+                ):
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
@@ -670,6 +685,13 @@ class InProcessCronScheduler(CronScheduler):
                             home,
                         )
                     record_ticker_heartbeat()
+            except FileNotFoundError:
+                if profile_name == "default" or Path(home).is_dir():
+                    raise
+                logger.info(
+                    "Skipping cron recovery for deleted profile at %s",
+                    home,
+                )
             finally:
                 reset_hermes_home_override(home_token)
 
@@ -677,15 +699,24 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             _tick_error = None
+            ticked_homes = {}
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    for entry in profile_homes:
+                    for entry in current_profile_homes():
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        # Record the identity before entering tick(): a failed
+                        # tick still needs a liveness/error heartbeat, but only
+                        # if this home remains in authoritative membership.
+                        ticked_homes[Path(home).resolve()] = entry
                         home_token = set_hermes_home_override(str(home))
                         try:
-                            with use_cron_store(home):
+                            with use_cron_store(
+                                home,
+                                require_existing_home=profile_name != "default",
+                            ):
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,
@@ -704,11 +735,41 @@ class InProcessCronScheduler(CronScheduler):
             else:
                 _tick_error = None
             # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
+            # Resolve membership again here: profile deletion can happen while
+            # a tick is running, and touching its stale startup Path would make
+            # ensure_dirs() recreate the deleted profile as a cron-only ghost.
+            heartbeat_homes = []
+            if ticked_homes:
+                try:
+                    refreshed_homes = {
+                        Path(entry[1] if isinstance(entry, tuple) else entry).resolve():
+                        entry
+                        for entry in current_profile_homes()
+                    }
+                except BaseException as e:
+                    logger.error("Cron profile membership error: %s", e, exc_info=True)
+                    if _tick_error is None:
+                        consecutive_failures = _note_tick_failure(e, consecutive_failures)
+                    _tick_error = f"{type(e).__name__}: {e}"
+                    ok = False
+                else:
+                    # A profile created between the tick and heartbeat
+                    # snapshots has not actually ticked yet. Conversely, a
+                    # deleted profile must not be touched by heartbeat writes.
+                    heartbeat_homes = [
+                        refreshed_homes[identity]
+                        for identity in ticked_homes
+                        if identity in refreshed_homes
+                    ]
+            for entry in heartbeat_homes:
+                profile_name = entry[0] if isinstance(entry, tuple) else None
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:
-                    with use_cron_store(home):
+                    with use_cron_store(
+                        home,
+                        require_existing_home=profile_name != "default",
+                    ):
                         record_ticker_heartbeat(success=ok)
                         # Surface the failure reason (or clear it) per profile
                         # so `hermes cron status` can show WHY ticks fail

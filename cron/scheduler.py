@@ -648,6 +648,9 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
+    ensure_cron_dir,
+    ensure_profile_dir,
+    cron_store_requires_existing_home,
     mark_job_run,
     save_job_output,
     use_cron_store,
@@ -696,6 +699,7 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
+_guarded_fire_tokens: set[object] = set()
 _running_lock = threading.Lock()
 
 # Wall-clock (time.time()) instant each in-flight job id was claimed by
@@ -971,7 +975,7 @@ def _record_forced_release(job_id: str, name: str, age_seconds: float, allowance
         del _forced_releases[:-_FORCED_RELEASE_HISTORY]
     try:
         path = _get_hermes_home() / "cron" / "inflight_forced_releases.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_cron_dir(path.parent)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except Exception as e:  # never let telemetry break a tick
@@ -1215,7 +1219,7 @@ def mark_running_jobs_interrupted(
     """
     with _running_lock:
         active_fires = [
-            (token, job_id, owner, profile_home)
+            (token, job_id, owner, profile_home, token in _guarded_fire_tokens)
             for job_id, executions in _running_fire_owners.items()
             for token, (owner, profile_home) in executions.items()
         ]
@@ -1224,18 +1228,18 @@ def mark_running_jobs_interrupted(
                 fire for fire in active_fires
                 if (fire[1], fire[2]) in only_owners
             ]
-        registered_ids = {job_id for _t, job_id, _o, _p in active_fires}
+        registered_ids = {job_id for _t, job_id, _o, _p, _g in active_fires}
         if only_owners is None:
             active_fires.extend(
-                (None, job_id, None, _get_hermes_home())
+                (None, job_id, None, _get_hermes_home(), False)
                 for job_id in _running_job_ids - registered_ids
             )
         _interrupted_job_ids.update(
             token if token is not None else job_id
-            for token, job_id, _owner, _profile_home in active_fires
+            for token, job_id, _owner, _profile_home, _guarded in active_fires
         )
     marked = []
-    for _token, job_id, fire_owner, profile_home in active_fires:
+    for _token, job_id, fire_owner, profile_home, guarded_home in active_fires:
         if not fire_owner:
             logger.warning(
                 "Job '%s' interrupted before its durable fire owner was registered; "
@@ -1250,7 +1254,10 @@ def mark_running_jobs_interrupted(
             marked.append(job_id)
             continue
         try:
-            with use_cron_store(profile_home):
+            with use_cron_store(
+                profile_home,
+                require_existing_home=guarded_home,
+            ):
                 if mark_job_run(
                     job_id,
                     False,
@@ -1512,7 +1519,7 @@ def _write_usage_audit(record: dict) -> None:
     """
     try:
         path = _usage_audit_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_cron_dir(path.parent)
         line = json.dumps(record, ensure_ascii=False)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -4211,7 +4218,10 @@ def _run_job_script(
         LLM can report the problem to the user.
     """
     scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_profile_dir(scripts_dir)
+    except OSError as exc:
+        return False, f"Profile home unavailable for cron script: {exc}"
     scripts_dir_resolved = scripts_dir.resolve()
 
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
@@ -6939,11 +6949,14 @@ def run_one_job(
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     execution_token = object()
     profile_home = _get_hermes_home().resolve()
+    guarded_home = cron_store_requires_existing_home()
     with _running_lock:
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
             fire_owner or None,
             profile_home,
         )
+        if guarded_home:
+            _guarded_fire_tokens.add(execution_token)
     try:
         return _run_with_fire_claim_heartbeat(
             job,
@@ -6963,6 +6976,7 @@ def run_one_job(
         )
     finally:
         with _running_lock:
+            _guarded_fire_tokens.discard(execution_token)
             executions = _running_fire_owners.get(job["id"])
             if executions is not None:
                 executions.pop(execution_token, None)
@@ -7578,7 +7592,7 @@ def tick(
         Number of jobs executed (0 if another tick is already running)
     """
     lock_dir, lock_file = _get_lock_paths()
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    ensure_cron_dir(lock_dir)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows.
     # Only genuine lock contention (another ticker holds the lock) skips the

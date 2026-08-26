@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
+from cron.jobs import ensure_cron_dir
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def _secure_file(path: Path) -> None:
 
 
 def _ensure_dir() -> None:
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_cron_dir(CRON_DIR)
 
 
 def _load_raw() -> Dict[str, Any]:

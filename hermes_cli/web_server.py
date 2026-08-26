@@ -295,14 +295,17 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
         try:
             from hermes_cli.profiles import profiles_to_serve
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
-                start_kwargs["profile_homes"] = profile_homes
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
-                )
+            initial_profile_homes = list(profiles_to_serve(multiplex=True))
+            # The primary desktop backend is long-lived while profiles may be
+            # created or deleted underneath it. Keep membership live even when
+            # startup sees only the default profile: a frozen deleted Path lets
+            # heartbeat writes recreate a cron-only profile tree.
+            start_kwargs["profile_homes"] = lambda: profiles_to_serve(multiplex=True)
+            _log.info(
+                "Desktop cron scheduler will tick %d profile(s): %s",
+                len(initial_profile_homes),
+                [name for name, _home in initial_profile_homes],
+            )
         except Exception:
             # Fail open to the single-store ticker — the active profile's
             # jobs must keep firing even if profile enumeration breaks.
@@ -12909,7 +12912,10 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
         profiles_mod.validate_profile_name(canon)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if not profiles_mod.profile_exists(canon):
+    if (
+        not profiles_mod.profile_exists(canon)
+        or profiles_mod.is_profile_deletion_marked(canon)
+    ):
         raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
     return canon, profiles_mod.get_profile_dir(canon)
 
@@ -12939,7 +12945,10 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
 
     token = set_hermes_home_override(str(home))
     try:
-        with cron_jobs.use_cron_store(home):
+        with cron_jobs.use_cron_store(
+            home,
+            require_existing_home=profile_name != "default",
+        ):
             if func_name == "create_job":
                 from cron.scheduler import create_job_with_scheduler_registration
 
@@ -12971,7 +12980,7 @@ def _notify_cron_provider_for_profile(target_profile: Optional[str]) -> None:
     re-reads jobs.json each tick and stays a no-op here.
     """
     try:
-        _profile_name, home = _cron_profile_home(target_profile)
+        profile_name, home = _cron_profile_home(target_profile)
         from cron import jobs as cron_jobs
         from cron.scheduler_provider import (
             InProcessCronScheduler,
@@ -12984,7 +12993,10 @@ def _notify_cron_provider_for_profile(target_profile: Optional[str]) -> None:
 
         token = set_hermes_home_override(str(home))
         try:
-            with cron_jobs.use_cron_store(home):
+            with cron_jobs.use_cron_store(
+                home,
+                require_existing_home=profile_name != "default",
+            ):
                 provider = resolve_cron_scheduler()
                 if not isinstance(provider, InProcessCronScheduler):
                     profile_names = [
@@ -13327,7 +13339,7 @@ def _fire_cron_job_for_profile(
     box) or E2EE rooms. Kept temporarily because external callers may still
     resolve it via the web_deps late-binding seam.
     """
-    _profile_name, home = _cron_profile_home(profile)
+    profile_name, home = _cron_profile_home(profile)
     from cron import jobs as cron_jobs
     from cron.scheduler_provider import (
         provider_supports_force_fire,
@@ -13340,7 +13352,10 @@ def _fire_cron_job_for_profile(
 
     token = set_hermes_home_override(str(home))
     try:
-        with cron_jobs.use_cron_store(home):
+        with cron_jobs.use_cron_store(
+            home,
+            require_existing_home=profile_name != "default",
+        ):
             provider = resolve_cron_scheduler()
             if force:
                 if not provider_supports_force_fire(provider):
