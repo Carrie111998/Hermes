@@ -31,6 +31,20 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (home / "config.yaml").write_text(
+        """
+model_routing:
+  enabled: true
+  tiers:
+    T1:
+      - {provider: openai, model: gpt-5.6-sol}
+      - {provider: openrouter, model: qwen-max}
+      - {provider: openrouter, model: glm-5}
+      - {provider: nous, model: fallback-model}
+  classification:
+    P1: {tier: T1}
+""".strip()
+    )
     kb.init_db()
     return home
 
@@ -135,12 +149,19 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
     return captured["cmd"]
 
 
+def _claim_for_spawn(conn, task_id):
+    task = kb.claim_task(conn, task_id)
+    assert task is not None
+    assert task.route_snapshot is not None
+    return task
+
+
 def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     tid = kb.create_task(
         conn, title="t", assignee="elias",
         model_override="glm-5", provider_override="openrouter",
     )
-    task = kb.get_task(conn, tid)
+    task = _claim_for_spawn(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     i = cmd.index("-m")
     assert cmd[i + 1] == "glm-5"
@@ -253,7 +274,7 @@ def test_reasoning_effort_without_a_model_override(conn):
 
 def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
     tid = kb.create_task(conn, title="t", assignee="elias", reasoning_effort="high")
-    task = kb.get_task(conn, tid)
+    task = _claim_for_spawn(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "-m" not in cmd
     i = cmd.index("--reasoning")
@@ -262,7 +283,7 @@ def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
 
 def test_spawn_omits_reasoning_when_unset(monkeypatch, tmp_path, conn):
     tid = kb.create_task(conn, title="t", assignee="elias")
-    task = kb.get_task(conn, tid)
+    task = _claim_for_spawn(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "--reasoning" not in cmd
 

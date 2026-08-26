@@ -85,9 +85,42 @@ def test_override_is_validated_and_audited(routed_conn):
     assert any(kind == "model_override_rejected" for kind, _ in events)
 
 
+def test_create_task_rejects_unauthorized_override_before_persisting(routed_conn, caplog):
+    with pytest.raises(ValueError, match="routing policy rejected model override"):
+        kb.create_task(
+            routed_conn,
+            title="unauthorized",
+            assignee="worker",
+            model_override="unapproved",
+            provider_override="evil",
+        )
+    assert routed_conn.execute("SELECT COUNT(*) FROM tasks WHERE title='unauthorized'").fetchone()[0] == 0
+    assert "model_override_rejected at task creation" in caplog.text
+
+
+def test_create_task_override_rejects_when_registry_is_missing(routed_conn, monkeypatch, tmp_path):
+    missing_home = tmp_path / "no-registry"
+    missing_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(missing_home))
+    with pytest.raises(ValueError, match="model_routing config unavailable"):
+        kb.create_task(
+            routed_conn,
+            title="missing registry",
+            assignee="worker",
+            model_override="small",
+            provider_override="nous",
+        )
+
+
 def test_override_invalidates_prior_route_snapshot(routed_conn):
     task_id = kb.create_task(routed_conn, title="t", assignee="worker")
-    assert kb.claim_task(routed_conn, task_id) is not None
+    claimed = kb.claim_task(routed_conn, task_id)
+    assert claimed is not None
+    assert claimed.route_snapshot is not None
+    run = routed_conn.execute(
+        "SELECT route_snapshot FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    assert run["route_snapshot"] == claimed.route_snapshot
     # Pretend the first worker completed; the next route must be freshly
     # authorized, rather than reusing a snapshot from before the override.
     routed_conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (task_id,))
@@ -102,4 +135,27 @@ def test_spawn_rejects_malicious_persisted_override(routed_conn, monkeypatch, tm
     task = kb.get_task(routed_conn, task_id)
     monkeypatch.setattr(kb.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("must not spawn"))
     with pytest.raises(ValueError, match="routing policy"):
+        kb._default_spawn(task, str(tmp_path))
+
+
+def test_spawn_requires_a_claim_snapshot(routed_conn, monkeypatch, tmp_path):
+    task_id = kb.create_task(routed_conn, title="unclaimed", assignee="worker")
+    task = kb.get_task(routed_conn, task_id)
+    assert task is not None
+    monkeypatch.setattr(kb.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("must not spawn"))
+    with pytest.raises(ValueError, match="persisted route snapshot"):
+        kb._default_spawn(task, str(tmp_path))
+
+
+def test_p0_cannot_spawn_an_approved_persisted_model(routed_conn, monkeypatch, tmp_path):
+    task_id = kb.create_task(routed_conn, title="cleanup", assignee="worker", skills=["deterministic"])
+    routed_conn.execute(
+        "UPDATE tasks SET model_override='small', provider_override='nous', "
+        "route_snapshot=? WHERE id=?",
+        (json.dumps({"priority": "P0", "tier": "T1", "provider": "nous", "model": "small"}, sort_keys=True), task_id),
+    )
+    task = kb.get_task(routed_conn, task_id)
+    assert task is not None
+    monkeypatch.setattr(kb.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("must not spawn"))
+    with pytest.raises(ValueError, match="P0"):
         kb._default_spawn(task, str(tmp_path))

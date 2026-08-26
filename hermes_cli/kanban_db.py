@@ -3238,6 +3238,20 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    if model_override:
+        # Creation is a write surface too.  Do not wait until claim/spawn to
+        # discover that a caller persisted an unapproved model pair.
+        try:
+            from hermes_cli.kanban_model_policy import PolicyError, ModelRoutingPolicy
+            ModelRoutingPolicy.load().validate_override(provider_override, model_override)
+        except (PolicyError, ValueError) as exc:
+            _log.warning(
+                "model_override_rejected at task creation: provider=%r model=%r reason=%s",
+                provider_override,
+                model_override,
+                exc,
+            )
+            raise ValueError(f"routing policy rejected model override: {exc}") from exc
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -4656,6 +4670,8 @@ def _snapshot_claim_route(conn: sqlite3.Connection, task_id: str, status: str) -
     try:
         from hermes_cli.kanban_model_policy import PolicyError, policy_for_task
         policy, route = policy_for_task(task)
+        if route["priority"] == "P0" and task.model_override:
+            raise PolicyError("P0 deterministic tasks cannot use model overrides")
         if task.model_override:
             approved = policy.validate_override(task.provider_override, task.model_override)
             route = {**route, **approved}
@@ -10819,9 +10835,13 @@ def _default_spawn(
     try:
         from hermes_cli.kanban_model_policy import policy_for_task
         policy, resolved_route = policy_for_task(task)
+        if resolved_route["priority"] == "P0":
+            raise ValueError("routing policy rejects P0 deterministic task spawn")
         if task.model_override:
             resolved_route = {**resolved_route, **policy.validate_override(task.provider_override, task.model_override)}
-        persisted_route = json.loads(task.route_snapshot or "")
+        if not task.route_snapshot:
+            raise ValueError("routing policy requires a persisted route snapshot")
+        persisted_route = json.loads(task.route_snapshot)
         if persisted_route != resolved_route:
             raise ValueError("persisted route snapshot does not match routing policy")
     except Exception as exc:
