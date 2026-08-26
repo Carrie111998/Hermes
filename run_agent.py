@@ -4900,11 +4900,11 @@ class AIAgent:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
-        # Kanban worker/orchestrator lifecycle — only present when the
-        # dispatcher spawned this process (kanban_show check_fn gates on
-        # HERMES_KANBAN_TASK env var). Normal chat sessions never see
-        # this block.
-        if "kanban_show" in self.valid_tool_names:
+        # Kanban worker lifecycle — only for dispatcher-spawned workers.
+        # Do not key off kanban_show in valid_tool_names: orchestrator
+        # profiles and gateway platforms may expose kanban_* interactively
+        # without HERMES_KANBAN_TASK, and must not get worker protocol.
+        if os.environ.get("HERMES_KANBAN_TASK") and "kanban_show" in self.valid_tool_names:
             tool_guidance.append(KANBAN_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
