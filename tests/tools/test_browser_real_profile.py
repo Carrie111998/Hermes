@@ -353,6 +353,48 @@ class TestLocalSessionRealProfile:
         assert "real_profile" not in info["features"]
         assert info["session_name"].startswith("h_")
 
+    def test_private_url_sidecar_does_not_get_the_real_profile(self):
+        """The sidecar keeps a LAN host off the cloud backend.
+
+        Handing it the user's logged-in cookie jar instead would be a larger
+        exposure than the routing rule was protecting against.
+        """
+        import tools.browser_tool as bt
+        with patch.object(bt, "_real_profile_cdp",
+                          return_value=("http://127.0.0.1:9251", None)) as rp:
+            info = bt._create_local_session("t1::local", allow_real_profile=False)
+        rp.assert_not_called()
+        assert info["cdp_url"] is None
+        assert "real_profile" not in info["features"]
+        assert info["session_name"].startswith("h_")
+
+    def test_sidecar_is_not_blocked_by_a_real_profile_failure(self):
+        """A broken real-profile setup must not break private-URL routing."""
+        import tools.browser_tool as bt
+        with patch.object(bt, "_real_profile_cdp", return_value=(None, "no chromium")):
+            info = bt._create_local_session("t1::local", allow_real_profile=False)
+        assert info["session_name"].startswith("h_")
+
+    def test_session_creation_routes_the_sidecar_without_the_real_profile(self):
+        """End to end through _get_session_info: the ::local key opts out."""
+        import tools.browser_tool as bt
+        seen = {}
+
+        def fake_create(task_id, allow_real_profile=True):
+            seen[task_id] = allow_real_profile
+            return {"session_name": "h_x", "bb_session_id": None,
+                    "cdp_url": None, "features": {"local": True}}
+
+        with patch.object(bt, "_create_local_session", side_effect=fake_create), \
+             patch.object(bt, "_get_cdp_override", return_value=None), \
+             patch.object(bt, "_get_cloud_provider", return_value=None), \
+             patch.dict(bt._active_sessions, {}, clear=True):
+            bt._get_session_info("t1::local")
+            bt._get_session_info("t2")
+
+        assert seen["t1::local"] is False, "sidecar must opt out of the real profile"
+        assert seen["t2"] is True, "a bare local session keeps consented behaviour"
+
 
 class TestBrowserExecLocalArg:
     def _env(self):

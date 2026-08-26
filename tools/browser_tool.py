@@ -1736,10 +1736,11 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     When all are true, returns ``f"{task_id}::local"`` so the hybrid-routing
     path spawns a local Chromium sidecar while the cloud session (if any)
     continues to serve public URLs. With ``browser.use_real_profile`` consent,
-    local sessions (bare or sidecar) attach to the user's real-profile
-    copy-browser via ``_create_local_session``; forcing a local session from
-    the model side is the Browser Use lane's ``local`` argument, not a
-    built-in-tools argument.
+    a BARE local session attaches to the user's real-profile copy-browser via
+    ``_create_local_session``; the private-URL sidecar deliberately does not
+    (it exists to keep a LAN host off the cloud backend, not to hand it the
+    user's logins). Forcing a local session from the model side is the Browser
+    Use lane's ``local`` argument, not a built-in-tools argument.
     """
     if task_id is None:
         task_id = "default"
@@ -2577,7 +2578,7 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
-def _create_local_session(task_id: str) -> Dict[str, str]:
+def _create_local_session(task_id: str, allow_real_profile: bool = True) -> Dict[str, str]:
     import uuid
 
     # Real-profile consent: instead of an agent-browser-managed throwaway
@@ -2585,7 +2586,11 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
     # browser running on a hermes-owned SNAPSHOT of their real profile —
     # live logins/cookies included. Fail closed on resolver/launch errors:
     # a consented user must never be silently downgraded to a throwaway.
-    cdp_url, err = _real_profile_cdp()
+    #
+    # ``allow_real_profile=False`` is the hybrid private-URL sidecar. That
+    # session exists to keep a LAN/loopback URL AWAY from the cloud backend,
+    # not to carry the user's logged-in cookie jar to it. See the caller.
+    cdp_url, err = (_real_profile_cdp() if allow_real_profile else (None, None))
     if err:
         raise RuntimeError(err)
     if cdp_url:
@@ -2689,7 +2694,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
-        session_info = _create_local_session(task_id)
+        # Private-URL sidecar. It was created because auto_local_for_private_urls
+        # decided a LAN/loopback host must not be handed to the cloud backend;
+        # sending the user's real cookie jar there instead would be a strictly
+        # larger exposure than the routing rule was protecting against. A
+        # throwaway profile is what this session is for.
+        session_info = _create_local_session(task_id, allow_real_profile=False)
     else:
         provider = _get_cloud_provider()
         if provider is None:
