@@ -7,6 +7,8 @@ import httpx
 
 from tools.url_safety import (
     is_safe_url,
+    is_safe_browser_url,
+    _is_internal_hostname,
     async_is_safe_url,
     is_always_blocked_url,
     normalize_url_for_request,
@@ -88,6 +90,83 @@ class TestIsSafeUrl:
             monkeypatch.delenv(var, raising=False)
         with patch("socket.getaddrinfo", side_effect=socket.gaierror("Name resolution failed")):
             assert is_safe_url("https://nonexistent.example.com") is False
+
+
+class TestIsSafeBrowserUrl:
+    """Browser-navigation classification (is_safe_browser_url).
+
+    Regression for #95544: DNS-level ad/parental filters (AdGuard Home,
+    pi-hole, NextDNS, some ISP resolvers) answer public social domains
+    (tiktok.com / instagram.com / …) with 0.0.0.0, 127.x or private-range
+    addresses — or NXDOMAIN.  Browsers resolve DNS themselves, so the
+    agent-side resolver must not decide the fate of a public registrable
+    domain; only literal private IPs and machine-local/internal names are
+    blocked.  The fetch-oriented is_safe_url() (where agent-side DNS IS the
+    connection's DNS) is intentionally unchanged.
+    """
+
+    @pytest.mark.parametrize("url", [
+        # the exact #95544 repro URLs, incl. the short-link and app hosts
+        "https://www.tiktok.com/@user/video/7212345678901234567",
+        "https://vt.tiktok.com/ZS1AbCdEf/",
+        "https://tiktok.com",
+        "https://www.instagram.com/p/CabcDEF123/",
+        "https://www.instagram.com/reel/CabcDEF123/",
+        "https://instagram.com",
+        # control
+        "https://example.com",
+    ])
+    def test_public_domains_allowed_even_with_filtered_resolver(self, url):
+        # Poisoned answer (loopback / private IP) — the browser would load
+        # the site fine, so the guard must not block.
+        with _resolves_to("127.0.0.1"):
+            assert is_safe_browser_url(url) is True
+        with _resolves_to("10.0.0.1"):
+            assert is_safe_browser_url(url) is True
+        # NXDOMAIN from the filter — same story.
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("filtered")):
+            assert is_safe_browser_url(url) is True
+
+    @pytest.mark.parametrize("url", [
+        # literal private / loopback / link-local / CGNAT / metadata IPs
+        "http://127.0.0.1:8080/secret",
+        "http://10.0.0.1/admin",
+        "http://192.168.1.1/",
+        "http://172.16.5.5/",
+        "http://100.64.0.1/x",                    # CGNAT (RFC 6598)
+        "http://169.254.169.254/latest/meta-data/",
+        "http://169.254.170.2/v2/credentials",
+        "http://100.100.100.200/latest/meta-data/",
+        "http://[::1]:8080/",
+        # machine-local / internal-reserved hostnames
+        "http://localhost:3000/",
+        "http://router/",                          # single-label host
+        "http://myservice.local/",
+        "http://nas.internal/",
+        "http://printer.home/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+    ])
+    def test_internal_targets_still_blocked(self, url):
+        with _resolves_to("127.0.0.1"):
+            assert is_safe_browser_url(url) is False
+
+    def test_suffix_match_requires_dot_boundary(self):
+        """Public domains that merely contain an internal suffix as a
+        substring (foo.example.com vs .example) must not be treated as
+        internal."""
+        assert _is_internal_hostname("example.com") is False
+        assert _is_internal_hostname("foo.example.com") is False
+        assert _is_internal_hostname("host.local") is True
+        assert _is_internal_hostname("localhost") is True
+
+    @pytest.mark.parametrize("url", [
+        "ftp://example.com/file.txt",
+        "example.com/path",
+        "http://",
+        "",
+    ])
+    def test_unusable_urls_blocked(self, url):
+        assert is_safe_browser_url(url) is False
 
 
 class TestProxyEnvironmentDnsDelegation:

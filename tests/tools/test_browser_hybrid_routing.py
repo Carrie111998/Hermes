@@ -10,6 +10,7 @@ These tests cover the routing decision layer — session_key selection,
 sidecar detection, last-active-session tracking, and the config toggle.
 The downstream session creation is covered by test_browser_cloud_fallback.py.
 """
+import socket
 from unittest.mock import Mock
 
 import pytest
@@ -60,6 +61,26 @@ class TestNavigationSessionKey:
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: Mock())
         key = browser_tool._navigation_session_key(None, "http://localhost:3000/")
         assert key == "default::local"
+
+    def test_public_domain_not_routed_local_despite_poisoned_dns(self, monkeypatch):
+        """Regression for #95544: a DNS filter answering a public social
+        domain with a loopback address must not reroute it to the local
+        sidecar — the cloud browser resolves DNS itself."""
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: Mock())
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            h = host.lower().rstrip(".")
+            if h in ("www.tiktok.com", "www.instagram.com"):
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+            raise socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        for url in (
+            "https://www.tiktok.com/@user/video/7212345678901234567",
+            "https://www.instagram.com/p/CabcDEF123/",
+        ):
+            key = browser_tool._navigation_session_key("default", url)
+            assert key == "default", url
 
 
 class TestSessionKeyHelpers:
