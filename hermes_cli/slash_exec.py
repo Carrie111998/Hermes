@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+import shlex
 from typing import Any
 
 __all__ = [
@@ -242,6 +243,159 @@ def _exec_commands(ctx: CommandContext) -> CommandReply:
     return CommandReply("\n".join(lines), format="markdown")
 
 
+def _short_text(value: Any, limit: int = 140) -> str:
+    """Return a single-line display value bounded for gateway messages."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "-"
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "..."
+
+
+def _schedule_display(job: Mapping[str, Any]) -> str:
+    schedule = job.get("schedule") or {}
+    if isinstance(schedule, Mapping):
+        return _short_text(
+            job.get("schedule_display")
+            or schedule.get("display")
+            or schedule.get("expr")
+            or schedule.get("value")
+        )
+    return _short_text(job.get("schedule_display") or schedule)
+
+
+def _job_mode(job: Mapping[str, Any]) -> str:
+    if job.get("no_agent"):
+        return "script-only"
+    if job.get("script"):
+        return "agent+script"
+    return "agent"
+
+
+def _format_cron_job(job: Mapping[str, Any]) -> list[str]:
+    job_id = _short_text(job.get("id") or job.get("job_id") or "?", 18)
+    name = _short_text(job.get("name") or "(unnamed)", 80)
+    state = _short_text(
+        job.get("state") or ("scheduled" if job.get("enabled", True) else "paused"), 24
+    )
+    enabled = "enabled" if job.get("enabled", True) else "disabled"
+    lines = [f"- {name} ({job_id}) [{state}, {enabled}, {_job_mode(job)}]"]
+    lines.append(f"  schedule: {_schedule_display(job)}")
+    lines.append(f"  next: {_short_text(job.get('next_run_at'), 48)}")
+    last_status = job.get("last_status")
+    last_run = job.get("last_run_at")
+    if last_status or last_run:
+        last = _short_text(last_run, 48)
+        status = _short_text(last_status or "unknown", 32)
+        last_error = job.get("last_error")
+        if last_error:
+            status = f"{status}: {_short_text(last_error, 120)}"
+        lines.append(f"  last: {last} {status}")
+    else:
+        lines.append("  last: never")
+    delivery_error = job.get("last_delivery_error")
+    if delivery_error:
+        lines.append(f"  delivery_error: {_short_text(delivery_error, 180)}")
+    script = job.get("script")
+    if script:
+        lines.append(f"  script: {_short_text(script, 80)}")
+    workdir = job.get("workdir")
+    if workdir:
+        lines.append(f"  workdir: {_short_text(workdir, 120)}")
+    latest_execution = job.get("latest_execution")
+    if isinstance(latest_execution, Mapping):
+        latest_status = latest_execution.get("status")
+        latest_id = latest_execution.get("id")
+        if latest_status or latest_id:
+            lines.append(
+                "  execution: "
+                f"{_short_text(latest_status or '?', 24)} {_short_text(latest_id or '?', 28)}"
+            )
+    return lines
+
+
+def _exec_cron(ctx: CommandContext) -> CommandReply:
+    """Gateway-safe read-only cron listing."""
+    raw_args = (ctx.args or "").strip()
+    try:
+        tokens = shlex.split(raw_args) if raw_args else []
+    except ValueError:
+        return CommandReply(
+            "Usage: /cron list [--all]\n"
+            "Gateway /cron is read-only; use the CLI for "
+            "add/create/edit/pause/resume/run/remove.",
+            format="markdown",
+        )
+
+    if not tokens:
+        tokens = ["list"]
+    subcommand = tokens[0].lower()
+    show_all = False
+    if subcommand in {"list", "ls", "jobs"}:
+        rest = tokens[1:]
+    elif subcommand in {"--all", "-a", "all"}:
+        rest = tokens
+    else:
+        return CommandReply(
+            "Gateway /cron is read-only.\n"
+            "Use /cron list [--all] here, or use the CLI for "
+            "add/create/edit/pause/resume/run/remove.",
+            data={"blocked_subcommand": subcommand},
+            format="markdown",
+        )
+    for token in rest:
+        if token in {"--all", "-a", "all"}:
+            show_all = True
+        else:
+            return CommandReply("Usage: /cron list [--all]", format="markdown")
+
+    try:
+        from cron.jobs import list_jobs
+
+        jobs = list_jobs(include_disabled=show_all)
+    except Exception as exc:  # pragma: no cover - environment-specific failure
+        return CommandReply(
+            f"Cron jobs unavailable: {_short_text(exc, 200)}",
+            data={"error": str(exc)},
+        )
+
+    if not jobs:
+        return CommandReply(
+            "No scheduled cron jobs found."
+            if show_all
+            else "No active cron jobs found. Use /cron list --all to include disabled jobs.",
+            data={"count": 0, "include_disabled": show_all},
+        )
+
+    lines = [
+        f"Cron jobs ({len(jobs)} {'total' if show_all else 'active'}):",
+        "",
+    ]
+    any_no_agent = False
+    for job in jobs:
+        any_no_agent = any_no_agent or bool(job.get("no_agent"))
+        lines.extend(_format_cron_job(job))
+    if any_no_agent:
+        lines.extend([
+            "",
+            "Note: script-only jobs can be intentionally silent when stdout is empty.",
+        ])
+    text = "\n".join(lines)
+    try:
+        max_chars = int(ctx.options.get("max_chars", 3800))
+    except (TypeError, ValueError):
+        max_chars = 3800
+    max_chars = max(500, max_chars)
+    if len(text) > max_chars:
+        text = text[: max_chars - 80].rstrip() + "\n... truncated; use CLI `hermes cron list --all` for full details."
+    return CommandReply(
+        text,
+        data={"count": len(jobs), "include_disabled": show_all},
+        format="markdown",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry + resolution
 # ---------------------------------------------------------------------------
@@ -253,6 +407,7 @@ EXECUTORS: dict[str, Callable[[CommandContext], CommandReply]] = {
     "bundles": _exec_bundles,
     "gateway_help": _exec_help,
     "gateway_commands": _exec_commands,
+    "gateway_cron": _exec_cron,
 }
 
 

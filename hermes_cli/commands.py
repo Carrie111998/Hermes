@@ -324,8 +324,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", args_hint="<what to learn from>"),
     CommandDef("init", "Generate or update AGENTS.md project instructions from a repo scan",
                "Tools & Skills", args_hint="[notes]"),
-    CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
-               cli_only=True, args_hint="[subcommand]",
+    CommandDef("cron", "Manage scheduled tasks (gateway: read-only list)", "Tools & Skills",
+               args_hint="[subcommand]", busy_policy="dispatch",
+               execute="gateway_cron",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
     CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
                "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
@@ -1368,7 +1369,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - cron: read-only scheduled-job inspection; reached via /hermes cron on
+#     Slack so it does not displace an existing native slash at the 50-cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "heartbeat", "refine", "review", "pause", "whoami", "platform", "cron",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:
