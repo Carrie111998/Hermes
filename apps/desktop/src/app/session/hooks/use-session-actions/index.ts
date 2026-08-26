@@ -18,7 +18,6 @@ import {
 } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
-import { withTimeout } from '@/lib/with-timeout'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
@@ -180,13 +179,6 @@ interface SessionActionsOptions {
 // bounded retry rebinds it when the backend returns. Boot-into-a-stale-last-id
 // (NOT in this set) still legitimately drops to a draft.
 const createdThisRun = new Set<string>()
-
-// `requestGateway` normally settles `session.resume` quickly because Desktop
-// asks the gateway for a deferred-history acknowledgement. Keep a client-side
-// deadline anyway: a transport/dispatcher wedge can otherwise leave the
-// promise pending forever, so the catch below never arms the existing bounded
-// retry ladder and the window stays on "Waking up…" indefinitely (#95910).
-const SESSION_RESUME_SETTLEMENT_TIMEOUT_MS = 20_000
 
 // Reflect a stored row's persisted token counts into the live usage atom
 // (total is derived, so callers can't drift it out of sync with input/output).
@@ -1399,25 +1391,21 @@ export function useSessionActions({
         const resumeStartedAt = Date.now() / 1000
 
         const resumePromise = singleFlightSessionResume(storedSessionId, () =>
-          withTimeout(
-            requestForSession<SessionResumeResponse>('session.resume', {
-              session_id: storedSessionId,
-              cols: 96,
-              source: 'desktop',
-              defer_history: !watchWindow,
-              // REST is the transcript authority for Desktop. Avoid duplicating a
-              // potentially huge compression lineage in the WebSocket response.
-              // Watch windows attach lazily (live mirror). Every other cold resume
-              // gets the gateway's default deferred build: the RPC returns the
-              // transcript immediately instead of blocking the switch on _make_agent
-              // (MCP discovery / prompt build), and the agent pre-warms in the
-              // background while the prefetch above paints the transcript.
-              ...(watchWindow ? { lazy: true } : { omit_messages: true }),
-              ...(sessionProfile ? { profile: sessionProfile } : {})
-            }),
-            SESSION_RESUME_SETTLEMENT_TIMEOUT_MS,
-            `Timed out resuming session ${storedSessionId}`
-          )
+          requestForSession<SessionResumeResponse>('session.resume', {
+            session_id: storedSessionId,
+            cols: 96,
+            source: 'desktop',
+            defer_history: !watchWindow,
+            // REST is the transcript authority for Desktop. Avoid duplicating a
+            // potentially huge compression lineage in the WebSocket response.
+            // Watch windows attach lazily (live mirror). Every other cold resume
+            // gets the gateway's default deferred build: the RPC returns the
+            // transcript immediately instead of blocking the switch on _make_agent
+            // (MCP discovery / prompt build), and the agent pre-warms in the
+            // background while the prefetch above paints the transcript.
+            ...(watchWindow ? { lazy: true } : { omit_messages: true }),
+            ...(sessionProfile ? { profile: sessionProfile } : {})
+          })
         ).then(resumed => {
           resumeRuntimeBaselineMessages =
             sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
