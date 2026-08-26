@@ -14,7 +14,7 @@ web UI, sold to operators who research and contact B2B leads.
 | `skills/sales/` | Agent-facing instruction text the runs dispatch to: lead-discovery, lead-research, contact-discovery, cold-email-outreach, whatsapp-outreach, linkedin-notes, document-processing, company-brain-build. |
 | `company-packs/` | Per-tenant config (`company.yaml`, market preferences, templates). Read via `server/run_types.py`. |
 | `candidate-manifests/`, `scripts/leads/` | Curated candidate data and the scripts that build corpora from it. |
-| `tests/server/` | The product test suite. Run this before anything else. |
+| `tests/` | 110 files, ~90s, all of it about the product. `tests/server/` is the API and the lead engine (47 lead_research contract tests); `tests/sales_skills/` holds the skill-registry and search-backend contracts. |
 | `PRODUCT.md` | The product spec. Code comments cite it by section (`PRODUCT.md §7.5`). |
 | `docs/product/` | Status, roadmap, design notes, TODO. |
 
@@ -29,7 +29,6 @@ a dependency you happen to be able to edit, not as your codebase.
 | `agent/`, `tools/`, `hermes_cli/`, `gateway/`, `cron/` | Agent loop, tool implementations, CLI, messaging gateway, scheduler. |
 | `plugins/` | Integrations. `plugins/web/scrapling/` is the one the product depends on. |
 | `optional-skills/`, `optional-mcps/`, `locales/` | Shipped catalogs. `Dockerfile.interfaze-api` copies `skills/` and `optional-skills/` into the image. |
-| `tests/` (everything except `tests/server/`) | Upstream framework tests. |
 | `AGENTS.md` (below this map) | The upstream contributor guide. It describes **Hermes**, not the product. |
 
 ## What the Hermes layer can no longer do
@@ -52,6 +51,8 @@ a live dependency.
 
 - Container: `Dockerfile.interfaze-api` + `docker-compose.interfaze.yml`. These
   are the only container files; the upstream Hermes gateway image was removed.
+- Tests: `pytest tests` runs everything in about 90 seconds. There is no shard
+  harness any more; `interfaze-api.yml` runs the whole tree.
 - CI: `.github/workflows/interfaze-api.yml` is the product pipeline (tests,
   packaging, image build + boot). `ci.yml` orchestrates the upstream lanes.
 - Local state lives under `$HERMES_HOME` (`/data` in the image).
