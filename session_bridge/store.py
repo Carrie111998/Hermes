@@ -4015,16 +4015,32 @@ class SessionBridgeStore:
                 )
 
             if rebuild:
-                # Delete by session_id, NOT by joining external_message_map.
-                # The map-join form only removed rows the map still pointed at,
-                # so a session whose map rows had been lost (the map cascades
-                # from external_sessions) kept its existing copy while the
-                # insert below appended a second one -- the 2026-08-06..08-10
-                # double-ingest, 287,351 rows over 1,551 sessions. The bridge
-                # owns every message row of an external session, so deleting
-                # by session_id is both correct and unconditionally idempotent.
+                # Delete the rows THIS ingest owns: every message carrying a
+                # native_event_key. Not the map join, and not the whole session.
+                #
+                # Not the map join, because external_message_map cascades from
+                # external_sessions: a session whose map rows were lost kept its
+                # existing copy while the insert below appended a second one --
+                # the 2026-08-06..08-10 double-ingest, 287,351 rows over 1,551
+                # sessions. native_event_key lives on the message row itself, so
+                # it cannot be orphaned that way and the delete stays idempotent.
+                #
+                # Not the whole session, because "the bridge owns every message
+                # row of an external session" is FALSE. Measured on the live root
+                # state.db 2026-08-25: of 18,757 keyless rows across 66 external
+                # sessions, 13,062 (70%) have no keyed twin -- unique messages a
+                # session_id-wide delete destroys on every rebuild. One session
+                # alone holds 6,235 of them against a single keyed row.
+                #
+                # Consequence, deliberate: the other 5,695 keyless rows ARE
+                # double-ingest residue with keyed twins, and this delete leaves
+                # them in place where the wide form cleared them. Retaining 5,695
+                # stale rows is the correct trade against destroying 13,062 live
+                # ones, but it is a trade, not an oversight -- anyone counting
+                # duplicates later should know it was chosen.
                 conn.execute(
-                    "DELETE FROM messages WHERE session_id = ?",
+                    "DELETE FROM messages "
+                    "WHERE session_id = ? AND native_event_key IS NOT NULL",
                     (session_id,),
                 )
 

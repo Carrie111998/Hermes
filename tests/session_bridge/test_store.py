@@ -15482,3 +15482,73 @@ def test_inspect_refuses_a_repair_lease_that_has_not_expired(
             expected_reserved_claude_uuid=identity.claude_uuid,
             expected_error_code="bridge_conflict",
         )
+
+
+def test_rebuild_deletes_a_keyed_row_whose_map_entry_is_missing(db):
+    """The delete must not depend on external_message_map surviving.
+
+    external_message_map cascades from external_sessions, so a session whose
+    map rows were lost kept its old copy while the rebuild's insert appended a
+    second one -- the 2026-08-06..08-10 double-ingest, 287,351 rows over 1,551
+    sessions.  Scoping the delete on native_event_key, which lives on the
+    message row itself, cannot be defeated that way.  Nothing else stops a
+    future change re-narrowing it back to the map join, so pin it here.
+    """
+
+    now = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: now[0])
+    store.upsert_projection(_projection(_message("e1", "old one")))
+
+    # Lose the map entry, exactly as the cascade did.
+    with db._lock:
+        db._conn.execute("DELETE FROM external_message_map")
+        db._conn.commit()
+
+    now[0] = 200.0
+    store.upsert_projection(
+        _projection(
+            _message("e1", "rebuilt one"),
+            cursor="cursor-rebuilt",
+            native_hash="hash-rebuilt",
+        ),
+        rebuild=True,
+    )
+
+    # One copy, not two: the orphaned keyed row was still deleted.
+    assert [m["content"] for m in db.get_messages("claude:native-1")] == [
+        "rebuilt one"
+    ]
+
+
+def test_rebuild_preserves_a_keyless_row_with_no_keyed_twin(db):
+    """Unique non-ingested rows must survive a rebuild.
+
+    Measured on the live root state.db 2026-08-25: 18,757 keyless rows across
+    66 external sessions, of which 13,062 (70%) have no keyed twin.  A
+    session_id-wide delete destroyed those on every rebuild.
+    """
+
+    now = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: now[0])
+    store.upsert_projection(_projection(_message("e1", "ingested")))
+    db.append_message(
+        "claude:native-1",
+        "assistant",
+        "unique keyless row with no twin",
+        timestamp=1_000.0,
+    )
+
+    now[0] = 200.0
+    store.upsert_projection(
+        _projection(
+            _message("e1", "ingested again"),
+            cursor="cursor-rebuilt",
+            native_hash="hash-rebuilt",
+        ),
+        rebuild=True,
+    )
+
+    contents = [m["content"] for m in db.get_messages("claude:native-1")]
+    assert "unique keyless row with no twin" in contents
+    assert "ingested again" in contents
+    assert "ingested" not in contents
