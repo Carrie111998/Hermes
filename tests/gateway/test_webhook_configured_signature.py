@@ -415,6 +415,16 @@ class TestSignatureConfigValidation:
             {"header": "H", "template": "{body}", "tolerance_seconds": "300"},
             {"header": "H", "template": "{body}", "tolerance_seconds": True},
             {"header": 5, "template": "{body}"},
+            {"header": "H", "template": "{body}", "signature_prefix": 1},
+            {"header": "H", "template": "{body}", "signature_prefix": ["v0="]},
+            {"header": "H", "template": "{body}", "signature_part": 1},
+            {"header": "H", "template": "{body}", "algorithm": 256},
+            {"header": "H", "template": "{body}", "encoding": 16},
+            {"header": "H", "template": "{timestamp}.{body}", "timestamp_part": 1},
+            {"header": "H", "template": "{timestamp}.{body}", "timestamp_header": 1},
+            {"header": "H", "template": 5},
+            {"header": "H", "template": "{body}:{body}"},
+            {"header": "H", "template": "{timestamp}.{body}{body}", "timestamp_part": "t"},
         ],
     )
     def test_invalid_blocks_rejected(self, block):
@@ -553,3 +563,166 @@ class TestOverHttp:
                 },
             )
             assert resp.status == 413
+
+
+# ===================================================================
+# Review regressions — a malformed block must never raise
+#
+# Every string-valued key must be normalised at parse time. Before this was
+# enforced, a truthy non-string `signature_prefix` passed startup validation
+# and then reached `candidate.startswith(prefix)` in the verifier, raising
+# TypeError — a 500 on the request path, on the one boundary that is supposed
+# to fail closed. These pin the whole class, not just the reported key.
+# ===================================================================
+
+
+STRING_KEYS = [
+    "header",
+    "signature_part",
+    "signature_prefix",
+    "timestamp_part",
+    "timestamp_header",
+    "template",
+]
+
+
+def _block_with(key, value):
+    """A block that is valid except for *key*."""
+    block = {"header": "X-Sig", "template": "{timestamp}.{body}", "timestamp_part": "t"}
+    block[key] = value
+    return block
+
+
+class TestMalformedBlockNeverRaises:
+    @pytest.mark.parametrize("key", STRING_KEYS)
+    @pytest.mark.parametrize("value", [1, 0.5, ["x"], {"x": 1}, object()])
+    def test_non_string_values_rejected_at_parse(self, key, value):
+        with pytest.raises(ValueError):
+            _parse_signature_spec("r", _block_with(key, value))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", STRING_KEYS)
+    async def test_connect_rejects_non_string(self, key):
+        """Static routes must fail at startup, not at request time."""
+        adapter = _make_adapter({"r": _route(_block_with(key, 1))})
+        with pytest.raises(ValueError):
+            await adapter.connect()
+
+    @pytest.mark.parametrize("key", STRING_KEYS)
+    def test_live_route_returns_false_without_raising(self, key):
+        """A dynamically-registered route never reaches connect()'s check, so
+        the request path must reject it rather than raise out of the handler."""
+        adapter = _make_adapter({})
+        adapter._routes["dyn"] = _route(_block_with(key, 1))
+        req = _mock_request({"X-Sig": "v0=" + "a" * 64}, route_name="dyn")
+        assert adapter._validate_signature(req, BODY, SECRET) is False
+
+    def test_non_string_prefix_reaches_the_startswith_call_site(self):
+        """The reported defect: a truthy non-string prefix used to survive
+        parsing and blow up inside the verifier on `candidate.startswith()`."""
+        block = _block_with("signature_prefix", 1)
+        with pytest.raises(ValueError):
+            _parse_signature_spec("r", block)
+
+        adapter = _make_adapter({})
+        adapter._routes["dyn"] = _route(block)
+        ts = str(int(time.time()))
+        header = f"t={ts},v0={_hex_hmac(SECRET, f'{ts}.'.encode() + BODY)}"
+        req = _mock_request({"X-Sig": header}, route_name="dyn")
+        assert adapter._validate_signature(req, BODY, SECRET) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", STRING_KEYS)
+    async def test_over_http_is_401_never_500(self, key):
+        """End to end: a malformed live route rejects with 401, and the
+        request never reaches agent dispatch."""
+        adapter = _make_adapter({})
+        adapter._routes["dyn"] = _route(_block_with(key, 1))
+        seen = []
+
+        async def _capture(event):
+            seen.append(event)
+
+        adapter.handle_message = _capture
+
+        ts = str(int(time.time()))
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post(
+                "/webhooks/dyn",
+                data=BODY,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Sig": f"t={ts},v0={_hex_hmac(SECRET, f'{ts}.'.encode() + BODY)}",
+                },
+            )
+            assert resp.status == 401, f"{key}: got {resp.status}"
+        assert seen == []
+
+
+# ===================================================================
+# Review regressions — accepted templates have deterministic semantics
+#
+# The renderer splices the raw body at a single point, so a repeated {body}
+# used to leave a literal "{body}" in the signed message: "{body}:{body}"
+# rendered `<raw-body>:{body}`. Rejecting at startup is the fail-closed
+# reading and keeps the accepted set unambiguous.
+# ===================================================================
+
+
+class TestTemplateShape:
+    @pytest.mark.parametrize(
+        "template",
+        ["{body}{body}", "{body}:{body}", "{body}.{body}.{body}"],
+    )
+    def test_repeated_body_marker_rejected(self, template):
+        with pytest.raises(ValueError, match="exactly one"):
+            _parse_signature_spec("r", {"header": "H", "template": template})
+
+    def test_missing_body_marker_rejected(self):
+        with pytest.raises(ValueError, match=r"must contain"):
+            _parse_signature_spec("r", {"header": "H", "template": "{timestamp}",
+                                        "timestamp_part": "t"})
+
+    def test_single_body_marker_accepted(self):
+        spec = _parse_signature_spec("r", {"header": "H", "template": "{body}"})
+        assert spec["template"] == "{body}"
+
+    @pytest.mark.asyncio
+    async def test_connect_rejects_repeated_body_marker(self):
+        adapter = _make_adapter({"r": _route({"header": "H", "template": "{body}{body}"})})
+        with pytest.raises(ValueError, match="exactly one"):
+            await adapter.connect()
+
+    def test_repeated_timestamp_marker_is_substituted_everywhere(self):
+        """{timestamp} may repeat — unlike {body} it is a plain string
+        replacement, so every occurrence is substituted and the result is
+        deterministic. Pinned so the two markers can't silently diverge."""
+        assert (
+            _render_signed_message("{timestamp}:{timestamp}.{body}", "42", b"X")
+            == b"42:42.X"
+        )
+
+    def test_repeated_timestamp_validates_end_to_end(self):
+        spec = {
+            "header": "X-Sig",
+            "signature_part": "v0",
+            "timestamp_part": "t",
+            "template": "{timestamp}:{timestamp}.{body}",
+        }
+        ts = str(int(time.time()))
+        signed = f"{ts}:{ts}.".encode() + BODY
+        headers = {"X-Sig": f"t={ts},v0={_hex_hmac(SECRET, signed)}"}
+        assert _validate(spec, headers=headers) is True
+
+    def test_no_literal_marker_survives_into_the_signed_message(self):
+        """The bug this closes: any accepted template must render without a
+        leftover placeholder."""
+        for template in ("{body}", "{timestamp}.{body}", "v0:{timestamp}:{body}"):
+            spec = _parse_signature_spec("r", dict(
+                {"header": "H", "template": template},
+                **({"timestamp_part": "t"} if "{timestamp}" in template else {}),
+            ))
+            rendered = _render_signed_message(spec["template"], "123", b"PAYLOAD")
+            assert b"{body}" not in rendered
+            assert b"{timestamp}" not in rendered
+            assert b"PAYLOAD" in rendered

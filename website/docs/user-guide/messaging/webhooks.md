@@ -531,7 +531,7 @@ routes:
 | `signature_prefix` | `""` | Literal prefix that must be present on the signature value and is stripped before comparison (e.g. `sha256=`, `v0=`). |
 | `timestamp_part` | _(none)_ | Label inside the same header holding the Unix-seconds timestamp. |
 | `timestamp_header` | _(none)_ | Separate header holding the timestamp. Mutually exclusive with `timestamp_part`. |
-| `template` | `{timestamp}.{body}` | The exact message the provider signs. Must contain `{body}`; may contain `{timestamp}`. |
+| `template` | `{timestamp}.{body}` | The exact message the provider signs. Must contain `{body}` **exactly once**; `{timestamp}` is optional and may repeat. |
 | `algorithm` | `sha256` | `sha1`, `sha256`, or `sha512`. |
 | `encoding` | `hex` | `hex` or `base64`. |
 | `tolerance_seconds` | `300` | Maximum clock skew, in either direction, between the signed timestamp and the server. |
@@ -579,7 +579,11 @@ Notes:
   whenever the provider offers one.
 - A malformed `signature` block on a route in `config.yaml` stops the gateway at
   startup with an error naming the route and key, rather than silently
-  rejecting every delivery.
+  rejecting every delivery. A route registered dynamically never reaches that
+  startup check, so the same validation runs on the request path and rejects
+  with `401` — it never raises.
+- Every string-valued key is type-checked. `template` must contain `{body}`
+  exactly once, so the signed message is never ambiguous.
 
 ### Secret is required
 

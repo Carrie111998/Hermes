@@ -274,10 +274,22 @@ def _parse_signature_spec(route_name: str, raw: Any) -> Dict[str, Any]:
             f"{', '.join('{%s}' % t for t in unknown)} "
             f"(expected only {', '.join('{%s}' % t for t in _SIGNATURE_TEMPLATE_TOKENS)})"
         )
-    if "body" not in tokens:
+    # Exactly one, not merely at least one: the renderer splices the raw body
+    # at a single point, so a repeated marker would leave a literal "{body}" in
+    # the signed message. Rejecting is the fail-closed reading, and it is the
+    # direction that stays compatible — a later release can accept more
+    # templates without breaking anyone, whereas tightening this later would
+    # break configs that had silently "worked".
+    body_markers = template.count("{body}")
+    if body_markers == 0:
         raise ValueError(
             f"{prefix} template must contain '{{body}}' — a signature that "
             f"does not cover the payload authenticates nothing about it"
+        )
+    if body_markers > 1:
+        raise ValueError(
+            f"{prefix} template contains '{{body}}' {body_markers} times; "
+            f"exactly one is required so the signed message is unambiguous"
         )
     uses_timestamp = "timestamp" in tokens
 
@@ -308,7 +320,7 @@ def _parse_signature_spec(route_name: str, raw: Any) -> Dict[str, Any]:
     return {
         "header": header,
         "signature_part": _opt_str("signature_part"),
-        "signature_prefix": raw.get("signature_prefix") or "",
+        "signature_prefix": _opt_str("signature_prefix"),
         "timestamp_part": timestamp_part,
         "timestamp_header": timestamp_header,
         "template": template,
@@ -349,7 +361,9 @@ def _render_signed_message(template: str, timestamp: str, body: bytes) -> bytes:
 
     ``{body}`` is located in the *template* before the timestamp is
     substituted, so an attacker-supplied timestamp cannot introduce a second
-    ``{body}`` marker and move where the payload is spliced.
+    ``{body}`` marker and move where the payload is spliced. The template is
+    validated to hold exactly one ``{body}``; ``{timestamp}`` may repeat, and
+    every occurrence is substituted.
     """
     head, _, tail = template.partition("{body}")
     return (
