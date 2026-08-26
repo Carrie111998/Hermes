@@ -499,9 +499,41 @@ def _classify_entrypoint_value_kind(value: str) -> str:
 # hooks. They become high-trust prompt bytes and are charged on every turn.
 SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
 DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS = 4_000
-MAX_SYSTEM_PROMPT_SECTION_CHARS = 4_000
 MAX_SYSTEM_PROMPT_SECTIONS = 32
-MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS = 8_000
+
+
+def _system_prompt_section_max_chars() -> int:
+    """Per-section char ceiling; configurable via ``plugins.system_prompt_section_max_chars``."""
+    try:
+        config = load_config_readonly() or {}
+        value = cfg_get(
+            config,
+            "plugins",
+            "system_prompt_section_max_chars",
+            default=DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS,
+        )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS
+        return value
+    except Exception:
+        return DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS
+
+
+def _system_prompt_sections_total_chars() -> int:
+    """Aggregate section budget; configurable via ``plugins.system_prompt_sections_total_chars``."""
+    try:
+        config = load_config_readonly() or {}
+        value = cfg_get(
+            config,
+            "plugins",
+            "system_prompt_sections_total_chars",
+            default=8_000,
+        )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return 8_000
+        return max(value, _system_prompt_section_max_chars())
+    except Exception:
+        return 8_000
 _SYSTEM_PROMPT_SECTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SYSTEM_PROMPT_SECTION_HEADING_PREFIX = "## Plugin Context: "
 PLUGIN_SECTIONS_START = "<!-- hermes-plugin-sections:start -->"
@@ -3246,11 +3278,11 @@ class PluginContext:
         if (
             isinstance(max_chars, bool)
             or not isinstance(max_chars, int)
-            or not 0 < max_chars <= MAX_SYSTEM_PROMPT_SECTION_CHARS
+            or not 0 < max_chars <= _system_prompt_section_max_chars()
         ):
             raise ValueError(
                 "system prompt section max_chars must be between 1 and "
-                f"{MAX_SYSTEM_PROMPT_SECTION_CHARS}"
+                f"{_system_prompt_section_max_chars()}"
             )
         existing = self._manager._system_prompt_sections.get(id)
         if existing is not None:
@@ -5590,13 +5622,13 @@ class PluginManager:
             rendered_chars = len(format_system_prompt_section(section.id, text))
             if rendered:
                 rendered_chars += 2  # canonical ``\n\n`` separator
-            if total_chars + rendered_chars > MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS:
+            if total_chars + rendered_chars > _system_prompt_sections_total_chars():
                 logger.warning(
                     "Plugin system prompt section %s (%s) exceeded the aggregate "
                     "session budget (%d chars) and was skipped",
                     section.id,
                     section.plugin,
-                    MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS,
+                    _system_prompt_sections_total_chars(),
                 )
                 continue
             rendered.append(
