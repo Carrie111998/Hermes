@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from agent.llm_egress_firewall import EgressBlocked
+from agent.llm_egress_runtime import authorize_agent_sdk_kwargs
 from agent.auxiliary_client import (
     _NOUS_MODEL,
     CodexAuxiliaryClient,
@@ -38,6 +39,8 @@ from agent.auxiliary_client import (
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
+    _auxiliary_egress_binding,
+    _RELAY_AUX_CALL_CONTEXT,
 )
 
 
@@ -190,6 +193,119 @@ def test_local_auxiliary_route_bypasses_remote_egress(monkeypatch, tmp_path):
     assert response.choices[0].message.content == "ok"
     client.chat.completions.create.assert_called_once()
     dispatch.assert_not_called()
+
+
+def test_only_compression_auxiliary_binding_gets_larger_exact_grant_caps():
+    client = SimpleNamespace(base_url="https://chatgpt.com/backend-api/codex")
+    compression_token = _RELAY_AUX_CALL_CONTEXT.set({"task": "compression"})
+    try:
+        compression_agent, _ = _auxiliary_egress_binding(
+            client,
+            provider="openai-codex",
+            model="gpt-5.4",
+            api_mode="codex_responses",
+        )
+    finally:
+        _RELAY_AUX_CALL_CONTEXT.reset(compression_token)
+
+    vision_token = _RELAY_AUX_CALL_CONTEXT.set({"task": "vision"})
+    try:
+        vision_agent, _ = _auxiliary_egress_binding(
+            client,
+            provider="openai-codex",
+            model="gpt-5.4",
+            api_mode="codex_responses",
+        )
+    finally:
+        _RELAY_AUX_CALL_CONTEXT.reset(vision_token)
+
+    assert compression_agent._llm_egress_max_granted_serialized_bytes == 2_000_000
+    assert compression_agent._llm_egress_max_granted_conservative_tokens == 666_667
+    assert compression_agent._llm_egress_max_serialized_bytes == 2_000_000
+    assert compression_agent._llm_egress_max_conservative_tokens == 666_667
+    assert compression_agent._llm_egress_max_sanitized_bytes == 2_000_000
+    assert compression_agent._llm_egress_max_sanitized_segment_bytes == 32_768
+    assert not hasattr(vision_agent, "_llm_egress_max_granted_serialized_bytes")
+    assert not hasattr(vision_agent, "_llm_egress_max_granted_conservative_tokens")
+    assert not hasattr(vision_agent, "_llm_egress_max_sanitized_bytes")
+    assert not hasattr(vision_agent, "_llm_egress_max_sanitized_segment_bytes")
+
+
+def _bound_aux_agent(task: str, tmp_path):
+    client = SimpleNamespace(base_url="https://chatgpt.com/backend-api/codex")
+    token = _RELAY_AUX_CALL_CONTEXT.set({"task": task})
+    try:
+        agent, route = _auxiliary_egress_binding(
+            client,
+            provider="openai-codex",
+            model="gpt-5.4",
+            api_mode="codex_responses",
+        )
+    finally:
+        _RELAY_AUX_CALL_CONTEXT.reset(token)
+    agent._llm_egress_state_dir = tmp_path / task
+    return agent, route
+
+
+def _many_bounded_sanitized_messages():
+    return [
+        {"role": "user", "content": f"segment {index}. " + "ordinary sentence. " * 240}
+        for index in range(12)
+    ]
+
+
+def test_compression_allows_many_bounded_sanitized_segments_but_vision_denies(
+    tmp_path,
+):
+    request = {"model": "gpt-5.4", "messages": _many_bounded_sanitized_messages()}
+    compression_agent, compression_route = _bound_aux_agent("compression", tmp_path)
+    vision_agent, vision_route = _bound_aux_agent("vision", tmp_path)
+
+    authorized, decision = authorize_agent_sdk_kwargs(
+        compression_agent,
+        request,
+        route=compression_route,
+    )
+    assert authorized == request
+    assert decision.decision.serialized_bytes > 32_768
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(vision_agent, request, route=vision_route)
+    assert "sanitized_bytes_exceeded" in exc_info.value.decision.reason_codes
+
+
+def test_compression_still_denies_one_sanitized_segment_over_32768_bytes(tmp_path):
+    compression_agent, compression_route = _bound_aux_agent("compression", tmp_path)
+    oversized = "ordinary sentence. " * 2_000
+
+    with pytest.raises(ValueError, match="sanitized segment exceeds byte cap"):
+        authorize_agent_sdk_kwargs(
+            compression_agent,
+            {"model": "gpt-5.4", "messages": [{"role": "user", "content": oversized}]},
+            route=compression_route,
+        )
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "reason"),
+    [
+        ("token=super-secret-value", "secret_detected"),
+        ("cHJpdmF0ZSBzb3VyY2UgdGhhdCBtdXN0IG5vdCBsZWF2ZQ==", "base64_payload"),
+        ("Read /Users/private/repository/file.py", "private_absolute_path"),
+    ],
+)
+def test_compression_aggregate_capacity_does_not_bypass_scans(tmp_path, unsafe, reason):
+    compression_agent, compression_route = _bound_aux_agent("compression", tmp_path)
+    messages = _many_bounded_sanitized_messages()
+    messages.append({"role": "user", "content": unsafe})
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            compression_agent,
+            {"model": "gpt-5.4", "messages": messages},
+            route=compression_route,
+        )
+    assert reason in exc_info.value.decision.reason_codes
 
 
 def test_blocked_remote_aux_call_is_fallback_eligible_without_retry(monkeypatch, tmp_path):

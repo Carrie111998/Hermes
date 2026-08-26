@@ -603,7 +603,10 @@ class LLMEgressFirewall:
         *,
         max_serialized_bytes: int = 262_144,
         max_sanitized_bytes: int = 32_768,
+        max_sanitized_segment_bytes: int = 32_768,
         max_conservative_tokens: int = 87_382,
+        max_granted_serialized_bytes: int | None = None,
+        max_granted_conservative_tokens: int | None = None,
         conservative_chars_per_token: int = 3,
         policy_digest: str | None = None,
         static_literal_hashes_by_policy: Mapping[str, Sequence[str]] | None = None,
@@ -612,15 +615,35 @@ class LLMEgressFirewall:
             raise ValueError("max_serialized_bytes must be positive")
         if max_sanitized_bytes <= 0:
             raise ValueError("max_sanitized_bytes must be positive")
+        if max_sanitized_segment_bytes <= 0:
+            raise ValueError("max_sanitized_segment_bytes must be positive")
         if max_conservative_tokens <= 0:
             raise ValueError("max_conservative_tokens must be positive")
+        if max_granted_serialized_bytes is not None and max_granted_serialized_bytes <= 0:
+            raise ValueError("max_granted_serialized_bytes must be positive")
+        if (
+            max_granted_conservative_tokens is not None
+            and max_granted_conservative_tokens <= 0
+        ):
+            raise ValueError("max_granted_conservative_tokens must be positive")
         if conservative_chars_per_token <= 0:
             raise ValueError("conservative_chars_per_token must be positive")
         self._state_dir = Path(state_dir)
         self._receipt_path = self._state_dir / "llm-egress-receipts.jsonl"
         self._max_serialized_bytes = max_serialized_bytes
         self._max_sanitized_bytes = max_sanitized_bytes
+        self._max_sanitized_segment_bytes = max_sanitized_segment_bytes
         self._max_conservative_tokens = max_conservative_tokens
+        self._max_granted_serialized_bytes = (
+            max_serialized_bytes
+            if max_granted_serialized_bytes is None
+            else max_granted_serialized_bytes
+        )
+        self._max_granted_conservative_tokens = (
+            max_conservative_tokens
+            if max_granted_conservative_tokens is None
+            else max_granted_conservative_tokens
+        )
         self._conservative_chars_per_token = conservative_chars_per_token
         self._policy_digest = str(policy_digest or "")
         self._static_literal_hashes_by_policy = {
@@ -682,6 +705,7 @@ class LLMEgressFirewall:
         reasons: list[str] = []
         valid_grants: list[SourceGrant] = []
         grant_contents: dict[str, tuple[SourceGrant, bytes]] = {}
+        grant_reasons: list[str] = []
         source_segment_count = 0
         sanitized_only = False
         if typed_request is not None:
@@ -762,9 +786,25 @@ class LLMEgressFirewall:
         estimated_tokens = (
             serialized_bytes + self._conservative_chars_per_token - 1
         ) // self._conservative_chars_per_token
-        if serialized_bytes > self._max_serialized_bytes:
+        use_granted_caps = bool(
+            typed_request is not None
+            and source_segment_count > 0
+            and valid_grants
+            and not grant_reasons
+        )
+        serialized_byte_cap = (
+            self._max_granted_serialized_bytes
+            if use_granted_caps
+            else self._max_serialized_bytes
+        )
+        conservative_token_cap = (
+            self._max_granted_conservative_tokens
+            if use_granted_caps
+            else self._max_conservative_tokens
+        )
+        if serialized_bytes > serialized_byte_cap:
             reasons.append("serialized_bytes_exceeded")
-        if estimated_tokens > self._max_conservative_tokens:
+        if estimated_tokens > conservative_token_cap:
             reasons.append("token_cap_exceeded")
 
         if destination in {DestinationClass.REMOTE, DestinationClass.UNKNOWN}:
@@ -936,6 +976,8 @@ class LLMEgressFirewall:
                     reasons.append("sanitized_segment_forbidden")
                 if isinstance(segment.text, str):
                     encoded = segment.text.encode("utf-8")
+                    if len(encoded) > self._max_sanitized_segment_bytes:
+                        reasons.append("sanitized_segment_bytes_exceeded")
                     sanitized_bytes += len(encoded)
                     if sanitized_bytes > self._max_sanitized_bytes:
                         reasons.append("sanitized_bytes_exceeded")

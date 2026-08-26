@@ -333,6 +333,19 @@ def test_sanitized_remote_text_has_an_independent_exact_byte_cap(tmp_path):
     assert "sanitized_bytes_exceeded" in exc_info.value.decision.reason_codes
 
 
+def test_sanitized_segment_cap_remains_independent_from_larger_aggregate_cap(tmp_path):
+    request = _sanitized_request("ordinary sentence. " * 2_000)
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(
+            tmp_path,
+            max_sanitized_segment_bytes=32_768,
+            max_sanitized_bytes=2_000_000,
+            max_serialized_bytes=2_000_000,
+            max_conservative_tokens=666_667,
+        ).preflight(request, _route())
+    assert "sanitized_segment_bytes_exceeded" in exc_info.value.decision.reason_codes
+
+
 @pytest.mark.parametrize(
     ("text", "reason"),
     [
@@ -710,6 +723,92 @@ def test_byte_and_token_caps_allow_the_exact_boundary(tmp_path):
         max_conservative_tokens=token_count,
     ).preflight(request, _route(base_url="http://127.0.0.1:11434"))
     assert decision.allowed is True
+
+
+def test_larger_granted_caps_require_a_fully_valid_bound_source_segment(tmp_path):
+    path = tmp_path / "large-source.txt"
+    path.write_text("plain source sentence\n" * 24, encoding="utf-8")
+    grant = _source_grant(path, end=24)
+    request = _typed_request(_request("ignored"), source_grant=grant)
+    gate = firewall(
+        tmp_path,
+        max_serialized_bytes=128,
+        max_conservative_tokens=64,
+        max_sanitized_bytes=2_048,
+        max_granted_serialized_bytes=2_048,
+        max_granted_conservative_tokens=1_024,
+    )
+
+    decision = gate.preflight(request, _route(), grants=(grant,))
+
+    assert decision.allowed is True
+    assert decision.serialized_bytes > 128
+    assert decision.estimated_tokens > 64
+
+    raw_request = _request(path.read_text(encoding="utf-8"))
+    with pytest.raises(EgressBlocked) as raw_exc:
+        gate.preflight(raw_request, _route(), grants=(grant,))
+    assert "typed_request_required" in raw_exc.value.decision.reason_codes
+    assert "serialized_bytes_exceeded" in raw_exc.value.decision.reason_codes
+
+    sanitized_request = _sanitized_request(path.read_text(encoding="utf-8"))
+    with pytest.raises(EgressBlocked) as sanitized_exc:
+        gate.preflight(sanitized_request, _route())
+    assert "serialized_bytes_exceeded" in sanitized_exc.value.decision.reason_codes
+    assert "token_cap_exceeded" in sanitized_exc.value.decision.reason_codes
+
+
+def test_invalid_grant_cannot_select_larger_granted_caps(tmp_path):
+    path = tmp_path / "source.txt"
+    path.write_text("plain source sentence\n", encoding="utf-8")
+    mismatched_grant = _source_grant(path, request_id="another-request")
+    request = _sanitized_request("bounded sanitized sentence " * 12)
+    gate = firewall(
+        tmp_path,
+        max_serialized_bytes=128,
+        max_conservative_tokens=64,
+        max_sanitized_bytes=2_048,
+        max_granted_serialized_bytes=2_048,
+        max_granted_conservative_tokens=1_024,
+    )
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        gate.preflight(request, _route(), grants=(mismatched_grant,))
+
+    reasons = exc_info.value.decision.reason_codes
+    assert "grant_binding_mismatch" in reasons
+    assert "serialized_bytes_exceeded" in reasons
+    assert "token_cap_exceeded" in reasons
+
+
+@pytest.mark.parametrize(
+    ("source_text", "reason"),
+    [
+        ("token=super-secret-value\n", "secret_detected"),
+        ("cHJpdmF0ZSBzb3VyY2UgdGhhdCBtdXN0IG5vdCBsZWF2ZQ==\n", "base64_payload"),
+        ("Read /Users/private/repository/file.py\n", "private_absolute_path"),
+    ],
+)
+def test_larger_granted_caps_do_not_bypass_content_scans(tmp_path, source_text, reason):
+    path = tmp_path / "unsafe-source.txt"
+    path.write_text(source_text, encoding="utf-8")
+    grant = _source_grant(path)
+    gate = firewall(
+        tmp_path,
+        max_serialized_bytes=8,
+        max_conservative_tokens=4,
+        max_granted_serialized_bytes=2_048,
+        max_granted_conservative_tokens=1_024,
+    )
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        gate.preflight(
+            _typed_request(_request("ignored"), source_grant=grant),
+            _route(),
+            grants=(grant,),
+        )
+
+    assert reason in exc_info.value.decision.reason_codes
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
