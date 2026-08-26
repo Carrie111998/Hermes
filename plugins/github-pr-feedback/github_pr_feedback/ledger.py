@@ -74,6 +74,8 @@ class FeedbackLedger:
         self._connection = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.execute("PRAGMA wal_autocheckpoint=1000")
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS feedback_receipts (
                 repository TEXT NOT NULL,

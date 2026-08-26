@@ -425,6 +425,18 @@ class LocalGitRepository:
         head = self._run(["git", "-C", str(workspace), "rev-parse", "HEAD"]).strip()
         if head.casefold() != expected_sha.casefold():
             raise RuntimeError("worktree HEAD does not match expected SHA")
+        dirty = self._run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ]
+        )
+        if dirty:
+            raise RuntimeError("deterministic receipt worktree is not clean")
 
     def _run(self, argv: list[str], *, missing_ok: bool = False) -> str:
         result = self._runner.run(argv)

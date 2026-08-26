@@ -73,7 +73,7 @@ def _is_git_worktree(path: Path) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=3,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False

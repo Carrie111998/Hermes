@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import subprocess
+from types import SimpleNamespace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from github_pr_feedback.policy import (
     PostMergePolicy,
     PullRequest,
     Reviewer,
+    _is_git_worktree,
     load_policy,
 )
 
@@ -1103,6 +1105,32 @@ def test_ledger_uses_profile_scoped_hermes_home(
 
     assert ledger.path == tmp_path / "profile" / "github-pr-feedback" / "ledger.sqlite3"
     ledger.close()
+
+
+def test_ledger_enables_bounded_busy_waits_and_wal_autocheckpoint(
+    tmp_path: Path,
+) -> None:
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    assert ledger._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
+    assert ledger._connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1_000
+    ledger.close()
+
+
+def test_worktree_policy_allows_ten_seconds_for_local_git_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["timeout"] = kwargs["timeout"]
+        return SimpleNamespace(returncode=0, stdout=f"true\n{tmp_path.resolve()}\n")
+
+    monkeypatch.setattr("github_pr_feedback.policy.subprocess.run", fake_run)
+
+    assert _is_git_worktree(tmp_path) is True
+    assert observed["timeout"] == 10
 
 
 def test_archived_dispatch_replacement_is_all_or_nothing(tmp_path: Path) -> None:

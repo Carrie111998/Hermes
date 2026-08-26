@@ -3032,6 +3032,19 @@ def test_local_git_hard_fails_if_a_materialized_receipt_worktree_head_changes(
         repository.prepare_receipt_worktree(source, receipt)
 
 
+def test_local_git_hard_fails_if_a_materialized_receipt_worktree_is_dirty(
+    tmp_path: Path,
+) -> None:
+    source, original_sha = initialized_repository(tmp_path)
+    receipt = FeedbackReceipt("acme/widgets", 17, "issue_comment", "dirty", original_sha)
+    repository = LocalGitRepository(tmp_path / "profile" / "worktrees")
+    prepared = repository.prepare_receipt_worktree(source, receipt)
+    (prepared.path / "untrusted.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="receipt worktree is not clean"):
+        repository.prepare_receipt_worktree(source, receipt)
+
+
 def test_local_git_reports_an_unavailable_exact_head_without_falling_back_to_local_head(
     tmp_path: Path,
 ) -> None:

@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import quote
 
 from .policy import PullRequest, Reviewer
@@ -32,21 +33,42 @@ class CommandRunner(Protocol):
 class SubprocessCommandRunner:
     """The only production command boundary; it never invokes a shell."""
 
+    def __init__(
+        self,
+        *,
+        sleeper: Callable[[float], None] = time.sleep,
+        rate_limit_backoff: float = 1.0,
+    ) -> None:
+        self._sleeper = sleeper
+        self._rate_limit_backoff = max(0.0, min(float(rate_limit_backoff), 2.0))
+
     def run(self, argv: list[str]) -> str:
-        try:
-            completed = subprocess.run(
-                argv,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise GitHubClientError("GitHub command failed") from error
-        if completed.returncode != 0:
+        for attempt in range(2):
+            try:
+                completed = subprocess.run(
+                    argv,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise GitHubClientError("GitHub command failed") from error
+            if completed.returncode == 0:
+                return completed.stdout
+            if attempt == 0 and _is_rate_limit_failure(completed.stderr):
+                self._sleeper(self._rate_limit_backoff)
+                continue
             raise GitHubClientError("GitHub command failed")
-        return completed.stdout
+        raise GitHubClientError("GitHub command failed")
+
+
+def _is_rate_limit_failure(stderr: str) -> bool:
+    normalized = str(stderr or "").casefold()
+    return "rate limit" in normalized and (
+        "403" in normalized or "429" in normalized or "secondary" in normalized
+    )
 
 
 @dataclass(frozen=True, slots=True)

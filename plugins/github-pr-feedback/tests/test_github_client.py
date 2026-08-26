@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 
 import pytest
@@ -13,6 +14,7 @@ from github_pr_feedback.github_client import (
     PullRequestMergeState,
     RepositoryMergePolicy,
     ReviewState,
+    SubprocessCommandRunner,
 )
 
 
@@ -38,6 +40,49 @@ class FeedbackBarrierRunner(RecordingRunner):
         if "--paginate" in argv:
             self.barrier.wait(timeout=1)
         return super().run(argv)
+
+
+def test_subprocess_runner_retries_one_bounded_rate_limit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+    results = iter(
+        (
+            subprocess.CompletedProcess(
+                ["gh", "api", "rate_limit"], 1, "", "HTTP 403: rate limit exceeded"
+            ),
+            subprocess.CompletedProcess(["gh", "api", "rate_limit"], 0, "{}", ""),
+        )
+    )
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return next(results)
+
+    monkeypatch.setattr("github_pr_feedback.github_client.subprocess.run", fake_run)
+    runner = SubprocessCommandRunner(sleeper=sleeps.append, rate_limit_backoff=0.25)
+
+    assert runner.run(["gh", "api", "rate_limit"]) == "{}"
+    assert calls == [["gh", "api", "rate_limit"], ["gh", "api", "rate_limit"]]
+    assert sleeps == [0.25]
+
+
+def test_subprocess_runner_does_not_retry_an_ordinary_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, "", "not found")
+
+    monkeypatch.setattr("github_pr_feedback.github_client.subprocess.run", fake_run)
+
+    with pytest.raises(GitHubClientError, match="GitHub command failed"):
+        SubprocessCommandRunner(sleeper=lambda _delay: None).run(["gh", "api", "missing"])
+
+    assert calls == [["gh", "api", "missing"]]
 
 
 def test_github_client_reads_paginated_canonical_feedback_with_fixed_gh_argv() -> None:
