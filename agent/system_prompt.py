@@ -200,6 +200,17 @@ def _cron_anti_propagation_guidance(hint: str) -> str:
     precisely the case that must still get the guidance appended last.
     An empty hint still yields the warning on its own (a cron session must
     never end up with no anti-propagation guidance at all).
+
+    Scope: this covers the executing cron agent's own turn only, gated on
+    ``platform_key == "cron"``. When a delivery is mirrored into a chat
+    session (``_maybe_mirror_cron_delivery`` / ``mirror_to_session``), the
+    cron output is already seeded into that session's history as soon as
+    the job runs — a human reply merely triggers the next turn, which runs
+    under the messaging platform's own hint and reads that seeded history
+    without this guidance. A ``delegate_task`` subagent spawned from a cron
+    run gets ``platform="subagent"``, not "cron", and likewise doesn't
+    inherit it. Neither path is addressed here; they'd need their own
+    follow-up if judged worth covering.
     """
     if not hint:
         return _CRON_ANTI_PROPAGATION_HINT
@@ -820,6 +831,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if platform_key == "tui" and _effective_hint:
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if platform_key == "cron":
+        # Apply after platform override resolution so the canonical warning
+        # trails all platform_hints.cron text within the effective
+        # platform-hint segment. NOT a claim that this segment is the
+        # trailing content of the full prompt — a cron job with a coding
+        # workspace places it in the context band, ahead of project context
+        # files (see the coding_workspace_parts branch below). See
+        # tests/agent/test_system_prompt.py::TestCronAntiPropagationGuidance.
         _effective_hint = _cron_anti_propagation_guidance(_effective_hint)
     if _effective_hint:
         post_workspace_parts.append(_effective_hint)
