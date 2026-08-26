@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1655,19 +1655,6 @@ class SessionStore:
         self._reconcile_persisted_routing_locked(snapshot, data, rejected)
         return rejected
 
-    def _evict_rejected_routing_locked(
-        self,
-        rejected: Dict[str, str],
-    ) -> None:
-        """Drop only local aliases rejected for their exact terminal owner."""
-        for key, rejected_session_id in rejected.items():
-            current = self._entries.get(key)
-            if (
-                current is not None
-                and current.session_id == rejected_session_id
-            ):
-                self._entries.pop(key, None)
-
     def _reconcile_persisted_routing_locked(
         self,
         snapshot: Dict[str, Any],
@@ -2066,11 +2053,15 @@ class SessionStore:
                         if isinstance(decoded, dict):
                             durable_data = decoded
                 except Exception as exc:
+                    # A failed durable read is not proof the row is absent.
+                    # Keep the live entry rather than evicting a possibly
+                    # healthy route; the next save retries the reconcile.
                     logger.warning(
                         "Failed to reconcile rejected route %r: %s",
                         session_key,
                         exc,
                     )
+                    return
 
             def _reconcile() -> None:
                 current = self._entries.get(session_key)
@@ -3440,21 +3431,43 @@ class SessionStore:
                 lock_held=True,
             )
 
-        data = {
-            key: current.to_dict()
-            for key, current in self._entries.items()
-        }
-        data[session_key] = dict(candidate)
-        return self._persist_primary_routing_cas_locked(
-            lambda: replacer(
-                session_key,
-                entry.session_id,
-                expected_token,
-                json.dumps(candidate),
-                scope=self._routing_scope(),
-            ),
-            data,
-        )
+        # Active-turn transitions are metadata-only (the key -> session_id
+        # mapping never changes), so they use the fast-save bookkeeping from
+        # _save_entry rather than _persist_primary_routing_cas_locked:
+        # advancing _persisted_routing_generation after a single-row write
+        # would suppress a concurrent in-flight full snapshot of *other*
+        # keys, and rebuilding/fsyncing the whole sessions.json mirror twice
+        # per turn is exactly the cost the fast path exists to avoid (mirror
+        # metadata lag is part of the _save_entry contract).
+        generation = self._next_routing_generation_locked()
+        save_lock = getattr(self, "_save_lock", None)
+        if save_lock is None:
+            save_lock = threading.Lock()
+            self._save_lock = save_lock
+        candidate_json = json.dumps(candidate)
+        with save_lock:
+            try:
+                committed = bool(
+                    replacer(
+                        session_key,
+                        entry.session_id,
+                        expected_token,
+                        candidate_json,
+                        scope=self._routing_scope(),
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "state.db routing transition failed"
+                ) from exc
+            if not committed:
+                return False
+            fast_persisted = getattr(self, "_fast_persisted_entries", None)
+            if fast_persisted is None:
+                fast_persisted = {}
+                self._fast_persisted_entries = fast_persisted
+            fast_persisted[session_key] = (generation, candidate_json)
+            return True
 
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
@@ -3529,6 +3542,11 @@ class SessionStore:
                         json.loads(durable_json)
                     )
                 except Exception:
+                    logger.warning(
+                        "clear_turn_active: durable reconcile failed for %r",
+                        session_key,
+                        exc_info=True,
+                    )
                     return False
                 if (
                     durable.session_id != entry.session_id
@@ -3605,6 +3623,46 @@ class SessionStore:
                     candidate,
                     token,
                 ):
+                    # Another owner already transitioned the durable row (for
+                    # example the webhook success transaction clears this
+                    # exact token durably). Adopt the authoritative row
+                    # verbatim — never promote or re-arm resume for work
+                    # another owner finalized — so memory rejoins durable
+                    # state and the next mark_turn_active CAS can succeed
+                    # instead of wedging on the stale local token.
+                    logger.warning(
+                        "recover_interrupted_turns: durable active-turn CAS "
+                        "rejected for %r; adopting the authoritative row",
+                        session_key,
+                    )
+                    db = getattr(self, "_db", None)
+                    loader = getattr(db, "load_gateway_routing_entries", None)
+                    durable_entry = None
+                    if callable(loader):
+                        try:
+                            durable_json = loader(
+                                scope=self._routing_scope()
+                            ).get(session_key)
+                            if durable_json is not None:
+                                durable_entry = SessionEntry.from_dict(
+                                    json.loads(durable_json)
+                                )
+                        except Exception:
+                            logger.warning(
+                                "recover_interrupted_turns: durable "
+                                "reconcile failed for %r",
+                                session_key,
+                                exc_info=True,
+                            )
+                            continue
+                    if durable_entry is not None:
+                        self._entries[session_key] = durable_entry
+                    else:
+                        # No durable row (e.g. a legacy sessions.json import
+                        # the next full save will migrate): keep the route
+                        # but drop the unpersistable local marker.
+                        entry.active_turn_token = None
+                        entry.active_turn_started_at = None
                     continue
                 if promote_entry:
                     entry.resume_pending = True
@@ -3757,10 +3815,24 @@ class SessionStore:
                 if entry.updated_at < cutoff:
                     prune_candidates.append((key, entry.session_id))
 
+        # Each removal re-verifies eligibility under the store lock: a session
+        # that received a message or gained an active process after the
+        # collection pass above must not be pruned mid-turn.
+        def _still_prunable(entry: SessionEntry) -> bool:
+            return (
+                not entry.suspended
+                and not self._has_active_processes_safe(
+                    entry.session_key, context="prune"
+                )
+                and entry.updated_at < cutoff
+            )
+
         removed_keys = [
             key
             for key, session_id in prune_candidates
-            if self.remove_session_route(key, session_id)
+            if self.remove_session_route(
+                key, session_id, precondition=_still_prunable
+            )
         ]
 
         if removed_keys:
@@ -3939,7 +4011,7 @@ class SessionStore:
         )
         if callable(replacer):
             removed_session_keys: list[str] = []
-            authoritative_entries: Dict[str, Dict[str, Any]] = {}
+            authoritative_entries: Dict[str, SessionEntry] = {}
 
             def _replace_primary_route() -> bool:
                 result = replacer(
@@ -3956,16 +4028,33 @@ class SessionStore:
                     )
                     for key in removed_session_keys:
                         candidate.pop(key, None)
+                    # Validate peer rows HERE, not in the post-commit publish
+                    # loop: the durable CAS has already committed by the time
+                    # this closure returns, so a from_dict raise after it
+                    # would leave state.db holding the replacement while
+                    # memory keeps the old route. A malformed peer row is
+                    # skipped like the loaders do (#46994) — memory/mirror
+                    # keep their prior value for that key.
                     for key, entry_json in result.get(
                         "authoritative_entries", {}
                     ).items():
                         try:
                             entry_data = json.loads(entry_json)
-                        except (TypeError, ValueError):
+                            if not isinstance(entry_data, dict):
+                                continue
+                            authoritative_entry = SessionEntry.from_dict(
+                                entry_data
+                            )
+                        except (TypeError, ValueError, KeyError) as exc:
+                            logger.warning(
+                                "Skipping invalid authoritative routing "
+                                "entry %r: %s",
+                                key,
+                                exc,
+                            )
                             continue
-                        if isinstance(entry_data, dict):
-                            candidate[str(key)] = entry_data
-                            authoritative_entries[str(key)] = entry_data
+                        candidate[str(key)] = entry_data
+                        authoritative_entries[str(key)] = authoritative_entry
                     return True
                 return bool(result)
 
@@ -3982,8 +4071,8 @@ class SessionStore:
                     and old_route.session_id == replacement.session_id
                 ):
                     self._entries.pop(key, None)
-            for key, entry_data in authoritative_entries.items():
-                self._entries[key] = SessionEntry.from_dict(entry_data)
+            for key, authoritative_entry in authoritative_entries.items():
+                self._entries[key] = authoritative_entry
             self._entries[session_key] = replacement
             return True
 
@@ -4223,8 +4312,20 @@ class SessionStore:
                             authoritative_entry = SessionEntry.from_dict(
                                 authoritative_data
                             )
-                        except (TypeError, ValueError, KeyError):
-                            return False
+                        except (TypeError, ValueError, KeyError) as exc:
+                            # A dict result means the durable move already
+                            # committed. Reporting failure here would leave
+                            # the session live at the source key in memory
+                            # while state.db routes it at the destination —
+                            # exactly the split ownership the CAS exists to
+                            # prevent. Keep the submitted candidate instead.
+                            logger.warning(
+                                "move_session_route: committed move echoed "
+                                "an unparseable destination entry for %r: %s",
+                                destination_session_key,
+                                exc,
+                            )
+                            return True
                         if source_entry is None and destination_entry is moved_entry:
                             # Preserve the existing live object for the
                             # no-write already-moved case while reconciling
@@ -4287,6 +4388,8 @@ class SessionStore:
         self,
         session_key: str,
         expected_session_id: str,
+        *,
+        precondition: Optional[Callable[[SessionEntry], bool]] = None,
     ) -> bool:
         """Durably remove a route only while its expected owner still holds it.
 
@@ -4294,6 +4397,10 @@ class SessionStore:
         returns ``False`` and is never removed.  As with ``move_session_route``,
         state.db is the required commit point and the live mapping changes only
         after that transaction succeeds.
+
+        ``precondition`` is re-evaluated against the live entry under
+        ``_lock`` immediately before the durable delete, for callers (prune)
+        whose eligibility check happened outside this lock and can go stale.
         """
         if not session_key or not expected_session_id:
             return False
@@ -4302,6 +4409,12 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is not None and entry.session_id != expected_session_id:
+                return False
+            if (
+                entry is not None
+                and precondition is not None
+                and not precondition(entry)
+            ):
                 return False
 
             candidate = {

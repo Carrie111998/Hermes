@@ -2552,7 +2552,7 @@ class TestSessionStoreRouteMove:
         entry = store.get_or_create_session(self._webhook_source())
         assert store._db.request_handoff_once(entry.session_id, "discord") is True
         assert store._db.claim_handoff(entry.session_id) is True
-        assert store._db.complete_running_handoff(entry.session_id) is True
+        store._db.complete_handoff(entry.session_id)
 
         assert store.remove_session_route_and_end(
             entry.session_key,
@@ -3669,3 +3669,49 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
+
+
+class TestPruneRecheckUnderLock:
+    def test_session_becoming_active_between_scan_and_removal_survives(
+        self, tmp_path
+    ):
+        """Prune eligibility must be re-verified under the store lock.
+
+        The scan collects candidates and releases ``_lock`` before removing
+        them; a session that receives activity in that window still passes
+        the session-id CAS (activity never changes the id), so the removal
+        itself must re-check eligibility or a live session is pruned
+        mid-turn.
+        """
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        store._loaded = True
+        entry = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="42",
+                chat_type="dm",
+                user_id="42",
+            )
+        )
+        with store._lock:
+            entry.updated_at = datetime.now() - timedelta(days=2)
+
+        calls = {"count": 0}
+
+        def _active_after_scan(session_key, context=None):
+            calls["count"] += 1
+            # Inactive during the scan pass, active by removal time.
+            return calls["count"] > 1
+
+        store._has_active_processes_safe = _active_after_scan
+
+        assert store.prune_old_entries(1) == 0
+        assert store.peek_session_id(entry.session_key) == entry.session_id
+
+        # Once genuinely inactive again, the same entry prunes normally.
+        store._has_active_processes_safe = lambda session_key, context=None: False
+        assert store.prune_old_entries(1) == 1
+        assert store.peek_session_id(entry.session_key) is None

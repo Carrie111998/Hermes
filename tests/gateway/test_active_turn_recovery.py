@@ -914,3 +914,61 @@ async def test_unclean_recovery_promotes_exact_markers_before_legacy_fallback(
 
     assert await runner._recover_unclean_sessions() == (1, 2)
     assert calls == ["exact", "fallback"]
+
+
+def test_mark_and_clear_turn_active_use_fast_save_bookkeeping(tmp_path):
+    """Per-turn marker transitions must not act as full-index writers.
+
+    Advancing ``_persisted_routing_generation`` after a single-row CAS would
+    suppress a concurrent in-flight full snapshot of *other* keys, and the
+    sessions.json mirror rewrite (twice per turn) is exactly the cost the
+    ``_save_entry`` fast path exists to avoid.  The committed row rides the
+    fast-persisted overlay instead, so a delayed full writer folds it in.
+    """
+    store = _make_db_store(tmp_path)
+    try:
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        key = entry.session_key
+
+        sessions_file = store.sessions_dir / "sessions.json"
+        mirror_before = (
+            sessions_file.read_text() if sessions_file.exists() else None
+        )
+        persisted_before = getattr(store, "_persisted_routing_generation", 0)
+
+        token = store.mark_turn_active(key)
+        assert token
+
+        assert (
+            getattr(store, "_persisted_routing_generation", 0)
+            == persisted_before
+        )
+        fast = getattr(store, "_fast_persisted_entries", {})
+        assert key in fast
+        revision, entry_json = fast[key]
+        assert revision > persisted_before
+        assert json.loads(entry_json)["active_turn_token"] == token
+
+        # The owner CAS is still the durable commit point.
+        durable = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )[key]
+        assert json.loads(durable)["active_turn_token"] == token
+
+        mirror_after = (
+            sessions_file.read_text() if sessions_file.exists() else None
+        )
+        assert mirror_after == mirror_before
+
+        assert store.clear_turn_active(key, token) is True
+        assert (
+            getattr(store, "_persisted_routing_generation", 0)
+            == persisted_before
+        )
+        durable = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )[key]
+        assert json.loads(durable)["active_turn_token"] is None
+    finally:
+        _close_store_db(store)
