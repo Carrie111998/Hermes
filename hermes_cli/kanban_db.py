@@ -9989,16 +9989,14 @@ def _dispatch_once_locked(
 
     # Convert any concurrency caps into a shared additional-spawns budget
     # for this tick. Both ready and review loops consume from the same
-    # budget so the total number of new workers stays bounded.
-    if max_spawn is not None:
-        if running_count >= max_spawn:
-            return result
-        spawn_budget = max_spawn - running_count
-
+    # budget so the total number of new workers stays bounded.  Check the
+    # host cap before the board-local cap so a full single-slot host is
+    # reported as intentional capacity deferral, regardless of which limit
+    # has the same numeric value.
     # Honour kanban.max_in_progress across both ready and review queues: if
     # the board already has enough running tasks, skip this tick entirely.
     # When there is room left, intersect the remaining in-progress budget
-    # with any explicit max_spawn cap above.
+    # with any explicit max_spawn cap below.
     #
     # max_in_progress is a HOST-level cap, not a per-board one (OOF-30):
     # workers are OS processes sharing one machine's memory, so running
@@ -10013,6 +10011,13 @@ def _dispatch_once_locked(
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+    if max_spawn is not None:
+        if running_count >= max_spawn:
+            return result
+        board_remaining = max_spawn - running_count
+        if spawn_budget is None or spawn_budget > board_remaining:
+            spawn_budget = board_remaining
 
     # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
     # can't see the host's actual memory state (other tenants, bloated
