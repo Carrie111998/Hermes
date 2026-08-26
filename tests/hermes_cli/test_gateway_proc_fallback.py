@@ -180,6 +180,38 @@ class TestPsFallbackBsdCompat:
 class TestGetServicePidsAllProfiles:
     """_get_service_pids(all_profiles=...) discovery across profiles."""
 
+    def test_default_scope_systemd_uses_only_current_profile_unit(self):
+        calls = []
+
+        def _run_side_effect(args, **kwargs):
+            args_list = list(args)
+            calls.append(args_list)
+            if "list-units" in args_list:
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "hermes-gateway.service loaded active running\n"
+                        "hermes-gateway-sol.service loaded active running\n"
+                    ),
+                    stderr="",
+                )
+            if "show" in args_list:
+                service = args_list[args_list.index("show") + 1]
+                pid = "222\n" if service == "hermes-gateway-sol.service" else "111\n"
+                return MagicMock(returncode=0, stdout=pid, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("hermes_cli.gateway.is_macos", return_value=False),
+            patch("hermes_cli.gateway.supports_systemd_services", return_value=True),
+            patch("hermes_cli.gateway.get_service_name", return_value="hermes-gateway-sol"),
+            patch("subprocess.run", side_effect=_run_side_effect),
+        ):
+            pids = gateway_mod._get_service_pids(all_profiles=False)
+
+        assert pids == {222}
+        assert not any("list-units" in call for call in calls)
+
     def test_default_scope_uses_current_profile_label(self):
         """Without all_profiles, only the current profile's launchd agent is
         located (per-label domain-explicit probe, #73627)."""
@@ -307,9 +339,8 @@ class TestGetServicePidsAllProfiles:
 
         assert pids == {123}
 
-    def test_all_profiles_preserves_systemd_behavior(self):
-        """systemd scope is unaffected by the all_profiles switch — it already
-        lists every hermes-gateway* unit unconditionally."""
+    def test_all_profiles_enumerates_systemd_fleet(self):
+        """With all_profiles=True, systemd enumerates every gateway unit."""
         with (
             patch("hermes_cli.gateway.is_macos", return_value=False),
             patch("hermes_cli.gateway.supports_systemd_services", return_value=True),

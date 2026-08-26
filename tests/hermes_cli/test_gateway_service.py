@@ -3,8 +3,9 @@
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -188,6 +189,68 @@ class TestGeneratedSystemdUnits:
     def _expected_timeout_stop_sec(self) -> str:
         timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30))
         return f"TimeoutStopSec={timeout}"
+
+    def test_user_unit_path_uses_real_home_when_profile_home_is_active(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        profile_root = tmp_path / "profiles" / "sol"
+        profile_home = profile_root / "home"
+        profile_home.mkdir(parents=True)
+        real_home.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_root))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_root)
+
+        assert gateway_cli.get_systemd_unit_path(system=False) == (
+            real_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / "hermes-gateway-sol.service"
+        )
+
+    def test_user_unit_path_uses_real_home_for_local_bins(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        profile_root = tmp_path / "profiles" / "sol"
+        profile_home = profile_root / "home"
+        real_local_bin = real_home / ".local" / "bin"
+        profile_local_bin = profile_home / ".local" / "bin"
+        real_local_bin.mkdir(parents=True)
+        profile_local_bin.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_root))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_root)
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(
+            gateway_cli, "_append_node_dir_for_service", lambda entries: None
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert str(real_local_bin) in unit
+        assert str(profile_local_bin) not in unit
+
+    def test_real_user_home_path_reloads_constants_across_update_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.managed_uv as managed_uv
+
+        stale_constants = ModuleType("hermes_constants")
+        monkeypatch.setitem(sys.modules, "hermes_constants", stale_constants)
+        monkeypatch.setattr(
+            managed_uv,
+            "_reload_hermes_constants",
+            lambda: SimpleNamespace(get_real_home=lambda: str(tmp_path)),
+        )
+
+        assert gateway_cli._get_real_user_home_path() == tmp_path
 
 
 
@@ -1285,7 +1348,7 @@ class TestGeneratedUnitIncludesLocalBin:
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="root")
         # System unit uses the resolved home dir from _system_service_identity
         assert "/.local/bin" in unit
 
@@ -1634,6 +1697,26 @@ class TestLegacyHermesUnitDetection:
         "[Unit]\nDescription=Hermes Gateway\n[Service]\n"
         "ExecStart=/usr/bin/python -m hermes_cli.main gateway run --replace\n"
     )
+
+    def test_user_scope_search_uses_real_home_when_profile_home_is_active(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        profile_root = tmp_path / "profiles" / "sol"
+        profile_home = profile_root / "home"
+        real_home.mkdir()
+        profile_home.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_root))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+        monkeypatch.setenv("HOME", str(profile_home))
+
+        paths = gateway_cli._legacy_unit_search_paths()
+
+        assert paths[0] == (
+            False,
+            real_home / ".config" / "systemd" / "user",
+        )
 
     @staticmethod
     def _setup_search_paths(tmp_path, monkeypatch):

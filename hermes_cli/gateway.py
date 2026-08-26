@@ -106,41 +106,40 @@ def _get_service_pids(all_profiles: bool = False) -> set:
     the service manager having committed the new PID before the restart command
     returns (true for both systemd and launchd in practice).
 
-    ``all_profiles`` widens the launchd branch to every installed
-    ``ai.hermes.gateway*`` LaunchAgent — the update path needs the whole
-    fleet excluded from its sweep (#41403, #73626): sibling-profile launchd
-    gateways found by the (BSD-fixed) ps scan must not be misclassified as
-    manual processes and killed.  Default-scope callers (``gateway status``,
-    cron checks) keep seeing only the current profile's service; the orphan
-    reaper passes all_profiles=True for the same friendly-fire reason.  The
-    systemd branch has always been fleet-wide (``hermes-gateway*``) and is
-    unaffected.
+    ``all_profiles`` widens service-manager discovery to the whole gateway
+    fleet. Default-scope callers (``gateway status``, cron checks) see only the
+    current profile's exact systemd unit or launchd label; update/reaper paths
+    pass ``all_profiles=True`` when they need fleet-wide protection.
     """
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
-    # systemd always lists every hermes-gateway* unit regardless of scope.
     if supports_systemd_services():
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
-                result = subprocess.run(
-                    scope_args
-                    + [
-                        "list-units",
-                        "hermes-gateway*",
-                        "--plain",
-                        "--no-legend",
-                        "--no-pager",
-                    ],
-                    capture_output=True,
-                    text=True, encoding='utf-8', errors='replace',
-                    timeout=5,
-                )
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if not parts or not parts[0].endswith(".service"):
-                        continue
-                    svc = parts[0]
+                if all_profiles:
+                    result = subprocess.run(
+                        scope_args
+                        + [
+                            "list-units",
+                            "hermes-gateway*",
+                            "--plain",
+                            "--no-legend",
+                            "--no-pager",
+                        ],
+                        capture_output=True,
+                        text=True, encoding='utf-8', errors='replace',
+                        timeout=5,
+                    )
+                    services = [
+                        parts[0]
+                        for line in result.stdout.strip().splitlines()
+                        if (parts := line.split()) and parts[0].endswith(".service")
+                    ]
+                else:
+                    services = [f"{get_service_name()}.service"]
+
+                for svc in services:
                     try:
                         show = subprocess.run(
                             scope_args + ["show", svc, "--property=MainPID", "--value"],
@@ -1598,10 +1597,9 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
 
     from hermes_constants import is_container
 
-    if is_linux() and is_container():
+    containerized = is_linux() and is_container()
+    if containerized:
         # Phase 4: report s6 supervision when running under our /init.
-        # Other container runtimes (or containers built before Phase 2)
-        # still get the original "docker (foreground)" label.
         try:
             from hermes_cli.service_manager import detect_service_manager, get_service_manager
             if detect_service_manager() == "s6":
@@ -1629,21 +1627,28 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
                     service_scope="s6",
                 )
         except Exception:
-            pass  # Fall through to the legacy label on any detection error.
-        return GatewayRuntimeSnapshot(
-            manager="docker (foreground)",
-            gateway_pids=gateway_pids,
-        )
+            pass
 
     if supports_systemd_services():
         selected_system, service_running = _probe_systemd_service_running(system=system)
-        scope_label = _service_scope_label(selected_system)
+        unit_path = get_systemd_unit_path(system=selected_system)
+        service_installed = unit_path.exists()
+        # A containerized host can still run a real systemd user manager. Prefer
+        # that concrete installed service over the generic foreground label.
+        if service_installed or not containerized:
+            scope_label = _service_scope_label(selected_system)
+            return GatewayRuntimeSnapshot(
+                manager=f"systemd ({scope_label})",
+                service_installed=service_installed,
+                service_running=service_running,
+                gateway_pids=gateway_pids,
+                service_scope=scope_label,
+            )
+
+    if containerized:
         return GatewayRuntimeSnapshot(
-            manager=f"systemd ({scope_label})",
-            service_installed=get_systemd_unit_path(system=selected_system).exists(),
-            service_running=service_running,
+            manager="docker (foreground)",
             gateway_pids=gateway_pids,
-            service_scope=scope_label,
         )
 
     if is_macos():
@@ -2337,11 +2342,24 @@ def get_service_name() -> str:
     return f"{_SERVICE_BASE}-{suffix}"
 
 
+def _get_real_user_home_path() -> Path:
+    """Return the OS home without trusting a profile-isolated ``HOME``."""
+    try:
+        from hermes_constants import get_real_home
+    except ImportError:
+        # Update-boundary: the running process may have cached an older
+        # hermes_constants module while the checkout has already advanced.
+        from hermes_cli.managed_uv import _reload_hermes_constants
+
+        get_real_home = _reload_hermes_constants().get_real_home
+    return Path(get_real_home())
+
+
 def get_systemd_unit_path(system: bool = False) -> Path:
     name = get_service_name()
     if system:
         return Path("/etc/systemd/system") / f"{name}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+    return _get_real_user_home_path() / ".config" / "systemd" / "user" / f"{name}.service"
 
 
 class UserSystemdUnavailableError(RuntimeError):
@@ -2653,7 +2671,7 @@ def _legacy_unit_search_paths() -> list[tuple[bool, Path]]:
     real filesystem paths.
     """
     return [
-        (False, Path.home() / ".config" / "systemd" / "user"),
+        (False, _get_real_user_home_path() / ".config" / "systemd" / "user"),
         (True, Path("/etc/systemd/system")),
     ]
 
@@ -3601,7 +3619,7 @@ WantedBy=multi-user.target
         hermes_home
     )
     profile_arg = _profile_arg(hermes_home)
-    path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
+    path_entries.extend(_build_user_local_paths(_get_real_user_home_path(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend(common_bin_paths)
     sane_path = ":".join(path_entries)
