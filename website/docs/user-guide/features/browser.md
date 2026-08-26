@@ -503,6 +503,8 @@ Navigate to a URL. Must be called before any other browser tool. Initializes the
 Navigate to https://github.com/NousResearch
 ```
 
+Optional argument `local_browser: true` — run this navigation in a local session on your real browser profile even when a cloud provider is configured. Only honoured when `browser.use_real_profile` is on (see [Real Browser Profile](#real-browser-profile-consent-gated)); otherwise ignored with a `note` in the result.
+
 :::tip
 For simple information retrieval, prefer `web_search` or `web_extract` — they are faster and cheaper. Use browser tools when you need to **interact** with a page (click buttons, fill forms, handle dynamic content).
 :::
@@ -729,6 +731,38 @@ Headed mode does two things:
 2. **Keeps the window open between turns.** Normally the browser session is cleaned up after every agent reply; in headed mode the per-turn cleanup is skipped so you can watch the agent work, intervene manually (sign-in challenges, CAPTCHAs), and keep login state warm across the conversation.
 
 Idle sessions are still reaped after `browser.inactivity_timeout` (default 120s of no browser activity), and all sessions are closed on shutdown. Headed mode only affects the local browser — cloud sessions (Browserbase) are unaffected.
+
+## Real Browser Profile (consent-gated)
+
+By default the local browser runs in a throwaway profile: no logins, no cookies, nothing shared with the browser you use yourself. You can opt in to driving your **real default Chromium profile** instead — its logins, cookies and history become available to the agent:
+
+```yaml
+browser:
+  use_real_profile: true  # default: false
+```
+
+The desktop app exposes the same switch under **Settings → Browser**. The setting is read on every launch, so turning it off takes effect immediately.
+
+What it does:
+
+- Every local Chromium launch — the built-in tools, and the local sidecar that hybrid routing spawns under a cloud provider — runs with `--profile <your default browser's user-data-dir>` and `--executable-path <that browser's binary>`.
+- The default browser is detected per OS (Windows `UserChoice`, macOS LaunchServices `https` handler, Linux `xdg-settings`). Only Chromium-family browsers are supported: Chrome, Edge, Brave, Chromium (native packages, snap and Flatpak on Linux).
+- The `browser_navigate` tool accepts `local_browser: true`. With consent on, it forces a local real-profile session for a public URL even when a cloud provider is configured. Private URLs still follow `auto_local_for_private_urls`; without consent the flag is ignored and the result carries a `note` saying so.
+- Navigation results that ran on the real profile include `"used_real_profile": true`.
+
+It fails closed — with a message naming the reason — when:
+
+- the default browser is not a Chromium-family browser (Firefox, Safari, Arc …) or cannot be determined (no `xdg-settings` on a headless box);
+- the profile directory or the browser binary cannot be located;
+- the profile is currently open in another Chromium process (your own browser, or another Hermes session — Chromium allows one process per profile directory, so close it first);
+- the default browser is **Google Chrome 136 or newer**. Since 136 branded Chrome refuses remote debugging on its default profile directory, and agent-browser needs remote debugging — the launch would hang instead of failing. Chromium and Brave builds do not enforce that block (Edge is untested), so the check only applies to Google Chrome;
+- `browser.engine` is `lightpanda` (agent-browser does not support profiles there).
+
+Caveats worth knowing:
+
+- This drives the live profile in place — the agent's cookies, history and site data land in your real browser profile.
+- agent-browser launches Chromium with a mock keychain, so cookies your browser encrypted with the OS keychain (macOS Keychain, GNOME Keyring / KWallet on Linux) may not decrypt inside the automated session. Windows (DPAPI) is unaffected.
+- With consent on, any page the agent visits sees your logged-in state. This is a convenience, not an isolation boundary — treat it like handing someone your browser.
 
 ## Stealth Features
 

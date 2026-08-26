@@ -3561,17 +3561,24 @@ def browser_navigate(url: str, task_id: Optional[str] = None, local_browser: boo
     if local_browser and not _use_real_profile():
         real_profile_note = (
             "local_browser was requested but browser.use_real_profile is off; "
-            "using the default browser backend. Enable real-profile browsing in "
-            "Settings → Browser to honor this."
+            "using the default browser backend. Set browser.use_real_profile: "
+            "true in config.yaml (desktop app: Settings → Browser) to honor this."
         )
     nav_session_key = _navigation_session_key(
         effective_task_id, url, local_browser=local_browser
     )
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
+    def _failure(payload: Dict[str, Any]) -> str:
+        # The consent-off note matters most on the failures it explains
+        # (blocked private URL, launch error); never lose it there.
+        if real_profile_note:
+            payload["note"] = real_profile_note
+        return json.dumps(payload, ensure_ascii=False)
+
     sensitive_query_key = _sensitive_query_param_name(url)
     if sensitive_query_key and not _is_local_backend() and not auto_local_this_nav:
-        return json.dumps({
+        return _failure({
             "success": False,
             "error": (
                 "Blocked: URL contains a credential-like query parameter "
@@ -3602,7 +3609,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None, local_browser: boo
         and not _allow_private_urls()
         and not _is_safe_url(url)
     ):
-        return json.dumps({
+        return _failure({
             "success": False,
             "error": "Blocked: URL targets a private or internal address",
         })
@@ -3692,6 +3699,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None, local_browser: boo
         }
         if real_profile_note:
             response["note"] = real_profile_note
+        # Audit trail: a local session under consent ran on the real profile
+        # (the launch would have failed closed otherwise). Cloud/CDP sessions
+        # never do.
+        if not session_info.get("cdp_url") and _use_real_profile():
+            response["used_real_profile"] = True
         # Remember only a successful, non-blocked navigation as the task owner.
         # Failed opens and blocked redirects must not retarget follow-up clicks
         # or snapshots to a newly-created but irrelevant session.
@@ -3747,10 +3759,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None, local_browser: boo
 
         return json.dumps(response, ensure_ascii=False)
     else:
-        return json.dumps({
+        return _failure({
             "success": False,
             "error": result.get("error", "Navigation failed")
-        }, ensure_ascii=False)
+        })
 
 
 def browser_snapshot(

@@ -347,6 +347,95 @@ class TestRunBrowserCommandInjection:
         assert cmd is None
 
 
+class TestBrowserNavigateAudit:
+    """Navigation results say when they ran on the real profile, and the
+    consent-off note survives failures — the cases it actually explains."""
+
+    def _wire(self, monkeypatch, *, session, open_result, consent, local_backend=True):
+        import json
+        import tools.browser_tool as bt
+
+        def fake_run(task_id, command, args, timeout=None):
+            if command == "open":
+                return open_result
+            return {"success": True, "data": {}}
+
+        monkeypatch.setattr(bt, "_run_browser_command", fake_run)
+        monkeypatch.setattr(bt, "_get_session_info", lambda key: session)
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_is_local_backend", lambda: local_backend)
+        monkeypatch.setattr(bt, "_is_local_sidecar_key", lambda key: False)
+        monkeypatch.setattr(
+            bt, "_navigation_session_key", lambda task_id, url, local_browser=False: task_id
+        )
+        monkeypatch.setattr(bt, "_maybe_start_recording", lambda *a, **kw: None)
+        monkeypatch.setattr(bt, "check_website_access", lambda url: None)
+        monkeypatch.setattr(bt, "_use_real_profile", lambda: consent)
+        monkeypatch.setattr(bt, "_last_active_session_key", {})
+        return bt, json
+
+    def test_local_session_under_consent_is_stamped(self, monkeypatch):
+        bt, json = self._wire(
+            monkeypatch,
+            session={"_first_nav": True, "features": {}},
+            open_result={"success": True, "data": {"title": "t", "url": "https://example.com"}},
+            consent=True,
+        )
+        out = json.loads(bt.browser_navigate("https://example.com", task_id="t1"))
+        assert out["success"] is True
+        assert out["used_real_profile"] is True
+
+    def test_cloud_session_is_never_stamped(self, monkeypatch):
+        bt, json = self._wire(
+            monkeypatch,
+            session={"_first_nav": True, "features": {}, "cdp_url": "wss://cloud"},
+            open_result={"success": True, "data": {"title": "t", "url": "https://example.com"}},
+            consent=True,
+        )
+        out = json.loads(bt.browser_navigate("https://example.com", task_id="t1"))
+        assert "used_real_profile" not in out
+
+    def test_no_consent_means_no_stamp(self, monkeypatch):
+        bt, json = self._wire(
+            monkeypatch,
+            session={"_first_nav": True, "features": {}},
+            open_result={"success": True, "data": {"title": "t", "url": "https://example.com"}},
+            consent=False,
+        )
+        out = json.loads(bt.browser_navigate("https://example.com", task_id="t1"))
+        assert "used_real_profile" not in out
+
+    def test_consent_off_note_survives_open_failure(self, monkeypatch):
+        bt, json = self._wire(
+            monkeypatch,
+            session={"_first_nav": True, "features": {}},
+            open_result={"success": False, "error": "boom"},
+            consent=False,
+        )
+        out = json.loads(bt.browser_navigate("https://example.com", task_id="t1", local_browser=True))
+        assert out == {
+            "success": False,
+            "error": "boom",
+            "note": out["note"],
+        }
+        assert "use_real_profile is off" in out["note"]
+
+    def test_consent_off_note_survives_private_url_block(self, monkeypatch):
+        bt, json = self._wire(
+            monkeypatch,
+            session={"_first_nav": True, "features": {}},
+            open_result={"success": True, "data": {}},
+            consent=False,
+            local_backend=False,
+        )
+        monkeypatch.setattr(bt, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(bt, "_is_safe_url", lambda url: False)
+        out = json.loads(bt.browser_navigate("http://192.168.1.1/admin", task_id="t1", local_browser=True))
+        assert out["success"] is False
+        assert "private or internal address" in out["error"]
+        assert "use_real_profile is off" in out["note"]
+
+
 class TestLocalBrowserRouting:
     def _reset(self):
         import tools.browser_tool as bt
