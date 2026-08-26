@@ -7,7 +7,7 @@ from the same session and aggregate them before dispatching.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -63,6 +63,70 @@ def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
 
 
 class TestTextBatching:
+    @staticmethod
+    def _rich_message():
+        return SimpleNamespace(
+            text=None,
+            api_kwargs={
+                "rich_message": {
+                    "blocks": [
+                        {"type": "paragraph", "text": "Production path:"},
+                        {
+                            "type": "list",
+                            "items": [
+                                {
+                                    "label": "1.",
+                                    "blocks": [
+                                        {"type": "paragraph", "text": "Try normal PageIndex."}
+                                    ],
+                                },
+                                {
+                                    "label": "2.",
+                                    "blocks": [
+                                        {"type": "paragraph", "text": "Fall back to AnyDoc."}
+                                    ],
+                                },
+                            ],
+                        },
+                    ]
+                }
+            },
+        )
+
+    def test_registered_text_handler_accepts_inbound_rich_message(self):
+        """PTB's TEXT filter misses rich-only updates; Hermes must match them."""
+        adapter = _make_adapter()
+        app = SimpleNamespace(handlers=[], add_handler=lambda handler, **_: app.handlers.append(handler))
+
+        adapter._register_handlers(app)
+
+        update = SimpleNamespace(effective_message=self._rich_message())
+        assert app.handlers[0].check_update(update)
+
+    @pytest.mark.asyncio
+    async def test_inbound_rich_message_is_flattened_and_enqueued(self):
+        """A rich-only paste reaches the ordinary batching pipeline as text."""
+        adapter = _make_adapter()
+        message = self._rich_message()
+        adapter._is_user_authorized_from_message = lambda _: True
+        adapter._should_process_message = lambda _: True
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._build_message_event = lambda *_, **__: _make_event("")
+        adapter._clean_bot_trigger_text = lambda text: text
+        adapter._cache_replied_media = AsyncMock()
+        adapter._apply_telegram_group_observe_attribution = lambda event: event
+        adapter._enqueue_text_event = MagicMock()
+        update = SimpleNamespace(effective_message=message, message=message, update_id=77)
+
+        await adapter._handle_text_message(update, None)
+
+        event = adapter._enqueue_text_event.call_args.args[0]
+        assert event.text == (
+            "Production path:\n"
+            "1. Try normal PageIndex.\n"
+            "2. Fall back to AnyDoc."
+        )
+
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_adapter()

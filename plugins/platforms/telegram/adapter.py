@@ -252,6 +252,25 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 
+
+def _telegram_message_has_rich_text(message: Any) -> bool:
+    """Return whether PTB preserved an inbound Bot API rich-message body.
+
+    Bot API rich messages are currently exposed by PTB as unknown fields in
+    ``Message.api_kwargs`` rather than as ``Message.text``. Consequently the
+    stock ``filters.TEXT`` filter does not match them.
+    """
+    try:
+        api_kwargs = getattr(message, "api_kwargs", None)
+        getter = getattr(api_kwargs, "get", None)
+        if not callable(getter):
+            return False
+        rich_message = getter("rich_message")
+        rich_getter = getattr(rich_message, "get", None)
+        return callable(rich_getter) and isinstance(rich_getter("blocks"), list)
+    except Exception:
+        return False
+
 def _coerce_duration_seconds(value: Any) -> Optional[int]:
     """Round a raw length to whole positive seconds, or None if unusable."""
     try:
@@ -4341,8 +4360,13 @@ class TelegramAdapter(BasePlatformAdapter):
         the ``gateway_platform_event`` observer (group 99) in lockstep with the
         core handlers.
         """
+        class _InboundRichTextFilter(filters.MessageFilter):
+            def filter(self, message: Message) -> bool:
+                return _telegram_message_has_rich_text(message)
+
+        inbound_text = filters.TEXT | _InboundRichTextFilter()
         app.add_handler(TelegramMessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            inbound_text & ~filters.COMMAND,
             self._handle_text_message
         ))
         app.add_handler(TelegramMessageHandler(
@@ -9666,7 +9690,10 @@ class TelegramAdapter(BasePlatformAdapter):
         them into a single MessageEvent before dispatching.
         """
         msg = self._effective_update_message(update)
-        if not msg or not msg.text:
+        if not msg:
+            return
+        inbound_text = self._extract_inbound_message_text(msg)
+        if not inbound_text:
             return
         # Early user-level auth check: reject unauthorized users before any
         # text batching, observe-buffer persistence, event building, or response
@@ -9686,6 +9713,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = inbound_text
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -10513,6 +10541,25 @@ class TelegramAdapter(BasePlatformAdapter):
                 lines.extend(text.splitlines())
 
         return "\n".join(line.rstrip() for line in lines if line)
+
+    @classmethod
+    def _extract_inbound_message_text(cls, message: Any) -> str:
+        """Extract normal or Bot API rich text from an inbound message."""
+        text = getattr(message, "text", None)
+        if text:
+            return text
+        try:
+            api_kwargs = getattr(message, "api_kwargs", None)
+            getter = getattr(api_kwargs, "get", None)
+            if not callable(getter):
+                return ""
+            rich_message = getter("rich_message")
+            rich_getter = getattr(rich_message, "get", None)
+            if not callable(rich_getter):
+                return ""
+            return cls._flatten_rich_blocks(rich_getter("blocks")).strip()
+        except Exception:
+            return ""
 
     @classmethod
     def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
