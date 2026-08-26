@@ -151,8 +151,10 @@ class TestDurableFactPersistence:
             < body.index("\n2b.")
         )
         # Memory persistence names its explicit tool parameters; dropping
-        # them loses the add/replace semantics the guidance depends on.
+        # either loses the add/replace update semantics the guidance
+        # depends on — pin both, not just the common case.
         assert 'action="add"' in prompt
+        assert '"replace"' in prompt
 
 
 class TestLearnRegistryWiring:
