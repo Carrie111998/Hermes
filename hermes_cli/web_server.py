@@ -7194,7 +7194,7 @@ def get_model_info(profile: Optional[str] = None):
     """
     try:
         with _profile_scope(profile):
-            cfg = read_raw_config()
+            cfg = load_config()
         model_cfg = cfg.get("model", "")
 
         # Extract model name and provider from the config
@@ -17729,7 +17729,7 @@ def _render_active_theme_bootstrap_css() -> str:
     before paint, so no shim is needed for them.
     """
     try:
-        config = read_raw_config()
+        config = load_config()
         active = cfg_get(config, "dashboard", "theme", default="default")
         if not active or not isinstance(active, str):
             return ""
