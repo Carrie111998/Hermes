@@ -202,7 +202,7 @@ export function installZoomReassertOnNavigation(webContents, reassert) {
  * Extracted so the "helper windows opt out, everything else opts in" contract is
  * unit-testable without booting a BrowserWindow or reading source.
  */
-export const ZOOM_WINDOW_CONFIG = {
+const ZOOM_WINDOW_CONFIG = {
   chat: { zoom: true },
   petOverlay: { zoom: false },
   quickEntry: { zoom: false },

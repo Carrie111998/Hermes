@@ -530,7 +530,6 @@ export function ModelCatalogMenu({
 }
 
 /** Re-exported so callers building a footer row match the catalog's rows. */
-export { dropdownMenuRow }
 
 // Collapsed we show the user's chosen models (or the curated default); typing
 // spans every available model so anything is reachable past the cut. A search

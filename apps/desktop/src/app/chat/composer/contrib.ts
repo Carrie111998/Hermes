@@ -72,7 +72,7 @@ export interface ComposerAtCompletionSource {
   provide: (query: string) => ComposerAtCompletionItem[]
 }
 
-export interface ComposerAttachmentContext {
+interface ComposerAttachmentContext {
   insertText: (text: string) => void
 }
 

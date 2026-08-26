@@ -275,7 +275,7 @@ function TileChat({
   )
 }
 
-export function SessionTilePane({ storedSessionId }: { storedSessionId: string }) {
+function SessionTilePane({ storedSessionId }: { storedSessionId: string }) {
   const tiles = useStore($sessionTiles)
   const tile = tiles.find(t => t.storedSessionId === storedSessionId)
   const ownerRoute = tile?.ownerRoute
@@ -432,7 +432,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
  *  the paginated recents page, so it has no `$sessions` row at all until new
  *  activity lands it there — resolving through the tree keeps its tab titled
  *  and tinted instead of a grey "Session" placeholder. */
-export function tileStoredRow(storedSessionId: string): SessionInfo | undefined {
+function tileStoredRow(storedSessionId: string): SessionInfo | undefined {
   const match = (s: SessionInfo) => sessionMatchesStoredId(s, storedSessionId)
 
   return (
@@ -476,7 +476,7 @@ const $confirmCloseTile = atom<null | string>(null)
 
 /** The tile closer, gated: a quiet session closes immediately; a busy or
  *  input-blocked one asks first. One state read — the tile's runtime slice. */
-export function requestCloseSessionTile(storedSessionId: string): void {
+function requestCloseSessionTile(storedSessionId: string): void {
   const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
   const state = runtimeId ? $sessionStates.get()[runtimeId] : undefined
 
@@ -568,7 +568,7 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
  *  gets, targeted through the tile delegate (whose verbs are generic over
  *  stored ids, primary included). The wrapper stops the contextmenu from also
  *  opening the zone strip's menu. Shared by tile tabs AND the main tab. */
-export function SessionTabMenu({
+function SessionTabMenu({
   children,
   onClose,
   onHideTabBar,

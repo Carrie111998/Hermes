@@ -1401,7 +1401,6 @@ let remoteHeaderRulesInstalled = false
 const remoteWsHeadersByUrl = new Map<string, Record<string, string>>()
 const hermesLog = []
 const previewWatchers = new Map()
-let previewShortcutActive = false
 let desktopLogBuffer = ''
 let desktopLogFlushTimer = null
 let desktopLogFlushPromise = Promise.resolve()
@@ -4059,7 +4058,7 @@ function preflightStateDb(hermesHome, rememberLog) {
 // .hermes-update-result.json for the relaunched Desktop to surface. It shows
 // its own tiny shim window (or nothing, headless) — this process only needs
 // to leave. Checkouts that predate the script get the manual card once.
-async function applyUpdatesPosixHandoff(opts: any) {
+async function applyUpdatesPosixHandoff(_opts: any) {
   const updateRoot = resolveUpdateRoot()
   const handoff = resolvePosixScriptHandoff(updateRoot)
 
@@ -13972,10 +13971,6 @@ ipcMain.handle('hermes:profile:set', async (_event, name) => {
   return { profile: next }
 })
 
-ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
-  previewShortcutActive = Boolean(active)
-})
-
 ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
   if (!IS_MAC || typeof systemPreferences.askForMediaAccess !== 'function') {
     return true
@@ -15321,8 +15316,6 @@ const terminalIpc = registerTerminalIpc({
   ensureBackend: () => ensureBackend(primaryProfileKey()),
   getSshConnectionState: scope => sshConnections.get(scope)
 })
-
-const disposeTerminalSession = terminalIpc.disposeTerminalSession
 
 ipcMain.handle('hermes:updates:check', async () =>
   checkUpdates().catch(error => ({

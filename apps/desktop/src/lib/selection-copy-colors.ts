@@ -29,13 +29,6 @@ const RGB_FN_RE = /rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*(?
 const SRGB_FN_RE = /^color\(\s*srgb\s+([\d.]+%?)\s+([\d.]+%?)\s+([\d.]+%?)(?:\s*[/\s]+\s*([\d.%]+))?\s*\)$/i
 const HEX_RE = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i
 
-/** Parse one component: percentage or 0–255 integer. */
-const channelValue = (raw: string): number => {
-  const v = raw.trim()
-
-  return v.endsWith('%') ? (Number.parseFloat(v) / 100) * 255 : Number.parseFloat(v)
-}
-
 /** color(srgb …) components are 0–1 floats (or percentages), not 0–255. */
 const srgbChannelValue = (raw: string): number => {
   const v = raw.trim()

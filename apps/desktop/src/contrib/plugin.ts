@@ -15,14 +15,17 @@
 import { pluginRest, type PluginRestOptions, pluginSocket } from '@/hermes'
 import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
-import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
+import {
+  dispatchPluginNativeNotification,
+  type PluginNativeNotificationInput,
+  type PluginNotificationAction
+} from '@/store/native-notifications'
 
 import { registry } from './registry'
 import type { Contribution } from './types'
 
 export type { PluginRestOptions } from '@/hermes'
-export type { HermesOpenTarget } from '@/lib/hermes-open-target'
-export type { PluginNativeNotificationInput, PluginNotificationAction } from '@/store/native-notifications'
+export type { PluginNativeNotificationInput, PluginNotificationAction }
 
 /** A contribution as a plugin author writes it — provenance + id scoping are
  *  the host's job, so those fields are off-limits here. */

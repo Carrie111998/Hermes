@@ -6,13 +6,11 @@ export {
   chatMessageText,
   collectUnspokenTurnSpeech,
   completeOpenTimelineParts,
-  dedupeRepeatedTextInParts,
   mergeFinalAssistantText,
   reasoningPart,
   renderMediaTags,
   textPart
 } from './parts'
-export type { UnspokenTurnSpeech } from './parts'
 export { branchGroupForUser, preserveLocalAssistantErrors } from './reconciliation'
 export {
   restorePendingClarifyToolCall,

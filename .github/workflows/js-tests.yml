@@ -81,3 +81,11 @@ jobs:
       # nothing.
       - name: Run all workspace checks
         run: node .github/scripts/run-workspace-checks.mjs
+
+      - name: Unused files, exports and dependencies (knip)
+        # Advisory only: sdk/index.ts's exports are the plugin SDK's public
+        # surface, invisible to knip's static analysis (no in-repo importer),
+        # and knip.config doesn't mute export-level checks there yet the way
+        # it does for the vendored shadcn/ink trees. Blocking on this today
+        # would fail every PR on that false-positive alone.
+        run: npm run lint:unused || true

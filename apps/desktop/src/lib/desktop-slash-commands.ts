@@ -1,4 +1,4 @@
-export interface CommandsCatalogSection {
+interface CommandsCatalogSection {
   name: string
   pairs: [string, string][]
 }
@@ -16,7 +16,7 @@ export interface CommandsCatalogLike {
  * Absent on older backends — every helper below degrades to "no ranking,
  * hide nothing".
  */
-export interface SkillCatalogEntry {
+interface SkillCatalogEntry {
   /** Where the skill came from; matches `/api/skills` provenance ('agent' = 'local'). */
   origin?: 'bundled' | 'hub' | 'local'
   /** Observed activity (use + view + patch) — the same number Capabilities shows. */
@@ -100,7 +100,7 @@ export type DesktopCommandSurface =
  * the typed arg, and the canonical command name so handlers can construct
  * the exact JSON the gateway method expects.
  */
-export interface SlashCommandBuildCtx {
+interface SlashCommandBuildCtx {
   arg: string
   command: string
   name: string
@@ -413,7 +413,7 @@ function normalizeCommand(command: string): string {
   return base
 }
 
-export function canonicalDesktopSlashCommand(command: string): string {
+function canonicalDesktopSlashCommand(command: string): string {
   const normalized = normalizeCommand(command)
 
   return ALIAS_TO_CANONICAL.get(normalized) || normalized
