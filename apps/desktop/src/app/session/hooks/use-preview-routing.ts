@@ -1,5 +1,6 @@
 import { useCallback } from 'react'
 
+import { isPreviewTileVisible } from '@/app/chat/preview-tile'
 import { gatewayEventCompletedFileDiff } from '@/lib/gateway-events'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
@@ -83,27 +84,63 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         // session that is NOT visible anywhere still can't yank the pane
         // open (offer, don't hijack). Routes through the same normalizer as
         // the file browser so URLs, localhost, and file paths all resolve.
-        const { url, label } = asRecord(event.payload)
+        const { url, label, request_id: requestIdValue } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
+        const requestId = typeof requestIdValue === 'string' ? requestIdValue : ''
 
-        if (target && (!event.session_id || sessionIsOnScreen(event.session_id))) {
-          void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(
-            async resolved => {
-              if (!resolved) {
-                return
-              }
-
-              const trimmedLabel = typeof label === 'string' ? label.trim() : ''
-              // The agent's loopback is the GATEWAY's loopback. Give the pane a
-              // URL this machine can load, keeping the original as the label so
-              // the user still sees the address the agent named.
-              const url = resolved.kind === 'url' ? await reachablePreviewUrl(resolved.url) : resolved.url
-              const reached = url === resolved.url ? resolved : { ...resolved, label: resolved.label || target, url }
-
-              openPreview(trimmedLabel ? { ...reached, label: trimmedLabel } : reached, 'tool-result')
-            }
-          )
+        const answer = (result: Record<string, unknown>) => {
+          if (requestId) {
+            void requestGateway('preview.open.respond', {
+              request_id: requestId,
+              text: JSON.stringify(result)
+            }).catch(() => undefined)
+          }
         }
+
+        if (!target) {
+          answer({ error: 'The preview target was empty.', success: false })
+
+          return
+        }
+
+        if (event.session_id && !sessionIsOnScreen(event.session_id)) {
+          answer({ error: 'The requesting session is not visible in this window.', success: false })
+
+          return
+        }
+        void (async () => {
+          try {
+            const resolved = await normalizeOrLocalPreviewTarget(
+              target,
+              $currentCwd.get() || currentCwd || undefined
+            )
+
+            if (!resolved) {
+              answer({ error: 'The preview target could not be resolved.', success: false })
+
+              return
+            }
+
+            const trimmedLabel = typeof label === 'string' ? label.trim() : ''
+            // The agent's loopback is the GATEWAY's loopback. Give the pane a
+            // URL this machine can load, keeping the original as the label so
+            // the user still sees the address the agent named.
+            const url = resolved.kind === 'url' ? await reachablePreviewUrl(resolved.url) : resolved.url
+            const reached = url === resolved.url ? resolved : { ...resolved, label: resolved.label || target, url }
+            const tabId = openPreview(trimmedLabel ? { ...reached, label: trimmedLabel } : reached, 'tool-result')
+
+            answer(
+              isPreviewTileVisible(tabId)
+                ? { success: true, tab_id: tabId, url }
+                : { error: 'The preview tab opened, but its pane did not become visible.', success: false }
+            )
+          } catch (error) {
+            answer({
+              error: error instanceof Error ? error.message : String(error),
+              success: false
+            })
+          }
+        })()
 
         return
       }
@@ -173,7 +210,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         requestPreviewReload()
       }
     },
-    [baseHandleGatewayEvent, currentCwd]
+    [baseHandleGatewayEvent, currentCwd, requestGateway]
   )
 
   return { handleDesktopGatewayEvent, restartPreviewServer }

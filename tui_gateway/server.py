@@ -4096,6 +4096,7 @@ def _block(
         "sudo.request",
         "clarify.request",
         "terminal.read.request",
+        "preview.open",
         "preview.read.request",
         "preview.act.request",
         "window.read.request",
@@ -11144,6 +11145,14 @@ def _wire_desktop_ui() -> None:
         return
 
     desktop_ui.set_emitter(lambda sid, event, payload: _emit(event, sid, payload))
+    desktop_ui.set_requester(
+        lambda sid, event, payload, timeout: _block(
+            event,
+            sid,
+            dict(payload),
+            timeout=timeout,
+        )
+    )
     _desktop_ui_wired = True
 
 

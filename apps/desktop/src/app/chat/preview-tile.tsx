@@ -13,7 +13,13 @@
 import { useStore } from '@nanostores/react'
 
 import { findGroup } from '@/components/pane-shell/tree/model'
-import { $activeTreeGroup, $layoutTree, revealTreePane, treePanesWithPrefix } from '@/components/pane-shell/tree/store'
+import {
+  $activeTreeGroup,
+  $layoutTree,
+  isPaneVisible,
+  revealTreePane,
+  treePanesWithPrefix
+} from '@/components/pane-shell/tree/store'
 import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
@@ -172,6 +178,9 @@ function PreviewTabLead({ tabId }: { tabId: string }) {
 const PREVIEW_TILE_PREFIX = 'preview-tile'
 
 const previewPaneId = (tabId: string) => `${PREVIEW_TILE_PREFIX}:${tabId}`
+
+/** True only when the tab's real layout-tree pane is the visible stack slot. */
+export const isPreviewTileVisible = (tabId: string): boolean => isPaneVisible(previewPaneId(tabId))
 
 /** The pane a NEW preview tile should stack into: another preview tile already
  *  in the tree, else another open tab adopted earlier in the same pass (a

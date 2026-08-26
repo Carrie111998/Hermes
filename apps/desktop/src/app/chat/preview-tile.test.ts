@@ -8,13 +8,17 @@ vi.mock('./right-rail/preview-console-store', () => ({
   forgetPreviewConsole: () => undefined
 }))
 
+import { group } from '@/components/pane-shell/tree/model'
+import { $layoutTree, watchContributedPanes } from '@/components/pane-shell/tree/store'
 import { contributesToWorkspace } from '@/components/pane-shell/workspace-scope'
 import { registry } from '@/contrib/registry'
 import { $previewTabs, closeRightRail, noteBrowserPage, openPreview } from '@/store/preview'
 
-import { browserTabExternalUrl, browserTabLabel, watchPreviewTiles } from './preview-tile'
+import { browserTabExternalUrl, browserTabLabel, isPreviewTileVisible, watchPreviewTiles } from './preview-tile'
 
 beforeAll(() => {
+  $layoutTree.set(group(['workspace'], { active: 'workspace', id: 'grp-main' }))
+  watchContributedPanes()
   watchPreviewTiles()
 })
 
@@ -29,6 +33,15 @@ function browserPane() {
 }
 
 describe('preview tiles in Bot Mode', () => {
+  it('reports visible only after the real layout-tree pane is fronted', () => {
+    const tabId = openPreview(
+      { kind: 'url', label: 'example.com', source: 'https://example.com', url: 'https://example.com' },
+      'tool-result'
+    )
+
+    expect(isPreviewTileVisible(tabId)).toBe(true)
+  })
+
   it('registers the in-app Browser as a global pane so Bot Mode can show it', () => {
     openPreview(
       { kind: 'url', label: 'example.com', source: 'https://example.com', url: 'https://example.com' },

@@ -1538,6 +1538,14 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "text", allow_expired=True)
 
 
+@method("preview.open.respond")
+def _(rid, params: dict) -> dict:
+    # `text` confirms that the renderer normalized the target, registered its
+    # layout-tree pane, and made that pane visible. Older renderer bundles do
+    # not answer, so open_preview reports bundle skew instead of false success.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
 @method("preview.act.respond")
 def _(rid, params: dict) -> dict:
     # `text` is a JSON string with the interaction's outcome (drive_preview

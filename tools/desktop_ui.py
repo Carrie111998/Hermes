@@ -16,12 +16,20 @@ from gateway.session_context import get_session_env
 
 # (sid, event, payload) sink, installed by the desktop gateway.
 _emit: Optional[Callable[[str, str, dict], None]] = None
+# Blocking renderer round-trip, installed alongside the event sink.
+_request: Optional[Callable[[str, str, dict, float], str]] = None
 
 
 def set_emitter(fn: Optional[Callable[[str, str, dict], None]]) -> None:
     """Install (or clear) the renderer-event sink. Called by the desktop gateway."""
     global _emit
     _emit = fn
+
+
+def set_requester(fn: Optional[Callable[[str, str, dict, float], str]]) -> None:
+    """Install (or clear) the blocking renderer request bridge."""
+    global _request
+    _request = fn
 
 
 def available() -> bool:
@@ -38,3 +46,15 @@ def emit(event: str, payload: dict) -> bool:
         return False
     fn(get_session_env("HERMES_UI_SESSION_ID", ""), event, payload)
     return True
+
+
+def request(event: str, payload: dict, *, timeout: float) -> Optional[str]:
+    """Route an event and wait for the owning renderer's response.
+
+    Returns ``None`` when no desktop gateway installed the blocking bridge;
+    an empty string means a wired renderer did not answer before ``timeout``.
+    """
+    fn = _request
+    if fn is None:
+        return None
+    return fn(get_session_env("HERMES_UI_SESSION_ID", ""), event, payload, timeout)

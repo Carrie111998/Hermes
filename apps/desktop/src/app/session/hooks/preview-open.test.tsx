@@ -2,6 +2,14 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+const { isPreviewTileVisible } = vi.hoisted(() => ({
+  isPreviewTileVisible: vi.fn(() => true)
+}))
+
+vi.mock('@/app/chat/preview-tile', () => ({
+  isPreviewTileVisible
+}))
+
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
 import { $previewTabs, $previewTarget, closeRightRail, type PreviewTarget } from '@/store/preview'
 import { $activeSessionId, $currentCwd, $messages, $selectedStoredSessionId } from '@/store/session'
@@ -10,6 +18,13 @@ import type { RpcEvent } from '@/types/hermes'
 import { usePreviewRouting } from './use-preview-routing'
 
 const RUNTIME_SESSION_ID = '20260727_140707_edec2d'
+const requestGatewayMock = vi.fn()
+
+async function requestGateway<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+  requestGatewayMock(method, params)
+
+  return {} as T
+}
 
 function assistantMessage(id: string, text: string): ChatMessage {
   return { id, parts: [assistantTextPart(text)], role: 'assistant' }
@@ -25,7 +40,7 @@ function Harness() {
   const routing = usePreviewRouting({
     baseHandleGatewayEvent: vi.fn(),
     currentCwd: '/work',
-    requestGateway: vi.fn()
+    requestGateway
   })
 
   useEffect(() => {
@@ -39,6 +54,16 @@ async function emitPreviewOpen(url = '/tmp/artifact-test.html', sessionId = RUNT
   await act(async () => {
     handleEvent({
       payload: { label: 'hi bestie', url },
+      session_id: sessionId,
+      type: 'preview.open'
+    } as unknown as RpcEvent)
+  })
+}
+
+async function emitPreviewOpenRequest(url = '/tmp/artifact-test.html', sessionId = RUNTIME_SESSION_ID) {
+  await act(async () => {
+    handleEvent({
+      payload: { label: 'hi bestie', request_id: 'open-1', url },
       session_id: sessionId,
       type: 'preview.open'
     } as unknown as RpcEvent)
@@ -63,6 +88,8 @@ describe('preview routing', () => {
     $messages.set([])
     closeRightRail()
     window.localStorage.clear()
+    requestGatewayMock.mockClear()
+    isPreviewTileVisible.mockReturnValue(true)
 
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
@@ -93,6 +120,33 @@ describe('preview routing', () => {
 
       await waitFor(() => expect($previewTarget.get()?.path).toBe('/tmp/artifact-test.html'))
       expect($previewTabs.get()).toHaveLength(1)
+    })
+
+    it('acknowledges only after the requested preview tab becomes visible', async () => {
+      render(<Harness />)
+
+      await emitPreviewOpenRequest()
+
+      await waitFor(() =>
+        expect(requestGatewayMock).toHaveBeenCalledWith('preview.open.respond', {
+          request_id: 'open-1',
+          text: expect.stringContaining('"success":true') as string
+        })
+      )
+    })
+
+    it('rejects the request when the tab exists but its layout pane is not visible', async () => {
+      isPreviewTileVisible.mockReturnValue(false)
+      render(<Harness />)
+
+      await emitPreviewOpenRequest()
+
+      await waitFor(() =>
+        expect(requestGatewayMock).toHaveBeenCalledWith('preview.open.respond', {
+          request_id: 'open-1',
+          text: expect.stringContaining('"success":false') as string
+        })
+      )
     })
 
     it('keeps the tab when the stored session id arrives afterwards', async () => {

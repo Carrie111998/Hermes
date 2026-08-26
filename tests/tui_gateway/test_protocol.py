@@ -337,10 +337,11 @@ def test_sensitive_prompt_timeout_emits_expiry(capture, event):
         ("sudo.respond", "password"),
         ("clarify.respond", "answer"),
         ("terminal.read.respond", "text"),
+        ("preview.open.respond", "text"),
     ],
 )
 def test_late_prompt_response_is_idempotent(server, method, value_key):
-    """All four blocking bridges tolerate a late reply after their request has
+    """Blocking bridges tolerate a late reply after their request has
     expired — the `*.respond` returns a graceful `{"status": "expired"}` instead
     of the raw 4009 protocol error a client would otherwise surface verbatim."""
     response = server.handle_request(

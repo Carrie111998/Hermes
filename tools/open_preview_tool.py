@@ -34,7 +34,7 @@ def _normalize_target(raw: str) -> str:
 
 
 def open_preview_tool(url: str, label: str = "") -> str:
-    """Ask the desktop GUI to show ``url`` in the preview pane beside the chat."""
+    """Ask the desktop GUI to show ``url`` and confirm the pane became visible."""
     target = _normalize_target(url or "")
     if not target:
         return tool_error(
@@ -44,13 +44,33 @@ def open_preview_tool(url: str, label: str = "") -> str:
 
     label = (label or "").strip()
     try:
-        ok = desktop_ui.emit("preview.open", {"url": target, "label": label})
+        raw = desktop_ui.request(
+            "preview.open",
+            {"url": target, "label": label},
+            timeout=10,
+        )
     except Exception as exc:
         return tool_error(f"Failed to open the preview pane: {exc}")
-    if not ok:
+    if raw is None:
         return tool_error("The preview pane is only available in the Hermes desktop app.")
+    if not raw:
+        return tool_error(
+            "No Hermes Desktop window confirmed that the preview pane became visible. "
+            "The desktop renderer updates separately from the backend. Update the Hermes "
+            "Desktop app and start a new session."
+        )
 
-    return json.dumps({"success": True, "url": target, "label": label}, ensure_ascii=False)
+    try:
+        result = json.loads(raw)
+    except (TypeError, ValueError):
+        return tool_error("The Hermes Desktop window returned an invalid preview response.")
+
+    if not isinstance(result, dict):
+        return tool_error("The Hermes Desktop window returned an invalid preview response.")
+    if result.get("success") is not True:
+        return tool_error(str(result.get("error") or "The preview pane did not become visible."))
+
+    return json.dumps(result, ensure_ascii=False)
 
 
 OPEN_PREVIEW_SCHEMA = {
