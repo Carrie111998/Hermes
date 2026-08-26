@@ -68,13 +68,19 @@ def _resolve_timezone_name() -> str:
             try:
                 from hermes_cli import managed_scope
                 cfg = managed_scope.apply_managed_overlay(cfg)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "Failed to apply managed timezone overlay, using "
+                    "unmanaged config value: %s", exc,
+                )
             tz_cfg = cfg.get("timezone", "")
             if isinstance(tz_cfg, str) and tz_cfg.strip():
                 return tz_cfg.strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "Failed to read timezone from config.yaml, falling back to "
+            "server local time: %s", exc,
+        )
 
     return ""
 
