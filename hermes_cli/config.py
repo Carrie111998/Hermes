@@ -1180,7 +1180,11 @@ def _get_nested(config, dotted_key: str):
     """Return a dotted-path value from nested dict/list config data.
 
     Prefers existing literal keys spanning several segments (dotted model
-    IDs, #91607) so set/get round-trips resolve the same location.
+    IDs, #91607) so set/get round-trips resolve the same location.  When
+    both a literal multi-segment key (``"b.c"``) and a nested hierarchy
+    (``b → c``) exist, the longest literal key always wins.  A scalar
+    literal value resolves only when no segments remain after it, so it
+    can never swallow a path that still needs descending.
     """
     parts = _split_dotted_key(dotted_key)
     current = config
@@ -1198,6 +1202,13 @@ def _get_nested(config, dotted_key: str):
                 if consume < 2:
                     break
                 if literal in current:
+                    # A scalar resolves ONLY as the final literal match;
+                    # never let it swallow segments that still need
+                    # descending (keeps get/set/unset walkers aligned).
+                    if i + consume < len(parts) and not isinstance(
+                        current[literal], (dict, list)
+                    ):
+                        continue
                     current = current[literal]
                     i += consume
                     matched = True
@@ -1234,10 +1245,14 @@ def _unset_nested(config, dotted_key: str) -> bool:
             except (TypeError, ValueError):
                 return False
             try:
-                current = current[idx]
+                child = current[idx]
             except IndexError:
                 return False
+            # Record the CONTAINER before descending so empty-container
+            # pruning can pop this list slot later (the dict branches below
+            # follow the same container-first pairing).
             parents.append((current, part))
+            current = child
             i += 1
             continue
         if isinstance(current, dict):

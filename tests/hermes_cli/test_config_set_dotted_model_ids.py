@@ -125,3 +125,50 @@ def test_legacy_plain_paths_unchanged():
     _set_nested(cfg_list, "providers.1.name", "c")
     assert cfg_list["providers"][1]["name"] == "c"
     assert _get_nested(cfg_list, "providers.0.name") == "a"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Unset through lists: container-first parent pairing + pruning
+# (sweeper review on #91607 fix — parents must record the CONTAINER)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_unset_through_list_pops_empty_slot():
+    cfg = {"providers": [{"name": "a", "opts": {}}, {"name": "b"}]}
+    # Removing the last key inside providers[0].opts empties opts...
+    assert _unset_nested(cfg, "providers.0.opts") is True
+    assert _get_nested(cfg, "providers.0.opts") is _MISSING
+    # ...and pruning removes name too, the whole empty slot is popped.
+    assert _unset_nested(cfg, "providers.0.name") is True
+    assert cfg == {"providers": [{"name": "b"}]}
+
+
+def test_unset_through_list_chain_prunes_to_root_value():
+    cfg = {"deep": [{"inner": {"leaf": 1}}]}
+    assert _unset_nested(cfg, "deep.0.inner.leaf") is True
+    # leaf → inner pruned → slot 0 popped → deep becomes an empty list;
+    # user-authored empty lists are preserved, so only `deep` remains.
+    assert cfg == {"deep": []}
+
+
+def test_unset_through_list_keeps_nonempty_siblings():
+    cfg = {"routes": [{"path": "/x", "keep": 1}, {"path": "/y"}]}
+    assert _unset_nested(cfg, "routes.0.path") is True
+    assert cfg["routes"][0] == {"keep": 1}
+    assert len(cfg["routes"]) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Scalar literal keys: readable when final, never over-consuming
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_scalar_literal_key_readable_as_final_target():
+    cfg = {"x.y": 5}
+    assert _get_nested(cfg, "x.y") == 5
+
+
+def test_scalar_literal_key_does_not_swallow_descending_segments():
+    cfg = {"x.y": 5}
+    # x → y → z cannot resolve through a scalar; no over-consumption.
+    assert _get_nested(cfg, "x.y.z") is _MISSING
