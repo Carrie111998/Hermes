@@ -7,12 +7,12 @@ import signal
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 import hermes_cli.gateway as gateway
+from hermes_constants import venv_python_path
 
 
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
@@ -1194,10 +1194,19 @@ class TestGetPythonPathVenvMissingSurface:
         fails this contract."""
         venv_dir = tmp_path / "myvenv"
         venv_dir.mkdir()
-        missing = venv_dir / "Scripts" / "python.exe"
+        # Compute the expectation with the same helper the production code
+        # uses (``hermes_constants.venv_python_path`` via ``get_python_path``),
+        # so the assertion holds on both layouts — ``Scripts/python.exe`` on
+        # Windows and ``bin/python`` on POSIX. Hard-coding one layout here
+        # made this test fail on the other platform (#95233 review).
+        missing = venv_python_path(venv_dir, windows=gateway.is_windows())
         monkeypatch.setattr(gateway, "_detect_venv_dir", lambda: venv_dir)
         monkeypatch.setattr(sys, "executable", "/nope/sys/exec")
         with pytest.raises(RuntimeError) as excinfo:
             gateway.get_python_path()
-        # Windows path uses backslashes — accept either separator.
-        assert str(missing) in str(excinfo.value) or missing.as_posix() in str(excinfo.value)
+
+        assert str(missing) in str(excinfo.value)
+        # The same raise fires when the PROJECT_ROOT probe merely finds a
+        # stray/partial ``.venv``/``venv`` dir while running from a different
+        # interpreter — the message must warn about that possibility too.
+        assert "stray or partial" in str(excinfo.value)

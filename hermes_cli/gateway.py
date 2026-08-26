@@ -3404,8 +3404,12 @@ def get_python_path() -> str:
             f"``.hermes-runtime/python`` is gone; Hermes will NOT silently "
             f"fall back to {sys.executable} because doing so can open "
             f"state.db with a different SQLite version and corrupt the WAL "
-            f"(issue #95169). Repair the runtime: run ``hermes update`` or "
-            f"recreate the venv via ``scripts/install.ps1 -Stage venv``."
+            f"(issue #95169). This can also fire when the project-root probe "
+            f"merely found a stray or partial ``.venv``/``venv`` directory "
+            f"while Hermes runs from a different interpreter — if that "
+            f"directory is unrelated to your runtime, remove or repair it. "
+            f"Repair the runtime: run ``hermes update`` or recreate the venv "
+            f"via ``scripts/install.ps1 -Stage venv``."
         )
     return sys.executable
 
