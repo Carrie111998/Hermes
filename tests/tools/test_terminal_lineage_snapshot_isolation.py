@@ -19,6 +19,7 @@ from agent.delegation_context import (
     SCOPED_SUBPROCESS_ENV_MARKERS,
     delegated_child_context,
 )
+from gateway.session_context import _CRON_SESSION
 from tools.environments.local import LocalEnvironment
 
 
@@ -120,7 +121,7 @@ def test_current_lineage_wins_over_preexisting_poisoned_snapshot(
 ):
     """Per-call identity must survive while stale snapshot identity is discarded."""
     _clear_lineage_env(monkeypatch)
-    monkeypatch.setenv("HERMES_CRON_SESSION", "current-cron-session")
+    cron_token = _CRON_SESSION.set("current-cron-session")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "current-parent-task")
 
     env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
@@ -144,4 +145,5 @@ def test_current_lineage_wins_over_preexisting_poisoned_snapshot(
         assert observed["HERMES_KANBAN_TASK"] == "current-parent-task"
         _assert_snapshot_has_no_lineage(env)
     finally:
+        _CRON_SESSION.reset(cron_token)
         env.cleanup()
