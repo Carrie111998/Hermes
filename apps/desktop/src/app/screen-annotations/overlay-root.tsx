@@ -11,14 +11,23 @@ import { ScreenAnnotationsApp } from './annotations-app'
  * a minimal, transparent surface (no app shell, no gateway, no theme — the
  * marks use fixed screen-legible colors).
  *
- * The index.html boot script paints an OPAQUE themed background to avoid a
- * flash in normal windows; this overlay must be see-through, so we force every
- * host layer transparent with a late, high-specificity style tag (same trick
- * as the pet overlay).
+ * index.html skips the opaque anti-flash backing for this window kind (a
+ * full-display sheet painted #f7f7f7 is a white veil over the user's screen).
+ * styles.css still assigns `body` a themed background, so we also force every
+ * host layer transparent here — same trick as the pet overlay.
  */
 export function mountScreenAnnotations(): void {
+  // Drop the inline boot color too — a stylesheet `background` rule does not
+  // always beat `element.style.backgroundColor` on the first composite, and
+  // this window is the size of the display.
+  document.documentElement.style.backgroundColor = 'transparent'
+  if (document.body) {
+    document.body.style.backgroundColor = 'transparent'
+  }
+
   const style = document.createElement('style')
-  style.textContent = 'html,body,#root{background:transparent !important;}'
+  style.textContent =
+    'html,body,#root{background:transparent !important;background-color:transparent !important;}'
   document.head.appendChild(style)
 
   const root = document.getElementById('root')

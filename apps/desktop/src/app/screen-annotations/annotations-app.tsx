@@ -264,7 +264,17 @@ export function ScreenAnnotationsApp() {
           }
         `}
       </style>
-      <svg style={{ height: '100vh', left: 0, position: 'fixed', top: 0, width: '100vw' }}>
+      <svg
+        fill="none"
+        style={{
+          background: 'transparent',
+          height: '100vh',
+          left: 0,
+          position: 'fixed',
+          top: 0,
+          width: '100vw'
+        }}
+      >
         {shapes.map((shape, index) => (
           <g className={shape.steady ? undefined : 'hermes-annotation'} key={index}>
             <Shape shape={shape} />

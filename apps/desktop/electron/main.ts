@@ -11483,25 +11483,19 @@ const screenAnnotationsController = createScreenAnnotationsController({
 
 registerScreenAnnotationsIpc(screenAnnotationsController)
 
-// Live subtitles (subtitle_overlay tool): a hidden worker window samples the
-// subtitle band of the window behind Hermes, the backend OCRs + translates
-// changed frames, and the translation is painted through the annotation
-// overlay's `subtitles` channel. The agent only starts/stops the session; the
-// per-line loop never touches a model conversation.
+// Live subtitles (subtitle_overlay tool): periodic snapshots of the target
+// window's subtitle band, OCR + translation on the backend, painted through
+// the annotation overlay's `subtitles` channel. The agent only starts/stops
+// the session; the per-line loop never touches a model conversation.
 const subtitleCaptureController = createSubtitleCaptureController({
   annotations: screenAnnotationsController,
-  devServer: DEV_SERVER,
-  loadWindowUrl,
   log: rememberLog,
   postToBackend: async (path, body) => {
     const connection = await ensureBackend(undefined)
 
     return postJsonForBackend(connection, path, body)
   },
-  preloadPath: PRELOAD_PATH,
-  rendererIndex: resolveRendererIndex,
-  titlesAvailable: () => (IS_MAC ? systemPreferences.getMediaAccessStatus?.('screen') === 'granted' : true),
-  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('petOverlay'))
+  titlesAvailable: () => (IS_MAC ? systemPreferences.getMediaAccessStatus?.('screen') === 'granted' : true)
 })
 
 registerSubtitleCaptureIpc(subtitleCaptureController)

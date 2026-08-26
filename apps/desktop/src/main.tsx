@@ -53,8 +53,6 @@ if (winParam === 'overlay') {
   void import('./app/pet-overlay/overlay-root').then(({ mountPetOverlay }) => mountPetOverlay())
 } else if (winParam === 'annotate') {
   void import('./app/screen-annotations/overlay-root').then(({ mountScreenAnnotations }) => mountScreenAnnotations())
-} else if (winParam === 'subcap') {
-  void import('./app/subtitle-capture/capture-root').then(({ mountSubtitleCapture }) => mountSubtitleCapture())
 } else if (winParam === 'quick') {
   void import('./app/quick-entry/quick-entry-root').then(({ mountQuickEntry }) => mountQuickEntry())
 } else if (winParam === 'wake') {

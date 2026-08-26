@@ -5,6 +5,7 @@ import {
   bandFractions,
   clampBandFraction,
   clampSampleHz,
+  matchCapturerWindow,
   SUBTITLE_BAND_FRACTION_DEFAULT,
   SUBTITLE_SAMPLE_HZ_DEFAULT,
   subtitleBand,
@@ -142,5 +143,20 @@ describe('subtitleShapes', () => {
     expect(subtitleShapes({ ...PARAMS, text: '   ' })).toEqual([])
     expect(subtitleShapes({ ...PARAMS, box: { height: 0, width: 800, x: 0, y: 0 } })).toEqual([])
     expect(subtitleShapes({ ...PARAMS, cropWidth: 0 })).toEqual([])
+  })
+})
+
+describe('matchCapturerWindow', () => {
+  const sources = [
+    { id: 'window:99:0', name: 'Finder' },
+    { id: 'window:42:0', name: 'Netflix - Google Chrome' }
+  ]
+
+  it('matches Chromium window:<id>: prefix first', () => {
+    expect(matchCapturerWindow(sources, 42, { app: 'Chrome', title: 'Other' })?.id).toBe('window:42:0')
+  })
+
+  it('falls back to title substring when the id is unknown', () => {
+    expect(matchCapturerWindow(sources, 7, { app: 'Safari', title: 'Netflix' })?.id).toBe('window:42:0')
   })
 })

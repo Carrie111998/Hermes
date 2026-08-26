@@ -12,7 +12,7 @@ handles all of them without touching the conversation.
 
 Round-trips through the gateway's blocking-prompt bridge like ``tour`` and
 ``annotate_screen``: tui_gateway emits ``subtitles.control.request``, the
-desktop renderer asks its main process (which owns the capture worker and the
+desktop renderer asks its main process (which owns the snapshot loop and the
 overlay) and answers ``subtitles.control.respond`` with the outcome.
 
 Lives in the ``desktop_ui`` toolset, which the GUI gateway enables only for

@@ -1,9 +1,9 @@
 // subtitle-capture-session.ts — the live-subtitle session (Electron main).
 //
-// One session at a time: a hidden worker window screen-captures the display,
-// crops the subtitle band of the target window at a few Hz, and ships changed
-// crops here; main relays each crop to the backend (`/api/subtitles/process`,
-// OCR + translation) and paints the result over the original line through the
+// One session at a time: periodic window snapshots (not a persistent display
+// stream — that blanks DRM video in the player's own window), crop the
+// subtitle band, and ship changed crops to the backend (`/api/subtitles/process`).
+// Main paints the translation over the original line through the
 // screen-annotation overlay's `subtitles` channel. The agent starts and stops
 // the session; nothing in the per-line path touches a model conversation.
 //
@@ -13,43 +13,40 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
 
-import { app, BrowserWindow, desktopCapturer, ipcMain, screen, session, webContents } from 'electron'
+import { app, BrowserWindow, desktopCapturer, ipcMain, screen } from 'electron'
 
-import { attachRendererConsoleCapture } from './renderer-log'
 import { type AnnotationBounds, resolveAnnotationWindow } from './screen-annotations'
 import type { ScreenAnnotationsController } from './screen-annotations-window'
 import {
   bandFractions,
+  brightMaskHash,
   clampBandFraction,
   clampSampleHz,
+  cropRectFor,
+  hammingDistance,
+  matchCapturerWindow,
+  SAME_TEXT_MAX_DISTANCE,
+  shipSize,
   type SubtitleBandFractions,
   subtitleBand,
   subtitleShapes,
+  SUBTITLE_KEEPALIVE_MS,
   type SubtitleTextBox
 } from './subtitle-capture'
 import { type EnumeratedWindow, enumerateWindowsFrontToBack, enumerationFailed, enumerationFailureNote } from './window-below'
-import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 
 interface SubtitleCaptureOptions {
   annotations: ScreenAnnotationsController
-  devServer?: string
-  loadWindowUrl: (window: BrowserWindow, url: string, label: string) => void
   log: (message: string) => void
   /** Authenticated POST to the backend that owns OCR + translation. */
   postToBackend: (path: string, body: Record<string, unknown>) => Promise<Record<string, unknown>>
-  preloadPath: string
-  rendererIndex: () => string
   titlesAvailable: () => boolean
-  wireWindow: (window: BrowserWindow) => void
 }
 
 export interface SubtitleCaptureController {
   close(): void
   control(request: unknown, senderBounds: AnnotationBounds | null): Promise<Record<string, unknown>>
-  getRendererConfig(): Record<string, unknown> | null
-  onFrame(senderId: number, payload: unknown): void
 }
 
 interface SubtitleSession {
@@ -62,7 +59,9 @@ interface SubtitleSession {
   epoch: number
   fractions: SubtitleBandFractions
   language: string
+  lastHash: string
   lastLatencyMs: number
+  lastSentAt: number
   lastShapesAt: number
   lastSourceText: string
   linesDrawn: number
@@ -70,20 +69,14 @@ interface SubtitleSession {
   startedAt: number
   streamId: string
   targetSpec?: string
+  windowBounds: AnnotationBounds
   windowId: number
   windowRef: { app: string; title: string }
 }
 
-// The band follows the player: a moved/resized window re-anchors the crop, a
-// vanished one (2 consecutive misses, matching hud-game-overlay's tolerance
-// for transient enumeration failures) stops the session.
 const FOLLOW_INTERVAL_MS = 5000
 const FOLLOW_MISSES_BEFORE_STOP = 2
-
-// A backend that fails this many times in a row is not coming back this
-// session (dead OCR dep, unreachable remote); stop instead of spinning.
 const BACKEND_ERRORS_BEFORE_STOP = 5
-
 const SUPPORTED_ACTIONS = ['start', 'status', 'stop'] as const
 
 const asBounds = (value: unknown): AnnotationBounds | null => {
@@ -97,126 +90,33 @@ const asBounds = (value: unknown): AnnotationBounds | null => {
     : null
 }
 
-export function createSubtitleCaptureController(options: SubtitleCaptureOptions): SubtitleCaptureController {
-  const { annotations, devServer, loadWindowUrl, log, postToBackend, preloadPath, rendererIndex, titlesAvailable, wireWindow } = options
+/** Chromium NativeImage.toBitmap() is BGRA on little-endian; the hash wants RGBA. */
+const bgraToRgba = (bgra: Buffer, width: number, height: number): Uint8ClampedArray => {
+  const rgba = new Uint8ClampedArray(width * height * 4)
 
-  let captureWindow: BrowserWindow | null = null
+  for (let index = 0; index < width * height; index += 1) {
+    const offset = index * 4
+
+    rgba[offset] = bgra[offset + 2]
+    rgba[offset + 1] = bgra[offset + 1]
+    rgba[offset + 2] = bgra[offset]
+    rgba[offset + 3] = bgra[offset + 3]
+  }
+
+  return rgba
+}
+
+export function createSubtitleCaptureController(options: SubtitleCaptureOptions): SubtitleCaptureController {
+  const { annotations, log, postToBackend, titlesAvailable } = options
+
   let current: SubtitleSession | null = null
   let followTimer: NodeJS.Timeout | null = null
+  let sampleTimer: NodeJS.Timeout | null = null
   let followMisses = 0
   let followInFlight = false
-  // Stale-result guard: only the newest submitted frame may paint. A slow
-  // translation finishing after a newer line landed must be dropped, not drawn.
+  let sampleInFlight = false
   let frameGeneration = 0
-  let displayMediaHandlerInstalled = false
-
-  const url = () => {
-    if (devServer) {
-      return `${devServer.endsWith('/') ? devServer.slice(0, -1) : devServer}/?win=subcap#/`
-    }
-
-    return `${pathToFileURL(rendererIndex()).toString()}?win=subcap#/`
-  }
-
-  // getDisplayMedia in the hidden worker resolves through this handler: the
-  // worker gets the screen source for the session's display, every other
-  // frame in the app gets a refusal — nothing else in Hermes screen-captures,
-  // and an in-app page must never be able to open a stream of the desktop.
-  const installDisplayMediaHandler = () => {
-    if (displayMediaHandlerInstalled) {
-      return
-    }
-
-    displayMediaHandlerInstalled = true
-
-    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
-      const requester = request.frame ? webContents.fromFrame(request.frame) : null
-      const allowed =
-        requester && captureWindow && !captureWindow.isDestroyed() && requester.id === captureWindow.webContents.id
-
-      if (!allowed || !current) {
-        callback({})
-
-        return
-      }
-
-      const wantedDisplayId = String(current.displayId)
-
-      desktopCapturer
-        .getSources({ fetchWindowIcons: false, thumbnailSize: { height: 0, width: 0 }, types: ['screen'] })
-        .then(sources => {
-          const match = sources.find(source => source.display_id === wantedDisplayId) ?? sources[0]
-
-          if (match) {
-            callback({ video: match })
-          } else {
-            callback({})
-          }
-        })
-        .catch(error => {
-          log(`subtitles: screen source lookup failed: ${error instanceof Error ? error.message : String(error)}`)
-          callback({})
-        })
-    })
-  }
-
-  const rendererConfig = (): Record<string, unknown> | null => {
-    if (!current) {
-      return null
-    }
-
-    return {
-      epoch: current.epoch,
-      fractions: current.fractions,
-      sample_hz: current.sampleHz
-    }
-  }
-
-  const pushConfig = () => {
-    if (captureWindow && !captureWindow.isDestroyed()) {
-      captureWindow.webContents.send('hermes:subtitle-capture:config', rendererConfig())
-    }
-  }
-
-  const spawnCaptureWindow = () => {
-    // A worker, not a surface: never shown, never focused. Background
-    // throttling must stay off — the whole window exists to run a timer while
-    // hidden.
-    const next = new BrowserWindow({
-      focusable: false,
-      frame: false,
-      height: 180,
-      show: false,
-      skipTaskbar: true,
-      webPreferences: {
-        backgroundThrottling: false,
-        contextIsolation: true,
-        devTools: true,
-        nodeIntegration: false,
-        preload: preloadPath,
-        sandbox: true
-      },
-      width: 320
-    })
-
-    wireWindow(next)
-    installWindowRendererLifecycle(next, { callbacks: { log }, kind: 'subtitle-capture' })
-    attachRendererConsoleCapture(next, 'subtitle-capture', log)
-
-    // Push on load AND answer the renderer's pull — its chunk is lazy, so the
-    // listener can attach after did-finish-load already fired.
-    next.webContents.on('did-finish-load', pushConfig)
-
-    next.on('closed', () => {
-      if (captureWindow === next) {
-        captureWindow = null
-      }
-    })
-
-    loadWindowUrl(next, url(), 'Subtitle capture')
-
-    return next
-  }
+  let lastDrawn: { display: AnnotationBounds; shapes: ReturnType<typeof subtitleShapes> } | null = null
 
   const resolveTarget = async (
     spec: string | undefined,
@@ -231,6 +131,13 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
     return resolveAnnotationWindow(windows, process.pid, senderBounds, spec)
   }
 
+  const stopSampling = () => {
+    if (sampleTimer) {
+      clearInterval(sampleTimer)
+      sampleTimer = null
+    }
+  }
+
   const stop = (reason?: string): Record<string, unknown> => {
     const wasRunning = current !== null
     const stats = current
@@ -242,15 +149,10 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
       followTimer = null
     }
 
+    stopSampling()
     followMisses = 0
     frameGeneration += 1
     current = null
-
-    if (captureWindow && !captureWindow.isDestroyed()) {
-      captureWindow.close()
-    }
-
-    captureWindow = null
     annotations.clearChannel('subtitles')
 
     if (reason) {
@@ -317,15 +219,198 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
       current.band = band
       current.display = display.bounds
       current.displayId = display.id
-      current.fractions = bandFractions(band, display.bounds)
+      current.fractions = bandFractions(band, match.bounds)
+      current.windowBounds = match.bounds
       current.windowId = match.id
       current.epoch += 1
-      pushConfig()
+      current.lastHash = ''
     } catch (error) {
       log(`subtitles: follow tick failed: ${error instanceof Error ? error.message : String(error)}`)
     } finally {
       followInFlight = false
     }
+  }
+
+  const saveDebugFrame = (dataUrl: string) => {
+    try {
+      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+      const file = path.join(app.getPath('temp'), 'hermes-subtitles-first-frame.png')
+
+      fs.writeFileSync(file, Buffer.from(base64, 'base64'))
+      log(`subtitles: first captured frame saved to ${file}`)
+    } catch {
+      // Diagnostics only — never fail the pipeline over it.
+    }
+  }
+
+  const asBox = (value: unknown): SubtitleTextBox | null => {
+    const bounds = asBounds(value)
+
+    return bounds && bounds.width > 0 && bounds.height > 0 ? bounds : null
+  }
+
+  const redrawLast = () => {
+    if (lastDrawn) {
+      annotations.setChannelShapes('subtitles', lastDrawn.shapes, lastDrawn.display)
+    }
+  }
+
+  const processCrop = (dataUrl: string, cropWidth: number, cropHeight: number, epoch: number): void => {
+    if (!current || epoch !== current.epoch) {
+      return
+    }
+
+    if (!current.debugFrameSaved) {
+      current.debugFrameSaved = true
+      saveDebugFrame(dataUrl)
+    }
+
+    const generation = ++frameGeneration
+    const startedAt = Date.now()
+    const sessionAtSubmit = current
+
+    void postToBackend('/api/subtitles/process', {
+      image_data_url: dataUrl,
+      language: sessionAtSubmit.language,
+      prev_text: sessionAtSubmit.lastSourceText,
+      stream_id: sessionAtSubmit.streamId
+    })
+      .then(result => {
+        if (!current || current !== sessionAtSubmit || generation !== frameGeneration) {
+          return
+        }
+
+        current.lastLatencyMs = Date.now() - startedAt
+
+        if (!result || result.ok !== true) {
+          throw new Error(typeof result?.detail === 'string' ? result.detail : 'backend returned no result')
+        }
+
+        current.consecutiveBackendErrors = 0
+
+        if (result.unchanged === true) {
+          if (current.lastShapesAt > 0) {
+            redrawLast()
+          }
+
+          return
+        }
+
+        const sourceText = typeof result.source_text === 'string' ? result.source_text : ''
+        const text = typeof result.text === 'string' ? result.text.trim() : ''
+        const box = asBox(result.box)
+
+        current.lastSourceText = sourceText
+
+        if (!text || !box) {
+          lastDrawn = null
+          current.lastShapesAt = 0
+          annotations.clearChannel('subtitles')
+
+          return
+        }
+
+        const shapes = subtitleShapes({
+          band: current.band,
+          box,
+          cropHeight,
+          cropWidth,
+          display: current.display,
+          text
+        })
+
+        if (shapes.length === 0) {
+          return
+        }
+
+        lastDrawn = { display: current.display, shapes }
+        current.lastShapesAt = Date.now()
+        current.linesDrawn += 1
+        annotations.setChannelShapes('subtitles', shapes, current.display)
+      })
+      .catch(error => {
+        if (!current || current !== sessionAtSubmit) {
+          return
+        }
+
+        current.consecutiveBackendErrors += 1
+        log(
+          `subtitles: process failed (${current.consecutiveBackendErrors}): ${error instanceof Error ? error.message : String(error)}`
+        )
+
+        if (current.consecutiveBackendErrors >= BACKEND_ERRORS_BEFORE_STOP) {
+          stop('the backend kept failing to OCR/translate frames')
+        }
+      })
+  }
+
+  const sampleTick = async () => {
+    if (!current || sampleInFlight) {
+      return
+    }
+
+    sampleInFlight = true
+    const sessionAtSample = current
+
+    try {
+      const display = screen.getDisplayMatching(sessionAtSample.windowBounds)
+      const scale = display.scaleFactor || 1
+      const sources = await desktopCapturer.getSources({
+        fetchWindowIcons: false,
+        thumbnailSize: {
+          height: Math.max(8, Math.round(sessionAtSample.windowBounds.height * scale)),
+          width: Math.max(8, Math.round(sessionAtSample.windowBounds.width * scale))
+        },
+        types: ['window']
+      })
+
+      if (!current || current !== sessionAtSample) {
+        return
+      }
+
+      const hit = matchCapturerWindow(sources, sessionAtSample.windowId, sessionAtSample.windowRef)
+      const source = hit ? sources.find(entry => entry.id === hit.id) : undefined
+
+      if (!source || source.thumbnail.isEmpty()) {
+        return
+      }
+
+      const size = source.thumbnail.getSize()
+      const crop = cropRectFor(sessionAtSample.fractions, size.width, size.height)
+
+      if (!crop) {
+        return
+      }
+
+      const cropped = source.thumbnail.crop(crop)
+      const shipped = shipSize(crop)
+      const sized = cropped.getSize().width === shipped.width ? cropped : cropped.resize(shipped)
+      const shippedSize = sized.getSize()
+      const rgba = bgraToRgba(sized.toBitmap(), shippedSize.width, shippedSize.height)
+      const hash = brightMaskHash(rgba, shippedSize.width, shippedSize.height)
+      const now = Date.now()
+      const changed = hammingDistance(hash, sessionAtSample.lastHash) > SAME_TEXT_MAX_DISTANCE
+
+      if (!changed && now - sessionAtSample.lastSentAt < SUBTITLE_KEEPALIVE_MS) {
+        return
+      }
+
+      sessionAtSample.lastHash = hash
+      sessionAtSample.lastSentAt = now
+      const dataUrl = `data:image/png;base64,${sized.toPNG().toString('base64')}`
+
+      processCrop(dataUrl, shippedSize.width, shippedSize.height, sessionAtSample.epoch)
+    } catch (error) {
+      log(`subtitles: snapshot failed: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      sampleInFlight = false
+    }
+  }
+
+  const startSampling = (hz: number) => {
+    stopSampling()
+    sampleTimer = setInterval(() => void sampleTick(), Math.round(1000 / Math.max(1, hz)))
+    void sampleTick()
   }
 
   const start = async (req: Record<string, unknown>, senderBounds: AnnotationBounds | null) => {
@@ -355,6 +440,8 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
       return { error: `The "${target.app}" window is not visibly on any display.`, success: false }
     }
 
+    const sampleHz = clampSampleHz(typeof req.sample_hz === 'number' ? req.sample_hz : undefined)
+
     current = {
       band,
       bandFraction: fraction,
@@ -363,30 +450,26 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
       display: display.bounds,
       displayId: display.id,
       epoch: 1,
-      fractions: bandFractions(band, display.bounds),
+      fractions: bandFractions(band, target.bounds),
       language,
+      lastHash: '',
       lastLatencyMs: 0,
+      lastSentAt: 0,
       lastShapesAt: 0,
       lastSourceText: '',
       linesDrawn: 0,
-      sampleHz: clampSampleHz(typeof req.sample_hz === 'number' ? req.sample_hz : undefined),
+      sampleHz,
       startedAt: Date.now(),
       streamId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       targetSpec: spec,
+      windowBounds: target.bounds,
       windowId: target.id,
       windowRef: { app: target.app, title: target.title }
     }
 
-    installDisplayMediaHandler()
-
-    if (!captureWindow || captureWindow.isDestroyed()) {
-      captureWindow = spawnCaptureWindow()
-    } else {
-      pushConfig()
-    }
-
     followMisses = 0
     followTimer = setInterval(() => void followTick(), FOLLOW_INTERVAL_MS)
+    startSampling(sampleHz)
 
     return {
       band,
@@ -433,148 +516,13 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
     return { error: `action must be one of: ${SUPPORTED_ACTIONS.join(', ')}.`, success: false }
   }
 
-  let lastDrawn: { display: AnnotationBounds; shapes: ReturnType<typeof subtitleShapes> } | null = null
-
-  const redrawLast = () => {
-    if (lastDrawn) {
-      annotations.setChannelShapes('subtitles', lastDrawn.shapes, lastDrawn.display)
-    }
-  }
-
-  const asBox = (value: unknown): SubtitleTextBox | null => {
-    const bounds = asBounds(value)
-
-    return bounds && bounds.width > 0 && bounds.height > 0 ? bounds : null
-  }
-
-  // First crop of every session lands on disk so "is the capture black?"
-  // (DRM-protected content) is answerable from a log line instead of a debug
-  // build. One frame, temp dir, overwritten per session.
-  const saveDebugFrame = (dataUrl: string) => {
-    try {
-      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
-      const file = path.join(app.getPath('temp'), 'hermes-subtitles-first-frame.png')
-
-      fs.writeFileSync(file, Buffer.from(base64, 'base64'))
-      log(`subtitles: first captured frame saved to ${file}`)
-    } catch {
-      // Diagnostics only — never fail the pipeline over it.
-    }
-  }
-
-  const onFrame = (senderId: number, payload: unknown): void => {
-    if (!current || !captureWindow || captureWindow.isDestroyed() || senderId !== captureWindow.webContents.id) {
-      return
-    }
-
-    const frame = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-    const dataUrl = typeof frame.data_url === 'string' ? frame.data_url : ''
-    const cropWidth = typeof frame.width === 'number' ? frame.width : 0
-    const cropHeight = typeof frame.height === 'number' ? frame.height : 0
-
-    if (!dataUrl.startsWith('data:image/png;base64,') || cropWidth <= 0 || cropHeight <= 0 || frame.epoch !== current.epoch) {
-      return
-    }
-
-    if (!current.debugFrameSaved) {
-      current.debugFrameSaved = true
-      saveDebugFrame(dataUrl)
-    }
-
-    const generation = ++frameGeneration
-    const startedAt = Date.now()
-    const sessionAtSubmit = current
-
-    void postToBackend('/api/subtitles/process', {
-      image_data_url: dataUrl,
-      language: sessionAtSubmit.language,
-      prev_text: sessionAtSubmit.lastSourceText,
-      stream_id: sessionAtSubmit.streamId
-    })
-      .then(result => {
-        if (!current || current !== sessionAtSubmit || generation !== frameGeneration) {
-          return
-        }
-
-        current.lastLatencyMs = Date.now() - startedAt
-
-        if (!result || result.ok !== true) {
-          throw new Error(typeof result?.detail === 'string' ? result.detail : 'backend returned no result')
-        }
-
-        current.consecutiveBackendErrors = 0
-
-        // Same line still on screen (background motion tripped the hash):
-        // refresh the hold so the cover doesn't blink out mid-line.
-        if (result.unchanged === true) {
-          if (current.lastShapesAt > 0) {
-            redrawLast()
-          }
-
-          return
-        }
-
-        const sourceText = typeof result.source_text === 'string' ? result.source_text : ''
-        const text = typeof result.text === 'string' ? result.text.trim() : ''
-        const box = asBox(result.box)
-
-        current.lastSourceText = sourceText
-
-        if (!text || !box) {
-          // No subtitle on screen right now.
-          lastDrawn = null
-          current.lastShapesAt = 0
-          annotations.clearChannel('subtitles')
-
-          return
-        }
-
-        const shapes = subtitleShapes({
-          band: current.band,
-          box,
-          cropHeight,
-          cropWidth,
-          display: current.display,
-          text
-        })
-
-        if (shapes.length === 0) {
-          return
-        }
-
-        lastDrawn = { display: current.display, shapes }
-        current.lastShapesAt = Date.now()
-        current.linesDrawn += 1
-        annotations.setChannelShapes('subtitles', shapes, current.display)
-      })
-      .catch(error => {
-        if (!current || current !== sessionAtSubmit) {
-          return
-        }
-
-        current.consecutiveBackendErrors += 1
-        log(`subtitles: process failed (${current.consecutiveBackendErrors}): ${error instanceof Error ? error.message : String(error)}`)
-
-        if (current.consecutiveBackendErrors >= BACKEND_ERRORS_BEFORE_STOP) {
-          stop('the backend kept failing to OCR/translate frames')
-        }
-      })
-  }
-
   const close = () => {
     stop()
   }
 
-  return { close, control, getRendererConfig: rendererConfig, onFrame }
+  return { close, control }
 }
 
-/**
- * IPC surface. The chat renderer that received the agent's control request
- * forwards it here (its own bounds anchor the default target, matching the
- * annotate tool); the hidden capture renderer pulls its config on mount and
- * streams changed crops up. Frame/config channels only answer the capture
- * window itself.
- */
 export function registerSubtitleCaptureIpc(controller: SubtitleCaptureController): void {
   ipcMain.handle('hermes:subtitles:control', async (event, request) => {
     const sender = BrowserWindow.fromWebContents(event.sender)
@@ -585,11 +533,5 @@ export function registerSubtitleCaptureIpc(controller: SubtitleCaptureController
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error), success: false }
     }
-  })
-
-  ipcMain.handle('hermes:subtitle-capture:get', () => controller.getRendererConfig())
-
-  ipcMain.on('hermes:subtitle-capture:frame', (event, payload) => {
-    controller.onFrame(event.sender.id, payload)
   })
 }

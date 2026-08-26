@@ -9,6 +9,8 @@ import {
   clampAnnotationTtlSeconds,
   isScreenTarget,
   mapAnnotationShapes,
+  offsetAnnotationShapes,
+  overlayBoundsForShapes,
   resolveAnnotationWindow
 } from './screen-annotations'
 import type { EnumeratedWindow } from './window-below'
@@ -228,6 +230,30 @@ test('undrawable entries are skipped and counted, never crash the batch', () => 
 
   assert.equal(shapes.length, 1)
   assert.equal(skipped, 5)
+})
+
+test('subtitle-only overlay bounds hug the cover instead of filling the display', () => {
+  const display = { height: 1000, width: 1600, x: 0, y: 0 }
+  const cover = { color: 'black' as const, fill: true, height: 80, kind: 'rect' as const, width: 600, x: 400, y: 800 }
+
+  const bounds = overlayBoundsForShapes([cover], display, 12)
+
+  assert.equal(bounds.x, 388)
+  assert.equal(bounds.y, 788)
+  assert.equal(bounds.width, 624)
+  assert.equal(bounds.height, 104)
+  assert.ok(bounds.width < display.width)
+  assert.ok(bounds.height < display.height)
+})
+
+test('offsetAnnotationShapes shifts overlay-local coordinates into a tighter window', () => {
+  const shapes = offsetAnnotationShapes(
+    [{ color: 'white', kind: 'label', text: 'oi', x: 500, y: 820 }],
+    -388,
+    -788
+  )
+
+  assert.deepEqual(shapes, [{ color: 'white', kind: 'label', text: 'oi', x: 112, y: 32 }])
 })
 
 test('a non-array shapes payload maps to nothing rather than throwing', () => {

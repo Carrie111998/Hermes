@@ -1,12 +1,13 @@
 // screen-annotations-window.ts — the transparent overlay the agent draws on.
 //
-// One frameless, click-through, always-on-top window covering the display the
-// target sits on. It is a pure display surface: never focusable, never
-// interactive, hidden from taskbar/Mission Control, and it steps over
-// fullscreen Spaces the same way the HUD does (visibleOnFullScreen) — the
-// whole point is marking the app the user is playing under the HUD. All
-// geometry decisions live in screen-annotations.ts; main.ts owns only the IPC
-// registration (see registerScreenAnnotationsIpc call site).
+// One frameless, click-through, always-on-top window. Agent marks cover the
+// display the target sits on; live subtitles shrink it to the caption box so
+// a compositor that paints the window opaque cannot veil the whole movie. It
+// is a pure display surface: never focusable, never interactive, hidden from
+// taskbar/Mission Control, and it steps over fullscreen Spaces the same way
+// the HUD does (visibleOnFullScreen). All geometry decisions live in
+// screen-annotations.ts; main.ts owns only the IPC registration (see
+// registerScreenAnnotationsIpc call site).
 
 import { pathToFileURL } from 'node:url'
 
@@ -21,6 +22,8 @@ import {
   isScreenTarget,
   mapAnnotationShapes,
   type MappedAnnotationShape,
+  offsetAnnotationShapes,
+  overlayBoundsForShapes,
   resolveAnnotationWindow
 } from './screen-annotations'
 import { enumerateWindowsFrontToBack, enumerationFailed, enumerationFailureNote } from './window-below'
@@ -75,6 +78,9 @@ export function createScreenAnnotationsController({
   let window: BrowserWindow | null = null
   const channelShapes: Record<AnnotationChannel, MappedAnnotationShape[]> = { agent: [], subtitles: [] }
   const ttlTimers: Record<AnnotationChannel, NodeJS.Timeout | null> = { agent: null, subtitles: null }
+  // Display the overlay is currently placed on — shapes are stored relative to
+  // this origin, then shifted into the (possibly tighter) window before paint.
+  let overlayDisplay: AnnotationBounds | null = null
 
   // Draw/clear ordering guard. `annotate` suspends at the window-enumeration
   // await, and requests can overlap (the main window and the HUD each run
@@ -95,9 +101,22 @@ export function createScreenAnnotationsController({
     return `${pathToFileURL(rendererIndex()).toString()}?win=annotate#/`
   }
 
+  const shapesForOverlay = (): MappedAnnotationShape[] => {
+    const shapes = unionShapes()
+    const origin = overlayDisplay
+
+    if (!window || window.isDestroyed() || !origin) {
+      return shapes
+    }
+
+    const bounds = window.getBounds()
+
+    return offsetAnnotationShapes(shapes, origin.x - bounds.x, origin.y - bounds.y)
+  }
+
   const sendState = () => {
     if (window && !window.isDestroyed()) {
-      window.webContents.send('hermes:screen-annotations:state', { shapes: unionShapes() })
+      window.webContents.send('hermes:screen-annotations:state', { shapes: shapesForOverlay() })
     }
   }
 
@@ -126,6 +145,7 @@ export function createScreenAnnotationsController({
       minimizable: false,
       movable: false,
       resizable: false,
+      enableLargerThanScreen: true,
       // Full-display drawing surface: a rounded corner would clip a mark
       // drawn at the screen's edge.
       roundedCorners: false,
@@ -148,17 +168,16 @@ export function createScreenAnnotationsController({
     next.setAlwaysOnTop(true, isMac ? 'floating' : 'screen-saver')
     next.setHiddenInMissionControl?.(true)
 
+    // No platform material. Vibrancy on a full-display overlay is a frosted
+    // sheet over the user's screen — the renderer paints only the marks.
+    if (isMac && typeof next.setVibrancy === 'function') {
+      next.setVibrancy(null)
+    }
+
     // Pure display surface — every click belongs to the app underneath. No
     // `forward`: the overlay has no hover logic to feed. On X11 ignore-mouse
     // is a one-way door (hud-ipc.ts), which is fine here: it never reopens.
     next.setIgnoreMouseEvents(true)
-
-    // Invisible to screen-capture APIs (macOS sharingType none / Windows
-    // WDA_MONITOR). The live-subtitle loop samples the display this overlay
-    // floats over; an overlay that shows up in that capture OCRs its own
-    // painted translation forever (feedback loop). The user still sees every
-    // mark — capture APIs don't.
-    next.setContentProtection(true)
 
     try {
       next.setVisibleOnAllWorkspaces(true, {
@@ -183,6 +202,15 @@ export function createScreenAnnotationsController({
     next.webContents.on('did-finish-load', sendState)
 
     next.once('ready-to-show', () => {
+      if (!next.isDestroyed()) {
+        next.setBackgroundColor('#00000000')
+        setTimeout(() => {
+          if (!next.isDestroyed()) {
+            next.setBackgroundColor('#00000000')
+          }
+        }, 2500)
+      }
+
       if (!next.isDestroyed() && unionShapes().length > 0) {
         next.showInactive()
       }
@@ -236,6 +264,19 @@ export function createScreenAnnotationsController({
     window.showInactive()
   }
 
+  const paint = (displayBounds: AnnotationBounds) => {
+    overlayDisplay = displayBounds
+    // Subtitles only need a strip over the caption; a full-display overlay
+    // that fails to composite transparent is a white sheet over the movie.
+    const bounds =
+      channelShapes.agent.length === 0 && channelShapes.subtitles.length > 0
+        ? overlayBoundsForShapes(channelShapes.subtitles, displayBounds)
+        : displayBounds
+
+    showOn(bounds)
+    sendState()
+  }
+
   const clearChannel = (channel: AnnotationChannel) => {
     disarmTtl(channel)
     channelShapes[channel] = []
@@ -267,8 +308,7 @@ export function createScreenAnnotationsController({
 
     disarmTtl(channel)
     channelShapes[channel] = shapes
-    showOn(displayBounds)
-    sendState()
+    paint(displayBounds)
 
     ttlTimers[channel] = setTimeout(() => {
       ttlTimers[channel] = null
@@ -353,8 +393,7 @@ export function createScreenAnnotationsController({
 
     disarmTtl('agent')
     channelShapes.agent = mapped.shapes
-    showOn(display.bounds)
-    sendState()
+    paint(display.bounds)
 
     ttlTimers.agent = setTimeout(() => {
       ttlTimers.agent = null
@@ -399,7 +438,7 @@ export function createScreenAnnotationsController({
     clear,
     clearChannel,
     close,
-    getState: () => ({ shapes: unionShapes() }),
+    getState: () => ({ shapes: shapesForOverlay() }),
     setChannelShapes
   }
 }

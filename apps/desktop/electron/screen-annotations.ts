@@ -96,6 +96,114 @@ export function clampChannelHoldSeconds(raw: unknown): number {
   return Math.min(CHANNEL_HOLD_MAX_S, value)
 }
 
+/** Axis-aligned box of one overlay-local shape. Labels get a generous
+ *  width guess so a tight overlay window does not clip the last glyph. */
+export function annotationShapeBounds(shape: MappedAnnotationShape): AnnotationBounds | null {
+  if (shape.kind === 'rect') {
+    return { height: shape.height, width: shape.width, x: shape.x, y: shape.y }
+  }
+
+  if (shape.kind === 'circle') {
+    return {
+      height: shape.radius * 2,
+      width: shape.radius * 2,
+      x: shape.x - shape.radius,
+      y: shape.y - shape.radius
+    }
+  }
+
+  if (shape.kind === 'label') {
+    const size = shape.fontSize && shape.fontSize > 0 ? shape.fontSize : 15
+    const lines = shape.text.split('\n').filter(line => line.trim().length > 0)
+    const longest = lines.reduce((max, line) => Math.max(max, line.length), 0)
+    const width = Math.max(size, longest * size * 0.65)
+    const height = size * (1 + 1.3 * Math.max(0, lines.length - 1))
+
+    return { height, width, x: shape.x - width / 2, y: shape.y - size }
+  }
+
+  const x = Math.min(shape.fromX, shape.toX)
+  const y = Math.min(shape.fromY, shape.toY)
+
+  return {
+    height: Math.max(1, Math.abs(shape.toY - shape.fromY)),
+    width: Math.max(1, Math.abs(shape.toX - shape.fromX)),
+    x,
+    y
+  }
+}
+
+export function unionAnnotationBounds(shapes: MappedAnnotationShape[]): AnnotationBounds | null {
+  let left = Infinity
+  let top = Infinity
+  let right = -Infinity
+  let bottom = -Infinity
+
+  for (const shape of shapes) {
+    const box = annotationShapeBounds(shape)
+
+    if (!box) {
+      continue
+    }
+
+    left = Math.min(left, box.x)
+    top = Math.min(top, box.y)
+    right = Math.max(right, box.x + box.width)
+    bottom = Math.max(bottom, box.y + box.height)
+  }
+
+  if (!Number.isFinite(left) || right - left < 1 || bottom - top < 1) {
+    return null
+  }
+
+  return { height: bottom - top, width: right - left, x: left, y: top }
+}
+
+export function offsetAnnotationShapes(shapes: MappedAnnotationShape[], dx: number, dy: number): MappedAnnotationShape[] {
+  return shapes.map(shape => {
+    if (shape.kind === 'rect' || shape.kind === 'circle' || shape.kind === 'label') {
+      return { ...shape, x: shape.x + dx, y: shape.y + dy }
+    }
+
+    return {
+      ...shape,
+      fromX: shape.fromX + dx,
+      fromY: shape.fromY + dy,
+      toX: shape.toX + dx,
+      toY: shape.toY + dy
+    }
+  })
+}
+
+/** Screen bounds for an overlay that only needs to cover `shapes`. Agent
+ *  marks can land anywhere on the display, so callers pass the full display
+ *  when that channel is occupied. */
+export function overlayBoundsForShapes(
+  shapes: MappedAnnotationShape[],
+  display: AnnotationBounds,
+  pad = 12
+): AnnotationBounds {
+  const local = unionAnnotationBounds(shapes)
+
+  if (!local) {
+    return display
+  }
+
+  const x = display.x + local.x - pad
+  const y = display.y + local.y - pad
+  const left = Math.max(display.x, x)
+  const top = Math.max(display.y, y)
+  const right = Math.min(display.x + display.width, x + local.width + pad * 2)
+  const bottom = Math.min(display.y + display.height, y + local.height + pad * 2)
+
+  return {
+    height: Math.max(8, bottom - top),
+    width: Math.max(8, right - left),
+    x: left,
+    y: top
+  }
+}
+
 /** `target: 'screen'` anchors coordinates to the whole display instead of a
  *  window — for coordinates read off a full-display screenshot. */
 export const isScreenTarget = (spec: string | undefined): boolean => {
