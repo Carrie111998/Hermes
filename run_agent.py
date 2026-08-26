@@ -7621,10 +7621,20 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
-    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
+    def _build_api_kwargs(
+        self,
+        api_messages: list,
+        tools_for_api: Optional[list] = None,
+        reasoning_config: Optional[dict] = None,
+    ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return build_api_kwargs(
+            self,
+            api_messages,
+            tools_for_api=tools_for_api,
+            reasoning_config=reasoning_config,
+        )
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -7766,7 +7776,10 @@ class AIAgent:
         cache[key] = (supported, _time.monotonic())
         return bool(supported)
 
-    def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
+    def _resolve_lmstudio_summary_reasoning_effort(
+        self,
+        reasoning_config: Optional[dict] = None,
+    ) -> Optional[str]:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
@@ -7774,12 +7787,19 @@ class AIAgent:
         can't drift on effort resolution and clamping.
         """
         from agent.lmstudio_reasoning import resolve_lmstudio_effort
+        effective_config = (
+            getattr(self, "reasoning_config", None)
+            if reasoning_config is None else reasoning_config
+        )
         return resolve_lmstudio_effort(
-            self.reasoning_config,
+            effective_config,
             self._lmstudio_reasoning_options_cached(),
         )
 
-    def _github_models_reasoning_extra_body(self) -> dict | None:
+    def _github_models_reasoning_extra_body(
+        self,
+        reasoning_config: Optional[dict] = None,
+    ) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
         try:
             from hermes_cli.models import github_model_reasoning_efforts
@@ -7790,11 +7810,15 @@ class AIAgent:
         if not supported_efforts:
             return None
 
-        if self.reasoning_config and isinstance(self.reasoning_config, dict):
-            if self.reasoning_config.get("enabled") is False:
+        effective_config = (
+            getattr(self, "reasoning_config", None)
+            if reasoning_config is None else reasoning_config
+        )
+        if effective_config and isinstance(effective_config, dict):
+            if effective_config.get("enabled") is False:
                 return None
             requested_effort = str(
-                self.reasoning_config.get("effort", "medium")
+                effective_config.get("effort", "medium")
             ).strip().lower()
         else:
             requested_effort = "medium"

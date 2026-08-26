@@ -95,6 +95,30 @@ class TestReasoningCommand:
 
 
     @pytest.mark.asyncio
+    async def test_handle_reasoning_command_accepts_auto_through_shared_parser(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: medium\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        event = _make_event("/reasoning auto")
+        session_key = runner._session_key_for_source(event.source)
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert runner._session_reasoning_overrides[session_key] == {
+            "enabled": True,
+            "effort": "auto",
+        }
+        assert result is not None
+        assert "auto" in result
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("effort", ["max", "ultra"])
     async def test_handle_reasoning_command_accepts_extended_efforts(
         self, tmp_path, monkeypatch, effort

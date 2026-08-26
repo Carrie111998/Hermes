@@ -20,6 +20,7 @@ from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
     _build_call_kwargs,
+    _get_task_extra_body,
     _read_codex_access_token,
     _get_provider_chain,
     _is_payment_error,
@@ -465,6 +466,71 @@ class TestBuildCallKwargsMaxTokens:
         assert "max_tokens" not in kw3
 
 
+def test_moa_reference_resolves_auto_before_auxiliary_wire_projection():
+    """MoA advisor requests must never project the internal ``auto`` sentinel."""
+    kwargs = _build_call_kwargs(
+        provider="custom",
+        model="reasoning-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "debug this production security incident",
+            }
+        ],
+        reasoning_config={"enabled": True, "effort": "auto"},
+        task="moa_reference",
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+    assert "auto" not in repr(kwargs)
+
+
+def test_explicit_extra_body_auto_is_resolved_before_wire_projection():
+    kwargs = _build_call_kwargs(
+        provider="openrouter",
+        model="reasoning-model",
+        messages=[{"role": "user", "content": "debug this production security incident"}],
+        extra_body={"reasoning": {"enabled": True, "effort": "auto"}},
+        task="compression",
+    )
+
+    assert kwargs["extra_body"]["reasoning"]["effort"] == "high"
+    assert "auto" not in repr(kwargs)
+
+
+def test_task_reasoning_effort_auto_is_resolved_before_wire_projection(monkeypatch):
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux,
+        "_get_auxiliary_task_config",
+        lambda task: {"reasoning_effort": "auto"} if task == "compression" else {},
+    )
+    extra_body = _get_task_extra_body("compression")
+    kwargs = _build_call_kwargs(
+        provider="openrouter",
+        model="reasoning-model",
+        messages=[{"role": "user", "content": "debug this production security incident"}],
+        extra_body=extra_body,
+        task="compression",
+    )
+
+    assert kwargs["extra_body"]["reasoning"]["effort"] == "high"
+    assert "auto" not in repr(kwargs)
+
+
+def test_moa_slot_resolution_cannot_coexist_with_task_extra_body_auto():
+    kwargs = _build_call_kwargs(
+        provider="custom",
+        model="reasoning-model",
+        messages=[{"role": "user", "content": "debug this production security incident"}],
+        reasoning_config={"enabled": True, "effort": "high"},
+        extra_body={"reasoning": {"enabled": True, "effort": "auto"}},
+        task="moa_reference",
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+    assert "auto" not in repr(kwargs)
 
 
 class TestNousTagsScoping:
