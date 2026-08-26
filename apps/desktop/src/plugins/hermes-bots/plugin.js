@@ -2278,14 +2278,18 @@ function startHideSweepScheduler(ctx) {
     }
   })
 
-  ctx.onDispose(() => {
-    disposed = true
-    stopGatewayListener()
-    if (timer !== null) {
-      clearTimeout(timer)
-      timer = null
-    }
-  })
+  if (typeof ctx.onDispose === 'function') {
+    ctx.onDispose(() => {
+      disposed = true
+      if (typeof stopGatewayListener === 'function') {
+        stopGatewayListener()
+      }
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+    })
+  }
   schedule()
 }
 
