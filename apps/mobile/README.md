@@ -42,9 +42,12 @@ Hermes Mobile preserves the Desktop renderer instead of rebuilding it as a separ
 
 - One compact top toolbar keeps **Sessions** one tap or left-edge swipe away.
 - A right-edge swipe opens the Files/preview drawer.
-- The toolbar’s overflow sheet contains every visible workspace pane plus New session, Command Center, Command palette, Settings, Layout editor, HUD, haptics, pane flip, Keyboard Shortcuts, and page-specific Desktop toolbar actions.
+- The toolbar’s overflow sheet opens directly below its top-right control and contains every visible workspace pane plus New session, Browser/preview, Command Center, Command palette, Settings, Layout editor, HUD, haptics, pane flip, Keyboard Shortcuts, and page-specific Desktop toolbar actions.
 - Sheets and drawers have explicit close controls, scrims, Android Back priority, and keyboard Escape behavior. Focus returns to the invoking toolbar control after a sheet closes.
 - Native mobile never keeps a desktop rail docked beside chat, even on an unfolded Fold. Drawers overlay the full-width chat canvas instead.
+- Browser, PDF, Markdown, image, source, and artifact preview tabs open in a full-screen mobile surface. Closing that surface preserves the tabs; users can reopen it, switch tabs, close individual tabs, or create another Browser tab.
+- URL tabs embed only private **HTTPS** pages in a sandboxed in-app frame. The visible **Open** action hands a page to Android’s system browser when a site needs its normal browser session or blocks framing. Insecure and special schemes are never loaded inline.
+- Motion is deliberately limited to navigation changes and touch feedback: drawers, menus, preview tabs, list/detail transitions, onboarding cards, and controls animate quietly; transcript/body content stays still, and every motion treatment respects `prefers-reduced-motion`.
 
 This is intentional adaptation, not a separate dashboard: existing Desktop pages, sessions, composer behavior, overlays, and visual language remain shared.
 

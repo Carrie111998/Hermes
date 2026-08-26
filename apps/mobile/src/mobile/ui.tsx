@@ -11,6 +11,7 @@ export function Screen({ children }: { children: ReactNode }) {
   return (
     <div
       className="flex min-h-full flex-col items-center justify-center px-6"
+      data-mobile-connect-screen=""
       style={{
         paddingTop: 'calc(env(safe-area-inset-top) + 1.5rem)',
         paddingBottom: 'calc(env(safe-area-inset-bottom) + 1.5rem)',
@@ -23,7 +24,7 @@ export function Screen({ children }: { children: ReactNode }) {
 
 export function Brand({ subtitle }: { subtitle: string }) {
   return (
-    <div className="flex flex-col items-center gap-1 text-center">
+    <div className="flex flex-col items-center gap-1 text-center" data-mobile-connect-brand="">
       <div
         className="text-3xl font-bold tracking-tight text-primary"
         style={{ fontFamily: "'Collapse', var(--dt-font-sans)" }}
@@ -37,7 +38,10 @@ export function Brand({ subtitle }: { subtitle: string }) {
 
 export function Card({ children }: { children: ReactNode }) {
   return (
-    <div className="flex flex-col gap-4 rounded-2xl border border-border bg-card/60 p-5 backdrop-blur">
+    <div
+      className="flex flex-col gap-4 rounded-2xl border border-border bg-card/60 p-5 backdrop-blur"
+      data-mobile-connect-card=""
+    >
       {children}
     </div>
   )
@@ -86,6 +90,7 @@ export function ErrorNote({ children }: { children: ReactNode }) {
     <div
       aria-live="assertive"
       className="rounded-xl border border-destructive/40 bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive-foreground"
+      data-mobile-connect-error=""
       role="alert"
     >
       {children}

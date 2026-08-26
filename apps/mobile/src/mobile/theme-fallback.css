@@ -165,6 +165,51 @@ body {
   min-height: 2.75rem;
 }
 
+/* Motion audit: lists/details, status actions, and filter controls all get
+   touch feedback or an entry transition; passive text and scroll content stay
+   still. The user can disable every motion treatment through reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  [data-mobile-master-detail] [data-master-detail-select],
+  [data-mobile-master-detail] [data-master-detail-detail] > div:first-child button,
+  .mobile-statusbar-more,
+  [data-mobile-statusbar-more] [data-statusbar-id],
+  [data-page-filters] > * {
+    transition: background-color 150ms ease, color 150ms ease, transform 150ms ease;
+  }
+  [data-mobile-master-detail] [data-master-detail-select]:active,
+  [data-mobile-master-detail] [data-master-detail-detail] > div:first-child button:active,
+  .mobile-statusbar-more:active,
+  [data-mobile-statusbar-more] [data-statusbar-id]:active {
+    transform: scale(0.98);
+  }
+  [data-mobile-master-detail][data-mobile-master-detail-view='browse'] [data-master-detail-list],
+  [data-mobile-master-detail][data-mobile-master-detail-view='detail'] [data-master-detail-detail] {
+    animation: mobile-detail-enter 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+}
+@keyframes mobile-detail-enter {
+  from { opacity: 0.01; transform: translateX(0.375rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-mobile-connect-brand],
+  [data-mobile-connect-card],
+  [data-mobile-connect-error] {
+    animation: mobile-connect-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  [data-mobile-connect-card] {
+    animation-delay: 40ms;
+  }
+  [data-mobile-connect-error] {
+    animation-delay: 80ms;
+  }
+}
+@keyframes mobile-connect-enter {
+  from { opacity: 0.01; transform: translateY(0.375rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 /* The desktop intro wordmark intentionally fills broad windows. On a Fold it
    should stay recognisable without becoming a billboard that crowds the first
    useful task affordance below it. */
@@ -374,18 +419,19 @@ html:has([data-overlay-surface]) .mobile-top-toolbar {
 .mobile-toolbar-menu {
   position: absolute;
   z-index: 90;
-  right: 0;
-  bottom: 0;
-  left: 0;
+  top: calc(3.25rem + 0.375rem);
+  right: calc(env(safe-area-inset-right) + 0.5rem);
+  left: auto;
   display: flex;
-  max-height: min(72%, 36rem);
+  width: min(23rem, calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem));
+  max-height: calc(100% - 4.125rem);
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
-  border-bottom: 0;
-  border-radius: 1.125rem 1.125rem 0 0;
+  border-radius: 1rem;
   background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
-  box-shadow: 0 -1.25rem 3rem rgb(0 0 0 / 0.28);
+  box-shadow: 0 1.25rem 3rem rgb(0 0 0 / 0.28);
+  transform-origin: top right;
 }
 .mobile-toolbar-menu header {
   display: flex;
@@ -440,14 +486,220 @@ html:has([data-overlay-surface]) .mobile-top-toolbar {
   .mobile-toolbar-button {
     transition: background-color 160ms ease, transform 160ms ease;
   }
+  .mobile-toolbar-menu [role='group'] > button,
+  .mobile-toolbar-menu header button {
+    transition: background-color 150ms ease, transform 150ms ease;
+  }
   .mobile-toolbar-button:active {
     transform: scale(0.94);
   }
+  .mobile-toolbar-menu [role='group'] > button:active,
+  .mobile-toolbar-menu header button:active {
+    transform: scale(0.98);
+  }
+  .mobile-toolbar-scrim {
+    animation: mobile-scrim-enter 160ms ease-out both;
+  }
   .mobile-toolbar-menu {
-    animation: mobile-toolbar-menu-enter 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation: mobile-toolbar-menu-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
   }
 }
 @keyframes mobile-toolbar-menu-enter {
-  from { opacity: 0.01; transform: translateY(0.75rem); }
+  from { opacity: 0.01; transform: translateY(-0.5rem) scale(0.98); }
   to { opacity: 1; transform: translateY(0); }
+}
+@keyframes mobile-scrim-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Full-screen preview home for Browser, PDF, Markdown, source, images, and
+   generated artifacts. It owns preview tabs on mobile instead of rebuilding a
+   desktop side rail beside chat. */
+.mobile-preview-overlay {
+  position: absolute;
+  z-index: 120;
+  inset: 0;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ui-chat-surface-background, var(--dt-background, #0d2f86));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-header {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.3));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+}
+.mobile-preview-tabs {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 0.25rem;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding-inline: calc(env(safe-area-inset-left) + 0.5rem) 0.25rem;
+  scrollbar-width: none;
+}
+.mobile-preview-tabs::-webkit-scrollbar {
+  display: none;
+}
+.mobile-preview-tab {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  border-radius: 0.75rem;
+}
+.mobile-preview-tab [role='tab'] {
+  min-width: 5rem;
+  max-width: min(13rem, 48vw);
+  height: 2.75rem;
+  padding: 0.75rem 2.5rem 0.75rem 0.75rem;
+  overflow: hidden;
+  border-radius: 0.75rem;
+  color: var(--ui-text-tertiary, currentColor);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mobile-preview-tab [role='tab'][aria-selected='true'] {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-tab > button[aria-label^='Close'] {
+  display: grid;
+  width: 2.25rem;
+  height: 2.75rem;
+  margin-left: -2.25rem;
+  place-items: center;
+  border-radius: 0.75rem;
+  color: var(--ui-text-tertiary, currentColor);
+}
+.mobile-preview-new-tab,
+.mobile-preview-close {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-close {
+  margin-right: calc(env(safe-area-inset-right) + 0.5rem);
+}
+.mobile-preview-content {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.mobile-preview-url {
+  width: 100%;
+}
+.mobile-preview-browserbar {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem calc(env(safe-area-inset-right) + 0.5rem) 0.25rem calc(env(safe-area-inset-left) + 0.5rem);
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.25));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+}
+.mobile-preview-browserbar button {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-browserbar .mobile-preview-open-external {
+  display: flex;
+  width: auto;
+  min-width: 2.75rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding-inline: 0.5rem;
+  font-size: 0.75rem;
+}
+.mobile-preview-browserbar input {
+  min-width: 0;
+  height: 2.75rem;
+  flex: 1;
+  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.45));
+  border-radius: 0.75rem;
+  background: var(--ui-chat-surface-background, var(--dt-background, #0d2f86));
+  color: var(--ui-text-primary, currentColor);
+  padding-inline: 0.75rem;
+}
+.mobile-preview-webpage {
+  width: 100%;
+  min-height: 0;
+  flex: 1;
+  border: 0;
+  background: white;
+}
+.mobile-preview-unavailable {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  place-items: center;
+  align-content: center;
+  gap: 0.75rem;
+  padding: 2rem;
+  text-align: center;
+}
+.mobile-preview-unavailable p {
+  max-width: 22rem;
+  margin: 0;
+  color: var(--ui-text-tertiary, currentColor);
+  line-height: 1.5;
+}
+
+/* Motion is limited to navigation/state changes: no ambient animation, no
+   animated body copy, and a complete reduced-motion opt-out. */
+@media (prefers-reduced-motion: no-preference) {
+  .mobile-preview-overlay {
+    animation: mobile-preview-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .mobile-preview-tab [role='tab'],
+  .mobile-preview-tab > button,
+  .mobile-preview-new-tab,
+  .mobile-preview-close,
+  .mobile-preview-browserbar button,
+  .mobile-preview-browserbar input {
+    transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease, transform 150ms ease;
+  }
+  .mobile-preview-tab > button:active,
+  .mobile-preview-new-tab:active,
+  .mobile-preview-close:active,
+  .mobile-preview-browserbar button:active {
+    background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+    transform: scale(0.95);
+  }
+  .mobile-preview-browserbar input:focus {
+    border-color: var(--dt-ring, currentColor);
+  }
+  .mobile-preview-url,
+  .mobile-preview-content > aside {
+    animation: mobile-preview-content-enter 150ms ease-out both;
+  }
+}
+@keyframes mobile-preview-enter {
+  from { opacity: 0.01; transform: translateY(0.375rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes mobile-preview-content-enter {
+  from { opacity: 0.01; transform: translateX(0.25rem); }
+  to { opacity: 1; transform: translateX(0); }
 }

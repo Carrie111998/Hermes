@@ -55,6 +55,9 @@ describe('MobileToolbar', () => {
       })
     )
 
+    const dialog = screen.getByRole('dialog', { name: 'Desktop actions' })
+    expect(dialog.getAttribute('data-mobile-toolbar-origin')).toBe('top-right')
+
     fireEvent.click(screen.getByRole('button', { name: 'Files' }))
     expect(onFiles).toHaveBeenCalledWith('files')
 
