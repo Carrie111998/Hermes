@@ -32,7 +32,14 @@ import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { notifyError } from '@/store/notifications'
 
 import { createPluginContext, type HermesPlugin } from './plugin'
-import { $pluginRecords, dropPlugin, pluginActive, type PluginKind, publishPlugin } from './plugins-store'
+import {
+  $pluginRecords,
+  dropPlugin,
+  markPluginDiscoveryReady,
+  pluginActive,
+  type PluginKind,
+  publishPlugin
+} from './plugins-store'
 
 interface LoadOptions {
   /** Root-level default-enable CAP: `false` ships the plugin opt-in (inventory
@@ -417,7 +424,13 @@ async function scanDiskPlugins(): Promise<void> {
 
   // Re-entrancy guard: the 5s poll must not overlap a slow in-flight scan
   // (reads/loads can exceed the interval).
-  if (!desktop || scanning) {
+  if (!desktop) {
+    markPluginDiscoveryReady()
+
+    return
+  }
+
+  if (scanning) {
     return
   }
 
@@ -508,6 +521,7 @@ async function scanDiskPlugins(): Promise<void> {
     // No plugin roots (or no gateway yet) — nothing to reconcile.
   } finally {
     scanning = false
+    markPluginDiscoveryReady()
   }
 }
 

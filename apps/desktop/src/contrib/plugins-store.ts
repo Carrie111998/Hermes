@@ -75,6 +75,11 @@ function saveDecisions(next: Record<string, boolean>) {
 
 export const $pluginRecords = atom<Record<string, PluginRecord>>({})
 
+/** True after the initial disk-plugin scan has registered its contributions. */
+export const $pluginDiscoveryReady = atom(false)
+
+export const markPluginDiscoveryReady = (): void => $pluginDiscoveryReady.set(true)
+
 /** Loader-owned lifecycle controls for a plugin (activate/deactivate). */
 interface PluginHandle {
   activate: () => Promise<void> | void

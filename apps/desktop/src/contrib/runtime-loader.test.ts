@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HermesReadDirResult } from '@/global'
 import type * as HermesModule from '@/hermes'
 
-import { $pluginRecords, publishPlugin, setPluginEnabled } from './plugins-store'
+import {
+  $pluginDiscoveryReady,
+  $pluginRecords,
+  publishPlugin,
+  setPluginEnabled
+} from './plugins-store'
 import { discoverRuntimePlugins, loadRuntimePlugin, watchRuntimePlugins } from './runtime-loader'
 
 // getStatus would supply the connected backend's hermes_home — a REMOTE path in
@@ -37,6 +42,7 @@ beforeEach(() => {
   stopPreviewFileWatch.mockResolvedValue(true)
   onPreviewFileChanged.mockReset()
   getStatus.mockClear()
+  $pluginDiscoveryReady.set(false)
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
     agentPluginsRoot,
     desktopPluginsRoot,
@@ -54,6 +60,18 @@ afterEach(() => {
 })
 
 describe('scanDiskPlugins (#66899)', () => {
+  it('marks initial plugin discovery ready after the scan completes', async () => {
+    desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
+    agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
+    readDir.mockResolvedValue({ entries: [] })
+
+    expect($pluginDiscoveryReady.get()).toBe(false)
+
+    await discoverRuntimePlugins()
+
+    expect($pluginDiscoveryReady.get()).toBe(true)
+  })
+
   it('scans the Electron-resolved local roots, never the backend hermes_home', async () => {
     desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
     agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')

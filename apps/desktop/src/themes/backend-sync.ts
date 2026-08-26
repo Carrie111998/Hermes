@@ -26,6 +26,9 @@ import type { DesktopTheme } from './types'
 /** Skins pushed by the backend, keyed by name. Merged by `listAllThemes`. */
 export const $backendThemes = atom<Record<string, DesktopTheme>>({})
 
+/** True after the backend has supplied a valid resolved skin at least once. */
+export const $backendSkinReady = atom(false)
+
 /** One-shot skin name the ThemeProvider should switch to (it clears this). */
 export const $pendingSkinApply = atom<string | null>(null)
 
@@ -41,6 +44,7 @@ let lastSynced: { applied: boolean; name: string } | null = null
 export function __resetBackendSkinSync(): void {
   lastSynced = null
   $backendThemes.set({})
+  $backendSkinReady.set(false)
   $pendingSkinApply.set(null)
 }
 
@@ -76,6 +80,10 @@ export function ingestBackendSkin(skin: HermesSkin | undefined | null, { apply }
       $backendThemes.set({ ...current, [name]: theme })
     }
   }
+
+  // Registration above is synchronous. Once this flips, the merged registry
+  // can safely distinguish a delayed custom skin from a genuinely stale name.
+  $backendSkinReady.set(true)
 
   if (!apply) {
     // Connect-time seed: record without painting. A reconnect re-seed keeps an
