@@ -3508,6 +3508,18 @@ async def _relay_async_completion(
     )
 
 
+def _require_auxiliary_stream_middleware_support() -> None:
+    from hermes_cli.middleware import (
+        RequiredMiddlewareError,
+        llm_execution_middleware_required,
+    )
+
+    if llm_execution_middleware_required():
+        raise RequiredMiddlewareError(
+            "streaming auxiliary provider execution is blocked in strict middleware mode"
+        )
+
+
 def _relay_sync_stream(
     client: Any,
     kwargs: dict[str, Any],
@@ -3515,14 +3527,7 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
-    from hermes_cli.middleware import (
-        RequiredMiddlewareError,
-        llm_execution_middleware_required,
-    )
-    if llm_execution_middleware_required():
-        raise RequiredMiddlewareError(
-            "streaming auxiliary provider execution is blocked in strict middleware mode"
-        )
+    _require_auxiliary_stream_middleware_support()
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return client.chat.completions.create(**kwargs)
@@ -9662,6 +9667,8 @@ def _call_llm_impl(
     # a non-streaming call on error. stream_options is best-effort: providers that
     # reject it surface an error the caller's fallback already handles.
     if stream:
+        # Fence every streaming fast path before an adapter can invoke a provider.
+        _require_auxiliary_stream_middleware_support()
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options

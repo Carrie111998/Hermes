@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent import auxiliary_client
+from agent.auxiliary_client import CodexAuxiliaryClient, call_llm
 from hermes_cli.middleware import RequiredMiddlewareError
 
 
@@ -103,4 +104,54 @@ def test_strict_auxiliary_stream_blocks_before_provider(monkeypatch):
 
     with pytest.raises(RequiredMiddlewareError, match="streaming auxiliary"):
         run("moa_aggregator")
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize(
+    "middleware_callbacks",
+    [[], [lambda request, next_call, **_context: next_call(request)]],
+    ids=["missing", "registered"],
+)
+def test_strict_codex_moa_stream_blocks_before_provider(
+    monkeypatch, middleware_callbacks
+):
+    """The public MoA path must fence its completed-response fast path."""
+    provider_calls = []
+    completed = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="unsafe"))]
+    )
+    real_client = SimpleNamespace(
+        api_key="test-key",
+        base_url="https://public.example.invalid/codex/",
+        close=lambda: None,
+    )
+    client = CodexAuxiliaryClient(real_client, "synthetic-model")
+
+    def create(**kwargs):
+        provider_calls.append(kwargs)
+        return completed
+
+    monkeypatch.setattr(client.chat.completions, "create", create)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_get_cached_client",
+        lambda *args, **kwargs: (client, "synthetic-model"),
+    )
+    monkeypatch.setenv("HERMES_REQUIRE_LLM_EXECUTION_MIDDLEWARE", "true")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: SimpleNamespace(
+            _middleware={"llm_execution": middleware_callbacks}
+        ),
+    )
+
+    with pytest.raises(RequiredMiddlewareError, match="streaming auxiliary"):
+        call_llm(
+            task="moa_aggregator",
+            provider="openai-codex",
+            model="synthetic-model",
+            messages=[{"role": "user", "content": "synthetic"}],
+            stream=True,
+        )
+
     assert provider_calls == []
