@@ -1306,7 +1306,14 @@ def test_real_hermes_registers_the_fixed_card_as_blocked_dir_workspace_without_s
     workspace.mkdir()
     environment = os.environ.copy()
     environment.update({"HERMES_HOME": str(profile), "HOME": str(tmp_path / "home")})
-    for name in ("GH_TOKEN", "GITHUB_TOKEN", "HERMES_PROFILE"):
+    for name in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "HERMES_PROFILE",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
         environment.pop(name, None)
     board = subprocess.run(
         [hermes, "kanban", "boards", "create", "repairs"],
