@@ -19,6 +19,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -226,6 +227,19 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # coroutine pinning its worker — a 97-minute penalty on the boot path
 # froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+
+# Generic action buttons (#15311). ``callback_data`` carries ONLY a
+# server-minted nonce — never a producer-supplied value — so a forged tap can
+# neither inject text nor address a built-in flow's prefix. Versioned so the
+# payload can gain structure later without breaking outstanding buttons.
+_ACTION_BUTTON_PREFIX = "hb1:"
+_ACTION_BUTTON_TTL_SECS = 600.0
+# Hard cap on outstanding buttons; the oldest are evicted first. Only a
+# delivered keyboard is ever registered, so a producer whose sends keep failing
+# cannot grow the registry — or evict live buttons out of it.
+_ACTION_BUTTON_MAX_PENDING = 512
+_ACTION_BUTTON_MAX_ROWS = 8
+_ACTION_BUTTON_MAX_PER_ROW = 8
 
 
 def _flood_cap_result(wait: float) -> "SendResult":
@@ -842,6 +856,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Generic action-button state: nonce → delivered-button record. Modeled
+        # on the relay connector's pending-prompt registry
+        # (gateway/relay/adapter.py _mint_prompt/_pop_prompt): in-memory,
+        # TTL-bounded, single-use, and restart-ephemeral. Written by
+        # _commit_action_buttons once a send has actually delivered.
+        self._action_button_state: Dict[str, Dict[str, Any]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -1380,6 +1400,84 @@ class TelegramAdapter(BasePlatformAdapter):
         extra = getattr(getattr(self, "config", None), "extra", None) or {}
         return str(extra.get("unauthorized_dm_behavior", "")).strip().lower() == "pair"
 
+    def _adapter_allow_from_decision(self, source) -> Optional[bool]:
+        """Adapter-level ``allow_from``/``group_allow_from`` for this source.
+
+        When configured for the source's chat type they are the SOLE authority
+        (a hard constraint, not one voice among several), so this returns a
+        verdict; ``None`` means no adapter allowlist applies. Group/forum/
+        channel chats use ``group_allow_from``, DMs use ``allow_from``.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        if (source.chat_type or "") in ("group", "forum", "channel"):
+            adapter_allow_from = extra.get("group_allow_from")
+        else:
+            adapter_allow_from = extra.get("allow_from")
+        if adapter_allow_from is None:
+            return None
+        allowed = _coerce_allow_set(adapter_allow_from)
+        return source.user_id in allowed or "*" in allowed
+
+    def _runner_authorization_decision(self, source) -> Optional[bool]:
+        """Resolve ``source`` through the gateway's full auth chain.
+
+        Prefers the platform-bound callback registered via
+        ``set_authorization_check``: it routes to
+        ``GatewayRunner._is_user_authorized`` AND survives multiplex handler
+        wrapping, whereas the bound-handler ``__self__`` lookup is None when
+        the primary handler is a profile closure (#87132). Falls back to the
+        bound handler for setups without a registered callback; ``None`` when
+        neither is available or the runner raised.
+        """
+        # getattr: adapters built via object.__new__() never ran
+        # BasePlatformAdapter.__init__, and _is_sender_authorized reads the
+        # attribute directly.
+        decision = (
+            self._is_sender_authorized(
+                source.user_id, chat_type=source.chat_type, chat_id=source.chat_id,
+            )
+            if getattr(self, "_authorization_check", None) is not None
+            else None
+        )
+        if decision is not None:
+            return decision
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                return bool(auth_fn(source))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back to env-only auth for user %s",
+                    source.user_id,
+                    exc_info=True,
+                )
+        return None
+
+    def _is_callback_actor_authorized(self, source) -> bool:
+        """Authorize an inline-button tap exactly as a typed message is.
+
+        Same chain as :meth:`_is_user_authorized_from_message` — adapter
+        ``allow_from``/``group_allow_from`` as a hard constraint, then the
+        profile-bound authorization callback / runner, then the env allowlist —
+        with the message path's fail-open exits removed: a tap is never a
+        pairing handshake, so "undecidable" means deny.
+        """
+        if not (source.user_id or "").strip():
+            return False
+        decision = self._adapter_allow_from_decision(source)
+        if decision is None:
+            decision = self._runner_authorization_decision(source)
+        if decision is not None:
+            return decision
+        allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
+        if not allowed_csv:
+            # Fail-closed: no allowlist and no runner means deny by default
+            # (#24457); GATEWAY_ALLOW_ALL_USERS is the explicit opt-in.
+            return _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        return "*" in allowed_ids or source.user_id in allowed_ids
+
     def _is_user_authorized_from_message(self, message: Message) -> bool:
         """Check if the sender of a Telegram message is authorized.
 
@@ -1402,18 +1500,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
-        authorized: Optional[bool] = None
-
         # Adapter-level allow_from / group_allow_from: when set, they are the
         # sole authority.  Group chats use group_allow_from; DMs use allow_from.
-        chat_type = source.chat_type or ""
-        if chat_type in ("group", "forum", "channel"):
-            adapter_allow_from = self.config.extra.get("group_allow_from")
-        else:
-            adapter_allow_from = self.config.extra.get("allow_from")
-        if adapter_allow_from is not None:
-            allowed = _coerce_allow_set(adapter_allow_from)
-            authorized = user_id in allowed or "*" in allowed
+        authorized: Optional[bool] = self._adapter_allow_from_decision(source)
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -1454,26 +1543,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # being default-denied here.
                 if not self._telegram_auth_env_configured():
                     return True
-                decision = (
-                    self._is_sender_authorized(
-                        user_id,
-                        chat_type=source.chat_type,
-                        chat_id=source.chat_id,
-                    )
-                    if has_callback
-                    else None
-                )
-                if decision is not None:
-                    authorized = decision
-                elif callable(auth_fn):
-                    try:
-                        authorized = bool(auth_fn(source))
-                    except Exception:
-                        logger.debug(
-                            "[Telegram] Falling back to env-only auth for user %s",
-                            user_id,
-                            exc_info=True,
-                        )
+                authorized = self._runner_authorization_decision(source)
 
         if authorized is None:
             allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
@@ -2232,12 +2302,20 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
+        *,
+        reply_markup: Optional["InlineKeyboardMarkup"] = None,
+        pending_buttons: Optional["List[Dict[str, Any]]"] = None,
     ) -> Optional[SendResult]:
         """Attempt a single ``sendRichMessage`` send.
 
         Returns a :class:`SendResult` (success, or a transient failure that the
         caller must NOT legacy-resend), or ``None`` to signal "fall back to the
         legacy MarkdownV2 path" (permanent/capability error or DM-topic skip).
+
+        ``sendRichMessage`` takes ``reply_markup`` like every other send method,
+        so action buttons ride this path too; if Telegram rejects the markup the
+        BadRequest is a normal fallback error and the legacy path re-sends the
+        keyboard (nothing is registered until a send succeeds).
         """
         thread_id = self._metadata_thread_id(metadata)
         routing = self._compute_single_send_routing(chat_id, reply_to, metadata, thread_id)
@@ -2262,6 +2340,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # params are silently ignored by the Bot API, so the scalar would
             # quietly drop the reply anchor instead of erroring.
             payload["reply_parameters"] = {"message_id": reply_to_id}
+        if reply_markup is not None:
+            # Raw endpoint: serialize the markup ourselves (PTB only does that
+            # for its own typed methods).
+            to_dict = getattr(reply_markup, "to_dict", None)
+            payload["reply_markup"] = to_dict() if callable(to_dict) else reply_markup
 
         try:
             # Take the raw Bot API result (dict under real PTB). Passing
@@ -2313,6 +2396,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 retry_after=_retry_after,
             )
 
+        if pending_buttons:
+            self._commit_action_buttons(pending_buttons, msg, chat_id=chat_id)
         message_id = None
         if isinstance(msg, dict):
             message_id = msg.get("message_id")
@@ -5250,6 +5335,289 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    # ── Generic action buttons (#15311) ──────────────────────────────────
+    # Producers declare buttons in ``metadata["buttons"]``; a tap comes back as
+    # a ``gateway_platform_event`` of type ``action_button``. Separate from the
+    # built-in clarify/approval/model-picker flows, which own their own prefixes.
+
+    def _action_buttons(self) -> Dict[str, Dict[str, Any]]:
+        """The pending-button registry, lazily created — tests build adapters
+        via ``object.__new__()`` (same getattr() posture as ``_send_path_degraded``)."""
+        if getattr(self, "_action_button_state", None) is None:
+            self._action_button_state = {}
+        return self._action_button_state
+
+    def _action_button_reservations(self) -> Set[str]:
+        """Nonces minted for a send that has not committed yet.
+
+        The registry alone cannot answer "is this nonce free?" while a send is
+        in flight: a keyboard's nonces are only committed once Telegram
+        confirms the delivery, so two sends building markup concurrently would
+        both read an empty registry and could mint the same one. Reserving at
+        mint time closes that window; :meth:`send` releases the reservation on
+        every exit, by which point a delivered nonce lives in the registry —
+        which is what keeps it unique from there on.
+        """
+        if getattr(self, "_action_button_reserved", None) is None:
+            self._action_button_reserved = set()
+        return self._action_button_reserved
+
+    def _new_action_button_nonce(self, taken: Set[str]) -> str:
+        """A nonce unique against the registry, this keyboard, and every
+        in-flight send's reservations. Regenerated while it collides."""
+        import secrets
+
+        registry = self._action_buttons()
+        reserved = self._action_button_reservations()
+        nonce = secrets.token_hex(8)
+        while nonce in registry or nonce in taken or nonce in reserved:
+            nonce = secrets.token_hex(8)
+        return nonce
+
+    def _release_action_button_nonces(self, pending: "List[Dict[str, Any]]") -> None:
+        """Drop one send's nonce reservations.
+
+        Delivered nonces have already moved into the registry by this point, so
+        releasing is not un-reserving them; undelivered ones simply become
+        mintable again.
+        """
+        if not pending:
+            return
+        reserved = self._action_button_reservations()
+        for record in pending:
+            reserved.discard(record.get("nonce"))
+
+    def _action_button_profile(
+        self,
+        *,
+        source: Optional[Any] = None,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """The profile lane an action button belongs to.
+
+        ``_session_key_profile`` is the gateway's own answer to "which profile
+        does this source belong to" — the route-stamped ``source.profile``
+        first, then this adapter's credential owner, then the session store's
+        resolver — and it is what a dispatched tap is keyed on downstream.
+        Feeding it a source built from the button's CANONICAL chat/thread makes
+        the send side ask *exactly* the question the callback side answers, so a
+        healthy round trip agrees by construction, while a lane that has drifted
+        apart (re-pointed ``profile_routes``, a re-owned adapter) fails closed
+        instead of dispatching a tap into another profile's session.
+        """
+        if source is None and chat_id:
+            try:
+                source = self.build_source(chat_id=str(chat_id), thread_id=thread_id)
+            except Exception:  # bare/partial adapter: fall back to the owner answer
+                source = None
+        return self._session_key_profile(source)
+
+    def _commit_action_buttons(
+        self,
+        pending: "List[Dict[str, Any]]",
+        sent_message: Any,
+        *,
+        chat_id: str,
+    ) -> None:
+        """Register delivered buttons against the identity Telegram assigned.
+
+        Called only once a send has actually returned a message, so the record
+        is bound to the CANONICAL identity of the message the keyboard is
+        attached to — the numeric ``chat.id`` (never an ``@username``), the
+        normalized effective thread id, and the message id — which is exactly
+        what a tap on that keyboard reports back. Minting on the way in instead
+        would leave live nonces behind for every send that never delivered, and
+        a retry loop would evict delivered buttons out of the FIFO bound.
+
+        A send that fails ambiguously (a timeout that may still have delivered)
+        therefore leaves its buttons inert: they answer "expired" rather than
+        act on an identity we never confirmed. The same applies when the
+        response did not carry a full identity: BOTH canonical ids are required,
+        because a record missing one would turn that half into a wildcard the
+        tap side has nothing to check.
+
+        The profile lane is bound here too, from the same canonical identity the
+        tap resolves — see :meth:`_action_button_profile`.
+        """
+        if not pending:
+            return
+        sent_chat_id, thread_id, message_id = self._sent_message_identity(sent_message)
+        bound_chat_id = sent_chat_id
+        if bound_chat_id is None and chat_id:
+            # Fall back to the requested chat only when it is a canonical
+            # numeric id; an "@username" has no numeric id a tap could ever
+            # match, so bind nothing rather than a record that can only expire.
+            requested = str(chat_id)
+            bound_chat_id = requested if requested.lstrip("-").isdigit() else None
+        if not bound_chat_id or not message_id:
+            logger.debug(
+                "[%s] action buttons left unregistered: incomplete send identity "
+                "(chat_id=%s message_id=%s)",
+                self.name, bound_chat_id, message_id,
+            )
+            return
+        profile = self._action_button_profile(
+            chat_id=bound_chat_id, thread_id=thread_id,
+        )
+        registry = self._action_buttons()
+        now = time.monotonic()
+        for stale in [k for k, v in registry.items() if v.get("expires_at", 0) < now]:
+            registry.pop(stale, None)
+        while registry and len(registry) + len(pending) > _ACTION_BUTTON_MAX_PENDING:
+            registry.pop(next(iter(registry)), None)
+        for record in pending:
+            registry[record["nonce"]] = {
+                "producer": record.get("producer"),
+                "label": record.get("label"),
+                "value": record.get("value"),
+                "chat_id": bound_chat_id,
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "profile": profile,
+                "created_at": now,
+                "expires_at": now + _ACTION_BUTTON_TTL_SECS,
+            }
+
+    def _sent_message_identity(self, msg: Any) -> tuple:
+        """``(chat_id, thread_id, message_id)`` for a message we just sent.
+
+        Handles both a PTB ``Message`` (legacy path) and the raw Bot API dict
+        the rich path returns. The thread id is normalized through
+        ``_effective_message_thread_id`` so a forum General-topic send binds to
+        ``"1"`` and a plain reply's anchor id binds to ``None`` — the same
+        normalization a tap on that message goes through.
+        """
+        if isinstance(msg, dict):
+            result = msg.get("result") if isinstance(msg.get("result"), dict) else msg
+            chat = result.get("chat") if isinstance(result.get("chat"), dict) else {}
+            msg = SimpleNamespace(
+                message_id=result.get("message_id"),
+                message_thread_id=result.get("message_thread_id"),
+                is_topic_message=result.get("is_topic_message"),
+                chat=SimpleNamespace(
+                    id=chat.get("id"),
+                    type=chat.get("type"),
+                    is_forum=chat.get("is_forum"),
+                ),
+            )
+        chat_id = getattr(getattr(msg, "chat", None), "id", None)
+        message_id = getattr(msg, "message_id", None)
+        try:
+            thread_id = self._effective_message_thread_id(msg)
+        except Exception:  # non-Message stand-in: bind no thread rather than a wrong one
+            thread_id = None
+        return (
+            str(chat_id) if isinstance(chat_id, (int, str)) and str(chat_id).strip() else None,
+            str(thread_id) if thread_id is not None else None,
+            str(message_id) if isinstance(message_id, (int, str)) and str(message_id).strip() else None,
+        )
+
+    def _pop_action_button(
+        self,
+        nonce: str,
+        *,
+        chat_id: Optional[str],
+        thread_id: Optional[str],
+        message_id: Optional[str],
+        profile: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Consume a pending action button whose bound identity matches the tap.
+
+        Single-use, TTL-bounded, and bound to the exact message the keyboard was
+        delivered on AND the profile lane it was minted for: a tap from another
+        chat, another forum topic, a different message, or a chat that now
+        resolves to a different profile is NOT consumed, so the button still
+        works where it was minted. Every comparison is an unconditional exact
+        match — an identity the tap cannot report is a mismatch, never a
+        wildcard. Expired entries are dropped on the way past.
+        """
+        registry = self._action_buttons()
+        record = registry.get(str(nonce))
+        if not record:
+            return None
+        if not chat_id or not message_id:
+            return None
+        if (
+            record.get("chat_id") != str(chat_id)
+            or record.get("thread_id") != (str(thread_id) if thread_id is not None else None)
+            or record.get("message_id") != str(message_id)
+            or record.get("profile") != profile
+        ):
+            return None
+        registry.pop(str(nonce), None)
+        if record.get("expires_at", 0) < time.monotonic():
+            return None
+        return record
+
+    def _build_reply_markup(
+        self, metadata: Optional[Dict[str, Any]]
+    ) -> tuple:
+        """Build an inline keyboard from ``metadata["buttons"]``.
+
+        Returns ``(markup, pending)`` — ``(None, [])`` when there are no
+        buttons. ``pending`` holds the not-yet-registered records; they are
+        committed by :meth:`_commit_action_buttons` once the send that carries
+        the keyboard has actually delivered.
+
+        Accepts a flat list of buttons (one row) or a list of rows. Each button
+        is ``{"text": ..., "url": ...}`` for a link, or ``{"text": ...,
+        "callback_data"|"value"|"action": ...}`` for an action. An action's
+        value is NOT put on the wire: it is stored in the pending-button
+        registry and the button carries the minted nonce instead, so a forged
+        ``callback_data`` can neither replay a producer's value nor address the
+        ``ea:``/``cl:``/``mp:`` prefixes the built-in flows own.
+        """
+        buttons = (metadata or {}).get("buttons")
+        if not isinstance(buttons, (list, tuple)) or not buttons:
+            return None, []
+        rows_in = buttons if any(isinstance(b, (list, tuple)) for b in buttons) else [buttons]
+        producer = str((metadata or {}).get("button_producer") or "unknown")[:64]
+        pending: List[Dict[str, Any]] = []
+        minted: Set[str] = set()
+        rows = []
+        for row_in in rows_in[:_ACTION_BUTTON_MAX_ROWS]:
+            if not isinstance(row_in, (list, tuple)):
+                row_in = [row_in]
+            row = []
+            for spec in row_in[:_ACTION_BUTTON_MAX_PER_ROW]:
+                if not isinstance(spec, dict):
+                    continue
+                text = str(spec.get("text") or spec.get("label") or "").strip()[:64]
+                if not text:
+                    continue
+                url = spec.get("url")
+                if isinstance(url, str) and url.strip():
+                    row.append(InlineKeyboardButton(text, url=url.strip()))
+                    continue
+                raw = spec.get("callback_data", spec.get("value", spec.get("action")))
+                if raw is None:
+                    continue
+                nonce = self._new_action_button_nonce(minted)
+                minted.add(nonce)
+                pending.append({
+                    "nonce": nonce,
+                    "producer": producer,
+                    "label": text,
+                    "value": str(raw)[:512],
+                })
+                row.append(InlineKeyboardButton(
+                    text, callback_data=f"{_ACTION_BUTTON_PREFIX}{nonce}",
+                ))
+            if row:
+                rows.append(row)
+        if not rows:
+            return None, []
+        # Build the markup BEFORE reserving: a constructor failure then leaks
+        # nothing, because the send-side finally block can only release the
+        # pending list it was handed back and a raise here never returns one.
+        markup = InlineKeyboardMarkup(rows)
+        # Reserve adapter-wide until this send commits or exits, so a second
+        # send building its markup before this one delivers cannot mint the
+        # same nonce off the still-empty registry.
+        self._action_button_reservations().update(minted)
+        return markup, pending
+
     async def send(
         self,
         chat_id: str,
@@ -5281,15 +5649,30 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        pending_buttons: List[Dict[str, Any]] = []
         try:
+            # Action buttons (#15311). Both send paths carry reply_markup, so
+            # buttoned rich content (tables/task lists/math) still renders
+            # natively instead of being pushed through the lossy MarkdownV2
+            # chunker. The pending records stay uncommitted until a send
+            # actually delivers.
+            reply_markup, pending_buttons = self._build_reply_markup(metadata)
+
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
             if self._should_attempt_rich(content, metadata=metadata):
-                rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
+                rich_result = await self._try_send_rich(
+                    chat_id,
+                    content,
+                    reply_to,
+                    metadata,
+                    reply_markup=reply_markup,
+                    pending_buttons=pending_buttons,
+                )
                 if rich_result is not None:
                     if rich_result.success:
                         # Re-trigger typing like the legacy success path does,
@@ -5343,6 +5726,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
+                # Buttons belong on the last chunk only — one keyboard per
+                # action, whatever the split. Absent when there are none, so
+                # the kwargs a button-less send makes are byte-for-byte
+                # unchanged.
+                is_last_chunk = i == len(chunks) - 1
+                markup_kwargs = (
+                    {"reply_markup": reply_markup}
+                    if reply_markup is not None and is_last_chunk
+                    else {}
+                )
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
                 # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
@@ -5397,6 +5790,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **markup_kwargs,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -5411,6 +5805,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **markup_kwargs,
                                 )
                             else:
                                 raise
@@ -5550,6 +5945,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
+                if markup_kwargs and pending_buttons and msg is not None:
+                    self._commit_action_buttons(pending_buttons, msg, chat_id=chat_id)
                 message_ids.append(str(msg.message_id))
 
             # Re-trigger typing indicator after sending a message.
@@ -5606,6 +6003,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
                 error_kind=error_kind,
             )
+        finally:
+            # Every exit — delivered, failed, or raised — drops this send's
+            # nonce reservations. Delivered ones are already in the registry.
+            self._release_action_button_nonces(pending_buttons)
 
     async def send_or_update_status(
         self,
@@ -7172,6 +7573,199 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    @staticmethod
+    def _is_inaccessible_callback_message(message: Any) -> bool:
+        """Whether a tap's message is PTB's ``InaccessibleMessage``.
+
+        Telegram delivers one whenever the tapped message was deleted or
+        predates the bot's access window, and PTB permits it anywhere a
+        callback's ``message`` appears. Recognized structurally rather than by
+        ``isinstance``: the gateway test suite substitutes a mock ``telegram``
+        module, so the real class is not always a usable type. The object
+        carries only ``chat``, ``message_id`` and ``date`` — the absence of
+        ``message_thread_id`` IS "this message cannot report its thread".
+        """
+        if message is None:
+            return False
+        return (
+            type(message).__name__ == "InaccessibleMessage"
+            or not hasattr(message, "message_thread_id")
+        )
+
+    def _callback_message_identity(self, query) -> tuple:
+        """``(chat_id, thread_id, message_id, thread_known)`` for a tap's message.
+
+        Normalized exactly like :meth:`_sent_message_identity` does for the
+        outbound side — numeric ``chat.id``, effective thread id (forum General
+        topic → ``"1"``, a plain reply's anchor id → ``None``) — so the two can
+        be compared for equality without either footgun.
+
+        ``thread_known`` is ``False`` for an ``InaccessibleMessage``: it carries
+        no ``message_thread_id`` at all, and feeding that absence to the normal
+        resolver would read it as the General topic ``"1"`` for ANY forum chat,
+        falsely expiring every button bound to some other topic. Callers must
+        recover the thread from a trusted source rather than believe the
+        ``None``.
+        """
+        message = getattr(query, "message", None)
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if not isinstance(chat_id, (int, str)) or not str(chat_id).strip():
+            chat_id = getattr(message, "chat_id", None)
+        message_id = getattr(message, "message_id", None)
+        thread_known = not self._is_inaccessible_callback_message(message)
+        thread_id = None
+        if thread_known:
+            try:
+                thread_id = self._effective_message_thread_id(message)
+            except Exception:
+                thread_id = None
+        return (
+            str(chat_id).strip() if isinstance(chat_id, (int, str)) and str(chat_id).strip() else None,
+            str(thread_id) if thread_id is not None else None,
+            str(message_id) if isinstance(message_id, (int, str)) and str(message_id).strip() else None,
+            thread_known,
+        )
+
+    def _action_button_thread_from_registry(
+        self,
+        nonce: str,
+        *,
+        chat_id: Optional[str],
+        message_id: Optional[str],
+    ) -> Optional[str]:
+        """The thread a nonce was delivered to, for a tap that cannot report one.
+
+        Trusted only once the parts an ``InaccessibleMessage`` CAN report — the
+        numeric chat id and the message id — match the record exactly, so a tap
+        from anywhere else cannot borrow another record's topic. Non-consuming:
+        :meth:`_pop_action_button` still runs the full match afterwards.
+        """
+        if not nonce or not chat_id or not message_id:
+            return None
+        record = self._action_buttons().get(str(nonce))
+        if not record:
+            return None
+        if (
+            record.get("chat_id") != str(chat_id)
+            or record.get("message_id") != str(message_id)
+        ):
+            return None
+        return record.get("thread_id")
+
+    def _source_from_callback_for_auth(self, query, nonce: Optional[str] = None):
+        """Build the SessionSource for an action-button tap's actor.
+
+        The authorized identity is the CLICKING user (``callback_query.from``)
+        in the canonical chat/thread the tapped message lives in, so the
+        gateway's profile-scoped gate applies to a tap exactly as it does to a
+        typed message. Raises ``ValueError`` when the actor, chat or message
+        identity is absent so the boundary fails closed — every one of them is
+        compared exactly against the registry record, so a missing one can only
+        ever be a mismatch.
+        """
+        user = getattr(query, "from_user", None)
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user_id = str(getattr(user, "id", "") or "").strip() or None
+        chat_id, thread_id, message_id, thread_known = self._callback_message_identity(query)
+        if not user_id or not chat_id or not message_id:
+            raise ValueError(
+                "gateway_platform_event action_button requires actor, chat and "
+                "message identities"
+            )
+        if not thread_known:
+            # The tap cannot report its own topic — take the one this exact
+            # chat/message was registered under instead of the resolver's
+            # General-topic reading of the absence.
+            thread_id = self._action_button_thread_from_registry(
+                nonce, chat_id=chat_id, message_id=message_id,
+            )
+        chat_type = str(getattr(chat, "type", "dm") or "dm").strip().lower() or "dm"
+        if chat_type == "private":
+            chat_type = "dm"
+        elif chat_type == "supergroup":
+            chat_type = "forum" if thread_id is not None else "group"
+        return self.build_source(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=(
+                str(getattr(user, "username", "") or getattr(user, "full_name", "") or "").strip()
+                or None
+            ),
+            thread_id=thread_id,
+            message_id=message_id,
+        )
+
+    async def _handle_action_button_callback(self, query, data: str) -> None:
+        """Resolve an ``hb1:<nonce>`` tap into a ``gateway_platform_event``.
+
+        Admission runs first and through the same boundary a typed message goes
+        through (:meth:`_is_callback_actor_authorized`), so an unauthorized tap
+        can never consume the nonce. The nonce is then single-use: a replayed or
+        double tap finds nothing and is a no-op, as is a tap after the TTL or
+        after a restart (the registry is in-memory, the same tradeoff the relay
+        connector makes). The callback query is answered in a ``finally`` so no
+        failure — including a cancelled dispatch — leaves the client spinner
+        turning.
+        """
+        answer_text = "⌛ This action has expired."
+        nonce = data[len(_ACTION_BUTTON_PREFIX):]
+        try:
+            try:
+                source = self._source_from_callback_for_auth(query, nonce)
+            except Exception:
+                logger.debug(
+                    "[%s] action_button identity error", self.name, exc_info=True,
+                )
+                answer_text = "⛔ You are not authorized to use this button."
+                return
+            if not self._is_callback_actor_authorized(source):
+                answer_text = "⛔ You are not authorized to use this button."
+                return
+
+            record = self._pop_action_button(
+                nonce,
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                message_id=source.message_id,
+                profile=self._action_button_profile(source=source),
+            )
+            if record is None:
+                return
+            answer_text = str(record.get("label") or "Done")
+
+            event = {
+                "platform": "telegram",
+                "event_type": "action_button",
+                "payload": {
+                    # Identity comes from the validated record — the chat and
+                    # thread the keyboard was actually delivered to.
+                    "chat_id": str(record.get("chat_id"))[:128],
+                    "message_id": str(record.get("message_id"))[:128] if record.get("message_id") else None,
+                    "thread_id": str(record.get("thread_id"))[:128] if record.get("thread_id") else None,
+                    "user_id": str(source.user_id)[:128],
+                    "producer": str(record.get("producer") or "unknown")[:64],
+                    "label": str(record.get("label") or "")[:64],
+                    "value": str(record.get("value"))[:512] if record.get("value") is not None else None,
+                },
+            }
+            handler = getattr(self, "_platform_event_handler", None)
+            if handler is not None:
+                try:
+                    await handler(event, source)
+                except Exception:
+                    logger.debug(
+                        "[%s] action_button dispatch error", self.name, exc_info=True,
+                    )
+        finally:
+            try:
+                await query.answer(text=answer_text)
+            except Exception:
+                logger.debug(
+                    "[%s] action_button answer failed", self.name, exc_info=True,
+                )
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7186,6 +7780,13 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Generic action-button callbacks (hb1:<nonce>) ---
+        # Its own namespace; the built-in flows below own theirs and are
+        # untouched by this branch.
+        if data.startswith(_ACTION_BUTTON_PREFIX):
+            await self._handle_action_button_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

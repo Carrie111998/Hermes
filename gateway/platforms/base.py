@@ -74,6 +74,14 @@ _HISTORY_MEDIA_LOOKUP_MAX_WORKERS = 2
 _HISTORY_MEDIA_LOOKUP_ADMISSION = threading.BoundedSemaphore(
     _HISTORY_MEDIA_LOOKUP_MAX_WORKERS
 )
+# Send metadata that describes the CONTENT of one message rather than where it
+# is routed. A notice we compose ourselves about a failed send is a different
+# message, so it must not inherit these — action buttons (#15311) would
+# otherwise be re-rendered on the notice and register a second live copy of the
+# original actions, executable without the message that explained them.
+# Routing keys (thread, notification, reply anchors) are deliberately kept so
+# the notice still lands where the message would have.
+_CONTENT_SPECIFIC_SEND_METADATA = frozenset({"buttons", "button_producer"})
 
 
 def _platform_name(platform) -> str:
@@ -5610,6 +5618,18 @@ class BasePlatformAdapter(ABC):
             return self
         return live_adapter
 
+    @staticmethod
+    def _routing_only_metadata(metadata: Any) -> Any:
+        """Strip content-specific keys so a self-composed notice can reuse the
+        original send's routing (see ``_CONTENT_SPECIFIC_SEND_METADATA``)."""
+        if not isinstance(metadata, dict):
+            return metadata
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key not in _CONTENT_SPECIFIC_SEND_METADATA
+        }
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -5684,7 +5704,12 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    await self.send(
+                        chat_id=chat_id,
+                        content=notice,
+                        reply_to=reply_to,
+                        metadata=self._routing_only_metadata(metadata),
+                    )
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result

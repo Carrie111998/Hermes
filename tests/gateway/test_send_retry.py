@@ -25,6 +25,7 @@ class _StubAdapter(BasePlatformAdapter):
         super().__init__(cfg, Platform.TELEGRAM)
         self._send_results = []   # queue of SendResult to return per call
         self._send_calls = []     # record of (chat_id, content) sent
+        self._send_metadata = []  # metadata passed alongside each send
 
     def _next_result(self) -> SendResult:
         if self._send_results:
@@ -33,6 +34,7 @@ class _StubAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id, content, reply_to=None, metadata=None, **kwargs) -> SendResult:
         self._send_calls.append((chat_id, content))
+        self._send_metadata.append(metadata)
         return self._next_result()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -144,6 +146,38 @@ class TestSendWithRetryExhausted:
         # The notice content should mention delivery failure
         notice_content = adapter._send_calls[-1][1]
         assert "delivery failed" in notice_content.lower() or "Message delivery failed" in notice_content
+
+    @pytest.mark.asyncio
+    async def test_notice_does_not_inherit_the_action_buttons(self):
+        """The notice is a DIFFERENT message and must not carry the failed
+        message's buttons (#15311): they would register a second live copy of
+        the producer's actions, tappable with nothing on screen explaining what
+        they belong to. Routing metadata still rides along."""
+        adapter = _StubAdapter()
+        network_err = SendResult(success=False, error="httpx.ConnectError: host unreachable")
+        adapter._send_results = [network_err, network_err, network_err, SendResult(success=True)]
+        metadata = {
+            "buttons": [{"text": "Ship it", "value": "ship"}],
+            "button_producer": "deploy-webhook",
+            "thread_id": "42",
+            "notify": True,
+        }
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._send_with_retry(
+                "chat1", "Deploy?", metadata=metadata, max_retries=2, base_delay=0,
+            )
+
+        assert len(adapter._send_calls) == 4
+        notice_metadata = adapter._send_metadata[-1]
+        assert "buttons" not in notice_metadata
+        assert "button_producer" not in notice_metadata
+        # Routing survives, so the notice lands where the message would have.
+        assert notice_metadata["thread_id"] == "42"
+        assert notice_metadata["notify"] is True
+        # The real attempts keep the caller's own metadata, unmutated.
+        assert adapter._send_metadata[0] is metadata
+        assert metadata["buttons"] == [{"text": "Ship it", "value": "ship"}]
 
 
 # ---------------------------------------------------------------------------
