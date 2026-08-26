@@ -487,6 +487,32 @@ function currentGroupActivity(group) {
   return ($groupActivity.get()[group] || {}).events?.filter(event => (event.epoch || 0) === epoch) || []
 }
 
+/** Keep unresolved terminal alerts visible in the collapsed row even after the
+ *  turn settles. A later successful reply clears alerts for that member only.
+ *  Input is already scoped to the current epoch. */
+function groupActivitySummary(events) {
+  const current = Array.isArray(events) ? events : []
+  const resolvedMembers = new Set()
+
+  for (let i = current.length - 1; i >= 0; i--) {
+    const event = current[i]
+
+    if (event.kind === 'replied' || event.kind === 'delivered') {
+      resolvedMembers.add(event.member)
+      continue
+    }
+
+    if (
+      (event.kind === 'failed' || event.kind === 'timed-out') &&
+      !resolvedMembers.has(event.member)
+    ) {
+      return event
+    }
+  }
+
+  return current.length ? current[current.length - 1] : null
+}
+
 /** Human label for one activity event, used by the collapsed summary and
  *  the expanded rows. */
 function groupActivityLabel(event) {
@@ -12991,11 +13017,12 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
     }))
 
-  // Activity disclosure: quiet, collapsed by default. The collapsed row shows
-  // the latest event; expanding lists the current run's events newest-first.
-  // Events are epoch-tagged, so a superseded run's history drops out of view.
+  // Activity disclosure: quiet, collapsed by default. The collapsed row keeps
+  // a current-run failure/timeout visible over the later settled event;
+  // expanding lists the current run's events newest-first. Events are
+  // epoch-tagged, so a superseded run's history drops out of view.
   const activityEvents = currentGroupActivity(group)
-  const latestActivity = activityEvents.length ? activityEvents[activityEvents.length - 1] : null
+  const latestActivity = groupActivitySummary(activityEvents)
   const activityPanel = jsxs('div', {
     className: 'border-b border-(--ui-stroke-secondary)',
     children: [
@@ -13015,7 +13042,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           jsx('span', { className: 'shrink-0 font-medium', children: 'Activity' }),
           latestActivity
             ? jsx('span', {
-                className: 'min-w-0 flex-1 truncate',
+                className: cn('min-w-0 flex-1 truncate', groupActivityTone(latestActivity.kind)),
                 children: `${groupActivityLabel(latestActivity)} · ${relativeTime(latestActivity.at)}`
               })
             : null

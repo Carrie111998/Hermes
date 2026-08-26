@@ -104,7 +104,7 @@ function load(turnScript = () => '(pass)') {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__ga = { sendToGroupChat, recordGroupActivity, currentGroupActivity, groupActivityLabel, updateGroupChat, $groupChats, $groupActivity, GROUP_ACTIVITY_LIMIT };\n'
+      '\nglobalThis.__ga = { sendToGroupChat, recordGroupActivity, currentGroupActivity, groupActivitySummary: typeof groupActivitySummary === "function" ? groupActivitySummary : undefined, groupActivityLabel, updateGroupChat, $groupChats, $groupActivity, GROUP_ACTIVITY_LIMIT };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -157,11 +157,65 @@ test('a failed member turn records failed instead of a phantom reply', async () 
     return '(pass)'
   })
 
-  gc.sendToGroupChat('Flaky', MEMBERS, 'anyone around?')
+  gc.sendToGroupChat('Flaky', MEMBERS, '@builder anyone around?')
   await drain(gc, 'Flaky')
 
   const events = feed(gc, 'Flaky')
   assert.equal(events.some(e => e.kind === 'failed' && e.member === 'builder'), true)
+  assert.equal(gc.groupActivitySummary(events).kind, 'failed')
+  assert.deepEqual(gc.calls.map(call => call.profile), ['builder'])
+})
+
+test('collapsed summary keeps a current-epoch failure visible after settling', () => {
+  const gc = load()
+  gc.updateGroupChat('Flaky', room => ({ ...room, log: [], epoch: 7 }))
+  gc.recordGroupActivity('Flaky', { kind: 'failed', member: 'builder' })
+  gc.recordGroupActivity('Flaky', { kind: 'settled', member: null })
+
+  assert.equal(typeof gc.groupActivitySummary, 'function')
+  assert.equal(gc.groupActivitySummary(gc.currentGroupActivity('Flaky')).kind, 'failed')
+})
+
+test('collapsed summary keeps a current-epoch timeout visible after settling', () => {
+  const gc = load()
+  gc.updateGroupChat('Slow', room => ({ ...room, log: [], epoch: 9 }))
+  gc.recordGroupActivity('Slow', { kind: 'timed-out', member: 'research' })
+  gc.recordGroupActivity('Slow', { kind: 'settled', member: null })
+
+  assert.equal(gc.groupActivitySummary(gc.currentGroupActivity('Slow')).kind, 'timed-out')
+})
+
+test('collapsed summary clears a member timeout after its late reply is delivered', () => {
+  const gc = load()
+  const events = [
+    { kind: 'timed-out', member: 'research' },
+    { kind: 'settled', member: null },
+    { kind: 'delivered', member: 'research' }
+  ]
+
+  assert.equal(gc.groupActivitySummary(events).kind, 'delivered')
+})
+
+test('another member reply does not clear an unresolved timeout', () => {
+  const gc = load()
+  const events = [
+    { kind: 'timed-out', member: 'research' },
+    { kind: 'replied', member: 'builder' },
+    { kind: 'settled', member: null }
+  ]
+
+  const summary = gc.groupActivitySummary(events)
+  assert.equal(summary.kind, 'timed-out')
+  assert.equal(summary.member, 'research')
+})
+
+test('collapsed summary uses the latest event when the turn has no alert', () => {
+  const gc = load()
+  gc.updateGroupChat('Fine', room => ({ ...room, log: [], epoch: 11 }))
+  gc.recordGroupActivity('Fine', { kind: 'replied', member: 'research' })
+  gc.recordGroupActivity('Fine', { kind: 'settled', member: null })
+
+  assert.equal(gc.groupActivitySummary(gc.currentGroupActivity('Fine')).kind, 'settled')
 })
 
 test('a newer send interrupts the previous run and records cancelled in the CURRENT epoch', async () => {
@@ -266,6 +320,10 @@ test('source contract: the workspace mounts a quiet, collapsed-by-default disclo
   const panel = pluginSource.slice(pluginSource.indexOf('// Activity disclosure:'), pluginSource.indexOf('const submit = () => {'))
   assert.doesNotMatch(panel, /autoFocus/)
   assert.doesNotMatch(panel, /autoScroll|scrollIntoView/)
+  // A terminal alert stays visible and destructive in the collapsed summary
+  // instead of being replaced by the final settled event.
+  assert.match(panel, /const latestActivity = groupActivitySummary\(activityEvents\)/)
+  assert.match(panel, /groupActivityTone\(latestActivity\.kind\)/)
   // Truthful event vocabulary is wired.
   assert.match(pluginSource, /'timed-out': 'took too long'/)
   assert.match(pluginSource, /cancelled: 'turn interrupted by a newer message'/)
