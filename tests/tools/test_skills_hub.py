@@ -1804,3 +1804,48 @@ class TestLoadHermesIndex:
 
         data = hub._load_hermes_index()
         assert data == {"skills": [{"name": "stale"}]}
+
+
+# ---------------------------------------------------------------------------
+# Directory link handling in SKILL.md referenced support paths (#95637)
+# ---------------------------------------------------------------------------
+
+
+class TestDirectoryLinksInSkillMd:
+    def test_referenced_support_paths_ignores_directory_links(self):
+        from tools.skills_hub import _referenced_support_paths
+
+        md = """
+# Web Design Engineer
+
+Check out our [style recipes](references/style-recipes/) and [component guide](references/components.md).
+See also `scripts/build.sh` and `assets/images/`.
+"""
+        paths = _referenced_support_paths(md)
+        assert paths is not None
+        assert "references/components.md" in paths
+        assert "scripts/build.sh" in paths
+        assert "references/style-recipes" not in paths
+        assert "references/style-recipes/" not in paths
+        assert "assets/images" not in paths
+        assert "assets/images/" not in paths
+
+    def test_github_source_fetch_skips_tree_entries(self):
+        auth = MagicMock(spec=GitHubAuth)
+        src = GitHubSource(auth=auth)
+
+        skill_md = """
+# Test Skill
+See [recipes](references/recipes) and [details](references/details.md).
+"""
+        with patch.object(src, "_fetch_file_content", return_value=skill_md), \
+             patch.object(src, "_get_repo_tree", return_value=("main", [
+                 {"path": "skills/my-skill/references/recipes", "type": "tree"},
+                 {"path": "skills/my-skill/references/details.md", "type": "blob", "mode": "100644"},
+             ])), \
+             patch.object(src, "_fetch_file_bytes", return_value=b"some content"):
+            bundle = src.fetch("owner/repo/skills/my-skill")
+
+        assert bundle is not None
+        assert "references/details.md" in bundle.files
+        assert "references/recipes" not in bundle.files
