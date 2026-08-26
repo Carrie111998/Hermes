@@ -1108,6 +1108,48 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
     }
 
 
+def _claude_code_source_is_suppressed() -> bool:
+    """Return whether Hermes must not access Claude Code credentials.
+
+    Suppression is a credential-access boundary, so uncertainty fails closed.
+    Read both the active profile store and the global fallback through the auth
+    layer's path resolver; never hardcode ``~/.hermes``.
+    """
+
+    def _store_suppresses(store: Dict[str, Any]) -> bool:
+        if not isinstance(store, dict):
+            raise TypeError("auth store is not a mapping")
+        suppressed = store.get("suppressed_sources", {})
+        if not isinstance(suppressed, dict):
+            raise TypeError("suppressed_sources is not a mapping")
+        raw_sources = suppressed.get("anthropic", [])
+        if isinstance(raw_sources, dict):
+            return "claude_code" in raw_sources
+        if isinstance(raw_sources, list):
+            return "claude_code" in raw_sources
+        if raw_sources is None:
+            return False
+        raise TypeError("anthropic suppressed sources are malformed")
+
+    try:
+        from hermes_cli.auth import _global_auth_file_path, _load_auth_store
+
+        if _store_suppresses(_load_auth_store()):
+            return True
+        global_auth_path = _global_auth_file_path()
+        if global_auth_path is not None and _store_suppresses(
+            _load_auth_store(global_auth_path)
+        ):
+            return True
+        return False
+    except Exception:
+        logger.debug(
+            "Unable to determine Claude Code suppression state; denying credential access",
+            exc_info=True,
+        )
+        return True
+
+
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read refreshable Claude Code OAuth credentials.
 
@@ -1129,6 +1171,9 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
+    if _claude_code_source_is_suppressed():
+        return None
+
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
@@ -1241,6 +1286,10 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     has already produced a valid token, adopt it and skip the POST entirely.
     Only fall back to refreshing ourselves when no fresh credential is found.
     """
+    if _claude_code_source_is_suppressed():
+        logger.debug("Claude Code source is suppressed; skipping OAuth refresh")
+        return None
+
     # Claude Code may have already refreshed — adopt its token rather than
     # racing it with our (possibly already-rotated) refresh token. Only adopt
     # when the live re-read produced a DIFFERENT token with a real future
@@ -1294,6 +1343,10 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
+    if _claude_code_source_is_suppressed():
+        logger.debug("Claude Code source is suppressed; skipping credential write")
+        return
+
     cred_path = Path.home() / ".claude" / ".credentials.json"
     try:
         # Read existing file to preserve other fields

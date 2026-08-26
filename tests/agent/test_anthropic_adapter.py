@@ -42,6 +42,93 @@ class TestIsOAuthToken:
         assert _is_oauth_token("sk-ant-api03-abcdef1234567890") is False
 
 
+class TestClaudeCodeSuppressionBoundary:
+    @pytest.mark.parametrize(
+        ("profile_store", "global_store"),
+        [
+            ({"suppressed_sources": {"anthropic": ["claude_code"]}}, {}),
+            ({}, {"suppressed_sources": {"anthropic": ["claude_code"]}}),
+        ],
+    )
+    def test_suppression_prevents_all_credential_source_reads(
+        self, monkeypatch, profile_store, global_store
+    ):
+        global_auth_path = object()
+
+        def _load_auth_store(path=None):
+            return profile_store if path is None else global_store
+
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", _load_auth_store)
+        monkeypatch.setattr(
+            "hermes_cli.auth._global_auth_file_path", lambda: global_auth_path
+        )
+        with patch(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain"
+        ) as read_keychain, patch(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_file"
+        ) as read_file:
+            assert read_claude_code_credentials() is None
+        read_keychain.assert_not_called()
+        read_file.assert_not_called()
+
+    def test_suppression_lookup_failure_prevents_all_credential_source_reads(
+        self, monkeypatch
+    ):
+        def _raise_auth_error(_path=None):
+            raise OSError("auth store unavailable")
+
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", _raise_auth_error)
+        with patch(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain"
+        ) as read_keychain, patch(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_file"
+        ) as read_file:
+            assert read_claude_code_credentials() is None
+        read_keychain.assert_not_called()
+        read_file.assert_not_called()
+
+    def test_suppression_prevents_refresh_of_already_loaded_credentials(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._claude_code_source_is_suppressed",
+            lambda: True,
+        )
+        creds = {
+            "accessToken": "expired",
+            "refreshToken": "shared-refresh-token",
+            "expiresAt": 1,
+        }
+        refreshed = {
+            "access_token": "rotated-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "expires_at_ms": 9999999999999,
+        }
+        with patch(
+            "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+            return_value=refreshed,
+        ) as refresh, patch(
+            "agent.anthropic_adapter._write_claude_code_credentials"
+        ) as write:
+            assert _refresh_oauth_token(creds) is None
+        refresh.assert_not_called()
+        write.assert_not_called()
+
+    def test_suppression_prevents_writing_claude_credential_store(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._claude_code_source_is_suppressed",
+            lambda: True,
+        )
+
+        _write_claude_code_credentials(
+            "rotated-access-token", "rotated-refresh-token", 9999999999999
+        )
+
+        assert not (tmp_path / ".claude" / ".credentials.json").exists()
+
 
 
 
