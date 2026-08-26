@@ -277,6 +277,7 @@ function Harness({
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
+  const gatewayRef = useRef(null)
 
   const cache = useSessionStateCache({
     activeSessionId,
@@ -306,9 +307,11 @@ function Harness({
   const sessionActions = useSessionActions({
     activeSessionId,
     activeSessionIdRef: cache.activeSessionIdRef,
+    bindGatewayRequest: vi.fn() as never,
     busyRef,
     creatingSessionRef,
     ensureSessionState: cache.ensureSessionState,
+    gatewayRef,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
     navigate: vi.fn() as never,

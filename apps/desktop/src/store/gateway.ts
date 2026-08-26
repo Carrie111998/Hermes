@@ -1518,11 +1518,14 @@ let primaryCommandReconnect: { gateway: HermesGateway; profile: string; promise:
  */
 export function acquireGatewayRequestLease(gateway: HermesGateway, profile: string): GatewayRequestLease {
   const key = normKey(profile)
+
   const secondary =
     [...g.secondaries.values()].find(entry => entry.gateway === gateway && normKey(entry.profile) === key) ?? null
+
   // Shared-primary commands may bind a logical profile that differs from the
   // primary's physical route. Snapshot the physical owner so a later re-home
   // cannot let this lease reconnect or retry on the wrong backend.
+
   const primaryOwnerProfile = g.primaryProfile
   const primaryOwnerConnectionId = g.primaryConnectionId
   const ownsPrimary = !secondary && g.primaryGateway === gateway
@@ -1536,6 +1539,7 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
   }
 
   let released = false
+
   const stillRegistered = () =>
     !released &&
     (secondary
@@ -1579,6 +1583,7 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
         await gateway.connect(wsUrl)
       }
     })()
+
     const reconnect = { gateway, profile: key, promise: attempt }
     primaryCommandReconnect = reconnect
 
@@ -1600,11 +1605,16 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
       }
 
       try {
-        return await gateway.request<T>(method, params, timeoutMs, signal)
+        return await (timeoutMs !== undefined || signal !== undefined
+          ? gateway.request<T>(method, params, timeoutMs, signal)
+          : gateway.request<T>(method, params))
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
 
-        if (!/not connected|connection closed/i.test(message)) {
+        // Only transport failures on a socket that actually left `open` are
+        // replay-safe. Domain errors may contain the same words (for example,
+        // "model provider not connected") and must never duplicate a command.
+        if (!/not connected|connection closed/i.test(message) || isOpen(gateway)) {
           throw error
         }
 
@@ -1620,7 +1630,9 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
           throw error
         }
 
-        return gateway.request<T>(method, params, timeoutMs, signal)
+        return timeoutMs !== undefined || signal !== undefined
+          ? gateway.request<T>(method, params, timeoutMs, signal)
+          : gateway.request<T>(method, params)
       }
     },
     release: () => {

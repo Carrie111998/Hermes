@@ -707,6 +707,9 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const capturedRoute = options?.route === undefined ? resolveNewChatOwnerRoute() : options.route
+        const ownerProfile = normalizeProfileKey(
+          capturedRoute?.targetProfile ?? capturedRoute?.profile ?? $activeGatewayProfile.get()
+        )
         const workspaceScope = options?.workspaceScope ?? { workspaceMode: 'sessions' }
 
         const cwd =
@@ -779,7 +782,7 @@ export function useSessionActions({
         // so the right rail kept showing the previous session's tree when a
         // Project "+" created a session while the main chat was occupied
         // (#76696). Split/side tiles deliberately stay isolated.
-        const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
+        const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false, profile: ownerProfile })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir, undefined, undefined, workspaceScope)

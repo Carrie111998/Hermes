@@ -92,6 +92,7 @@ describe('JsonRpcGatewayClient connect() URL guard', () => {
     }
 
     const sockets: ControlledSocket[] = []
+
     const client = new JsonRpcGatewayClient({
       connectTimeoutMs: 50,
       socketFactory: () => {
