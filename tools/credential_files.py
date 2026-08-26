@@ -207,15 +207,40 @@ def _load_config_files() -> List[Dict[str, str]]:
     atomically retargeted from home A to home B yields a *different* key even
     though the active ``HERMES_HOME`` override string is unchanged, so the
     retarget can no longer serve A's cached host paths under B.
-    """
-    from hermes_constants import hermes_home_key
 
-    home_key = hermes_home_key(_resolve_hermes_home())
+    The key AND the load must observe *one* home snapshot. ``read_raw_config``
+    re-derives the config path from the live ``HERMES_HOME`` and each
+    ``_admit_credential_relpath`` re-runs :func:`_resolve_hermes_home`; if the
+    alias is retargeted A -> B *during a single cache miss* (after the key is
+    captured but before the read/admission run), B's config and B's token path
+    would be realized and then cached under A's key. To close that intra-load
+    boundary we resolve the canonical home once, derive the key from that exact
+    object, and pin it as the context-local ``HERMES_HOME`` override for the
+    duration of the read + admission so both consume the same snapshot; the
+    mutable alias spelling is never re-read inside the operation. Pinning the
+    resolved path (not the alias) means ``read_raw_config`` keeps its own
+    cache/parse/fail-open semantics unchanged — it simply reads the canonical
+    home's ``config.yaml`` directly.
+    """
+    from hermes_constants import (
+        hermes_home_key,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    # Snapshot the canonical home once (symlink-resolved) so a mid-miss alias
+    # retarget cannot make the key and the realized paths disagree.
+    canonical_home = _resolve_hermes_home().resolve()
+    home_key = hermes_home_key(canonical_home)
     cached = _config_files_by_home.get(home_key)
     if cached is not None:
         return cached
 
     result: List[Dict[str, str]] = []
+    # Pin the snapshot for every home resolution inside the miss: the raw-config
+    # read and each admission both consult this exact object rather than the
+    # mutable alias, so no B path can be realized and cached under A's key.
+    override_token = set_hermes_home_override(canonical_home)
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
@@ -239,6 +264,8 @@ def _load_config_files() -> List[Dict[str, str]]:
                         })
     except Exception as e:
         logger.warning("Could not read terminal.credential_files from config: %s", e)
+    finally:
+        reset_hermes_home_override(override_token)
 
     _config_files_by_home[home_key] = result
     return result

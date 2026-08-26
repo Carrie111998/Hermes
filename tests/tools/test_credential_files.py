@@ -442,6 +442,55 @@ class TestConfigCacheProfileBoundary:
         assert host_paths_b == [str((home_b / "b_token.json").resolve())]
         assert str((home_a / "a_token.json").resolve()) not in host_paths_b
 
+    def test_intra_load_alias_retarget_never_crosses_home(self, tmp_path, monkeypatch):
+        """The race is *inside* a single cache miss, not just between two loads.
+
+        The key is captured from the canonical home, but the config read and
+        every admission independently re-resolve ``HERMES_HOME``. If the alias
+        is retargeted A -> B after key capture yet before those run, B's config
+        and B's token path could be realized and cached under A's key — the same
+        cross-home credential transplant, only within one load. The loader pins
+        the resolved home snapshot for the whole miss, so both the raw-config
+        read and admission observe home A regardless of the live alias.
+        """
+        home_a = self._profile(tmp_path, "a", "a_token.json")
+        home_b = self._profile(tmp_path, "b", "b_token.json")
+
+        alias = tmp_path / "profiles" / "current"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(home_a, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+
+        import hermes_cli.config as hermes_config
+        real_read_raw_config = hermes_config.read_raw_config
+
+        def _retarget_then_read(*args, **kwargs):
+            # Fire exactly once, mid-load: flip the alias A -> B *after* the
+            # loader captured its canonical key but *before* it realizes any
+            # path. A snapshot-blind loader would now read B under A's key.
+            if alias.readlink() == home_a:
+                alias.unlink()
+                alias.symlink_to(home_b, target_is_directory=True)
+            return real_read_raw_config(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_config, "read_raw_config", _retarget_then_read)
+
+        mounts = get_credential_file_mounts()
+        host_paths = [m["host_path"] for m in mounts]
+
+        # The load must have stayed on home A end-to-end; B's token must never
+        # be realized under A's captured key.
+        assert host_paths == [str((home_a / "a_token.json").resolve())]
+        assert str((home_b / "b_token.json").resolve()) not in host_paths
+
+        # Point the alias back to A: the canonical-A cache entry must still hold
+        # A's own token (never poisoned with B during the interleaved miss).
+        alias.unlink()
+        alias.symlink_to(home_a, target_is_directory=True)
+        assert [m["host_path"] for m in get_credential_file_mounts()] == [
+            str((home_a / "a_token.json").resolve())
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Cache directory mounts
