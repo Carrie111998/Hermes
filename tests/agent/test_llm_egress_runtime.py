@@ -181,20 +181,18 @@ def test_runtime_denies_unsafe_text_before_provider_callback(tmp_path, text):
     assert calls == []
 
 
-def test_runtime_splits_large_sanitized_text_into_independently_scanned_segments(
+def test_runtime_does_not_manufacture_boundaries_for_oversized_sanitized_text(
     tmp_path,
 ):
     agent = _agent(tmp_path)
     agent._llm_egress_max_sanitized_bytes = 128_000
     text = "ordinary bounded repair context. " * 2_000
 
-    authorized, receipt = authorize_agent_sdk_kwargs(
-        agent,
-        {"model": "test-model", "messages": [{"role": "system", "content": text}]},
-    )
-
-    assert authorized["messages"][0]["content"] == text
-    assert receipt.decision.allowed is True
+    with pytest.raises(ValueError, match="sanitized segment exceeds byte cap"):
+        authorize_agent_sdk_kwargs(
+            agent,
+            {"model": "test-model", "messages": [{"role": "system", "content": text}]},
+        )
 
 
 def test_runtime_dispatches_exactly_once_with_authorized_bytes(tmp_path):
