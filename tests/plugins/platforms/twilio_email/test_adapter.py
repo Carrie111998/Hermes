@@ -202,7 +202,14 @@ def test_connect_succeeds_when_fully_configured(monkeypatch):
     _configure(monkeypatch)
     adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
-    connected = asyncio.run(adapter.connect())
+    async def _connect_and_disconnect():
+        connected = await adapter.connect()
+        # connect() opens a real aiohttp.ClientSession -- close it in the same
+        # event loop it was created in, or aiohttp warns about an unclosed session.
+        await adapter.disconnect()
+        return connected
+
+    connected = asyncio.run(_connect_and_disconnect())
 
     assert connected is True
 
@@ -474,6 +481,96 @@ def test_send_rejects_non_string_metadata_subject_without_crashing(monkeypatch):
         )
 
     assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Error clarity on a first real send -- exceptions like asyncio.TimeoutError
+# stringify to "", which must not surface as a blank/useless error.
+
+
+def test_send_error_is_never_blank_for_exceptions_with_empty_str(monkeypatch):
+    _configure(monkeypatch)
+    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
+
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(side_effect=TimeoutError())
+    mock_session.close = AsyncMock()
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = asyncio.run(
+            adapter.send("customer@example.com", "Test subject\nTest body")
+        )
+
+    assert result.success is False
+    assert result.error
+    assert "TimeoutError" in result.error
+
+
+def test_standalone_send_error_is_never_blank_for_exceptions_with_empty_str(
+    monkeypatch,
+):
+    _configure(monkeypatch)
+
+    with patch("aiohttp.ClientSession", side_effect=TimeoutError()):
+        result = asyncio.run(
+            twilio_email._standalone_send(
+                None, "customer@example.com", "Test subject\nTest body"
+            )
+        )
+
+    assert "error" in result
+    assert "TimeoutError" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# A 2xx response that already means "accepted" must not be reported as a
+# failed send just because its body didn't parse -- that would risk a
+# retry-induced duplicate email.
+
+
+def test_send_treats_unparseable_202_body_as_success_not_failure(monkeypatch):
+    _configure(monkeypatch)
+    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
+
+    mock_resp = MagicMock()
+    mock_resp.status = 202
+    mock_resp.headers = {}
+    mock_resp.json = AsyncMock(side_effect=ValueError("not json"))
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(return_value=_AsyncCM(mock_resp))
+    mock_session.close = AsyncMock()
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = asyncio.run(
+            adapter.send("customer@example.com", "Test subject\nTest body")
+        )
+
+    assert result.success is True
+    assert result.message_id == ""
+
+
+def test_send_treats_empty_202_body_as_success_not_attribute_error(monkeypatch):
+    # aiohttp's resp.json() returns None (no exception) for an empty body --
+    # a naive `data.get(...)` on that would raise AttributeError and get
+    # caught by the outer except, misreporting an accepted send as failed.
+    _configure(monkeypatch)
+    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
+
+    mock_resp = MagicMock()
+    mock_resp.status = 202
+    mock_resp.headers = {}
+    mock_resp.json = AsyncMock(return_value=None)
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(return_value=_AsyncCM(mock_resp))
+    mock_session.close = AsyncMock()
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = asyncio.run(
+            adapter.send("customer@example.com", "Test subject\nTest body")
+        )
+
+    assert result.success is True
+    assert result.message_id == ""
 
 
 # ---------------------------------------------------------------------------

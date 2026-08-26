@@ -55,6 +55,7 @@ multiple chunks/sends: an email is one document, not a multi-part SMS train,
 so `truncate_message()` is deliberately not called here.
 """
 
+import asyncio
 import base64
 import logging
 import mimetypes
@@ -152,6 +153,20 @@ def _redact_emails_in_text(text: str) -> str:
     return _EMAIL_IN_TEXT_RE.sub(lambda m: _mask_email(m.group(0)), text)
 
 
+def _format_exception_error(e: Exception) -> str:
+    """Render an exception so it's never an empty/near-empty error string.
+
+    ``asyncio.TimeoutError`` and several aiohttp connector/SSL errors stringify
+    to ``""``, which would otherwise surface as a blank error to both the log
+    and the caller (e.g. ``tools/send_message_tool.py``'s ``f"Adapter send
+    failed: {result.error}"``) with no clue what actually happened. Also runs
+    the result through ``_redact_emails_in_text`` -- defense in depth, since an
+    exception's message could in principle echo back request/response content.
+    """
+    text = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+    return _redact_emails_in_text(text)
+
+
 def _sanitize_subject(subject: str) -> str:
     """Strip CR/LF/tab so a subject can never inject extra headers into the
     outbound email (CWE-93), regardless of whether it came from the
@@ -189,16 +204,22 @@ def _build_attachments(
         if not os.path.isfile(file_path):
             return [], f"Attachment not found: {file_path}"
         try:
-            with open(file_path, "rb") as f:
-                raw = f.read()
+            size = os.path.getsize(file_path)
         except OSError as e:
             return [], f"Could not read attachment {file_path}: {e}"
-        total_bytes += len(raw)
+        total_bytes += size
         if total_bytes > MAX_ATTACHMENT_BYTES_RAW:
+            # Checked before reading -- refuse an oversized file outright rather
+            # than loading it fully into memory first.
             return [], (
                 f"Attachments too large ({total_bytes} bytes) -- Twilio Email caps "
                 "the whole request (including base64-encoded attachments) at 10 MB"
             )
+        try:
+            with open(file_path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            return [], f"Could not read attachment {file_path}: {e}"
         content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
         attachments.append({
             "filename": os.path.basename(file_path),
@@ -206,6 +227,21 @@ def _build_attachments(
             "content": base64.b64encode(raw).decode("ascii"),
         })
     return attachments, None
+
+
+async def _build_attachments_async(
+    file_paths: List[str],
+) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """Run _build_attachments() off the event loop.
+
+    It does blocking file I/O (and base64-encodes up to ~7 MB), which would
+    otherwise stall every other chat/platform the gateway is servicing for
+    the duration -- matches the built-in `email` plugin's own
+    `loop.run_in_executor(...)` convention for blocking send-path work.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        None, _build_attachments, file_paths
+    )
 
 
 def check_email_requirements() -> bool:
@@ -257,6 +293,12 @@ class TwilioEmailAdapter(BasePlatformAdapter):
                 "twilio_email_missing_from_email", msg, retryable=False
             )
             return False
+        import aiohttp
+
+        self._http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            trust_env=True,
+        )
         self._mark_connected()
         logger.info("[twilio_email] Ready (outbound-only, no inbound channel)")
         return True
@@ -328,8 +370,29 @@ class TwilioEmailAdapter(BasePlatformAdapter):
                         success=False,
                         error=f"Twilio Email {resp.status}: {error_body}{suffix}",
                     )
-                data = await resp.json()
+                # Twilio already accepted the request at this point -- a body-parse
+                # failure here is not a failed send (a caller retrying on a false
+                # failure could cause a duplicate email), so it's handled separately
+                # from the network/request exceptions below.
+                try:
+                    data = await resp.json()
+                except Exception as parse_err:
+                    data = None
+                    logger.warning(
+                        "[twilio_email] Queued to %s but response body didn't parse: %s",
+                        _mask_email(chat_id),
+                        parse_err,
+                    )
+                # aiohttp's resp.json() returns None (no exception) for an empty
+                # body -- treat that the same as a parse failure, not an AttributeError.
+                if data is None:
+                    return SendResult(success=True, message_id="")
                 operation_id = data.get("operationId", "")
+                if not operation_id:
+                    logger.warning(
+                        "[twilio_email] 202 response missing operationId, raw body: %s",
+                        data,
+                    )
                 logger.info(
                     "[twilio_email] Queued to %s (operationId=%s)",
                     _mask_email(chat_id),
@@ -337,8 +400,14 @@ class TwilioEmailAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=operation_id)
         except Exception as e:
-            logger.error("[twilio_email] send error to %s: %s", _mask_email(chat_id), e)
-            return SendResult(success=False, error=str(e))
+            error_text = _format_exception_error(e)
+            logger.error(
+                "[twilio_email] send error to %s: %s",
+                _mask_email(chat_id),
+                error_text,
+                exc_info=True,
+            )
+            return SendResult(success=False, error=error_text)
         finally:
             if not self._http_session and session:
                 await session.close()
@@ -361,7 +430,9 @@ class TwilioEmailAdapter(BasePlatformAdapter):
         attachment_paths = meta.get("attachments") or []
         attachments: List[Dict[str, str]] = []
         if attachment_paths:
-            attachments, attach_error = _build_attachments(list(attachment_paths))
+            attachments, attach_error = await _build_attachments_async(
+                list(attachment_paths)
+            )
             if attach_error:
                 return SendResult(success=False, error=attach_error)
 
@@ -386,7 +457,7 @@ class TwilioEmailAdapter(BasePlatformAdapter):
             from urllib.parse import unquote
 
             local_path = unquote(image_url[7:])
-            attachments, attach_error = _build_attachments([local_path])
+            attachments, attach_error = await _build_attachments_async([local_path])
             if attach_error:
                 return SendResult(success=False, error=attach_error)
             subject, body = _split_subject_and_body(caption or "")
@@ -433,7 +504,7 @@ class TwilioEmailAdapter(BasePlatformAdapter):
         try:
             attachments: List[Dict[str, str]] = []
             if local_paths:
-                attachments, attach_error = _build_attachments(local_paths)
+                attachments, attach_error = await _build_attachments_async(local_paths)
                 if attach_error:
                     logger.error(
                         "[twilio_email] multi-image send failed: %s", attach_error
@@ -468,7 +539,7 @@ class TwilioEmailAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        attachments, attach_error = _build_attachments([file_path])
+        attachments, attach_error = await _build_attachments_async([file_path])
         if attach_error:
             return SendResult(success=False, error=attach_error)
         if file_name:
@@ -522,7 +593,7 @@ async def _standalone_send(
     attachments: List[Dict[str, str]] = []
     media_paths = [path for path, _is_voice in (media_files or [])]
     if media_paths:
-        attachments, attach_error = _build_attachments(media_paths)
+        attachments, attach_error = await _build_attachments_async(media_paths)
         if attach_error:
             return {"error": attach_error}
 
@@ -565,18 +636,48 @@ async def _standalone_send(
                         error_body,
                     )
                     return {"error": f"Twilio Email {resp.status}: {error_body}"}
-                data = await resp.json()
+                # Twilio already accepted the request at this point -- a body-parse
+                # failure here is not a failed send (a caller retrying on a false
+                # failure could cause a duplicate email).
+                try:
+                    data = await resp.json()
+                except Exception as parse_err:
+                    data = None
+                    logger.warning(
+                        "[twilio_email] Queued to %s but response body didn't parse: %s",
+                        _mask_email(chat_id),
+                        parse_err,
+                    )
+                # aiohttp's resp.json() returns None (no exception) for an empty
+                # body -- treat that the same as a parse failure, not an AttributeError.
+                if data is None:
+                    return {
+                        "success": True,
+                        "platform": "twilio_email",
+                        "chat_id": chat_id,
+                        "message_id": "",
+                    }
+                operation_id = data.get("operationId", "")
+                if not operation_id:
+                    logger.warning(
+                        "[twilio_email] 202 response missing operationId, raw body: %s",
+                        data,
+                    )
                 return {
                     "success": True,
                     "platform": "twilio_email",
                     "chat_id": chat_id,
-                    "message_id": data.get("operationId", ""),
+                    "message_id": operation_id,
                 }
     except Exception as e:
+        error_text = _format_exception_error(e)
         logger.error(
-            "[twilio_email] standalone send error to %s: %s", _mask_email(chat_id), e
+            "[twilio_email] standalone send error to %s: %s",
+            _mask_email(chat_id),
+            error_text,
+            exc_info=True,
         )
-        return {"error": f"Twilio Email send failed: {e}"}
+        return {"error": f"Twilio Email send failed: {error_text}"}
 
 
 def _is_connected(config) -> bool:
