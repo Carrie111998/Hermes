@@ -3408,11 +3408,24 @@ def read_raw_config_readonly() -> Dict[str, Any]:
 
 
 def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
-    """Refuse to replace an existing config.yaml that cannot be read."""
+    """Refuse to replace an existing config.yaml that cannot be read or parsed.
+
+    Two independent failure modes land here, both because
+    ``read_raw_config()`` collapses them to the same ``{}``: an
+    I/O-unreadable file (permission error, broken mount) and a
+    byte-readable-but-syntactically-corrupt one (bad YAML — truncated
+    write, stray editor characters). Either way, a load->mutate->save
+    flow (setup wizard, ``hermes config set``, gateway platform-field
+    writes) would otherwise persist a defaults-only or partial config
+    over the user's file, silently erasing every override it couldn't
+    read back. The corrupt/unreadable file is left in place (already
+    snapshotted to ``.bak`` by ``_warn_config_parse_failure`` on the read
+    side) for the user to repair rather than being overwritten.
+    """
     if config_path is None:
         config_path = get_config_path()
     try:
-        config_path.stat()
+        st = config_path.stat()
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -3428,6 +3441,19 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         raise RuntimeError(
             f"Refusing to overwrite {config_path}: existing config.yaml cannot be read "
             f"({exc}). Fix the file permissions or move it aside first."
+        ) from exc
+
+    if st.st_size == 0:
+        return
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            fast_safe_load(f)
+    except Exception as exc:
+        # A comments-only file parses to None, not an exception — that's
+        # parseable and falls through. Only a genuine parse failure raises.
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml is not valid YAML "
+            f"({exc}). Fix the file by hand or move it aside first."
         ) from exc
 
 

@@ -1,6 +1,7 @@
 """Tests for hermes_cli configuration management."""
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,7 +37,18 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            assert home == Path.home() / ".hermes"
+            if sys.platform == "win32":
+                # Windows default is %LOCALAPPDATA%\hermes — see
+                # hermes_constants._get_platform_default_hermes_home.
+                local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+                base = (
+                    Path(local_appdata)
+                    if local_appdata
+                    else Path.home() / "AppData" / "Local"
+                )
+                assert home == base / "hermes"
+            else:
+                assert home == Path.home() / ".hermes"
 
 
 class TestEnsureHermesHome:
@@ -423,6 +435,41 @@ class TestSaveConfigAtomicity:
                 raw = yaml.safe_load(f)
             assert raw["model"] == "test/atomic-model"
             assert raw["agent"]["max_turns"] == 77
+
+    def test_refuses_to_overwrite_unparseable_config(self, tmp_path):
+        """save_config must never clobber an existing-but-unparseable
+        config.yaml.
+
+        A fresh process (no in-memory "last known good" from
+        TestLoadConfigParseFailure to fall back on) that loads an
+        already-corrupt config.yaml gets DEFAULT_CONFIG out of
+        load_config(). Saving that back would silently erase every
+        override the corrupt file still holds. The corrupt file is left
+        in place — already snapshotted to .bak by
+        _warn_config_parse_failure on the read side — for the user to
+        repair rather than being overwritten with defaults.
+        """
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            broken = "model:\n  default: my-model\n\tbroken tab indent:\n"
+            (tmp_path / "config.yaml").write_text(broken, encoding="utf-8")
+
+            with pytest.raises(RuntimeError, match="not valid YAML"):
+                save_config({"agent": {"max_turns": 5}})
+
+            assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == broken
+
+    def test_empty_config_file_is_still_a_valid_write_target(self, tmp_path):
+        """A zero-byte config.yaml (e.g. `touch`ed but never written) is not
+        "corrupt" — it's the same as absent, and saving must proceed."""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text("", encoding="utf-8")
+
+            save_config({"agent": {"max_turns": 5}})
+
+            with open(config_path, encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            assert raw["agent"]["max_turns"] == 5
 
 
 class TestSanitizeEnvLines:
