@@ -25,6 +25,7 @@ from gateway.platforms.base import (
     _thread_metadata_for_source,
 )
 from gateway.session import build_session_key
+from hermes_state import SessionDB
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -385,6 +386,96 @@ async def test_created_private_topic_thread_not_found_fails_without_root_fallbac
     assert "thread not found" in str(result.error).lower()
     assert len(call_log) == 1
     assert call_log[0]["message_thread_id"] == 32343
+
+
+@pytest.mark.asyncio
+async def test_existing_private_topic_transient_thread_error_retries_same_lane(tmp_path):
+    """A one-off thread error must not prune or escape a healthy DM topic."""
+    adapter = _make_adapter()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="123", user_id="123")
+    db.create_session(session_id="topic-session", source="telegram", user_id="123")
+    db.bind_telegram_topic(
+        chat_id="123",
+        thread_id="20197",
+        user_id="123",
+        session_key="agent:main:telegram:dm:123:20197",
+        session_id="topic-session",
+    )
+    adapter._session_store = SimpleNamespace(_db=db)
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        if len(call_log) == 1:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=782)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="topic reply",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert len(call_log) == 2
+    assert all(call["message_thread_id"] == 20197 for call in call_log)
+    assert all(call["reply_to_message_id"] == 462 for call in call_log)
+    assert db.get_telegram_topic_binding(chat_id="123", thread_id="20197") is not None
+    assert db.is_telegram_topic_mode_enabled(chat_id="123", user_id="123") is True
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_private_topic_confirmed_missing_prunes_and_retries_root(tmp_path):
+    """A confirmed-dead DM topic must self-heal and deliver in the root DM."""
+    adapter = _make_adapter()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="123", user_id="123")
+    db.create_session(session_id="topic-session", source="telegram", user_id="123")
+    db.bind_telegram_topic(
+        chat_id="123",
+        thread_id="20197",
+        user_id="123",
+        session_key="agent:main:telegram:dm:123:20197",
+        session_id="topic-session",
+    )
+    adapter._session_store = SimpleNamespace(_db=db)
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        if len(call_log) < 3:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=783)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="topic reply",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert len(call_log) == 3
+    assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[1]["message_thread_id"] == 20197
+    assert call_log[2]["message_thread_id"] is None
+    assert call_log[2]["reply_to_message_id"] is None
+    assert db.get_telegram_topic_binding(chat_id="123", thread_id="20197") is None
+    assert db.is_telegram_topic_mode_enabled(chat_id="123", user_id="123") is False
+    db.close()
 
 
 @pytest.mark.asyncio

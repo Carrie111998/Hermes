@@ -5422,7 +5422,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                if metadata and metadata.get("telegram_dm_topic_created_for_send"):
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
@@ -5456,6 +5456,13 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                                 used_thread_fallback = True
                                 effective_thread_id = None
+                                if private_dm_topic_send:
+                                    # The reply anchor belongs to the vanished
+                                    # private topic too. Keeping it would make
+                                    # the root-DM recovery fail with "message
+                                    # to be replied not found" immediately
+                                    # after dropping message_thread_id.
+                                    reply_to_id = None
                                 thread_kwargs = {"message_thread_id": None}
                                 continue
                             err_lower = str(send_err).lower()
