@@ -1008,9 +1008,14 @@ def _merge_maintainer_task(
         title=f"PR merge readiness: {merge_policy.repository}#{pull_request.number}",
         instructions=(
             "Inspect only the deterministic blocker codes and explain what canonical evidence is "
-            "missing. Do not edit source, push, reply, approve, merge, change configuration, or "
-            "construct GitHub write commands. Model output cannot waive a blocker or create CI or "
-            "merge receipts. A deterministic controller will act automatically after every gate passes."
+            "missing from the supplied deterministic evidence; do not inspect the repository, GitHub, "
+            "or other sources. The listed PR blockers are the requested report, not a blocker for this "
+            "observability card. Do not edit source, push, reply, approve, merge, change configuration, "
+            "or construct GitHub write commands. Model output cannot waive a blocker or create CI or "
+            "merge receipts. After the bounded explanation, immediately call kanban_complete with the "
+            "repository, PR number, expected head, blockers, and snapshot digest. Call kanban_block only "
+            "if kanban_complete itself is unavailable or rejected. A deterministic controller will act "
+            "automatically after every gate passes."
         ),
         board=policy.board or "",
         assignee=merge_policy.assignee,

@@ -690,6 +690,10 @@ def test_merge_maintainer_task_has_no_model_merge_authority(tmp_path: Path) -> N
     assert task.evidence["blockers"] == ["ci_receipt_missing"]
     assert "Do not edit source, push, reply, approve, merge" in task.instructions
     assert "Model output cannot waive" in task.instructions
+    assert "supplied deterministic evidence" in task.instructions
+    assert "not a blocker for this observability card" in task.instructions
+    assert "immediately call kanban_complete" in task.instructions
+    assert "kanban_block only if kanban_complete" in task.instructions
 
 
 def test_merge_scan_skips_expensive_github_reads_without_exact_head_ci_receipt(
