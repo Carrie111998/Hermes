@@ -338,3 +338,36 @@ def test_start_server_treats_windows_fallback_keyboardinterrupt_as_clean_shutdow
             "start_server must treat serve-time KeyboardInterrupt as a clean "
             "shutdown on the Windows pre-0.36 fallback, not propagate it"
         )
+
+@pytest.mark.asyncio
+async def test_get_put_config_preserves_env_var_placeholders(test_client, tmp_path, monkeypatch):
+    """
+    Regression test for #94918:
+    Ensure GET /api/config returns raw ${ENV_VAR} placeholders (not resolved secrets)
+    and subsequent PUT /api/config preserves those placeholders in config.yaml.
+    """
+    monkeypatch.setenv("TEST_OPENAI_SECRET", "super-secret-runtime-token-123")
+    
+    raw_yaml_content = {
+        "model": {
+            "provider": "openai",
+            "api_key": "${TEST_OPENAI_SECRET}"
+        }
+    }
+    
+    with patch("hermes_cli.web_server.read_raw_config", return_value=raw_yaml_content):
+        get_res = await test_client.get("/api/config")
+        assert get_res.status_code == 200
+        get_data = get_res.json()
+        
+        assert get_data.get("model", {}).get("api_key") == "${TEST_OPENAI_SECRET}"
+        
+        put_payload = get_data
+        put_res = await test_client.put("/api/config", json=put_payload)
+        assert put_res.status_code == 200
+        
+        saved_raw_config = read_raw_config()
+        saved_api_key = saved_raw_config.get("model", {}).get("api_key")
+        
+        assert saved_api_key == "${TEST_OPENAI_SECRET}"
+        assert "super-secret-runtime-token-123" not in str(saved_raw_config)
