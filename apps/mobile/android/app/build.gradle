@@ -13,11 +13,12 @@ android {
         applicationId "com.nousresearch.hermesagent.mobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        // Keep each private device-test delivery installable as an Android
-        // in-place update; v16 applies the mobile renderer marker before the
-        // reused Desktop tree picks its layout, removing the Fold's dead rail.
-        versionCode 12
-        versionName "1.0.11"
+        // Final device candidate: touch workspace routing, Fold-safe overlays,
+        // first-connection capabilities, and the visible active-session path.
+        // It remains a debug-signed device-test build until real Fold proof and
+        // a production signing identity are separately verified.
+        versionCode 13
+        versionName "1.0.12"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
