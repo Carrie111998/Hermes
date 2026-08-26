@@ -2793,7 +2793,7 @@ class MCPServerTask:
                 # is currently owned by another server.
                 if registry.get_toolset_for_tool(tool_name) != toolset_name:
                     continue
-                registry.deregister(tool_name)
+                registry.deregister(tool_name, scope=_mcp_registry_scope())
                 _forget_mcp_tool_server(tool_name)
 
             # 3. Re-register with the fresh list. The helper may skip names that
@@ -2811,7 +2811,7 @@ class MCPServerTask:
             for tool_name in old_tool_names - registered_name_set:
                 if registry.get_toolset_for_tool(tool_name) != toolset_name:
                     continue
-                registry.deregister(tool_name)
+                registry.deregister(tool_name, scope=_mcp_registry_scope())
                 _forget_mcp_tool_server(tool_name)
             self._registered_tool_names = registered_names
 
@@ -4413,7 +4413,7 @@ class MCPServerTask:
         from tools.registry import registry
 
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
+            registry.deregister(tool_name, scope=_mcp_registry_scope())
             _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
 
@@ -4441,6 +4441,9 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+# Profile owner for each live connection. Multiplex reloads use this to tear
+# down only the requesting profile's servers; single-profile owners are None.
+_server_scope_keys: Dict[str, Optional[str]] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
@@ -5215,6 +5218,20 @@ _mcp_thread: Optional[threading.Thread] = None
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
 
+
+def _mcp_registry_scope() -> Optional[str]:
+    """Return the active profile registry scope in multiplex mode."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return None
+        from tools.registry import registry
+
+        return registry.current_scope_key()
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery guard
 # ---------------------------------------------------------------------------
@@ -5931,7 +5948,7 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
         from tools.registry import registry
 
         for tool_name in phantom_names:
-            registry.deregister(tool_name)
+            registry.deregister(tool_name, scope=_mcp_registry_scope())
             _forget_mcp_tool_server(tool_name)
         logger.info(
             "MCP server '%s': deregistered %d phantom cached tool(s) not "
@@ -7304,6 +7321,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            scope=_mcp_registry_scope(),
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
@@ -7461,6 +7479,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            scope=_mcp_registry_scope(),
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
@@ -7494,6 +7513,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
+            scope=_mcp_registry_scope(),
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
@@ -7561,6 +7581,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
+        _server_scope_keys[name] = _mcp_registry_scope()
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -8270,27 +8291,28 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 
-def shutdown_mcp_servers():
-    """Close all MCP server connections and stop the background loop.
+def shutdown_mcp_servers(*, scope: Optional[str] = None):
+    """Close MCP connections, optionally for one multiplex profile only.
 
     Each server Task is signalled to exit its ``async with`` block so that
     the anyio cancel-scope cleanup happens in the same Task that opened it.
-    All servers are shut down in parallel via ``asyncio.gather``.
+    A scoped reload leaves other profiles' connections and loop ownership
+    intact; process shutdown keeps the historical all-server behavior.
     """
     with _lock:
-        servers_snapshot = list(_servers.values())
+        selected = {
+            name: server
+            for name, server in _servers.items()
+            if scope is None or _server_scope_keys.get(name) == scope
+        }
+        servers_snapshot = list(selected.values())
 
-    # Fast path: nothing to shut down. The connect-cooldown maps can still
-    # be populated here — a server that failed to connect is never recorded
-    # in ``_servers`` (that is the very premise of the #50394 cooldown), so
-    # "no live servers" is the MOST likely state in which stale backoff
-    # entries exist. Clear them so a post-shutdown restart re-attempts every
-    # configured server immediately.
     if not servers_snapshot:
-        with _lock:
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
-        _stop_mcp_loop()
+        if scope is None:
+            with _lock:
+                _server_connect_retry_after.clear()
+                _server_connect_failures.clear()
+            _stop_mcp_loop()
         return
 
     async def _shutdown():
@@ -8304,12 +8326,12 @@ def shutdown_mcp_servers():
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
         with _lock:
-            _servers.clear()
-            # Drop connect-retry cooldowns too: a full shutdown/restart
-            # should re-attempt every server immediately, not honour a
-            # stale per-server backoff from before the restart (#50394).
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
+            for name in selected:
+                _servers.pop(name, None)
+                _server_scope_keys.pop(name, None)
+            if scope is None:
+                _server_connect_retry_after.clear()
+                _server_connect_failures.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -8326,15 +8348,14 @@ def shutdown_mcp_servers():
             except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
 
-    # Unconditional final sweep: whether the async ``_shutdown`` ran,
-    # timed out, or was never scheduled (loop already stopped), a full
-    # shutdown must leave no stale connect-cooldown state behind — the
-    # next start should re-attempt every server immediately (#50394).
-    with _lock:
-        _server_connect_retry_after.clear()
-        _server_connect_failures.clear()
-
-    _stop_mcp_loop()
+    if scope is None:
+        # A full process shutdown must leave no stale retry state behind.
+        with _lock:
+            _server_connect_retry_after.clear()
+            _server_connect_failures.clear()
+        _stop_mcp_loop()
+    else:
+        _stop_mcp_loop_if_idle()
 
 
 def _kill_orphaned_mcp_children(
