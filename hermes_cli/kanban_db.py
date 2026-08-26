@@ -336,6 +336,7 @@ def _fire_dispatch_tick_hook(
             result.reconciled_orphans,
             result.crashed,
             result.stale,
+            result.no_progress_deferred,
             result.timed_out,
             result.auto_blocked,
             result.rate_limited,
@@ -374,7 +375,158 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
 # so any genuinely active worker keeps its heartbeat fresh as a side
 # effect of normal API traffic.
+#
+# That bridge is exactly why this threshold cannot detect the *no-progress*
+# case: a worker reasoning in a loop is talking to its provider constantly,
+# so its heartbeat never goes stale. Liveness and progress are separate
+# leases — see the progress lease block below.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+
+# ---------------------------------------------------------------------------
+# Progress lease
+# ---------------------------------------------------------------------------
+# A running claim carries two INDEPENDENT leases:
+#
+#   liveness (last_heartbeat_at + claim_expires)
+#       "the worker process and its provider are responsive." Renewed by any
+#       agent activity, raw stream tokens and API waits included. This is
+#       what carries a slow-but-healthy single tool-free model call.
+#
+#   progress (tasks.last_progress_at — the one authoritative column)
+#       "something observable happened OUTSIDE the model's token stream."
+#       Stamped only by deterministic events the model cannot author directly:
+#         * the claim that started the attempt,
+#         * a VERIFIED tool execution seen by the centralized tool middleware
+#           (tools.kanban_tools.note_tool_progress_from_env, driven from
+#           agent/tool_executor.py): dispatched, side-effect-capable, and its
+#           result a success — a refused, failed, read-only or bookkeeping
+#           call is not evidence,
+#         * a durable board state transition (``PROGRESS_EVENT_KINDS``).
+#
+# Text a model writes is NOT one of them. ``kanban_heartbeat(note=...)``
+# renews liveness and records the note as commentary; it never touches this
+# lease, however specific the note sounds, because nothing checks the note
+# against the world. See ``PROGRESS_RENEWAL_SOURCES``.
+#
+# Detection only. ``detect_no_progress_running`` reports an expired progress
+# lease with a durable ``no_progress_deferred`` receipt and holds the claim
+# for a bounded grace. It never signals a process, requeues the card or
+# counts a failure: releasing a claim beside a worker we cannot prove we own
+# is the duplicate-worker bug, and the dispatcher holds no settlement
+# authority over any worker here. Turning a detected expiry into a reclaim
+# is a separate, narrower change layered on this one.
+#
+# Default 45 minutes: comfortably longer than any plausible single tool-free
+# model call (extended thinking and provider backoff included), and short
+# enough to bound a reasoning-only loop. ``kanban.no_progress_timeout_seconds``
+# configures it; 0 disables detection.
+DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 45 * 60
+
+# Smallest progress window that can mean what it says. A single model call
+# routinely runs past a minute with nothing else happening, so any value in
+# 1..59 would report healthy workers on the very next tick. In practice such
+# a value is a units slip (45 "minutes" written into a seconds field), not an
+# intent, so it is refused rather than obeyed.
+MIN_NO_PROGRESS_TIMEOUT_SECONDS = 60
+
+# How long a detected no-progress expiry holds the claim, and therefore how
+# often the ``no_progress_deferred`` receipt may be re-issued for the same
+# run while the condition persists. The stale ``last_progress_at`` is left
+# alone on purpose (clearing it would reset the very clock that detected the
+# problem), so the condition re-detects every tick; the receipt is bounded
+# to one per grace window so it stays auditable rather than becoming noise.
+NO_PROGRESS_DEFER_GRACE_SECONDS = 15 * 60
+
+# ``record_progress`` sources. The claim and board transitions stamp the
+# column inline (they already hold the write txn), so the single callable
+# entry point is the tool middleware.
+PROGRESS_SOURCE_TOOL = "tool_invocation"
+
+# The allowlist IS the class boundary, enforced inside ``record_progress``
+# rather than at its call sites, so a future caller cannot re-open a
+# model-authored path by accident. There is deliberately NO source for
+# model-authored text: a deterministic, verified evidence mechanism gets its
+# own source constant here — and its own verification — rather than a string.
+PROGRESS_RENEWAL_SOURCES = frozenset({PROGRESS_SOURCE_TOOL})
+
+# Event kinds that constitute a durable board state transition. Deliberately
+# EXCLUDES lease bookkeeping (``heartbeat``, ``claim_extended``, ``claimed``,
+# ``spawned``) and dispatcher recovery receipts (``reclaimed``, ``stale``,
+# ``timed_out``, ``crashed``, ``reclaim_deferred``, ``no_progress_deferred``)
+# — counting those would make the guard renew itself.
+PROGRESS_EVENT_KINDS = frozenset({
+    "completed",
+    "review_requested",
+    "changes_requested",
+    "review_reopened",
+    "blocked",
+    "unblocked",
+    "commented",
+    "attached",
+    "attachment_removed",
+    "linked",
+    "unlinked",
+    "edited",
+    "decomposed",
+    "specified",
+})
+
+
+def resolve_no_progress_timeout_seconds(
+    value: Any = None,
+    *,
+    default: int = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
+) -> int:
+    """Coerce a ``kanban.no_progress_timeout_seconds`` config value.
+
+    ``None`` / missing -> ``default``. ``0`` is an explicit "disable". Every
+    rejected value falls back to ``default`` rather than to 0: a typo in
+    config.yaml must not silently switch detection off. Each rejection is
+    logged at WARNING so a misconfigured board is visible, not merely ignored.
+
+    Rejected: booleans (``True`` is an ``int`` in Python, so a YAML
+    ``no_progress_timeout_seconds: true`` would otherwise resolve to a
+    one-second bound), anything unparseable, non-finite floats (``.inf`` and
+    ``.nan`` are real YAML scalars; ``int(float("inf"))`` raises
+    ``OverflowError``, which is not a ``ValueError``), negatives, and values
+    in ``1..MIN_NO_PROGRESS_TIMEOUT_SECONDS - 1``.
+
+    Every dispatch entry point (gateway watcher, ``hermes kanban dispatch``,
+    the standalone daemon, the dashboard nudge) resolves through here, so
+    there is exactly one definition of a valid progress bound.
+    """
+    if value is None:
+        return int(default)
+    if isinstance(value, bool):
+        _log.warning(
+            "kanban: no_progress_timeout_seconds=%r is a boolean, not a "
+            "duration; using default %ds", value, default,
+        )
+        return int(default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        _log.warning(
+            "kanban: no_progress_timeout_seconds=%r is not a finite integer; "
+            "using default %ds", value, default,
+        )
+        return int(default)
+    if parsed < 0:
+        _log.warning(
+            "kanban: no_progress_timeout_seconds=%d is negative; using "
+            "default %ds", parsed, default,
+        )
+        return int(default)
+    if 0 < parsed < MIN_NO_PROGRESS_TIMEOUT_SECONDS:
+        _log.warning(
+            "kanban: no_progress_timeout_seconds=%ds is below the %ds "
+            "minimum — a single model call routinely takes longer (did you "
+            "mean minutes?); using default %ds",
+            parsed, MIN_NO_PROGRESS_TIMEOUT_SECONDS, default,
+        )
+        return int(default)
+    return parsed
+
 
 # Grace added to a claim when a reclaim is deferred because the previous
 # host-local worker is still alive after a termination attempt. Releasing the
@@ -1085,7 +1237,12 @@ class Task:
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    # Liveness lease — "process/provider responsive". Bumped by ordinary API
+    # traffic (stream chunks included) via the runtime-activity bridge.
     last_heartbeat_at: Optional[int] = None
+    # Progress lease — "something observable happened outside the token
+    # stream". See ``PROGRESS_EVENT_KINDS`` / :func:`record_progress`.
+    last_progress_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
@@ -1193,6 +1350,9 @@ class Task:
             ),
             last_heartbeat_at=(
                 row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
+            ),
+            last_progress_at=(
+                row["last_progress_at"] if "last_progress_at" in keys else None
             ),
             current_run_id=(
                 row["current_run_id"] if "current_run_id" in keys else None
@@ -1363,6 +1523,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
+    -- Progress lease: last time something observable happened outside the
+    -- worker's token stream — the claim, a verified tool execution, or a
+    -- durable board transition (PROGRESS_EVENT_KINDS). Independent of the
+    -- liveness lease above; NULL on rows that predate it (readers fall back
+    -- to the active run's started_at). The one authoritative column.
+    last_progress_at     INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
@@ -2597,6 +2763,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
+        )
+    if "last_progress_at" not in cols:
+        # Progress lease (see SCHEMA_SQL). Existing rows get NULL rather than
+        # ``now``: backfilling a timestamp would hand every in-flight worker
+        # a lease it never earned, including one already wedged in a
+        # reasoning loop at upgrade time. Readers COALESCE NULL to the active
+        # run's ``started_at``, so a legitimately-running pre-upgrade worker
+        # is measured from when its attempt began.
+        _add_column_if_missing(
+            conn, "tasks", "last_progress_at", "last_progress_at INTEGER"
         )
     if "current_run_id" not in cols:
         _add_column_if_missing(
@@ -4319,6 +4495,108 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    # A durable board transition IS progress evidence, whichever surface
+    # produced it (worker tool, CLI, dashboard). Routing it through the one
+    # funnel every transition already passes keeps the rule in a single
+    # place instead of sprinkled across a dozen mutators. Lease bookkeeping
+    # and dispatcher recovery receipts are excluded — see PROGRESS_EVENT_KINDS.
+    if kind in PROGRESS_EVENT_KINDS:
+        _stamp_progress(conn, task_id, now)
+
+
+def _stamp_progress(conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Write ``tasks.last_progress_at``. Caller holds the write transaction.
+
+    Tolerates only a missing column: a state transition on a board that
+    somehow predates the additive migration must not be taken down by its
+    progress lease. Any other error is the caller's transaction to handle.
+    """
+    try:
+        conn.execute(
+            "UPDATE tasks SET last_progress_at = ? WHERE id = ?",
+            (now, task_id),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc):
+            raise
+        _log.debug(
+            "kanban: progress lease column missing on this board; skipping "
+            "stamp for %s", task_id,
+        )
+
+
+def record_progress(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source: Any,
+    expected_run_id: Optional[int] = None,
+    claim_lock: Optional[str] = None,
+) -> dict[str, Any]:
+    """Renew the PROGRESS lease for ``task_id`` and return a receipt.
+
+    ``source`` must be in :data:`PROGRESS_RENEWAL_SOURCES`; anything else is
+    refused with ``reason="unsupported_source"`` and writes nothing —
+    including values that are not even hashable, which would otherwise make
+    the frozenset membership test raise instead of refuse. That check is the
+    class boundary and lives here rather than at the call sites. There is no
+    ``note`` parameter: free text a model writes is commentary and must not
+    be able to move a lease, because nothing validates it against the world.
+
+    Only a running task can make progress, and only the attempt that owns
+    it: ``expected_run_id`` must match the task's active run and
+    ``claim_lock`` (when given) its claim, so a worker whose run was reclaimed
+    or whose claim was taken over cannot resurrect the lease of whatever
+    replaced it.
+
+    Progress stamps a column and never appends an event — a tool call every
+    few seconds for hours would otherwise bloat ``task_events``. Board
+    transitions are the durable record and stamp inline from
+    :func:`_append_event`. Never raises on a normal miss; the receipt
+    (``recorded``, ``reason``, ``source``, ``run_id``, ``last_progress_at``)
+    is advisory.
+    """
+    now = int(time.time())
+    receipt: dict[str, Any] = {
+        "recorded": False,
+        "reason": "not_running",
+        "source": source,
+        "run_id": None,
+        "last_progress_at": None,
+    }
+    try:
+        supported = source in PROGRESS_RENEWAL_SOURCES
+    except TypeError:
+        # An unhashable source is by definition not on the allowlist.
+        supported = False
+    if not supported:
+        receipt["reason"] = "unsupported_source"
+        return receipt
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return receipt
+        if expected_run_id is None or not claim_lock:
+            receipt["reason"] = "authority_required"
+            return receipt
+        run_id = row["current_run_id"]
+        if expected_run_id is not None and (
+            run_id is None or int(run_id) != int(expected_run_id)
+        ):
+            receipt["reason"] = "superseded"
+            return receipt
+        if claim_lock is not None and row["claim_lock"] != claim_lock:
+            receipt["reason"] = "claim_mismatch"
+            return receipt
+        receipt["run_id"] = int(run_id) if run_id is not None else None
+        _stamp_progress(conn, task_id, now)
+        receipt["recorded"] = True
+        receipt["reason"] = "recorded"
+        receipt["last_progress_at"] = now
+    return receipt
 
 
 def _end_run(
@@ -4678,15 +4956,19 @@ def claim_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+               SET status           = 'running',
+                   claim_lock       = ?,
+                   claim_expires    = ?,
+                   started_at       = COALESCE(started_at, ?),
+                   -- The claim itself is a state transition: the attempt
+                   -- starts with a fresh progress lease, so a worker gets
+                   -- the full no-progress window to do something.
+                   last_progress_at = ?
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4778,15 +5060,18 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+               SET status           = 'running',
+                   claim_lock       = ?,
+                   claim_expires    = ?,
+                   started_at       = COALESCE(started_at, ?),
+                   -- Same as claim_task: a review attempt starts with a
+                   -- fresh progress lease.
+                   last_progress_at = ?
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -8058,6 +8343,14 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    no_progress_deferred: list[str] = field(default_factory=list)
+    """Task ids whose PROGRESS lease expired this tick — no verified tool
+    execution and no board transition within
+    ``kanban.no_progress_timeout_seconds`` — and were reported with a
+    durable ``no_progress_deferred`` receipt. The card keeps its status,
+    claim, PID and run and nothing is signalled, requeued or counted as a
+    failure; the claim is held for ``NO_PROGRESS_DEFER_GRACE_SECONDS``. See
+    :func:`detect_no_progress_running`."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -8675,6 +8968,185 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
+
+
+# Liveness classification carried on the no-progress receipt, so an operator
+# can tell whether the worker was chattering with its provider the whole time
+# (a reasoning loop: ``fresh``) or had gone quiet as well (``stale``). Matches
+# the liveness backstop used by ``release_stale_claims`` so the two agree.
+_NO_PROGRESS_LIVENESS_FRESH_SECONDS = DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+
+
+def detect_no_progress_running(
+    conn: sqlite3.Connection,
+    *,
+    no_progress_timeout_seconds: int = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Report ``running`` tasks whose PROGRESS lease expired. Detection only.
+
+    ``release_stale_claims`` and ``detect_stale_running`` both key off
+    ``last_heartbeat_at``, which the runtime-activity bridge keeps fresh from
+    raw stream tokens — so a worker that reasoned for thousands of tokens
+    with zero tool calls and zero board transitions renewed its claim
+    forever. This pass keys off ``tasks.last_progress_at`` instead.
+
+    A task is a candidate when ``now - COALESCE(tasks.last_progress_at,
+    run.started_at, tasks.started_at)`` exceeds the timeout. The COALESCE is
+    the migration path: a run claimed before the progress lease existed is
+    measured from when its attempt began, never treated as infinitely stale.
+
+    Classification, not overlap. This runs after the crash, stale and
+    max-runtime passes in a dispatcher tick and skips a host-local task whose
+    PID is already gone: that is a *dead* worker and ``detect_crashed_workers``
+    owns it (it carries exit-code forensics this pass cannot see).
+
+    For each expiry this pass emits a durable ``no_progress_deferred`` event
+    and holds the claim for :data:`NO_PROGRESS_DEFER_GRACE_SECONDS` — and
+    does nothing else. Status, claim lock, worker pid, the active run and the
+    failure counter are left exactly as they were; no signal is sent and the
+    card is never requeued. The dispatcher holds no settlement authority over
+    any worker here — missing, custom-spawned, remote or otherwise — so every
+    expiry is the same safe-defer case, not an error. Releasing a claim beside
+    a worker we cannot prove we own is the duplicate-worker bug this refuses
+    to reintroduce; the settling path is a separate, narrower change.
+
+    The stale ``last_progress_at`` is deliberately left alone (clearing it
+    would reset the clock that detected the problem), so the condition
+    re-detects every tick; the receipt is re-issued at most once per grace
+    window per run, which keeps the hold bounded and auditable. The task id
+    is returned only on the ticks a receipt was written.
+
+    ``no_progress_timeout_seconds <= 0`` disables the pass entirely.
+    """
+    if no_progress_timeout_seconds <= 0:
+        return []
+
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    deferred: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.claim_lock, t.claim_expires, "
+        "       t.current_run_id, t.last_heartbeat_at, t.last_progress_at, "
+        "       COALESCE(t.last_progress_at, r.started_at, t.started_at) "
+        "           AS progress_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running'"
+    ).fetchall()
+
+    for row in rows:
+        if (
+            row["progress_at"] is None
+            or row["claim_lock"] is None
+            or row["claim_expires"] is None
+        ):
+            # Broken claim bookkeeping — reconcile_orphaned_running owns it.
+            # Holding such a row would invent a ``claim_expires`` where
+            # there was none and hand it to the TTL path later, beside a
+            # possibly-live process.
+            continue
+        progress_age = now - int(row["progress_at"])
+        if progress_age <= no_progress_timeout_seconds:
+            continue
+
+        tid = row["id"]
+        lock = row["claim_lock"]
+        pid = row["worker_pid"]
+        host_local = lock.startswith(host_prefix)
+        if host_local and pid and not _pid_alive(pid):
+            # Dead, not wedged. Leave the forensics to the crash path.
+            continue
+
+        run_id = row["current_run_id"]
+        # Bounded receipt: one per grace window per run. The window is read
+        # from the durable event log, so it survives restarts and is shared
+        # by every dispatcher that can tick this board.
+        recent = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'no_progress_deferred' "
+            "  AND run_id IS ? AND created_at > ? LIMIT 1",
+            (tid, run_id, now - NO_PROGRESS_DEFER_GRACE_SECONDS),
+        ).fetchone()
+        if recent is not None:
+            continue
+
+        last_hb = row["last_heartbeat_at"]
+        hb_age = (now - int(last_hb)) if last_hb is not None else None
+        if hb_age is None:
+            liveness = "never"
+        elif hb_age <= _NO_PROGRESS_LIVENESS_FRESH_SECONDS:
+            liveness = "fresh"
+        else:
+            liveness = "stale"
+
+        hold_until = now + NO_PROGRESS_DEFER_GRACE_SECONDS
+        with write_txn(conn):
+            # Hold the claim for the grace: a floor, never a reset, so a live
+            # worker's own renewals are not brought forward. CAS on the
+            # claim and run we classified so a concurrent transition wins.
+            cur = conn.execute(
+                "UPDATE tasks "
+                "   SET claim_expires = MAX(COALESCE(claim_expires, 0), ?) "
+                " WHERE id = ? AND status = 'running' "
+                "   AND claim_lock IS ? AND current_run_id IS ?",
+                (hold_until, tid, row["claim_lock"], run_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs "
+                    "   SET claim_expires = MAX(COALESCE(claim_expires, 0), ?) "
+                    " WHERE id = ?",
+                    (hold_until, int(run_id)),
+                )
+            claim_expires_now = conn.execute(
+                "SELECT claim_expires FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()["claim_expires"]
+            _append_event(
+                conn, tid, "no_progress_deferred",
+                {
+                    "classification": "no_progress",
+                    # This dispatcher holds no settlement authority over
+                    # any worker; every expiry is the safe-defer case.
+                    "reason": "authority_unavailable",
+                    "progress_age_seconds": int(progress_age),
+                    "timeout_seconds": int(no_progress_timeout_seconds),
+                    "last_progress_at": (
+                        int(row["last_progress_at"])
+                        if row["last_progress_at"] is not None else None
+                    ),
+                    "last_heartbeat_at": (
+                        int(last_hb) if last_hb is not None else None
+                    ),
+                    "heartbeat_age_seconds": (
+                        int(hb_age) if hb_age is not None else None
+                    ),
+                    "liveness": liveness,
+                    "worker_pid": int(pid) if pid else None,
+                    "claim_lock": row["claim_lock"],
+                    "host_local": host_local,
+                    "claim_expires_was": (
+                        int(row["claim_expires"])
+                        if row["claim_expires"] is not None else None
+                    ),
+                    "claim_expires_now": int(claim_expires_now),
+                    "grace_seconds": NO_PROGRESS_DEFER_GRACE_SECONDS,
+                },
+                run_id=run_id,
+            )
+            deferred.append(tid)
+        _log.warning(
+            "kanban: task %s has shown no observable progress for %ss "
+            "(limit %ss; liveness %s); holding the claim for %ss and "
+            "deferring — no settlement authority, nothing signalled or "
+            "requeued",
+            tid, int(progress_age), int(no_progress_timeout_seconds),
+            liveness, NO_PROGRESS_DEFER_GRACE_SECONDS,
+        )
+
+    return deferred
 
 
 def reconcile_orphaned_running(
@@ -9694,6 +10166,21 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
+def configured_kanban_setting(key: str) -> Any:
+    """Read one raw ``kanban.<key>`` value from config.yaml, or None.
+
+    Shared by the dispatch entry points that do not already hold a loaded
+    config (the standalone daemon, the dashboard nudge). Fails open: an
+    unreadable config must not take down a dispatcher tick, it just falls
+    back to the caller's default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        return (load_config_readonly() or {}).get("kanban", {}).get(key)
+    except Exception:
+        return None
+
+
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
@@ -9815,6 +10302,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    no_progress_timeout_seconds: int = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -9850,6 +10338,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            no_progress_timeout_seconds=no_progress_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -9870,6 +10359,7 @@ def dispatch_once(
                 max_in_progress=max_in_progress,
                 failure_limit=failure_limit,
                 stale_timeout_seconds=stale_timeout_seconds,
+                no_progress_timeout_seconds=no_progress_timeout_seconds,
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
@@ -9897,6 +10387,7 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    no_progress_timeout_seconds: int = DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -9908,6 +10399,10 @@ def _dispatch_once_locked(
       1. Reclaim stale running tasks (TTL expired).
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
+      3b. Report running tasks whose PROGRESS lease expired (after the
+          crash / stale / max-runtime passes; detection only, see
+          ``detect_no_progress_running`` — bounded by
+          ``no_progress_timeout_seconds``, 0 disables).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
@@ -9969,6 +10464,14 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Progress-lease detection runs AFTER every settling pass above so each
+    # recovery path keeps its own case: a dead pid is a crash, an absent
+    # heartbeat is stale, a blown runtime cap is timed_out. What is left is
+    # a worker that is alive-or-remote and has produced nothing observable.
+    # This pass only records and holds; it never signals or requeues.
+    result.no_progress_deferred = detect_no_progress_running(
+        conn, no_progress_timeout_seconds=no_progress_timeout_seconds,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -10978,12 +11481,20 @@ def run_daemon(
             max_in_progress = resolve_max_in_progress(
                 configured_max_in_progress()
             )
+            # Same for the progress-lease bound: the standalone daemon must
+            # honour kanban.no_progress_timeout_seconds exactly like the
+            # gateway and the CLI, or the systemd deployment would be the
+            # one surface where the lease is measured differently.
+            no_progress_timeout_seconds = resolve_no_progress_timeout_seconds(
+                configured_kanban_setting("no_progress_timeout_seconds")
+            )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    no_progress_timeout_seconds=no_progress_timeout_seconds,
                 )
             if on_tick is not None:
                 try:
