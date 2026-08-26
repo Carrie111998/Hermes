@@ -697,6 +697,57 @@ subprocess.check_output = lambda *args, **kwargs: os.environ['HERMES_TEST_PS_LIN
   }
 )
 
+test('disconnect reaps the backend recorded for this desktop ownership', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/print\("OWNED"/, 'OWNED\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID)
+
+  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test('disconnect reaps a wrapper when the live backend proves authenticated ownership', async () => {
+  const lock = ownedLock()
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID, async candidate => candidate.spawnNonce === SPAWN_NONCE)
+
+  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test('disconnect preserves the lock when an alive process cannot prove ownership', async () => {
+  const lock = ownedLock()
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID)
+
+  assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test('disconnect is a no-op when this desktop has no lockfile', async () => {
+  const ssh = fakeSsh([[/cat .*backend\.lock\.json/, '']])
+
+  await disconnect(ssh, OWNERSHIP_ID)
+
+  assert.ok(!ssh.calls.some(command => /\bkill\b/.test(command)))
+})
+
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])
   await cleanupStale(notOurs, OWNERSHIP_ID, {

@@ -9497,19 +9497,49 @@ async function teardownSshConnection(profile) {
 
   terminalIpc.disposeTerminalSessionsForSshScope(scope)
 
-  try {
-    if (state.localPort && state.remotePort) {
-      await state.ssh.cancelForward(state.localPort, state.remotePort)
-    }
-  } catch {
-    // best effort
-  }
+  // Kill the owned remote serve --isolated *before* closing the SSH
+  // transport. Spawn detaches with setsid/nohup, so closing the tunnel
+  // alone leaves the backend at pid 1 holding state.db (#91668).
+  // Windows remotes use a different lifecycle (connectWindowsRemote) and
+  // are left to a follow-up; POSIX is the leak that OOM'd gateways.
+  await teardownSshState(
+    {
+      ...state,
+      ownershipId: state.ownershipId || sshOwnershipKey(profile)
+    },
+    {
+      cleanupRemote:
+        state.remotePlatform === 'Windows'
+          ? async () => {
+              // connectWindowsRemote does not share POSIX lock/kill. Stay
+              // silent on the kill path, but leave a log so quit is not a
+              // mysterious no-op on Windows remotes.
+              sshRememberLog('[ssh] skip remote serve teardown on Windows remotes; POSIX disconnect does not apply')
+            }
+          : (ssh, ownershipId) =>
+              remoteLifecycle.disconnect(ssh, ownershipId, async lock => {
+                // The active tunnel already points at the backend this state
+                // adopted. Its token + owner nonce are the exact ownership
+                // proof when macOS ps cannot preserve argv boundaries.
+                if (
+                  !state.localPort ||
+                  !state.token ||
+                  state.pid !== lock.pid ||
+                  state.remotePort !== lock.port
+                ) {
+                  return false
+                }
 
-  try {
-    await state.ssh.close()
-  } catch {
-    // best effort
-  }
+                return (
+                  (await sshProbeReuseProof(
+                    `http://127.0.0.1:${state.localPort}`,
+                    state.token,
+                    lock.spawnNonce
+                  )) === 'authenticated-ok'
+                )
+              })
+    }
+  )
 }
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
@@ -9743,6 +9773,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     localPort: result.localPort,
     remotePort: result.remotePort,
     pid: result.pid,
+    token: result.token,
     host: sshConfig.host,
     hostLabel,
     hermesVersion: result.hermesVersion || '',

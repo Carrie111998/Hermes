@@ -493,21 +493,46 @@ async function pidIsOurDashboard(
   }
 }
 
-// Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
-async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
-  if (
+// Kill the stale dashboard ONLY if provably ours, then drop the lockfile unless
+// the caller asks us to preserve an unverified live owner's only recovery record.
+async function cleanupStale(
+  ssh,
+  ownershipId,
+  lock,
+  pidAlive = true,
+  proveOwnership?: (lock: any) => boolean | Promise<boolean>,
+  preserveUnverified = false
+) {
+  let authenticatedOwnership = false
+
+  if (pidAlive && lock && typeof proveOwnership === 'function') {
+    try {
+      authenticatedOwnership = (await proveOwnership(lock)) === true
+    } catch {
+      // Fall back to process identity. Teardown remains best-effort when the
+      // authenticated HTTP proof cannot cross the existing tunnel.
+    }
+  }
+
+  const owned =
     pidAlive &&
     lock &&
-    (await pidIsOurDashboard(
-      ssh,
-      lock.pid,
-      lock.spawnNonce,
-      lock.hermesPath,
-      lock.hermesHome,
-      ownershipId,
-      lock.profile
-    ))
-  ) {
+    (authenticatedOwnership ||
+      (await pidIsOurDashboard(
+        ssh,
+        lock.pid,
+        lock.spawnNonce,
+        lock.hermesPath,
+        lock.hermesHome,
+        ownershipId,
+        lock.profile
+      )))
+
+  if (pidAlive && lock && !owned && preserveUnverified) {
+    return false
+  }
+
+  if (owned) {
     try {
       const result = (
         await ssh.exec(
@@ -537,6 +562,29 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   }
 
   await removeLockfile(ssh, ownershipId)
+
+  return true
+}
+
+// Normal disconnect (quit, connection switch): reuse cleanupStale so we kill
+// only a provably-owned serve --isolated. Preserve the lock when an alive pid
+// cannot be verified; dropping it would make a detached backend unreapable.
+// Closing the SSH transport first is not enough — spawn detaches with
+// setsid/nohup, so the backend reparents to pid 1 and keeps state.db
+// open (#91668).
+async function disconnect(ssh, ownershipId, proveOwnership?: (lock: any) => boolean | Promise<boolean>) {
+  if (!ssh || !ownershipId) {
+    return
+  }
+
+  const lock = await readLockfile(ssh, ownershipId)
+
+  if (!lock) {
+    return
+  }
+
+  const pidAlive = await remotePidAlive(ssh, lock.pid)
+  await cleanupStale(ssh, ownershipId, lock, pidAlive, proveOwnership, true)
 }
 
 // Detach so the backend survives the SSH channel closing: setsid (Linux)
