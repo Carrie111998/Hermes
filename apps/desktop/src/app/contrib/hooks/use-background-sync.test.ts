@@ -30,8 +30,8 @@ import {
   reconcileActiveTranscript,
   reconcileTileTranscripts as reconcileTileTranscriptsForTest,
   rehydrateLiveSessionStatuses,
-  resetTypingActivityTracking,
   resetLiveRuntimeTracking,
+  resetTypingActivityTracking,
   resolveActiveTranscriptSession,
   useBackgroundSync,
   windowIsActivelyViewed
@@ -214,8 +214,9 @@ describe('active transcript refresh', () => {
     $activeSessionId.set(ACTIVE_RUNTIME_ID)
     $selectedStoredSessionId.set(hiddenStoredSessionId)
     setSessionOwnerHint(hiddenStoredSessionId, ownerRoute)
-    const fixture = makeRefresh(resolveActiveTranscriptSession)
+    const fixture = makeRefresh(resolveActiveTranscriptSession, 'bot-profile')
     fixture.selectedStoredSessionIdRef.current = hiddenStoredSessionId
+    fixture.state.storedSessionId = hiddenStoredSessionId
     vi.mocked(getLatestSessionMessages).mockResolvedValue(
       transcript('hidden external answer', hiddenStoredSessionId) as never
     )
@@ -529,6 +530,7 @@ describe('reconcileActiveTranscript', () => {
     setSessionOwnerHint(ownerBStoredSessionId, ownerBRoute)
     const fixture = makeRefresh(resolveActiveTranscriptSession, 'bot-b')
     fixture.selectedStoredSessionIdRef.current = ownerBStoredSessionId
+    fixture.state.storedSessionId = ownerBStoredSessionId
     vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('owner B answer', ownerBStoredSessionId) as never)
 
     await fixture.refresh()
@@ -540,8 +542,8 @@ describe('reconcileActiveTranscript', () => {
     })
     expect(fixture.updateSessionState).toHaveBeenCalledWith(
       ACTIVE_RUNTIME_ID,
+      { profile: 'bot-b', storedSessionId: ownerBStoredSessionId },
       expect.any(Function),
-      ownerBStoredSessionId
     )
     expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({
       text: 'owner B answer'

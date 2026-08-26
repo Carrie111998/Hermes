@@ -44,6 +44,7 @@ export function resolveActiveTranscriptSession(
   ownerProfile: string
 ): ActiveTranscriptSession | undefined {
   const owner = normalizeProfileKey(ownerProfile)
+
   const visible =
     $sessions
       .get()

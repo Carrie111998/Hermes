@@ -241,11 +241,13 @@ function StoredIdRotationHarness({
   activeSessionIdRef,
   getRoutedStoredSessionId,
   navigate,
+  selectedStoredSessionProfileRef,
   selectedStoredSessionIdRef
 }: {
   activeSessionIdRef: MutableRefObject<string | null>
   getRoutedStoredSessionId: () => null | string
   navigate: (to: string, options?: { replace?: boolean }) => void
+  selectedStoredSessionProfileRef?: MutableRefObject<string | null>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -264,6 +266,7 @@ function StoredIdRotationHarness({
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: selectedStoredSessionIdRef.current,
     selectedStoredSessionIdRef,
+    selectedStoredSessionProfileRef,
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
@@ -308,6 +311,42 @@ describe('active stored-session id rotation routing', () => {
     expect($selectedStoredSessionId.get()).toBe('stored-A-next')
     expect(navigate).toHaveBeenCalledWith(sessionRoute('stored-A-next'), { replace: true })
     expect($activeSessionStoredIdRotation.get()).toBeNull()
+  })
+
+  it('preserves the selected owner profile when a qualified cron run rotates beside a same-id sibling', async () => {
+    const sharedId = 'cron-shared-session'
+    const nextId = 'cron-shared-session-next'
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-meta' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: sharedId }
+    const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'meta' }
+    const navigate = vi.fn()
+
+    setSessions([
+      storedSession({ id: sharedId, profile: 'default' }),
+      storedSession({ id: sharedId, profile: 'meta' })
+    ])
+    setSelectedStoredSessionId(sharedId)
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => sharedId}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        selectedStoredSessionProfileRef={selectedStoredSessionProfileRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        nextStoredSessionId: nextId,
+        previousStoredSessionId: sharedId,
+        runtimeSessionId: 'runtime-meta'
+      })
+    })
+
+    await waitFor(() => expect(selectedStoredSessionIdRef.current).toBe(nextId))
+    expect(selectedStoredSessionProfileRef.current).toBe('meta')
+    expect(navigate).toHaveBeenCalledWith(sessionRoute(nextId, 'meta'), { replace: true })
   })
 
   it('keeps draft on the previous tip when the new tip row is not loaded yet', async () => {

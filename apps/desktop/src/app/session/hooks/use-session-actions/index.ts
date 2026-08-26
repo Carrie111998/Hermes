@@ -100,8 +100,7 @@ import {
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
   requestForSessionProfile,
-  type SessionOwnerScope,
-  type SessionProfileRoute
+  type SessionOwnerScope
 } from '@/store/session-request-router'
 import {
   $sessionTiles,
@@ -385,9 +384,16 @@ export function useSessionActions({
     // chat still needs to follow the continuation. Update that selection in
     // place without navigating out of the surface the user deliberately opened.
     if (routedStoredSessionId === previousId) {
-      navigate(sessionRoute(nextId), { replace: true })
+      navigate(sessionRoute(nextId, selectedProfileRef.current), { replace: true })
     }
-  }, [activeSessionIdRef, getRoutedStoredSessionId, navigate, selectedStoredSessionIdRef, storedIdRotation])
+  }, [
+    activeSessionIdRef,
+    getRoutedStoredSessionId,
+    navigate,
+    selectedProfileRef,
+    selectedStoredSessionIdRef,
+    storedIdRotation
+  ])
 
   const startFreshSessionDraft = useCallback(
     (options: boolean | FreshSessionDraftOptions = false) => {
