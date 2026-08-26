@@ -145,6 +145,91 @@ def test_single_flight_coalesces_concurrent_identical_queries():
     assert len(results) == 2 and all(r["success"] for r in results)
 
 
+# ── successful-but-empty search responses (#95516) ──────────────────────
+
+def _empty_ok_response():
+    return {"success": True, "data": {"web": []}}
+
+
+def test_search_memo_does_not_cache_successful_empty_results():
+    """A transiently empty SearXNG response must not stick for a whole TTL."""
+    memo = SearchMemo()
+    memo.store("searxng", "q", 5, _empty_ok_response())
+    assert memo.lookup("searxng", "q", 5) is None
+
+
+@pytest.mark.parametrize("response", [
+    {"success": True},                                  # data missing entirely
+    {"success": True, "data": {}},                      # web missing
+    {"success": True, "data": None},                    # malformed data
+    {"success": True, "data": {"web": None}},           # null web
+    {"success": True, "data": {"web": "nope"}},         # non-list web
+])
+def test_search_memo_does_not_cache_malformed_web_payloads(response):
+    memo = SearchMemo()
+    memo.store("searxng", "q", 5, response)
+    assert memo.lookup("searxng", "q", 5) is None
+
+
+@pytest.mark.parametrize("web", [
+    [{"title": "no url here"}],
+    [{"url": ""}],
+    [{"url": "   "}],
+    [{"url": None}],
+    ["not-a-dict", {"title": "t"}],
+    [],
+])
+def test_search_memo_entries_without_usable_urls_not_cached(web):
+    memo = SearchMemo()
+    memo.store("searxng", "q", 5, {"success": True, "data": {"web": web}})
+    assert memo.lookup("searxng", "q", 5) is None
+
+
+def test_search_memo_single_usable_url_among_garbage_still_caches():
+    memo = SearchMemo()
+    web = [{"title": "junk"}, {"url": ""}, {"url": "https://e.com/real"}]
+    memo.store("p", "q", 5, {"success": True, "data": {"web": web}})
+    hit = memo.lookup("p", "q", 5)
+    assert hit is not None and len(hit["data"]["web"]) == 3
+
+
+def test_single_flight_coalesces_concurrent_identical_empty_queries():
+    """Empty responses share the in-flight result exactly once but never
+    become a TTL entry: waiters get the winner's response, and any lookup
+    after the flight misses so the next caller retries the backend."""
+    memo = SearchMemo()
+    calls = []
+    barrier = threading.Barrier(2)
+    results = []
+
+    def worker():
+        barrier.wait()
+        resp = memo.lookup("p", "q", 5)
+        if resp is None:
+            with memo.flight_lock("p", "q", 5):
+                resp = memo.lookup_in_flight("p", "q", 5)
+                if resp is None:
+                    calls.append(1)          # the "paid" request
+                    time.sleep(0.05)         # widen the race window
+                    resp = _empty_ok_response()
+                    memo.store("p", "q", 5, resp)
+        results.append(resp)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1, "concurrent identical empty queries must coalesce"
+    assert len(results) == 2 and all(r["success"] for r in results)
+    # No sticky TTL entry: the next caller must reach the backend again,
+    # via both the strict lookup and the in-flight variant.
+    assert memo.lookup("p", "q", 5) is None
+    assert memo.lookup_in_flight("p", "q", 5) is None
+    assert memo.lookup("p", "q", 5) is None
+
+
 # ── extract cache ────────────────────────────────────────────────────────
 
 def test_extract_cache_roundtrip(_isolated_cache):

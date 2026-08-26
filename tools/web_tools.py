@@ -1010,8 +1010,11 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             if response_data is None:
                 with _search_memo.flight_lock(provider.name, query, limit):
                     # Re-check inside the lock: a concurrent identical call
-                    # may have stored while this one waited.
-                    response_data = _search_memo.lookup(
+                    # may have stored while this one waited. The in-flight
+                    # variant also shares a just-recorded successful-but-
+                    # empty response (#95516) so waiters coalesce instead
+                    # of re-paying for a query that just came back empty.
+                    response_data = _search_memo.lookup_in_flight(
                         provider.name, query, limit
                     )
                     if response_data is None:

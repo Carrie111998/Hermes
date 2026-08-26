@@ -23,7 +23,9 @@ and hooks on cache hits. Down here the cache sits *after* every safety check
 only the network request, never a control.
 
 Disable with ``web.cache_enabled: false``; both TTLs come from
-``web.cache_ttl_minutes``. Only successful responses are ever cached.
+``web.cache_ttl_minutes``. Only successful responses are ever cached;
+successful-but-empty search responses are shared within the requesting
+flight and then dropped, never persisted for the TTL (#95516).
 """
 
 import hashlib
@@ -44,6 +46,11 @@ logger = logging.getLogger(__name__)
 _LIMIT_BUCKETS = (10, 20, 50, 100)
 
 DEFAULT_TTL_MINUTES = 20
+
+# How long a successful-but-empty search response stays shareable for
+# concurrent waiters of the same flight (#95516). Deliberately tiny: it
+# only needs to cover callers blocked on the flight lock, not real reuse.
+_RECENT_EMPTY_TTL = 5.0
 
 # Extract-index sidecar filename inside cache/web.
 _INDEX_FILENAME = "extract-index.json"
@@ -92,6 +99,29 @@ def normalize_query(query: str) -> str:
     return re.sub(r"\s+", " ", (query or "").strip().lower())
 
 
+def has_usable_results(response: dict) -> bool:
+    """True when a search response carries at least one usable result.
+
+    Backends like SearXNG can answer HTTP-successfully with zero results
+    when individual engines are rate-limited or challenged (#95516). A
+    "successful" empty payload is not cacheable: persisting it would pin
+    the transient outage for a whole TTL. Usable means ``data.web`` is a
+    list containing at least one dict whose ``url`` is a non-empty string.
+    """
+    try:
+        web = response.get("data", {}).get("web")
+    except AttributeError:
+        return False
+    if not isinstance(web, list):
+        return False
+    for item in web:
+        if isinstance(item, dict):
+            url = item.get("url")
+            if isinstance(url, str) and url.strip():
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Search memo (in-memory, single-flight)
 # ---------------------------------------------------------------------------
@@ -107,6 +137,11 @@ class SearchMemo:
 
     def __init__(self) -> None:
         self._store: Dict[tuple, Tuple[float, dict]] = {}
+        # Successful-but-empty responses (#95516): never enter the TTL
+        # store; they live here briefly so the waiters of the current
+        # single-flight can share the result instead of re-paying for a
+        # query that just came back empty.
+        self._recent_empty: Dict[tuple, Tuple[float, dict]] = {}
         self._store_lock = threading.Lock()
         self._key_locks: Dict[tuple, threading.Lock] = {}
 
@@ -128,8 +163,38 @@ class SearchMemo:
         logger.info("web_search cache hit: %r via %s", query, provider)
         return json.loads(json.dumps(response))  # defensive copy
 
+    def lookup_in_flight(self, provider: str, query: str, limit: int) -> Optional[dict]:
+        """Re-check performed under the flight lock (web_tools recheck step).
+
+        Identical to :meth:`lookup`, except a successful-but-empty response
+        recorded moments ago by the flight's winner is handed off once to
+        one waiter (single-consume). The entry never outlives that handoff,
+        so the next caller reaches the backend again instead of receiving
+        a stale empty payload for a whole cache TTL (#95516).
+        """
+        hit = self.lookup(provider, query, limit)
+        if hit is not None:
+            return hit
+        if not cache_enabled():
+            return None
+        key = self._key(provider, query, limit)
+        with self._store_lock:
+            recent = self._recent_empty.pop(key, None)
+            if recent is None:
+                return None
+            stored_at, response = recent
+            if (time.monotonic() - stored_at) >= _RECENT_EMPTY_TTL:
+                return None
+        return json.loads(json.dumps(response))  # defensive copy
+
     def store(self, provider: str, query: str, limit: int, response: dict) -> None:
-        """Cache a SUCCESSFUL response for the bucketed key."""
+        """Cache a SUCCESSFUL response for the bucketed key.
+
+        Responses without usable results (successful-but-empty or malformed
+        payloads, #95516) are NOT persisted into the TTL store; they are
+        parked in a short-lived side slot so concurrent identical queries
+        coalesce onto them, and dropped right after.
+        """
         if not cache_enabled():
             return
         if not isinstance(response, dict) or not response.get("success"):
@@ -140,7 +205,21 @@ class SearchMemo:
             now = time.monotonic()
             for k in [k for k, (exp, _) in self._store.items() if now >= exp]:
                 del self._store[k]
-            self._store[key] = (now + ttl_seconds(), json.loads(json.dumps(response)))
+            for k in [
+                k for k, (stored_at, _) in self._recent_empty.items()
+                if (now - stored_at) >= _RECENT_EMPTY_TTL
+            ]:
+                del self._recent_empty[k]
+            if has_usable_results(response):
+                self._store[key] = (
+                    now + ttl_seconds(),
+                    json.loads(json.dumps(response)),
+                )
+            else:
+                self._recent_empty[key] = (
+                    now,
+                    json.loads(json.dumps(response)),
+                )
 
     def flight_lock(self, provider: str, query: str, limit: int) -> threading.Lock:
         """Per-key lock for single-flight coalescing.
@@ -171,6 +250,7 @@ class SearchMemo:
         """Drop all cached entries (tests; config changes)."""
         with self._store_lock:
             self._store.clear()
+            self._recent_empty.clear()
             self._key_locks.clear()
 
 
