@@ -378,7 +378,7 @@ locales = ["locales/*.yaml"]
 ]
 
 [tool.setuptools.package-data]
-hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
+hermes_cli = ["scripts/install.sh", "scripts/install.ps1"]
 # Dashboard SPA and Supabase migrations used by the interfaze-api process.
 # Demo datasets and provider fixtures are deliberately absent; the release
 # workflow inspects the installed wheel and container for those forbidden
@@ -406,7 +406,7 @@ plugins = [
 server = ["demo_data/*", "webui/js/mocks/*"]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "server", "server.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "server", "server.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
