@@ -609,6 +609,7 @@ export interface Translations {
       active: string
       takenBy: string
       invalidShortcut: string
+      sessionUnavailable: string
     }
     credentials: {
       pasteKey: string
