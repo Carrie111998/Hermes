@@ -79,10 +79,94 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 
 
 # ---------------------------------------------------------------------------
-# Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
+# Directly-created initial_status='blocked' tasks are sticky too
 # ---------------------------------------------------------------------------
 
 
+def test_direct_initial_block_is_not_auto_promoted(kanban_home: Path) -> None:
+    """A task created directly in ``blocked`` is an intentional human-ops
+    gate, not a dependency-only wait.  It must not silently become dispatchable
+    merely because it has no parent edges."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="awaiting human operational approval",
+            initial_status="blocked",
+        )
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_direct_initial_block_with_all_parents_done_requires_unblock(
+    kanban_home: Path,
+) -> None:
+    """Completed dependencies never override an initial human-ops block."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="finished upstream work")
+        assert kb.complete_task(conn, parent, summary="done")
+        child = kb.create_task(
+            conn,
+            title="human-gated child after dependency completion",
+            parents=[parent],
+            initial_status="blocked",
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "blocked"
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_direct_initial_block_with_unfinished_parent_requires_unblock(
+    kanban_home: Path,
+) -> None:
+    """An initial human-ops block remains sticky after dispatcher ticks.
+
+    An explicit unblock re-gates the child to ``todo`` while its parent is
+    unfinished; the dispatcher must not make it ready until the dependency
+    completes.  This pins both halves of the API contract.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="upstream work")
+        child = kb.create_task(
+            conn,
+            title="human-gated child",
+            parents=[parent],
+            initial_status="blocked",
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker blocks still auto-recover (mutation negative)
+# ---------------------------------------------------------------------------
+
+
+def test_circuit_breaker_block_without_block_event_still_recovers(
+    kanban_home: Path,
+) -> None:
+    """Kill the tempting but wrong mutation: treating every blocked state
+    as sticky would strand circuit-breaker blocks forever.
+
+    This reproduces the circuit-breaker shape: status is ``blocked`` but
+    lifecycle history has no operator ``blocked`` event.  It must promote.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="transient worker failure")
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 # ---------------------------------------------------------------------------

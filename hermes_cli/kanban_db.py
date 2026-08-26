@@ -3554,6 +3554,18 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if initial_status == "blocked":
+                    # Direct creation in blocked is an intentional human-ops
+                    # gate.  Emit the same durable lifecycle signal as an
+                    # explicit block so recompute_ready cannot mistake this
+                    # for a dependency-only or circuit-breaker block and
+                    # silently dispatch it (#49b74840).
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"source": "initial_status"},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
