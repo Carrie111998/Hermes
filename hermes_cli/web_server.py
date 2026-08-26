@@ -82,6 +82,7 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
+    _canonical_api_mode,
     _deep_merge,
 )
 from plugins.memory.config_schema import (
@@ -7668,6 +7669,23 @@ def _apply_model_assignment_sync(
         provider, model = _normalize_main_model_assignment(provider, model)
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+        if isinstance(provider_entry, dict):
+            provider_models = provider_entry.get("models")
+            selected_metadata = (
+                provider_models.get(model)
+                if isinstance(provider_models, dict) else None
+            )
+            if isinstance(selected_metadata, dict):
+                provider_entry["_selected_model_alias"] = model
+                model = str(selected_metadata.get("canonical_model") or model).strip()
+                provider_entry["model"] = model
+        current_model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        current_provider = str(current_model_cfg.get("provider") or "").strip().lower()
+        previous_entry = (
+            providers_cfg.get(current_provider)
+            if isinstance(providers_cfg, dict) else None
+        )
+        _sync_custom_endpoint_reasoning_override(cfg, previous_entry, provider_entry)
         if not base_url and isinstance(provider_entry, dict) and provider_entry.get("base_url"):
             base_url = str(provider_entry.get("base_url") or "").strip()
         model_cfg = _apply_main_model_assignment(
@@ -8276,8 +8294,13 @@ _CREDENTIAL_PROBES: dict[str, tuple[str, str]] = {
 }
 
 
-def _parse_model_ids(resp: "Any") -> List[str]:
-    """Extract model ids from an OpenAI-compatible ``/v1/models`` response.
+_CUSTOM_ENDPOINT_MODEL_METADATA = (
+    "canonical_model", "reasoning_effort", "supported_reasoning_levels"
+)
+
+
+def _parse_model_catalog(resp: "Any") -> List[Dict[str, Any]]:
+    """Extract safe model routing metadata from a ``/v1/models`` response.
 
     Tolerant of the common shapes: ``{"data": [{"id": ...}]}`` (OpenAI / vLLM /
     llama.cpp) and a bare ``{"data": ["id", ...]}``. Returns ``[]`` on any
@@ -8292,15 +8315,31 @@ def _parse_model_ids(resp: "Any") -> List[str]:
     data = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(data, list):
         return []
-    ids: List[str] = []
+    models: List[Dict[str, Any]] = []
     for item in data:
         if isinstance(item, dict):
             mid = str(item.get("id") or "").strip()
         else:
             mid = str(item or "").strip()
         if mid:
-            ids.append(mid)
-    return ids
+            model: Dict[str, Any] = {"id": mid}
+            if isinstance(item, dict):
+                for field in _CUSTOM_ENDPOINT_MODEL_METADATA:
+                    value = item.get(field)
+                    if field == "supported_reasoning_levels":
+                        if isinstance(value, list):
+                            levels = [str(level).strip() for level in value if str(level).strip()]
+                            if levels:
+                                model[field] = levels
+                    elif isinstance(value, str) and value.strip():
+                        model[field] = value.strip()
+            models.append(model)
+    return models
+
+
+def _parse_model_ids(resp: "Any") -> List[str]:
+    """Compatibility projection for callers that only consume model ids."""
+    return [model["id"] for model in _parse_model_catalog(resp)]
 
 
 def _custom_endpoint_id(raw: str, fallback: str = "custom") -> str:
@@ -8322,6 +8361,102 @@ def _models_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[str]:
 
     seen: set[str] = set()
     return [model for model in models if model and not (model in seen or seen.add(model))]
+
+
+def _model_catalog_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_models = entry.get("models")
+    metadata = raw_models if isinstance(raw_models, dict) else {}
+    return [
+        {
+            "id": model_id,
+            **{
+                field: model_meta[field]
+                for field in _CUSTOM_ENDPOINT_MODEL_METADATA
+                if isinstance(model_meta, dict) and field in model_meta
+            },
+        }
+        for model_id in _models_from_custom_endpoint_entry(entry)
+        for model_meta in [metadata.get(model_id, {})]
+    ]
+
+
+def _custom_endpoint_reasoning(entry: Any) -> Tuple[str, str]:
+    """Return the canonical model and advertised effort selected by an entry."""
+    if not isinstance(entry, dict):
+        return "", ""
+    canonical_model = str(entry.get("model") or entry.get("default_model") or "").strip()
+    raw_models = entry.get("models")
+    if not canonical_model or not isinstance(raw_models, dict):
+        return canonical_model, ""
+
+    selected_alias = str(entry.get("_selected_model_alias") or "").strip()
+    selected_metadata = raw_models.get(selected_alias)
+    if selected_alias and isinstance(selected_metadata, dict):
+        selected_canonical = str(
+            selected_metadata.get("canonical_model") or selected_alias
+        ).strip()
+        effort = str(selected_metadata.get("reasoning_effort") or "").strip().lower()
+        if selected_canonical == canonical_model:
+            return canonical_model, effort
+
+    candidates = []
+    for model_id, metadata in raw_models.items():
+        if not isinstance(metadata, dict):
+            continue
+        candidate_canonical = str(metadata.get("canonical_model") or model_id).strip()
+        effort = str(metadata.get("reasoning_effort") or "").strip().lower()
+        if candidate_canonical == canonical_model and effort:
+            candidates.append(effort)
+    return canonical_model, candidates[0] if len(set(candidates)) == 1 else ""
+
+
+def _sync_custom_endpoint_reasoning_override(
+    cfg: Dict[str, Any], previous_entry: Any, active_entry: Any
+) -> None:
+    """Restore prior user state, then install the active endpoint's override."""
+    previous_state = (
+        previous_entry.get("_reasoning_override_state")
+        if isinstance(previous_entry, dict) else None
+    )
+    active_model, active_effort = _custom_endpoint_reasoning(active_entry)
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    overrides = agent_cfg.get("reasoning_overrides")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    else:
+        overrides = dict(overrides)
+
+    if isinstance(previous_state, dict):
+        previous_model = str(previous_state.get("model") or "").strip()
+        applied = previous_state.get("applied")
+        if previous_model and overrides.get(previous_model) == applied:
+            if previous_state.get("had_previous"):
+                overrides[previous_model] = previous_state.get("previous")
+            else:
+                overrides.pop(previous_model, None)
+        previous_entry.pop("_reasoning_override_state", None)
+    if active_model and active_effort:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed_effort = parse_reasoning_effort(active_effort)
+        if parsed_effort is not None:
+            if isinstance(active_entry, dict):
+                active_entry["_reasoning_override_state"] = {
+                    "model": active_model,
+                    "applied": active_effort,
+                    "had_previous": active_model in overrides,
+                    "previous": overrides.get(active_model),
+                }
+            overrides[active_model] = active_effort
+
+    if overrides:
+        agent_cfg["reasoning_overrides"] = overrides
+    else:
+        agent_cfg.pop("reasoning_overrides", None)
+    if agent_cfg:
+        cfg["agent"] = agent_cfg
+    else:
+        cfg.pop("agent", None)
 
 
 def _api_key_display(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -8372,15 +8507,27 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if not base_url:
                 continue
             endpoint_id = str(provider_id)
-            models = _models_from_custom_endpoint_entry(raw_entry)
-            endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (models[0] if models else ""))
+            model_ids = _models_from_custom_endpoint_entry(raw_entry)
+            models = _model_catalog_from_custom_endpoint_entry(raw_entry)
+            endpoint_model = str(
+                raw_entry.get("_selected_model_alias")
+                or raw_entry.get("model")
+                or raw_entry.get("default_model")
+                or (model_ids[0] if model_ids else "")
+            )
             has_api_key, api_key_preview = _api_key_display(raw_entry)
             endpoints.append({
                 "id": endpoint_id,
                 "name": str(raw_entry.get("name") or endpoint_id),
                 "base_url": base_url,
+                "api_mode": _canonical_api_mode(str(
+                    raw_entry.get("api_mode")
+                    or raw_entry.get("transport")
+                    or "chat_completions"
+                )),
                 "model": endpoint_model,
-                "models": models,
+                "models": model_ids,
+                "model_details": models,
                 "context_length": raw_entry.get("context_length"),
                 "discover_models": bool(raw_entry.get("discover_models", True)),
                 "has_api_key": has_api_key,
@@ -8395,8 +8542,12 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "id": "custom",
             "name": "Custom",
             "base_url": current_base_url,
+            "api_mode": _canonical_api_mode(str(
+                model_cfg.get("api_mode") or "chat_completions"
+            )),
             "model": current_model,
             "models": [current_model] if current_model else [],
+            "model_details": [{"id": current_model}] if current_model else [],
             "context_length": model_cfg.get("context_length"),
             "discover_models": True,
             "has_api_key": has_api_key,
@@ -8433,7 +8584,7 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
         return
     if str(model_cfg.get("provider") or "").strip().lower() != provider_key:
         return
-    for field in ("provider", "base_url", "api_key", "key_env"):
+    for field in ("provider", "base_url", "api_key", "key_env", "api_mode"):
         model_cfg.pop(field, None)
     cfg["model"] = model_cfg
 
@@ -8460,10 +8611,21 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     existing = providers.get(endpoint_id)
     if not isinstance(existing, dict):
         existing = {}
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    active_provider = str(model_cfg.get("provider") or "").strip().lower()
+    previous_active_entry = (
+        existing if active_provider == endpoint_id
+        else providers.get(active_provider)
+    )
+    api_mode = body.api_mode or _canonical_api_mode(str(
+        existing.get("api_mode")
+        or existing.get("transport")
+        or "chat_completions"
+    ))
 
     # Merge onto the existing entry rather than replacing it. A providers.<name>
     # block is not owned by this panel: it can carry hand-written keys the
-    # dashboard has no field for — ``api_mode``, ``key_env``/``api_key_env``,
+    # dashboard has no field for — ``key_env``/``api_key_env``,
     # ``extra_headers`` (which may themselves carry credentials),
     # ``request_overrides`` — and rebuilding from scratch silently dropped every
     # one of them on an unrelated edit, leaving a provider that no longer
@@ -8472,7 +8634,7 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     entry.update({
         "name": name,
         "base_url": base_url,
-        "model": model,
+        "api_mode": api_mode,
         "discover_models": bool(body.discover_models),
     })
     # Same for the model map: merge rather than replace, so existing models
@@ -8483,16 +8645,40 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     # UI) still just ensures the named default is present.
     existing_models = entry.get("models")
     models_map: Dict[str, Any] = dict(existing_models) if isinstance(existing_models, dict) else {}
-    for candidate in (*(body.models or ()), model):
-        model_id = str(candidate).strip()
+    if body.model_details is not None:
+        for existing_metadata in models_map.values():
+            if isinstance(existing_metadata, dict):
+                for field in _CUSTOM_ENDPOINT_MODEL_METADATA:
+                    existing_metadata.pop(field, None)
+    selected_metadata: Dict[str, Any] = {}
+    candidates = body.model_details if body.model_details is not None else (body.models or ())
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            model_id = candidate.strip()
+            model_metadata: Dict[str, Any] = {}
+        else:
+            candidate_data = candidate.model_dump(exclude_none=True)
+            model_id = str(candidate_data.pop("id", "")).strip()
+            model_metadata = candidate_data
         if not model_id:
             continue
         current = models_map.get(model_id)
-        models_map[model_id] = dict(current) if isinstance(current, dict) else {}
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update(model_metadata)
+        models_map[model_id] = merged
+        if model_id == model:
+            selected_metadata = merged
+
+    canonical_model = str(selected_metadata.get("canonical_model") or model).strip()
+    current = models_map.get(canonical_model)
+    models_map[canonical_model] = dict(current) if isinstance(current, dict) else {}
+    entry["model"] = canonical_model
+    entry["_selected_model_alias"] = model
     entry["models"] = models_map
     if body.context_length and body.context_length > 0:
         entry["context_length"] = int(body.context_length)
-        entry["models"][model]["context_length"] = int(body.context_length)
+        entry["models"][canonical_model]["context_length"] = int(body.context_length)
+
 
     # API keys never belong in config.yaml (#69449). Write to .env and
     # reference it via ``key_env`` — the same indirection built-in providers
@@ -8521,9 +8707,14 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     cfg["providers"] = providers
 
     if body.make_default:
+        _sync_custom_endpoint_reasoning_override(cfg, previous_active_entry, entry)
         cfg["model"] = _apply_main_model_assignment(
-            cfg.get("model", {}), endpoint_id, model, base_url
+            cfg.get("model", {}), endpoint_id, canonical_model, base_url
         )
+        if api_mode == "auto":
+            cfg["model"].pop("api_mode", None)
+        else:
+            cfg["model"]["api_mode"] = api_mode
         if entry.get("key_env") and isinstance(cfg["model"], dict):
             cfg["model"]["key_env"] = entry["key_env"]
             cfg["model"].pop("api_key", None)
@@ -8587,7 +8778,20 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
             if not model or not base_url:
                 raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
+            current_model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+            current_provider = str(current_model_cfg.get("provider") or "").strip().lower()
+            previous_entry = providers.get(current_provider) if isinstance(providers, dict) else None
+            _sync_custom_endpoint_reasoning_override(cfg, previous_entry, entry)
             model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
+            api_mode = _canonical_api_mode(str(
+                entry.get("api_mode")
+                or entry.get("transport")
+                or "chat_completions"
+            ))
+            if api_mode == "auto":
+                model_cfg.pop("api_mode", None)
+            else:
+                model_cfg["api_mode"] = api_mode
             if entry.get("key_env"):
                 model_cfg["key_env"] = entry["key_env"]
                 model_cfg.pop("api_key", None)
@@ -8613,8 +8817,15 @@ def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
             providers = cfg.get("providers")
             if not isinstance(providers, dict) or provider_key not in providers:
                 raise HTTPException(status_code=404, detail="custom endpoint not found")
-            providers.pop(provider_key, None)
+            deleted_entry = providers.pop(provider_key, None)
             cfg["providers"] = providers
+            model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+            if (
+                str(model_cfg.get("provider") or "").strip().lower() == provider_key
+                or isinstance(deleted_entry, dict)
+                and deleted_entry.get("_reasoning_override_state")
+            ):
+                _sync_custom_endpoint_reasoning_override(cfg, deleted_entry, None)
             _detach_main_model_from_provider(cfg, provider_key)
             remove_env_value(custom_endpoint_key_env(provider_key))
             save_config(cfg)
@@ -8653,7 +8864,14 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
     if not resp.is_success:
         return {"ok": False, "reachable": True, "message": f"Endpoint returned HTTP {resp.status_code}.", "models": []}
 
-    return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
+    model_details = _parse_model_catalog(resp)
+    return {
+        "ok": True,
+        "reachable": True,
+        "message": "",
+        "models": [model["id"] for model in model_details],
+        "model_details": model_details,
+    }
 
 
 @app.post("/api/providers/validate")

@@ -50,16 +50,34 @@ class MemoryProviderSetupRequest(BaseModel):
     values: Dict[str, Any] = {}
 
 
+class CustomEndpointModel(BaseModel):
+    id: str
+    canonical_model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    supported_reasoning_levels: Optional[List[str]] = None
+
+
 class CustomEndpointUpdate(BaseModel):
     id: str = ""
     name: str
     base_url: str
     model: str
     api_key: Optional[str] = None
+    api_mode: Optional[str] = None
     context_length: Optional[int] = None
     discover_models: bool = True
     make_default: bool = False
     models: Optional[List[str]] = None
+    model_details: Optional[List[CustomEndpointModel]] = None
+
+    @field_validator("api_mode", mode="before")
+    @classmethod
+    def _normalize_api_mode(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        from hermes_cli.config import _canonical_api_mode
+
+        return _canonical_api_mode(value)
 
 
 class MessagingPlatformUpdate(BaseModel):

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   activateCustomEndpoint,
   deleteCustomEndpoint,
@@ -15,7 +16,12 @@ import { Check, Globe, Loader2, Plus, Save, Trash2, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
-import type { CustomEndpoint, CustomEndpointUpdate } from '@/types/hermes'
+import type {
+  CustomEndpoint,
+  CustomEndpointApiMode,
+  CustomEndpointModel,
+  CustomEndpointUpdate
+} from '@/types/hermes'
 
 import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } from './primitives'
 
@@ -25,6 +31,7 @@ interface CustomEndpointsSettingsProps {
 }
 
 interface EndpointForm {
+  apiMode: CustomEndpointApiMode
   apiKey: string
   baseUrl: string
   contextLength: string
@@ -36,6 +43,7 @@ interface EndpointForm {
 }
 
 const EMPTY_FORM: EndpointForm = {
+  apiMode: 'chat_completions',
   apiKey: '',
   baseUrl: '',
   contextLength: '',
@@ -46,8 +54,9 @@ const EMPTY_FORM: EndpointForm = {
   name: ''
 }
 
-function formFromEndpoint(endpoint: CustomEndpoint): EndpointForm {
+export function formFromEndpoint(endpoint: CustomEndpoint): EndpointForm {
   return {
+    apiMode: endpoint.api_mode ?? 'chat_completions',
     apiKey: '',
     baseUrl: endpoint.base_url,
     contextLength: endpoint.context_length ? String(endpoint.context_length) : '',
@@ -59,20 +68,26 @@ function formFromEndpoint(endpoint: CustomEndpoint): EndpointForm {
   }
 }
 
-function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate {
+export function toPayload(form: EndpointForm, models?: CustomEndpointModel[]): CustomEndpointUpdate {
   const contextLength = Number.parseInt(form.contextLength, 10)
 
   return {
     id: form.id.trim() || undefined,
     name: form.name.trim(),
     base_url: form.baseUrl.trim(),
+    api_mode: form.apiMode,
     model: form.model.trim(),
     api_key: form.apiKey.trim() || undefined,
     context_length: Number.isFinite(contextLength) && contextLength > 0 ? contextLength : undefined,
     discover_models: form.discoverModels,
     make_default: form.makeDefault,
-    models: models?.length ? models : undefined
+    models: models ? models.map(model => model.id) : undefined,
+    model_details: models
   }
+}
+
+export function endpointModels(endpoint: CustomEndpoint): CustomEndpointModel[] {
+  return endpoint.model_details ?? endpoint.models.map(id => ({ id }))
 }
 
 export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: CustomEndpointsSettingsProps) {
@@ -83,7 +98,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   const [deleting, setDeleting] = useState<string | null>(null)
   const [endpoints, setEndpoints] = useState<CustomEndpoint[]>([])
   const [form, setForm] = useState<EndpointForm>(EMPTY_FORM)
-  const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  const [discoveredModels, setDiscoveredModels] = useState<CustomEndpointModel[]>([])
 
   async function refresh() {
     const data = await getCustomEndpoints()
@@ -106,7 +121,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
 
         if (current) {
           setForm(formFromEndpoint(current))
-          setDiscoveredModels(current.models)
+          setDiscoveredModels(endpointModels(current))
         }
       } catch (err) {
         notifyError(err, 'Could not load custom endpoints')
@@ -133,7 +148,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
 
       if (saved) {
         setForm(formFromEndpoint(saved))
-        setDiscoveredModels(saved.models)
+        setDiscoveredModels(endpointModels(saved))
       }
 
       if (saved && saved.is_current) {
@@ -154,11 +169,12 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     try {
       setTesting(true)
       const response = await validateCustomEndpoint(toPayload(form))
-      setDiscoveredModels(response.models)
+      const models = response.model_details ?? response.models.map(id => ({ id }))
+      setDiscoveredModels(models)
 
       if (response.ok) {
-        if (!form.model && response.models[0]) {
-          setForm(current => ({ ...current, model: response.models[0] }))
+        if (!form.model && models[0]) {
+          setForm(current => ({ ...current, model: models[0].id }))
         }
 
         notify({
@@ -224,7 +240,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     return <SettingsSkeleton sections={[{ heading: true, rows: 3 }]} />
   }
 
-  const allModelOptions = Array.from(new Set([...discoveredModels, form.model].filter(Boolean)))
+  const allModelOptions = Array.from(new Set([...discoveredModels.map(model => model.id), form.model].filter(Boolean)))
   const canSave = form.name.trim() && form.baseUrl.trim() && form.model.trim()
 
   return (
@@ -240,7 +256,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                     className="min-w-0 text-left"
                     onClick={() => {
                       setForm(formFromEndpoint(endpoint))
-                      setDiscoveredModels(endpoint.models)
+                      setDiscoveredModels(endpointModels(endpoint))
                     }}
                     type="button"
                   >
@@ -321,6 +337,27 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 placeholder="http://127.0.0.1:8081/v1"
                 value={form.baseUrl}
               />
+            </label>
+            <label className="grid gap-1.5 text-xs text-muted-foreground">
+              API Transport
+              <Select
+                onValueChange={value =>
+                  setForm(current => ({ ...current, apiMode: value as CustomEndpointApiMode }))
+                }
+                value={form.apiMode}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">Auto detect</SelectItem>
+                  <SelectItem value="chat_completions">Chat Completions</SelectItem>
+                  <SelectItem value="codex_responses">Responses API</SelectItem>
+                  <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+                  <SelectItem value="bedrock_converse">Bedrock Converse</SelectItem>
+                  <SelectItem value="codex_app_server">Codex App Server</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem]">
               <label className="grid gap-1.5 text-xs text-muted-foreground">

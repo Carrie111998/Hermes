@@ -1598,10 +1598,9 @@ class TestWebServerEndpoints:
 
 
 
-    def test_parse_model_ids_handles_openai_and_bare_shapes(self):
-        """Model discovery must tolerate the common /v1/models shapes and
-        never raise (so a slightly non-standard local endpoint still works)."""
-        from hermes_cli.web_server import _parse_model_ids
+    def test_parse_model_catalog_preserves_recognized_metadata(self):
+        """Discovery keeps routing metadata without trusting arbitrary fields."""
+        from hermes_cli.web_server import _parse_model_catalog
 
         class FakeResp:
             def __init__(self, payload, ok=True):
@@ -1613,18 +1612,370 @@ class TestWebServerEndpoints:
                     raise self._payload
                 return self._payload
 
-        # OpenAI / vLLM / llama.cpp shape.
-        assert _parse_model_ids(
-            FakeResp({"data": [{"id": "llama-3.1-8b"}, {"id": "qwen2.5-7b"}]})
-        ) == ["llama-3.1-8b", "qwen2.5-7b"]
+        assert _parse_model_catalog(FakeResp({"data": [{
+            "id": "gpt-5.6-sol-high",
+            "canonical_model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "supported_reasoning_levels": ["low", "high"],
+            "untrusted": "drop-me",
+        }]})) == [{
+            "id": "gpt-5.6-sol-high",
+            "canonical_model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "supported_reasoning_levels": ["low", "high"],
+        }]
         # Bare list of ids.
-        assert _parse_model_ids(FakeResp({"data": ["m1", "m2"]})) == ["m1", "m2"]
+        assert _parse_model_catalog(FakeResp({"data": ["m1", "m2"]})) == [
+            {"id": "m1"}, {"id": "m2"}
+        ]
         # Top-level list.
-        assert _parse_model_ids(FakeResp([{"id": "x"}])) == ["x"]
+        assert _parse_model_catalog(FakeResp([{"id": "x"}])) == [{"id": "x"}]
         # Non-success / malformed / exception → [] (never raises).
-        assert _parse_model_ids(FakeResp({"data": []}, ok=False)) == []
-        assert _parse_model_ids(FakeResp({"nope": 1})) == []
-        assert _parse_model_ids(FakeResp(ValueError("bad json"))) == []
+        assert _parse_model_catalog(FakeResp({"data": []}, ok=False)) == []
+        assert _parse_model_catalog(FakeResp({"nope": 1})) == []
+        assert _parse_model_catalog(FakeResp(ValueError("bad json"))) == []
+
+    def test_custom_endpoint_persists_transport_and_resolves_reasoning_alias(self):
+        """A discovered Responses alias becomes an executable runtime config."""
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "responses-proxy",
+                "name": "Responses Proxy",
+                "base_url": "https://responses.example/v1",
+                "api_mode": "codex_responses",
+                "model": "gpt-5.6-sol-high",
+                "models": ["gpt-5.6-sol-high"],
+                "model_details": [{
+                    "id": "gpt-5.6-sol-high",
+                    "canonical_model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "supported_reasoning_levels": ["low", "medium", "high"],
+                }],
+                "make_default": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        endpoint = resp.json()["endpoints"][0]
+        assert endpoint["api_mode"] == "codex_responses"
+        assert endpoint["model"] == "gpt-5.6-sol-high"
+        alias = next(model for model in endpoint["model_details"] if model["id"] == "gpt-5.6-sol-high")
+        assert alias["canonical_model"] == "gpt-5.6-sol"
+
+        cfg = load_config()
+        entry = cfg["providers"]["responses-proxy"]
+        assert entry["api_mode"] == "codex_responses"
+        assert entry["model"] == "gpt-5.6-sol"
+        assert entry["models"]["gpt-5.6-sol-high"]["reasoning_effort"] == "high"
+        assert cfg["model"]["api_mode"] == "codex_responses"
+        assert cfg["model"]["default"] == "gpt-5.6-sol"
+        assert cfg["agent"]["reasoning_overrides"]["gpt-5.6-sol"] == "high"
+
+    def test_custom_endpoint_chat_completions_remains_the_default(self):
+        """Old payloads keep their historical Chat Completions behavior."""
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "legacy-proxy",
+                "name": "Legacy Proxy",
+                "base_url": "https://chat.example/v1",
+                "model": "chat-model",
+                "make_default": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        endpoint = resp.json()["endpoints"][0]
+        assert endpoint["api_mode"] == "chat_completions"
+        assert endpoint["models"] == ["chat-model"]
+        assert endpoint["model_details"] == [{"id": "chat-model"}]
+
+    def test_custom_endpoint_auto_transport_round_trips_without_main_override(self):
+        """Auto remains a provider preference while runtime transport stays inferred."""
+        from hermes_cli.config import load_config
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "auto-proxy",
+                "name": "Auto Proxy",
+                "base_url": "https://auto.example/v1",
+                "model": "auto-model",
+                "api_mode": "auto",
+                "make_default": True,
+            },
+        )
+
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "auto-proxy")
+        assert endpoint["api_mode"] == "auto"
+        cfg = load_config()
+        assert cfg["providers"]["auto-proxy"]["api_mode"] == "auto"
+        assert "api_mode" not in cfg["model"]
+
+    def test_inactive_endpoint_edit_does_not_change_reasoning_and_metadata_is_authoritative(self):
+        """Editing a non-active endpoint neither leaks nor retains discovered effort."""
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy",
+            "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1",
+            "model": "gpt-high",
+            "model_details": [{
+                "id": "gpt-high",
+                "canonical_model": "gpt",
+                "reasoning_effort": "high",
+            }],
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        assert not (load_config().get("agent") or {}).get("reasoning_overrides")
+
+        payload["model_details"] = [{"id": "gpt-high", "canonical_model": "gpt"}]
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        metadata = load_config()["providers"]["responses-proxy"]["models"]["gpt-high"]
+        assert "reasoning_effort" not in metadata
+
+    def test_rediscovery_neutralizes_omitted_alias_metadata(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://old.example/v1", "model": "old-high",
+            "model_details": [{"id": "old-high", "canonical_model": "gpt", "reasoning_effort": "high"}],
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        payload.update({
+            "base_url": "https://new.example/v1", "model": "new-low",
+            "model_details": [{"id": "new-low", "canonical_model": "gpt", "reasoning_effort": "low"}],
+            "make_default": True,
+        })
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        cfg = load_config()
+        assert cfg["providers"]["responses-proxy"]["models"]["old-high"] == {}
+        assert cfg["agent"]["reasoning_overrides"]["gpt"] == "low"
+
+    def test_selected_reasoning_alias_wins_in_multi_effort_catalog(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [
+                {"id": "gpt-low", "canonical_model": "gpt", "reasoning_effort": "low"},
+                {"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"},
+            ],
+            "make_default": True,
+        }
+        response = self.client.post("/api/providers/custom-endpoints", json=payload)
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "responses-proxy")
+        assert endpoint["model"] == "gpt-high"
+        cfg = load_config()
+        assert cfg["providers"]["responses-proxy"]["model"] == "gpt"
+        assert cfg["agent"]["reasoning_overrides"]["gpt"] == "high"
+
+    def test_empty_model_details_clear_discovery_metadata(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [{"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"}],
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        payload["model"] = "gpt"
+        payload["model_details"] = []
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        metadata = load_config()["providers"]["responses-proxy"]["models"]["gpt-high"]
+        assert "canonical_model" not in metadata
+        assert "reasoning_effort" not in metadata
+
+    def test_active_endpoint_reasoning_override_follows_activation_and_delete(self):
+        """Generated reasoning state follows the endpoint's active lifecycle."""
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy",
+            "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1",
+            "model": "gpt-high",
+            "model_details": [{
+                "id": "gpt-high",
+                "canonical_model": "gpt",
+                "reasoning_effort": "high",
+            }],
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        assert self.client.post(
+            "/api/providers/custom-endpoints/responses-proxy/activate", json={}
+        ).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "high"
+
+        assert self.client.request(
+            "DELETE", "/api/providers/custom-endpoints/responses-proxy"
+        ).status_code == 200
+        assert not (load_config().get("agent") or {}).get("reasoning_overrides")
+
+    def test_endpoint_reasoning_restores_preexisting_user_override(self):
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg.setdefault("agent", {})["reasoning_overrides"] = {"gpt": "low"}
+        save_config(cfg)
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [{"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"}],
+            "make_default": True,
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "high"
+        switched = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main", "provider": "openrouter",
+                "model": "openai/gpt-5.5", "confirm_expensive_model": True,
+            },
+        )
+        assert switched.status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "low"
+        assert self.client.request(
+            "DELETE", "/api/providers/custom-endpoints/responses-proxy"
+        ).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "low"
+
+    def test_model_set_resolves_selected_custom_reasoning_alias(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-high",
+            "model_details": [
+                {"id": "gpt-low", "canonical_model": "gpt", "reasoning_effort": "low"},
+                {"id": "gpt-high", "canonical_model": "gpt", "reasoning_effort": "high"},
+            ],
+            "make_default": True,
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        response = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main", "provider": "responses-proxy", "model": "gpt-low",
+                "confirm_expensive_model": True,
+            },
+        )
+        assert response.status_code == 200
+        cfg = load_config()
+        assert cfg["model"]["default"] == "gpt"
+        assert cfg["providers"]["responses-proxy"]["_selected_model_alias"] == "gpt-low"
+        assert cfg["agent"]["reasoning_overrides"]["gpt"] == "low"
+
+    def test_custom_endpoint_preserves_unknown_transport(self):
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "future", "name": "Future",
+                "base_url": "https://future.example/v1", "model": "m",
+                "api_mode": "plugin_future_transport",
+            },
+        )
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "future")
+        assert endpoint["api_mode"] == "plugin_future_transport"
+
+    def test_endpoint_reasoning_none_disables_reasoning(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "responses-proxy", "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1", "model": "gpt-none",
+            "model_details": [{"id": "gpt-none", "canonical_model": "gpt", "reasoning_effort": "none"}],
+            "make_default": True,
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+        assert load_config()["agent"]["reasoning_overrides"]["gpt"] == "none"
+
+    def test_custom_endpoint_legacy_edit_preserves_explicit_transport(self):
+        """An older Desktop payload must not reset a transport it cannot display."""
+        payload = {
+            "id": "responses-proxy",
+            "name": "Responses Proxy",
+            "base_url": "https://responses.example/v1",
+            "model": "gpt-5.6-sol",
+            "api_mode": "codex_responses",
+        }
+        assert self.client.post("/api/providers/custom-endpoints", json=payload).status_code == 200
+
+        payload.pop("api_mode")
+        payload["name"] = "Renamed Responses Proxy"
+        response = self.client.post("/api/providers/custom-endpoints", json=payload)
+
+        assert response.status_code == 200
+        endpoint = next(item for item in response.json()["endpoints"] if item["id"] == "responses-proxy")
+        assert endpoint["api_mode"] == "codex_responses"
+
+    def test_custom_endpoint_legacy_transport_alias_round_trips(self):
+        """Legacy aliases returned by config remain editable through Desktop."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg.setdefault("providers", {})["legacy-responses"] = {
+            "name": "Legacy Responses",
+            "base_url": "https://responses.example/v1",
+            "transport": "responses",
+            "model": "gpt-5.6-sol",
+            "models": {"gpt-5.6-sol": {}},
+        }
+        save_config(cfg)
+
+        listed = self.client.get("/api/providers/custom-endpoints")
+        assert listed.status_code == 200
+        endpoint = next(
+            item for item in listed.json()["endpoints"]
+            if item["id"] == "legacy-responses"
+        )
+        assert endpoint["api_mode"] == "codex_responses"
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": endpoint["id"],
+                "name": "Renamed Legacy Responses",
+                "base_url": endpoint["base_url"],
+                "model": endpoint["model"],
+                "models": endpoint["models"],
+                "api_mode": endpoint["api_mode"],
+                "make_default": True,
+            },
+        )
+
+        assert response.status_code == 200
+        saved = load_config()
+        assert saved["providers"]["legacy-responses"]["api_mode"] == "codex_responses"
+        assert saved["model"]["api_mode"] == "codex_responses"
+
+    def test_custom_endpoint_accepts_legacy_transport_alias(self):
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "legacy-input",
+                "name": "Legacy Input",
+                "base_url": "https://responses.example/v1",
+                "model": "gpt-5.6-sol",
+                "api_mode": "openai-responses",
+            },
+        )
+
+        assert response.status_code == 200
+        endpoint = next(
+            item for item in response.json()["endpoints"]
+            if item["id"] == "legacy-input"
+        )
+        assert endpoint["api_mode"] == "codex_responses"
 
 
     def test_set_model_main_custom_persists_api_key_and_registers_provider(self):
@@ -4761,6 +5112,7 @@ class TestValidateProviderCredential:
             "reachable": True,
             "message": "",
             "models": ["local-model"],
+            "model_details": [{"id": "local-model"}],
         }
         assert captured == {
             "url": "http://localhost:8000/v1/models",

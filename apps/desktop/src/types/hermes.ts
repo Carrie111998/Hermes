@@ -155,8 +155,18 @@ export interface MemoryProviderConfig {
   name: string
 }
 
+export type CustomEndpointApiMode = string
+
+export interface CustomEndpointModel {
+  canonical_model?: string
+  id: string
+  reasoning_effort?: string
+  supported_reasoning_levels?: string[]
+}
+
 export interface CustomEndpoint {
   api_key_preview?: null | string
+  api_mode?: CustomEndpointApiMode
   base_url: string
   context_length?: null | number
   discover_models: boolean
@@ -164,6 +174,7 @@ export interface CustomEndpoint {
   id: string
   is_current?: boolean
   model: string
+  model_details?: CustomEndpointModel[]
   models: string[]
   name: string
   source?: string
@@ -182,18 +193,21 @@ export interface CustomEndpointsResponse {
 
 export interface CustomEndpointUpdate {
   api_key?: string
+  api_mode?: CustomEndpointApiMode
   base_url: string
   context_length?: number
   discover_models?: boolean
   id?: string
   make_default?: boolean
   model: string
+  model_details?: CustomEndpointModel[]
   models?: string[]
   name: string
 }
 
 export interface CustomEndpointValidationResponse {
   message: string
+  model_details?: CustomEndpointModel[]
   models: string[]
   ok: boolean
   reachable: boolean
