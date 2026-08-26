@@ -1587,6 +1587,22 @@ def _real_profile_cdp() -> tuple:
                 "real-profile browsing does not support. Set your default to a "
                 "stable Chrome / Edge / Brave / Chromium, or turn the toggle off."
             )
+        if sys.platform == "win32":
+            # App-Bound Encryption (Chrome/Edge 127+) binds the cookie
+            # encryption key to the original browser install via a Windows
+            # service, so a COPIED profile decrypts nothing — even when the
+            # copy is launched by the same browser binary. Verified on Edge
+            # 152: the cookie rows copy across, but their values do not
+            # decrypt, and the session lands logged-out. The snapshot approach
+            # therefore cannot deliver real logins on Windows; fail closed
+            # rather than hand back a silently-unauthenticated browser.
+            return None, (
+                "browser.use_real_profile is on, but real-profile browsing via a "
+                "profile copy is not supported on Windows: App-Bound Encryption "
+                "binds cookies to the original browser, so a copied profile "
+                "decrypts nothing (the agent would browse logged-out). Turn "
+                "browser.use_real_profile off on Windows."
+            )
         copy_dir, err = snapshot_real_profile(browser)
         if err or not copy_dir:
             return None, f"browser.use_real_profile is on, but {err}"
