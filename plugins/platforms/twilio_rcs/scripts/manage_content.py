@@ -118,20 +118,63 @@ def create_card(
     title: str,
     *,
     subtitle: str = "",
+    media: str = "",
     actions: list[dict] | None = None,
     language: str = "en",
     variables: dict[str, str] | None = None,
 ) -> dict:
-    """actions: dicts like {'type': 'URL'|'PHONE_NUMBER'|'QUICK_REPLY', 'title': ..., plus 'url'/'phone'/'id'}."""
+    """actions: dicts like {'type': 'URL'|'PHONE_NUMBER'|'QUICK_REPLY', 'title': ..., plus 'url'/'phone'/'id'}.
+
+    Live-verified against the Content API (2026-08-26): unlike
+    twilio/carousel's per-card 'media' (a single URL string — see
+    create_carousel), twilio/card's top-level 'media' must be a JSON
+    ARRAY of URL strings — a bare string 400s with "Request input may
+    be invalid". Confirmed via GET echo that 'media' is a real field
+    name on this content type.
+    """
     card: dict[str, Any] = {"title": title}
     if subtitle:
         card["subtitle"] = subtitle
+    if media:
+        card["media"] = [media]
     if actions:
         card["actions"] = actions
     payload: dict[str, Any] = {
         "friendly_name": friendly_name,
         "language": language,
         "types": {"twilio/card": card},
+    }
+    if variables:
+        payload["variables"] = variables
+    return _request("POST", CONTENT_API_BASE, body=payload)
+
+
+def create_carousel(
+    friendly_name: str,
+    body: str,
+    cards: list[dict],
+    *,
+    language: str = "en",
+    variables: dict[str, str] | None = None,
+) -> dict:
+    """cards: list of {'title': ..., 'body': ..., 'media': <image url string>, 'actions': [...]}.
+
+    Schema verified against a full worked example in Twilio's docs
+    (twilio/carousel: top-level 'body' + 'cards' array; each card has
+    'title', 'body', 'media' (a single URL STRING — confirmed live; an
+    array here 400s, the opposite of twilio/card's top-level 'media').
+    """
+    if not cards:
+        raise ContentApiError("twilio/carousel requires at least one card")
+    payload: dict[str, Any] = {
+        "friendly_name": friendly_name,
+        "language": language,
+        "types": {
+            "twilio/carousel": {
+                "body": body,
+                "cards": cards,
+            }
+        },
     }
     if variables:
         payload["variables"] = variables
@@ -204,7 +247,8 @@ def main() -> int:
     p.add_argument("content_sid")
 
     p = sub.add_parser(
-        "create-quick-reply", help="Create a twilio/quick-reply template (RCS + WhatsApp)"
+        "create-quick-reply",
+        help="Create a twilio/quick-reply template (WhatsApp — NOT in Twilio's documented RCS-supported type list; sends over RCS silently fall back to SMS)",
     )
     p.add_argument("--friendly-name", required=True)
     p.add_argument("--body", required=True, help="Message body; use {{1}}, {{2}}, ... for variables")
@@ -225,8 +269,31 @@ def main() -> int:
     p.add_argument("--title", required=True, help="Card headline; use {{1}}, {{2}}, ... for variables")
     p.add_argument("--subtitle", default="")
     p.add_argument(
+        "--media", default="",
+        help="Image URL for the card header. NOT confirmed against a twilio/card doc example — inferred from twilio/carousel's per-card schema; verify delivery before relying on it.",
+    )
+    p.add_argument(
         "--action", action="append", default=[], metavar="KIND:TITLE:VALUE",
         help="Repeatable. 'url:Title:https://...' / 'phone:Title:+1555...' / 'quick_reply:Title:id'",
+    )
+    p.add_argument("--language", default="en")
+    p.add_argument("--var", action="append", default=[], metavar="KEY=VALUE")
+
+    p = sub.add_parser(
+        "create-carousel",
+        help="Create a twilio/carousel template (RCS + WhatsApp) — multiple cards, each with title/body/media/actions",
+    )
+    p.add_argument("--friendly-name", required=True)
+    p.add_argument("--body", required=True, help="Carousel intro text; use {{1}}, {{2}}, ... for variables")
+    p.add_argument(
+        "--cards-json", required=True,
+        help=(
+            "JSON array of cards, e.g. "
+            '[{"title":"Twilio Hoodie","body":"Warm as owl feathers.",'
+            '"media":"https://example.com/hoodie.jpeg",'
+            '"actions":[{"type":"QUICK_REPLY","title":"I want it!","id":"want_hoodie"},'
+            '{"type":"URL","title":"Shop","url":"https://example.com"}]}]'
+        ),
     )
     p.add_argument("--language", default="en")
     p.add_argument("--var", action="append", default=[], metavar="KEY=VALUE")
@@ -250,7 +317,20 @@ def main() -> int:
             variables = dict(_parse_var(v) for v in args.var) or None
             result = create_card(
                 args.friendly_name, args.title, subtitle=args.subtitle,
-                actions=actions, language=args.language, variables=variables,
+                media=args.media, actions=actions, language=args.language,
+                variables=variables,
+            )
+        elif args.command == "create-carousel":
+            try:
+                cards = json.loads(args.cards_json)
+            except json.JSONDecodeError as e:
+                raise ContentApiError(f"Invalid --cards-json: {e}")
+            if not isinstance(cards, list):
+                raise ContentApiError("--cards-json must be a JSON array of card objects")
+            variables = dict(_parse_var(v) for v in args.var) or None
+            result = create_carousel(
+                args.friendly_name, args.body, cards,
+                language=args.language, variables=variables,
             )
         else:
             parser.error(f"Unknown command {args.command}")

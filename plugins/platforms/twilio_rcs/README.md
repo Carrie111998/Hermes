@@ -64,37 +64,71 @@ characters) and chunked at `MAX_RCS_LENGTH` (3072 chars — Twilio's
 documented RCS text limit; re-verify against current docs if messages
 start getting truncated unexpectedly).
 
-## Rich content (cards, quick-reply chips)
+## Rich content (cards, carousels)
 
 Twilio's Messages API only accepts pre-created **Content API templates**
 referenced by `ContentSid` (+ optional `ContentVariables`) for rich
 content — there is no inline/ad-hoc JSON parameter for cards or
-quick-replies on either RCS or WhatsApp. Verified against Twilio's docs
-and confirmed empirically: a freshly created template sent immediately
-with no separate approval step.
+carousels on either RCS or WhatsApp. Verified against Twilio's docs and
+confirmed empirically: a freshly created template sent immediately with
+no separate approval step.
+
+**RCS-supported Content API types, per Twilio's docs:** `twilio/text`,
+`twilio/media`, `twilio/card`, `twilio/carousel`. `twilio/quick-reply` is
+**not** in that list — `manage_content.py create-quick-reply` still
+exists (its schema is verified, it's a real WhatsApp-supported type,
+and Content API creation succeeds) but Twilio silently falls back to
+plain SMS/MMS on RCS sends rather than rendering reply chips. Use
+`create-card` or `create-carousel` for anything that needs to render as
+true RCS rich content.
 
 ### 1. Create a template
 
 ```bash
-# Quick-reply chips
+# Rich card (title/subtitle/media + buttons) — RCS-supported
+python plugins/platforms/twilio_rcs/scripts/manage_content.py create-card \
+  --friendly-name "elite_status" \
+  --title "You've reached Elite status!" \
+  --subtitle "Reply STOP to unsubscribe" \
+  --media "https://example.com/card.jpg" \
+  --action "url:Shop now:https://example.com" \
+  --action "phone:Call us:+15551234567"
+
+# Carousel (multiple swipeable cards) — RCS-supported
+python plugins/platforms/twilio_rcs/scripts/manage_content.py create-carousel \
+  --friendly-name "product_picks" \
+  --body "Check out these options:" \
+  --cards-json '[
+    {"title":"Option A","body":"First option","media":"https://example.com/a.jpg",
+     "actions":[{"type":"QUICK_REPLY","title":"Pick A","id":"pick_a"}]},
+    {"title":"Option B","body":"Second option","media":"https://example.com/b.jpg",
+     "actions":[{"type":"QUICK_REPLY","title":"Pick B","id":"pick_b"}]}
+  ]'
+
+# Quick-reply chips — WhatsApp-verified, NOT confirmed as true RCS rich content (see above)
 python plugins/platforms/twilio_rcs/scripts/manage_content.py create-quick-reply \
   --friendly-name "order_confirm" \
   --body "Your order shipped! Track it?" \
   --action "Yes:track_yes" \
   --action "No:track_no"
-
-# Rich card (title/subtitle + buttons)
-python plugins/platforms/twilio_rcs/scripts/manage_content.py create-card \
-  --friendly-name "elite_status" \
-  --title "You've reached Elite status!" \
-  --subtitle "Reply STOP to unsubscribe" \
-  --action "url:Shop now:https://example.com" \
-  --action "phone:Call us:+15551234567"
 ```
 
-Both print the resulting `ContentSid` (`HX...`) and a ready-to-paste
+All three print the resulting `ContentSid` (`HX...`) and a ready-to-paste
 `hermes send` command. `list` and `get <content_sid>` are also available
 to inspect existing templates.
+
+**`media` field shape differs by type — confirmed live, not just from
+docs:**
+
+| Type | `media` field | Confirmed |
+|---|---|---|
+| `twilio/card` (top-level) | **array** of URL strings, e.g. `["https://..."]` | live test: bare string 400s, array works |
+| `twilio/carousel` (per-card) | **single string** URL | live test + matches Twilio's doc example verbatim |
+
+`create-card --media <url>` and `create-carousel --cards-json '[{"media": "<url>", ...}]'`
+already wrap/unwrap this correctly — the asymmetry only matters if you're
+calling `create_card()`/`create_carousel()` directly or hand-writing a
+payload.
 
 The script uses Python stdlib HTTP only (no `aiohttp`/`requests`
 dependency) and reads `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` from
@@ -118,13 +152,14 @@ error instead of silently sending garbage.
 
 ### Known gaps
 
-Only `twilio/quick-reply` and `twilio/card` (without a media/image field)
-are implemented — `twilio/carousel` and a card `media` field exist per
-Twilio's content-type list but their exact JSON schema wasn't verified
-against current docs, so they were left out rather than guessed at. Add
-them once confirmed (check `https://www.twilio.com/docs/content` for the
-current schema) rather than assuming the shape shown for `twilio/card`
-generalizes.
+`create-card`/`create-carousel`/`create-quick-reply` cover the fields
+verified live (title, subtitle, body, media, URL/PHONE_NUMBER/QUICK_REPLY
+actions). Not covered: `webview_size`/`height`/`orientation`/
+`thumbnailImageAlignment` on cards (Twilio echoes these back with
+defaults — e.g. `height: "TALL"`, `orientation: "VERTICAL"` — but their
+valid value sets weren't explored), and RCS-specific delivery receipts /
+read status (this plugin is send-only, no inbound webhook to receive
+them on).
 
 ## Architecture notes
 
