@@ -17,6 +17,7 @@ import atexit
 import base64
 import binascii
 import concurrent.futures
+import copy
 import functools
 from collections import deque
 from dataclasses import dataclass
@@ -7706,7 +7707,21 @@ def _apply_model_assignment_sync(
                 # must never block saving the model assignment.
                 _log.debug("apply_nous_managed_defaults skipped", exc_info=True)
 
-        save_config(cfg)
+        # A main-model assignment owns only ``model`` (plus the explicit Nous
+        # tool defaults above). ``load_config`` is a cached, default-expanded
+        # snapshot and can lag a CLI/API write to an auxiliary slot; saving that
+        # whole snapshot would turn a pinned provider/model back into auto/empty.
+        # Re-read the raw auxiliary section at the write boundary so unrelated
+        # per-task pins remain authoritative. The mutation lock also prevents a
+        # concurrent REST config save from interleaving between the re-read and
+        # the atomic write.
+        with _CONFIG_MUTATION_LOCK:
+            raw_config = read_raw_config()
+            if "auxiliary" in raw_config:
+                cfg["auxiliary"] = copy.deepcopy(raw_config["auxiliary"])
+            else:
+                cfg.pop("auxiliary", None)
+            save_config(cfg)
 
         # Register a named ``custom_providers`` entry for a custom/local
         # endpoint, mirroring the ``hermes model`` custom flow
