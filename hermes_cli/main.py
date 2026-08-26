@@ -456,6 +456,7 @@ from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.pause import build_pause_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.workflow import build_workflow_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.verify import build_verify_parser
@@ -5766,6 +5767,13 @@ def cmd_webhook(args):
     from hermes_cli.webhook import webhook_command
 
     webhook_command(args)
+
+
+def cmd_workflow(args):
+    """Stored workflow runs — list, start, signal."""
+    from hermes_cli.subcommands.workflow import workflow_command
+
+    workflow_command(args)
 
 
 def cmd_slack(args):
@@ -13413,6 +13421,7 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+    build_workflow_parser(subparsers, cmd_workflow=cmd_workflow)
 
     # =========================================================================
     # peer command — bot-to-bot DMs across machines (peer Hermes gateways)

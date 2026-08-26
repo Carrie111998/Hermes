@@ -3429,6 +3429,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "workflow":
+        def _execute(next_args: dict) -> Any:
+            from tools.workflow_tools import workflow_tool as _workflow_tool
+            return _finish_agent_tool(
+                _workflow_tool(
+                    action=next_args.get("action", ""),
+                    ops=next_args.get("ops"),
+                    workflow=next_args.get("workflow"),
+                    scenario=next_args.get("scenario"),
+                    callback=getattr(agent, "workflow_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "setup_mcp":
         def _execute(next_args: dict) -> Any:
             from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool

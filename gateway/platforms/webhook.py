@@ -782,6 +782,51 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        workflow_id = str(route_config.get("workflow") or "").strip()
+        if workflow_id:
+            try:
+                from workflow.runner import start_matching, start_run
+
+                state = start_run(
+                    workflow_id,
+                    payload=payload,
+                    source="webhook",
+                )
+                start_matching(event=str(event_type or ""), payload=payload, source="webhook")
+                return web.json_response(
+                    {
+                        "status": "started",
+                        "workflow": workflow_id,
+                        "run_id": state.get("runId"),
+                    }
+                )
+            except Exception as exc:
+                logger.error("[webhook] workflow start failed route=%s: %s", route_name, exc)
+                return web.json_response(
+                    {"error": f"Failed to start workflow: {exc}"}, status=500
+                )
+
+        workflow_event = str(route_config.get("workflow_event") or "").strip()
+        if workflow_event:
+            try:
+                from workflow.runner import start_matching
+
+                started = start_matching(
+                    event=workflow_event, payload=payload, source="webhook"
+                )
+                return web.json_response(
+                    {
+                        "status": "started" if started else "ok",
+                        "event": workflow_event,
+                        "runs": [s.get("runId") for s in started],
+                    }
+                )
+            except Exception as exc:
+                logger.error("[webhook] workflow event failed route=%s: %s", route_name, exc)
+                return web.json_response(
+                    {"error": f"Failed to emit workflow event: {exc}"}, status=500
+                )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.

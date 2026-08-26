@@ -30,6 +30,7 @@ GUI_TOOLS = {
     "react_to_message",
     "setup_mcp",
     "tour",
+    "workflow",
 }
 
 

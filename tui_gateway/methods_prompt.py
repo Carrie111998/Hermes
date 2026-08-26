@@ -1566,6 +1566,16 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "text", allow_expired=True)
 
 
+@method("workflow.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string with the Workflows canvas's answer (workflow
+    # tool) — the open scenario and its op vocabulary for a read, or what
+    # landed and what it broke for an edit. allow_expired=True for the same
+    # reason as terminal.read: the tool's bounded wait can expire while a busy
+    # renderer is still applying a large batch.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
 @method("mcp.setup.respond")
 def _(rid, params: dict) -> dict:
     # `result` is a JSON string of the setup card's outcome ({status, server,
