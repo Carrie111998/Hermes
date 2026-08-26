@@ -2805,6 +2805,113 @@ def _(rid, params: dict) -> dict:
     )
 
 
+# TWO TRANSCRIPT PROJECTIONS, AND CONFUSING THEM IS A REAL BUG WE SHIPPED.
+#
+#   session.history            what a PERSON should see. _history_to_messages drops rows marked
+#                              display_kind="hidden" -- machine scaffolding, compaction refs,
+#                              external activations -- because a UI must not render them as
+#                              somebody's speech.
+#
+#   session.canonical_history  what DURABLY HAPPENED. Evidence, for a process reconciling its own
+#                              writes against the record. Hidden rows are the whole point.
+#
+# An automated producer that delivers a turn with display_kind="hidden" and then searches
+# session.history for it will never find it, conclude nothing was written, and either retry
+# forever or record a successful delivery as a failure. That was measured, not imagined:
+# scripts/probe_lazy_resume_is_non_consuming.py has three durable rows and one visible.
+#
+# Deliberately NOT session.history(include_hidden=true). One method with two meanings -- a UI view
+# and an audit record -- is exactly the ambiguity that caused the bug, and a future caller cannot
+# be expected to notice which one a boolean selected.
+@method("session.canonical_history")
+def _(rid, params: dict) -> dict:
+    """Durable evidence for one stored session. Reads; creates nothing.
+
+    Takes the STORED session id, never a runtime handle: the caller is asking what the record
+    says, and resuming an executable session to answer that would create a live session -- which
+    runs the external-turn poller, is eligible to consume events addressed to that conversation,
+    and holds them hostage until closed. An inspector must be structurally incapable of acting.
+
+    So this creates no session record, builds no agent, takes no active-session lease and starts
+    no poller. It follows the same compression lineage and the same size guard as session.resume,
+    because a reader that disagreed with resume about which rows exist would be a slower way to be
+    wrong.
+    """
+    target = str(params.get("session_id") or "")
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+
+    owns_db = False
+    if profile_home is not None:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=profile_home / "state.db")
+        owns_db = True
+    else:
+        db = _get_db()
+    try:
+        if db is None:
+            return _db_unavailable_error(rid, code=5000)
+        found = db.get_session(target)
+        if not found:
+            found = db.get_session_by_title(target)
+            if found:
+                target = found["id"]
+            else:
+                return _err(rid, 4007, "session not found")
+
+        # The same tip resolution session.resume performs. A wake delivered before an
+        # auto-compression rotation lives on the parent, and a reader anchored on the wrong end of
+        # the chain would report the evidence missing.
+        requested = target
+        try:
+            tip = db.resolve_resume_session_id(target)
+        except Exception:
+            tip = target
+        if tip and tip != target:
+            target = tip
+
+        # The same guard, for the same reason: a runaway transcript must not be readable by a
+        # route that skipped the check. Fails OPEN on a transient error, like resume does -- only a
+        # genuine over-limit refuses.
+        from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
+
+        safety_check = getattr(db, "assert_resume_safe", None)
+        try:
+            if callable(safety_check):
+                safety_check(target)
+            else:
+                limit = resolved_max_resume_messages()
+                stored = int((db.get_session(target) or found).get("message_count") or 0)
+                if limit and stored > limit:
+                    raise SessionResumeTooLargeError(stored, limit)
+        except SessionResumeTooLargeError as exc:
+            return _err(rid, 4130, str(exc))
+        except Exception as exc:
+            logger.warning(
+                "canonical history guard failed for %s (proceeding without guard): %s", target, exc
+            )
+
+        # The LINEAGE copy, not the tip-only model copy. Evidence must span ancestors: a marker
+        # written before a compression rotation is still something that durably happened, and a
+        # tip-only read would report it absent and authorise saying it a second time.
+        _model_history, lineage = db.get_resume_conversations(target)
+        return _ok(rid, {
+            "session_id": requested,
+            "resolved_session_id": target,
+            "count": len(lineage),
+            "messages": _canonical_messages(lineage),
+        })
+    finally:
+        if owns_db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 @method("session.undo")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)

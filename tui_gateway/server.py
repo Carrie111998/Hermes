@@ -8266,6 +8266,42 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
+def _canonical_messages(history: list[dict]) -> list[dict]:
+    """Durable evidence, projected small and stable. The SIBLING of _history_to_messages.
+
+    That one answers "what should a person see" and drops hidden scaffolding. This one answers
+    "what is durably recorded", so hidden rows are kept -- they are the rows an automated producer
+    wrote and must be able to find again.
+
+    A deliberately narrow shape rather than the internal message dicts: every field serialized here
+    becomes a contract with an external reader, and the agent's working representation is not one
+    this project wants to freeze. Reasoning is reported as PRESENCE, not content -- a consumer
+    needs to know a turn happened and said something, not what the model thought.
+    """
+    messages: list[dict] = []
+    for m in history:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in {"user", "assistant", "tool", "system"}:
+            continue
+        row: dict = {"role": role, "text": _coerce_message_text(m.get("content"))}
+        display_kind = m.get("display_kind")
+        if display_kind:
+            row["display_kind"] = display_kind
+        for key in ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items"):
+            if m.get(key):
+                row[key] = True
+        for key in ("row_id", "message_row_id"):
+            if m.get(key) is not None:
+                row["row_id"] = m.get(key)
+                break
+        if role == "assistant" and m.get("tool_calls"):
+            row["tool_calls"] = len(m["tool_calls"])
+        messages.append(row)
+    return messages
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -15685,9 +15721,15 @@ def _(rid, params: dict) -> dict:
     # only that concurrent writers to a session are fenced; a build can do that
     # and still have no inbox, in which case enqueued events would sit forever
     # with nothing to consume them.
+    # THREE separate mechanical facts, and a producer needs all three. The lease fences concurrent
+    # writers; the inbox carries an event to the session's owner; canonical history is how the
+    # producer sees what its own delivery actually wrote. A build can genuinely have the first two
+    # and not the third -- that build existed, and its wakes would have been undeliverable-looking
+    # forever -- so this is not a version number, it is a statement about what is present.
     return _ok(rid, {
         "per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
         "session_external_turns_v1": bool(SESSION_EXTERNAL_TURNS_V1),
+        "session_canonical_history_v1": "session.canonical_history" in _methods,
     })
 
 
