@@ -131,10 +131,13 @@ class LegalAgent:
         """
         crimes = crime_name_index()
         criminal_block = (
-            f"\n\n## 구성요건 데이터가 있는 죄명 (형사)\n\n{crimes}\n\n"
-            "죄명이 정해지면 `get_crime_elements` 로 구성요건을 꺼내 쓴다. "
+            f"\n\n## 구성요건 데이터가 있는 죄명 (형사 — 분야별)\n\n{crimes}\n\n"
+            "형사 상담은 두 단계다: 위 목록에서 **분야를 먼저 고르고**, 그 안에서 "
+            "죄명을 좁힌 뒤 `get_crime_elements` 로 구성요건을 꺼내 쓴다. "
             "형법 조문 번호·법정형은 도구가 준 것만 쓰고, 목록에 없는 죄는 "
-            "지어내지 말고 변호사에게 넘긴다."
+            "지어내지 말고 변호사에게 넘긴다. **학교폭력** 상담이면 범죄 해당 여부"
+            "(폭행·상해·모욕 등)와 별도로 `get_school_violence_measures` 로 학폭위 "
+            "조치(행정)를 함께 안내한다."
             if crimes
             else ""
         )

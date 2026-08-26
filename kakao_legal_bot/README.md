@@ -148,13 +148,28 @@ python kakao_legal_bot/relay/moa_draft_worker.py \
 조문·법정형도 마찬가지로 **도구가 준 것만** 씁니다. 데이터에 없는 죄는
 지어내지 않고 변호사에게 넘깁니다(`escalate_to_lawyer`).
 
-데이터는 `knowledge/criminal/*.jsonl` 이고 형법각론·특별형법이 같은 형식입니다.
-지금 들어 있는 16개는 형식을 보여드리는 씨앗이라 전부 `미검증` 표시가 붙어 있고,
-미검증인 동안에는 답변에 "변호사 확인 필요"가 자동으로 따라붙습니다.
+데이터는 변호사님의 **엑셀이 원본**입니다. `criminal_import` 로 변환하면
+`knowledge/criminal/*.jsonl` 이 만들어집니다 — 현재 **233개 죄명**(형법 168 ·
+특별형법 20개 법률 65)에 학교폭력 조치 39건이 실려 있습니다.
+
+죄명 색인은 **분야별 두 단계**로 상주합니다(약 2,600자, 캐시 대상). 형법은
+각칙의 장(살인 / 절도와 강도 / 사기와 공갈 …)으로, 특별형법은 법률 이름으로
+묶여 있어 모아가 분야를 먼저 고르고 그 안에서 죄명을 좁힙니다. 구성요건
+본문(법정형·기수시기·소추조건 특례·공소사실 기재례 포함)은 죄명이 정해진
+순간 `get_crime_elements` 로만 들어옵니다.
+
+**학교폭력은 두 갈래로 안내합니다.** 행위가 폭행·상해·모욕 등 범죄에
+해당하는지는 `get_crime_elements` 로, 학폭위 조치(제1~9호 · 피해학생 보호 ·
+학생부 · 불복)는 `get_school_violence_measures` 로 — 뒤쪽은 형사처벌이 아니라
+**행정조치**임을 구별해 말합니다.
+
+검증등급이 A가 아닌 데이터에는 답변에 "변호사 확인 필요"가 자동으로
+따라붙고, "…원문 확인"으로 표시된 법정형은 인용하지 않습니다.
 채우는 법과 점검 명령은 `knowledge/criminal/README.md` 에 있습니다.
 
 ```bash
-python -m kakao_legal_bot.app.criminal --check   # 배포 전 점검
+python -m kakao_legal_bot.app.criminal_import 형사데이터.xlsx   # 엑셀 → JSONL
+python -m kakao_legal_bot.app.criminal --check                  # 배포 전 점검
 ```
 
 ### ⑥ 문서는 반드시 변호사를 거쳐서

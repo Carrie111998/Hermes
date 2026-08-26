@@ -19,6 +19,7 @@ from .criminal import (
     crime_name_index,
     find_crime,
     find_crimes,
+    school_measures_block,
 )
 from .intake import (
     CIVIL,
@@ -459,6 +460,16 @@ def _related_tool(
     )
 
 
+async def _school_measures_result() -> str:
+    block = school_measures_block()
+    if not block:
+        return (
+            "학교폭력 조치 데이터가 아직 없습니다. 일반적인 절차만 안내하고 "
+            "구체적인 조치 번호·내용은 변호사에게 넘기세요."
+        )
+    return _clip(block, limit=8000)
+
+
 def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
     """The document-intake flow: form → requisite facts → report → quote.
 
@@ -632,6 +643,17 @@ def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
                 "required": ["crime"],
             },
             handler=get_crime_elements,
+        ),
+        ToolSpec(
+            name="get_school_violence_measures",
+            description=(
+                "학교폭력 상담에서 학폭위(심의위원회) 조치를 가져온다 — 가해학생 조치 "
+                "제1~9호, 피해학생 보호조치, 학생부 기재, 불복 절차. 이것은 형사처벌이 "
+                "아니라 행정조치다. 행위 자체가 폭행·상해·모욕 등 범죄에 해당하는지는 "
+                "get_crime_elements 로 따로 확인하고, 학폭 상담에서는 두 갈래를 함께 안내한다."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            handler=lambda _arguments: _school_measures_result(),
         ),
         ToolSpec(
             name="submit_consultation_report",

@@ -44,10 +44,10 @@ def test_the_shipped_data_loads_without_complaints():
 
 
 def test_every_crime_carries_what_a_question_needs():
+    """질문항목이 없으면 객관적 구성요건이 질문의 기준이 됩니다 — 그건 필수."""
     for crime in all_crimes():
         assert crime.article, crime.name
         assert crime.objective, crime.name
-        assert crime.questions, crime.name
 
 
 def test_special_statutes_use_the_same_shape():
@@ -55,15 +55,18 @@ def test_special_statutes_use_the_same_shape():
     special = [c for c in all_crimes() if c.statute != "형법"]
     assert special, "특별형법 예시가 하나는 있어야 형식을 보여줄 수 있습니다."
     for crime in special:
-        assert crime.objective and crime.questions
+        assert crime.objective
 
 
 def test_the_index_lists_names_only_so_the_prompt_does_not_balloon():
     index = crime_name_index()
-    assert "절도" in index and "형법" in index
+    assert "절도" in index and "[형법]" in index
+    # 분야로 묶여 있어 233개 중에서 두 단계로 찾는다.
+    assert "절도와 강도:" in index
+    assert "[특별형법]" in index
     # 구성요건 본문은 색인에 없다 — 죄명이 정해진 뒤 도구로 꺼낸다.
     assert "불법영득의사" not in index
-    assert len(index) < 2000
+    assert len(index) < 4000  # 233개 죄명 — 상주하므로 이 이상 부풀면 안 된다
 
 
 # ── 죄명 찾기 ────────────────────────────────────────────────────────────
@@ -73,7 +76,7 @@ def test_the_index_lists_names_only_so_the_prompt_does_not_balloon():
         ("물건을 훔쳐갔어요", "절도"),
         ("투자금을 돌려받지 못했습니다", "사기"),
         ("맞았어요", "폭행"),
-        ("단톡방에 퍼뜨렸어요", "정보통신망 명예훼손"),
+        ("단톡방에 퍼뜨렸어요", "정보통신망명예훼손(구법)"),
         ("절도", "절도"),
     ],
 )
@@ -88,10 +91,10 @@ def test_an_unknown_crime_is_not_forced_into_a_wrong_one():
 
 
 def test_ambiguous_words_come_back_as_candidates_not_a_guess():
-    """'명예를 훼손' 은 형법과 정보통신망법 둘 다에 걸립니다."""
-    candidates = find_crimes("인터넷에 글을 올려서 명예를 훼손했어요")
-    names = {c.name for c in candidates}
-    assert {"명예훼손", "정보통신망 명예훼손"} <= names
+    """'폭행 협박' 은 두 죄에 같은 세기로 걸립니다 — 하나로 단정하지 않습니다."""
+    assert find_crime("폭행 협박을 당했어요") is None
+    names = {c.name for c in find_crimes("폭행 협박을 당했어요")}
+    assert {"폭행", "협박"} <= names
 
 
 # ── 처벌규정: 모르면 모른다고 한다 ───────────────────────────────────────
@@ -261,7 +264,7 @@ async def test_fetching_elements_records_the_crime_as_the_case_type():
     state = TurnState()
     result = await tools_for(state)["get_crime_elements"].handler({"crime": "사기"})
 
-    assert "기망행위" in result
+    assert "기망" in result
     assert [a.kind for a in state.intake_actions] == ["case_type"]
     assert state.intake_actions[0].case_type == "사기"
     assert state.intake_actions[0].track == "criminal"
@@ -281,11 +284,11 @@ async def test_an_unknown_crime_tells_the_model_not_to_invent_an_article():
 async def test_an_ambiguous_crime_asks_one_more_question_instead_of_picking():
     state = TurnState()
     result = await tools_for(state)["get_crime_elements"].handler(
-        {"crime": "명예를 훼손 인터넷에 글"}
+        {"crime": "폭행 협박을 당했어요"}
     )
 
     assert "좁혀지지 않습니다" in result
-    assert "정보통신망 명예훼손" in result
+    assert "폭행" in result and "협박" in result
     assert state.intake_actions == []
 
 
@@ -326,3 +329,93 @@ def test_the_prefix_stays_byte_identical_between_calls(settings):
 
     agent = LegalAgent(settings, llm=None)  # type: ignore[arg-type]
     assert agent.stable_prefix() == agent.stable_prefix()
+
+
+# ── 변호사님 엑셀 데이터 (233죄 + 학교폭력) ──────────────────────────────
+def test_the_full_dataset_is_loaded():
+    stats = criminal_stats()
+    assert stats["crimes"] >= 230
+    assert stats["special_statutes"] >= 15
+
+
+def test_the_index_is_grouped_by_field_so_233_names_stay_findable():
+    """죄명을 그냥 늘어놓으면 모델이 못 찾습니다 — 분야 먼저, 죄명은 그 안에서."""
+    from kakao_legal_bot.app.criminal import penal_chapter
+
+    index = crime_name_index()
+    assert "- 살인:" in index
+    assert "- 사기와 공갈:" in index
+    assert "도로교통법:" in index
+    assert penal_chapter("제329조") == "절도와 강도"
+    assert penal_chapter("제347조 제1항") == "사기와 공갈"
+    assert penal_chapter("없는 조문") == ""
+
+
+def test_a_placeholder_penalty_is_an_instruction_not_a_penalty():
+    """'조문 원문 확인' 을 법정형으로 인용하면 안 됩니다."""
+    text = crime_elements_for("살인")
+    assert "인용하지 말 것" in text or "## 법정형\n" not in text.split("## 보호법익")[0]
+
+
+def test_the_indictment_example_is_marked_internal():
+    text = crime_elements_for("절도")
+    assert "공소사실 기재례" in text
+    assert "그대로 보내지 말 것" in text
+
+
+def test_a_crime_without_handwritten_questions_still_tells_how_to_ask():
+    text = crime_elements_for("무고")
+    assert "6하원칙" in text
+
+
+def test_special_prosecution_notes_survive():
+    """'친족상도례 검토' 같은 특례는 버리지 않고 상담 확인사항으로 남깁니다."""
+    text = crime_elements_for("절도")
+    assert "친족상도례" in text
+
+
+def test_the_lawyer_grade_b_still_warns():
+    """검증등급 B 는 미검증 — 봇이 '변호사 확인 필요'를 붙입니다."""
+    text = crime_elements_for("살인")
+    assert "미검증" in text
+
+
+# ── 학교폭력 — 범죄가 아니라 행정조치 ────────────────────────────────────
+def test_school_measures_load_and_are_ordered():
+    from kakao_legal_bot.app.criminal import school_measures
+
+    rows = school_measures()
+    assert len(rows) >= 30
+    numbered = [row for row in rows if str(row.get("구분", "")).startswith("제")]
+    assert [row["구분"] for row in numbered][:3] == ["제1호", "제2호", "제3호"]
+
+
+def test_the_school_block_separates_measures_from_punishment():
+    from kakao_legal_bot.app.criminal import school_measures_block
+
+    block = school_measures_block()
+    assert "형벌이 아니라 행정조치" in block
+    assert "가해학생 조치" in block
+    assert "피해학생 보호조치" in block
+    assert "서면사과" in block
+    assert "get_crime_elements" in block  # 형사 갈래를 함께 보라는 안내
+    assert len(block) < 8000  # 도구 한 번 호출로 들어갈 크기
+
+
+def test_school_crimes_do_not_leak_into_the_crime_list():
+    """학교폭력.jsonl 은 조치 표라 죄명 로더가 읽으면 안 됩니다."""
+    assert load_problems() == ()
+    assert find_crime("서면사과") is None
+
+
+@pytest.mark.asyncio
+async def test_the_school_tool_returns_the_measures():
+    state = TurnState()
+    result = await tools_for(state)["get_school_violence_measures"].handler({})
+    assert "제1호" in result and "행정" in result
+
+
+def test_school_violence_words_reach_a_crime_too():
+    """학폭 상담의 형사 갈래 — '여럿이서 때렸다'는 폭처법입니다."""
+    crime = find_crime("여럿이서 때렸어요")
+    assert crime is not None and crime.statute.startswith("폭력행위")

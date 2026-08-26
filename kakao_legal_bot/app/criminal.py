@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -74,6 +75,41 @@ def _flag(raw: object) -> bool | None:
     return bool(raw) if isinstance(raw, bool) else None
 
 
+# 형법 각칙의 장(章). 조문 번호로 분야를 찾는 구조 정보입니다 — 죄의 내용이
+# 아니라 법전의 차례이므로 여기 두어도 안전합니다.
+_PENAL_CODE_CHAPTERS: tuple[tuple[int, int, str], ...] = (
+    (87, 91, "내란"), (92, 104, "외환"), (105, 106, "국기"), (107, 113, "국교"),
+    (114, 118, "공안을 해하는 죄"), (119, 121, "폭발물"),
+    (122, 135, "공무원의 직무"), (136, 144, "공무방해"),
+    (145, 151, "도주와 범인은닉"), (152, 155, "위증과 증거인멸"), (156, 157, "무고"),
+    (158, 163, "신앙에 관한 죄"), (164, 176, "방화와 실화"), (177, 184, "일수와 수리"),
+    (185, 191, "교통방해"), (192, 197, "음용수"), (198, 206, "아편"),
+    (207, 213, "통화"), (214, 224, "유가증권·우표·인지"), (225, 237, "문서"),
+    (238, 240, "인장"), (241, 245, "성풍속"), (246, 249, "도박과 복표"),
+    (250, 256, "살인"), (257, 265, "상해와 폭행"), (266, 268, "과실치사상"),
+    (269, 270, "낙태"), (271, 275, "유기와 학대"), (276, 282, "체포와 감금"),
+    (283, 286, "협박"), (287, 296, "약취·유인·인신매매"), (297, 306, "강간과 추행"),
+    (307, 312, "명예"), (313, 315, "신용·업무와 경매"), (316, 318, "비밀침해"),
+    (319, 322, "주거침입"), (323, 328, "권리행사방해"), (329, 346, "절도와 강도"),
+    (347, 354, "사기와 공갈"), (355, 361, "횡령과 배임"), (362, 365, "장물"),
+    (366, 372, "손괴"),
+)
+
+_ARTICLE_NO = re.compile(r"제\s*(\d{1,4})\s*조")
+
+
+def penal_chapter(article: str) -> str:
+    """형법 조문 → 각칙의 장 이름. 못 찾으면 빈 문자열."""
+    match = _ARTICLE_NO.search(article or "")
+    if match is None:
+        return ""
+    number = int(match.group(1))
+    for start, end, chapter in _PENAL_CODE_CHAPTERS:
+        if start <= number <= end:
+            return chapter
+    return ""
+
+
 # ── 죄명 ─────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Crime:
@@ -84,14 +120,20 @@ class Crime:
     interest: str = ""
     objective: tuple[str, ...] = ()
     subjective: tuple[str, ...] = ()
+    completion: str = ""  # 기수시기
     attempt: Punishability = field(default_factory=lambda: Punishability(known=False))
     preparation: Punishability = field(default_factory=lambda: Punishability(known=False))
     habitual: Punishability = field(default_factory=lambda: Punishability(known=False))
     negligent: Punishability = field(default_factory=lambda: Punishability(known=False))
     complaint_required: bool | None = None  # 친고죄
     victim_veto: bool | None = None  # 반의사불벌죄
+    special_note: str = ""  # 소추조건·특례 원문 (친족상도례 검토 등)
     limitation: str = ""  # 공소시효
     questions: tuple[str, ...] = ()
+    indictment_example: str = ""  # 공소사실 합성기재례 — 참고용
+    penalty_note: str = ""  # "조문 원문 확인" 같은 지시문
+    source_url: str = ""
+    as_of: str = ""  # 데이터 기준일
     aliases: tuple[str, ...] = ()
     verified: bool = False
     source: str = ""
@@ -104,6 +146,13 @@ class Crime:
     def label(self) -> str:
         head = f"{self.statute} {self.article}".strip()
         return f"{self.name} ({head})" if head else self.name
+
+    @property
+    def chapter(self) -> str:
+        """분야 — 형법이면 각칙의 장, 특별형법이면 법률 이름."""
+        if self.statute == "형법":
+            return penal_chapter(self.article) or "형법 기타"
+        return self.statute
 
     def strength(self, text: str) -> int:
         """이 죄를 가리키는 표현 중 문장에 등장한 가장 긴 것의 길이 (없으면 0).
@@ -136,14 +185,20 @@ def _crime_from(row: dict, source: str) -> Crime | None:
         interest=str(row.get("보호법익") or "").strip(),
         objective=_strings(row.get("객관적_구성요건")),
         subjective=_strings(row.get("주관적_구성요건")),
+        completion=str(row.get("기수시기") or "").strip(),
         attempt=_punishability(row.get("미수")),
         preparation=_punishability(row.get("예비음모")),
         habitual=_punishability(row.get("상습범")),
         negligent=_punishability(row.get("과실범")),
         complaint_required=_flag(row.get("친고죄")),
         victim_veto=_flag(row.get("반의사불벌죄")),
+        special_note=str(row.get("소추조건_특례") or "").strip(),
         limitation=str(row.get("공소시효") or "").strip(),
         questions=_strings(row.get("질문항목")),
+        indictment_example=str(row.get("공소사실_기재례") or "").strip(),
+        penalty_note=str(row.get("법정형_확인") or "").strip(),
+        source_url=str(row.get("출처") or "").strip(),
+        as_of=str(row.get("기준일") or "").strip(),
         aliases=_strings(row.get("별칭")),
         verified=str(row.get("검증") or "").strip() == VERIFIED,
         source=source,
@@ -172,6 +227,8 @@ def _load() -> LoadReport:
         return LoadReport((), (f"{CRIMINAL_DIR} 디렉터리가 없습니다.",))
 
     for path in sorted(CRIMINAL_DIR.glob("*.jsonl")):
+        if path.name.startswith("학교폭력"):
+            continue  # 범죄가 아니라 행정조치 — school_measures() 가 읽습니다
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
@@ -221,6 +278,8 @@ def reload_crimes() -> None:
     crime_index.cache_clear()
     crime_name_index.cache_clear()
     crime_elements_for.cache_clear()
+    school_measures.cache_clear()
+    school_measures_block.cache_clear()
 
 
 # ── 조회 ─────────────────────────────────────────────────────────────────
@@ -267,17 +326,33 @@ def crime_index() -> str:
 
 @lru_cache(maxsize=1)
 def crime_name_index() -> str:
-    """시스템 프롬프트에 상주하는 죄명 색인.
+    """시스템 프롬프트에 상주하는 죄명 색인 — **분야별로 묶어서**.
 
-    죄명이 수백 개로 늘어도 프롬프트가 부풀지 않도록 이름만 이어 붙입니다.
-    구성요건 본문은 죄명이 정해진 뒤 ``get_crime_elements`` 로 꺼냅니다.
+    죄명이 수백 개라 그냥 늘어놓으면 모델이 못 찾습니다. 형법은 각칙의
+    장(살인 / 절도와 강도 / 사기와 공갈 …)으로, 특별형법은 법률 이름으로
+    묶습니다. 상담자의 말에서 분야를 먼저 고르고 그 안에서 죄명을 고르는
+    두 단계가 되도록요. 구성요건 본문은 죄명이 정해진 뒤
+    ``get_crime_elements`` 로 꺼냅니다.
     """
-    by_statute: dict[str, list[str]] = {}
-    for crime in all_crimes():
-        by_statute.setdefault(crime.statute or "형법", []).append(crime.name)
-    lines = []
-    for statute in sorted(by_statute, key=lambda s: (s != "형법", s)):
-        lines.append(f"- {statute}: {', '.join(by_statute[statute])}")
+    crimes = all_crimes()
+    penal: dict[str, list[str]] = {}
+    special: dict[str, list[str]] = {}
+    for crime in crimes:
+        if crime.statute == "형법":
+            penal.setdefault(crime.chapter, []).append(crime.name)
+        else:
+            special.setdefault(crime.statute, []).append(crime.name)
+
+    lines: list[str] = []
+    if penal:
+        lines.append("[형법]")
+        order = {chapter: index for index, (_s, _e, chapter) in enumerate(_PENAL_CODE_CHAPTERS)}
+        for chapter in sorted(penal, key=lambda c: order.get(c, 999)):
+            lines.append(f"- {chapter}: {', '.join(penal[chapter])}")
+    if special:
+        lines.append("[특별형법]")
+        for statute in sorted(special):
+            lines.append(f"- {statute}: {', '.join(special[statute])}")
     return "\n".join(lines)
 
 
@@ -324,6 +399,11 @@ def crime_elements_for(name: str) -> str:
 
     if crime.penalty:
         blocks.append(f"## 법정형\n{crime.penalty}")
+    elif crime.penalty_note:
+        note = f"## 법정형\n{crime.penalty_note}"
+        if crime.source_url:
+            note += f" → {crime.source_url}"
+        blocks.append(note + "\n(법정형을 답변에 인용하지 말 것 — 조문을 확인하지 않았다)")
     if crime.interest:
         blocks.append(f"## 보호법익\n{crime.interest}")
 
@@ -336,16 +416,111 @@ def crime_elements_for(name: str) -> str:
         blocks.append(
             "## 주관적 구성요건\n" + "\n".join(f"- {item}" for item in crime.subjective)
         )
+    if crime.completion:
+        blocks.append(f"## 기수시기\n{crime.completion}")
 
     blocks.append("## 미수·예비음모·상습·과실 처벌규정\n" + "\n".join(_punish_lines(crime)))
-    blocks.append("## 절차\n" + "\n".join(_procedure_lines(crime)))
+    procedure = _procedure_lines(crime)
+    if crime.special_note:
+        procedure.append(f"- 소추조건·특례: {crime.special_note} — 상담에서 함께 확인할 것")
+    blocks.append("## 절차\n" + "\n".join(procedure))
 
     if crime.questions:
         blocks.append(
             "## 반드시 물어야 할 것 (6하원칙으로 풀어서 묻되, 한 번에 3개까지)\n"
             + "\n".join(f"- {item}" for item in crime.questions)
         )
+    else:
+        blocks.append(
+            "## 질문 만들기\n객관적 구성요건을 하나씩 6하원칙(언제·어디서·누가·"
+            "무엇을·어떻게·왜)으로 풀어 물어라. 한 번에 3개까지."
+        )
+    if crime.indictment_example:
+        blocks.append(
+            "## 공소사실 기재례 (참고 — 상담자에게 그대로 보내지 말 것)\n"
+            f"{crime.indictment_example}"
+        )
     return "\n\n".join(blocks).strip()
+
+
+# ── 학교폭력 — 범죄가 아니라 행정조치 ────────────────────────────────────
+# 학폭 상담은 두 갈래가 함께 갑니다: (형사) 폭행·상해·모욕 등의 구성요건과
+# (행정) 학폭위 조치·보호조치·불복. 이 표는 뒤쪽입니다.
+SCHOOL_FILE = "학교폭력.jsonl"
+
+_SCHOOL_ORDER = {
+    "제1호": 0, "제2호": 1, "제3호": 2, "제4호": 3, "제5호": 4,
+    "제6호": 5, "제7호": 6, "제8호": 7, "제9호": 8,
+}
+_SCHOOL_GROUPS = (
+    ("가해학생 조치 (제1호~제9호)", lambda row: str(row.get("구분", "")).startswith("제")),
+    ("피해학생 보호조치", lambda row: row.get("구분") == "피해학생"),
+    ("절차·불복·기타", lambda row: True),
+)
+
+
+@lru_cache(maxsize=1)
+def school_measures() -> tuple[dict, ...]:
+    path = CRIMINAL_DIR / SCHOOL_FILE
+    rows: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "//")):
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("조치명"):
+            rows.append(row)
+    rows.sort(key=lambda row: _SCHOOL_ORDER.get(str(row.get("구분", "")), 99))
+    return tuple(rows)
+
+
+@lru_cache(maxsize=1)
+def school_measures_block() -> str:
+    """학교폭력 조치 전체를 프롬프트용 한 덩어리로. 비어 있으면 빈 문자열."""
+    rows = list(school_measures())
+    if not rows:
+        return ""
+    blocks: list[str] = [
+        "# 학교폭력예방법 — 조치·제재 (형벌이 아니라 행정조치다)",
+        "학교폭력 상담은 두 갈래를 함께 본다: ① 행위가 폭행·상해·모욕·협박 등 "
+        "범죄에 해당하는지 (get_crime_elements 로 확인), ② 학폭위(심의위원회) "
+        "조치. 아래는 ②다. 조치는 형사처벌이 아니고, 불복은 행정심판·행정소송이다.",
+    ]
+    remaining = rows
+    for title, matcher in _SCHOOL_GROUPS:
+        group = [row for row in remaining if matcher(row)]
+        remaining = [row for row in remaining if row not in group]
+        if not group:
+            continue
+        lines = [f"## {title}"]
+        for row in group:
+            head = str(row.get("조치명", ""))
+            number = str(row.get("조치번호", "") or "")
+            if number and not head.startswith(number):
+                head = f"{number} {head}"
+            bits = [
+                str(row.get("내용", "")),
+                str(row.get("법적성격", "")),
+            ]
+            tail = " · ".join(bit for bit in bits if bit)
+            lines.append(f"- **{head}** — {tail}" if tail else f"- **{head}**")
+            for key, label in (("학생부_장기효과", "학생부"), ("불복_병행_확인", "불복·확인")):
+                value = str(row.get(key, "") or "")
+                if value:
+                    lines.append(f"  - {label}: {value}")
+        blocks.append("\n".join(lines))
+    blocks.append(
+        "⚠ 학생부 기재·삭제 기준과 법정형은 기준일 이후 바뀌었을 수 있다. "
+        "확정적으로 안내하지 말고 변호사 확인을 붙여라."
+    )
+    return "\n\n".join(blocks)
 
 
 def criminal_stats() -> dict[str, int]:
