@@ -468,13 +468,12 @@ CLARIFY_SCHEMA = {
                 "description": (
                     "The question(s). Each: question text (options excluded), "
                     "optional choices (recommended first; omit for free-text), "
-                    "optional multi_select, optional `id` echoed in the "
-                    "matching response."
+                    "optional multi_select. Responses come back in question "
+                    "order with the question text echoed."
                 ),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
                         "question": {"type": "string"},
                         "choices": {
                             "type": "array",
@@ -486,11 +485,12 @@ CLARIFY_SCHEMA = {
                     "required": ["question"],
                 },
             },
-            # NOTE: the handler also accepts the legacy single-question shape
-            # (`question` + `choices` + `multi_select` at top level) for old
-            # transcripts and external callers, and a top-level `question`
-            # alongside `questions` is used as the batch form's title.
-            # Deliberately unadvertised: one documented way to call.
+            # NOTE: the handler also accepts (unadvertised): a per-question
+            # `id` (echoed in the matching response — redundant since rows
+            # carry the question text and preserve order), and the legacy
+            # single-question shape (`question` + `choices` + `multi_select`
+            # at top level; a top-level `question` beside `questions` is the
+            # batch form's title). One documented way to call.
         },
         "required": ["questions"],
     },
