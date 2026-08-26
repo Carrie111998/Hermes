@@ -59,6 +59,13 @@ def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
 # (Firecrawl / Tavily / …). Mapped back to ``web_search`` in normalize_response.
 _XAI_CLIENT_WEB_SEARCH_ALIAS = "hermes_web_search"
 
+# Wire-name used when Hermes's Tool Search bridge is on the xAI wire.
+# Grok reserves the literal ``tool_search`` for its native server-side Tool
+# Search and rejects the client declaration with HTTP 400 (#95003). Alias
+# on the wire; map back to ``tool_search`` in normalize_response so Hermes
+# dispatch is unchanged. ``tool_describe`` / ``tool_call`` are not reserved.
+_XAI_CLIENT_TOOL_SEARCH_ALIAS = "hermes_tool_search"
+
 # OpenCode's /v1/responses endpoints (Zen and Go, including custom providers
 # pointing at opencode.ai) reserve certain function names server-side and
 # reject client tools that use them with HTTP 400 ("custom function name
@@ -142,6 +149,19 @@ def _rename_client_web_search_for_xai(response_tools: List[Dict[str, Any]]) -> L
         if isinstance(tool, dict) and tool.get("name") == "web_search":
             aliased = dict(tool)
             aliased["name"] = _XAI_CLIENT_WEB_SEARCH_ALIAS
+            rewritten.append(aliased)
+        else:
+            rewritten.append(tool)
+    return rewritten
+
+
+def _rename_client_tool_search_for_xai(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rename client ``tool_search`` → alias so xAI won't reject the request."""
+    rewritten: List[Dict[str, Any]] = []
+    for tool in response_tools:
+        if isinstance(tool, dict) and tool.get("name") == "tool_search":
+            aliased = dict(tool)
+            aliased["name"] = _XAI_CLIENT_TOOL_SEARCH_ALIAS
             rewritten.append(aliased)
         else:
             rewritten.append(tool)
@@ -553,6 +573,12 @@ class ResponsesApiTransport(ProviderTransport):
                 else:
                     response_tools = _rename_client_web_search_for_xai(response_tools)
 
+            # Always alias the Tool Search bridge name — xAI's native
+            # ``tool_search`` is a different feature (server-side discovery
+            # of *xAI's* tools), not a substitute for Hermes's deferred
+            # MCP/plugin catalog. Do not swap to ``{"type": "tool_search"}``.
+            response_tools = _rename_client_tool_search_for_xai(response_tools)
+
         # OpenCode Responses backends reserve web_search / search_files as
         # function names (HTTP 400 "custom function name 'X' is reserved",
         # #85589). Alias them on the wire; normalize_response maps them back.
@@ -799,6 +825,10 @@ class ResponsesApiTransport(ProviderTransport):
                 # the real ``web_search`` tool (Firecrawl / etc.).
                 if name == _XAI_CLIENT_WEB_SEARCH_ALIAS:
                     name = "web_search"
+                # Undo the xAI Tool Search bridge alias so Hermes dispatches
+                # the real ``tool_search`` handler (#95003).
+                elif name == _XAI_CLIENT_TOOL_SEARCH_ALIAS:
+                    name = "tool_search"
                 # Undo the OpenCode reserved-name wire aliases the same way
                 # (hermes_web_search / hermes_search_files, #85589).
                 elif name in _RESERVED_ALIAS_TO_NAME:
