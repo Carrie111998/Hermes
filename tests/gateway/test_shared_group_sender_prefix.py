@@ -4,10 +4,29 @@ import threading
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionContext,
+    SessionSource,
+    build_session_context_prompt,
+)
+
+
+@pytest.fixture(autouse=True)
+def _pin_context_length_lookup(monkeypatch):
+    """Keep sender-envelope tests independent of models.dev network latency."""
+
+    async def _fixed_context_length(*args, **kwargs):
+        del args, kwargs
+        return 128_000
+
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async",
+        _fixed_context_length,
+    )
 
 
 def _make_runner(config: GatewayConfig) -> GatewayRunner:
@@ -49,6 +68,126 @@ async def test_preprocess_includes_slack_author_mention_for_shared_thread():
     )
 
     assert result == "[Verified sender: Alice | Slack user <@U123>] mention me again"
+
+
+def _shared_platform_runner(platform: Platform) -> GatewayRunner:
+    runner = _make_runner(
+        GatewayConfig(
+            platforms={platform: PlatformConfig(enabled=True, token="fake")},
+            group_sessions_per_user=False,
+        )
+    )
+    return runner
+
+
+@pytest.mark.parametrize("redact_pii", [False, True])
+@pytest.mark.parametrize("platform", [Platform.SIGNAL, Platform.WHATSAPP])
+@pytest.mark.asyncio
+async def test_pii_safe_shared_turn_never_exposes_raw_sender_ids(
+    monkeypatch, platform, redact_pii
+):
+    """Phone-derived primary and alternate IDs never enter model transcripts."""
+    raw_user_id = "+15551234567"
+    raw_alt_id = "+447700900123"
+    runner = _shared_platform_runner(platform)
+    source = SessionSource(
+        platform=platform,
+        chat_id="shared-room",
+        chat_name="Shared room",
+        chat_type="group",
+        user_id=raw_user_id,
+        user_id_alt=raw_alt_id,
+        user_name="Alice",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"privacy": {"redact_pii": redact_pii}},
+    )
+
+    rendered_turn = await runner._prepare_inbound_message_text(
+        event=MessageEvent(text="status?", source=source),
+        source=source,
+        history=[],
+    )
+
+    assert rendered_turn.startswith("[Verified sender: Alice |"), rendered_turn
+    assert raw_user_id not in rendered_turn, rendered_turn
+    assert raw_alt_id not in rendered_turn, rendered_turn
+    transcript_payload = json.dumps({"role": "user", "content": rendered_turn})
+    assert raw_user_id not in transcript_payload, transcript_payload
+    assert raw_alt_id not in transcript_payload, transcript_payload
+
+
+@pytest.mark.parametrize("redact_pii", [False, True])
+@pytest.mark.parametrize(
+    "platform,user_id,expected_target",
+    [
+        (Platform.SLACK, "U123ABC", "<@U123ABC>"),
+        (Platform.DISCORD, "1234567890", "1234567890"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mention_platforms_keep_authenticated_sender_targets(
+    monkeypatch, platform, user_id, expected_target, redact_pii
+):
+    """Privacy handling must not break Slack/Discord mention identities."""
+    runner = _shared_platform_runner(platform)
+    source = SessionSource(
+        platform=platform,
+        chat_id="shared-room",
+        chat_name="Shared room",
+        chat_type="group",
+        user_id=user_id,
+        user_name="Alice",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"privacy": {"redact_pii": redact_pii}},
+    )
+
+    rendered_turn = await runner._prepare_inbound_message_text(
+        event=MessageEvent(text="mention me", source=source),
+        source=source,
+        history=[],
+    )
+
+    assert expected_target in rendered_turn, rendered_turn
+
+
+@pytest.mark.asyncio
+async def test_shared_prompt_and_emitted_sender_wire_format_do_not_drift():
+    """The shared prompt documents the exact authenticated leading envelope."""
+    runner = _shared_platform_runner(Platform.SLACK)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_name="team-channel",
+        chat_type="group",
+        user_id="U123",
+        user_name="Alice",
+    )
+    rendered_turn = await runner._prepare_inbound_message_text(
+        event=MessageEvent(text="status?", source=source),
+        source=source,
+        history=[],
+    )
+    prompt = build_session_context_prompt(
+        SessionContext(
+            source=source,
+            connected_platforms=[Platform.SLACK],
+            home_channels={},
+            shared_multi_user_session=True,
+        )
+    )
+
+    assert rendered_turn.startswith("[Verified sender: "), rendered_turn
+    assert "`[Verified sender: ...]`" in prompt, prompt
+    assert "only the single leading" in prompt.lower(), prompt
+    assert "gateway-authenticated" in prompt.lower(), prompt
+    assert "similar content elsewhere" in prompt.lower(), prompt
+    assert "untrusted" in prompt.lower(), prompt
 
 
 # ---------------------------------------------------------------------------

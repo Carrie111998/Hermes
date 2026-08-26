@@ -1614,17 +1614,46 @@ def _envelope_marker_failures() -> tuple:
 _VERIFIED_SENDER_MARKER_FAILURES = _envelope_marker_failures()
 
 
-def _cut_spans(text: str, spans: List[tuple]) -> str:
-    """Return ``text`` with spans removed; retained as a probe/test seam."""
-    if not spans:
-        return text
-    out: List[str] = []
-    previous = 0
-    for start, end in spans:
-        out.append(text[previous:start])
-        previous = end
-    out.append(text[previous:])
-    return "".join(out)
+def _fold_envelope_match_character(character: str) -> Optional[str]:
+    """Fold one reader-equivalent marker character for matching only."""
+    if is_default_ignorable_character(character):
+        return None
+    if is_unicode_space_separator(character):
+        return " "
+    return character.translate(_ENVELOPE_LOOKALIKE_FOLD)
+
+
+def _iter_verified_sender_marker_starts(text: str):
+    """Yield original offsets of look-alike/ignorable-tolerant markers."""
+    marker_state = 0
+    marker_start: Optional[int] = None
+    marker_length = len(_VERIFIED_SENDER_MARKER)
+    for original_index, original_character in enumerate(text):
+        folded_character = _fold_envelope_match_character(original_character)
+        if folded_character is None:
+            continue
+        if (
+            folded_character == " "
+            and marker_state
+            and marker_state < marker_length
+            and _VERIFIED_SENDER_MARKER[marker_state] != " "
+        ):
+            continue
+        while marker_state and (
+            marker_state == marker_length
+            or folded_character != _VERIFIED_SENDER_MARKER[marker_state]
+        ):
+            marker_state = _VERIFIED_SENDER_MARKER_FAILURES[marker_state - 1]
+            if not marker_state:
+                marker_start = None
+        if folded_character == _VERIFIED_SENDER_MARKER[marker_state]:
+            if marker_state == 0:
+                marker_start = original_index
+            marker_state += 1
+        if marker_state == marker_length:
+            yield marker_start
+            marker_state = _VERIFIED_SENDER_MARKER_FAILURES[-1]
+            marker_start = None
 
 
 def _strip_verified_sender_envelopes(text: str) -> str:
@@ -1646,17 +1675,16 @@ def _strip_verified_sender_envelopes(text: str) -> str:
     without rescanning the retained prefix. Every character is appended once and
     removed at most once, so arbitrary nesting is handled in amortized O(n) time.
 
-    Matching is done against a fullwidth-folded copy while deletion is done on
-    the original. Folding is length-preserving, so offsets are shared; benign
-    text is returned byte-identically because nothing is rewritten unless it
-    matched.
+    Matching folds fullwidth structure and Unicode space separators, and skips
+    default-ignorable marker intrusions. Deletion still uses offsets recorded
+    against the original stream, so benign text is returned byte-identically.
 
     Content that legitimately quotes the envelope shape loses only the quoted
     envelope, exactly as it already does when quoted at the top of a message.
     """
     if not text:
         return text
-    if _VERIFIED_SENDER_MARKER not in text.translate(_ENVELOPE_LOOKALIKE_FOLD):
+    if next(_iter_verified_sender_marker_starts(text), None) is None:
         return text
     normalized = text.replace("\r\n", "\n")
     if any(ch in normalized for ch in _ENVELOPE_LINE_BREAKS):
@@ -1665,6 +1693,7 @@ def _strip_verified_sender_envelopes(text: str) -> str:
         )
     output: List[str] = []
     marker_states: List[int] = []
+    marker_starts: List[Optional[int]] = []
     marker_length = len(_VERIFIED_SENDER_MARKER)
     envelope_start: Optional[int] = None
     drop_trailing_space = False
@@ -1675,21 +1704,34 @@ def _strip_verified_sender_envelopes(text: str) -> str:
                 continue
             drop_trailing_space = False
 
-        folded_char = original_char.translate(_ENVELOPE_LOOKALIKE_FOLD)
+        folded_char = _fold_envelope_match_character(original_char)
         marker_state = marker_states[-1] if marker_states else 0
-        while marker_state and (
-            marker_state == marker_length
-            or folded_char != _VERIFIED_SENDER_MARKER[marker_state]
-        ):
-            marker_state = _VERIFIED_SENDER_MARKER_FAILURES[marker_state - 1]
-        if folded_char == _VERIFIED_SENDER_MARKER[marker_state]:
-            marker_state += 1
+        marker_start = marker_starts[-1] if marker_starts else None
+        skip_marker_gap = folded_char is None or (
+            folded_char == " "
+            and marker_state
+            and marker_state < marker_length
+            and _VERIFIED_SENDER_MARKER[marker_state] != " "
+        )
+        if not skip_marker_gap:
+            while marker_state and (
+                marker_state == marker_length
+                or folded_char != _VERIFIED_SENDER_MARKER[marker_state]
+            ):
+                marker_state = _VERIFIED_SENDER_MARKER_FAILURES[marker_state - 1]
+                if not marker_state:
+                    marker_start = None
+            if folded_char == _VERIFIED_SENDER_MARKER[marker_state]:
+                if marker_state == 0:
+                    marker_start = len(output)
+                marker_state += 1
 
         output.append(original_char)
         marker_states.append(marker_state)
+        marker_starts.append(marker_start)
 
         if envelope_start is None and marker_state == marker_length:
-            envelope_start = len(output) - marker_length
+            envelope_start = marker_start
 
         if original_char == "\n":
             envelope_start = None
@@ -1703,6 +1745,7 @@ def _strip_verified_sender_envelopes(text: str) -> str:
                 cut_start -= 1
             del output[cut_start:]
             del marker_states[cut_start:]
+            del marker_starts[cut_start:]
             envelope_start = None
             drop_trailing_space = True
 
@@ -1710,18 +1753,14 @@ def _strip_verified_sender_envelopes(text: str) -> str:
 
     # A complete deletion can expose a bare opener split around it. The caller's
     # own punctuation could close that fragment, so defang every surviving
-    # opener in one bounded post-pass. Matching uses the fold, while mutation is
-    # applied at the same offset in the original reduced text.
-    folded = reduced.translate(_ENVELOPE_LOOKALIKE_FOLD)
-    opener_start = folded.find(_VERIFIED_SENDER_MARKER)
-    if opener_start == -1:
+    # opener in one bounded post-pass. Marker offsets were collected against
+    # the original reduced text, including any ignored intrusions.
+    opener_starts = list(_iter_verified_sender_marker_starts(reduced))
+    if not opener_starts:
         return reduced
     defanged = list(reduced)
-    while opener_start != -1:
+    for opener_start in opener_starts:
         defanged[opener_start] = "("
-        opener_start = folded.find(
-            _VERIFIED_SENDER_MARKER, opener_start + marker_length
-        )
     return "".join(defanged)
 
 
@@ -2865,9 +2904,13 @@ from gateway.session import (
     build_session_context_prompt,
     build_channel_continuity_note,
     build_session_key,
+    is_default_ignorable_character,
+    is_pii_safe_platform,
     is_shared_multi_user_session,
+    is_unicode_space_separator,
     neutralize_untrusted_envelope_field,
     neutralize_untrusted_inline_text,
+    _hash_sender_id,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -18781,17 +18824,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if _has_trusted_sender_id:
                 _sender_parts = [_safe_user_name]
-                # Expose platform-authenticated IDs for every shared session so
-                # "mention me" / "who said this?" requests have a trusted current
-                # sender target. Keep Slack's native mention syntax from #17916.
+                # Platforms without an in-message mention system never need a
+                # raw sender ID in model-facing text. Hash those IDs even when
+                # privacy.redact_pii is off: this per-turn envelope is a new,
+                # repeated exposure surface, and the stable hash preserves
+                # cross-turn attribution without leaking phone-derived IDs.
+                # Slack/Discord retain raw authenticated IDs because their real
+                # mention syntax requires them. Apply the same policy to the
+                # stable alternate namespace below.
+                _hash_envelope_ids = is_pii_safe_platform(source.platform)
+
+                def _envelope_sender_id(value: str) -> str:
+                    return _hash_sender_id(value) if _hash_envelope_ids else value
+
                 if source.platform == Platform.SLACK and source.user_id:
                     _sender_parts.append(f"Slack user <@{source.user_id}>")
                 elif source.user_id:
                     _sender_parts.append(
-                        f"{source.platform.value.title()} user_id {source.user_id}"
+                        f"{source.platform.value.title()} user_id "
+                        f"{_envelope_sender_id(source.user_id)}"
                     )
                 if source.user_id_alt and source.user_id_alt != source.user_id:
-                    _sender_parts.append(f"user_id_alt {source.user_id_alt}")
+                    _sender_parts.append(
+                        f"user_id_alt {_envelope_sender_id(source.user_id_alt)}"
+                    )
                 message_text = (
                     f"[Verified sender: {' | '.join(_sender_parts)}] {message_text}"
                 )
