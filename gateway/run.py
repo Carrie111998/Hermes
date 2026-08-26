@@ -65,7 +65,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
-from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+from hermes_cli.config import TURN_LIMIT_UNLIMITED, _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -2166,6 +2166,21 @@ def _current_max_iterations() -> int:
     _reload_runtime_env_preserving_config_authority()
     from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
     return _resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
+
+
+def _format_agent_budget(max_iterations: int) -> str:
+    """Format the resolved turn-limit sentinel for operator diagnostics."""
+    if max_iterations == TURN_LIMIT_UNLIMITED:
+        return "unlimited"
+    return str(max_iterations)
+
+
+def _log_agent_budget() -> None:
+    """Log the runtime-resolved agent budget for startup diagnostics."""
+    logger.info(
+        "Agent budget: max_iterations=%s (resolved through runtime turn-limit chain)",
+        _format_agent_budget(_current_max_iterations()),
+    )
 
 
 from contextlib import contextmanager as _contextmanager
@@ -12573,12 +12588,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # config.yaml → env bridge did the right thing at a glance (instead
         # of silently running at a stale .env value for weeks).
         try:
-            _effective_max_iter = int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
-            logger.info(
-                "Agent budget: max_iterations=%d (agent.max_turns from config.yaml, "
-                "or HERMES_MAX_ITERATIONS from .env, or default 500)",
-                _effective_max_iter,
-            )
+            _log_agent_budget()
         except Exception:
             pass
         # Redaction status: ON by default (#17691). Surface a prominent
