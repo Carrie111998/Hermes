@@ -196,6 +196,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="TOKENHUB_BASE_URL",
     ),
+    "tencent-tokenplan": HermesOverlay(
+        transport="anthropic_messages",
+        base_url_override="https://api.lkeap.cloud.tencent.com/plan/anthropic",
+        base_url_env_var="TOKENPLAN_BASE_URL",
+    ),
     "arcee": HermesOverlay(
         transport="openai_chat",
         base_url_override="https://api.arcee.ai/api/v1",
@@ -378,6 +383,8 @@ ALIASES: Dict[str, str] = {
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
     "tencentmaas": "tencent-tokenhub",
+    "tokenplan": "tencent-tokenplan",
+    "tencent-lkeap": "tencent-tokenplan",
 
     # bedrock
     "aws": "bedrock",
@@ -432,6 +439,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "upstage": "Upstage Solar",
     "actual": "Actual Computer",
     "tencent-tokenhub": "Tencent TokenHub",
+    "tencent-tokenplan": "Tencent TokenPlan",
     "lmstudio": "LM Studio",
     "local": "Local endpoint",
     "bedrock": "AWS Bedrock",

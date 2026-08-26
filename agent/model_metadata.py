@@ -564,12 +564,16 @@ DEFAULT_CONTEXT_LENGTHS = {
     "solar-pro3": 131072,
     "solar-pro2": 65536,
     "solar-mini": 32768,
-    # Tencent — Hy3 Preview (Hunyuan) with 256K context window.
+    # Tencent — Hy3 preview (Hunyuan) with 256K context window.
     # OpenRouter live metadata reports 262144 (256 × 1024); align the
     # static fallback so cache and offline both agree (issue #22268).
+    
+    # Tencent — Hy3 Preview (Hunyuan), same 256K window.
     "hy3-preview": 262144,
     # Tencent — Hy3 (GA successor to Hy3 Preview), same 256K window.
     "hy3": 262144,
+    # Tencent — Hy4 preview (Hunyuan) with 1M context window.
+    "hy4-preview": 1024000,
     # OpenCode Zen — "Ox Alpha" stealth model (x-preview-f-free). 1M context
     # per OpenCode's launch announcement (2026-08-20); free, ZDR.
     "x-preview-f": 1_048_576,
@@ -752,6 +756,7 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.gmi-serving.com": "gmi",
     "api.novita.ai": "novita",
     "tokenhub.tencentmaas.com": "tencent-tokenhub",
+    "api.lkeap.cloud.tencent.com": "tencent-tokenplan",
     "ollama.com": "ollama-cloud",
 }
 
