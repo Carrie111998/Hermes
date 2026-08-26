@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import ntpath
 import os
@@ -543,6 +544,51 @@ def _profile_subdirs(src: str) -> list[str]:
     return out or ["Default"]
 
 
+def active_profile_dir(src: str) -> str:
+    """Return the profile directory the user actually browses in.
+
+    Chromium records it as ``profile.last_used`` in ``Local State``. Falls
+    back to ``Default`` when the file is missing/unparsable or names a
+    directory that isn't there.
+    """
+    try:
+        with open(os.path.join(src, "Local State"), encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as e:
+        logger.debug("real-profile: could not read Local State in %s: %s", src, e)
+        return "Default"
+    profile = state.get("profile") if isinstance(state, dict) else None
+    last_used = profile.get("last_used") if isinstance(profile, dict) else None
+    if isinstance(last_used, str) and last_used:
+        if os.path.isdir(os.path.join(src, last_used)):
+            return last_used
+        logger.debug("real-profile: Local State names missing profile %r", last_used)
+    return "Default"
+
+
+def _mirror_active_profile_as_default(src: str, dst: str, active: str) -> None:
+    """Copy ``active``'s auth files into the snapshot's ``Default`` slot.
+
+    Chrome opens ``Default`` inside a user-data-dir unless
+    ``--profile-directory`` says otherwise, and agent-browser only emits that
+    flag when ``--profile`` is a profile NAME — the real-profile path hands it
+    a PATH. So the copy's ``Default`` has to BE the profile the user browses
+    in, or the agent gets a signed-out profile that merely sorts first.
+    """
+    for rel in _AUTH_REFRESH_FILES:
+        if "<profile>" not in rel:
+            continue
+        s = os.path.join(src, rel.replace("<profile>", active))
+        if not os.path.isfile(s):
+            continue
+        d = os.path.join(dst, rel.replace("<profile>", "Default"))
+        try:
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copy2(s, d)
+        except OSError as e:
+            logger.debug("real-profile: could not mirror %s as Default: %s", rel, e)
+
+
 def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
     """Snapshot ``browser``'s real profile into the hermes copy dir.
 
@@ -598,6 +644,15 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                         shutil.copy2(s, d)
                     except OSError as e:
                         logger.debug("real-profile refresh: skipped %s: %s", r, e)
+        # Point the copy's Default slot at the profile the user browses in.
+        # Runs on both paths: the full copy reproduces the source layout (so
+        # "Profile 6" stays "Profile 6"), and the refresh re-syncs each profile
+        # in place — neither makes Default the ACTIVE one, which is what Chrome
+        # will open here.
+        active = active_profile_dir(src)
+        if active != "Default":
+            logger.info("real-profile: mirroring %r into the snapshot's Default", active)
+            _mirror_active_profile_as_default(src, dst, active)
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
             try:

@@ -117,6 +117,85 @@ class TestSnapshotRealProfile:
         assert err and "was not found" in err
 
 
+class TestActiveProfileLandsInDefault:
+    """Chrome opens Default in a user-data-dir; that has to be the live one."""
+
+    def _make_multi_profile(self, root, last_used):
+        """A user-data-dir whose signed-in session is NOT in Default."""
+        for name in ("Default", "Profile 6"):
+            (root / name / "Network").mkdir(parents=True)
+            (root / name / "Preferences").write_text("{}", encoding="utf-8")
+        (root / "Local State").write_text(
+            json.dumps({"profile": {"last_used": last_used}}), encoding="utf-8"
+        )
+        # Default is a stale, signed-out profile; Profile 6 carries the session.
+        (root / "Default" / "Cookies").write_text("signed-out", encoding="utf-8")
+        (root / "Default" / "Network" / "Cookies").write_text("signed-out-net", encoding="utf-8")
+        (root / "Profile 6" / "Cookies").write_text("li_at-session", encoding="utf-8")
+        (root / "Profile 6" / "Network" / "Cookies").write_text("li_at-net", encoding="utf-8")
+        (root / "Profile 6" / "Login Data").write_text("real-logins", encoding="utf-8")
+        return root
+
+    def test_active_profile_is_read_from_local_state(self, tmp_path):
+        import hermes_cli.browser_connect as bc
+        src = self._make_multi_profile(tmp_path / "real", "Profile 6")
+        assert bc.active_profile_dir(str(src)) == "Profile 6"
+
+    def test_active_profile_falls_back_when_local_state_is_unusable(self, tmp_path):
+        import hermes_cli.browser_connect as bc
+        src = tmp_path / "real"
+        (src / "Default").mkdir(parents=True)
+        assert bc.active_profile_dir(str(src)) == "Default"
+        (src / "Local State").write_text("not json", encoding="utf-8")
+        assert bc.active_profile_dir(str(src)) == "Default"
+        (src / "Local State").write_text(
+            json.dumps({"profile": {"last_used": "Profile 9"}}), encoding="utf-8"
+        )
+        # Names a directory that does not exist -> do not point Chrome at it.
+        assert bc.active_profile_dir(str(src)) == "Default"
+
+    def test_snapshot_puts_the_active_profile_in_default(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        src = self._make_multi_profile(tmp_path / "real", "Profile 6")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None
+        copy = home / "browser-profile" / "chrome"
+        # Chrome will open Default here, so Default must hold the live session.
+        assert (copy / "Default" / "Cookies").read_text(encoding="utf-8") == "li_at-session"
+        assert (copy / "Default" / "Network" / "Cookies").read_text(encoding="utf-8") == "li_at-net"
+        assert (copy / "Default" / "Login Data").read_text(encoding="utf-8") == "real-logins"
+        # The original layout is still there for anything that addresses it.
+        assert (copy / "Profile 6" / "Cookies").read_text(encoding="utf-8") == "li_at-session"
+
+    def test_refresh_keeps_default_pointed_at_the_active_profile(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        src = self._make_multi_profile(tmp_path / "real", "Profile 6")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+
+        bc.snapshot_real_profile("chrome", src=str(src))
+        (src / "Profile 6" / "Cookies").write_text("li_at-session-v2", encoding="utf-8")
+        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
+
+        assert err2 is None
+        copy = home / "browser-profile" / "chrome"
+        assert (copy / "Default" / "Cookies").read_text(encoding="utf-8") == "li_at-session-v2"
+
+    def test_default_is_left_alone_when_it_is_the_active_profile(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        src = self._make_multi_profile(tmp_path / "real", "Default")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None
+        copy = home / "browser-profile" / "chrome"
+        assert (copy / "Default" / "Cookies").read_text(encoding="utf-8") == "signed-out"
+
+
 class TestRealProfileCdpLaunch:
     """The agent-browser-based launcher in browser_tool._real_profile_cdp."""
 
