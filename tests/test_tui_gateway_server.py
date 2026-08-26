@@ -10750,6 +10750,71 @@ def test_commands_catalog_project_override_has_independent_metadata(
     }
 
 
+def test_slash_cache_follows_same_profile_project_cwd_transition(tmp_path, monkeypatch):
+    """Cached slash discovery must follow supported in-process cwd changes."""
+    import agent.skill_commands as sc_mod
+    from agent import skill_utils
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    profile_skill = home / "skills" / "cwd-shadow"
+    profile_skill.mkdir(parents=True)
+    profile_skill.joinpath("SKILL.md").write_text(
+        "---\nname: cwd-shadow\ndescription: Profile command.\n---\n\nProfile body.\n",
+        encoding="utf-8",
+    )
+
+    project_a = tmp_path / "project-a"
+    project_a.joinpath(".git").mkdir(parents=True)
+    project_b = tmp_path / "project-b"
+    project_b.joinpath(".git").mkdir(parents=True)
+    project_skill = project_b / ".hermes" / "skills" / "cwd-shadow"
+    project_skill.mkdir(parents=True)
+    project_skill.joinpath("SKILL.md").write_text(
+        "---\nname: cwd-shadow\ndescription: Project command.\n---\n\nProject body.\n",
+        encoding="utf-8",
+    )
+    home.joinpath("config.yaml").write_text(
+        "skills:\n"
+        "  external_dirs: []\n"
+        f"  trusted_project_dirs: ['{project_b.as_posix()}']\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.chdir(project_a)
+        monkeypatch.setenv("TERMINAL_CWD", str(project_a))
+        skill_utils._external_dirs_cache_clear()
+        with patch.object(sc_mod, "_skill_commands", {}):
+            primed = sc_mod.get_skill_commands()
+            assert primed["/cwd-shadow"]["skill_dir"] == str(profile_skill)
+
+            monkeypatch.chdir(project_b)
+            monkeypatch.setenv("TERMINAL_CWD", str(project_b))
+            selected = sc_mod.get_skill_commands()
+            invocation = sc_mod.build_skill_invocation_message("/cwd-shadow")
+            completion = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "complete.slash",
+                    "params": {"text": "/cwd-shadow"},
+                }
+            )
+    finally:
+        reset_hermes_home_override(token)
+        skill_utils._external_dirs_cache_clear()
+
+    assert selected["/cwd-shadow"]["skill_dir"] == str(project_skill)
+    assert selected["/cwd-shadow"]["source_tier"] == "project"
+    assert invocation is not None and "Project body." in invocation
+    skill_items = [
+        item for item in completion["result"]["items"] if item["kind"] == "skill"
+    ]
+    assert any(item["text"].strip().lstrip("/") == "cwd-shadow" for item in skill_items)
+    assert any("Project command." in item["meta"] for item in skill_items)
+
+
 def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     """Skill entries carry the usage + origin the `/` menu ranks on.
 

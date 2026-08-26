@@ -26,7 +26,9 @@ _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
 _skill_commands_archived: frozenset[str] = frozenset()
-# Guards the (map, platform-tag, home-tag, archive-state) snapshot so
+_skill_commands_project: tuple[Optional[str], tuple[str, ...]] | None = None
+# Guards the (map, platform-tag, home-tag, archive-state, project-context)
+# snapshot so
 # publication and the freshness lookup always see a consistent view. Scanning
 # itself stays outside this lock.
 _publish_lock = threading.Lock()
@@ -244,6 +246,24 @@ def _archived_skill_names() -> frozenset[str]:
         return frozenset()
 
 
+def _resolve_skill_commands_project_context() -> tuple[
+    tuple[Optional[str], tuple[str, ...]], list[Path]
+]:
+    """Return the current project identity and its effective skill dirs."""
+    try:
+        from agent.skill_utils import find_project_root, get_project_skills_dirs
+
+        root = find_project_root()
+        project_dirs = list(get_project_skills_dirs())
+        identity = (
+            str(root.resolve()) if root is not None else None,
+            tuple(str(path.resolve()) for path in project_dirs),
+        )
+        return identity, project_dirs
+    except Exception:
+        return (None, ()), []
+
+
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -443,10 +463,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
-    global _skill_commands_archived
+    global _skill_commands_archived, _skill_commands_project
     platform = _resolve_skill_commands_platform()
     home = _resolve_skill_commands_home()
     archived = _archived_skill_names()
+    project_context, project_dirs = _resolve_skill_commands_project_context()
     # Build into a local map and publish once, at the end. Writing straight
     # into the global made a scan's partial results visible to everything
     # else in the process: a second, overlapping scan deduped against its own
@@ -458,7 +479,6 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
             get_external_skills_dirs,
-            get_project_skills_dirs,
             iter_project_skill_files,
             iter_skill_index_files,
         )
@@ -469,7 +489,6 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         # Scan project dirs first (highest precedence), then local, then external.
         # Project dirs iterate through the quarantine chokepoint.
-        project_dirs = list(get_project_skills_dirs())
         dirs_to_scan = list(project_dirs)
         if active_skills_dir.exists():
             dirs_to_scan.append(active_skills_dir)
@@ -573,6 +592,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         _skill_commands_platform = platform
         _skill_commands_home = home
         _skill_commands_archived = archived
+        _skill_commands_project = project_context
     return commands
 
 
@@ -583,11 +603,14 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536), and when the
     active profile's Hermes home changes (e.g. Desktop switching profiles
-    mid-session) so each profile sees its own ``skills.external_dirs`` (#88023).
+    mid-session) so each profile sees its own ``skills.external_dirs`` (#88023),
+    and when cwd/project discovery changes so a long-lived CLI selects the
+    current project's highest-precedence skill copy.
     """
     current_platform = _resolve_skill_commands_platform()
     current_home = _resolve_skill_commands_home()
     current_archived = _archived_skill_names()
+    current_project, _ = _resolve_skill_commands_project_context()
     # Read the map and its tags under the same lock that publishes them, so
     # the freshness decision is made against a consistent snapshot.
     with _publish_lock:
@@ -597,6 +620,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
             and _skill_commands_platform == current_platform
             and _skill_commands_home == current_home
             and _skill_commands_archived == current_archived
+            and _skill_commands_project == current_project
         )
     if is_fresh:
         return commands
