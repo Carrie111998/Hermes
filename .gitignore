@@ -40,7 +40,6 @@ run_datagen_kimik2-thinking.sh
 run_datagen_megascience_glm4-6.sh
 run_datagen_sonnet.sh
 source-data/*
-run_datagen_megascience_glm4-6.sh
 data/*
 node_modules/
 browser-use/
@@ -50,7 +49,6 @@ agent-browser/
 *.pem
 privvy*
 images/
-__pycache__/
 hermes_agent.egg-info/
 wandb/
 testlogs
@@ -111,7 +109,6 @@ docs/superpowers/*
 # Superpowers plugin scratch (brainstorm servers, ports, session state) written
 # into the checkout root during agent sessions — never a codebase artifact.
 .superpowers/
-.worktrees/
 # Working directory for the Hermes Agent's session state (~/.hermes/ at runtime;
 # also created in-repo when an agent operates in this checkout). Plans, audit
 # logs, and per-session caches are never artifacts of the codebase.
@@ -182,7 +179,6 @@ test-results/
 *.interfaze-password
 
 # Isolated feature worktrees created by the agent workflow.
-.worktrees/
 
 # Customer and candidate corpus data. Contact lists and company corpora are
 # private commercial input, never repo content — see server/README.md.
@@ -192,3 +188,13 @@ customer list*.csv
 
 # Agent worktrees created under .claude/
 .claude/worktrees/
+
+# --- repo hygiene (chore/tidy-repo-structure) ---
+# setuptools output; 867 copies of every module were committed here and every
+# repo-wide grep matched them twice.
+/build/
+# git worktrees: full repo copies that make non-git greps hit each file 3x.
+/.worktrees/
+/.claude/worktrees/
+# Local lead corpora / customer exports. Contains contact PII; never commit.
+/data/
