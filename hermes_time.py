@@ -77,7 +77,12 @@ def _resolve_timezone_name() -> str:
             if isinstance(tz_cfg, str) and tz_cfg.strip():
                 return tz_cfg.strip()
     except Exception as exc:
-        logger.debug(
+        # A user-configured timezone that silently fails to load can be
+        # confusing (wrong cron schedules, log timestamps, session display),
+        # so this failure path is logged at warning level — unlike the
+        # managed-overlay failure above, there is no config value left to
+        # fall back to here, only the server-local default.
+        logger.warning(
             "Failed to read timezone from config.yaml, falling back to "
             "server local time: %s", exc,
         )
