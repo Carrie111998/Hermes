@@ -8,11 +8,11 @@ from the same session and aggregate them before dispatching.
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 from gateway.session import build_session_key
 
@@ -130,6 +130,70 @@ class TestTextBatching:
         dispatched = adapter.handle_message.call_args[0][0]
         assert "part one" in dispatched.text
         assert "split by Telegram" in dispatched.text
+
+    @pytest.mark.asyncio
+    async def test_split_messages_reach_pre_gateway_dispatch_with_distinct_sources(
+        self, monkeypatch
+    ):
+        """A plugin sees each Telegram update boundary before agent dispatch."""
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="test-token")}
+        )
+        setattr(runner, "adapters", {Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())})
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_store._is_rate_limited.return_value = False
+        runner.session_store = MagicMock()
+        runner._running_agents = {}
+        runner._update_prompt_pending = {}
+
+        observed = []
+
+        def _capture_hook(name, **kwargs):
+            if name == "pre_gateway_dispatch":
+                event = kwargs["event"]
+                observed.append(
+                    (event.text, list(event.metadata["telegram_source_messages"]))
+                )
+                return [{"action": "skip", "reason": "observed"}]
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _capture_hook)
+        setattr(adapter, "handle_message", runner._handle_message)
+        adapter._enqueue_text_event(_make_event("first", message_id="41", update_id=101))
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(_make_event("second", message_id="42", update_id=102))
+        await asyncio.sleep(0.2)
+
+        assert observed == [
+            (
+                "first\nsecond",
+                [
+                    {
+                        "message_id": "41",
+                        "platform_update_id": "101",
+                        "thread_id": "",
+                        "source_timestamp": "2026-08-07T12:00:00+00:00",
+                        "source_text": "first",
+                        "reply_to_message_id": "",
+                        "message_type": "text",
+                    },
+                    {
+                        "message_id": "42",
+                        "platform_update_id": "102",
+                        "thread_id": "",
+                        "source_timestamp": "2026-08-07T12:00:00+00:00",
+                        "source_text": "second",
+                        "reply_to_message_id": "",
+                        "message_type": "text",
+                    },
+                ],
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_split_messages_preserve_each_source_update_for_observers(self):
