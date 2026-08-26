@@ -1,29 +1,11 @@
-"""Email channel for the Twilio plugin.
+"""Email channel: Twilio Email (SendGrid Mail Send API). Separate
+credential surface (``SENDGRID_API_KEY``) from core Twilio, so this
+implements ``Channel`` directly, not ``MessagingChannel``.
 
-Sends through Twilio's Email API — SendGrid's Mail Send API under the
-hood. Twilio's Email product uses a completely separate credential
-surface from core Twilio (SMS/RCS/Voice): a bearer ``SG.``-prefixed
-SendGrid API key, not the ``TWILIO_ACCOUNT_SID``/``TWILIO_AUTH_TOKEN``
-pair every Messages-API channel uses. That's why this channel implements
-``Channel`` directly rather than ``MessagingChannel`` — it doesn't use
-``MessagingServiceSid`` or the Messages.json resource at all, and its
-transport lives entirely in this file rather than in
-``core/messages_api.py``.
-
-Every other channel in this plugin passes a single `content` string with
-no subject concept. By convention here: the first line of `content` is
-the subject and the remainder (after the first newline) is the body;
-single-line content gets a generic default subject rather than guessing
-one. Callers with more control (e.g. our own standalone CLI use) can
-override via `metadata={"subject": ..., "html": True}`.
-
-Unlike the RCS channel, this one never splits a message into multiple
-chunks/sends: an email is one document, not a multi-part SMS train.
-
-Self-contained: nothing outside this file needs to change to modify Email
-behavior, and this file never reaches into another channel's module. If a
-future channel also needs SendGrid, extract the shared bits into
-``core/sendgrid_api.py`` then — not preemptively, for one consumer.
+Convention: first line of `content` is the subject, rest is the body;
+single-line content gets ``DEFAULT_SUBJECT``. Override via
+``metadata={"subject": ..., "html": True}``. Never chunked — one email,
+one document.
 """
 
 import logging
@@ -36,15 +18,12 @@ from .base import Channel
 logger = logging.getLogger(__name__)
 
 SENDGRID_API_BASE_DEFAULT = "https://api.sendgrid.com/v3"
-# Generous — SendGrid's real cap is far larger than any agent-generated
-# message; this just guards against something pathological.
+# Generous ceiling, not SendGrid's real (much larger) cap.
 MAX_EMAIL_LENGTH = 200_000
 DEFAULT_SUBJECT = "Message from Hermes Agent"
 
-# Mirrors the RCS channel's _E164_TARGET_RE role — this isn't a phone
-# number at all, so it declares its own parser to accept bare email
-# addresses as targets. Phone vs email formats are mutually exclusive by
-# construction, so adapter.py can safely try each channel in turn.
+# Own target parser (not a phone number) — mutually exclusive with RCS's
+# E.164 format, so adapter.py's per-channel dispatch is unambiguous.
 _EMAIL_TARGET_RE = re.compile(r"^\s*[^@\s]+@[^@\s]+\.[^@\s]+\s*$")
 _EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
@@ -62,24 +41,13 @@ def _mask_email(address: str) -> str:
 
 
 def _redact_emails_in_text(text: str) -> str:
-    """Mask any email addresses inside arbitrary text before it is logged or
-    handed back to a caller. SendGrid's own validation errors commonly echo
-    the offending to/from address back in ``errors[].message`` -- unlike
-    ``chat_id``, that text was never run through ``_mask_email`` before, so
-    a bad address could reach application logs, and from there
-    ``tools/send_message_tool.py``'s ``{"error": f"Adapter send failed:
-    {result.error}"}`` puts it straight into the agent's own context too.
-    """
+    """Mask emails in arbitrary text before logging/returning — SendGrid
+    error bodies often echo the offending address back."""
     return _EMAIL_IN_TEXT_RE.sub(lambda m: _mask_email(m.group(0)), text)
 
 
 def _sanitize_subject(subject: str) -> str:
-    """Strip CR/LF/tab so a subject can never inject extra headers into the
-    outbound email (CWE-93), regardless of whether it came from the
-    first-line convention (which can still carry a bare ``\\r`` even though
-    ``partition("\\n")`` rules out ``\\n``) or an explicit metadata override
-    (which has no structural protection at all).
-    """
+    """Strip CR/LF/tab so a subject can't inject extra headers (CWE-93)."""
     cleaned = re.sub(r"[\r\n\t]+", " ", subject).strip()
     return cleaned or DEFAULT_SUBJECT
 
@@ -143,7 +111,7 @@ class EmailChannel(Channel):
         return True if _EMAIL_TARGET_RE.fullmatch(chat_id) else "not a valid email address"
 
     def format_message(self, content: str) -> str:
-        # Email renders rich content properly, unlike SMS/RCS -- no markdown stripping.
+        # No markdown stripping — email renders rich content natively.
         return content
 
     def _build_payload(

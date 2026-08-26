@@ -1,17 +1,7 @@
-"""Shared Twilio Messages API transport.
-
-Any channel that sends through the Messages resource
-(``https://api.twilio.com/.../Messages.json``) builds a list of form-field
-dicts — one per API call — and hands it to ``send_message_requests``. This
-is the ONLY place that owns the HTTP loop, the auth header, and the
-Twilio-error-to-result shape, so RCS, SMS, MMS, and WhatsApp channels can
-all reuse it without duplicating (or silently diverging on) that logic.
-
-Voice (the Calls.json resource) and Email (a different provider's API
-entirely) do NOT go through this resource and will need their own
-transport module when they're added — don't stretch this one to cover
-them.
-"""
+"""Shared transport for Twilio's Messages.json resource. Channels build a
+list of form-field dicts (one per API call) and pass them to
+send_message_requests. Not for Voice (Calls.json) or Email (SendGrid) —
+those need their own transport module."""
 
 import logging
 from typing import Any, Dict, List, Optional
@@ -43,15 +33,11 @@ async def send_message_requests(
     request_kwargs: Optional[dict] = None,
     log_prefix: str = "[twilio]",
 ) -> Dict[str, Any]:
-    """POST each form-field dict to Messages.json, in order.
+    """POST each form-field dict to Messages.json in order; stops on first
+    failure, else returns the last result. session_kwargs/request_kwargs
+    are for standalone callers passing proxy settings.
 
-    Stops and returns on the first failure; otherwise returns the last
-    successful result. ``session_kwargs``/``request_kwargs`` let a
-    standalone (out-of-process) caller pass proxy settings — the live
-    gateway path reuses the adapter's own session and doesn't need them.
-
-    Returns ``{"success": True, "message_id": sid}`` or
-    ``{"success": False, "error": "..."}``.
+    Returns {"success": True, "message_id": sid} or {"success": False, "error": ...}.
     """
     import aiohttp
 

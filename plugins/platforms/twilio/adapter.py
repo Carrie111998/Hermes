@@ -1,36 +1,20 @@
-"""Twilio platform adapter — outbound-only.
+"""Twilio platform adapter — outbound-only. Thin BasePlatformAdapter glue;
+dispatches to whichever channel matches the target format (see
+channels/base.py, README "Architecture notes").
 
-Umbrella Twilio plugin, hosting multiple channels under a single
-registered platform name (``"twilio"``). This module is intentionally
-thin — it only does ``BasePlatformAdapter`` plumbing (connect/disconnect
-lifecycle, ``SendResult`` shape) and dispatches every channel-specific
-decision to the right channel object. See ``channels/base.py`` for the
-interface a channel implements, and the README's "Architecture notes" for
-why/how channel selection works.
+Channels: RCS (phone number) and Email (email address) — formats are
+mutually exclusive, so dispatch is unambiguous. A channel whose target
+format collides with an existing one needs an explicit disambiguation
+scheme instead — see the README before adding one.
 
-Channels today: RCS (``channels/rcs.py``) and Email (``channels/email.py``).
-Selection is by target format — a phone number routes to RCS, an email
-address routes to Email — which works because the two formats are
-mutually exclusive by construction. A future channel whose target format
-collides with an existing one (unlikely for SMS/MMS/WhatsApp, which are
-also phone numbers) would need an explicit disambiguation scheme instead;
-see the "Architecture notes" section in the README before adding one.
+Env vars: TWILIO_ACCOUNT_SID/AUTH_TOKEN/MESSAGING_SERVICE_SID (RCS,
+shared with the built-in sms platform), TWILIO_RCS_HOME_CHANNEL
+(optional cron target); SENDGRID_API_KEY/FROM_EMAIL/FROM_NAME (Email,
+separate credential surface), SENDGRID_HOME_CHANNEL (optional, not wired
+to cron — see README).
 
-Env vars (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN shared with the built-in
-SMS platform and the optional telephony skill; SENDGRID_* is a completely
-separate credential surface used only by the Email channel):
-  - TWILIO_ACCOUNT_SID
-  - TWILIO_AUTH_TOKEN
-  - TWILIO_MESSAGING_SERVICE_SID   (MGxxxx... with an RCS Sender attached)
-  - TWILIO_RCS_HOME_CHANNEL        (optional — destination for cron delivery)
-  - SENDGRID_API_KEY
-  - SENDGRID_FROM_EMAIL
-  - SENDGRID_FROM_NAME             (optional)
-  - SENDGRID_HOME_CHANNEL          (optional — NOT wired to cron; see README)
-
-There is no inbound channel, so ``connect()``/``disconnect()`` are no-ops.
-Delivery always goes through ``send()`` (live gateway) or
-``_standalone_send()`` (out-of-process ``hermes send`` / cron delivery).
+No inbound channel — connect()/disconnect() are no-ops. Delivery is
+send() (live gateway) or _standalone_send() (hermes send / cron).
 """
 
 import logging
@@ -46,19 +30,13 @@ from .core.messages_api import aiohttp_available
 
 logger = logging.getLogger(__name__)
 
-# Every channel this platform hosts. Adding a new one means writing
-# channels/<name>.py against channels.base's Channel/MessagingChannel
-# interface and appending an instance here — see the README's "Adding a
-# new channel" section. Order only matters as a tie-breaker if two
-# channels' target formats ever overlapped (they don't today).
+# Channels this platform hosts — see README "Adding a new channel".
 _CHANNELS: List[Channel] = [RcsChannel(), EmailChannel()]
 
-# The largest max_message_length across channels. Registered once for the
-# whole platform because tools/send_message_tool.py pre-chunks by this
-# single value BEFORE dispatching to any channel — using the smallest
-# channel's limit here would silently split long emails into multiple
-# separate sends. Each channel still enforces its own (smaller) limit
-# internally where relevant (see RcsChannel.build_send_requests).
+# Largest max_message_length across channels: send_message_tool.py
+# pre-chunks by this single value before any channel sees the content, so
+# using RCS's smaller limit would silently split long emails into
+# multiple sends. RCS still enforces its own limit internally.
 _MAX_MESSAGE_LENGTH = max(c.max_message_length for c in _CHANNELS)
 
 
@@ -197,12 +175,9 @@ def _build_adapter(config):
 
 
 def register(ctx) -> None:
-    """Plugin entry point — called by the Hermes plugin system."""
-    # cron_deliver_env_var is a single static env var per platform in
-    # Hermes core (cron/scheduler.py._resolve_home_env_var) — it can't
-    # route to different channels' home-channel vars. RCS keeps the slot;
-    # SENDGRID_HOME_CHANNEL exists as a plugin.yaml-documented env var for
-    # future use but isn't wired to cron delivery yet. See README.
+    """Plugin entry point. cron_deliver_env_var is one static var per
+    platform in Hermes core — RCS keeps the slot; SENDGRID_HOME_CHANNEL
+    isn't wired to cron yet (see README)."""
     ctx.register_platform(
         name="twilio",
         label="Twilio",

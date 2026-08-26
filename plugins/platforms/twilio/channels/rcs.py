@@ -1,17 +1,10 @@
-"""RCS channel for the Twilio plugin.
+"""RCS channel: Twilio Messaging Service (``MessagingServiceSid``) with an
+RCS Sender, falling back to SMS/MMS automatically.
 
-Sends through a Twilio Messaging Service (``MessagingServiceSid``) that
-has an RCS Sender (approved by Google) attached — Twilio auto-selects RCS
-for capable recipients and falls back to SMS/MMS otherwise.
-
-Rich content (RCS cards, carousels) is sent by referencing a pre-created
-Content API template through a ``CONTENT:<ContentSid>[:<json vars>]``
-directive in the message text (mirrors the existing ``MEDIA:<path>``
-convention used elsewhere in Hermes cross-platform messaging). Create
-templates with ``scripts/manage_content.py``.
-
-Self-contained: nothing outside this file needs to change to modify RCS
-behavior, and this file never reaches into another channel's module.
+Rich content (cards, carousels) via a pre-created Content API template,
+referenced with a ``CONTENT:<ContentSid>[:<json vars>]`` directive (see
+``scripts/manage_content.py``) — mirrors the ``MEDIA:<path>`` convention
+used elsewhere in Hermes.
 """
 
 import json
@@ -25,26 +18,22 @@ from gateway.platforms.helpers import strip_markdown
 from ..core.credentials import get_scoped_secret
 from .base import MessagingChannel
 
-# Twilio's documented RCS text body limit — verify against current Twilio
-# docs if recipients start seeing truncated messages.
+# Twilio's documented RCS text limit — re-verify if messages get truncated.
 MAX_RCS_LENGTH = 3072
 
-# Mirrors tools/send_message_tool._E164_TARGET_RE — this platform isn't in
-# core's hardcoded _PHONE_PLATFORMS set, so it must declare its own parser
-# to accept bare E.164 numbers as targets.
+# Not in core's hardcoded _PHONE_PLATFORMS, so this channel parses its own
+# E.164 targets (mirrors tools/send_message_tool._E164_TARGET_RE).
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
 
-# 'CONTENT:<ContentSid>' or 'CONTENT:<ContentSid>:<json ContentVariables>' —
-# references a Content API template created via scripts/manage_content.py.
+# 'CONTENT:<ContentSid>' or 'CONTENT:<ContentSid>:<json ContentVariables>'.
 _CONTENT_DIRECTIVE_RE = re.compile(
     r"^CONTENT:(?P<sid>HX[0-9a-fA-F]{32})(?::(?P<vars>.+))?$", re.DOTALL
 )
 
 
 def _parse_content_directive(message: str) -> Optional[Tuple[str, Optional[str]]]:
-    """Return (content_sid, content_variables_json_or_None), or None if
-    `message` isn't a CONTENT: directive. Raises ValueError if the
-    variables aren't valid JSON."""
+    """(content_sid, variables_json_or_None), or None if not a CONTENT:
+    directive. Raises ValueError on invalid JSON."""
     match = _CONTENT_DIRECTIVE_RE.match(message.strip())
     if not match:
         return None

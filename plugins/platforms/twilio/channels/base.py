@@ -1,29 +1,12 @@
-"""Shared contracts for a Twilio channel.
+"""Channel contracts for the Twilio plugin.
 
-``Channel`` is the minimal contract every channel implements regardless of
-transport — it's what ``adapter.py`` uses to dispatch target parsing,
-readiness checks, and connection status without knowing which channel it's
-talking to.
+Channel: minimal shape every channel implements. MessagingChannel: for
+channels on Twilio's Messages API resource (RCS now; SMS/MMS/WhatsApp
+later) — implements send()/standalone_send() via core/messages_api.py,
+so subclasses only need format_message() + build_send_requests().
 
-``MessagingChannel`` extends it for channels transported over Twilio's
-Messages API resource (RCS today; SMS, MMS, WhatsApp are expected to fit
-this same shape later — they're all "send text-ish content to a chat_id
-via the Messages API"). It provides ``send()``/``standalone_send()`` for
-free via ``core/messages_api.py``, so a Messages-API channel only needs to
-implement ``format_message()`` + ``build_send_requests()``.
-
-Voice and Email do NOT extend ``MessagingChannel`` — a phone call isn't
-"sent text" and email needs a subject/from-address, not
-``MessagingServiceSid``. They implement ``Channel`` directly and own their
-own transport (see ``channels/email.py``, which talks to SendGrid's Mail
-Send API, not Twilio's Messages resource). When Voice is added, give it
-its own transport module in ``core/`` (Twilio's Calls.json resource)
-rather than stretching ``messages_api.py`` to cover it.
-
-``adapter.py`` only ever calls the methods declared here — it never
-reaches into a channel module's private helpers. That boundary is the
-whole point: a bug or change in one channel's module can't reach into
-another's.
+Voice/Email don't extend MessagingChannel (no MessagingServiceSid, own
+transport) — they implement Channel directly.
 """
 
 import os
@@ -31,9 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class Channel:
-    """Minimal contract every Twilio channel implements, regardless of
-    transport (Messages API, SendGrid, or something else entirely)."""
-
     name: str = ""
     max_message_length: int = 0
     platform_hint: str = ""
@@ -41,58 +21,43 @@ class Channel:
     cron_deliver_env_var: str = ""
 
     def check_requirements(self) -> bool:
-        """Passive probe: are this channel's env vars set right now?
-        Must be side-effect free — called from status displays."""
+        """Side-effect-free: are this channel's env vars set right now?"""
         raise NotImplementedError
 
     def connect_requirements_ok(self) -> Tuple[bool, Optional[str]]:
-        """Return (ready, error_message). error_message is set iff not ready."""
+        """(ready, error_message); error_message set if not ready."""
         raise NotImplementedError
 
     def is_connected(self) -> bool:
         raise NotImplementedError
 
     def parse_target_ref(self, target_ref: str) -> Optional[Tuple[str, Optional[str]]]:
-        """Return (chat_id, thread_id) if `target_ref` is valid native syntax
-        for this channel, else None. RCS and Email target formats (phone
-        number vs email address) are mutually exclusive by construction, so
-        adapter.py can safely try each channel in turn."""
+        """(chat_id, thread_id) if target_ref matches this channel's native
+        syntax, else None."""
         raise NotImplementedError
 
     def validate_target_ref(self, chat_id: str):
-        """Return True to accept, False to reject, or a string diagnostic."""
+        """True to accept, False to reject, or a string diagnostic."""
         raise NotImplementedError
 
     async def send(self, chat_id: str, content: str, *, metadata: Optional[dict] = None, session=None) -> Dict[str, Any]:
-        """Live-gateway send. Return {"success": True, "message_id": ...} or
-        {"success": False, "error": "..."}. `session` (when given) is an
-        already-open aiohttp session to reuse."""
+        """{"success": True, "message_id": ...} or {"success": False, "error": ...}."""
         raise NotImplementedError
 
     async def standalone_send(self, pconfig, chat_id: str, message: str, **kwargs) -> Dict[str, Any]:
-        """Out-of-process send (`hermes send` / cron), no live gateway
-        adapter present. Return {"success": True, "platform": ..., "chat_id":
-        ..., "message_id": ...} or {"error": "..."}."""
+        """{"success": True, "platform", "chat_id", "message_id"} or {"error": ...}."""
         raise NotImplementedError
 
 
 class MessagingChannel(Channel):
-    """Channels transported over Twilio's Messages API resource.
-
-    Implements send()/standalone_send() once, generically, via
-    core/messages_api.py — subclasses only need format_message() and
-    build_send_requests().
-    """
-
     def format_message(self, content: str) -> str:
         raise NotImplementedError
 
     def build_send_requests(
         self, chat_id: str, content: str, messaging_service_sid: str
     ) -> List[Dict[str, str]]:
-        """Return the Messages.json form-field dicts for this content — one
-        dict per API call. May raise ValueError for malformed content (e.g.
-        a bad rich-content directive)."""
+        """Messages.json form-field dicts, one per API call. May raise
+        ValueError for malformed content."""
         raise NotImplementedError
 
     async def send(self, chat_id: str, content: str, *, metadata: Optional[dict] = None, session=None) -> Dict[str, Any]:
