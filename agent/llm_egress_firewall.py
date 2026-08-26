@@ -69,6 +69,14 @@ class SanitizedSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidatedToolSyntaxSegment:
+    """Strictly parsed syntax emitted by a protected local tool result."""
+
+    text: str
+    syntax_kind: str
+
+
+@dataclass(frozen=True, slots=True)
 class SourceBoundSegment:
     """Opaque reference whose text is loaded only from a verified grant."""
 
@@ -79,7 +87,10 @@ class SourceBoundSegment:
 class OutboundText:
     """Ordered typed segments that construct one outbound JSON string."""
 
-    segments: tuple[LiteralSegment | SanitizedSegment | SourceBoundSegment, ...]
+    segments: tuple[
+        LiteralSegment | SanitizedSegment | ValidatedToolSyntaxSegment | SourceBoundSegment,
+        ...,
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +188,28 @@ _BASE64_CANDIDATE = re.compile(
 _HERMES_TASK_ID = re.compile(r"^t_[0-9a-f]{8}$")
 _PROMPT_CACHE_KEY = re.compile(r"^pck_[0-9a-f]{24}$")
 _MAX_BASE64_CANDIDATE_CHARS = 262_144
+_VALIDATED_TOOL_SYNTAX = {
+    "github_url": re.compile(
+        r"https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}"
+        r"(?:\.git|/(?:pull|issues)/[0-9]{1,10})?"
+    ),
+    "cli_option": re.compile(r"--[a-z0-9][a-z0-9-]{0,63}"),
+    "source_identifier": re.compile(
+        r"(?:[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#[0-9]{1,10}"
+        r"|[0-9a-f]{40}|[0-9a-f]{64})"
+    ),
+    "git_ref": re.compile(
+        r"(?:refs/(?:heads|tags)/)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+        r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){1,8}"
+    ),
+    "run_counter": re.compile(
+        r"(?:run|run_id|attempt|attempt_id)(?:\s+|=)[0-9]{1,10}"
+    ),
+    "safe_env_counter": re.compile(
+        r"HERMES_(?:KANBAN_RUN_ID|TURN_LEASE_TIMEOUT|STREAM_STALE_GIVEUP)="
+        r"[0-9]{1,10}"
+    ),
+}
 _PRIVATE_ABSOLUTE_PATH = re.compile(
     r"(?:^|[\s\"'`(])(?:"
     r"/(?:Users|home|private|var/folders|root|Volumes)/[^\s\"'`)]+"
@@ -191,6 +224,8 @@ _PRIVATE_ABSOLUTE_PATH = re.compile(
 # scan; this set only resolves the mathematical ambiguity in Base64 detection.
 _PROTOCOL_GRAMMAR_ATOMS = frozenset(
     {
+        "--noEmit",
+        "--repository",
         "--result",
         "-removed",
         "100K",
@@ -203,7 +238,15 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "EPUB",
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_RUN_ID",
         "HERMES_KANBAN_WORKSPACE",
+        "HERMES_CONTROL_HOME",
+        "HERMES_HOME=",
+        "HERMES_SESSION_ID",
+        "HERMES_STREAM_STALE_GIVEUP",
+        "HERMES_TURN_LEASE_TIMEOUT",
+        "HEAD",
         "LAST",
         "MIME",
         "MODE",
@@ -216,6 +259,7 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "REQUIRED",
         "SILENTLY",
         "assistant",
+        "already-resolved",
         "assignee/profile",
         "computer_call_output",
         "com/docs",
@@ -228,6 +272,7 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "find-and-replace",
         "function_call",
         "function_call_output",
+        "_force_close_actionable_pending_routes_for_cycle",
         "github-code-review",
         "grep/rg/find/ls",
         "include_archived",
@@ -238,8 +283,10 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "machine-readable",
         "max_runtime_seconds",
         "messages",
+        "n_error_",
         "notification/15s",
         "optional-profile",
+        "OPEN/MERGEABLE/CLEAN",
         "output_text",
         "parent/child",
         "parents=",
@@ -247,11 +294,14 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "path/to/file",
         "ppt/",
         "prompt_cache_key",
+        "protected-remote",
+        "repository-owned",
         "reasoning",
         "role",
         "sed/awk",
         "servers/daemons",
         "servers/watchers/daemons",
+        "session_resolver",
         "skills/plugins/cron/memories",
         "system",
         "tool",
@@ -360,6 +410,17 @@ def static_literal_sha256(text: str) -> str:
     return sha256(text.encode("utf-8")).hexdigest()
 
 
+def validate_tool_syntax(text: str, syntax_kind: str) -> str:
+    """Revalidate one complete protected tool-result syntax atom."""
+
+    grammar = _VALIDATED_TOOL_SYNTAX.get(syntax_kind)
+    if not isinstance(text, str) or grammar is None or grammar.fullmatch(text) is None:
+        raise ValueError("invalid_tool_syntax_segment")
+    if _contains_secret(text) or _contains_private_absolute_path(text):
+        raise ValueError("invalid_tool_syntax_segment")
+    return text
+
+
 def _canonical_base64_candidate(candidate: str) -> bool:
     """Recognize bounded canonical encodings without flagging ordinary IDs."""
 
@@ -415,12 +476,35 @@ def _contains_canonical_base64(value: Any, *, seen: set[int] | None = None) -> b
         for match in _BASE64_CANDIDATE.finditer(value):
             candidate = match.group(1)
             prefix = value[max(0, match.start() - 16) : match.start()].lower()
-            if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate.lower()):
+            if re.fullmatch(
+                r"[0-9a-f]{7,12}|[0-9a-f]{40}|[0-9a-f]{64}",
+                candidate.lower(),
+            ):
                 continue
+            if candidate.isdigit():
+                before = value[: match.start(1)].rstrip()[-1:]
+                after = value[match.end(1) :].lstrip()[:1]
+                if before in {":", ",", "["} and after in {",", "]", "}"}:
+                    # JSON numeric values in tool results are serialized
+                    # protocol fields, not encoded text. A quoted numeric
+                    # string remains eligible for Base64 detection.
+                    continue
             # The fixed Kanban task-id grammar carries only a 32-bit hex
             # database key. It is application protocol metadata, not an
             # encoded source payload.
             if _HERMES_TASK_ID.fullmatch(candidate):
+                continue
+            # Provider-generated tool-call and response-item identifiers are
+            # opaque protocol routing metadata, not caller-supplied encoded
+            # content.  Match their complete, fixed grammar only.
+            if re.fullmatch(r"(?:call|fc)_[A-Za-z0-9_-]{8,128}", candidate):
+                continue
+            if candidate in {
+                "HERMES_CONTROL_HOME",
+                "HERMES_KANBAN_DB",
+                "HERMES_KANBAN_WORKSPACES_ROOT",
+                "HERMES_PROFILE_HOME",
+            }:
                 continue
             # Content-addressed cache routing is a fixed application protocol
             # value: the literal ``pck_`` prefix plus exactly 96 bits of hex.
@@ -642,6 +726,12 @@ def _is_strict_sanitized_only_payload(
 
     if isinstance(value, SanitizedSegment):
         return isinstance(value.text, str), 1 if isinstance(value.text, str) else 0
+    if isinstance(value, ValidatedToolSyntaxSegment):
+        try:
+            validate_tool_syntax(value.text, value.syntax_kind)
+        except (TypeError, ValueError):
+            return False, 0
+        return True, 1
     if isinstance(value, LiteralSegment):
         return isinstance(value.text, str), 0
     if isinstance(value, SourceBoundSegment):
@@ -839,7 +929,13 @@ class LLMEgressFirewall:
                 reasons.extend(grant_reasons)
 
         if typed_request is not None:
-            logical_request, construction_reasons, source_segment_count, scan_values = (
+            (
+                logical_request,
+                construction_reasons,
+                source_segment_count,
+                scan_values,
+                base64_scan_values,
+            ) = (
                 self._construct_typed_request(
                     typed_request,
                     grant_contents,
@@ -850,6 +946,7 @@ class LLMEgressFirewall:
         else:
             logical_request = request
             scan_values = request
+            base64_scan_values = request
 
         try:
             serialized = json.dumps(
@@ -913,7 +1010,7 @@ class LLMEgressFirewall:
             except Exception:
                 reasons.append("redaction_failed")
             try:
-                if _contains_canonical_base64(scan_values):
+                if _contains_canonical_base64(base64_scan_values):
                     reasons.append("base64_payload")
             except Exception:
                 reasons.append("base64_scan_failed")
@@ -1035,7 +1132,7 @@ class LLMEgressFirewall:
         grant_contents: Mapping[str, tuple[SourceGrant, bytes]],
         *,
         allow_sanitized_segments: bool = False,
-    ) -> tuple[Mapping[str, Any], list[str], int, list[str]]:
+    ) -> tuple[Mapping[str, Any], list[str], int, list[str], list[str]]:
         """Build a plain JSON request exclusively from typed segment nodes."""
 
         reasons: list[str] = []
@@ -1043,6 +1140,7 @@ class LLMEgressFirewall:
         source_segment_count = 0
         sanitized_bytes = 0
         scan_values: list[str] = []
+        base64_scan_values: list[str] = []
         allowed_static_hashes = self._static_literal_hashes_by_policy.get(
             request.policy_digest,
             frozenset(),
@@ -1054,11 +1152,17 @@ class LLMEgressFirewall:
             # authorization, including exact policy-bound static literals and
             # structural keys/scalars.
             scan_values.append(text)
+            base64_scan_values.append(text)
             if static_literal_sha256(text) not in allowed_static_hashes:
                 reasons.append("static_literal_not_allowed")
 
         def render_text_segment(
-            segment: LiteralSegment | SanitizedSegment | SourceBoundSegment,
+            segment: (
+                LiteralSegment
+                | SanitizedSegment
+                | ValidatedToolSyntaxSegment
+                | SourceBoundSegment
+            ),
         ) -> str:
             nonlocal sanitized_bytes, source_segment_count
             if isinstance(segment, LiteralSegment):
@@ -1086,9 +1190,24 @@ class LLMEgressFirewall:
                     ):
                         reasons.append("source_bytes_in_sanitized_segment")
                     scan_values.append(segment.text)
+                    base64_scan_values.append(segment.text)
                     return segment.text
                 reasons.append("invalid_literal_segment")
                 return ""
+            if isinstance(segment, ValidatedToolSyntaxSegment):
+                try:
+                    text = validate_tool_syntax(segment.text, segment.syntax_kind)
+                except (TypeError, ValueError):
+                    reasons.append("invalid_tool_syntax_segment")
+                    return ""
+                encoded = text.encode("utf-8")
+                if len(encoded) > self._max_sanitized_segment_bytes:
+                    reasons.append("sanitized_segment_bytes_exceeded")
+                sanitized_bytes += len(encoded)
+                if sanitized_bytes > self._max_sanitized_bytes:
+                    reasons.append("sanitized_bytes_exceeded")
+                scan_values.append(text)
+                return text
             if isinstance(segment, SourceBoundSegment):
                 grant_and_content = grant_contents.get(segment.source_grant_digest)
                 if grant_and_content is None:
@@ -1102,12 +1221,21 @@ class LLMEgressFirewall:
                 referenced_grants.add(segment.source_grant_digest)
                 source_segment_count += 1
                 scan_values.append(text)
+                base64_scan_values.append(text)
                 return text
             reasons.append("invalid_source_segment")
             return ""
 
         def render(value: Any) -> Any:
-            if isinstance(value, (LiteralSegment, SanitizedSegment, SourceBoundSegment)):
+            if isinstance(
+                value,
+                (
+                    LiteralSegment,
+                    SanitizedSegment,
+                    ValidatedToolSyntaxSegment,
+                    SourceBoundSegment,
+                ),
+            ):
                 return render_text_segment(value)
             if isinstance(value, OutboundText):
                 return "".join(render_text_segment(segment) for segment in value.segments)
@@ -1153,7 +1281,13 @@ class LLMEgressFirewall:
                 reasons.append("request_identity_mismatch")
         if set(grant_contents) - referenced_grants:
             reasons.append("source_grant_unbound")
-        return rendered_payload, reasons, source_segment_count, scan_values
+        return (
+            rendered_payload,
+            reasons,
+            source_segment_count,
+            scan_values,
+            base64_scan_values,
+        )
 
     def _block(
         self,
@@ -1252,7 +1386,9 @@ __all__ = [
     "SourceBoundSegment",
     "SourceGrant",
     "TypedOutboundRequest",
+    "ValidatedToolSyntaxSegment",
     "classify_destination",
     "source_grant_digest",
     "static_literal_sha256",
+    "validate_tool_syntax",
 ]
