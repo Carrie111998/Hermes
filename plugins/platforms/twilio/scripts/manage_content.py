@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Twilio Content API helper for the twilio_rcs Hermes plugin.
+"""Twilio Content API helper for the twilio Hermes plugin.
 
 Creates and inspects Twilio Content API templates so their Content SID can
-be sent as rich RCS content through the twilio_rcs platform's send path:
+be sent as rich RCS content through the twilio platform's send path:
 
-    hermes send --to twilio_rcs:+15551234567 "CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    hermes send --to twilio_rcs:+15551234567 'CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:{"1":"Alice"}'
+    hermes send --to twilio:+15551234567 "CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    hermes send --to twilio:+15551234567 'CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:{"1":"Alice"}'
 
 RCS-supported Content API types (per Twilio docs): twilio/text, twilio/media,
-twilio/card, twilio/carousel. Only 'twilio/card' and 'twilio/quick-reply' are
-implemented here (schema verified against Twilio's docs) — carousel and a
-media/image field on cards are left out because their exact field names
-weren't verified; add them once confirmed against current Twilio docs
-rather than guessing.
+twilio/card, twilio/carousel. 'twilio/card' and 'twilio/carousel' are
+implemented here with a 'media' field on both (schema live-verified —
+note the field shape differs: an array on twilio/card, a plain string on
+twilio/carousel; see create_card/create_carousel docstrings).
+'twilio/quick-reply' is also implemented (schema verified) but is NOT in
+Twilio's RCS-supported type list — sends over RCS silently fall back to
+plain SMS/MMS rather than rendering reply chips; it's real and WhatsApp-
+supported, just not a true RCS rich-content type.
 
 This file intentionally uses Python stdlib HTTP clients only (no aiohttp
 dependency), mirroring
@@ -229,7 +232,7 @@ def _print_result(result: dict) -> None:
     if sid:
         print(f"\nContent SID: {sid}", file=sys.stderr)
         print(
-            f'Use it: hermes send --to twilio_rcs:+15551234567 "CONTENT:{sid}"',
+            f'Use it: hermes send --to twilio:+15551234567 "CONTENT:{sid}"',
             file=sys.stderr,
         )
 

@@ -1,6 +1,8 @@
-"""Twilio RCS platform adapter — outbound-only.
+"""Twilio platform adapter — outbound-only.
 
-Sends messages through a Twilio Messaging Service that has an RCS Sender
+Umbrella Twilio plugin, intended to grow into more channels over time
+(SMS, MMS, WhatsApp, Voice, Email). Currently implements only the **RCS**
+channel: sends through a Twilio Messaging Service that has an RCS Sender
 (approved by Google) attached. Twilio automatically selects RCS for
 capable recipients and falls back to SMS/MMS otherwise — the send call
 looks identical either way, just with ``MessagingServiceSid`` instead of
@@ -17,16 +19,17 @@ There is no inbound channel, so ``connect()``/``disconnect()`` are no-ops.
 Delivery always goes through ``send()`` (live gateway) or
 ``_standalone_send()`` (out-of-process ``hermes send`` / cron delivery).
 
-Rich content (RCS cards, quick-reply chips) is sent by referencing a
-pre-created Twilio Content API template through a ``CONTENT:`` directive
-in the message text, mirroring the existing ``MEDIA:<path>`` convention
-used elsewhere in Hermes cross-platform messaging:
+Rich content (RCS cards, carousels) is sent by referencing a pre-created
+Twilio Content API template through a ``CONTENT:`` directive in the
+message text, mirroring the existing ``MEDIA:<path>`` convention used
+elsewhere in Hermes cross-platform messaging:
 
-    hermes send --to twilio_rcs:+15551234567 "CONTENT:HXxxxxxxxxxxxx"
-    hermes send --to twilio_rcs:+15551234567 'CONTENT:HXxxxxxxxxxxxx:{"1":"Alice"}'
+    hermes send --to twilio:+15551234567 "CONTENT:HXxxxxxxxxxxxx"
+    hermes send --to twilio:+15551234567 'CONTENT:HXxxxxxxxxxxxx:{"1":"Alice"}'
 
 Create templates with ``scripts/manage_content.py`` (create-card /
-create-quick-reply), which prints the resulting Content SID.
+create-carousel / create-quick-reply), which prints the resulting
+Content SID.
 """
 
 import base64
@@ -116,7 +119,13 @@ def _basic_auth_header(account_sid: str, auth_token: str) -> str:
 
 
 def check_rcs_requirements() -> bool:
-    """Passive probe: dependencies + minimal config present right now."""
+    """Passive probe: dependencies + minimal config present right now.
+
+    Named for the RCS channel specifically — when a second channel (SMS,
+    WhatsApp, Voice, Email) is added to this plugin, each will likely need
+    its own check_fn/required_env, since they won't all share
+    TWILIO_MESSAGING_SERVICE_SID as a hard requirement.
+    """
     try:
         import aiohttp  # noqa: F401
     except ImportError:
@@ -128,13 +137,14 @@ def check_rcs_requirements() -> bool:
     )
 
 
-class TwilioRcsAdapter(BasePlatformAdapter):
-    """Outbound-only Twilio RCS adapter (with automatic SMS/MMS fallback)."""
+class TwilioAdapter(BasePlatformAdapter):
+    """Outbound-only Twilio adapter. RCS channel only for now (with
+    automatic SMS/MMS fallback) — more channels planned."""
 
     MAX_MESSAGE_LENGTH = MAX_RCS_LENGTH
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform("twilio_rcs"))
+        super().__init__(config, Platform("twilio"))
         self._account_sid: str = _get_scoped_secret("TWILIO_ACCOUNT_SID", "")
         self._auth_token: str = _get_scoped_secret("TWILIO_AUTH_TOKEN", "")
         self._messaging_service_sid: str = os.getenv(
@@ -145,17 +155,17 @@ class TwilioRcsAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._messaging_service_sid:
             msg = (
-                "[twilio_rcs] TWILIO_MESSAGING_SERVICE_SID not set — cannot send. "
+                "[twilio] TWILIO_MESSAGING_SERVICE_SID not set — cannot send. "
                 "Attach an RCS Sender to a Messaging Service in the Twilio "
                 "Console and set its SID here."
             )
             logger.error(msg)
             self._set_fatal_error(
-                "twilio_rcs_missing_messaging_service_sid", msg, retryable=False
+                "twilio_missing_messaging_service_sid", msg, retryable=False
             )
             return False
         self._mark_connected()
-        logger.info("[twilio_rcs] Ready (outbound-only, no inbound channel)")
+        logger.info("[twilio] Ready (outbound-only, no inbound channel)")
         return True
 
     async def disconnect(self) -> None:
@@ -163,7 +173,7 @@ class TwilioRcsAdapter(BasePlatformAdapter):
             await self._http_session.close()
             self._http_session = None
         self._mark_disconnected()
-        logger.info("[twilio_rcs] Disconnected")
+        logger.info("[twilio] Disconnected")
 
     async def send(
         self,
@@ -207,7 +217,7 @@ class TwilioRcsAdapter(BasePlatformAdapter):
                         if resp.status >= 400:
                             error_msg = body.get("message", str(body))
                             logger.error(
-                                "[twilio_rcs] send failed to %s: %s %s",
+                                "[twilio] send failed to %s: %s %s",
                                 redact_phone(chat_id), resp.status, error_msg,
                             )
                             return SendResult(
@@ -217,7 +227,7 @@ class TwilioRcsAdapter(BasePlatformAdapter):
                         msg_sid = body.get("sid", "")
                         last_result = SendResult(success=True, message_id=msg_sid)
                 except Exception as e:
-                    logger.error("[twilio_rcs] send error to %s: %s", redact_phone(chat_id), e)
+                    logger.error("[twilio] send error to %s: %s", redact_phone(chat_id), e)
                     return SendResult(success=False, error=str(e))
         finally:
             if not self._http_session and session:
@@ -242,7 +252,7 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
 ):
-    """Out-of-process RCS delivery for `hermes send` and cron `deliver=twilio_rcs`
+    """Out-of-process RCS delivery for `hermes send` and cron `deliver=twilio`
     when no live gateway adapter is present in this process."""
     import aiohttp
 
@@ -284,7 +294,7 @@ async def _standalone_send(
                     return {"error": f"Twilio API error ({resp.status}): {error_msg}"}
                 return {
                     "success": True,
-                    "platform": "twilio_rcs",
+                    "platform": "twilio",
                     "chat_id": chat_id,
                     "message_id": payload.get("sid", ""),
                 }
@@ -299,14 +309,14 @@ def _is_connected(config) -> bool:
 
 
 def _build_adapter(config):
-    return TwilioRcsAdapter(config)
+    return TwilioAdapter(config)
 
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
-        name="twilio_rcs",
-        label="Twilio RCS",
+        name="twilio",
+        label="Twilio",
         adapter_factory=_build_adapter,
         check_fn=check_rcs_requirements,
         is_connected=_is_connected,

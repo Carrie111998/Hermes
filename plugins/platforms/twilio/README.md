@@ -1,13 +1,20 @@
-# Twilio RCS platform plugin
+# Twilio platform plugin
 
-Outbound-only Hermes platform plugin that sends messages through a Twilio
-**Messaging Service** (`MessagingServiceSid`). Twilio automatically selects
-RCS for capable recipients and falls back to SMS/MMS otherwise — the send
-call looks identical either way.
+Outbound-only Hermes platform plugin for Twilio. Meant to grow into an
+umbrella for multiple Twilio channels over time (SMS, MMS, WhatsApp,
+Voice, Email) — **currently implements only RCS**, sent through a Twilio
+**Messaging Service** (`MessagingServiceSid`). Twilio automatically
+selects RCS for capable recipients and falls back to SMS/MMS otherwise —
+the send call looks identical either way.
+
+Note: Hermes already ships a separate built-in `sms` platform
+(`plugins/platforms/sms/`) that also talks to Twilio. This plugin doesn't
+replace it — they're independent, and currently overlap only in that both
+read `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`.
 
 There is **no inbound channel**: no webhook, no polling, no `hermes gateway`
 listener. This plugin only participates in *outbound* delivery — `hermes
-send`, cron `deliver=twilio_rcs`, and (if explicitly asked) an agent's own
+send`, cron `deliver=twilio`, and (if explicitly asked) an agent's own
 `terminal` tool shelling out to `hermes send`.
 
 ## For AI agents reading this file
@@ -22,7 +29,7 @@ chat session is to use your `terminal` tool to run the CLI command
 yourself:
 
 ```bash
-hermes send --to "twilio_rcs:+15551234567" "your message text"
+hermes send --to "twilio:+15551234567" "your message text"
 ```
 
 For rich content (a template created via `scripts/manage_content.py`),
@@ -43,7 +50,7 @@ by both):
 | `TWILIO_ACCOUNT_SID` | yes | Starts with `AC` |
 | `TWILIO_AUTH_TOKEN` | yes | |
 | `TWILIO_MESSAGING_SERVICE_SID` | yes | Starts with `MG` — must have an RCS Sender (approved by Google) attached in the Twilio Console |
-| `TWILIO_RCS_HOME_CHANNEL` | no | Destination E.164 number for cron `deliver=twilio_rcs` jobs |
+| `TWILIO_RCS_HOME_CHANNEL` | no | Destination E.164 number for cron `deliver=twilio` jobs |
 
 Add them to `~/.hermes/.env`, then verify with `hermes status` (shows
 `Twilio RCS  ✓ configured (plugin)`).
@@ -51,7 +58,7 @@ Add them to `~/.hermes/.env`, then verify with `hermes status` (shows
 ## Sending plain text
 
 ```bash
-hermes send --to "twilio_rcs:+15551234567" "hello from Hermes"
+hermes send --to "twilio:+15551234567" "hello from Hermes"
 ```
 
 Targets are bare E.164 numbers (`+` followed by 7–15 digits) — this
@@ -86,7 +93,7 @@ true RCS rich content.
 
 ```bash
 # Rich card (title/subtitle/media + buttons) — RCS-supported
-python plugins/platforms/twilio_rcs/scripts/manage_content.py create-card \
+python plugins/platforms/twilio/scripts/manage_content.py create-card \
   --friendly-name "elite_status" \
   --title "You've reached Elite status!" \
   --subtitle "Reply STOP to unsubscribe" \
@@ -95,7 +102,7 @@ python plugins/platforms/twilio_rcs/scripts/manage_content.py create-card \
   --action "phone:Call us:+15551234567"
 
 # Carousel (multiple swipeable cards) — RCS-supported
-python plugins/platforms/twilio_rcs/scripts/manage_content.py create-carousel \
+python plugins/platforms/twilio/scripts/manage_content.py create-carousel \
   --friendly-name "product_picks" \
   --body "Check out these options:" \
   --cards-json '[
@@ -106,7 +113,7 @@ python plugins/platforms/twilio_rcs/scripts/manage_content.py create-carousel \
   ]'
 
 # Quick-reply chips — WhatsApp-verified, NOT confirmed as true RCS rich content (see above)
-python plugins/platforms/twilio_rcs/scripts/manage_content.py create-quick-reply \
+python plugins/platforms/twilio/scripts/manage_content.py create-quick-reply \
   --friendly-name "order_confirm" \
   --body "Your order shipped! Track it?" \
   --action "Yes:track_yes" \
@@ -138,10 +145,10 @@ the Hermes venv.
 ### 2. Send it
 
 ```bash
-hermes send --to "twilio_rcs:+15551234567" "CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+hermes send --to "twilio:+15551234567" "CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # with template variables ({{1}}, {{2}}, ... in the template body)
-hermes send --to "twilio_rcs:+15551234567" 'CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:{"1":"Alice"}'
+hermes send --to "twilio:+15551234567" 'CONTENT:HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:{"1":"Alice"}'
 ```
 
 The `CONTENT:<sid>[:<json>]` directive is recognized in both `send()`
@@ -163,7 +170,7 @@ them on).
 
 ## Architecture notes
 
-- `TwilioRcsAdapter.connect()`/`disconnect()` are no-ops (`_mark_connected`/
+- `TwilioAdapter.connect()`/`disconnect()` are no-ops (`_mark_connected`/
   `_mark_disconnected` only) — there's nothing to actually connect to.
 - `_standalone_send()` is the primary delivery path in practice, since
   `hermes send` and cron jobs usually run in a separate process from any
@@ -171,14 +178,21 @@ them on).
 - `register(ctx)` in `adapter.py` wires everything into
   `gateway.platform_registry` — no core Hermes files were touched to add
   this plugin (see `website/docs/developer-guide/adding-platform-adapters.md`).
+- The platform is registered under the single name `"twilio"`. If/when a
+  second channel (SMS, WhatsApp, Voice, Email) is added, it'll need its
+  own way to pick a channel per send — nothing in `register_platform()`
+  currently distinguishes channels within one platform name. Worth
+  deciding deliberately (e.g. a channel prefix in the target ref, or
+  separate registered platform names per channel) before adding the next
+  one, rather than bolting it on ad hoc.
 
 ## Files
 
 ```
-twilio_rcs/
+twilio/
   __init__.py           # re-exports register() for plugin discovery
   plugin.yaml            # kind: platform, env var declarations
-  adapter.py             # TwilioRcsAdapter, _standalone_send, register(ctx)
+  adapter.py             # TwilioAdapter, _standalone_send, register(ctx)
   scripts/
     manage_content.py    # Content API template create/list/get helper
 ```
