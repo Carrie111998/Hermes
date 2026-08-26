@@ -1881,6 +1881,14 @@ def _seed_cron_thread_session(
         from gateway.session import SessionSource
 
         seeded_session_id: Optional[str] = None
+        # Discord thread destinations use the thread's own ID as chat_id for
+        # both session creation and origin lookup. Other platforms keep the
+        # parent channel as chat_id and distinguish the thread separately.
+        session_chat_id = (
+            str(thread_id)
+            if str(platform_name).lower() == Platform.DISCORD.value
+            else str(chat_id)
+        )
         session_store = getattr(adapter, "_session_store", None)
         if session_store is not None:
             try:
@@ -1888,19 +1896,9 @@ def _seed_cron_thread_session(
             except (ValueError, KeyError):
                 platform_enum = None
             if platform_enum is not None:
-                # Discord thread destinations must key on the thread's OWN id
-                # to match how the Discord adapter keys organic in-thread
-                # messages (chat_id == thread_id). Other platforms (Slack,
-                # Telegram) use chat_id == parent_channel for thread messages,
-                # so the parent chat_id is correct for them. See the matching
-                # guard in GatewayRunner._process_handoff.
-                if platform_enum == Platform.DISCORD:
-                    seed_chat_id = str(thread_id)
-                else:
-                    seed_chat_id = str(chat_id)
                 dest_source = SessionSource(
                     platform=platform_enum,
-                    chat_id=seed_chat_id,
+                    chat_id=session_chat_id,
                     chat_name=chat_name,
                     # DM threads key through the DM arm (see docstring); the
                     # reply's chat_type is what the seed must reproduce.
@@ -1927,7 +1925,7 @@ def _seed_cron_thread_session(
         # thread-keyed session row we just created.
         ok = mirror_to_session(
             platform_name,
-            str(chat_id),
+            session_chat_id,
             f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
             source_label="cron",
             thread_id=str(thread_id),

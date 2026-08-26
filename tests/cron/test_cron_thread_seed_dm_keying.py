@@ -17,13 +17,88 @@ not on SessionSource field shapes — pins the end-to-end contract.
 from unittest.mock import MagicMock, patch
 
 from cron.scheduler import _seed_cron_channel_session, _seed_cron_thread_session
-from gateway.config import Platform
-from gateway.session import SessionSource, build_session_key
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore, build_session_key
 
 
 def _seeded_source(store):
     store.get_or_create_session.assert_called_once()
     return store.get_or_create_session.call_args[0][0]
+
+
+def test_discord_thread_seed_lookup_matches_inbound_reply(tmp_path, monkeypatch):
+    """Discord keys thread messages on the thread ID as both chat and thread.
+
+    Exercise mirror_to_session's origin lookup rather than its explicit-session
+    fast path so a parent-channel lookup cannot be masked. The seeded brief must
+    land in the same real session a later Discord reply resolves to.
+    """
+    import gateway.mirror as mirror
+    from hermes_state import SessionDB
+
+    home = tmp_path / "hermes-home"
+    sessions_dir = home / "sessions"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(mirror, "_SESSIONS_DIR", sessions_dir)
+    monkeypatch.setattr(mirror, "_SESSIONS_INDEX", sessions_dir / "sessions.json")
+
+    store = SessionStore(
+        sessions_dir,
+        GatewayConfig(sessions_dir=sessions_dir),
+    )
+
+    class _Adapter:
+        _session_store = store
+
+    parent_channel_id = "111111111111111111"
+    thread_id = "222222222222222222"
+    brief = "Daily calibration brief"
+    real_mirror = mirror.mirror_to_session
+
+    def _lookup_only_mirror(*args, **kwargs):
+        # The active failing path had to rediscover the newly-created row. Keep
+        # that compatibility seam covered even though current code can also pass
+        # the exact session_id as a fast path.
+        kwargs["session_id"] = None
+        return real_mirror(*args, **kwargs)
+
+    with patch("gateway.mirror.mirror_to_session", side_effect=_lookup_only_mirror):
+        _seed_cron_thread_session(
+            {"id": "discord-brief", "name": "Calibration"},
+            _Adapter(),
+            "discord",
+            parent_channel_id,
+            thread_id,
+            brief,
+            chat_name="calibration",
+        )
+
+    inbound_reply = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=thread_id,
+        chat_type="thread",
+        user_id="discord-user",
+        thread_id=thread_id,
+    )
+
+    db = SessionDB()
+    try:
+        seeded_session_id = db.find_session_by_origin(
+            platform="discord",
+            chat_id=thread_id,
+            user_id="system:cron",
+            thread_id=thread_id,
+        )
+        reply_entry = store.get_or_create_session(inbound_reply)
+        messages = db.get_messages(reply_entry.session_id)
+    finally:
+        db.close()
+
+    assert seeded_session_id is not None
+    assert reply_entry.session_id == seeded_session_id
+    assert any(brief in str(message.get("content", "")) for message in messages), (
+        "Discord reply resolved to a session without the seeded cron brief"
+    )
 
 
 def test_dm_thread_seed_key_matches_dm_reply_key():
@@ -63,7 +138,7 @@ def test_channel_thread_seed_key_matches_thread_reply_key():
     adapter = MagicMock()
     adapter._session_store = store
 
-    with patch("gateway.mirror.mirror_to_session", return_value=True):
+    with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
         _seed_cron_thread_session(
             {"id": "j2", "name": "digest"}, adapter, "slack",
             "C0AAAAAAAA", "1787188000.000100", "Three bullets",
@@ -80,6 +155,7 @@ def test_channel_thread_seed_key_matches_thread_reply_key():
     assert build_session_key(_seeded_source(store)) == build_session_key(
         reply_source
     )
+    assert mirror_mock.call_args.args[1] == "C0AAAAAAAA"
 
 
 def test_dm_seed_default_is_backward_compatible():
