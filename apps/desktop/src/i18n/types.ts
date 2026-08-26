@@ -2447,6 +2447,7 @@ export interface Translations {
       gatewayRestarting: string
       gatewayTitle: string
       customizeTitle: string
+      moreActions: string
       hideStatusbar: string
       resetStatusbar: string
       toggleApprovalMode: string

@@ -157,14 +157,41 @@ html:has([data-overlay-surface]) .mobile-session-drawer-trigger {
   display: none !important;
 }
 
-/* Bottom actions keep full 44px touch targets. The horizontal strip preserves
-   every action without shrinking hit areas; users can swipe to reach extras. */
-[data-statusbar] {
+/* Bottom actions retain full 44px targets. The old horizontal strip made an
+   off-screen action effectively invisible; a compact primary cluster plus More
+   keeps the full Desktop status surface reachable without relying on swiping. */
+[data-statusbar][data-mobile-statusbar] {
   height: 2.75rem !important;
-  /* Show every control; scroll the bar horizontally rather than cram or clip. */
-  justify-content: flex-start !important;
-  overflow-x: auto;
-  scrollbar-width: none;
+  justify-content: space-between !important;
+  overflow: visible;
+}
+[data-statusbar-mobile-primary] {
+  min-width: 0;
+}
+[data-statusbar][data-mobile-statusbar] [data-statusbar-id] {
+  min-width: 2.75rem;
+}
+.mobile-statusbar-more {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0.5rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-statusbar-more:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+[data-mobile-statusbar-more] [data-statusbar-id] {
+  width: 100%;
+  min-height: 2.75rem;
+  justify-content: flex-start;
+  border-radius: 0.5rem;
+  font-size: 0.875rem !important;
+}
+[data-mobile-statusbar-more] [data-statusbar-id] span {
+  display: inline !important;
 }
 [data-statusbar]::-webkit-scrollbar {
   display: none;
