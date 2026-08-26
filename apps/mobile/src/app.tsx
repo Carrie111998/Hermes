@@ -1,7 +1,7 @@
 import { App } from '@capacitor/app'
 import { Preferences } from '@capacitor/preferences'
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 // The REAL desktop app (DesktopController) — its AppShell already collapses to a
 // drawer on narrow viewports, so mounting it on a phone gives the desktop chat
@@ -17,6 +17,7 @@ import { LoginScreen } from '~mobile/connect/LoginScreen'
 import { TokenScreen } from '~mobile/connect/TokenScreen'
 import { MobileBehaviors } from '~mobile/mobile-behaviors'
 import { INITIAL_MOBILE_CAPABILITIES_KEY, shouldRequestInitialMobileCapabilities } from '~mobile/initial-capabilities'
+import { MobileRootShell } from '~mobile/mobile-root-shell'
 import { mobileBackDestination } from '~mobile/navigation'
 import { initNativeChrome } from '~mobile/native-init'
 
@@ -132,30 +133,25 @@ export function MobileRoot() {
     setView('connected')
   }
 
+  let content: ReactNode
   if (view === 'loading') {
-    return (
+    content = (
       <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
         Loading…
       </div>
     )
-  }
-
-  if (view === 'connect') {
-    return <ConnectScreen initialUrl={probe?.baseUrl ?? ''} onResult={onProbeResult} />
-  }
-
-  if (view === 'login' && probe) {
-    return (
+  } else if (view === 'connect') {
+    content = <ConnectScreen initialUrl={probe?.baseUrl ?? ''} onResult={onProbeResult} />
+  } else if (view === 'login' && probe) {
+    content = (
       <LoginScreen
         probe={probe}
         onBack={() => setView('connect')}
         onLoggedIn={(provider) => commit({ baseUrl: probe.baseUrl, authMode: 'oauth', provider })}
       />
     )
-  }
-
-  if (view === 'token' && probe) {
-    return (
+  } else if (view === 'token' && probe) {
+    content = (
       <TokenScreen
         probe={probe}
         onBack={() => setView('connect')}
@@ -167,14 +163,19 @@ export function MobileRoot() {
         }
       />
     )
+  } else {
+    // Connected → hand off to the real desktop chat app, plus the mobile touch
+    // adaptations (toolbar, drawers, settings master-detail, Android Back).
+    content = (
+      <>
+        <DesktopController />
+        <MobileBehaviors />
+      </>
+    )
   }
 
-  // Connected → hand off to the real desktop chat app, plus the mobile touch
-  // adaptations (sidebar drawers, settings master-detail, Android back).
-  return (
-    <>
-      <DesktopController />
-      <MobileBehaviors />
-    </>
-  )
+  // One owned shell is a critical structural boundary: the mobile CSS may size
+  // this shell to the safe viewport without accidentally stretching each toolbar
+  // button into its own full-height rail.
+  return <MobileRootShell>{content}</MobileRootShell>
 }
