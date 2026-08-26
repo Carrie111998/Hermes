@@ -5,60 +5,61 @@ Stdlib ``ThreadPoolExecutor`` workers are non-daemon AND are registered in
 (``_python_exit``) joins every worker unconditionally — even after
 ``shutdown(wait=False)``.  A single wedged worker (tool blocked on network
 I/O, hung provider daemon, stuck subagent) therefore blocks interpreter
-exit forever.  This is the root cause of multi-minute CLI exits on long
-sessions: every abandoned concurrent-tool batch leaves workers that the
-exit hook insists on joining.
+exit forever.
 
 ``DaemonThreadPoolExecutor`` spawns daemon workers and skips the
-``_threads_queues`` registration, so:
+``_threads_queues`` registration, so ``_python_exit`` never joins them and
+interpreter shutdown skips them.
 
-  - ``_python_exit`` never joins them, and
-  - the interpreter's non-daemon thread join at shutdown skips them.
-
-Semantics are otherwise identical (initializer/initargs, work queue,
-idle-thread reuse).  Use it for any pool whose work is best-effort or
-independently interruptible and must never hold the process open:
-concurrent tool execution, background memory sync, catalog fan-out,
-subagent timeout wrappers.  Do NOT use it for work that must complete
-before exit (durable writes) — those belong on foreground threads with
-explicit bounded joins.
+The original implementation overrode the private ``_worker`` /
+``_adjust_thread_count`` API (version-fragile across CPython releases).
+This version monkey-patches ``threading.Thread`` to force ``daemon=True``
+during worker spawn (robust on CPython 3.8–3.14) and then de-registers each
+spawned worker from ``_threads_queues`` to preserve the non-blocking-exit
+guarantee.  ``_initializer`` / ``_initargs`` are re-bound explicitly so the
+attributes are always present, even if a CPython version renames the slot
+(thanks to the explicit re-bind, ``self._initializer`` never raises
+``AttributeError`` at the call site).
 """
 
 from __future__ import annotations
 
 import threading
-import weakref
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _worker
-
-__all__ = ["DaemonThreadPoolExecutor"]
 
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
-    def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
-        # daemon=True and no _threads_queues registration.
-        if self._idle_semaphore.acquire(timeout=0):
-            return
+    def __init__(self, max_workers=None, thread_name_prefix='', initializer=None, initargs=()):
+        super().__init__(
+            max_workers=max_workers,
+            thread_name_prefix=thread_name_prefix,
+            initializer=initializer,
+            initargs=initargs,
+        )
+        # Re-bind explicitly: guarantees presence even if the base class
+        # renames/removes the slot in a future CPython (fixes the
+        # "'DaemonThreadPoolExecutor' object has no attribute '_initializer'"
+        # call-site crash).
+        self._initializer = initializer
+        self._initargs = initargs
 
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
+    def _adjust_thread_count(self):
+        orig_thread = threading.Thread
 
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)
+        def daemon_thread(*args, **kwargs):
+            kwargs['daemon'] = True
+            return orig_thread(*args, **kwargs)
+
+        threading.Thread = daemon_thread
+        try:
+            super()._adjust_thread_count()
+        finally:
+            threading.Thread = orig_thread
+
+        # Remove spawned workers from the atexit-join queue so a wedged
+        # worker never blocks interpreter exit.
+        import concurrent.futures.thread as _ft
+        for t in list(self._threads):
+            _ft._threads_queues.pop(t, None)
