@@ -626,6 +626,27 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     return dst, None
 
 
+def active_profile_directory(data_dir: str) -> str:
+    """Return the profile sub-directory the browser was last using.
+
+    agent-browser's ``--profile`` sets the user-data-dir, but Chrome then opens
+    ``Default``; a user whose daily profile is e.g. ``Profile 6`` would get an
+    empty ``Default`` with none of their session cookies. ``Local State``'s
+    ``profile.last_used`` names the profile they actually browse in. Defaults to
+    ``Default`` when it can't be read.
+
+    Profile-selection finding: @kshitijk4poor (#95620).
+    """
+    try:
+        import json
+        with open(os.path.join(data_dir, "Local State"), encoding="utf-8") as fh:
+            ls = json.load(fh)
+        last = (ls.get("profile") or {}).get("last_used")
+        return last if isinstance(last, str) and last else "Default"
+    except (OSError, ValueError, AttributeError):
+        return "Default"
+
+
 def get_chrome_debug_candidates(system: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()

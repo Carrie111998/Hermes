@@ -1556,6 +1556,7 @@ def _real_profile_cdp() -> tuple:
 
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
+        active_profile_directory,
         chromium_executable,
         detect_default_chromium,
         snapshot_real_profile,
@@ -1647,6 +1648,14 @@ def _real_profile_cdp() -> tuple:
         _exe = chromium_executable(browser)
         if _exe:
             argv += ["--executable-path", _exe]
+        # Select the user's ACTIVE profile inside the copied user-data-dir.
+        # agent-browser opens "Default", so a user whose daily profile is e.g.
+        # "Profile 6" would otherwise get an empty Default with no session
+        # cookies. Pass Local State's last_used through as a Chrome launch arg.
+        # (Profile-selection finding: @kshitijk4poor, #95620.)
+        _active = active_profile_directory(copy_dir)
+        if _active and _active != "Default":
+            argv += ["--args", f"--profile-directory={_active}"]
         # Do NOT pass agent-browser's ``--headless``: it maps to Chrome's legacy
         # headless mode, which uses a SEPARATE cookie store and loads none of the
         # copied profile's cookies (verified: --headless → 0 cookies, default →
