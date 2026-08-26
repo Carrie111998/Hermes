@@ -1057,6 +1057,27 @@ class DiscordAdapter(BasePlatformAdapter):
     # cap are replaced by a short notice.
     MAX_SPLIT_MESSAGES = 8
 
+    def split_message(
+        self,
+        content: str,
+        max_length: int = MAX_MESSAGE_LENGTH,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> List[str]:
+        """Split Discord responses with optional visible ``(N/M)`` labels."""
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        raw = extra.get("chunk_indicators", True)
+        include_chunk_indicators = (
+            raw
+            if isinstance(raw, bool)
+            else str(raw).strip().lower() in {"true", "1", "yes", "on"}
+        )
+        return self.truncate_message(
+            content,
+            max_length,
+            len_fn=len_fn,
+            include_chunk_indicators=include_chunk_indicators,
+        )
+
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
     VOICE_TIMEOUT = 300
@@ -3512,7 +3533,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self._cap_split_chunks(
-                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                self.split_message(formatted, self.MAX_MESSAGE_LENGTH)
             )
 
             message_ids = []
@@ -3604,7 +3625,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(
-            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            self.split_message(formatted, self.MAX_MESSAGE_LENGTH)
         )
 
         thread_name = _derive_forum_thread_name(content)
@@ -3777,7 +3798,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     return await self._edit_overflow_split(
                         channel, msg, message_id, content,
                     )
-                formatted = self.truncate_message(
+                formatted = self.split_message(
                     formatted, self.MAX_MESSAGE_LENGTH,
                 )[0]
                 _saturated_preview = True
@@ -3809,7 +3830,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             channel, msg, message_id, content,
                         )
                     # Mid-stream: truncate and retry in place (no split).
-                    truncated = self.truncate_message(
+                    truncated = self.split_message(
                         formatted, self.MAX_MESSAGE_LENGTH,
                     )[0]
                     if self._last_overflow_preview.get(_preview_key) == truncated:
@@ -3873,7 +3894,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(
-            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            self.split_message(formatted, self.MAX_MESSAGE_LENGTH)
         )
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
@@ -10392,6 +10413,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
     seeded_extra = {}
+    chunk_indicators_cfg = discord_cfg.get("chunk_indicators")
+    if chunk_indicators_cfg is not None:
+        seeded_extra["chunk_indicators"] = chunk_indicators_cfg
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only

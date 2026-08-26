@@ -927,7 +927,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     Long messages are automatically chunked to fit within platform limits
     using the same smart-splitting algorithm as the gateway adapters
-    (preserves code-block boundaries, adds part indicators).
+    (preserves code-block boundaries and honors platform indicator settings).
     """
     from gateway.config import Platform
 
@@ -996,7 +996,21 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     max_len = _MAX_LENGTHS.get(platform)
     if max_len:
         _len_fn = utf16_len if platform == Platform.TELEGRAM else None
-        chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
+        _include_chunk_indicators = True
+        if platform == Platform.DISCORD:
+            _extra = pconfig.extra if isinstance(getattr(pconfig, "extra", None), dict) else {}
+            _raw = _extra.get("chunk_indicators", True)
+            _include_chunk_indicators = (
+                _raw
+                if isinstance(_raw, bool)
+                else str(_raw).strip().lower() in {"true", "1", "yes", "on"}
+            )
+        chunks = BasePlatformAdapter.truncate_message(
+            message,
+            max_len,
+            len_fn=_len_fn,
+            include_chunk_indicators=_include_chunk_indicators,
+        )
     else:
         chunks = [message]
 

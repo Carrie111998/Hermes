@@ -16,6 +16,7 @@ The fix mirrors the proven Telegram contract (and its #48648 lesson):
   in ``message_id`` plus every continuation in ``continuation_message_ids``.
 """
 
+import re
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -52,8 +53,14 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 MAX = DiscordAdapter.MAX_MESSAGE_LENGTH  # 2000
 
 
-def _make_adapter():
-    return DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+def _make_adapter(*, chunk_indicators=True):
+    return DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"chunk_indicators": chunk_indicators},
+        )
+    )
 
 
 def _wire_channel(adapter, *, original_msg, send_side_effect=None):
@@ -186,6 +193,33 @@ class TestSaturatedPreviewDedup:
         result = await adapter.edit_message("555", "42", "x" * 4500, finalize=True)
         assert result.success is True
         assert len(edits) == 3
+
+    @pytest.mark.asyncio
+    async def test_disabled_indicators_keep_saturated_preview_stable(self):
+        adapter = _make_adapter(chunk_indicators=False)
+        edits = []
+        msg = SimpleNamespace(
+            id=42,
+            edit=AsyncMock(side_effect=lambda *, content: edits.append(content)),
+        )
+        channel, sends = _wire_channel(adapter, original_msg=msg)
+
+        result = await adapter.edit_message("555", "42", "x" * 2500, finalize=False)
+        assert result.success is True
+        assert len(edits) == 1
+
+        for grow in (3000, 3500, 4000, 4500):
+            result = await adapter.edit_message("555", "42", "x" * grow, finalize=False)
+            assert result.success is True
+        assert len(edits) == 1
+
+        result = await adapter.edit_message("555", "42", "x" * 4500, finalize=True)
+        assert result.success is True
+        assert len(edits) == 2
+        delivered = edits + [send["content"] for send in sends]
+        assert all(
+            re.search(r"\(\d+/\d+\)\s*$", content) is None for content in delivered
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -337,6 +337,7 @@ discord:
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
+  chunk_indicators: true          # Append visible (N/M) labels to split replies
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
@@ -420,6 +421,12 @@ Controls whether the bot adds emoji reactions to messages as visual feedback:
 - ❌ added if an error occurs during processing
 
 Disable this if you find the reactions distracting or if the bot's role doesn't have the **Add Reactions** permission.
+
+#### `discord.chunk_indicators`
+
+**Type:** boolean — **Default:** `true`
+
+Controls whether replies split across Discord's 2,000-character message limit end with visible labels such as `(1/3)`. Set this to `false` for clean multipart replies that copy and paste as continuous text.
 
 #### `discord.ignored_channels`
 
