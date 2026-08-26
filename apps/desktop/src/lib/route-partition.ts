@@ -9,7 +9,7 @@
  */
 
 import type { RouteKey } from '../../electron/connection-route-identity'
-import { routeKeyScopeKey } from '../../electron/connection-route-identity'
+import { routeKeyPartitionKey } from '../../electron/connection-route-identity'
 
 export interface Partition<T> {
   route: RouteKey
@@ -38,23 +38,28 @@ export class RoutePartitions<T> {
   }
 
   forRoute(route: RouteKey): Partition<T> {
-    const key = routeKeyScopeKey(route)
+    const key = routeKeyPartitionKey(route)
     let p = this.#map.get(key)
+
     if (p) {
       p.lastTouchedMs = Date.now()
       // LRU: move to end
       this.#map.delete(key)
       this.#map.set(key, p)
+
       return p
     }
+
     p = { route, scopeKey: key, data: this.createDefault(route), lastTouchedMs: Date.now() }
     this.#map.set(key, p)
     this.evictIfNeeded()
+
     return p
   }
 
   evictIfNeeded(nowMs = Date.now()): string[] {
     const evicted: string[] = []
+
     // TTL eviction
     for (const [k, p] of [...this.#map.entries()]) {
       if (nowMs - p.lastTouchedMs > this.#opts.ttlMs) {
@@ -62,13 +67,18 @@ export class RoutePartitions<T> {
         evicted.push(k)
       }
     }
+
     // LRU eviction
     while (this.#map.size > this.#opts.maxPartitions) {
       const oldest = this.#map.keys().next().value as string | undefined
-      if (!oldest) break
+
+      if (!oldest) {
+        break
+      }
       this.#map.delete(oldest)
       evicted.push(oldest)
     }
+
     return evicted
   }
 

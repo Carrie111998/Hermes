@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict'
-import { test, describe } from 'vitest'
-import { resourceRef, foregroundApi, BANNED_AMBIENT_PATTERNS } from './resource-ref'
+
+import { describe, test } from 'vitest'
+
+import { LOCAL_CONNECTION_ID, normalizeRegistry, REGISTRY_VERSION } from '../../electron/connection-registry'
 import { makeRouteKey } from '../../electron/connection-route-identity'
-import { LOCAL_CONNECTION_ID, REGISTRY_VERSION, normalizeRegistry } from '../../electron/connection-registry'
+
+import { BANNED_AMBIENT_PATTERNS, foregroundApi, resourceRef } from './resource-ref'
 
 function fakeRoute(id: string, profile='default') {
   const reg = normalizeRegistry({
     version: REGISTRY_VERSION, primary: id, launchMode: 'primary', lastUsed: id,
     connections: [{ id: LOCAL_CONNECTION_ID, kind: 'local', label: 'local' }, { id, kind: 'remote', label: id, url: `https://${id}.example` }],
   })
+
   return makeRouteKey(reg.connections.find(c=>c.id===id)!, profile)
 }
 

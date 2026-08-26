@@ -18,18 +18,26 @@ export function definePersistedState(opts: PersistedStateOpts) {
     ...opts,
     storageKey(parts: { connectionId?: string; routeKey?: string; sessionId?: string }): string {
       const base = `hermes:${opts.name}:v${opts.version}`
+
       switch (opts.scope) {
         case 'global':
           return base
+
         case 'connection':
-          if (!parts.connectionId) throw new Error(`Persisted state "${opts.name}" (scope=connection) requires connectionId`)
+          if (!parts.connectionId) {throw new Error(`Persisted state "${opts.name}" (scope=connection) requires connectionId`)}
+
           return `${base}:conn:${parts.connectionId}`
+
         case 'route':
-          if (!parts.routeKey) throw new Error(`Persisted state "${opts.name}" (scope=route) requires routeKey`)
+          if (!parts.routeKey) {throw new Error(`Persisted state "${opts.name}" (scope=route) requires routeKey`)}
+
           return `${base}:route:${parts.routeKey}`
+
         case 'session':
-          if (!parts.sessionId) throw new Error(`Persisted state "${opts.name}" (scope=session) requires sessionId`)
+          if (!parts.sessionId) {throw new Error(`Persisted state "${opts.name}" (scope=session) requires sessionId`)}
+
           return `${base}:session:${parts.sessionId}`
+
         default:
           return base
       }

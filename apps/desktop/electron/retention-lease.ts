@@ -44,24 +44,36 @@ export class RetentionRegistry {
   acquire(route: RouteKey, owner: RetentionOwner): RetentionLease {
     const sk = supervisorKey(route)
     let bucket = this.#leases.get(sk)
+
     if (!bucket) {
       bucket = new Map()
       this.#leases.set(sk, bucket)
     }
+
     // ownerId is globally unique per owner instance; re-acquire with same id is idempotent
     bucket.set(owner.ownerId, owner)
     const key = sk
     let released = false
+
     return {
       key,
       owner,
       release: (): boolean => {
-        if (released) return false
+        if (released) {
+          return false
+        }
         released = true
         const b = this.#leases.get(key)
-        if (!b) return false
+
+        if (!b) {
+          return false
+        }
         const deleted = b.delete(owner.ownerId)
-        if (b.size === 0) this.#leases.delete(key)
+
+        if (b.size === 0) {
+          this.#leases.delete(key)
+        }
+
         return deleted
       },
     }
@@ -73,15 +85,28 @@ export class RetentionRegistry {
 
   ownersFor(route: RouteKey): RetentionOwner[] {
     const bucket = this.#leases.get(supervisorKey(route))
+
     return bucket ? [...bucket.values()] : []
   }
 
   /** Whether the pruner is allowed to evict this route. */
   mayPrune(route: RouteKey, signals: MayPruneSignals = {}): boolean {
-    if ((this.#leases.get(supervisorKey(route))?.size ?? 0) > 0) return false
-    if ((signals.activeRequests ?? 0) > 0) return false
-    if ((signals.activeTurns ?? 0) > 0) return false
-    if (signals.isForeground) return false
+    if ((this.#leases.get(supervisorKey(route))?.size ?? 0) > 0) {
+      return false
+    }
+
+    if ((signals.activeRequests ?? 0) > 0) {
+      return false
+    }
+
+    if ((signals.activeTurns ?? 0) > 0) {
+      return false
+    }
+
+    if (signals.isForeground) {
+      return false
+    }
+
     return true
   }
 

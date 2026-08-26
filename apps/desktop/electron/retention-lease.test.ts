@@ -2,11 +2,13 @@
  * Phase 2 — Retention leases adversarial tests (#94724 §8 §21)
  */
 import assert from 'node:assert/strict'
+
 import { describe, test } from 'vitest'
+
+import { LOCAL_CONNECTION_ID, normalizeRegistry, REGISTRY_VERSION } from './connection-registry'
 import { makeRouteKey } from './connection-route-identity'
-import { LOCAL_CONNECTION_ID, REGISTRY_VERSION, normalizeRegistry } from './connection-registry'
-import { RetentionRegistry } from './retention-lease'
 import type { RouteKey } from './connection-route-identity'
+import { RetentionRegistry } from './retention-lease'
 
 function fakeRoute(id: string, profile = 'default', generation = 1): RouteKey {
   const registry = normalizeRegistry({
@@ -19,7 +21,9 @@ function fakeRoute(id: string, profile = 'default', generation = 1): RouteKey {
       { id, kind: 'remote', label: id, url: `https://${id}.example`, generation },
     ],
   })
+
   const conn = registry.connections.find(c => c.id === id)!
+
   return makeRouteKey(conn, profile)
 }
 
