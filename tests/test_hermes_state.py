@@ -834,6 +834,23 @@ class TestFTS5Search:
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
 
+        # Spy on the read-path dispense seam so the assertions below can prove
+        # the traced connection actually served the searches. Today the pool's
+        # sole occupant is the connection returned above, but an earlier
+        # checkout in this test or a future warmup read in SessionDB.__init__
+        # would silently hand the search an untraced connection — this spy
+        # turns that into a loud failure here instead of a confusing one in
+        # the trace assertions.
+        dispensed = []
+        real_checkout = db._checkout_read_conn
+
+        def spying_checkout():
+            conn = real_checkout()
+            dispensed.append(conn)
+            return conn
+
+        db._checkout_read_conn = spying_checkout
+
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
             return sum("WITH TARGET AS (" in sql for sql in normalized)
@@ -856,7 +873,18 @@ class TestFTS5Search:
             assert len(default) == 1
             assert default[0]["context"]
             assert context_query_count() == 2
+
+            # The traced connection must be the one that served the searches:
+            # every dispense from the seam must hand back the exact object the
+            # trace callback was installed on (or None on the non-WAL
+            # fallback, where reads run on the traced writer connection).
+            assert dispensed, "search_messages never used the read-path dispense seam"
+            if pooled_read_conn is not None:
+                assert {id(conn) for conn in dispensed} == {id(pooled_read_conn)}
+            else:
+                assert set(dispensed) == {None}
         finally:
+            db.__dict__.pop("_checkout_read_conn", None)
             for conn in traced_connections:
                 conn.set_trace_callback(None)
 
