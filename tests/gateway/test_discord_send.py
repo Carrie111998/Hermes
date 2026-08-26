@@ -44,7 +44,10 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _discord_cron_embed_parts,
+)
 
 
 @pytest.mark.asyncio
@@ -80,6 +83,95 @@ async def test_send_rejects_whitespace_and_records_failed_final_reply(
     )
     assert tuple(row) == ("failed", 0, 0, None)
     assert "Dropped empty message to chat=555" in caplog.text
+
+
+def _wrapped_cron(body: str) -> str:
+    return (
+        "Cronjob Response: Camera health watchdog\n"
+        "(job_id: test-job)\n"
+        "-------------\n\n"
+        f"{body}\n\n"
+        "To stop or manage this job, send me a new message "
+        '(e.g. "stop reminder Camera health watchdog").'
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "stage", "color"),
+    [
+        ("⚠️ Observing/debouncing two pipelines.", "Self-healing observing / repairing", "orange"),
+        ("🚨 Self-healing blocked and escalated.", "Self-healing blocked / attention required", "red"),
+        ("✅ Recovered naturally without intervention from the failed probe.", "Transiently self-recovered", "green"),
+    ],
+)
+def test_cron_embed_stage_and_color(body, stage, color):
+    parts = _discord_cron_embed_parts(
+        _wrapped_cron(body),
+        {"job_id": "test-job"},
+    )
+    assert parts is not None
+    assert parts["stage"] == stage
+    assert parts["color"] == color
+
+
+@pytest.mark.asyncio
+async def test_short_cron_recovery_delivery_uses_green_embed(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=9001)))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    embed = MagicMock()
+    embed_factory = MagicMock(return_value=embed)
+    monkeypatch.setattr(_discord_mod, "Embed", embed_factory)
+    monkeypatch.setattr(_discord_mod.Color, "green", MagicMock(return_value=222))
+
+    result = await adapter.send(
+        "555",
+        _wrapped_cron(
+            "✅ Verified self-healed: Frigate restarted and all pipelines are healthy."
+        ),
+        metadata={"job_id": "test-job", "notify": True},
+    )
+
+    assert result.success is True
+    assert result.raw_response["embedded"] is True
+    embed_factory.assert_called_once()
+    kwargs = embed_factory.call_args.kwargs
+    assert kwargs["title"] == "🔄 Camera health watchdog"
+    assert "Verified self-healed" in kwargs["description"]
+    assert kwargs["color"] == 222
+    embed.add_field.assert_any_call(
+        name="Self-healing stage",
+        value="Verified self-healing recovery",
+        inline=False,
+    )
+    embed.set_footer.assert_called_once_with(text="Hermes Cron Reliability")
+    channel.send.assert_awaited_once_with(embed=embed, reference=None)
+
+
+@pytest.mark.asyncio
+async def test_long_cron_delivery_falls_back_to_split_text(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=9002)))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    embed_factory = MagicMock()
+    monkeypatch.setattr(_discord_mod, "Embed", embed_factory)
+
+    result = await adapter.send(
+        "555",
+        _wrapped_cron("x" * 3801),
+        metadata={"job_id": "test-job", "notify": True},
+    )
+
+    assert result.success is True
+    embed_factory.assert_not_called()
+    assert channel.send.await_count >= 2
+    assert all("content" in call.kwargs for call in channel.send.await_args_list)
 
 
 def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
