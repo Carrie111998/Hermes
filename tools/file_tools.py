@@ -24,6 +24,7 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from agent.source_provenance import active_source_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,62 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
         kept.append(lines[0][:max_chars])
 
     return "\n".join(kept), len(kept), True
+
+
+def _issue_active_read_provenance(
+    *,
+    resolved: Path | PurePosixPath,
+    offset: int,
+    limit: int,
+    returned_content: str,
+    result_dict: dict,
+    file_ops,
+) -> None:
+    """Issue provenance only for a verified local ``read_file`` result.
+
+    A registry never treats the JSON returned by an arbitrary tool as source
+    evidence. For the trusted host file tool, re-read the exact bounded raw
+    interval and require that its line-numbered projection exactly equals the
+    successful, unredacted result before minting a grant.
+    """
+
+    context = active_source_provenance()
+    if context is None or not isinstance(resolved, Path):
+        return
+    if result_dict.get("error") or result_dict.get("truncated_by") or not returned_content:
+        return
+    try:
+        canonical = resolved.resolve(strict=True)
+        if resolved.is_symlink() or not canonical.is_file():
+            return
+        selected: list[bytes] = []
+        with canonical.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if line_number < offset:
+                    continue
+                if line_number >= offset + limit:
+                    break
+                selected.append(raw_line)
+        if not selected:
+            return
+        raw = b"".join(selected)
+        expected = file_ops._add_line_numbers(raw.decode("utf-8"), offset)
+        if returned_content != expected:
+            return
+        context.registry.issue_file_slice(
+            path=resolved,
+            line_start=offset,
+            line_end=offset + len(selected) - 1,
+            content=raw,
+            session_id=context.session_id,
+            turn_id=context.turn_id,
+            request_id=context.request_id,
+            policy_digest=context.policy_digest,
+        )
+    except Exception:
+        # This is a provenance failure, never a reason to turn an ordinary
+        # read into a more permissive source grant.
+        return
 
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
@@ -1918,6 +1975,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             content_len = len(trimmed)
 
         # ── Redact secrets (after guard check to skip oversized content) ──
+        content_before_redaction = result.content or ""
         if result.content:
             result.content = redact_sensitive_text(result.content, file_read=True)
             result_dict["content"] = result.content
@@ -1996,6 +2054,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 f"You have read this exact file region {count} times consecutively. "
                 "The content has not changed since your last read. Use the information you already have. "
                 "If you are stuck in a loop, stop reading and proceed with writing or responding."
+            )
+
+        if result.content == content_before_redaction:
+            _issue_active_read_provenance(
+                resolved=_resolved,
+                offset=offset,
+                limit=limit,
+                returned_content=result.content,
+                result_dict=result_dict,
+                file_ops=file_ops,
             )
 
         return json.dumps(result_dict, ensure_ascii=False)
