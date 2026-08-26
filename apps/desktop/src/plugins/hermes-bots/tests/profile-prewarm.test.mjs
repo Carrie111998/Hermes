@@ -87,6 +87,7 @@ function renderBotRow(input = 'alpha') {
     // #49 session-aware-row helpers referenced inside BotRow.
     previewKind: () => ({ fromBot: false, sender: null }),
     generatedSessionTitle: () => null,
+    introOnlyPreview: () => false,
     focusedRosterOwner: owner => ({ connectionId: owner.connectionId, name: owner.profile }),
     isActiveRosterBot: () => false,
     isBackfilledFacePng: () => false,
@@ -277,6 +278,7 @@ test('behavior: remote default never opens the same-name local chat', async () =
     haptic: () => undefined,
     previewKind: () => ({ fromBot: false, sender: null }),
     generatedSessionTitle: () => null,
+    introOnlyPreview: () => false,
     focusedRosterOwner: owner => ({ connectionId: owner.connectionId, name: owner.profile }),
     isActiveRosterBot: () => false,
     isBackfilledFacePng: () => false,

@@ -314,17 +314,32 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 pass
 
-            # Cheap existence flag so roster UIs know to profiles.get_asset
-            # without a probe call per profile per paint.
+            # Cheap existence + fingerprint flags so roster UIs can detect a
+            # server-side avatar change (or removal) without a probe call per
+            # profile per paint (#95613). Both come from a plain stat — still
+            # no asset read on the 5s roster poll.
             try:
                 from pathlib import Path as _Path
 
                 assets = _Path(str(p.path)) / "assets"
-                row["has_avatar"] = any(
-                    (assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp")
-                )
+                avatar_files = [assets / f"avatar.{ext}" for ext in ("png", "jpg", "webp")]
+                existing = [f for f in avatar_files if f.is_file()]
+                row["has_avatar"] = bool(existing)
+                if existing:
+                    try:
+                        st = existing[0].stat()
+                        row["avatar_size"] = int(st.st_size)
+                        row["avatar_mtime"] = int(st.st_mtime_ns)
+                    except Exception:
+                        row["avatar_size"] = None
+                        row["avatar_mtime"] = None
+                else:
+                    row["avatar_size"] = None
+                    row["avatar_mtime"] = None
             except Exception:
                 row["has_avatar"] = False
+                row["avatar_size"] = None
+                row["avatar_mtime"] = None
             out.append(row)
         # Capability flag: this backend's prompt builder injects the Bot Mode
         # teammate-messaging protocol (tools/bot_mode_probe.py) into every
