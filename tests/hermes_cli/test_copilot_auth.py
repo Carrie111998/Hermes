@@ -216,6 +216,24 @@ class TestCopilotClientIdentity:
         assert identity.user_agent == "copilot/1.2.3-4 (linux v24.1.0) term/tmux"
         mod.resolve_copilot_client_identity.cache_clear()
 
+    def test_node_version_uses_managed_runtime_resolution(self, monkeypatch):
+        import hermes_cli.copilot_auth as mod
+
+        seen = []
+        monkeypatch.setattr(
+            mod,
+            "find_node_executable",
+            lambda command: "/managed/node" if command == "node" else None,
+        )
+        monkeypatch.setattr(
+            mod,
+            "_command_version",
+            lambda command: seen.append(command) or "v24.1.0",
+        )
+
+        assert mod._installed_node_version() == "v24.1.0"
+        assert seen == [["/managed/node", "--version"]]
+
     def test_fallback_keeps_api_contract_without_claiming_cli_install(
         self, monkeypatch
     ):

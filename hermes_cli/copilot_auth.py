@@ -31,6 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+from hermes_constants import find_node_executable
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ def _installed_copilot_cli_version() -> Optional[str]:
 
 def _installed_node_version() -> str:
     """Return the Node version token used by the npm CLI's User-Agent shape."""
-    executable = shutil.which("node")
+    executable = find_node_executable("node")
     output = _command_version([executable, "--version"]) if executable else None
     if output:
         first_line = output.splitlines()[0].strip()
