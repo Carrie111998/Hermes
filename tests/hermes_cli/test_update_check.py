@@ -35,7 +35,7 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(banner, "_git_stdout", lambda *args, **kwargs: "cached-head")
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner.bounded_probe_run") as mock_run:
         result = banner.check_for_updates()
 
     assert result == 3
@@ -104,10 +104,10 @@ def test_check_via_local_git_fetch_failure_returns_none(tmp_path, monkeypatch):
             return failed_proc
         if args[:2] == ["git", "rev-list"]:
             return stale_zero_proc
-        raise AssertionError(f"unexpected subprocess.run: {args}")
+        raise AssertionError(f"unexpected bounded_probe_run: {args}")
 
     monkeypatch.setattr(banner, "_git_stdout", mock_git_stdout)
-    monkeypatch.setattr(banner.subprocess, "run", mock_run)
+    monkeypatch.setattr(banner, "bounded_probe_run", mock_run)
 
     result = banner._check_via_local_git(repo_dir)
     assert result is None, (
@@ -146,10 +146,10 @@ def test_check_via_local_git_fetch_failure_keeps_positive_stale_count(tmp_path, 
             return failed_proc
         if args[:2] == ["git", "rev-list"]:
             return stale_behind_proc
-        raise AssertionError(f"unexpected subprocess.run: {args}")
+        raise AssertionError(f"unexpected bounded_probe_run: {args}")
 
     monkeypatch.setattr(banner, "_git_stdout", mock_git_stdout)
-    monkeypatch.setattr(banner.subprocess, "run", mock_run)
+    monkeypatch.setattr(banner, "bounded_probe_run", mock_run)
 
     result = banner._check_via_local_git(repo_dir)
     assert result == 5, "Stale positive behind-count must be preserved on fetch failure"
@@ -185,13 +185,45 @@ def test_check_via_local_git_fetch_failure_rev_list_error_returns_none(tmp_path,
             return failed_proc
         if args[:2] == ["git", "rev-list"]:
             return bad_rev_list
-        raise AssertionError(f"unexpected subprocess.run: {args}")
+        raise AssertionError(f"unexpected bounded_probe_run: {args}")
 
     monkeypatch.setattr(banner, "_git_stdout", mock_git_stdout)
-    monkeypatch.setattr(banner.subprocess, "run", mock_run)
+    monkeypatch.setattr(banner, "bounded_probe_run", mock_run)
 
     result = banner._check_via_local_git(repo_dir)
     assert result is None
+
+
+def test_check_via_local_git_fetch_timeout_is_inconclusive(tmp_path, monkeypatch):
+    """A timed-out fetch must fail open without entering subprocess.run's
+    unbounded Windows pipe cleanup path."""
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    def mock_git_stdout(args, *, cwd, timeout=5):
+        if args[:2] == ["remote", "get-url"]:
+            return "https://github.com/NousResearch/hermes-agent.git"
+        if args[:2] == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        return None
+
+    stale_zero_proc = MagicMock(returncode=0, stdout="0")
+
+    def mock_bounded(args, **kwargs):
+        if args[:2] == ["git", "fetch"]:
+            assert kwargs == {"timeout": 10, "cwd": str(repo_dir)}
+            return None
+        if args[:2] == ["git", "rev-list"]:
+            return stale_zero_proc
+        raise AssertionError(f"unexpected bounded_probe_run: {args}")
+
+    monkeypatch.setattr(banner, "_git_stdout", mock_git_stdout)
+    monkeypatch.setattr(banner, "bounded_probe_run", mock_bounded)
+
+    assert banner._check_via_local_git(repo_dir) is None
 
 
 def test_check_for_updates_does_not_cache_none(tmp_path, monkeypatch):
@@ -252,6 +284,4 @@ def test_check_for_updates_does_not_cache_none(tmp_path, monkeypatch):
 
     # The cache file must NOT have been written with a None result
     assert not cache_file.exists(), "None result must not be cached"
-
-
 
