@@ -84,8 +84,8 @@ def test_clean_pushed_worktree_removed(repo: Path) -> None:
     wt = _make_worktree(repo, "t_aaaa1111")
     kb._cleanup_worktree_workspace("t_aaaa1111", str(wt))
     assert not wt.exists()
-    # auto-generated task branch goes with it
-    assert not _branch_exists(repo, "wt/t_aaaa1111")
+    # The named ref is the compact recovery handle and survives checkout removal.
+    assert _branch_exists(repo, "wt/t_aaaa1111")
     # main checkout untouched
     assert (repo / "README.md").exists()
 
@@ -138,13 +138,17 @@ def test_tree_dirtied_between_check_and_removal_preserved(
     ``--force``, git's own dirty guard re-verifies at removal time and the
     removal fails safe.
     """
-    import cli
+    from hermes_cli import kanban_retention as retention
 
     wt = _make_worktree(repo, "t_gggg7777")
     (wt / "late-wip.txt").write_text("dirtied after the check\n", encoding="utf-8")
     # Pre-check lies (as if the file appeared just after it ran) — real git
     # must still refuse the removal.
-    monkeypatch.setattr(cli, "_worktree_is_dirty", lambda _p: False)
+    monkeypatch.setattr(
+        retention,
+        "_git_check",
+        lambda _p: (True, "ok", {"named_ref": True, "remote_reachable": True}),
+    )
     kb._cleanup_worktree_workspace("t_gggg7777", str(wt))
     assert wt.is_dir()
     assert (wt / "late-wip.txt").exists()
@@ -175,7 +179,7 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.complete_task(conn, tid, summary="done")
     assert not wt.exists()
-    assert not _branch_exists(repo, f"wt/{tid}")
+    assert _branch_exists(repo, f"wt/{tid}")
 
 
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:

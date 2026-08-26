@@ -781,9 +781,41 @@ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-colu
         [--author NAME] [--json]                       #   into a full spec and promote to todo
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]
+hermes kanban retention [--apply]                      # truthful terminal-workspace sweep
+        [--completed-ttl-hours 6] [--recovery-ttl-hours 72]
+        [--workspace-cap-gib 50] [--free-floor-gib 25]
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+### Fail-closed workspace retention
+
+Run `hermes kanban retention` from a separate scheduled worker to inventory
+terminal workspaces without involving or restarting the gateway. Add `--apply`
+to remove independently eligible exact paths. Completed tasks use a six-hour
+recovery TTL; blocked tasks whose latest attempt ended as failed, interrupted,
+gave-up, timed-out, or cancelled use a 72-hour TTL. Active task/run leases,
+fresh heartbeats, live PIDs, process working directories, and open file
+descriptors always preserve the workspace.
+
+The sweep uses one non-overlapping lock and oldest-eligible ordering. It refuses
+paths outside board-managed workspace roots, changed path identities, escaping
+symlinks, nested mounts, partial inventories, dirty or untracked Git trees, and
+detached/unpushed/unreachable commits. Registered worktrees are removed only by
+their owning repository with `git worktree remove` and no force; their named
+branch/ref remains as the recovery handle.
+
+Each JSON receipt reports scanned, eligible, removed, skips by reason, bytes
+reclaimed, free space before/after, terminal backlog bytes, and the active
+capacity policy. Defaults are a 50 GiB workspace cap (40 GiB release
+hysteresis) and a 25 GiB free-space floor (30 GiB release hysteresis). A run
+exits non-zero when eligible stale backlog remains, inventory is partial, a
+removal is partial, the free-space floor is missed, another run holds the lock,
+or repeated growth exceeds cleanup. Therefore a dry-run that finds eligible
+backlog is intentionally non-zero: successful execution is not mistaken for
+retention convergence. Compact per-task receipts and one small hysteresis state
+file live under `kanban/retention/`, outside worker workspaces; they contain no
+workspace paths, source contents, credentials, or raw logs.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
