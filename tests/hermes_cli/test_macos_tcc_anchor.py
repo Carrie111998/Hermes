@@ -8,6 +8,10 @@ macOS.
 """
 
 import os
+import platform
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -195,9 +199,12 @@ class TestEnsureTccAnchor:
         assert marker.read_text(encoding="utf-8").strip() == str(
             store_bin / "python3.11"
         )
-        # Alias symlinks no longer resolve into the versioned store.
+        # Aliases are materialized as real-file copies of the anchor: a
+        # symlink to the anchor copy breaks CPython getpath at startup
+        # (issue #95541), while a symlink into the store would churn TCC.
         alias = venv_py.parent / "python3"
-        assert not tcc._is_uv_macos_store(str(alias.resolve(strict=False)))
+        assert alias.is_file() and not alias.is_symlink()
+        assert alias.read_bytes() == venv_py.read_bytes()
 
     def test_idempotent(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)
@@ -212,6 +219,25 @@ class TestEnsureTccAnchor:
         assert anchored == venv_py
         assert venv_py.is_file() and not venv_py.is_symlink()
         assert marker.read_text(encoding="utf-8") == before
+
+    def test_repairs_alias_symlinks_left_by_predecessor(self, tmp_path, monkeypatch):
+        """Anchors installed by the symlink-based predecessor left python3 as
+        a symlink pointing at the anchor copy — the on-disk shape that makes
+        every console script die with ModuleNotFoundError: encodings at
+        startup (issue #95541).  Idempotent runs must repair it."""
+        _darwin(monkeypatch)
+        store_bin = _build_store(tmp_path)
+        root = _build_checkout(tmp_path, store_bin=store_bin, anchored=True)
+        venv_bin = root / ".venv" / "bin"
+        venv_py = venv_bin / "python"
+        assert (venv_bin / "python3").is_symlink()  # predecessor shape
+
+        anchored = tcc.ensure_tcc_anchor(root)
+
+        assert anchored == venv_py
+        alias = venv_bin / "python3"
+        assert alias.is_file() and not alias.is_symlink()
+        assert alias.read_bytes() == venv_py.read_bytes()
 
     def test_reanchors_after_patch_bump(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)
@@ -234,6 +260,11 @@ class TestEnsureTccAnchor:
         assert venv_py.read_bytes() == new_py.read_bytes()
         marker = venv_py.parent / ".tcc-anchor-source"
         assert marker.read_text(encoding="utf-8").strip() == str(new_py)
+        # Aliases are refreshed alongside the anchor — a stale alias copy
+        # would keep running the previous patch build.
+        alias = venv_py.parent / "python3"
+        assert alias.is_file() and not alias.is_symlink()
+        assert alias.read_bytes() == new_py.read_bytes()
 
     def test_skips_homebrew_interpreter(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)
@@ -353,3 +384,72 @@ class TestDoctorCheck:
         doctor.check_macos_tcc_anchor(should_fix=False)  # must not raise
         out = capsys.readouterr().out
         assert "macOS TCC anchor check failed" in out
+
+
+class TestAnchoredAliasesBootE2E:
+    """Real-interpreter proof that anchored aliases stay bootable (#95541).
+
+    The fake-store fixtures above cannot catch getpath boot failures — the
+    crash only appears when a real CPython binary is invoked through the
+    alias.  Here the running interpreter's real base binary is copied into a
+    fake uv-store layout (stdlib provided via a ``lib`` symlink), a real venv
+    shape is anchored, and every entry point is actually executed.
+    """
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only anchor")
+    def test_python_entry_points_boot_after_anchor(self, tmp_path):
+        minor = f"python3.{sys.version_info.minor}"
+        base = Path(sys.base_prefix)
+        real_py = base / "bin" / minor
+        if not real_py.is_file() or real_py.is_symlink():
+            pytest.skip(f"no real base interpreter binary at {real_py}")
+        if not (base / "lib" / minor / "os.py").is_file():
+            pytest.skip("base stdlib not in the expected lib layout")
+
+        store = (
+            tmp_path
+            / "uv"
+            / "python"
+            / f"cpython-{platform.python_version()}-macos-aarch64-none"
+        )
+        store_bin = store / "bin"
+        store_bin.mkdir(parents=True)
+        shutil.copy2(real_py, store_bin / minor)
+        os.symlink(base / "lib", store / "lib")
+
+        root = tmp_path / "checkout"
+        venv = root / ".venv"
+        venv_bin = venv / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv / "lib" / minor / "site-packages").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {store_bin}\nversion = {platform.python_version()}\n",
+            encoding="utf-8",
+        )
+        os.symlink(store_bin / minor, venv_bin / "python")
+        os.symlink("python", venv_bin / "python3")
+        os.symlink("python", venv_bin / minor)
+
+        # Some uv-store builds link libpython dynamically via
+        # @executable_path/../lib (issue #95425); the anchored copy then
+        # needs that dylib reachable from the venv.  Mirror it so this test
+        # isolates the getpath boot failure rather than the dyld one.
+        libpython = base / "lib" / f"lib{minor}.dylib"
+        if libpython.is_file():
+            os.symlink(libpython, venv / "lib" / libpython.name)
+
+        anchored = tcc.ensure_tcc_anchor(root)
+        assert anchored is not None
+
+        for name in ("python", "python3", minor):
+            probe = subprocess.run(
+                [str(venv_bin / name), "-c",
+                 "import encodings, sys; print(sys.prefix)"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert probe.returncode == 0, (
+                f"{name} failed to boot after anchoring:\n{probe.stderr}"
+            )
+            assert str(venv) in probe.stdout

@@ -21,9 +21,15 @@ which still provides the stdlib exactly as it does today.
 The anchor self-heals: when ``hermes update`` / ``hermes doctor`` runs and the
 venv python is a symlink again (uv re-created it) or the recorded source no
 longer matches the current interpreter (patch bump), the copy is refreshed.
-Versioned alias symlinks (``python3``, ``python3.11``, ...) inside the venv bin
-dir are re-pointed at the anchor so no alias resolves back into the versioned
-store.
+Versioned alias names (``python3``, ``python3.11``, ...) inside the venv bin
+dir are materialized as real-file copies of the anchor.  They must NOT be
+symlinks: invoking the copied interpreter through a symlink makes CPython's
+getpath lose the venv prefix on affected python-build-standalone builds —
+startup dies with ``ModuleNotFoundError: No module named 'encodings'`` and
+the stdlib resolves to the build-time ``/install`` prefix (issue #95541).
+Real-file copies boot on every build, keep the anchor's identifier-pinned
+signature (TCC attribution stays on the stable venv path), and survive
+updates in place.
 
 All functions are no-ops on non-macOS and for interpreters that are not
 uv-managed (Homebrew/system Python has a stable path already).  This module is
@@ -36,6 +42,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -185,37 +192,52 @@ def _anchor_marker(venv_bin: Path) -> Path:
     return venv_bin / _MARKER_NAME
 
 
-def _repoint_aliases(venv_bin: Path, anchor: Path) -> None:
-    """Re-point uv alias symlinks at the stable anchor.
+def _copy_alias(venv_bin: Path, name: str, anchor: Path) -> None:
+    """Materialize *name* as a real-file copy of *anchor* (atomic rename)."""
+    tmp = venv_bin / f".{name}.tcc-tmp"
+    try:
+        shutil.copy2(anchor, tmp)
+        os.chmod(tmp, anchor.stat().st_mode | 0o111)
+        os.replace(tmp, venv_bin / name)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
-    ``python3`` / ``python3.11`` inside the venv bin dir currently resolve into
-    the versioned store; anything spawned through them would still churn TCC.
-    Only symlinks that resolve into the uv store are touched.
+
+def _materialize_aliases(venv_bin: Path, anchor: Path, *, refresh: bool = False) -> None:
+    """Materialize uv alias names as real-file copies of the anchor.
+
+    Aliases must be real files, never symlinks: invoking the anchor copy
+    through a symlink (``python3`` -> ``python``) makes CPython getpath lose
+    the venv prefix on affected interpreter builds — startup dies with
+    ``ModuleNotFoundError: encodings`` (issue #95541).  Real-file copies boot
+    on every build and preserve the anchor's identifier-pinned signature, so
+    TCC attribution stays on the stable venv path instead of churning back to
+    the versioned store.
+
+    *refresh* re-copies aliases that are already real files — used when the
+    anchor itself was just refreshed (patch bump) so aliases cannot go stale.
+    Without it, only missing names and leftover symlinks are repaired.
     """
     # Union of the running interpreter's expected aliases and every versioned
     # alias actually on disk — a store built by a different Python minor than
-    # the one running this code must still get its aliases repointed.
+    # the one running this code must still get its aliases materialized.
     names = set(_sibling_names())
     try:
-        names.update(p.name for p in venv_bin.glob("python3.*") if p.is_symlink())
+        names.update(
+            p.name
+            for p in venv_bin.glob("python3.*")
+            if re.fullmatch(r"python3(\.\d+)?", p.name)
+        )
     except OSError:
         pass
     for name in sorted(names):
         alias = venv_bin / name
         try:
-            if not alias.is_symlink():
-                continue
-            if not _is_uv_macos_store(str(alias.resolve(strict=False))):
-                continue
-            tmp = venv_bin / f".{name}.tcc-tmp"
-            try:
-                os.symlink(anchor.name, tmp)
-                os.replace(tmp, alias)
-            except OSError:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if refresh or alias.is_symlink() or not alias.exists():
+                _copy_alias(venv_bin, name, anchor)
         except OSError:
             continue
 
@@ -253,7 +275,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
             logger.debug("anchor copy signing skipped", exc_info=True)
         os.replace(tmp_path, venv_py)
         _anchor_marker(venv_bin).write_text(str(source_file), encoding="utf-8")
-        _repoint_aliases(venv_bin, venv_py)
+        _materialize_aliases(venv_bin, venv_py, refresh=True)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -292,6 +314,10 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
             if marker.is_file() and marker.read_text(encoding="utf-8").strip() == str(
                 source_file
             ):
+                # Repair aliases left as symlinks by the symlink-based
+                # predecessor implementation (issue #95541) or missing
+                # outright; up-to-date real-file copies are left untouched.
+                _materialize_aliases(venv_py.parent, venv_py)
                 return venv_py
         except OSError:
             pass
