@@ -2,10 +2,13 @@ import { useStore } from '@nanostores/react'
 import { App } from '@capacitor/app'
 import { Keyboard } from '@capacitor/keyboard'
 import { useEffect } from 'react'
-import { useLocation } from 'react-router'
+import { useLocation, useNavigate } from 'react-router'
 
+import { SETTINGS_ROUTE } from '@/app/routes'
 import { requestComposerAttachFiles, requestComposerInsert } from '@/app/chat/composer/focus'
+import { Codicon } from '@/components/ui/codicon'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+import { useI18n } from '@/i18n'
 import { $previewTabs, closeRightRail } from '@/store/preview'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
@@ -19,7 +22,9 @@ import {
 } from '@/store/layout'
 
 import {
+  mobileDrawerForEdgeSwipe,
   mobileDrawerForPane,
+  shouldCloseMobileDrawerFromSwipe,
   shouldDismissDrawerAfterSessionChange,
   shouldRevealPaneForDrawerChange,
   shouldSuppressPreviewOnMobile,
@@ -58,6 +63,8 @@ function dismissTopOverlay(): boolean {
 
 export function MobileBehaviors() {
   const location = useLocation()
+  const navigate = useNavigate()
+  const { t } = useI18n()
   const sidebarOpen = useStore($sidebarOpen)
 
   // Navigating (selecting a session) dismisses an open chat drawer.
@@ -144,16 +151,50 @@ export function MobileBehaviors() {
     const offPreview = $previewTabs.listen(dismissPhonePreview)
     dismissPhonePreview()
 
+    let swipeStart: { insideDrawer: boolean; x: number; y: number } | null = null
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Element | null
+      const insideDrawer = Boolean(target?.closest('[data-narrow-pane-overlay]'))
 
       // Tap outside an open chat drawer → dismiss it.
-      if (anyDrawerOpen() && !target?.closest('[data-narrow-pane-overlay]')) {
+      if (anyDrawerOpen() && !insideDrawer) {
         e.stopPropagation()
         closeOpenDrawer()
+
+        return
       }
+
+      // Never turn a modal/overlay interaction into a drawer gesture.
+      if (e.pointerType !== 'touch' || document.querySelector('[data-overlay-surface]')) return
+      swipeStart = { insideDrawer, x: e.clientX, y: e.clientY }
+    }
+    const onPointerUp = (e: PointerEvent) => {
+      const start = swipeStart
+      swipeStart = null
+
+      if (!start || e.pointerType !== 'touch' || document.querySelector('[data-overlay-surface]')) return
+      const deltaX = e.clientX - start.x
+      const deltaY = e.clientY - start.y
+
+      if (anyDrawerOpen()) {
+        const drawer = $sidebarOpen.get() ? 'sessions' : 'files'
+        if (start.insideDrawer && shouldCloseMobileDrawerFromSwipe(drawer, deltaX, deltaY)) closeOpenDrawer()
+
+        return
+      }
+
+      const drawer = mobileDrawerForEdgeSwipe({
+        endX: e.clientX,
+        endY: e.clientY,
+        startX: start.x,
+        startY: start.y,
+        viewportWidth: window.innerWidth
+      })
+      if (drawer === 'sessions') setSidebarOpen(true)
+      else if (drawer === 'files') setFileBrowserOpen(true)
     }
     document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('pointerup', onPointerUp, true)
 
     let disposed = false
     let backHandle: { remove: () => void } | undefined
@@ -193,6 +234,7 @@ export function MobileBehaviors() {
       offPreview()
       window.removeEventListener(PANE_TOGGLE_REVEAL_EVENT, onPaneReveal)
       document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('pointerup', onPointerUp, true)
       backHandle?.remove()
       void kbShow.then((h) => h.remove())
       void kbHide.then((h) => h.remove())
@@ -208,13 +250,23 @@ export function MobileBehaviors() {
   // Keep a permanent, thumb-sized session entry point instead of making Android
   // Back the only way to recover the session drawer.
   return (
-    <button
-      aria-label={sidebarOpen ? 'Close sessions' : 'Open sessions'}
-      className="mobile-session-drawer-trigger"
-      onClick={toggleSessionDrawer}
-      type="button"
-    >
-      ☰
-    </button>
+    <>
+      <button
+        aria-label={sidebarOpen ? t.titlebar.hideSidebar : t.titlebar.showSidebar}
+        className="mobile-session-drawer-trigger"
+        onClick={toggleSessionDrawer}
+        type="button"
+      >
+        <Codicon name="menu" size="1.35rem" />
+      </button>
+      <button
+        aria-label={t.titlebar.openSettings}
+        className="mobile-settings-trigger"
+        onClick={() => navigate(SETTINGS_ROUTE)}
+        type="button"
+      >
+        <Codicon name="settings-gear" size="1.35rem" />
+      </button>
+    </>
   )
 }

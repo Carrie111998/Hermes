@@ -66,6 +66,13 @@ body {
   top: calc(var(--titlebar-controls-top, 0px) + env(safe-area-inset-top)) !important;
 }
 
+/* The Electron titlebar has desktop-only controls. Mobile supplies its own two
+   deliberate actions below; leaving the inherited clusters mounted created the
+   screenshot's lone floating gear and redundant invisible tap zones. */
+[data-titlebar-cluster] {
+  display: none !important;
+}
+
 /* Phone chrome uses 44px hit boxes. Keep only gateway-essential titlebar actions
    visible so the enlarged targets never collide on a 360px screen. */
 :root {
@@ -92,7 +99,8 @@ body {
 [data-drawer-open] [data-titlebar-cluster] {
   display: none !important;
 }
-[data-drawer-open] .mobile-session-drawer-trigger {
+[data-drawer-open] .mobile-session-drawer-trigger,
+[data-drawer-open] .mobile-settings-trigger {
   display: none !important;
 }
 
@@ -117,10 +125,38 @@ body {
 .mobile-session-drawer-trigger:active {
   background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
 }
+.mobile-settings-trigger {
+  position: fixed;
+  z-index: 60;
+  top: calc(env(safe-area-inset-top) + 0.5rem);
+  right: calc(env(safe-area-inset-right) + 0.5rem);
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  place-items: center;
+  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
+  border-radius: 0.75rem;
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-settings-trigger:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mobile-session-drawer-trigger,
+  .mobile-settings-trigger {
+    transition: background-color 160ms ease, transform 160ms ease;
+  }
+  .mobile-session-drawer-trigger:active,
+  .mobile-settings-trigger:active {
+    transform: scale(0.94);
+  }
+}
 
 /* The settings/command overlays own their own close/navigation chrome. Keeping
    the session trigger above them is both redundant and visually misleading. */
-html:has([data-overlay-surface]) .mobile-session-drawer-trigger {
+html:has([data-overlay-surface]) .mobile-session-drawer-trigger,
+html:has([data-overlay-surface]) .mobile-settings-trigger {
   display: none !important;
 }
 
@@ -130,6 +166,23 @@ html:has([data-overlay-surface]) .mobile-session-drawer-trigger {
   width: min(17rem, calc(100vw - 1rem)) !important;
   max-width: calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem);
   z-index: 100 !important;
+}
+@media (prefers-reduced-motion: no-preference) {
+  [data-narrow-pane-overlay] {
+    will-change: transform, opacity;
+    animation: mobile-drawer-enter-right 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  [data-narrow-pane-overlay][data-narrow-pane-side='left'] {
+    animation-name: mobile-drawer-enter-left;
+  }
+}
+@keyframes mobile-drawer-enter-left {
+  from { opacity: 0.01; transform: translateX(-0.875rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes mobile-drawer-enter-right {
+  from { opacity: 0.01; transform: translateX(0.875rem); }
+  to { opacity: 1; transform: translateX(0); }
 }
 
 /* Safe-area helpers usable from any screen. */
