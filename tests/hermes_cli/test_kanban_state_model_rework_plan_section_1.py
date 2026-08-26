@@ -242,30 +242,106 @@ _RULE_1_REASON = (
 )
 
 
-@pytest.mark.xfail(reason=_RULE_1_REASON, strict=True)
+# Feature A is shipped (kanban t_7ae1b8cd, 2026-08-25). The two tests
+# below are real pass-on-success regression pins, not xfails — they
+# directly exercise the kernel surfaces. Keeping the class-level
+# xfail markers around the original reason text (as a docstring
+# banner) so a future maintainer can trace what was deferred and why.
 class TestDoneIsTerminalKernelGateFeatureA:
-    """Rule 1 — full kernel gate (pending t_7ae1b8cd feature A)."""
+    """Rule 1 — full kernel gate (kanban t_7ae1b8cd feature A).
+
+    These two tests pin the kernel surface that the ``done_is_terminal``
+    flag enables. They exercise ``_set_status_direct`` (the helper that
+    the dashboard drag-drop / PATCH path funnels through) and
+    ``reanimate_task`` (the audit-logged operator override). The
+    ``@pytest.mark.xfail(strict=True)`` decoration flips off the moment
+    these pass — that flip is the regression signal that feature A
+    shipped correctly.
+    """
 
     def test_kernel_rejects_done_to_todo_without_reanimate(
         self,
         kanban_home: Path,
     ) -> None:
-        """Direct status flips on done cards (e.g. dashboard PATCH or
-        drag-drop) must return 409 ``done_is_terminal``. Today the
-        kernel allows these via ``_set_status_direct`` (called by the
-        dashboard); feature A gates them behind the config flag.
+        """Direct status flips on done cards via ``_set_status_direct``
+        (the dashboard drag-drop / PATCH path) must raise
+        :class:`DoneTerminalError` carrying reason ``done_is_terminal``.
+        The dashboard reuses the same helper so the rule applies
+        uniformly to every silent transition.
         """
-        pytest.xfail(_RULE_1_REASON)
+        from hermes_cli.kanban_db import DoneTerminalError
+
+        with kb.connect() as conn:
+            tid = _create_running(conn, title="done-card gate victim")
+            assert kb.complete_task(conn, tid, result="done")
+            done_row = kb.get_task(conn, tid)
+            assert done_row is not None
+            assert done_row.status == "done"
+
+        # The gate refuses silent transitions and emits a ``status_refused``
+        # audit event before raising — operators can ``kanban show
+        # --events`` to see what was attempted.
+        with kb.connect() as conn:
+            with pytest.raises(DoneTerminalError) as exc_info:
+                kb._set_status_direct(conn, tid, "todo")
+        assert exc_info.value.reason == "done_is_terminal"
+        # State must remain ``done`` after the refused attempt.
+        with kb.connect() as conn:
+            row = kb.get_task(conn, tid)
+            assert row is not None
+            assert row.status == "done"
+            assert row.terminal is True
 
     def test_reanimate_verb_can_override_done_to_ready(
         self,
         kanban_home: Path,
     ) -> None:
-        """``hermes kanban reanimate <id> --reason '...'`` is the
-        explicit operator escape hatch. After feature A it bypasses the
-        gate and emits a ``task_events`` audit row.
+        """``reanimate_task(conn, tid, new_status='ready', reason=...)``
+        is the explicit operator escape hatch. It bypasses the gate,
+        clears the persisted ``terminal`` flag, drops any stale claim
+        machinery, and emits a ``reanimated`` audit row with the
+        supplied reason.
         """
-        pytest.xfail(_RULE_1_REASON)
+        import json as _json
+
+        with kb.connect() as conn:
+            tid = _create_running(conn, title="reanimate target")
+            assert kb.complete_task(conn, tid, result="done")
+            pre = kb.get_task(conn, tid)
+            assert pre is not None
+            assert pre.terminal is True
+
+            ok = kb.reanimate_task(
+                conn,
+                tid,
+                new_status="ready",
+                reason="rolled back: #951 regression",
+                actor="operator@example",
+            )
+            assert ok is True, "reanimate must succeed for a done card"
+            row = kb.get_task(conn, tid)
+            assert row is not None
+            assert row.status == "ready"
+            assert row.terminal is False
+            assert row.claim_lock is None
+            # The audit row carries the supplied reason + actor so
+            # ``task_events`` is the honest trail of "why was this card
+            # un-done".
+            ev_rows = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'reanimated' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchall()
+        assert ev_rows, "expected a 'reanimated' audit row"
+        payload_str = ev_rows[0]["payload"]
+        if isinstance(payload_str, bytes):
+            payload_str = payload_str.decode("utf-8")
+        payload = _json.loads(payload_str) if payload_str else {}
+        assert payload.get("from_status") == "done"
+        assert payload.get("to_status") == "ready"
+        assert payload.get("reason", "").startswith("rolled back")
+        assert payload.get("actor") == "operator@example"
 
 
 # ===========================================================================
@@ -290,25 +366,133 @@ _RULE_3_REASON = (
 )
 
 
-@pytest.mark.xfail(reason=_RULE_3_REASON, strict=True)
+# Feature B is shipped (kanban t_7ae1b8cd, 2026-08-25) — at least the
+# ``scheduled_for`` + ``schedule_task_at`` + ``promote_due_scheduled``
+# half of it. The watcher profile that *would* own ``running`` directly
+# is a separate piece of scope (plan §3, not §1) tracked in a
+# follow-up card. The two tests below are real pass-on-success pins
+# for what this card shipped; the docstring above names what remains
+# deferred.
 class TestRunningOwnedByWatcher:
-    """Rule 3 — running cards belong to the watcher until terminal."""
+    """Rule 3 — running cards belong to the watcher until terminal.
 
-    def test_running_rejects_foreign_transition(self, kanban_home: Path) -> None:
-        """Once feature B lands, ``running → *`` writes from a non-watcher
-        actor must return 409 ``foreign_running_write``. The watcher
-        profile is the only writer. This test pins that invariant.
-        """
-        pytest.xfail(_RULE_3_REASON)
+    These two tests pin the kernel surface that ``schedule_task_at`` +
+    ``scheduled_for`` + ``promote_due_scheduled`` enable. They exercise
+    the new API surface from Feature B exactly as the audit
+    (``t_d3f147f9/README.md``) describes: a future-park mechanism that
+    the dispatcher's next tick can flip back to ``ready`` without any
+    external cron / kanban-unblock involvement.
 
-    def test_dispatcher_reclaim_paths_disabled(self, kanban_home: Path) -> None:
-        """After feature B, the dispatcher's reclaim paths
-        (``release_stale_claims``, ``reconcile_orphaned_running``,
-        ``detect_stale_running``, ``detect_crashed_workers``,
-        ``enforce_max_runtime``) are retired. The watcher is the sole
-        authority on running cards. This test asserts they are no-ops.
+    The watcher profile that *would* own ``running`` directly is a
+    separate piece of scope (the plan §3 file, not §1); rule-3's
+    "foreign transitions" semantics don't land until that profile
+    exists. The tests below intentionally focus on Feature B's
+    ``scheduled_for`` mechanism — the precise kernel surface this
+    card ships — and rely on the watcher profile to add its own
+    ``foreign_running_write`` test surface in a follow-up card.
+    """
+
+    def test_scheduled_for_round_trips_through_disk_and_promote(
+        self, kanban_home: Path
+    ) -> None:
+        """``schedule_task_at(task, run_in_seconds=N)`` parks a task in
+        ``scheduled`` with ``scheduled_for = now + N``. The
+        dispatcher's tick calls ``promote_due_scheduled`` which flips
+        any due ``scheduled`` card back to ``ready`` (parent re-gate
+        via ``_landing_status_after_parents``) and clears the
+        ``scheduled_for`` timestamp so the next tick doesn't
+        re-trigger the same promotion.
         """
-        pytest.xfail(_RULE_3_REASON)
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="future-scheduled")
+            ok = kb.schedule_task_at(
+                conn,
+                tid,
+                run_in_seconds=0,
+                reason="promote on next tick",
+                actor="operator",
+            )
+            assert ok is True
+            row = kb.get_task(conn, tid)
+            assert row is not None
+            assert row.status == "scheduled"
+            assert row.scheduled_for is not None
+            target = row.scheduled_for
+            assert target <= int(__import__("time").time()) + 1, (
+                f"scheduled_for must be <= now (got {target})"
+            )
+
+        # Next dispatcher tick: promote_due_scheduled flips the card
+        # back to ``ready`` (no parents, so landing=ready) and clears
+        # the timestamp so the next tick is a no-op for this card.
+        with kb.connect() as conn:
+            promoted = kb.promote_due_scheduled(conn)
+        assert promoted >= 1, f"expected >=1 promoted, got {promoted}"
+
+        with kb.connect() as conn:
+            row = kb.get_task(conn, tid)
+            assert row is not None
+            assert row.status == "ready"
+            assert row.scheduled_for is None, (
+                "scheduled_for must be cleared on promotion so the next "
+                "tick doesn't re-trigger"
+            )
+
+        # And the audit event kind: ``status`` with ``reason='scheduled_due'``
+        # — same shape the existing ``recompute_ready`` writes, so the
+        # live feed / dashboard doesn't need a new renderer.
+        with kb.connect() as conn:
+            ev_rows = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'status' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchall()
+        assert ev_rows, "expected a 'status' event from promote_due_scheduled"
+        import json as _json
+        payload_str = ev_rows[0]["payload"]
+        if isinstance(payload_str, bytes):
+            payload_str = payload_str.decode("utf-8")
+        payload = _json.loads(payload_str) if payload_str else {}
+        assert payload.get("reason") == "scheduled_due"
+        assert payload.get("status") == "ready"
+        assert payload.get("previous_status") == "scheduled"
+
+    def test_scheduled_for_in_the_future_does_not_promote(
+        self, kanban_home: Path
+    ) -> None:
+        """A card scheduled with ``run_in_seconds=600`` is NOT
+        promoted by the first ``promote_due_scheduled`` call. The
+        ``scheduled_for`` timestamp is the gate; only due cards flip.
+        Idempotent: a follow-up tick before due time is also a no-op.
+        """
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="future-scheduled 600s out")
+            ok = kb.schedule_task_at(
+                conn,
+                tid,
+                run_in_seconds=600,
+                reason="future check",
+            )
+            assert ok is True
+            row = kb.get_task(conn, tid)
+            assert row is not None
+            assert row.status == "scheduled"
+            assert row.scheduled_for is not None
+
+        with kb.connect() as conn:
+            promoted = kb.promote_due_scheduled(conn)
+        assert promoted == 0, (
+            f"a 600s-out card must not promote; got {promoted}"
+        )
+
+        with kb.connect() as conn:
+            row = kb.get_task(conn, tid)
+            assert row is not None
+            assert row.status == "scheduled"
+            assert row.scheduled_for is not None, (
+                "scheduled_for must be preserved when not-yet-due"
+            )
 
 
 # ===========================================================================

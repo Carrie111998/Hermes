@@ -1158,6 +1158,14 @@ class Task:
     # legacy/un-typed (the pre-§1 behavior, preserved for any rows that
     # existed before this column existed).
     owner: Optional[str] = None
+    # Scheduled-for timestamp (Unix seconds) for rework §1 rule 3 + feature B.
+    # Populated by ``schedule_task_at(conn, task_id, run_in_seconds=N)`` when a
+    # caller parks a task with a delay. The dispatcher's tick promotes
+    # ``scheduled`` → ``ready`` whenever ``scheduled_for <= now`` (see
+    # ``promote_due_scheduled``). ``None`` = parked without a time (the
+    # pre-§1 ``schedule_task`` behavior — waits for an explicit
+    # ``unblock_task`` / external cron, never auto-promotes).
+    scheduled_for: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1260,6 +1268,11 @@ class Task:
             owner=(
                 row["owner"]
                 if "owner" in keys and row["owner"]
+                else None
+            ),
+            scheduled_for=(
+                int(row["scheduled_for"])
+                if "scheduled_for" in keys and row["scheduled_for"] is not None
                 else None
             ),
         )
@@ -1469,7 +1482,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- are rejected at the kernel guard layer. Existing rows backfill to
     -- NULL, matching the pre-§1 behavior where ``running`` ownership was
     -- not persisted.
-    owner                TEXT
+    owner                TEXT,
+    -- Scheduled-for timestamp (Unix seconds). Set by
+    -- ``schedule_task_at(conn, task_id, run_in_seconds=N)`` to ``now + N``;
+    -- the dispatcher's tick promotes ``scheduled`` → ``ready`` whenever
+    -- this column is non-null and ``<= now`` (see ``promote_due_scheduled``).
+    -- NULL = parked without an auto-promotion time — the pre-§1
+    -- ``schedule_task`` shape, promoted by an explicit ``unblock_task``
+    -- rather than by the dispatcher clock. NULL on every existing row
+    -- (legacy cards have no scheduled-for semantics).
+    scheduled_for       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2746,6 +2768,43 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # on the task row itself.
         _add_column_if_missing(conn, "tasks", "owner", "owner TEXT")
 
+    # Feature B migration: ``scheduled_for`` timestamp column. NULL on every
+    # pre-existing row — the pre-§1 ``schedule_task`` shape (park without
+    # timestamp) is preserved on cards that no caller has re-scheduled via
+    # ``schedule_task_at``.
+    if "scheduled_for" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "scheduled_for", "scheduled_for INTEGER"
+        )
+
+    # Feature A backfill (gated to run once per board): every row currently
+    # in ``status='done'`` is a terminal card. The kernel gate below refuses
+    # any transition out of ``done`` without an explicit operator override,
+    # so the persisted ``terminal`` flag must agree with the live status or
+    # the gate would silently let those cards move. ``terminal`` was added
+    # with a non-null default of 0 in the prior migration (t_002084ad); this
+    # UPDATE is safe to re-run — it's a no-op once every done card already
+    # has ``terminal=1``. Idempotent by construction: rows that already have
+    # ``terminal=1`` get written to the same value.
+    #
+    # Defensive: the migration may run against synthetic test schemas
+    # (``tests/hermes_cli/test_kanban_db.py`` race-window test) that
+    # don't carry a ``status`` column. Guard on column presence so the
+    # helper remains tolerant of stripped schemas — the helper is
+    # shared with init_db but the backfill only matters for live
+    # boards where both columns exist. A live DB created via
+    # ``init_db`` (which executes the full SCHEMA_SQL) always has both
+    # columns, so the guard doesn't change real-world behavior.
+    if "status" in {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    } and "terminal" in {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }:
+        conn.execute(
+            "UPDATE tasks SET terminal = 1 "
+            "WHERE status = 'done' AND terminal = 0"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3252,6 +3311,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     terminal: bool = False,
     owner: Optional[str] = None,
+    scheduled_for: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3576,8 +3636,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
-                        terminal, owner
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        terminal, owner, scheduled_for
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3605,6 +3665,7 @@ def create_task(
                         session_id,
                         1 if terminal else 0,
                         owner,
+                        int(scheduled_for) if scheduled_for is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -5531,7 +5592,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       terminal     = 1
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
@@ -5548,7 +5610,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       terminal     = 1
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
@@ -8100,6 +8163,13 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    scheduled_due: int = 0
+    """Feature B (kanban t_7ae1b8cd) — count of cards the dispatcher
+    promoted from ``scheduled`` to ``ready`` (or ``todo``) this tick
+    because their ``scheduled_for`` timestamp had arrived. Same
+    telemetry shape as ``promoted``; named separately so an operator can
+    see which fraction of ready-state arrivals came from a clock event
+    versus a parent-completion cascade."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
@@ -9691,6 +9761,394 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def done_is_terminal_enabled() -> bool:
+    """Return whether the rework-§1 ``done`` terminal-state gate is enforced.
+
+    When True (the default), the kernel refuses any ``done`` →
+    ``{not-done}`` status transition except via the explicit
+    :func:`reanimate_task` operator override. The flag gates the dashboard
+    drag-drop / PATCH path (the legacy ``invalidate_descendants_for_parent_reopen``
+    carve-out is intentionally preserved by the gate — see that function's
+    docstring). The CLI verb ``hermes kanban reanimate`` is always
+    available; the gate only blocks implicit transitions.
+
+    Operators can opt out with ``kanban.done_is_terminal: false`` in
+    ``config.yaml``. Backwards-compatible with boards that want to keep the
+    pre-§1 ability to silently un-done a card (the audit recommends against
+    this, but the escape hatch exists so a stuck gate can be turned off
+    via a config edit rather than a kernel patch).
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return True
+    if cfg is None:
+        return True
+    try:
+        return bool(
+            (cfg.get("kanban") or {}).get("done_is_terminal", True)
+        )
+    except Exception:
+        return True
+
+
+class DoneTerminalError(Exception):
+    """Raised when a kernel transition out of ``done`` violates the gate.
+
+    The raised ``reason`` mirrors the CLI/dashboard 409 payload so a
+    human-looking surface can render it directly. The accompanying
+    ``task_id`` is the card the caller tried to mutate, and ``new_status``
+    is the requested destination.
+    """
+
+    def __init__(self, task_id: str, new_status: str, reason: str = "done_is_terminal"):
+        self.task_id = task_id
+        self.new_status = new_status
+        self.reason = reason
+        super().__init__(
+            f"task {task_id!r} is terminal (status='done'); "
+            f"refusing transition to {new_status!r} "
+            f"(use kanban reanimate to override)"
+        )
+
+
+def _set_status_direct(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    allow_done_terminal: bool = False,
+    set_terminal: Optional[bool] = None,
+    set_owner: Optional[str] = None,
+    clear_scheduled_for: bool = False,
+    actor: Optional[str] = None,
+    extra_columns: Optional[dict] = None,
+) -> bool:
+    """Single funnel for one-row status mutations on ``tasks``.
+
+    Implements the rework-§1 state guards in one place so future helpers
+    don't have to re-implement the ``done``-terminal check or forget the
+    ``terminal`` / ``owner`` column coupling. Every public kernel helper
+    that wants to issue ``UPDATE tasks SET status=...`` should call this
+    function instead of issuing raw SQL.
+
+    ``allow_done_terminal=True`` is reserved for the operator's explicit
+    reanimation path (``reanimate_task`` below) and the audit-cleared
+    parent-reopen cascade. Every other caller leaves it at False; the
+    gate then enforces the rework-§1 rule 1 invariant.
+
+    ``set_terminal`` / ``set_owner`` let a caller express the cross-column
+    invariants: when ``new_status == 'done'`` the row's ``terminal`` flag
+    must flip to 1; when ``new_status == 'running'`` the row's ``owner``
+    must be stamped (typically to the dispatcher identity today; a watcher
+    profile once feature B becomes the canonical owner). Pass
+    ``set_terminal=None`` (default) and ``set_owner=None`` when the caller
+    wants the helper to pick the obvious coupled value automatically:
+
+    - ``new_status == 'done'`` → ``terminal=1`` (set implicitly)
+    - ``new_status == 'running'`` → leave ``owner`` unchanged unless the
+      caller explicitly passed ``set_owner`` (the dispatcher's
+      ``claim_task`` writes the owner separately today; feature B's
+      watcher-stamp lives behind a future, narrower helper).
+    - any other status → ``terminal`` left at its current value,
+      ``owner`` left at its current value.
+
+    ``clear_scheduled_for=True`` resets ``scheduled_for`` to NULL on the
+    destination row. Use this for any helper that promotes a card out of
+    the ``scheduled`` bucket so a stale timestamp doesn't leak into
+    ``ready`` / ``running`` and re-trigger a promotion on the next tick.
+
+    ``actor`` is included in the audit ``status`` event payload so the
+    reason it was mutated (dashboard drag, scheduled-due promotion, etc.)
+    is recoverable from ``task_events`` even if the helper wraps this.
+
+    Returns True if a row was updated; False otherwise (no matching row,
+    or the gate refused).
+    """
+    # Gate: rule 1 — ``done`` is terminal when the operator asked for it.
+    if not allow_done_terminal:
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if current is not None and current["status"] == "done":
+            if done_is_terminal_enabled() and new_status != "done":
+                # Audit the refused attempt before raising so an operator
+                # can ``kanban show --events`` to see who tried to do what.
+                try:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "status_refused",
+                        {
+                            "reason": "done_is_terminal",
+                            "new_status": new_status,
+                            "actor": actor,
+                        },
+                    )
+                except Exception:
+                    # The event log is best-effort; never let the audit
+                    # raise before the gate does.
+                    pass
+                raise DoneTerminalError(task_id, new_status)
+        # Backwards-compat: even when the config flag is off, ensure the
+        # persisted ``terminal`` column matches a row that just entered
+        # done (the backfill at migration time already handled legacy
+        # cards; this guards in-flight completions from drifting).
+        if (
+            current is not None
+            and current["status"] != "done"
+            and new_status == "done"
+        ):
+            # Mark the column for set below — caller-passed set_terminal
+            # wins if it was explicit.
+            if set_terminal is None:
+                set_terminal = True
+
+    sets = ["status = ?"]
+    params: list[Any] = [new_status]
+
+    if set_terminal is True:
+        sets.append("terminal = 1")
+    elif set_terminal is False:
+        sets.append("terminal = 0")
+
+    if set_owner is not None:
+        sets.append("owner = ?")
+        params.append(set_owner)
+
+    if clear_scheduled_for:
+        sets.append("scheduled_for = NULL")
+
+    if extra_columns:
+        for col, val in extra_columns.items():
+            sets.append(f"{col} = ?")
+            params.append(val)
+
+    params.append(task_id)
+    sql = f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?"
+    cur = conn.execute(sql, params)
+    return cur.rowcount == 1
+
+
+def reanimate_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    new_status: str,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> bool:
+    """Operator-override verb for the ``done``-terminal gate.
+
+    When a card truly needs to be reanimated (the original completion was
+    wrong, the work regressed and needs re-running) the operator uses
+    this helper, not the dashboard drag-drop / PATCH path. It bypasses
+    :func:`done_is_terminal_enabled` while logging every use to
+    ``task_events`` with the supplied ``reason`` so the audit trail
+    records WHY the card was un-done. The CLI verb ``hermes kanban
+    reanimate`` is the documented operator surface.
+
+    ``new_status`` must be one of the resumable phases (``ready``,
+    ``todo``, ``blocked``, ``scheduled``). ``archive`` is NOT a valid
+    reanimation destination — use :func:`archive_task` directly, which
+    has its own gate. The rule-1 invariant is preserved either way: the
+    kernel still refuses any silent dashboard drag-drop, but an operator
+    who calls this function with a justified reason can move the card.
+
+    Returns True on a successful reanimation, False if the row is missing
+    or ``new_status`` is not a valid resumable status. The audit event
+    ``reanimated`` is emitted with ``{from_status, to_status, reason,
+    actor}`` so an operator scanning ``task_events`` can see exactly
+    which cards were reanimated and by whom.
+    """
+    if new_status not in {"ready", "todo", "blocked", "scheduled"}:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, terminal FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if current is None:
+            return False
+        if current["status"] != "done":
+            # Nothing to reanimate: the card isn't terminal. Treat as a
+            # no-op so a CLI invocation doesn't silently do something
+            # unexpected — surfaces the operator's confusion in the
+            # error path instead of via a confusing event log.
+            return False
+        updated = _set_status_direct(
+            conn,
+            task_id,
+            new_status,
+            allow_done_terminal=True,
+            set_terminal=False,
+            actor=actor,
+        )
+        if not updated:
+            return False
+        # Clear any stale ``claim_lock`` / ``claim_expires`` / ``worker_pid``
+        # in case the row was completed mid-run and a stale claim survived
+        # the completion path (defensive; the completion path usually
+        # clears them already, but a reanimated card should never carry
+        # a claim to a worker that doesn't exist anymore).
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "reanimated",
+            {
+                "from_status": "done",
+                "to_status": new_status,
+                "reason": reason,
+                "actor": actor,
+            },
+        )
+    return True
+
+
+def schedule_task_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_in_seconds: int,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> bool:
+    """Park a task in ``scheduled`` with a future ``scheduled_for`` timestamp.
+
+    Feature B companion to :func:`schedule_task`: the legacy helper
+    parks without a timestamp and waits for an explicit
+    :func:`unblock_task`; this helper stamps ``scheduled_for = now + N``
+    and lets the dispatcher tick flip the card back to ``ready`` once
+    the time arrives. ``run_in_seconds`` must be a non-negative integer;
+    zero is a valid "promote on the next tick" knob.
+
+    The persisted ``scheduled_for`` is the dispatcher's promotion signal
+    — see :func:`promote_due_scheduled`. The dispatcher call is the only
+    place that uses it; callers should not poke at the column directly.
+
+    Returns True on a successful schedule, False when the row is missing
+    or the source status isn't a valid pre-``scheduled`` phase.
+    """
+    if run_in_seconds < 0:
+        raise ValueError("run_in_seconds must be >= 0")
+    now = int(time.time())
+    target = now + int(run_in_seconds)
+    with write_txn(conn):
+        # Closing any in-flight run keeps the runs invariant
+        # (``current_run_id IS NULL`` ⇔ terminal run state) intact
+        # across the schedule hop, mirroring ``schedule_task``.
+        closed_run = _end_run(
+            conn, task_id,
+            outcome="scheduled", status="scheduled",
+            summary=reason,
+        )
+        if closed_run is None and reason:
+            closed_run = _synthesize_ended_run(
+                conn, task_id,
+                outcome="scheduled",
+                summary=reason,
+            )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'scheduled',
+                   scheduled_for = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   current_run_id= NULL
+             WHERE id = ?
+               AND status IN ('todo', 'ready', 'running', 'blocked')
+            """,
+            (target, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "scheduled",
+            {
+                "reason": reason,
+                "scheduled_for": target,
+                "run_in_seconds": int(run_in_seconds),
+                "actor": actor,
+            },
+            run_id=closed_run,
+        )
+    return True
+
+
+def promote_due_scheduled(conn: sqlite3.Connection) -> int:
+    """Promote every due ``scheduled`` card back to ``ready``.
+
+    Dispatcher tick step (Feature B). Called between
+    :func:`recompute_ready` and the spawn loop on every tick. A card with
+    ``status='scheduled'`` and ``scheduled_for IS NOT NULL AND
+    scheduled_for <= now`` flips to ``ready`` (or ``todo`` when a parent
+    is still outstanding — same parent-re-gate :func:`unblock_task`
+    uses). The ``scheduled_for`` column is cleared on success so the
+    next tick doesn't re-trigger the same promotion, and a ``status``
+    event is appended for the audit trail.
+
+    Returns the count of promoted cards for telemetry / DispatchResult.
+    """
+    now = int(time.time())
+    promoted = 0
+    rows = conn.execute(
+        "SELECT id, status FROM tasks "
+        "WHERE status = 'scheduled' "
+        "  AND scheduled_for IS NOT NULL "
+        "  AND scheduled_for <= ? "
+        "ORDER BY scheduled_for ASC",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        landing = _landing_status_after_parents(conn, tid)
+        try:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = ?,
+                       scheduled_for = NULL,
+                       block_kind    = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'scheduled'
+                   AND scheduled_for IS NOT NULL
+                   AND scheduled_for <= ?
+                """,
+                (landing, tid, now),
+            )
+        except sqlite3.OperationalError:
+            # Race: a concurrent writer re-scheduled this row between the
+            # SELECT and the UPDATE. The next tick will pick it up; this
+            # tick should not crash.
+            continue
+        if cur.rowcount != 1:
+            continue
+        _append_event(
+            conn,
+            tid,
+            "status",
+            {
+                "status": landing,
+                "reason": "scheduled_due",
+                "previous_status": "scheduled",
+                "scheduled_for": now,
+            },
+        )
+        promoted += 1
+    return promoted
+
+
 # ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
@@ -10051,6 +10509,15 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Feature B (kanban t_7ae1b8cd): surface every ``scheduled`` card whose
+    # ``scheduled_for`` clock has elapsed back to ``ready`` (or ``todo`` if
+    # a parent is still outstanding). Hooked into the dispatcher tick
+    # because the watcher profile that *will* own running cards in the
+    # full §3 design doesn't exist yet — the dispatcher is the bridge.
+    # Cheap (indexed column + O(scheduled cards due) write); doesn't
+    # block the spawn loop. Result is surfaced for telemetry symmetry
+    # with ``result.promoted``.
+    result.scheduled_due = promote_due_scheduled(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

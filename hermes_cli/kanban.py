@@ -643,6 +643,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+    p_schedule.add_argument(
+        "--in-seconds", type=int, default=None, metavar="N",
+        help=(
+            "Feature B (kanban t_7ae1b8cd): schedule the task to auto-promote "
+            "to ready after N seconds. Uses kanban_schedule(task, +N) so the "
+            "dispatcher's next tick flips it back when due. Omitting the flag "
+            "preserves pre-Feature-B behavior: park without a timestamp and "
+            "wait for an explicit unblock."
+        ),
+    )
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -654,6 +664,37 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    # Feature A (kanban t_7ae1b8cd) operator override for the
+    # ``done``-terminal gate. ``hermes kanban reanimate <id> --reason 'why'``
+    # is the only kernel-approved path to un-done a card; the audit
+    # requires every such move to be logged with a justification so an
+    # operator scanning ``task_events`` can see WHY work regressed.
+    p_reanimate = sub.add_parser(
+        "reanimate",
+        help=(
+            "Operator override for the done-terminal gate: move a 'done' "
+            "task back to a resumable status (ready/todo/blocked/scheduled). "
+            "Bypasses kanban.done_is_terminal; logs a 'reanimated' audit "
+            "event with the supplied --reason. Use sparingly."
+        ),
+    )
+    p_reanimate.add_argument("task_id")
+    p_reanimate.add_argument(
+        "--to-status",
+        default="ready",
+        choices=("ready", "todo", "blocked", "scheduled"),
+        help="Where to land the reanimated card (default: ready)",
+    )
+    p_reanimate.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "Why this card was un-done. Required — recorded in task_events "
+            "and surfaced on the card timeline so the audit trail is "
+            "honest about who reanimated what and why."
+        ),
+    )
 
     p_request_review = sub.add_parser(
         "request-review",
@@ -1130,6 +1171,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "reanimate": _cmd_reanimate,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -2375,21 +2417,39 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    in_seconds = getattr(args, "in_seconds", None)
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
-            if not kb.schedule_task(
-                conn,
-                tid,
-                reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            # Feature B: --in-seconds routes through schedule_task_at so the
+            # dispatcher's tick flips the card back when due. No flag =
+            # legacy schedule_task (park without timestamp).
+            ok = False
+            if in_seconds is not None:
+                ok = kb.schedule_task_at(
+                    conn,
+                    tid,
+                    run_in_seconds=int(in_seconds),
+                    reason=reason,
+                    actor=author,
+                )
+            else:
+                ok = kb.schedule_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            if not ok:
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
-                print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+                suffix = f": {reason}" if reason else ""
+                if in_seconds is not None:
+                    suffix += f" (auto-promote in {int(in_seconds)}s)"
+                print(f"Scheduled {tid}{suffix}")
     return 0 if not failed else 1
 
 
@@ -2413,6 +2473,43 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_reanimate(args: argparse.Namespace) -> int:
+    """CLI handler for ``hermes kanban reanimate`` (Feature A).
+
+    Bypasses the ``done``-terminal gate with a logged ``--reason`` so
+    the audit trail records WHY the operator overrode the gate. The
+    underlying kernel helper is :func:`kb.reanimate_task`, which fails
+    closed if the row is missing or not currently ``done``.
+    """
+    tid = args.task_id
+    new_status = args.to_status
+    reason = (args.reason or "").strip()
+    if not reason:
+        # argparse ``required=True`` already enforced, but defend in
+        # depth against stripped-empty inputs.
+        print("--reason is required and must not be empty", file=sys.stderr)
+        return 1
+    author = _profile_author()
+    with kb.connect_closing() as conn:
+        if not kb.reanimate_task(
+            conn, tid, new_status=new_status, reason=reason, actor=author,
+        ):
+            print(
+                f"cannot reanimate {tid} "
+                f"(not done? or invalid --to-status?)",
+                file=sys.stderr,
+            )
+            return 1
+        kb.add_comment(
+            conn, tid, author,
+            f"REANIMATED → {new_status}: {reason}",
+        )
+    print(
+        f"Reanimated {tid} → {new_status} (reason logged to task_events)"
+    )
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
