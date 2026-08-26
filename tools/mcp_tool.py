@@ -2992,11 +2992,9 @@ class MCPServerTask:
             # os.kill probe below only runs when psutil is unavailable.
             import psutil
 
-            if not psutil.pid_exists(pid):
-                continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
-        return True
+            if psutil.pid_exists(pid):
+                return False  # at least one child alive → not dead
+        return True  # every tracked child has exited
 
     async def _watch_stdio_children(self) -> None:
         """Poll child liveness while a stdio RPC is in flight (#81995).
@@ -6127,6 +6125,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         and isinstance(_stdio_dead_result := _stdio_dead(), bool)
                         and _stdio_dead_result
                     ):
+                        # Dead stdio children with a stale session object: the
+                        # transport failed WITHOUT clearing session, so the
+                        # line-6077 reconnect path never fires. Signal the
+                        # server task to rebuild the transport (respawn the
+                        # subprocess) in the background and return a clean
+                        # reconnecting error; the next call lands on the fresh
+                        # session. The breaker resets once it initializes.
+                        _bump_server_error(server_name)
+                        if _signal_reconnect(server):
+                            return tool_error(
+                                f"MCP server '{server_name}' stdio subprocess is "
+                                f"dead and reconnect was requested. Do NOT retry "
+                                f"immediately — give it a few seconds to respawn."
+                            )
                         raise TimeoutError(
                             f"MCP stdio subprocess for '{server_name}' has "
                             f"exited; failing the call fast instead of "
