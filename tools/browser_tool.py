@@ -147,18 +147,37 @@ try:
 except Exception:
     check_website_access = lambda url: None  # noqa: E731 — fail-open if policy module unavailable
 
+class _URLSafetyVerdictFallback:
+    """Minimal fail-closed verdict used when tools.url_safety is unavailable."""
+
+    ok = False
+    reason = "error:internal"
+    detail = "safety module unavailable"
+    scheme = ""
+    hostname = ""
+    resolved_ips: tuple = ()
+    checked_at = 0.0
+
+
 try:
     from tools.url_safety import (
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
         normalize_url_for_request as _normalize_url_for_request,
         sensitive_query_param_name as _sensitive_query_param_name,
+        resolve_and_check_url as _resolve_and_check_url,
+        url_block_reason as _url_block_reason,
+        _classify_ip as _classify_ip,
+        _PRIVATE_ROUTING_REASONS as _PRIVATE_ROUTING_REASONS,
     )
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
     _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
     _sensitive_query_param_name = lambda url: None  # noqa: E731 — best-effort fallback
+    _resolve_and_check_url = lambda url, **kw: _URLSafetyVerdictFallback()  # noqa: E731 — fail-closed verdict
+    _url_block_reason = lambda url, **kw: "error:internal"  # noqa: E731 — fail-closed
+    _classify_ip = lambda ip: (True, "blocked:parse")  # noqa: E731 — fail-closed
 # Browser-provider ABC + registry — PR #25214 moved the per-vendor providers
 # (Browserbase / Browser Use / Firecrawl) out of ``tools/browser_providers/``
 # and into ``plugins/browser/<vendor>/``. The dispatcher consults the
@@ -845,26 +864,19 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
     global _cached_cloud_provider, _cloud_provider_resolved
 
     resolved: Optional[CloudBrowserProvider] = None
-    provider_key = None
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
+        provider_key = None
         if isinstance(browser_cfg, dict) and "cloud_provider" in browser_cfg:
             provider_key = normalize_browser_cloud_provider(
                 browser_cfg.get("cloud_provider")
             )
-            if provider_key in ("local", "camofox"):
-                # Camofox runs through the built-in browser tools
-                # (is_camofox_mode() dispatch), not a cloud provider.
+            if provider_key == "local":
                 _cached_cloud_provider = None
                 _cloud_provider_resolved = True
                 return None
-            if provider_key == "nous":
-                # Managed "Nous Subscription" selection is serviced by the
-                # Browser Use provider, whose config resolver routes it
-                # through the managed browser-use gateway.
-                provider_key = "browser-use"
         if provider_key:
             try:
                 if _is_legacy_provider_registry_overridden():
@@ -878,20 +890,20 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
                     # populated. Idempotent — cheap on subsequent calls.
                     _ensure_browser_plugins_loaded()
                     resolved = _registry_get_browser_provider(provider_key)
-                if resolved is None:
-                    # Strict selection: a stored-but-unregistered name is an
-                    # honest error, never a silent reroute to auto-detect.
-                    from tools.tool_backend_helpers import selection_error
-
-                    raise ValueError(selection_error(
-                        "browser",
-                        f"'{provider_key}'",
-                        "no registered browser plugin has that name (install "
-                        "the corresponding plugin or fix the config key "
-                        "spelling)",
-                    ))
-            except ValueError:
-                raise
+                    if resolved is None:
+                        # Explicit config name unknown to the registry —
+                        # might be a typo, an uninstalled plugin, or a
+                        # registry-population failure. Warn the user
+                        # (legacy code would have surfaced a typed
+                        # credentials error via direct class instantiation;
+                        # post-migration we surface this WARNING instead).
+                        logger.warning(
+                            "browser.cloud_provider=%r is not a registered "
+                            "browser plugin; falling back to auto-detect "
+                            "(install the corresponding plugin or fix the "
+                            "config key spelling).",
+                            provider_key,
+                        )
             except Exception:
                 logger.warning(
                     "Failed to instantiate explicit cloud_provider %r; will retry on next call",
@@ -899,16 +911,13 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
                     exc_info=True,
                 )
                 return None
-    except ValueError:
-        raise
     except Exception as e:
         # Config file may be temporarily unreadable; still try auto-detect so
         # env-based / managed-gateway credentials can resolve. Don't pin cache.
         logger.debug("Could not read cloud_provider from config: %s", e)
 
-    if resolved is None and provider_key is None:
-        # Auto-detect path — permitted ONLY when no cloud_provider selection
-        # was ever written: Browser Use first (managed Nous gateway or
+    if resolved is None:
+        # Auto-detect path: Browser Use first (managed Nous gateway or
         # direct API key), then Browserbase (direct credentials). Uses
         # the legacy class names imported at the top of this module so
         # tests that ``monkeypatch.setattr(browser_tool, "BrowserUseProvider", ...)``
@@ -1430,60 +1439,41 @@ def _auto_local_for_private_urls() -> bool:
 def _url_is_private(url: str) -> bool:
     """Return True when the URL's host resolves to a private/LAN/loopback address.
 
-    Reuses ``tools.url_safety.is_safe_url`` as the oracle — if the SSRF check
-    would reject the URL, we treat it as "private" for routing purposes.  DNS
-    resolution failures are treated as NOT private (fall through to whatever
-    backend is configured, which will surface the DNS error naturally).
+    Reuses ``tools.url_safety``'s shared classification core so routing and
+    enforcement always agree on IP classes (Region D). Hybrid-routing
+    semantics are preserved: bare ``localhost`` / ``.localhost`` /
+    ``.local`` / ``.lan`` / ``.internal`` names route to the local sidecar
+    WITHOUT DNS, and DNS-resolution failures / parse errors are treated as
+    NOT private (fall through to whatever backend is configured, which
+    surfaces the DNS error naturally).
     """
     try:
-        # is_safe_url returns False for private/loopback/link-local/CGNAT AND
-        # for DNS failures.  We only want the private-network case here, so
-        # we parse + check the host shape as a DNS-failure sieve first.
-        from urllib.parse import urlparse
         import ipaddress
-        import socket
+        from urllib.parse import urlparse
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").strip().lower().rstrip(".")
         if not hostname:
             return False
-        # Literal IP → check directly
-        try:
-            ip = ipaddress.ip_address(hostname)
-            return (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                # 172.16.0.0/12: only covered by ip.is_private on Python
-                # ≥3.11 (bpo-40791).  Explicit check keeps 3.10 runtimes
-                # routing these to the local sidecar correctly.
-                or ip in ipaddress.ip_network("172.16.0.0/12")
-                or ip in ipaddress.ip_network("100.64.0.0/10")
-            )
-        except ValueError:
-            pass
-        # Hostname — must resolve to confirm it's private (bare "localhost"
-        # resolves to 127.0.0.1 via /etc/hosts).  Short-circuit on obvious
-        # names to avoid a DNS hop.
+        # Routing-only pre-screen: obvious local names short-circuit without
+        # a DNS hop (unchanged from the pre-Region-D behavior).
         if hostname in {"localhost",} or hostname.endswith(".localhost"):
             return True
         if hostname.endswith(".local") or hostname.endswith(".lan") or hostname.endswith(".internal"):
             return True
+        # Literal IP → shared classification core (mapped-CGNAT / mapped
+        # Alibaba / ::/96 divergences closed).
         try:
-            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        except socket.gaierror:
-            return False  # DNS fail → not private, let the normal path fail
-        for _, _, _, _, sockaddr in addr_info:
-            try:
-                ip = ipaddress.ip_address(sockaddr[0])
-            except ValueError:
-                continue
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip in ipaddress.ip_network("100.64.0.0/10")
-            ):
-                return True
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            return _classify_ip(ip)[0]
+        # Hostname → resolve via the shared helper. Pinned exclusions:
+        # error:dns / error:internal / blocked:parse are NOT private (routing
+        # falls through to the configured backend, as before).
+        v = _resolve_and_check_url(url)
+        if not v.ok:
+            return v.reason in _PRIVATE_ROUTING_REASONS
         return False
     except Exception as exc:
         logger.debug("URL-privacy check failed for %s: %s", url, exc)
@@ -3276,8 +3266,15 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
-def evaluate_url_safety(url: str) -> Optional[dict]:
-    """Run URL safety checks; None if safe, else an error dict"""
+def evaluate_url_safety(url: str, strict: bool = False) -> Optional[dict]:
+    """Run URL safety checks; None if safe, else an error dict.
+
+    ``strict=True`` (browser_exec pre-check): the private-address gate is
+    unconditional w.r.t. the local-backend posture and fails closed on DNS
+    errors — it uses ``url_block_reason`` directly, never ``is_safe_url``'s
+    proxy-delegation branch. Non-strict callers (browser_navigate's own
+    pre-check and anything else) are byte-for-byte unchanged.
+    """
     import urllib.parse
     from agent.redact import _PREFIX_RE
 
@@ -3298,8 +3295,20 @@ def evaluate_url_safety(url: str) -> Optional[dict]:
             "query parameter before navigating.")}
     if _is_always_blocked_url(url):
         return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
-    if not local and not _allow_private_urls() and not _is_safe_url(url):
-        return {"success": False, "error": "Blocked: URL targets a private or internal address"}
+    if strict:
+        reason = _url_block_reason(url)
+        if reason is not None:
+            if reason in ("blocked:metadata-host", "blocked:metadata-ip",
+                          "blocked:link-local", "blocked:ipv4-compatible"):
+                return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
+            if reason in ("error:dns", "error:internal"):
+                return {"success": False, "error": (
+                    "Blocked: the destination could not be safely verified "
+                    "(DNS resolution failed) — page output was withheld.")}
+            return {"success": False, "error": "Blocked: URL targets a private or internal address"}
+    else:
+        if not local and not _allow_private_urls() and not _is_safe_url(url):
+            return {"success": False, "error": "Blocked: URL targets a private or internal address"}
     blocked = check_website_access(url)
     if blocked:
         return {"success": False, "error": blocked["message"],
@@ -4709,47 +4718,26 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 ),
             }, ensure_ascii=False)
 
-        # NOTE: the full-resolution base64 encode is deliberately deferred.
-        # The native fast path below sizes its own history-reuse embed via
-        # _resize_image_for_vision (stat-based quick estimate — no full-res
-        # encode when oversized), and only the aux-LLM fallback path needs
-        # the one-shot full-res data URL.
+        # Convert screenshot to base64 at full resolution.
+        _screenshot_bytes = screenshot_path.read_bytes()
+        _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
+        data_url = f"data:image/png;base64,{_screenshot_b64}"
 
         # Fast path: when native image routing is in effect for the active main
         # model, attach the screenshot directly instead of describing it through
         # an auxiliary vision LLM. The model inspects the pixels on its next
         # turn — no aux call, no information loss. Consistent with vision_analyze.
         from tools.vision_tools import (
-            _EMBED_MAX_DIMENSION,
-            _EMBED_TARGET_BYTES,
             _build_native_vision_tool_result,
-            _resize_image_for_vision,
             _should_use_native_vision_fast_path,
         )
 
         if _should_use_native_vision_fast_path():
-            # History-reuse cap (#92699): this embed is baked into the tool
-            # result and re-sent on every later turn, exactly like
-            # vision_analyze's native path — apply the same proactive resize
-            # so full-res screenshots can't enter immutable history uncapped.
-            # The helper's internal stat/dimension quick-estimate skips the
-            # resize (and encodes directly) when the screenshot is already
-            # under both caps, so no full-res base64 is built just to be
-            # thrown away. Fail-open: without Pillow it falls back to the
-            # raw bytes and the compressor's keep-newest pass still retires
-            # stale embeds.
-            data_url = _resize_image_for_vision(
-                screenshot_path,
-                mime_type="image/png",
-                max_base64_bytes=_EMBED_TARGET_BYTES,
-                max_dimension=_EMBED_MAX_DIMENSION,
-                force_jpeg=True,
-            )
             native_result = _build_native_vision_tool_result(
                 image_url=str(screenshot_path),
                 question=question,
                 image_data_url=data_url,
-                image_size_bytes=screenshot_path.stat().st_size,
+                image_size_bytes=len(_screenshot_bytes),
             )
             meta = native_result.setdefault("meta", {})
             meta["screenshot_path"] = str(screenshot_path)
@@ -4771,13 +4759,6 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             f"or CAPTCHAs, describe what type they are and what action might be needed. "
             f"Focus on answering the user's specific question."
         )
-
-        # Aux-LLM path: one-shot analysis, not baked into history — encode at
-        # full resolution here (the pre-existing 5 MB oversize guard below
-        # still applies).
-        _screenshot_bytes = screenshot_path.read_bytes()
-        _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
-        data_url = f"data:image/png;base64,{_screenshot_b64}"
 
         # Use the centralized LLM router
         vision_model = _get_vision_model()
@@ -5419,145 +5400,64 @@ if __name__ == "__main__":
 # Registry
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
-from tools.browser_extension_router import (
-    extension_controller_available,
-    routed_browser_handler,
-)
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
-
-
-def _browser_router_kw(kw: dict) -> dict:
-    """Identity kwargs forwarded to the extension router wrapper."""
-    return {
-        "task_id": kw.get("task_id"),
-        "session_id": kw.get("session_id"),
-    }
-
-
-def check_browser_routed_requirements(action: str = "browser_snapshot") -> bool:
-    """Availability gate for tools that can use either browser backend."""
-    return check_browser_requirements() or extension_controller_available(action)
-
-
-def check_browser_navigate_requirements() -> bool:
-    return check_browser_routed_requirements("browser_navigate")
-
-
-def check_browser_snapshot_requirements() -> bool:
-    return check_browser_routed_requirements("browser_snapshot")
-
-
-def check_browser_click_requirements() -> bool:
-    return check_browser_routed_requirements("browser_click")
-
-
-def check_browser_type_requirements() -> bool:
-    return check_browser_routed_requirements("browser_type")
-
-
-def check_browser_scroll_requirements() -> bool:
-    return check_browser_routed_requirements("browser_scroll")
-
-
-def check_browser_back_requirements() -> bool:
-    return check_browser_routed_requirements("browser_back")
-
-
-def check_browser_press_requirements() -> bool:
-    return check_browser_routed_requirements("browser_press")
-
 
 registry.register(
     name="browser_navigate",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_navigate",
-        args,
-        fallback=lambda: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_navigate_requirements,
+    handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
     emoji="🌐",
 )
 registry.register(
     name="browser_snapshot",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_snapshot"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_snapshot",
-        args,
-        fallback=lambda: browser_snapshot(
-            full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_snapshot_requirements,
+    handler=lambda args, **kw: browser_snapshot(
+        full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
+    check_fn=check_browser_requirements,
     emoji="📸",
 )
 registry.register(
     name="browser_click",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_click",
-        args,
-        fallback=lambda: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_click_requirements,
+    handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
     emoji="👆",
 )
 registry.register(
     name="browser_type",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_type",
-        args,
-        fallback=lambda: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_type_requirements,
+    handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
     emoji="⌨️",
 )
 registry.register(
     name="browser_scroll",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_scroll",
-        args,
-        fallback=lambda: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_scroll_requirements,
+    handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
     emoji="📜",
 )
 registry.register(
     name="browser_back",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_back",
-        args,
-        fallback=lambda: browser_back(task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_back_requirements,
+    handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
     emoji="◀️",
 )
 registry.register(
     name="browser_press",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_press"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_press",
-        args,
-        fallback=lambda: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
-    check_fn=check_browser_press_requirements,
+    handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
     emoji="⌨️",
 )
 
@@ -5565,12 +5465,7 @@ registry.register(
     name="browser_get_images",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_get_images",
-        args,
-        fallback=lambda: browser_get_images(task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
+    handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖼️",
 )
@@ -5578,12 +5473,7 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_vision",
-        args,
-        fallback=lambda: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
+    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
 )
@@ -5591,12 +5481,7 @@ registry.register(
     name="browser_console",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_console",
-        args,
-        fallback=lambda: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
+    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
 )
