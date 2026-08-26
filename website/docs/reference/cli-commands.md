@@ -449,6 +449,7 @@ hermes peer list
 hermes peer dm <peer>[/<agent>] "message"
 hermes peer run <peer>[/<agent>] --idempotency-key <key> "message"
 hermes peer status <peer>[/<agent>] <run_id>
+hermes peer stop <peer>[/<agent>] <run_id>
 hermes peer remove <name>
 ```
 
@@ -470,6 +471,7 @@ its `/p/<profile>/` mirror).
 | `dm <peer>[/<agent>] [message]` | Message the peer agent's canonical Bot Chat and print the reply (`--json` for machine-readable output; message falls back to stdin). |
 | `run <peer>[/<agent>] [message]` | Start a long canonical Bot Chat turn asynchronously and return its `run_id`, session ID, and idempotency key (`--json` supported). Reuse `--idempotency-key` when retrying the same request. |
 | `status <peer>[/<agent>] <run_id>` | Poll an asynchronous peer run and print its final output when complete (`--json` supported). |
+| `stop <peer>[/<agent>] <run_id>` | Stop the exact asynchronous peer run without targeting another turn (`--json` supported). |
 | `remove <name>` | Remove a peer from the registry (the `.env` key entry is left in place). |
 
 When at least one peer is registered, the Bot Mode messaging protocol

@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import hashlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -973,3 +974,174 @@ class TestRunIdempotency:
                 first = await cli.post("/v1/runs", json={"input": "hello"})
                 second = await cli.post("/v1/runs", json={"input": "hello"})
                 assert (await first.json())["run_id"] != (await second.json())["run_id"]
+
+    @pytest.mark.asyncio
+    async def test_memory_scope_participates_in_fingerprint(
+        self, auth_adapter, tmp_path
+    ):
+        adapter = auth_adapter
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                first_headers = {
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "memory-scope",
+                    "X-Hermes-Session-Key": "memory-a",
+                }
+                second_headers = {
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "memory-scope",
+                    "X-Hermes-Session-Key": "memory-b",
+                }
+                first = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=first_headers
+                )
+                conflict = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=second_headers
+                )
+                assert first.status == 202
+                assert conflict.status == 409
+
+    @pytest.mark.asyncio
+    async def test_replay_bypasses_concurrency_limit_and_preserves_session_header(
+        self, auth_adapter, tmp_path
+    ):
+        adapter = auth_adapter
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                headers = {
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "lost-acceptance",
+                    "X-Hermes-Session-Key": "memory-a",
+                }
+                first = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=headers
+                )
+                first_body = await first.json()
+                with patch.object(
+                    adapter,
+                    "_concurrency_limited_response",
+                    return_value=web.json_response({"error": "full"}, status=429),
+                ):
+                    replay = await cli.post(
+                        "/v1/runs", json={"input": "same"}, headers=headers
+                    )
+                replay_body = await replay.json()
+                assert replay.status == 202
+                assert replay_body["run_id"] == first_body["run_id"]
+                assert replay_body["replayed"] is True
+                assert replay.headers["X-Hermes-Session-Key"] == "memory-a"
+
+    @pytest.mark.asyncio
+    async def test_direct_status_hydrates_after_adapter_restart(
+        self, tmp_path
+    ):
+        path = tmp_path / "idem.db"
+        first_adapter = _make_adapter()
+        _use_idempotency_db(first_adapter, path)
+        first_app = _create_runs_app(first_adapter)
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch.object(first_adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs",
+                    json={"input": "same"},
+                    headers={"Idempotency-Key": "restart-status"},
+                )
+                run_id = (await started.json())["run_id"]
+                for _ in range(40):
+                    status = await cli.get(f"/v1/runs/{run_id}")
+                    if (await status.json()).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+        first_adapter._run_idempotency_store.close()
+
+        restarted = _make_adapter()
+        _use_idempotency_db(restarted, path)
+        restarted_app = _create_runs_app(restarted)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            status = await cli.get(f"/v1/runs/{run_id}")
+            body = await status.json()
+        assert status.status == 200
+        assert body["status"] == "completed"
+        assert body["output"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_dead_owner_nonterminal_status_becomes_interrupted(
+        self, tmp_path
+    ):
+        from gateway.platforms.api_server import RunIdempotencyStore
+
+        path = tmp_path / "idem.db"
+        scope = hashlib.sha256(
+            "default\0unauthenticated-test-listener".encode()
+        ).hexdigest()
+        store = RunIdempotencyStore(str(path))
+        store.reserve(
+            scope,
+            "stale-run",
+            "fingerprint",
+            "run_stale",
+            {"run_id": "run_stale", "status": "running"},
+            owner_pid=999_999_999,
+            owner_started=1,
+        )
+        store.close()
+
+        restarted = _make_adapter()
+        _use_idempotency_db(restarted, path)
+        app = _create_runs_app(restarted)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/runs/run_stale")
+            body = await response.json()
+        assert response.status == 200
+        assert body["status"] == "interrupted"
+        assert body["last_event"] == "run.interrupted"
+
+    def test_progress_event_does_not_fsync_unchanged_running_status(self, adapter):
+        adapter._run_statuses["run_progress"] = {
+            "run_id": "run_progress",
+            "status": "running",
+        }
+        adapter._run_idempotency_ids.add("run_progress")
+        adapter._run_idempotency_store.update_status = MagicMock()
+
+        adapter._set_run_status(
+            "run_progress", "running", last_event="tool.completed"
+        )
+
+        adapter._run_idempotency_store.update_status.assert_not_called()
+
+    def test_status_sweep_prunes_in_memory_ownership_mirrors(self, adapter):
+        adapter._run_statuses["run_old"] = {
+            "status": "completed",
+            "updated_at": 1,
+        }
+        adapter._run_idempotency_ids.add("run_old")
+        adapter._run_owners["run_old"] = "scope"
+
+        adapter._sweep_orphaned_runs_once(adapter._RUN_STATUS_TTL + 2)
+
+        assert "run_old" not in adapter._run_statuses
+        assert "run_old" not in adapter._run_idempotency_ids
+        assert "run_old" not in adapter._run_owners

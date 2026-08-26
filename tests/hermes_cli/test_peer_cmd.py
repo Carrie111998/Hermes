@@ -151,6 +151,9 @@ class _FakePeer(BaseHTTPRequestHandler):
                 202,
             )
 
+        if self.path == "/v1/runs/run_1/stop":
+            return self._json({"run_id": "run_1", "status": "stopping"})
+
         return self._json({"error": {"message": "not found"}}, 404)
 
     def log_message(self, *args):  # noqa: D102 — silence test server logging
@@ -398,6 +401,29 @@ def test_status_reads_async_run_output(monkeypatch, capsys, fake_peer_server):
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "completed"
     assert payload["output"] == "async reply from the other machine"
+
+
+def test_stop_requests_exact_async_run(monkeypatch, capsys, fake_peer_server):
+    monkeypatch.setattr(
+        peer_cmd, "_load_peers", lambda: {"spark": {"url": fake_peer_server}}
+    )
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(
+            peer_action="stop",
+            target="spark",
+            run_id="run_1",
+            json=True,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["run_id"] == "run_1"
+    assert payload["status"] == "stopping"
+
+
 # ── cross-origin redirect must not carry the peer's Bearer key ──────────────
 
 

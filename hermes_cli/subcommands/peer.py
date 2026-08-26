@@ -278,7 +278,7 @@ def cmd_peer(args) -> int:
             print(f"{name}\t{entry.get('url', '?')}\t[{has_key}]{note}")
         return 0
 
-    if action in {"dm", "run", "status"}:
+    if action in {"dm", "run", "status", "stop"}:
         try:
             peer_name, profile, peer, key = _resolve_peer_target(args.target)
         except ValueError as exc:
@@ -290,15 +290,18 @@ def cmd_peer(args) -> int:
 
         base = _base_url(peer, profile)
 
-        if action == "status":
+        if action in {"status", "stop"}:
             run_id = (getattr(args, "run_id", None) or "").strip()
             if not run_id:
                 print("Run ID required.", file=sys.stderr)
                 return 2
             try:
                 result = _request(
-                    f"{base}/v1/runs/{urllib.parse.quote(run_id, safe='')}",
+                    f"{base}/v1/runs/{urllib.parse.quote(run_id, safe='')}"
+                    + ("/stop" if action == "stop" else ""),
                     key,
+                    method="POST" if action == "stop" else "GET",
+                    body={} if action == "stop" else None,
                 )
             except urllib.error.HTTPError as exc:
                 print(
@@ -315,9 +318,9 @@ def cmd_peer(args) -> int:
                 print(json.dumps(payload))
             else:
                 print(f"{run_id}: {result.get('status', 'unknown')}")
-                if result.get("output"):
+                if action == "status" and result.get("output"):
                     print(result["output"])
-                elif result.get("error"):
+                elif action == "status" and result.get("error"):
                     print(result["error"], file=sys.stderr)
             return 0
 
@@ -435,6 +438,7 @@ def build_peer_parser(subparsers) -> None:
             '  hermes peer dm spark/researcher "..."   # named profile on a multiplexed peer\n'
             "  hermes peer run spark --idempotency-key ticket-123 < long-task.txt\n"
             "  hermes peer status spark run_abc123\n"
+            "  hermes peer stop spark run_abc123\n"
             "  hermes peer remove spark\n"
             "\n"
             "Exit codes: 0 ok, 1 delivery/peer error, 2 usage error."
@@ -496,6 +500,18 @@ def build_peer_parser(subparsers) -> None:
     )
     status_p.add_argument("run_id", help="Run ID returned by 'hermes peer run'")
     status_p.add_argument(
+        "--json", action="store_true", default=False, help="Emit a JSON result"
+    )
+
+    stop_p = peer_sub.add_parser(
+        "stop",
+        help="Stop one asynchronous peer run without affecting another turn",
+    )
+    stop_p.add_argument(
+        "target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)"
+    )
+    stop_p.add_argument("run_id", help="Run ID returned by 'hermes peer run'")
+    stop_p.add_argument(
         "--json", action="store_true", default=False, help="Emit a JSON result"
     )
 

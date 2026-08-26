@@ -136,6 +136,7 @@ hermes peer dm spark < /tmp/dm.txt        # message body from a file (nothing sh
 hermes peer dm spark/researcher < /tmp/dm.txt   # named profile on a multiplexed peer
 hermes peer run spark --idempotency-key ticket-123 < /tmp/long-task.txt
 hermes peer status spark run_abc123
+hermes peer stop spark run_abc123
 ```
 
 `hermes peer dm` delivers into the remote agent's canonical Bot Chat over the peer's existing API server, runs one agent turn there, and prints the reply on stdout — the exact cross-machine twin of the local `hermes -p <bot> chat` command.
@@ -144,7 +145,8 @@ Use `peer dm` only for short queries and receipts because it holds one HTTP
 connection until the turn finishes. For a long turn, `peer run` returns a
 `run_id` immediately; poll it with `peer status`. The run inherits the
 canonical Bot Chat transcript, and a stable `--idempotency-key` makes a retry
-return the original run instead of starting duplicate work.
+return the original run instead of starting duplicate work. Use `peer stop`
+with that exact run ID to interrupt it without targeting another turn.
 
 Once a peer is registered, the messaging protocol taught to every Bot Chat (`agent.bot_mode_protocol`) automatically includes the peer roster, and `message_agent` accepts peer targets directly — `message_agent(target="spark/researcher", …)`, or `target="spark"` for the peer's main agent — so **your bots learn on their own** that teammates exist on other machines and how to reach them. Registering or removing a peer refreshes each Bot Chat's protocol on its next message (capability epoch).
 
