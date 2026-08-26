@@ -735,7 +735,8 @@ def _execute_job_now(
     failure delivery, ``[SILENT]`` handling, and live-adapter delivery stay
     identical across paths and can't drift.
 
-    Returns {"claimed": bool, "success": bool, "error": str|None}.
+    Returns {"claimed": bool, "success": bool, "error": str|None,
+    "api_calls": int|None}.
     """
     job_id = job["id"]
     claimed_job = None
@@ -754,14 +755,24 @@ def _execute_job_now(
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
-            return {"claimed": False, "success": False, "error": reason}
+            return {
+                "claimed": False,
+                "success": False,
+                "error": reason,
+                "api_calls": 0,
+            }
     except Exception as e:
         logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
             pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        return {
+            "claimed": True,
+            "success": False,
+            "error": str(e),
+            "api_calls": 0,
+        }
 
     return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
 
@@ -776,11 +787,13 @@ def _run_claimed_job(
     the tool response can report "paused"/"already firing" immediately — and
     hand the actual run to a daemon worker.
 
-    Returns {"claimed": True, "success": bool, "error": str|None}.
+    Returns {"claimed": True, "success": bool, "error": str|None,
+    "api_calls": int|None}.
     """
     job_id = job["id"]
     _registered = False
     fire_owner = None
+    usage = {"api_calls": 0}
     try:
         from cron.scheduler import (
             _capture_execution_usage,
@@ -804,6 +817,7 @@ def _run_claimed_job(
                     "Job is already running (a scheduler tick or another "
                     "manual run is executing it); not started again."
                 ),
+                "api_calls": 0,
             }
         _registered = True
 
@@ -935,6 +949,7 @@ def _run_claimed_job(
             "claimed": True,
             "success": False,
             "error": str(e),
+            "api_calls": usage.get("api_calls"),
         }
 
 
@@ -1080,6 +1095,7 @@ def _try_dispatch_background_run(
                         "Job is already running (a scheduler tick or another "
                         "manual run is executing it); not started again."
                     ),
+                    "api_calls": 0,
                 }
         except Exception:
             pass
@@ -1095,14 +1111,25 @@ def _try_dispatch_background_run(
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
-            return {"claimed": False, "success": False, "error": reason}
+            return {
+                "claimed": False,
+                "success": False,
+                "error": reason,
+                "api_calls": 0,
+            }
     except Exception as e:
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
             pass
-        return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
+        return {
+            "claimed": True,
+            "dispatched": False,
+            "success": False,
+            "error": str(e),
+            "api_calls": 0,
+        }
 
     origin_ui_session_id = ""
     try:

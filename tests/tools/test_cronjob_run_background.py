@@ -221,6 +221,7 @@ class TestInFlightDedupe:
                 res = _run_claimed_job(_job('job-bg-08'))
             assert res["success"] is False
             assert "already running" in res["error"]
+            assert res["api_calls"] == 0
             m_run.assert_not_called()
         finally:
             sched.release_running_job("job-bg-08")
@@ -248,6 +249,26 @@ class TestInFlightDedupe:
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
+    def test_run_claimed_job_preserves_usage_when_refresh_fails(self):
+        from cron import scheduler as sched
+        from tools.cronjob_tools import _run_claimed_job
+
+        def measured_run(_job, **_kw):
+            sched._cron_execution_usage.get()["api_calls"] = 5
+            return True
+
+        with patch("cron.scheduler.run_one_job", side_effect=measured_run), \
+             patch(
+                 "tools.cronjob_tools.get_job",
+                 side_effect=OSError("refresh unavailable"),
+             ):
+            res = _run_claimed_job(_job("job-bg-refresh-error"))
+
+        assert res["success"] is False
+        assert res["api_calls"] == 5
+        assert "refresh unavailable" in res["error"]
+        assert "job-bg-refresh-error" not in sched.get_running_job_ids()
+
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
         reports in the tool response, not as a delayed completion event."""
@@ -261,6 +282,7 @@ class TestInFlightDedupe:
                     res = _try_dispatch_background_run(_job('job-bg-10'))
             assert res["claimed"] is False
             assert "already running" in res["error"]
+            assert res["api_calls"] == 0
             m_claim.assert_not_called()   # no claim consumed for a skipped run
             m_disp.assert_not_called()
         finally:
