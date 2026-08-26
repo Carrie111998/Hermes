@@ -204,6 +204,12 @@ class Settings:
     rag_dir_override: Path | None = field(
         default_factory=lambda: Path(_env("RAG_DIR")) if _env("RAG_DIR") else None
     )
+    # 위키 그래프 — 같은 조문·판례를 말하는 문서끼리의 연결. 없으면 그래프
+    # 검색 도구가 붙지 않을 뿐, 나머지는 그대로 돕니다.
+    wiki_graph_override: Path | None = field(
+        default_factory=lambda: Path(_env("WIKI_GRAPH")) if _env("WIKI_GRAPH") else None
+    )
+    wiki_related_limit: int = field(default_factory=lambda: _env_int("WIKI_RELATED_LIMIT", 6))
     rag_top_k: int = field(default_factory=lambda: _env_int("RAG_TOP_K", 6))
     rag_chunk_chars: int = field(default_factory=lambda: _env_int("RAG_CHUNK_CHARS", 900))
     rag_chunk_overlap: int = field(default_factory=lambda: _env_int("RAG_CHUNK_OVERLAP", 150))
@@ -270,6 +276,10 @@ class Settings:
     @property
     def rag_dir(self) -> Path:
         return self.rag_dir_override or (self.data_dir / "rag")
+
+    @property
+    def wiki_graph_path(self) -> Path:
+        return self.wiki_graph_override or (self.data_dir / "wiki.sqlite3")
 
     def rag_path(self, collection: str) -> Path:
         """Where one collection's index lives (``books`` → ``data/rag/books.sqlite3``)."""

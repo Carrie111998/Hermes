@@ -106,12 +106,14 @@ class LegalAgent:
         rag: RagStore | None = None,
         law: LawApiClient | None = None,
         embed_query: Any = None,
+        graph: Any = None,
     ) -> None:
         self.settings = settings
         self.llm = llm
         self.rag = rag
         self.law = law
         self.embed_query = embed_query
+        self.graph = graph
         self._persona = load_persona(settings.persona_path)
         self._playbook = load_persona(settings.intake_playbook_path)
 
@@ -160,6 +162,8 @@ class LegalAgent:
             law=self.law,
             rag_top_k=self.settings.rag_top_k,
             embed_query=self.embed_query,
+            graph=self.graph,
+            related_limit=self.settings.wiki_related_limit,
         )
         tools.extend(build_intake_tools(state, self.settings.lawyer_name))
         tools.extend(build_action_tools(state))

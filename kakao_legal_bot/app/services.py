@@ -22,6 +22,7 @@ from .llm import LlmClient
 from .rag.multi import MultiRagStore
 from .rag.store import RagStore
 from .sender import Sender
+from .wiki.graph import WikiGraph
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class Services:
     sender: Sender
     agent: LegalAgent
     rag: RagStore | MultiRagStore | None = None
+    graph: WikiGraph | None = None
     law: LawApiClient | None = None
     llm: LlmClient | None = None
     # One semaphore for the whole process: LLM calls are the expensive
@@ -49,6 +51,8 @@ class Services:
             await self.llm.aclose()
         if self.rag is not None:
             self.rag.close()
+        if self.graph is not None:
+            self.graph.close()
         self.db.close()
 
 
@@ -79,6 +83,15 @@ def build_services(settings: Settings | None = None) -> Services:
     # picked up as a collection of its own so an upgrade needs no re-index.
     rag = MultiRagStore.discover(settings.rag_dir, legacy=settings.data_dir / "rag.sqlite3")
     log.info("rag collections: %s", ", ".join(rag.collections()) or "(none)")
+
+    # 위키 그래프는 있을 때만 붙입니다. 없으면 그래프 검색 도구가 빠질 뿐,
+    # 나머지 상담은 그대로 돕니다.
+    graph: WikiGraph | None = None
+    if settings.wiki_graph_path.exists():
+        graph = WikiGraph(settings.wiki_graph_path)
+        log.info("wiki graph: %s", graph.stats())
+    else:
+        log.info("wiki graph not built yet (%s) — 그래프 검색 없이 동작합니다", settings.wiki_graph_path)
 
     law: LawApiClient | None = None
     if settings.law_api_enabled and (settings.law_oc or settings.data_go_kr_key):
@@ -116,7 +129,9 @@ def build_services(settings: Settings | None = None) -> Services:
     )
 
     iris = IrisClient(settings)
-    agent = LegalAgent(settings, llm, rag=rag, law=law, embed_query=_make_embedder(settings))
+    agent = LegalAgent(
+        settings, llm, rag=rag, law=law, embed_query=_make_embedder(settings), graph=graph
+    )
 
     return Services(
         settings=settings,
@@ -125,6 +140,7 @@ def build_services(settings: Settings | None = None) -> Services:
         sender=Sender(settings, db, iris),
         agent=agent,
         rag=rag,
+        graph=graph,
         law=law,
         llm=llm,
         semaphore=asyncio.Semaphore(max(1, settings.global_concurrency)),

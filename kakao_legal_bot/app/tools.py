@@ -102,8 +102,12 @@ def build_tools(
     law: LawApiClient | None,
     rag_top_k: int = 6,
     embed_query: Any = None,
+    graph: Any = None,
+    related_limit: int = 6,
 ) -> list[ToolSpec]:
     tools: list[ToolSpec] = []
+    if graph is not None:
+        tools.append(_related_tool(state, graph, rag, rag_top_k, related_limit))
 
     # ── local corpus ─────────────────────────────────────────────────────
     if rag is not None:
@@ -361,6 +365,98 @@ def build_tools(
         ]
     )
     return tools
+
+
+def _note_line(row: Any, weight_note: str = "") -> str:
+    """그래프 조회 결과 한 줄 — 날짜와 연혁 여부가 보여야 합니다."""
+    bits = [str(row["kind"] or "")]
+    if row["as_of"]:
+        bits.append(str(row["as_of"]))
+    if weight_note:
+        bits.append(weight_note)
+    head = f"■ {row['title']} ({' · '.join(bit for bit in bits if bit)})"
+    if row["superseded_by"]:
+        head += "  ⚠ 개정 전 자료 — 현행 확인 필요"
+    summary = str(row["summary"] or "").strip()
+    return f"{head}\n  {summary[:300]}" if summary else head
+
+
+def _related_tool(
+    state: TurnState, graph: Any, rag: Any, rag_top_k: int, related_limit: int
+) -> ToolSpec:
+    """같은 조문·같은 판례를 말하는 문서들을 그래프로 끌어온다.
+
+    키워드 검색과 임베딩은 '비슷한 문장'을 찾습니다. 정작 필요한 질문 —
+    "민법 제618조를 다루는 자료 전부" 나 "이 판례를 인용한 문서" — 는 문장이
+    닮았는지와 무관하고, 연결로만 답할 수 있습니다.
+    """
+
+    async def search_related_docs(arguments: dict[str, Any]) -> str:
+        anchor = str(arguments.get("anchor") or "").strip()
+        query = str(arguments.get("query") or "").strip()
+        limit = int(arguments.get("limit") or related_limit)
+        blocks: list[str] = []
+
+        if anchor:
+            rows = await asyncio.to_thread(graph.notes_for, anchor, limit)
+            if rows:
+                entity = await asyncio.to_thread(graph.entity, anchor)
+                key = entity.key if entity is not None else anchor
+                state.cite(key)
+                blocks.append(f"[{key} 를 다루는 자료 {len(rows)}건 — 최신 순]")
+                blocks.extend(
+                    _note_line(row, f"{int(row['weight'])}회" if row["weight"] > 1 else "")
+                    for row in rows
+                )
+            else:
+                blocks.append(f"'{anchor}' 로 연결된 자료가 없습니다. query 로 다시 찾아보세요.")
+
+        if query and rag is not None:
+            hits = await asyncio.to_thread(rag.search, query, rag_top_k)
+            seeds = await asyncio.to_thread(graph.resolve, [hit.source for hit in hits])
+            if seeds:
+                related = await asyncio.to_thread(graph.related, seeds, limit)
+                if related:
+                    blocks.append(f"\n['{query}' 와 같은 조문·판례를 다루는 자료]")
+                    for item in related:
+                        shared = ", ".join(item.shared[:4])
+                        mark = "  ⚠ 개정 전 자료" if item.stale else ""
+                        date = f" · {item.as_of}" if item.as_of else ""
+                        blocks.append(
+                            f"■ {item.title} ({item.kind}{date}){mark}\n  공통: {shared}"
+                        )
+        if not blocks:
+            return (
+                "그래프에서 연결된 자료를 찾지 못했습니다. search_local_docs 로 "
+                "본문을 직접 검색해 보세요."
+            )
+        blocks.append(
+            "\n본문이 필요하면 search_local_docs 로 그 제목을 검색하세요. "
+            "'개정 전 자료' 표시가 붙은 것은 연혁으로만 쓰고 현행 규정을 함께 확인하세요."
+        )
+        return _clip("\n".join(blocks), limit=8000)
+
+    return ToolSpec(
+        name="search_related_docs",
+        description=(
+            "같은 조문·판례·키워드를 다루는 자료들을 연결로 찾는다. "
+            "'민법 제618조를 다루는 자료 전부' 처럼 문장이 아니라 근거로 묶어야 할 때, "
+            "또는 어떤 쟁점의 자료를 빠짐없이 훑어야 할 때 쓴다. "
+            "조문·판례는 anchor 에, 자연어 질문은 query 에 넣는다."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "anchor": {
+                    "type": "string",
+                    "description": "조문·판례번호·키워드 (예: 민법 제618조, 2017다12345, 대항력)",
+                },
+                "query": {"type": "string", "description": "자연어 질문. anchor 를 모를 때."},
+                "limit": {"type": "integer"},
+            },
+        },
+        handler=search_related_docs,
+    )
 
 
 def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
