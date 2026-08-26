@@ -10,6 +10,7 @@
 // a user-initiated reload.
 
 import assert from 'node:assert/strict'
+
 import { test } from 'vitest'
 
 import { installFullscreenPaintWatchdog } from './fullscreen-paint-watchdog'
@@ -35,6 +36,7 @@ function makeFakeWindow() {
     },
     removeListener(event: string, fn: () => void) {
       const list = windowListeners as Map<string, unknown>
+
       // Single listener per event in our usage; equality is enough.
       if (list.get(event) === fn) {
         list.delete(event)

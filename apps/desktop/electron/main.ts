@@ -185,6 +185,7 @@ import {
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
+import { installFullscreenPaintWatchdog } from './fullscreen-paint-watchdog'
 import {
   filenameFromContentDisposition,
   gatewayFilePath,
@@ -346,7 +347,6 @@ import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstra
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
-import { installFullscreenPaintWatchdog } from './fullscreen-paint-watchdog'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {
