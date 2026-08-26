@@ -14,8 +14,11 @@ import {
 } from '@/lib/voice-playback'
 import {
   $composerAttachments,
+  clearComposerMessageQuotes,
   type ComposerAttachment,
   mainComposerScope,
+  messageQuoteContextBlocks,
+  reconcileComposerMessageQuotes,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
 import { $hudMode } from '@/store/hud'
@@ -60,7 +63,6 @@ interface SubmitPromptDeps {
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
-  onRuntimeRecovered?: (runtimeId: string) => void
   requestGateway: GatewayRequest
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
@@ -107,7 +109,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
     getRoutedStoredSessionId,
     getRuntimeIdForStoredSession,
     getRouteToken,
-    onRuntimeRecovered,
     requestGateway,
     runtimeIdByStoredSessionIdRef,
     resumeStoredSession,
@@ -132,6 +133,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       )
 
       const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
+      // Reconcile before resolving: drop quote entries whose @message: refs
+      // were edited or deleted from the draft.
+      reconcileComposerMessageQuotes(rawText)
+      const quoteContextBlocks = messageQuoteContextBlocks(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
 
       // Refs are recomputed after sync (file.attach rewrites @file: refs to
@@ -152,7 +157,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           .join('\n')
 
         return (
-          [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
+          [contextRefs, terminalContextBlocks, quoteContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
           (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
         )
       }
@@ -782,9 +787,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               requestGateway,
               driftReason: sessionDriftReason,
               onRecovered: recoveredId => {
-                if (onRuntimeRecovered) {
-                  onRuntimeRecovered(recoveredId)
-                } else if (targetIsCurrentView()) {
+                if (targetIsCurrentView()) {
                   activeSessionIdRef.current = recoveredId
                   setActiveSessionId(recoveredId)
                 }
@@ -816,6 +819,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // preserved while the staged object for a submitted file is removed.
           scope.removeAttachments(syncedAttachments)
         }
+
+        // Submit landed — clear stale message quotes from the store so they
+        // don't carry into the next turn. (Parallel to terminal selections,
+        // which are reconciled at the same point.)
+        clearComposerMessageQuotes()
 
         // Submit landed — the turn now runs (busy stays true), but the submit
         // window is closed, so release the lock for the next (sequential) send.
@@ -882,7 +890,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       getRoutedStoredSessionId,
       getRuntimeIdForStoredSession,
       getRouteToken,
-      onRuntimeRecovered,
       requestGateway,
       runtimeIdByStoredSessionIdRef,
       resumeStoredSession,

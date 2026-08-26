@@ -81,8 +81,6 @@ export const en: Translations = {
       backendStopped: 'Backend stopped',
       desktopBootFailed: 'Desktop boot failed',
       gatewayConnectionLost: 'Lost connection to the gateway',
-      gatewayConnectionLostDetail:
-        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
       gatewaySignInRequired: 'Gateway sign-in required',
       ipcBridgeUnavailable: 'Desktop IPC bridge is unavailable.'
     },
@@ -1825,38 +1823,6 @@ export const en: Translations = {
     switchConnectionFailed: name => `Could not connect to ${name}`,
     manageProfiles: 'Manage profiles…',
     connectGateway: 'Manage gateways…',
-    remoteOverride: {
-      menuItem: 'Connect to a remote host…',
-      badge: (host: string) => `Runs on ${host}`,
-      title: (profile: string) => `Connect ${profile} to a remote host`,
-      description: 'Sessions in this profile will run on the remote Hermes you point it at, instead of this computer.',
-      urlLabel: 'Remote address',
-      urlPlaceholder: 'https://hermes.example.com',
-      urlInvalid: 'Enter a full address starting with http:// or https://',
-      tokenLabel: 'Access token',
-      tokenPlaceholder: 'Paste the remote session token',
-      tokenSavedHint: 'A token is already saved. Leave blank to keep it.',
-      plainTextOptIn:
-        'This computer has no secure key storage, so the token would be saved unencrypted on disk. Save it anyway.',
-      collisionWarning: (label: string) =>
-        `A gateway named “${label}” already exists in Settings. This profile connection is separate and will not change it.`,
-      confirmTitle: 'Connect this profile to a remote host?',
-      confirmNote: (profile: string, host: string) =>
-        `New chats in ${profile} will run on ${host}. That computer will run commands and read files there, not on this one. Only connect to a host you trust.`,
-      confirmBack: 'Back',
-      connect: 'Connect',
-      connecting: 'Connecting…',
-      disconnect: 'Remove remote connection',
-      savedTitle: 'Profile connected',
-      savedMessage: (profile: string, host: string) => `${profile} now runs on ${host}`,
-      removedTitle: 'Remote connection removed',
-      removedMessage: (profile: string) => `${profile} now runs on this computer`,
-      removeFailed: 'Could not remove the remote connection',
-      authFailedTitle: 'Remote host rejected the saved token',
-      authFailedMessage: (profile: string, host: string) =>
-        `${host} refused the token saved for ${profile}. It may have been changed on the remote side.`,
-      updateToken: 'Enter new token…'
-    },
     actions: 'Actions',
     color: 'Color…',
     colorFor: 'Color',
@@ -2465,7 +2431,9 @@ export const en: Translations = {
         description: 'Walk through how the selected code works and link to the key files.',
         text: 'Please explain how this works and point me to the key files.'
       }
-    }
+    },
+    quoteSelected: 'Quote in chat',
+    addImageToChat: 'Add to chat'
   },
 
   statusStack: {
@@ -3195,7 +3163,8 @@ export const en: Translations = {
       restoreNext: 'Restore next checkpoint',
       goForward: 'Go forward',
       sendEdited: 'Send edited message',
-      attachingFile: 'Attaching…'
+      attachingFile: 'Attaching…',
+      quoteInChat: 'Quote in chat'
     },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',
