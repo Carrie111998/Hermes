@@ -8,8 +8,74 @@ their respective plugin subsystems (``plugins/image_gen/deepinfra`` and
 the TTS/STT dispatchers in ``tools/``).
 """
 
+import logging
+
 from providers import register_provider
 from providers.base import ProviderProfile
+
+logger = logging.getLogger(__name__)
+
+
+# Preference order for the auto-discovered vision default, most preferred
+# first. An entry that the catalog does not offer is simply skipped, so a
+# retired or renamed id degrades to catalog order instead of killing vision.
+#
+# WHY a preference at all: the catalog is served in DeepInfra's own
+# popularity/recency ranking, so "first chat+vision model" is a MOVING
+# TARGET. DeepInfra reorders or adds a model and Hermes silently starts
+# sending images somewhere else, with no log line naming the change.
+#
+# Measured 2026-08-25, that first slot held Qwen/Qwen3.5-397B-A17B -- a
+# REASONING model. It answered every probe correctly, but it spent 492-823
+# output tokens thinking per image where a dedicated VL model spent 26-33,
+# took 19-35s instead of 1.5-2.7s, and cost ~8x more (~$2.63 vs ~$0.33 per
+# 1000 calls at ~1500 input tokens). Reasoning also makes a model
+# budget-sensitive in a way callers do not expect: at a tight max_tokens it
+# returns EMPTY content with finish_reason "length" and NO error, having
+# spent the whole budget thinking. The in-tree vision tools pass 2000 and
+# 4000 (tools/vision_tools.py) so they clear it comfortably today, but
+# nothing enforces that, and a caller that trimmed the budget would get
+# blank answers with nothing to diagnose from.
+#
+# Qwen3-VL-*-Instruct are dedicated vision-language models with no reasoning
+# phase. The 235B is preferred over the cheaper 30B / Gemma / Mistral
+# options because all five answered every probe correctly -- the probes did
+# NOT discriminate quality, so the larger model is the safer default at a
+# price still far below the incumbent. Revisit with a harder eval before
+# trading further down.
+#
+# Measured at the pathological budget, max_tokens=16 on a solid-colour PNG:
+# Qwen3.5-397B returned content='' / finish_reason='length' / 16 output
+# tokens; Qwen3-VL-235B returned 'Red' / 'stop' / 2 tokens. So preferring a
+# non-reasoning VL model REMOVES the empty-answer failure mode rather than
+# merely staying clear of it.
+_VISION_MODEL_PREFERENCE = (
+    "Qwen/Qwen3-VL-235B-A22B-Instruct",
+)
+
+# Last vision model this process reported. Discovery re-runs on every vision
+# availability check (only the underlying catalog HTTP fetch is cached), so
+# an unconditional log here would be per-call noise. Reporting only on CHANGE
+# gives one line at selection -- and a second line if the answer ever moves
+# mid-process, which is exactly the drift worth seeing.
+_last_reported_vision_model = None
+
+
+def _report_vision_model(model_id, eligible_count, from_preference):
+    """Log the discovered vision default once, and again only if it changes."""
+    global _last_reported_vision_model
+    if model_id == _last_reported_vision_model:
+        return
+    _last_reported_vision_model = model_id
+    logger.info(
+        "DeepInfra vision default: %s (%s; %d vision-capable chat model%s "
+        "in catalog)",
+        model_id,
+        "preferred" if from_preference
+        else "NOT in preference list -- fell back to catalog order",
+        eligible_count,
+        "" if eligible_count == 1 else "s",
+    )
 
 
 class _DeepInfraProfile(ProviderProfile):
@@ -22,7 +88,11 @@ class _DeepInfraProfile(ProviderProfile):
     """
 
     def default_vision_model(self):  # type: ignore[override]
-        """First vision-capable *chat* model from the live catalog, or None.
+        """Preferred vision-capable *chat* model from the live catalog, or None.
+
+        Selection is preference-ordered, not catalog-ordered: the first entry
+        of :data:`_VISION_MODEL_PREFERENCE` that the catalog actually offers
+        wins, and catalog order is only the fallback. See that tuple for why.
 
         Key-gated so a box without a DeepInfra credential never pays the
         catalog round-trip. Requires the ``chat`` surface tag (not just the
@@ -64,14 +134,37 @@ class _DeepInfraProfile(ProviderProfile):
             items = _fetch_deepinfra_models_by_tag("chat")
         except Exception:
             return None
+
+        eligible = []
         for item in items or []:
             metadata = item.get("metadata") or {}
             tags = metadata.get("tags") if isinstance(metadata, dict) else None
             if isinstance(tags, list) and "vision" in tags:
                 model_id = item.get("id")
                 if model_id:
-                    return model_id
-        return None
+                    eligible.append(model_id)
+        if not eligible:
+            return None
+
+        # Match case-insensitively but return the catalog's own spelling --
+        # that string is sent to the API, so it must be the id DeepInfra
+        # published, not the one written in the preference tuple.
+        by_lower = {str(m).lower(): m for m in eligible}
+        chosen = None
+        for preferred in _VISION_MODEL_PREFERENCE:
+            chosen = by_lower.get(preferred.lower())
+            if chosen:
+                break
+        from_preference = chosen is not None
+        if chosen is None:
+            # Every preferred id has been retired or renamed upstream. Fall
+            # back to catalog order rather than returning None: a working but
+            # unpreferred vision backend beats no vision at all, and the log
+            # line below says which case this was.
+            chosen = eligible[0]
+
+        _report_vision_model(chosen, len(eligible), from_preference)
+        return chosen
 
 
 deepinfra = _DeepInfraProfile(
