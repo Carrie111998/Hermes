@@ -13,6 +13,7 @@ import pytest
 from hermes_cli.authority.manifest import (
     CANONICAL_AUTHORITY_MANIFEST,
     AdmissionRequestValidationError,
+    AuthorityManifestArtifactValidationError,
     ManifestValidationError,
     admission_request_from_mapping,
     compile_authority_manifest,
@@ -260,10 +261,9 @@ def test_shared_conformance_vectors_match_python_evaluator() -> None:
         assert decision.as_dict() == vector["expected"], vector["name"]
 
 
-def test_decision_binds_to_supplied_packaged_policy_identity() -> None:
+def test_evaluator_rejects_forged_packaged_policy_identity() -> None:
     artifact = CANONICAL_AUTHORITY_MANIFEST
-    alternate_digest = "a" * 64
-    alternate_artifact = replace(artifact, manifest_sha256=alternate_digest)
+    canonical_raw = _read_json(MANIFEST_PATH)
     request = admission_request_from_mapping(
         {
             "domain": "github.operation",
@@ -281,13 +281,37 @@ def test_decision_binds_to_supplied_packaged_policy_identity() -> None:
         }
     )
 
-    canonical_decision = evaluate_authority_operation(artifact, request)
-    alternate_decision = evaluate_authority_operation(alternate_artifact, request)
+    with pytest.raises(AuthorityManifestArtifactValidationError):
+        evaluate_authority_operation(
+            replace(artifact, manifest_sha256="a" * 64), request
+        )
 
-    assert canonical_decision.policy_version == alternate_decision.policy_version
-    assert canonical_decision.manifest_sha256 == artifact.manifest_sha256
-    assert alternate_decision.manifest_sha256 == alternate_digest
-    assert alternate_decision != canonical_decision
+    widened_raw = deepcopy(canonical_raw)
+    widened_raw["domains"]["github.operation"]["operation_classes"][
+        "github.comment.write"
+    ]["allowed_actor_classes"].append("external_bot")
+    widened_artifact = replace(
+        artifact,
+        manifest=compile_authority_manifest(widened_raw),
+    )
+    widened_request = admission_request_from_mapping(
+        {
+            "domain": "github.operation",
+            "operation_class": "github.comment.write",
+            "actor_class": "external_bot",
+            "resource_state": "open",
+            "capabilities": [
+                {
+                    "capability": "comments:write",
+                    "granted": True,
+                    "source": "external_installation",
+                    "generation": "installation-1",
+                }
+            ],
+        }
+    )
+    with pytest.raises(AuthorityManifestArtifactValidationError):
+        evaluate_authority_operation(widened_artifact, widened_request)
 
 
 def test_manifest_uses_the_canonical_github_vertical_slice() -> None:

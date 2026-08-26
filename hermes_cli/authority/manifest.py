@@ -212,6 +212,10 @@ class AdmissionRequestValidationError(ValueError):
     """Raised when an admission request is structurally malformed."""
 
 
+class AuthorityManifestArtifactValidationError(ValueError):
+    """Raised when admission is attempted with a non-canonical S1 artifact."""
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilityGrant:
     capability: str
@@ -540,6 +544,16 @@ def admission_request_from_mapping(raw: Mapping[str, Any]) -> AdmissionRequest:
     )
 
 
+def _require_canonical_manifest_artifact(
+    artifact: AuthorityManifestArtifact,
+) -> AuthorityManifestArtifact:
+    if artifact is not CANONICAL_AUTHORITY_MANIFEST:
+        raise AuthorityManifestArtifactValidationError(
+            "authority admission requires CANONICAL_AUTHORITY_MANIFEST"
+        )
+    return artifact
+
+
 def _decision(
     artifact: AuthorityManifestArtifact,
     request: AdmissionRequest,
@@ -567,9 +581,11 @@ def evaluate_authority_operation(
 
     Refusal precedence is unsupported operation, forbidden actor, denied
     resource state, invalid capability proof, then missing capability.
-    The returned decision is bound to the exact packaged manifest digest.
+    Admission accepts only the module-created canonical artifact, so callers
+    cannot combine widened compiled policy with canonical bytes or digest.
     """
 
+    artifact = _require_canonical_manifest_artifact(artifact)
     manifest = artifact.manifest
     domain = manifest.domains.get(request.domain)
     operation = domain.operations.get(request.operation_class) if domain else None
