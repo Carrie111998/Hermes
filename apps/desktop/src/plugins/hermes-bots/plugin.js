@@ -10953,6 +10953,7 @@ function RoutineRow({ job, onOpen, owner }) {
   const legacyUnsafe = isLegacyDelegatedRoutine(job)
   const serverActive = !legacyUnsafe && job.enabled !== false && job.state !== 'paused'
   const active = pendingActive === null ? serverActive : pendingActive
+  const displaySchedule = scheduleLabel(job.schedule)
 
   if (pendingActive !== null && pendingActive === serverActive) {
     setPendingActive(null) // server caught up
@@ -11031,11 +11032,19 @@ function RoutineRow({ job, onOpen, owner }) {
         children: [
           jsxs('span', {
             className:
-              'inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
-            children: [jsx(Codicon, { name: 'calendar', className: 'text-[0.7rem]' }), scheduleLabel(job.schedule)]
+              'inline-flex min-w-0 max-w-full flex-1 items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
+            children: [
+              jsx(Codicon, { name: 'calendar', className: 'shrink-0 text-[0.7rem]' }),
+              jsx('span', {
+                className: 'min-w-0 truncate',
+                title: displaySchedule,
+                children: displaySchedule
+              })
+            ]
           }),
           jsx('span', {
-            className: 'ml-auto shrink-0 whitespace-nowrap text-[0.65rem] text-(--ui-text-quaternary)',
+            className:
+              'ml-auto max-w-full shrink-0 truncate whitespace-nowrap text-[0.65rem] text-(--ui-text-quaternary)',
             children: active && job.next_run_at ? `next ${relativeTime(new Date(job.next_run_at).getTime())}` : 'paused'
           })
         ]
