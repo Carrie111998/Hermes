@@ -567,8 +567,6 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Tencent — Hy3 preview (Hunyuan) with 256K context window.
     # OpenRouter live metadata reports 262144 (256 × 1024); align the
     # static fallback so cache and offline both agree (issue #22268).
-    
-    # Tencent — Hy3 Preview (Hunyuan), same 256K window.
     "hy3-preview": 262144,
     # Tencent — Hy3 (GA successor to Hy3 Preview), same 256K window.
     "hy3": 262144,
