@@ -24,68 +24,80 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_is_session_expired_detects_invalid_or_expired_session():
-    """Reporter's exact wpcom-mcp error message (#13383)."""
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            "Invalid params: Invalid or expired session",
+            id="invalid-or-expired-session-wpcom-13383",
+        ),
+        pytest.param("Session expired", id="session-expired"),
+        pytest.param("expired session: abc", id="expired-session-prefix"),
+        pytest.param("session not found", id="session-not-found"),
+        pytest.param("Unknown session: abc123", id="unknown-session"),
+        pytest.param("Session terminated", id="session-terminated-remote-playwright"),
+        pytest.param("ClosedResourceError", id="closed-resource-class-name-in-text"),
+        pytest.param("closed resource in MCP child", id="closed-resource-text"),
+        pytest.param("transport is closed", id="transport-is-closed"),
+        pytest.param("Broken pipe while writing request", id="broken-pipe"),
+        pytest.param("End of file from MCP server", id="end-of-file"),
+        pytest.param("INVALID OR EXPIRED SESSION", id="case-insensitive-upper"),
+        pytest.param("Session Expired", id="case-insensitive-mixed"),
+    ],
+)
+def test_is_session_expired_matches_known_marker_messages(message):
+    """Every message marker the reconnect path recognizes, in one table.
+
+    Rows cover the reporter's exact wpcom-mcp error (#13383), the generic
+    session-expiry phrasings other SDK servers use, server-side GC wordings
+    (``session not found`` / ``unknown session``), remote Playwright's
+    ``Session terminated``, stdio/AnyIO stale-pipe and closed-transport
+    texts, and case-insensitivity (matching lower-cases both sides). A
+    marker the classifier silently stops recognizing fails exactly one row.
+    """
     from tools.mcp_tool import _is_session_expired_error
-    exc = RuntimeError("Invalid params: Invalid or expired session")
-    assert _is_session_expired_error(exc) is True
+
+    assert _is_session_expired_error(RuntimeError(message)) is True
 
 
-def test_is_session_expired_detects_expired_session_variant():
-    """Generic ``session expired`` / ``expired session`` phrasings used
-    by other SDK servers."""
-    from tools.mcp_tool import _is_session_expired_error
-    assert _is_session_expired_error(RuntimeError("Session expired")) is True
-    assert _is_session_expired_error(RuntimeError("expired session: abc")) is True
-
-
-def test_is_session_expired_detects_session_not_found():
-    """Server-side GC produces ``session not found`` / ``unknown session``
-    on some implementations."""
-    from tools.mcp_tool import _is_session_expired_error
-    assert _is_session_expired_error(RuntimeError("session not found")) is True
-    assert _is_session_expired_error(RuntimeError("Unknown session: abc123")) is True
-
-
-def test_is_session_expired_detects_session_terminated():
-    """Remote Playwright MCP reports transport loss as ``Session terminated``."""
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(RuntimeError("Tool failed to execute"), id="plain-tool-error"),
+        pytest.param(ValueError("Missing parameter"), id="value-error"),
+        pytest.param(Exception("Connection refused"), id="connection-refused"),
+        # 401 is handled by the sibling _is_auth_error path, not here.
+        pytest.param(RuntimeError("401 Unauthorized"), id="auth-401"),
+        # Bare exceptions with no message must not match anything.
+        pytest.param(RuntimeError(""), id="empty-message"),
+        pytest.param(Exception(), id="no-message"),
+    ],
+)
+def test_is_session_expired_rejects_non_marker_errors(exc):
+    """Narrow scope: only the specific session-expired markers trigger."""
     from tools.mcp_tool import _is_session_expired_error
 
-    assert _is_session_expired_error(RuntimeError("Session terminated")) is True
+    assert _is_session_expired_error(exc) is False
 
 
-def test_is_session_expired_detects_stale_pipe_and_closed_transport_variants():
-    """Stdio/AnyIO stale-pipe failures usually surface as closed-resource
-    or broken-pipe text, not an HTTP session-expired JSON-RPC error."""
-    from anyio import ClosedResourceError
+def test_is_session_expired_marker_alone_is_sufficient_by_design():
+    """Design decision: marker text alone triggers reconnect, with no
+    transport-type evidence required.
+
+    The motivating failures (#13383, stdio stale pipes) arrive as plain
+    RuntimeErrors whose message is the only available signal, so requiring a
+    typed transport exception would miss exactly the cases this path exists
+    for. The accepted trade-off: an error that merely QUOTES a marker
+    phrase — e.g. a downstream tool relaying the server's own error text —
+    also classifies as expired and buys one bounded reconnect+retry. That
+    cost is a single extra reconnect, not a loop. Tightening this to
+    require transport-type evidence must be a conscious change that starts
+    by deleting this test.
+    """
     from tools.mcp_tool import _is_session_expired_error
-    assert _is_session_expired_error(RuntimeError("ClosedResourceError")) is True
-    assert _is_session_expired_error(RuntimeError("closed resource in MCP child")) is True
-    assert _is_session_expired_error(RuntimeError("transport is closed")) is True
-    assert _is_session_expired_error(RuntimeError("Broken pipe while writing request")) is True
-    assert _is_session_expired_error(RuntimeError("End of file from MCP server")) is True
-    # AnyIO raises this with no message, so str(exc) is empty while repr(exc)
-    # still carries the transport-failure class name.
-    assert _is_session_expired_error(ClosedResourceError()) is True
 
-
-def test_is_session_expired_is_case_insensitive():
-    """Match uses lower-cased comparison so servers that emit the
-    message in different cases (SDK formatter quirks) still trigger."""
-    from tools.mcp_tool import _is_session_expired_error
-    assert _is_session_expired_error(RuntimeError("INVALID OR EXPIRED SESSION")) is True
-    assert _is_session_expired_error(RuntimeError("Session Expired")) is True
-
-
-def test_is_session_expired_rejects_unrelated_errors():
-    """Narrow scope: only the specific session-expired markers trigger.
-    A regular RuntimeError / ValueError does not."""
-    from tools.mcp_tool import _is_session_expired_error
-    assert _is_session_expired_error(RuntimeError("Tool failed to execute")) is False
-    assert _is_session_expired_error(ValueError("Missing parameter")) is False
-    assert _is_session_expired_error(Exception("Connection refused")) is False
-    # 401 is handled by the sibling _is_auth_error path, not here.
-    assert _is_session_expired_error(RuntimeError("401 Unauthorized")) is False
+    quoted = RuntimeError('upstream tool replied: "Session terminated"')
+    assert _is_session_expired_error(quoted) is True
 
 
 def test_is_session_expired_rejects_interrupted_error():
@@ -97,10 +109,16 @@ def test_is_session_expired_rejects_interrupted_error():
 
 
 def test_is_session_expired_detects_message_less_anyio_transport_failures():
-    """Recognized stream failures have no text for marker matching."""
-    from anyio import BrokenResourceError, EndOfStream
+    """Recognized stream failures have no text for marker matching.
+
+    AnyIO raises these with no message, so ``str(exc)`` is empty while
+    ``repr(exc)`` still carries the transport-failure class name — the
+    classifier must identify them by type, not text.
+    """
+    from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
     from tools.mcp_tool import _is_session_expired_error
 
+    assert _is_session_expired_error(ClosedResourceError()) is True
     assert _is_session_expired_error(BrokenResourceError()) is True
     assert _is_session_expired_error(EndOfStream()) is True
 
@@ -127,60 +145,55 @@ def test_is_session_expired_rejects_mixed_group_with_user_interruption():
 
 
 def test_is_session_expired_finds_closed_resource_beyond_recursion_limit():
-    """The full classifier must handle arbitrarily deep transport wrappers."""
+    """The full classifier must handle arbitrarily deep transport wrappers.
+
+    Built from real ``ExceptionGroup``s (upstream requires Python >=3.11)
+    nested far past the interpreter recursion limit, so this pins the
+    semantics — deep group nesting must classify — rather than the
+    traversal mechanics: it keeps passing across any rewrite that still
+    understands real groups, and forces the traversal to stay iterative.
+    """
     import sys
 
     from anyio import ClosedResourceError
     from tools.mcp_tool import _is_session_expired_error
 
-    class NestedException(Exception):
-        exceptions: tuple[BaseException, ...]
-
-    exc = ClosedResourceError()
+    exc: BaseException = ClosedResourceError()
     for _ in range(sys.getrecursionlimit() + 100):
-        wrapper = NestedException("wrapped")
-        wrapper.exceptions = (exc,)
-        exc = wrapper
+        exc = ExceptionGroup("wrapped", [exc])
 
     assert _is_session_expired_error(exc) is True
 
 
-def test_is_session_expired_handles_cyclic_graph_without_transport_error():
-    """A cyclic non-transport graph must terminate and classify false."""
-    from tools.mcp_tool import _is_session_expired_error
+def test_is_session_expired_handles_cyclic_exception_graphs_duck_typed():
+    """Cycle handling in ``.exceptions`` graphs — deliberately duck-typed.
 
-    class CyclicException(Exception):
-        exceptions: tuple[BaseException, ...]
-
-    first = CyclicException("first")
-    second = CyclicException("second")
-    first.exceptions = (second,)
-    second.exceptions = (first,)
-
-    assert _is_session_expired_error(first) is False
-
-
-def test_is_session_expired_finds_transport_error_in_cyclic_graph():
-    """Cycle detection must not prevent scanning reachable transport errors."""
+    Real ``ExceptionGroup``s freeze their children at construction, so a
+    cycle cannot be built from them; the traversal's cycle guard is only
+    reachable through a synthetic ``exceptions`` attribute. This is the ONE
+    test that intentionally couples to the ``getattr(current, "exceptions",
+    ())`` traversal mechanics — every other group-shaped test here uses real
+    ExceptionGroups so its coverage survives a traversal rewrite.
+    """
     from anyio import ClosedResourceError
     from tools.mcp_tool import _is_session_expired_error
 
     class CyclicException(Exception):
         exceptions: tuple[BaseException, ...]
 
+    # A cyclic graph with no transport signal must terminate, classify False.
     first = CyclicException("first")
     second = CyclicException("second")
-    first.exceptions = (second, ClosedResourceError())
+    first.exceptions = (second,)
     second.exceptions = (first,)
+    assert _is_session_expired_error(first) is False
 
-    assert _is_session_expired_error(first) is True
-
-
-def test_is_session_expired_rejects_empty_message():
-    """Bare exceptions with no message shouldn't match."""
-    from tools.mcp_tool import _is_session_expired_error
-    assert _is_session_expired_error(RuntimeError("")) is False
-    assert _is_session_expired_error(Exception()) is False
+    # Cycle detection must not prevent scanning reachable transport errors.
+    outer = CyclicException("outer")
+    inner = CyclicException("inner")
+    outer.exceptions = (inner, ClosedResourceError())
+    inner.exceptions = (outer,)
+    assert _is_session_expired_error(outer) is True
 
 
 def test_is_session_expired_follows_cause_chain():
