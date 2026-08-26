@@ -9783,6 +9783,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             current = child_id
         return current
 
+    def _compression_child_edges(self) -> Dict[str, List[str]]:
+        """Fetch every traversable compression edge in ONE statement.
+
+        This is get_compression_tip()'s per-hop child query lifted over all
+        compression-ended parents at once: identical child filters (no
+        ``_branched_from`` / ``_delegate_from`` / tool children) and the
+        identical preference ORDER BY (continuing chain first, then still
+        live, then closed; freshest first; higher id breaks ties). Read
+        through ``_read_ctx()`` so it borrows a WAL reader instead of taking
+        the global write lock.
+
+        Returns ``{parent_id: [child_id, ...]}`` with each candidate list
+        already sorted best-first, so an in-memory walk can take
+        ``children[0]`` exactly as the per-hop query's ``LIMIT 1`` would.
+        """
+        query = f"""
+            SELECT parent.id AS parent_id,
+                   child.id AS child_id,
+                   CASE
+                     WHEN child.end_reason = 'compression' THEN 0
+                     WHEN child.ended_at IS NULL THEN 1
+                     ELSE 2
+                   END AS pref,
+                   {_sql_session_last_active("child")} AS child_last_active
+            FROM sessions parent
+            JOIN sessions child ON child.parent_session_id = parent.id
+            WHERE parent.end_reason = 'compression'
+              AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+              AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+              AND COALESCE(child.source, '') != 'tool'
+            ORDER BY
+              parent.id,
+              pref ASC,
+              child_last_active DESC,
+              child.started_at DESC,
+              child.id DESC
+        """
+        with self._read_ctx() as conn:
+            rows = conn.execute(query).fetchall()
+        # Rows arrive globally ordered by (parent, preference), so grouping
+        # in scan order yields each parent's best-first candidate list.
+        index: Dict[str, List[str]] = {}
+        for row in rows:
+            index.setdefault(row["parent_id"], []).append(row["child_id"])
+        return index
+
+    def _resolve_compression_tips(self, root_ids) -> Dict[str, str]:
+        """Resolve every root's live continuation tip without per-hop queries.
+
+        Builds the batched edge index once (one statement, no write lock),
+        then walks each chain entirely in memory with
+        :meth:`get_compression_tip`'s exact hop semantics: repeatedly take
+        the best-ranked child of the current node, advancing only through
+        compression-ended parents (the index only contains edges out of
+        those), stopping on repeats/cycles and bounded at 100 hops like the
+        original walk. Replaces the N+1 pattern that cost one locked query
+        per hop per root.
+        """
+        tips: Dict[str, str] = {}
+        roots = [rid for rid in dict.fromkeys(root_ids or ()) if rid]
+        if not roots:
+            return tips
+        index = self._compression_child_edges()
+        for root_id in roots:
+            current = root_id
+            seen = {current}
+            for _ in range(100):
+                children = index.get(current)
+                if not children:
+                    break
+                next_child = children[0]
+                if not next_child or next_child in seen:
+                    break
+                seen.add(next_child)
+                current = next_child
+            tips[root_id] = current
+        return tips
+
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
     # routing fields and desktop sidebar fields like git_branch — stays, and
@@ -10153,18 +10231,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # as the live conversation. Keep the root's started_at to preserve
         # chronological ordering by original conversation start.
         if project_compression_tips and not include_children:
-            # get_compression_tip() walks each root's chain individually (it's
-            # a per-session graph walk, not batchable in one query), but the
-            # tip *row* fetch afterward was previously one _get_session_rich_row()
-            # call per compression root. Batch that half instead: resolve
-            # every tip id first, then fetch all tip rows in a single query.
-            tip_ids_by_root: Dict[str, str] = {}
-            for s in sessions:
-                if s.get("end_reason") != "compression":
-                    continue
-                tip_id = self.get_compression_tip(s["id"])
-                if tip_id != s["id"]:
-                    tip_ids_by_root[s["id"]] = tip_id
+            # Resolve every root's tip in one shot: a single edge-listing
+            # statement (read through the WAL reader pool) walked in memory
+            # reproduces get_compression_tip() hop-for-hop — same child
+            # filters, same preference order, same cycle guard. The previous
+            # implementation re-walked each chain hop-by-hop here: one query
+            # AND one acquisition of the global write lock per hop per row
+            # (R×D round-trips), re-computing chains this method already
+            # resolves in SQL when order_by_last_active=True.
+            tips = self._resolve_compression_tips(
+                s["id"] for s in sessions if s.get("end_reason") == "compression"
+            )
+            tip_ids_by_root = {
+                root_id: tip_id for root_id, tip_id in tips.items() if tip_id != root_id
+            }
 
             tip_rows = (
                 self._get_session_rich_rows_batch(
