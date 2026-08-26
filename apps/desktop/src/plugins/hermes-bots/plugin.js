@@ -14171,6 +14171,47 @@ function BotsPane() {
   }, [gatewayFilterExists])
 
   const activeSourceRoster = roster.filter(bot => !bot.remoteSource)
+
+  // Keyboard fallback for "New Group Chat" — Radix DropdownMenuItem relies
+  // on a complete pointer-event sequence (hover → pointerdown → pointerup)
+  // to deliver its onSelect. Programmatic or synthetic clicks that omit the
+  // hover/dwell (cua-driver Quartz sequences, some assistive-tool drivers)
+  // silently swallow the click, leaving users with no UI entry to create a
+  // group chat. Register Cmd+Shift+G as a parallel entry point: it routes
+  // through the same state setter the menu item would, so the dialog opens
+  // identically whether the user clicks or types the shortcut. The shortcut
+  // is also surfaced in the dropdown menu item's tooltip so the two paths
+  // discover each other.
+  //
+  // Declared AFTER activeSourceRoster: the deps array reads
+  // activeSourceRoster.length during render, and referencing a const before
+  // its initializer throws a TDZ ReferenceError — the first version of this
+  // effect sat above the declaration and crashed BotsPane on mount.
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.addEventListener) return undefined
+    const handler = event => {
+      if (event.defaultPrevented) return
+      // BotsPane is a docked pane, so this listener is global while the app
+      // is in Bot Mode. Never hijack the chord while the user is typing —
+      // the chat composer, settings, or the pane's own search box must keep
+      // their key events (review #93777-2: scope-gate the shortcut).
+      const target = event.target
+      if (target instanceof HTMLElement) {
+        const tag = target.tagName
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return
+      }
+      const mod = event.metaKey || event.ctrlKey
+      if (!mod || !event.shiftKey) return
+      if (event.altKey || event.repeat) return
+      if (typeof event.key === 'string' && event.key.toLowerCase() === 'g') {
+        if (activeSourceRoster.length < 2) return
+        event.preventDefault()
+        setGroupCreateOpen(true)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [activeSourceRoster.length])
   // Hidden rows remain fully alive and recoverable at the bottom. Every
   // non-display consumer continues to receive the complete roster.
   const hiddenExpanded = useValue($showHiddenBots)
@@ -14482,13 +14523,43 @@ function BotsPane() {
                     align: 'end',
                     children: [
                       jsxs(DropdownMenuItem, {
+                        // Programmatic / synthetic clicks (cua-driver Quartz
+                        // sequences, assistive-tool drivers) often skip the
+                        // hover dwell that Radix's pointerdown capture
+                        // listener relies on, so its onSelect silently
+                        // swallows the click. Wire the same state setter on
+                        // the React onClick handler — when onSelect already
+                        // fired, both handlers are idempotent (a no-op
+                        // dialog-open call), so the dual wiring cannot
+                        // double-open the create dialog.
                         onSelect: () => setCreateOpen(true),
+                        onClick: () => setCreateOpen(true),
+                        'data-testid': 'bots-new-bot',
                         children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Bot']
                       }),
                       jsxs(DropdownMenuItem, {
                         disabled: activeSourceRoster.length < 2,
+                        // Same Radix-onSelect-vs-programmatic-click
+                        // workaround as the New Bot row above. The keyboard
+                        // shortcut is also surfaced here so users can
+                        // discover the parallel entry point when the menu
+                        // item refuses to fire.
                         onSelect: () => setGroupCreateOpen(true),
-                        children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
+                        onClick: () => {
+                          if (activeSourceRoster.length >= 2) setGroupCreateOpen(true)
+                        },
+                        'data-testid': 'bots-new-group-chat',
+                        children: [
+                          jsx(Codicon, { name: 'organization', className: 'mr-1.5' }),
+                          jsx('span', { className: 'flex items-center gap-2' }, [
+                            'New Group Chat',
+                            jsx('kbd', {
+                              className: 'ml-auto rounded border border-(--ui-border) bg-(--chrome-control) px-1.5 py-0.5 text-[0.65rem] font-mono text-(--ui-text-tertiary)',
+                              'aria-hidden': 'true',
+                              children: '⌘⇧G'
+                            })
+                          ])
+                        ]
                       })
                     ]
                   })
