@@ -368,4 +368,24 @@ describe('startSessionOnSource', () => {
     expect($newChatRoute.get()).toBeNull()
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
   })
+
+  it('routes + onto local with the project stored profile when chrome is remote', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'work' })
+    $activeGatewayProfile.set('work')
+    $newChatRoute.set(null)
+
+    const openDraft = vi.fn(() => {
+      $newChatRoute.set(null)
+    })
+
+    await startSessionOnSource('local', openDraft, { profile: 'home' })
+
+    expect(openGatewayForAgent).toHaveBeenCalledWith('local', 'home')
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect(openDraft).toHaveBeenCalledTimes(1)
+    expect($connection.get()?.connectionId).toBe('homelab')
+    expect($activeGatewayProfile.get()).toBe('work')
+    expect($newChatRoute.get()).toEqual({ connectionId: 'local', mode: 'local', profile: 'home' })
+  })
 })

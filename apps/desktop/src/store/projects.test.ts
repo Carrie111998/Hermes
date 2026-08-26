@@ -591,52 +591,6 @@ describe('createProject', () => {
     expect($activeProjectId.get()).toBeNull()
   })
 
-  it('isolates the same backend project id across two profiles on one connection', async () => {
-    const { $projectTree, enterProject, findProjectByAddress, projectNodeScopeKey, resolveProjectAddress } =
-      await import('./projects')
-
-    const { makeProjectAddress, projectAddressKey, sameProjectAddress } = await import('@/lib/project-address')
-
-    const defaultAddr = makeProjectAddress('mimir', 'default', 'p_same')
-    const altAddr = makeProjectAddress('mimir', 'alt', 'p_same')
-
-    $projectTree.set([
-      {
-        id: 'p_same',
-        label: 'Default profile',
-        path: '/mimir/default',
-        connectionId: 'mimir',
-        profile: 'default',
-        repos: [],
-        sessionCount: 0
-      },
-      {
-        id: 'p_same',
-        label: 'Alt profile',
-        path: '/mimir/alt',
-        connectionId: 'mimir',
-        profile: 'alt',
-        repos: [],
-        sessionCount: 0
-      }
-    ])
-
-    expect(sameProjectAddress(defaultAddr, altAddr)).toBe(false)
-    expect(projectAddressKey(defaultAddr)).not.toBe(projectAddressKey(altAddr))
-
-    enterProject(defaultAddr)
-    expect($projectScope.get()).toBe(projectAddressKey(defaultAddr))
-    expect(findProjectByAddress(defaultAddr)?.label).toBe('Default profile')
-    expect(findProjectByAddress(altAddr)?.label).toBe('Alt profile')
-
-    enterProject(altAddr)
-    expect($projectScope.get()).toBe(projectAddressKey(altAddr))
-    expect(resolveProjectAddress($projectScope.get())?.profile).toBe('alt')
-
-    const nodes = $projectTree.get()
-    expect(projectNodeScopeKey(nodes[0]!)).not.toBe(projectNodeScopeKey(nodes[1]!))
-  })
-
   it('marks the backend stale and surfaces a friendly error when projects.create is missing', async () => {
     activeGateway.mockReturnValue({
       connectionState: 'open',
@@ -1103,5 +1057,379 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('adversarial project address witnesses', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.localStorage.clear()
+    $projectScope.set(ALL_PROJECTS)
+    $activeProjectId.set(null)
+    $projects.set([])
+    $projectTree.set([])
+    $projectsRpcAvailable.set(true)
+    setShowAllProfiles(false)
+    $activeGatewayProfile.set('default')
+  })
+
+  it('isolates the same backend project id across two profiles on one connection', async () => {
+    const { findProjectByAddress, projectNodeScopeKey, resolveProjectAddress } = await import('./projects')
+    const { makeProjectAddress, projectAddressKey, sameProjectAddress } = await import('@/lib/project-address')
+
+    const defaultAddr = makeProjectAddress('mimir', 'default', 'p_same')
+    const altAddr = makeProjectAddress('mimir', 'alt', 'p_same')
+
+    $projectTree.set([
+      {
+        id: 'p_same',
+        label: 'Default profile',
+        path: '/mimir/default',
+        connectionId: 'mimir',
+        profile: 'default',
+        repos: [],
+        sessionCount: 0
+      },
+      {
+        id: 'p_same',
+        label: 'Alt profile',
+        path: '/mimir/alt',
+        connectionId: 'mimir',
+        profile: 'alt',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+
+    expect(sameProjectAddress(defaultAddr, altAddr)).toBe(false)
+    expect(projectAddressKey(defaultAddr)).not.toBe(projectAddressKey(altAddr))
+
+    enterProject(defaultAddr)
+    expect($projectScope.get()).toBe(projectAddressKey(defaultAddr))
+    expect(findProjectByAddress(defaultAddr)?.label).toBe('Default profile')
+    expect(findProjectByAddress(altAddr)?.label).toBe('Alt profile')
+
+    enterProject(altAddr)
+    expect($projectScope.get()).toBe(projectAddressKey(altAddr))
+    expect(resolveProjectAddress($projectScope.get())?.profile).toBe('alt')
+
+    const nodes = $projectTree.get()
+    expect(projectNodeScopeKey(nodes[0]!)).not.toBe(projectNodeScopeKey(nodes[1]!))
+  })
+
+  it('keeps same explicit id on two gateways isolated for enter/fetch/update/delete', async () => {
+    const connections = await import('@/store/connections')
+    connections.$activeConnectionId.set('local')
+    connections.$connectionsRegistry.set({
+      activeId: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false },
+        { id: 'surtr', kind: 'ssh', label: 'surtr', tokenPreview: null, tokenSet: false }
+      ]
+    } as never)
+
+    const { makeProjectAddress, projectAddressKey } = await import('@/lib/project-address')
+    const mimirAddr = makeProjectAddress('mimir', 'default', 'p_deadbeef')
+    const surtrAddr = makeProjectAddress('surtr', 'default', 'p_deadbeef')
+
+    $projectTree.set([
+      {
+        id: 'p_deadbeef',
+        label: 'Mimir Brokk',
+        path: '/mimir/brokk',
+        connectionId: 'mimir',
+        profile: 'default',
+        repos: [],
+        sessionCount: 0
+      },
+      {
+        id: 'p_deadbeef',
+        label: 'Surtr Brokk',
+        path: '/surtr/brokk',
+        connectionId: 'surtr',
+        profile: 'default',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+
+    enterProject(mimirAddr)
+    expect($projectScope.get()).toBe(projectAddressKey(mimirAddr))
+    expect($projectScope.get()).not.toBe(projectAddressKey(surtrAddr))
+
+    const gw = await import('@/store/gateway')
+    const requestGatewayForAgent = vi.mocked(gw.requestGatewayForAgent)
+    requestGatewayForAgent.mockImplementation(async (connectionId, _profile, method) => {
+      if (method === 'projects.project_sessions') {
+        return {
+          project: {
+            id: 'p_deadbeef',
+            label: connectionId === 'mimir' ? 'Mimir hydrated' : 'Surtr hydrated',
+            path: connectionId === 'mimir' ? '/mimir/brokk' : '/surtr/brokk',
+            repos: [],
+            sessionCount: 1
+          }
+        } as never
+      }
+
+      if (method === 'projects.update') {
+        return { active_id: null, projects: [], scoped_session_ids: [] } as never
+      }
+
+      if (method === 'projects.delete') {
+        return { active_id: null, projects: [], scoped_session_ids: [] } as never
+      }
+
+      // Post-delete refresh: mimir gone, surtr still present.
+      if (method === 'projects.tree') {
+        if (connectionId === 'mimir') {
+          return { active_id: null, projects: [], scoped_session_ids: [] } as never
+        }
+
+        return {
+          active_id: null,
+          projects: [
+            {
+              id: 'p_deadbeef',
+              label: 'Surtr renamed',
+              path: '/surtr/brokk',
+              repos: [],
+              sessionCount: 0
+            }
+          ],
+          scoped_session_ids: []
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const chromeRequest = vi.fn().mockResolvedValue({
+      active_id: null,
+      projects: [],
+      scoped_session_ids: []
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request: chromeRequest } as never)
+    gatewayAtom.set({ connectionState: 'open', request: chromeRequest } as never)
+
+    const hydrated = await fetchProjectSessions(mimirAddr)
+    expect(hydrated?.label).toBe('Mimir hydrated')
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'mimir',
+      'default',
+      'projects.project_sessions',
+      expect.objectContaining({ project_id: 'p_deadbeef', profile: 'default' })
+    )
+
+    requestGatewayForAgent.mockClear()
+    const { updateProject, deleteProject, findProjectByAddress } = await import('./projects')
+
+    await updateProject(projectAddressKey(surtrAddr), { name: 'Surtr renamed' })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'surtr',
+      'default',
+      'projects.update',
+      expect.objectContaining({ id: 'p_deadbeef', name: 'Surtr renamed', profile: 'default' })
+    )
+    expect(findProjectByAddress(mimirAddr)?.label).toBe('Mimir Brokk')
+    expect(findProjectByAddress(surtrAddr)?.label).toBe('Surtr renamed')
+
+    requestGatewayForAgent.mockClear()
+    await deleteProject(projectAddressKey(mimirAddr))
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'mimir',
+      'default',
+      'projects.delete',
+      expect.objectContaining({ id: 'p_deadbeef', profile: 'default' })
+    )
+
+    await vi.waitFor(() => {
+      expect(findProjectByAddress(mimirAddr)).toBeUndefined()
+      expect(findProjectByAddress(surtrAddr)?.label).toBe('Surtr renamed')
+    })
+  })
+
+  it('keeps same auto-project path on local and SSH isolated', async () => {
+    const connections = await import('@/store/connections')
+    connections.$activeConnectionId.set('local')
+    connections.$connectionsRegistry.set({
+      activeId: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false }
+      ]
+    } as never)
+
+    const { makeProjectAddress, projectAddressKey } = await import('@/lib/project-address')
+    const {
+      connectionIdForAddress,
+      findProjectByAddress,
+      projectAddressForCwd,
+      projectNodeScopeKey
+    } = await import('./projects')
+
+    const path = '/home/user/repo'
+    const localAddr = makeProjectAddress('local', 'default', path)
+    const mimirAddr = makeProjectAddress('mimir', 'default', path)
+
+    $projectTree.set([
+      {
+        id: path,
+        label: 'Local repo',
+        path,
+        isAuto: true,
+        profile: 'default',
+        repos: [],
+        sessionCount: 0
+      },
+      {
+        id: path,
+        label: 'Mimir repo',
+        path,
+        connectionId: 'mimir',
+        profile: 'default',
+        isAuto: true,
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+
+    expect(projectNodeScopeKey($projectTree.get()[0]!)).toBe(projectAddressKey(localAddr))
+    expect(projectNodeScopeKey($projectTree.get()[1]!)).toBe(projectAddressKey(mimirAddr))
+    expect(projectAddressKey(localAddr)).not.toBe(projectAddressKey(mimirAddr))
+
+    // Longest-path ties prefer chrome (local).
+    expect(projectAddressForCwd(`${path}/src`)?.connectionId).toBe('local')
+    expect(connectionIdForAddress(mimirAddr)).toBe('mimir')
+    expect(findProjectByAddress(localAddr)?.label).toBe('Local repo')
+    expect(findProjectByAddress(mimirAddr)?.label).toBe('Mimir repo')
+
+    enterProject(mimirAddr)
+    expect($projectScope.get()).toBe(projectAddressKey(mimirAddr))
+  })
+
+  it('aggregates local projects when chrome is remote and routes + via stored profile', async () => {
+    setShowAllProfiles(false)
+    $activeGatewayProfile.set('work')
+
+    const connections = await import('@/store/connections')
+    connections.$activeConnectionId.set('mimir')
+    connections.$connectionsRegistry.set({
+      activeId: 'mimir',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false, remoteProfile: 'home' },
+        {
+          id: 'mimir',
+          kind: 'ssh',
+          label: 'mimir',
+          tokenPreview: null,
+          tokenSet: false,
+          remoteProfile: 'work'
+        }
+      ]
+    } as never)
+
+    const chromeRequest = vi.fn().mockResolvedValue({
+      active_id: null,
+      projects: [
+        {
+          id: 'p_mimir',
+          label: 'Remote only',
+          path: '/mimir/app',
+          repos: [],
+          sessionCount: 1
+        }
+      ],
+      scoped_session_ids: []
+    })
+
+    activeGateway.mockReturnValue({ connectionState: 'open', request: chromeRequest } as never)
+    gatewayAtom.set({ connectionState: 'open', request: chromeRequest } as never)
+
+    const gw = await import('@/store/gateway')
+    vi.mocked(gw.requestGatewayForAgent).mockImplementation(async (connectionId, profile) => {
+      expect(connectionId).toBe('local')
+      expect(profile).toBe('home')
+
+      return {
+        active_id: null,
+        projects: [
+          {
+            id: 'p_local',
+            label: 'This device app',
+            path: '/Users/me/app',
+            repos: [],
+            sessionCount: 2
+          }
+        ],
+        scoped_session_ids: []
+      } as never
+    })
+
+    await refreshProjectTree()
+
+    const ids = $projectTree.get().map(project => `${project.connectionId || 'local'}:${project.id}`).sort()
+    expect(ids).toEqual(['local:p_local', 'mimir:p_mimir'])
+
+    const { connectionIdForProjectPath, profileForProjectPath } = await import('./projects')
+    expect(connectionIdForProjectPath('/Users/me/app/src')).toBe('local')
+    expect(profileForProjectPath('/Users/me/app/src')).toBe('home')
+
+    // Entered local project: null path still resolves owner from scope.
+    const { makeProjectAddress, projectAddressKey } = await import('@/lib/project-address')
+    enterProject(makeProjectAddress('local', 'home', 'p_local'))
+    expect($projectScope.get()).toBe(projectAddressKey(makeProjectAddress('local', 'home', 'p_local')))
+    expect(connectionIdForProjectPath(null)).toBe('local')
+    expect(profileForProjectPath(null)).toBe('home')
+  })
+
+  it('does not transfer ownership after refresh when two gateways share an id', async () => {
+    const connections = await import('@/store/connections')
+    connections.$activeConnectionId.set('local')
+    connections.$connectionsRegistry.set({
+      activeId: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false }
+      ]
+    } as never)
+
+    const { makeProjectAddress, projectAddressKey } = await import('@/lib/project-address')
+    const {
+      $projectConnectionById,
+      findProjectByAddress,
+      rememberProjectAddress
+    } = await import('./projects')
+
+    const localAddr = makeProjectAddress('local', 'default', 'p_shared')
+    const mimirAddr = makeProjectAddress('mimir', 'default', 'p_shared')
+    rememberProjectAddress(localAddr)
+    rememberProjectAddress(mimirAddr)
+
+    expect($projectConnectionById.get()[projectAddressKey(localAddr)]).toBe('local')
+    expect($projectConnectionById.get()[projectAddressKey(mimirAddr)]).toBe('mimir')
+
+    const chromeRequest = vi.fn().mockResolvedValue({
+      active_id: null,
+      projects: [{ id: 'p_shared', label: 'Local shared', path: '/local/shared', repos: [], sessionCount: 0 }],
+      scoped_session_ids: []
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request: chromeRequest } as never)
+    gatewayAtom.set({ connectionState: 'open', request: chromeRequest } as never)
+
+    const gw = await import('@/store/gateway')
+    vi.mocked(gw.requestGatewayForAgent).mockResolvedValue({
+      active_id: null,
+      projects: [{ id: 'p_shared', label: 'Mimir shared', path: '/mimir/shared', repos: [], sessionCount: 0 }],
+      scoped_session_ids: []
+    } as never)
+
+    await refreshProjectTree()
+
+    expect(findProjectByAddress(localAddr)?.label).toBe('Local shared')
+    expect(findProjectByAddress(mimirAddr)?.label).toBe('Mimir shared')
+    expect($projectConnectionById.get()[projectAddressKey(localAddr)]).toBe('local')
+    expect($projectConnectionById.get()[projectAddressKey(mimirAddr)]).toBe('mimir')
   })
 })

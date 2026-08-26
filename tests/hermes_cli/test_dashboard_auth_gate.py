@@ -396,6 +396,112 @@ def test_start_server_ambient_desktop_marker_alone_fails_closed(monkeypatch):
         clear_providers()
 
 
+def test_start_server_ssh_child_missing_token_fails_closed(monkeypatch):
+    """Nonce without session token must leave the public-URL gate engaged."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    register_provider(StubAuthProvider())
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+            headless=True,
+            ssh_session_token="",
+            ssh_owner_nonce="0123456789abcdef",
+        )
+        assert web_server.app.state.auth_required is True
+    finally:
+        clear_providers()
+
+
+def test_start_server_ssh_child_non_headless_fails_closed(monkeypatch):
+    """Dashboard (non-headless) must not get SSH token-mode even with token+nonce."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    register_provider(StubAuthProvider())
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+            headless=False,
+            ssh_session_token="ssh-token-value",
+            ssh_owner_nonce="0123456789abcdef",
+        )
+        assert web_server.app.state.auth_required is True
+    finally:
+        clear_providers()
+
+
+def test_start_server_ssh_child_non_loopback_fails_closed(monkeypatch):
+    """Non-loopback bind never drops public hosts, even with full SSH proof."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    register_provider(StubAuthProvider())
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="0.0.0.0",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+            headless=True,
+            ssh_session_token="ssh-token-value",
+            ssh_owner_nonce="0123456789abcdef",
+        )
+        assert web_server.app.state.auth_required is True
+        assert "dashboard.example.test" in web_server.app.state.trusted_public_hosts
+    finally:
+        clear_providers()
+
+
 def test_public_url_aware_gate_preserves_local_only_mode(monkeypatch):
     """A loopback browser-facing URL does not change local token mode."""
     from hermes_cli.web_server import should_require_dashboard_auth
