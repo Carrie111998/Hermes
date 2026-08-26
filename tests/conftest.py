@@ -1747,3 +1747,109 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+# ── Kanban model-routing test admission helpers ────────────────────────────
+#
+# Kanban claims intentionally fail closed unless a persisted routing policy
+# authorizes them. These fixtures use production create/claim/reclaim paths;
+# callers must not hand-write route snapshots or suppress the admission gate.
+_VALID_MODEL_ROUTING_CONFIG = """\
+model_routing:
+  enabled: true
+  tiers:
+    T1:
+      - {provider: nous, model: small}
+    T4:
+      - {provider: openai, model: large}
+  classification:
+    P0: {tags: [deterministic]}
+    P1: {tier: T1}
+    P2: {tier: T1}
+    P3: {tier: T1}
+    P4: {tier: T4}
+"""
+
+
+@pytest.fixture
+def valid_model_routing_config() -> Path:
+    """Persist the minimal valid production routing policy for this test home."""
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "config.yaml"
+    path.write_text(_VALID_MODEL_ROUTING_CONFIG, encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def routable_task(valid_model_routing_config):
+    """Create a task which can pass the production routing admission gate."""
+    from hermes_cli import kanban_db as kb
+
+    def create(conn, *, title="routable task", assignee="worker", **kwargs):
+        return kb.create_task(conn, title=title, assignee=assignee, **kwargs)
+
+    return create
+
+
+@pytest.fixture
+def routed_task(routable_task):
+    """Create then claim a P1 task through the real routing gate."""
+    from hermes_cli import kanban_db as kb
+
+    def create_and_claim(conn, *, title="routed task", assignee="worker", claimer=None, **kwargs):
+        task_id = routable_task(conn, title=title, assignee=assignee, **kwargs)
+        task = kb.claim_task(conn, task_id, claimer=claimer)
+        assert task is not None, "valid routed task must be claimable"
+        assert task.status == "running"
+        assert task.route_snapshot is not None
+        return task_id, task
+
+    return create_and_claim
+
+
+@pytest.fixture
+def routed_ready_task(routed_task):
+    """Return a production-reclaimed ready task, never a synthetic snapshot."""
+    from hermes_cli import kanban_db as kb
+
+    def create_claim_and_reclaim(conn, *, title="routed ready task", assignee="worker", **kwargs):
+        task_id, _ = routed_task(conn, title=title, assignee=assignee, **kwargs)
+        assert kb.reclaim_task(conn, task_id, reason="test lifecycle setup")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        return task_id, task
+
+    return create_claim_and_reclaim
+
+
+@pytest.fixture
+def p0_task(routable_task):
+    """Create a deterministic P0 task through normal skill classification."""
+    def create(conn, *, title="deterministic task", assignee="worker", **kwargs):
+        return routable_task(conn, title=title, assignee=assignee, skills=["deterministic"], **kwargs)
+
+    return create
+
+
+@pytest.fixture
+def p4_blocked_task(routable_task, valid_model_routing_config):
+    """Let production claim admission block P4 when its configured T4 is absent."""
+    from hermes_cli import kanban_db as kb
+
+    def create_and_block(conn, *, title="P4 task", assignee="worker", **kwargs):
+        valid_model_routing_config.write_text(
+            _VALID_MODEL_ROUTING_CONFIG.replace(
+                "    T4:\n      - {provider: openai, model: large}\n", ""
+            ),
+            encoding="utf-8",
+        )
+        task_id = routable_task(conn, title=title, assignee=assignee, **kwargs)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET routing_priority='P4' WHERE id=?", (task_id,))
+        assert kb.claim_task(conn, task_id) is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+        return task_id, task
+
+    return create_and_block
