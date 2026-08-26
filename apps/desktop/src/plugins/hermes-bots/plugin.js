@@ -15415,6 +15415,13 @@ export default {
             group ? null : selected,
             group ? 'New group conversations start in the group composer.' : 'Select a Bot or group first.'
           )
+        } else if (host.paneMinimized?.(`${ID}:pane`)?.get()) {
+          // The Bots zone folded to its RAIL (the header chevron / a narrow
+          // edge collapse) — the tab is still reachable, so Bot Mode is still
+          // on screen. Keep the workspace owned by the current bot rather than
+          // stranding it: folding the sidebar is a layout gesture, not a
+          // deliberate return to Sessions.
+          $botsPaneVisible.set(true)
         } else {
           // Strand any owner wake still dialing. Its SDK open will fail the
           // workspace token too; this plugin generation prevents that expected

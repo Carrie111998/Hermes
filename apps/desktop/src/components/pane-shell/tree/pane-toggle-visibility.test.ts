@@ -9,6 +9,7 @@ import {
   $hiddenTreePanes,
   $layoutTree,
   bindPaneVisibility,
+  isPaneMinimized,
   isPaneVisible,
   setTreeGroupMinimized,
   togglePaneVisible
@@ -94,6 +95,61 @@ describe('a hide-style pane inside a minimized zone', () => {
     togglePaneVisible('files')
 
     expect(isPaneVisible('files')).toBe(true)
+  })
+})
+
+describe('minimized vs. hidden — the rail-collapse distinction', () => {
+  it('reports a zone folded to its rail as minimized, not visible', () => {
+    $layoutTree.set(
+      split('row', [
+        group(['workspace'], { active: 'workspace', id: 'g-main' }),
+        group(['files'], { active: 'files', id: 'g-files' })
+      ])
+    )
+
+    const $files = atom(true)
+    bindVisibility('files', $files)
+
+    // On screen and active: neither minimized nor hidden.
+    expect(isPaneMinimized('files')).toBe(false)
+    expect(isPaneVisible('files')).toBe(true)
+
+    // Fold the zone to its rail (the header chevron): the pane is off screen
+    // but still in the tree and reachable — a layout gesture, not a removal.
+    setTreeGroupMinimized('g-files', true)
+
+    expect(isPaneMinimized('files'), 'rail-folded pane reports minimized').toBe(true)
+    expect(isPaneVisible('files'), 'rail-folded pane is not on screen').toBe(false)
+  })
+
+  it('reports a dismissed pane as neither minimized nor visible', () => {
+    $layoutTree.set(
+      split('row', [
+        group(['workspace'], { active: 'workspace', id: 'g-main' }),
+        group(['files'], { active: 'files', id: 'g-files' })
+      ])
+    )
+
+    $dismissedPanes.set(new Set(['files']))
+
+    expect(isPaneMinimized('files'), 'a dismissed pane is not a rail fold').toBe(false)
+    expect(isPaneVisible('files')).toBe(false)
+  })
+
+  it('reports a chrome-hidden pane as neither minimized nor visible', () => {
+    $layoutTree.set(
+      split('row', [
+        group(['workspace'], { active: 'workspace', id: 'g-main' }),
+        group(['files'], { active: 'files', id: 'g-files' })
+      ])
+    )
+
+    const $files = atom(true)
+    bindVisibility('files', $files)
+    $files.set(false)
+
+    expect(isPaneMinimized('files'), 'a chrome-hidden pane is not a rail fold').toBe(false)
+    expect(isPaneVisible('files')).toBe(false)
   })
 })
 

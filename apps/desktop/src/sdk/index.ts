@@ -27,6 +27,7 @@ import type { ClientSessionState } from '@/app/types'
 import {
   $narrowViewport,
   $newSessionTabAction,
+  $paneMinimized,
   $paneVisible,
   registerPaneCloser,
   removeTreePane,
@@ -1121,6 +1122,16 @@ export const host = {
    *  safe to call in render. Feature-detect on older desktops
    *  (`typeof host.paneVisibility === 'function'`). */
   paneVisibility: (paneId: string): ReadableAtom<boolean> => $paneVisible(paneId),
+
+  /** Reactive minimized state of a contributed pane: true while the pane is
+   *  still in the layout tree (not dismissed/hidden) but its zone is folded
+   *  to a rail. Complements `paneVisibility` — a plugin that treats "zone
+   *  collapsed to a rail" differently from "removed from the layout" (e.g.
+   *  whether its workspace still owns the center) can tell the two apart.
+   *  Contribution-scoped pane id `<pluginId>:<paneId>`. Memoized per id.
+   *  Feature-detect on older desktops
+   *  (`typeof host.paneMinimized === 'function'`). */
+  paneMinimized: (paneId: string): ReadableAtom<boolean> => $paneMinimized(paneId),
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool
    *  activity, …) by event type — `'*'` for everything. Returns a disposer.

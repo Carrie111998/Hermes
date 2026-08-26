@@ -1727,6 +1727,37 @@ export function $paneVisible(paneId: string): ReadableAtom<boolean> {
   return cached
 }
 
+/** Is a pane's ZONE folded to its rail (minimized) while the pane itself is
+ *  still in the tree and reachable? Distinct from being hidden/dismissed: a
+ *  minimized zone keeps its tab on the rail, so the pane's surface is a
+ *  click away rather than gone. Chrome that must tell "collapsed to a rail"
+ *  apart from "removed from the layout" (a plugin deciding whether its
+ *  workspace still owns the center) reads this instead of `isPaneVisible`,
+ *  which folds both cases into `false`. */
+export function isPaneMinimized(paneId: string): boolean {
+  if ($dismissedPanes.get().has(paneId) || $hiddenTreePanes.get().has(paneId)) {
+    return false
+  }
+
+  const group = paneGroup(paneId)
+
+  return Boolean(group && group.minimized)
+}
+
+const paneMinimizedCache = new Map<string, ReadableAtom<boolean>>()
+
+/** Reactive `isPaneMinimized` — memoized per pane id like `$paneVisible`. */
+export function $paneMinimized(paneId: string): ReadableAtom<boolean> {
+  let cached = paneMinimizedCache.get(paneId)
+
+  if (!cached) {
+    cached = computed([$layoutTree, $dismissedPanes, $hiddenTreePanes], () => isPaneMinimized(paneId))
+    paneMinimizedCache.set(paneId, cached)
+  }
+
+  return cached
+}
+
 /**
  * HIDE-STYLE PANES (files, review, preview): bind a pane's visibility STORE to
  * the tree so its toggle HIDES the pane — its zone collapses while the content

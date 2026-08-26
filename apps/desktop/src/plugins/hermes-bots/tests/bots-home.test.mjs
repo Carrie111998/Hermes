@@ -758,8 +758,19 @@ test('an explicit Bots-home gesture fronts the selected owner over a Sessions co
 
 test('source contract: sidebar entry and boot restore reconcile passively after layout hydration', () => {
   assert.match(pluginSource, /const syncWorkspaceSurfaces = \(\) =>/)
-  assert.match(pluginSource, /stopSidebarSync = \$sidebarVisible\.listen\(visible => \{[\s\S]{0,1500}?syncWorkspaceSurfaces\(\)/)
-  assert.doesNotMatch(pluginSource, /stopSidebarSync = \$sidebarVisible\.listen\(visible => \{[\s\S]{0,1500}?syncWorkspaceSurfaces\(Boolean\(visible\)\)/)
+  // The sidebar-visibility listener must reconcile PASSIVELY: it may keep the
+  // bots workspace alive (a zone folded to its rail is still reachable) but
+  // must never swallow the sync call. 2000 chars headroom covers the
+  // paneMinimized guard added for the rail-collapse case.
+  assert.match(pluginSource, /stopSidebarSync = \$sidebarVisible\.listen\(visible => \{[\s\S]{0,2000}?syncWorkspaceSurfaces\(\)/)
+  assert.doesNotMatch(pluginSource, /stopSidebarSync = \$sidebarVisible\.listen\(visible => \{[\s\S]{0,2000}?syncWorkspaceSurfaces\(Boolean\(visible\)\)/)
+  // Rail-collapse (zone minimized, tab still on the rail) is a layout gesture,
+  // not a return to Sessions: the listener must check paneMinimized before
+  // stranding the workspace, and keep $botsPaneVisible true in that case.
+  assert.match(
+    pluginSource,
+    /stopSidebarSync = \$sidebarVisible\.listen\(visible => \{[\s\S]{0,2000}?host\.paneMinimized\?\.\(`\$\{ID\}:pane`\)\?\.get\(\)[\s\S]{0,600}?\$botsPaneVisible\.set\(true\)/
+  )
   assert.match(
     pluginSource,
     /\$botChatFocused\.set\(sessionOwnsWorkspace\(\)\)[\s\S]{0,500}?syncWorkspaceSurfaces\(\)[\s\S]{0,120}?scheduleSurfaceSync\(\)/
