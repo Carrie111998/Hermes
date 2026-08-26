@@ -15392,3 +15392,93 @@ def test_sidebar_candidate_with_malformed_activity_json_is_skipped(db) -> None:
     assert [candidate.source_session_id for candidate in page] == [
         healthy.source_session_id
     ]
+
+
+def test_inspect_accepts_every_state_the_repair_claim_accepts(
+    db: SessionDB,
+) -> None:
+    """--dry-run must not refuse what --apply would take.
+
+    inspect_ backs the CLI's --dry-run and claim_ backs its --apply.  While
+    inspect_ required state='claude_failed' it refused an abandoned
+    reconciliation lease -- the one shape claim_ uniquely exists to reclaim --
+    so the preview reported the operation impossible and the apply then
+    performed it.  Measured live 2026-08-25 on a real stuck job.
+    """
+
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("inspect-parity")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    # The repair lease is now abandoned: leased, reconciliation, expired.
+    clock[0] = 161.0
+
+    inspected = store.inspect_failed_claude_visibility_reconciliation(
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    assert inspected["status"] == "repairable"
+    assert inspected["job_id"] == identity.job_id
+    assert inspected["reserved_claude_uuid"] == identity.claude_uuid
+
+    # And the preview must have told the truth: the claim still succeeds.
+    reclaimed = store.claim_failed_claude_visibility_reconciliation(
+        161.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+    assert reclaimed.claimed is True
+
+
+def test_inspect_refuses_a_repair_lease_that_has_not_expired(
+    db: SessionDB,
+) -> None:
+    """Only an EXPIRED repair lease is reclaimable; a live one is someone's."""
+
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("inspect-live-lease")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+
+    # Still inside the 60s lease: the holder is live.
+    clock[0] = 130.0
+
+    with pytest.raises(ValueError):
+        store.inspect_failed_claude_visibility_reconciliation(
+            expected_job_id=identity.job_id,
+            expected_reserved_claude_uuid=identity.claude_uuid,
+            expected_error_code="bridge_conflict",
+        )

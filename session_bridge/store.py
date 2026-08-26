@@ -2682,16 +2682,36 @@ class SessionBridgeStore:
         )
         if normalized_code != "bridge_conflict":
             raise ValueError("terminal repair requires bridge_conflict")
+        operation_time = _finite_number(self._clock(), "clock")
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None
+            # This must accept exactly what
+            # claim_failed_claude_visibility_reconciliation accepts, including an
+            # ABANDONED repair lease.  It backs the CLI's --dry-run, and a preview
+            # that refuses what --apply would take reports the operation impossible
+            # immediately before it succeeds -- measured live 2026-08-25, where it
+            # sent an operator looking for a nonexistent escape hatch.
             row = conn.execute(
                 """SELECT id, reserved_claude_uuid, error_code, attempts
                    FROM session_claude_visibility_jobs
                    WHERE id = ? AND reserved_claude_uuid = ?
-                     AND state = 'claude_failed' AND error_code = ?
-                     AND operator_cleared_at IS NULL""",
-                (normalized_job, normalized_uuid, normalized_code),
+                     AND error_code = ? AND operator_cleared_at IS NULL
+                     AND (
+                         state = 'claude_failed' OR (
+                             state = 'claude_leased'
+                             AND lease_kind = 'reconciliation'
+                             AND lease_expires_at <= ?
+                             AND error_detail =
+                                 'exact terminal reconciliation in progress'
+                         )
+                     )""",
+                (
+                    normalized_job,
+                    normalized_uuid,
+                    normalized_code,
+                    operation_time,
+                ),
             ).fetchone()
             if row is None:
                 raise ValueError("exact failed Claude visibility job required")
