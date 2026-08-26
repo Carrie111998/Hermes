@@ -43,6 +43,15 @@ public class MobileCapabilitiesPlugin extends Plugin {
     static final String MEDIA = "media";
 
     @PluginMethod
+    public void enableActiveSession(PluginCall call) {
+        boolean enabled = ActiveSessionService.canShowForegroundNotification(getContext());
+        ActiveSessionService.arm(getContext(), enabled);
+        JSObject result = new JSObject();
+        result.put("enabled", enabled);
+        call.resolve(result);
+    }
+
+    @PluginMethod
     public void requestMedia(PluginCall call) {
         String alias = mediaAlias();
         if (!isPermissionDeclared(alias) || getPermissionState(alias) == PermissionState.GRANTED) {

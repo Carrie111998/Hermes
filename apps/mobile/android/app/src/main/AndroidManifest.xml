@@ -37,6 +37,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Visible only while an already connected remote session is backgrounded.
+             It stops when the user dismisses the app task; it is not a boot daemon. -->
+        <service
+            android:name=".ActiveSessionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -49,6 +56,10 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Visible active-session service while a connected remote session is
+         backgrounded. It is not started at boot and stops on task dismissal. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- The notification plugin declares these for delayed/reboot scheduling;
          Hermes only posts immediate foreground notifications, so keep the
          permission footprint minimal. -->
