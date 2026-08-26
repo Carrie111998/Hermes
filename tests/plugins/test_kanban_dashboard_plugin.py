@@ -142,6 +142,75 @@ def test_dashboard_filters_and_reparents_recursive_issues(client):
     assert moved.json()["task"]["parent_id"] == other["id"]
 
 
+def test_dashboard_rejects_ambiguous_parent_clear_payload(client):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "parent"}).json()["task"]
+    child = client.post("/api/plugins/kanban/tasks", json={"title": "child"}).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"parent_id": parent["id"], "clear_parent": True},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "parent_id and clear_parent=true are mutually exclusive"
+
+
+def test_board_batches_hierarchy_projection_in_one_query(client, monkeypatch):
+    root = client.post("/api/plugins/kanban/tasks", json={"title": "root"}).json()["task"]
+    parent = root["id"]
+    for depth in range(5):
+        parent = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"level {depth}", "parent_id": parent},
+        ).json()["task"]["id"]
+
+    statements = []
+    original_connect = kb.connect
+
+    def traced_connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(kb, "connect", traced_connect)
+    response = client.get("/api/plugins/kanban/board")
+    assert response.status_code == 200, response.text
+    per_task_reads = [
+        sql for sql in statements
+        if sql.startswith("SELECT id FROM tasks WHERE parent_id = ")
+    ]
+    batch_reads = [
+        sql for sql in statements
+        if sql == "SELECT * FROM tasks ORDER BY created_at, id"
+    ]
+    assert per_task_reads == []
+    assert batch_reads == ["SELECT * FROM tasks ORDER BY created_at, id"]
+
+
+def test_dashboard_depth_boundary_and_corrupt_projection_return_explicit_4xx(client):
+    chain = [client.post("/api/plugins/kanban/tasks", json={"title": "root"}).json()["task"]]
+    for depth in range(1, kb.MAX_CONTAINMENT_DEPTH + 1):
+        response = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"level {depth}", "parent_id": chain[-1]["id"]},
+        )
+        assert response.status_code == 200, response.text
+        chain.append(response.json()["task"])
+
+    too_deep = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "too deep", "parent_id": chain[-1]["id"]},
+    )
+    assert too_deep.status_code == 400
+    assert "maximum containment depth" in too_deep.json()["detail"]
+
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET parent_id = 'missing' WHERE id = ?", (chain[0]["id"],))
+    corrupt = client.get("/api/plugins/kanban/board")
+    assert corrupt.status_code == 409
+    assert corrupt.json()["detail"] == "unknown hierarchy issue missing"
+
+
 @pytest.mark.parametrize("case", ["cycle", "self", "orphan"])
 def test_dashboard_reparent_validation_returns_4xx(client, case):
     root = client.post(

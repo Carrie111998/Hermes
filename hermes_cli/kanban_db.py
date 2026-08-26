@@ -137,6 +137,10 @@ VALID_ISSUE_KINDS = {
     "individual", "group", "company", "portfolio", "product", "project",
     "feature", "task", "defect",
 }
+# A containment edge adds one level below a root issue.  Thirty-two levels is
+# intentionally generous for organizational/project decomposition while
+# bounding corrupt or adversarial chains across every hierarchy surface.
+MAX_CONTAINMENT_DEPTH = 32
 _SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
@@ -3477,6 +3481,13 @@ def create_task(
                     "SELECT 1 FROM tasks WHERE id = ?", (hierarchy_parent_id,)
                 ).fetchone():
                     raise ValueError(f"unknown hierarchy parent {hierarchy_parent_id}")
+                if hierarchy_parent_id:
+                    parent_by_id = {
+                        row["id"]: row["parent_id"]
+                        for row in conn.execute("SELECT id, parent_id FROM tasks")
+                    }
+                    parent_by_id[task_id] = hierarchy_parent_id
+                    _containment_chain(parent_by_id, task_id)
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3930,22 +3941,54 @@ def hierarchy_child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [row["id"] for row in rows]
 
 
-def issue_breadcrumbs(conn: sqlite3.Connection, task_id: str) -> list[Task]:
-    """Return root-to-issue containment breadcrumbs, failing on corrupt cycles."""
-    chain: list[Task] = []
+def _containment_chain(
+    parent_by_id: Mapping[str, Optional[str]], task_id: str,
+) -> list[str]:
+    """Return root-to-task ids from a fetched relation, failing closed."""
+    chain: list[str] = []
     seen: set[str] = set()
     current: Optional[str] = task_id
     while current:
         if current in seen:
             raise ValueError(f"hierarchy cycle detected at {current}")
-        seen.add(current)
-        issue = get_task(conn, current)
-        if issue is None:
+        if current not in parent_by_id:
             raise ValueError(f"unknown hierarchy issue {current}")
-        chain.append(issue)
-        current = issue.parent_id
+        seen.add(current)
+        chain.append(current)
+        if len(chain) - 1 > MAX_CONTAINMENT_DEPTH:
+            raise ValueError(
+                f"maximum containment depth is {MAX_CONTAINMENT_DEPTH}"
+            )
+        current = parent_by_id[current]
     chain.reverse()
     return chain
+
+
+def hierarchy_projection(
+    conn: sqlite3.Connection, task_ids: Iterable[str],
+) -> tuple[dict[str, list[str]], dict[str, list[Task]]]:
+    """Batch children and breadcrumbs from one deterministic task fetch."""
+    rows = conn.execute("SELECT * FROM tasks ORDER BY created_at, id").fetchall()
+    tasks_by_id = {row["id"]: Task.from_row(row) for row in rows}
+    parent_by_id = {task_id: task.parent_id for task_id, task in tasks_by_id.items()}
+    children: dict[str, list[str]] = {task_id: [] for task_id in tasks_by_id}
+    for task in tasks_by_id.values():
+        if task.parent_id in children:
+            children[task.parent_id].append(task.id)
+
+    breadcrumbs: dict[str, list[Task]] = {}
+    for task_id in task_ids:
+        breadcrumbs[task_id] = [
+            tasks_by_id[item_id]
+            for item_id in _containment_chain(parent_by_id, task_id)
+        ]
+    return children, breadcrumbs
+
+
+def issue_breadcrumbs(conn: sqlite3.Connection, task_id: str) -> list[Task]:
+    """Return root-to-issue containment breadcrumbs, failing on corrupt cycles."""
+    _, breadcrumbs = hierarchy_projection(conn, [task_id])
+    return breadcrumbs[task_id]
 
 
 def reparent_issue(
@@ -3974,6 +4017,25 @@ def reparent_issue(
                 if row is None:
                     raise ValueError(f"unknown hierarchy parent {ancestor}")
                 ancestor = row["parent_id"]
+        parent_by_id = {
+            row["id"]: row["parent_id"]
+            for row in conn.execute("SELECT id, parent_id FROM tasks")
+        }
+        parent_by_id[task_id] = parent_id
+        # Validate the moved issue and every descendant because moving a subtree
+        # can push its deepest leaf over the shared boundary. Unrelated legacy
+        # corruption does not prevent repairing or extending a valid subtree.
+        descendants = {task_id}
+        while True:
+            added = {
+                candidate for candidate, candidate_parent in parent_by_id.items()
+                if candidate_parent in descendants
+            } - descendants
+            if not added:
+                break
+            descendants.update(added)
+        for candidate in descendants:
+            _containment_chain(parent_by_id, candidate)
         if issue.parent_id == parent_id:
             return False
         conn.execute("UPDATE tasks SET parent_id = ? WHERE id = ?", (parent_id, task_id))

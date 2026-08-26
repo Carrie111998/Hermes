@@ -12,7 +12,9 @@ Each physical board remains the hard dispatch, workspace, attachment, and worker
 
 ## Current implementation
 
-The additive SQLite migration adds `kind`, `parent_id`, and `product_id` plus exact-filter indexes. Existing rows read as root `task` issues. Creation validates the closed kind vocabulary, structured product IDs, and parent existence. Reparenting is atomic and rejects self-parenting, orphans, and ancestry cycles. Deletion refuses to orphan containment children. Archive and review-reopen paths leave containment and dependencies unchanged.
+The additive SQLite migration adds `kind`, `parent_id`, and `product_id` plus exact-filter indexes. Existing rows read as root `task` issues. Creation validates the closed kind vocabulary, structured product IDs, parent existence, and the shared 32-edge maximum containment depth. Reparenting is atomic and rejects self-parenting, orphans, ancestry cycles, and moves that would push any descendant over that boundary. Breadcrumb traversal uses the same boundary and fails closed on corrupt cycles, orphans, or over-depth legacy rows rather than presenting truncated ancestry. Deletion refuses to orphan containment children. Archive and review-reopen paths leave containment and dependencies unchanged.
+
+Portable scope IDs deliberately allow `:` as an internal namespace separator (for example, `company:zer0:product:hermes-agent`). This is unambiguous with qualified issue references because scope IDs are opaque task fields, while `<board>:<issue-id>` parsing applies only to issue references and generated issue IDs never contain `:`.
 
 Existing model tools, CLI commands, and dashboard API fields are extended rather than duplicated. `kanban_create`, `kanban_show`, and `kanban_list` create, return, and filter hierarchy fields. CLI create/list/show JSON and dashboard create/list/update expose the same fields. The official Kanban plugin renders kind/product badges, breadcrumbs, containment-child counts separately from dependency counts, exact filters, creation controls, and reparenting.
 

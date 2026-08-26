@@ -105,3 +105,45 @@ def test_delete_refuses_to_orphan_hierarchy_children(board):
     kb.create_task(board, title="Child", hierarchy_parent_id=parent)
     with pytest.raises(ValueError, match="hierarchy children"):
         kb.delete_task(board, parent)
+
+
+def test_containment_depth_boundary_is_shared_by_create_reparent_and_breadcrumbs(board):
+    chain = [kb.create_task(board, title="root")]
+    for depth in range(1, kb.MAX_CONTAINMENT_DEPTH + 1):
+        chain.append(kb.create_task(
+            board, title=f"level {depth}", hierarchy_parent_id=chain[-1],
+        ))
+
+    assert len(kb.issue_breadcrumbs(board, chain[-1])) == kb.MAX_CONTAINMENT_DEPTH + 1
+    with pytest.raises(ValueError, match="maximum containment depth"):
+        kb.create_task(board, title="too deep", hierarchy_parent_id=chain[-1])
+
+    movable = kb.create_task(board, title="movable")
+    with pytest.raises(ValueError, match="maximum containment depth"):
+        kb.reparent_issue(board, movable, chain[-1])
+
+    # Corrupt legacy rows are never rendered with silently truncated ancestry.
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET parent_id = ? WHERE id = ?", (movable, chain[0]))
+    with pytest.raises(ValueError, match="maximum containment depth"):
+        kb.issue_breadcrumbs(board, chain[-1])
+
+
+def test_breadcrumbs_fail_closed_for_corrupt_orphan_and_cycle_rows(board):
+    root = kb.create_task(board, title="root")
+    child = kb.create_task(board, title="child", hierarchy_parent_id=root)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET parent_id = 'missing' WHERE id = ?", (root,))
+    with pytest.raises(ValueError, match="unknown hierarchy issue missing"):
+        kb.issue_breadcrumbs(board, child)
+
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET parent_id = ? WHERE id = ?", (child, root))
+    with pytest.raises(ValueError, match="hierarchy cycle"):
+        kb.issue_breadcrumbs(board, child)
+
+
+def test_product_scope_ids_deliberately_allow_colon(board):
+    product_id = "company:zer0:product:hermes-agent"
+    task_id = kb.create_task(board, title="portable", product_id=product_id)
+    assert kb.get_task(board, task_id).product_id == product_id

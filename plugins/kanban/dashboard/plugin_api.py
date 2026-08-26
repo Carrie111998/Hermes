@@ -467,6 +467,12 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        try:
+            hierarchy_children, breadcrumbs = kanban_db.hierarchy_projection(
+                conn, [t.id for t in tasks],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -475,10 +481,10 @@ def get_board(
             )
             d = _task_dict(t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
-            d["hierarchy_children"] = kanban_db.hierarchy_child_ids(conn, t.id)
+            d["hierarchy_children"] = hierarchy_children.get(t.id, [])
             d["breadcrumbs"] = [
                 {"id": item.id, "title": item.title, "kind": item.kind}
-                for item in kanban_db.issue_breadcrumbs(conn, t.id)
+                for item in breadcrumbs[t.id]
             ]
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -1091,6 +1097,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 board=board,
             )
 
+        if payload.parent_id is not None and payload.clear_parent:
+            raise HTTPException(
+                status_code=400,
+                detail="parent_id and clear_parent=true are mutually exclusive",
+            )
         if payload.parent_id is not None or payload.clear_parent:
             try:
                 kanban_db.reparent_issue(
