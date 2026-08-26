@@ -1357,8 +1357,12 @@ def test_cron_wrapper_invokes_only_the_fixed_scan_argv_with_an_absolute_hermes_e
 
     class Completed:
         returncode = 0
+        stdout = '{"status":"ok"}\n'
+        stderr = ""
 
-    def run(argv: list[str], *, check: bool) -> Completed:
+    def run(argv: list[str], *, check: bool, capture_output: bool, text: bool) -> Completed:
+        assert capture_output is True
+        assert text is True
         calls.append((argv, check))
         return Completed()
 
@@ -1371,6 +1375,41 @@ def test_cron_wrapper_invokes_only_the_fixed_scan_argv_with_an_absolute_hermes_e
 
     assert module.main() == 0
     assert calls == [([str(executable), "github-pr-feedback", "scan"], False)]
+
+
+@pytest.mark.parametrize(
+    ("payload", "process_returncode", "expected"),
+    [
+        (
+            {
+                "status": "ok",
+                "repair": {"status": "degraded"},
+                "merge": {"status": "ok"},
+                "release_maintenance": {"status": "waiting_open_prs"},
+            },
+            1,
+            0,
+        ),
+        ({"status": "degraded", "repair": {"status": "ok"}}, 1, 1),
+        ({"status": "ok", "merge": {"status": "degraded"}}, 1, 1),
+    ],
+)
+def test_cron_wrapper_treats_only_partial_repair_degradation_as_retryable_progress(
+    payload: dict[str, object],
+    process_returncode: int,
+    expected: int,
+) -> None:
+    script_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "github-pr-feedback-scan.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "github_pr_feedback_cron_status", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._cron_exit_code(json.dumps(payload), process_returncode) == expected
 
 
 @pytest.mark.parametrize("configured", [None, "hermes", "/missing/hermes"])
