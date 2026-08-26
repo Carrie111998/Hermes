@@ -242,6 +242,40 @@ class TestJobCRUD:
         job = create_job(prompt="One-shot", schedule="1h")
         assert job["repeat"]["times"] == 1
 
+    def test_repeat_forever_string_normalizes_to_infinite_not_a_crash(self, tmp_cron_dir):
+        """Regression for issue #95706: the tool schema's own description
+        text uses the word "forever" for the omitted/None case ("forever
+        for recurring"), making repeat="forever" a plausible value for a
+        caller to pass explicitly. Previously this crashed with a raw
+        TypeError ('<=' not supported between instances of 'str' and
+        'int') from the `repeat <= 0` normalization step."""
+        job = create_job(prompt="Recurring", schedule="0 11 * * 1", repeat="forever")
+        assert job["repeat"]["times"] is None
+
+    def test_repeat_forever_variant_strings_all_normalize(self, tmp_cron_dir):
+        for value in ("Forever", "FOREVER", "infinite", "", "none", "null"):
+            job = create_job(prompt="Recurring", schedule="0 11 * * 1", repeat=value)
+            assert job["repeat"]["times"] is None, f"failed for repeat={value!r}"
+
+    def test_repeat_numeric_string_coerces(self, tmp_cron_dir):
+        job = create_job(prompt="Recurring", schedule="0 11 * * 1", repeat="3")
+        assert job["repeat"]["times"] == 3
+
+    def test_repeat_invalid_string_raises_clear_error_not_typeerror(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="Invalid repeat value"):
+            create_job(prompt="Recurring", schedule="0 11 * * 1", repeat="nonsense")
+
+        assert load_jobs() == []
+
+    def test_repeat_int_and_none_unaffected(self, tmp_cron_dir):
+        """Sanity: the fix must not change behavior for the documented,
+        correct usage (a real int, or omitting repeat entirely)."""
+        job_int = create_job(prompt="Recurring", schedule="0 11 * * 1", repeat=5)
+        assert job_int["repeat"]["times"] == 5
+
+        job_none = create_job(prompt="Recurring", schedule="0 11 * * 1", repeat=None)
+        assert job_none["repeat"]["times"] is None
+
     def test_rejects_stale_past_one_shot_at_creation(self, tmp_cron_dir, monkeypatch):
         now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)

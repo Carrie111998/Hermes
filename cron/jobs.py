@@ -2006,6 +2006,28 @@ def create_job(
     """
     parsed_schedule = parse_schedule(schedule)
 
+    # Accept a non-int repeat: the tool schema's own description text uses
+    # the word "forever" for the omitted/None case ("forever for
+    # recurring"), so a caller (human or LLM) plausibly passes the literal
+    # string "forever" rather than omitting the field entirely. Recognize
+    # that (and its common synonyms) as None; coerce a numeric-looking
+    # string; reject anything else with a clear error instead of letting
+    # the `repeat <= 0` comparison below crash with a raw TypeError
+    # (issue #95706).
+    if isinstance(repeat, str):
+        normalized_repeat = repeat.strip().lower()
+        if normalized_repeat in ("", "forever", "infinite", "none", "null"):
+            repeat = None
+        else:
+            try:
+                repeat = int(repeat)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid repeat value {repeat!r}: expected an integer "
+                    f"repeat count, or omit the field entirely for forever/"
+                    f"recurring (do not pass the literal string \"forever\")."
+                ) from None
+
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
         repeat = None
