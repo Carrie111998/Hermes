@@ -713,7 +713,7 @@ def test_wrapper_ownership_rejects_sibling_extensions(suffix, tmp_path):
 @pytest.mark.skipif(
     sys.platform == "win32", reason="Symlinks require elevated privileges on Windows"
 )
-def test_wrapper_ownership_accepts_shim_via_symlinked_home(tmp_path):
+def test_wrapper_ownership_accepts_shim_via_symlinked_home(tmp_path, monkeypatch):
     """Installer writes $INSTALL_DIR lexically; the root stays lexical too.
 
     With /home -> /real-home, a shim that references the lexical
@@ -736,12 +736,17 @@ def test_wrapper_ownership_accepts_shim_via_symlinked_home(tmp_path):
         encoding="utf-8",
     )
     assert lde._wrapper_targets_checkout(shim, lexical_checkout) is True
-    # And the end-to-end probe finds it via the lexical root:
-    assert (
-        lde._resolve_hermes_bin_for_desktop_entry(
-            resolve_fn=lambda: None, checkout_root=lexical_checkout
-        )
-        is None
-        or True
-    )  # probe requires the shim on known paths; direct
-    # ownership assertion is the contract under test here.
+    # And the end-to-end probe finds it via the lexical root: make the
+    # shim executable, point HOME at the symlinked home, and give the
+    # resolver a checkout-internal primary (the repo script) so the
+    # probe leg actually engages.
+    shim.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home_link))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    repo_script = lexical_checkout / "hermes"
+    repo_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(repo_script), "desktop"])
+    assert lde._resolve_hermes_bin_for_desktop_entry(
+        resolve_fn=lambda: sys.argv[0] if sys.argv[0] else None,
+        checkout_root=lexical_checkout,
+    ) == str(shim)
