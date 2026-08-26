@@ -14,10 +14,10 @@ android {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         // Keep each private device-test delivery installable as an Android
-        // in-place update; v13 adds touch-first master-detail navigation and
-        // explicit status-bar overflow to the prior capability baseline.
-        versionCode 9
-        versionName "1.0.8"
+        // in-place update; v14 forces every native-mobile Fold width into the
+        // touch drawer layout instead of retaining a desktop navigation rail.
+        versionCode 10
+        versionName "1.0.9"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
