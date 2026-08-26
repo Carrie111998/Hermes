@@ -4,9 +4,10 @@ Telegram getUpdates wedge: shielded sticky-IP reconnect path can leave the
 gateway silently deaf. The previous ``TelegramFallbackTransport`` only
 rotated sticky IP on ``httpx.ConnectTimeout`` / ``httpx.ConnectError``
 (see ``_is_retryable_connect_error``); connect attempts that hung
-indefinitely or returned non-connect exceptions (HTTP 5xx from the edge,
-read timeouts after a successful TCP connect, etc.) kept the same IP as
-sticky indefinitely. With only one IP working in the seed list, the next
+indefinitely or returned *hard* application-layer failures
+(``ReadError`` / ``RemoteProtocolError`` after a successful TCP connect)
+kept the same IP as sticky indefinitely. With only one IP working in the
+seed list, the next
 ``getUpdates`` long-poll attempted the wedged IP, never returned, and PTB's
 ``network_retry_loop`` — which only re-issues ``getUpdates`` when the
 previous call *returns* — never advanced.
@@ -64,11 +65,18 @@ class _FakeTransport(httpx.AsyncBaseTransport):
         self.closed = True
 
 
-def _factory(calls, behavior):
-    """Build an ``AsyncHTTPTransport`` factory whose instances record calls."""
+def _factory(calls, behavior, created=None):
+    """Build an ``AsyncHTTPTransport`` factory whose instances record calls.
+
+    Pass ``created`` (a list) to collect every instantiated transport so
+    tests can assert pools were/weren't closed or replaced.
+    """
 
     def f(**_kwargs):
-        return _FakeTransport(calls, behavior)
+        transport = _FakeTransport(calls, behavior)
+        if created is not None:
+            created.append(transport)
+        return transport
 
     return f
 
@@ -94,8 +102,9 @@ class TestGetUpdatesLongPollRecovers:
     so the gateway was stuck on a wedged IP for hours.
 
     Post-fix: per-IP wedged-counter (``_STICKY_FAILURE_THRESHOLD``)
-    demotes sticky after consecutive non-connect failures, so the next
-    call walks the ladder from scratch.
+    demotes sticky after consecutive *hard* application-layer failures
+    (``ReadError`` / ``RemoteProtocolError``), so the next call walks the
+    ladder from scratch.
     """
 
     @pytest.mark.asyncio
@@ -131,7 +140,7 @@ class TestGetUpdatesLongPollRecovers:
         # demoted *after* the threshold is crossed (we want to absorb a
         # single transient blip without re-walking the IP ladder).
         last_sticky = transport._sticky_ip
-        for i in range(transport._STICKY_FAILURE_THRESHOLD):
+        for i in range(tnet._STICKY_FAILURE_THRESHOLD):
             try:
                 await transport.handle_async_request(_telegram_request())
             except httpx.ReadError:
@@ -142,7 +151,7 @@ class TestGetUpdatesLongPollRecovers:
         # remaining IPv4 candidates.
         assert transport._sticky_ip != "149.154.167.220", (
             f"Sticky IP still .220 after "
-            f"{transport._STICKY_FAILURE_THRESHOLD} consecutive wedge "
+            f"{tnet._STICKY_FAILURE_THRESHOLD} consecutive wedge "
             "failures — the wedge is not being demoted (#95159)."
         )
 
@@ -169,7 +178,7 @@ class TestGetUpdatesLongPollRecovers:
 
         # Wedge .220. Fire threshold calls. Sticky demotes.
         behavior["149.154.167.220"] = httpx.ReadError("wedge")
-        for _ in range(transport._STICKY_FAILURE_THRESHOLD):
+        for _ in range(tnet._STICKY_FAILURE_THRESHOLD):
             try:
                 await transport.handle_async_request(_telegram_request())
             except httpx.ReadError:
@@ -313,10 +322,10 @@ class TestRecordStickyFailureHelper:
     """Pin the per-IP wedged-counter helper.
 
     External health verifiers (and the adapter's polling progress
-    watchdog) can rely on ``_record_sticky_failure``: it must increment
-    a per-IP failure counter, demote the IP from sticky once the
-    threshold is exceeded, and reset the counter on a successful
-    response.
+    watchdog) can rely on ``_record_sticky_failure``: given a *hard*
+    application-layer exception it must increment a per-IP failure
+    counter, demote the IP from sticky once the threshold is exceeded,
+    and the counter is reset on a successful response.
     """
 
     @pytest.mark.asyncio
@@ -325,12 +334,16 @@ class TestRecordStickyFailureHelper:
         transport._sticky_ip = "149.154.167.220"
 
         # Under threshold: still sticky.
-        for _ in range(transport._STICKY_FAILURE_THRESHOLD - 1):
-            await transport._record_sticky_failure("149.154.167.220")
+        for _ in range(tnet._STICKY_FAILURE_THRESHOLD - 1):
+            await transport._record_sticky_failure(
+                "149.154.167.220", httpx.ReadError("wedge")
+            )
         assert transport._sticky_ip == "149.154.167.220"
 
         # Crossing the threshold: sticky is cleared.
-        await transport._record_sticky_failure("149.154.167.220")
+        await transport._record_sticky_failure(
+            "149.154.167.220", httpx.ReadError("wedge")
+        )
         assert transport._sticky_ip is tnet._UNSET
 
     def test_success_clears_failure_counter(self):
@@ -348,5 +361,226 @@ class TestRecordStickyFailureHelper:
         it has its own reset path on primary failure."""
         transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
         # Should be a no-op; counter dict untouched.
-        asyncio.run(transport._record_sticky_failure(None))
+        asyncio.run(
+            transport._record_sticky_failure(None, httpx.ReadError("wedge"))
+        )
         assert transport._sticky_failure_counts == {}
+
+
+# ---------------------------------------------------------------------------
+# Timeout-class failures must NOT demote sticky (#95234 review)
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutClassFailuresDoNotDemote:
+    """A ``ReadTimeout`` on getUpdates is the *normal* long-poll outcome
+    whenever the configured client read timeout is tighter than Telegram's
+    poll window (and also what benign packet loss looks like), and
+    ``PoolTimeout`` is *local* pool exhaustion on the shared connection
+    pool, not a wedged remote IP. Counting either toward the hard-failure
+    threshold demoted healthy IPs and forced full ladder walks with
+    duplicated getUpdates traffic against every candidate.
+
+    Contract: timeout-class exceptions are ignored entirely — no counter
+    increment, no counter clear, no pool reset, and the sticky IP stays
+    pinned. Only hard wedge signals (``ReadError`` /
+    ``RemoteProtocolError``) drive demotion.
+    """
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_never_demotes_nor_counts(self, monkeypatch):
+        calls = []
+        created = []
+        behavior = {
+            "149.154.167.220": "ok",
+            "149.154.167.221": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _factory(calls, behavior, created)
+        )
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "149.154.167.221"]
+        )
+
+        # Establish .220 as sticky.
+        resp = await transport.handle_async_request(_telegram_request())
+        assert resp.status_code == 200
+        assert transport._sticky_ip == "149.154.167.220"
+
+        # Client read timeout tighter than Telegram's poll window: every
+        # long-poll "fails" with ReadTimeout even though the path is
+        # healthy. Fire well past the hard-failure threshold.
+        behavior["149.154.167.220"] = httpx.ReadTimeout("long-poll window exceeded")
+        for _ in range(tnet._STICKY_FAILURE_THRESHOLD + 3):
+            try:
+                await transport.handle_async_request(_telegram_request())
+            except httpx.ReadTimeout:
+                pass
+
+        assert transport._sticky_ip == "149.154.167.220", (
+            "ReadTimeout demoted the sticky IP — timeout-class failures "
+            "must not count toward wedge demotion"
+        )
+        # Neither counted nor cleared: the counter stays empty.
+        assert transport._sticky_failure_counts.get("149.154.167.220", 0) == 0
+        # The pool must NOT have been reset mid-burst.
+        assert "149.154.167.220" in transport._fallbacks
+        assert all(not t.closed for t in created)
+
+    @pytest.mark.asyncio
+    async def test_pool_timeout_neither_demotes_nor_resets_pool(self, monkeypatch):
+        calls = []
+        created = []
+        behavior = {
+            "149.154.167.220": "ok",
+            "149.154.167.221": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _factory(calls, behavior, created)
+        )
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "149.154.167.221"]
+        )
+
+        resp = await transport.handle_async_request(_telegram_request())
+        assert resp.status_code == 200
+        assert transport._sticky_ip == "149.154.167.220"
+        fallback_before = transport._fallbacks["149.154.167.220"]
+
+        # Local pool exhaustion under load burst: must be log-only.
+        behavior["149.154.167.220"] = httpx.PoolTimeout("pool exhausted")
+        for _ in range(tnet._STICKY_FAILURE_THRESHOLD + 3):
+            try:
+                await transport.handle_async_request(_telegram_request())
+            except httpx.PoolTimeout:
+                pass
+
+        assert transport._sticky_ip == "149.154.167.220", (
+            "PoolTimeout demoted the sticky IP — local pool exhaustion "
+            "must not count toward wedge demotion"
+        )
+        assert transport._sticky_failure_counts.get("149.154.167.220", 0) == 0
+        # Pool must NOT have been discarded/reset: same instance retained.
+        assert transport._fallbacks.get("149.154.167.220") is fallback_before
+        assert all(not t.closed for t in created)
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_still_demotes_at_threshold(
+        self, monkeypatch
+    ):
+        """Hard wedge signals keep their pre-review contract: threshold
+        consecutive occurrences demote sticky AND reset the failed pool."""
+        calls = []
+        created = []
+        behavior = {
+            "149.154.167.220": "ok",
+            "149.154.167.221": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _factory(calls, behavior, created)
+        )
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "149.154.167.221"]
+        )
+
+        resp = await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220"
+
+        behavior["149.154.167.220"] = httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+        for _ in range(tnet._STICKY_FAILURE_THRESHOLD):
+            try:
+                await transport.handle_async_request(_telegram_request())
+            except httpx.RemoteProtocolError:
+                pass
+
+        assert transport._sticky_ip != "149.154.167.220", (
+            "RemoteProtocolError did not demote sticky at threshold — "
+            "hard wedge signals must still drive demotion"
+        )
+        # Hard failures still reset the poisoned pool (#63311 contract).
+        assert "149.154.167.220" not in transport._fallbacks
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_clear_hard_failure_evidence(self, monkeypatch):
+        """Chosen semantics: timeouts neither count NOR clear the counter.
+
+        A wedged IP whose ReadErrors interleave with benign ReadTimeouts
+        must still reach the demotion threshold; otherwise a flapping
+        wedge could avoid demotion indefinitely.
+        """
+        calls = []
+        behavior = {
+            "149.154.167.220": "ok",
+            "149.154.167.221": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _factory(calls, behavior)
+        )
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "149.154.167.221"]
+        )
+
+        resp = await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220"
+
+        # ReadError -> ReadTimeout -> ReadError must demote: the timeout
+        # in the middle leaves the accumulated hard-failure evidence intact.
+        behavior["149.154.167.220"] = httpx.ReadError("wedge")
+        with pytest.raises(httpx.ReadError):
+            await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220"  # below threshold
+
+        behavior["149.154.167.220"] = httpx.ReadTimeout("long-poll window exceeded")
+        with pytest.raises(httpx.ReadTimeout):
+            await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220"  # ignored entirely
+
+        behavior["149.154.167.220"] = httpx.ReadError("wedge")
+        with pytest.raises(httpx.ReadError):
+            await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip != "149.154.167.220", (
+            "Interleaved ReadTimeout cleared hard-failure evidence — "
+            "timeouts must neither count nor clear the counter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_clears_counter_end_to_end(self, monkeypatch):
+        """Existing behavior kept: a confirmed round-trip clears the
+        counter, so one post-recovery blip does not immediately demote."""
+        calls = []
+        behavior = {
+            "149.154.167.220": "ok",
+            "149.154.167.221": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _factory(calls, behavior)
+        )
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "149.154.167.221"]
+        )
+
+        resp = await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220"
+
+        # One hard failure below threshold...
+        behavior["149.154.167.220"] = httpx.ReadError("blip")
+        with pytest.raises(httpx.ReadError):
+            await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220"
+
+        # ...then success clears the counter...
+        behavior["149.154.167.220"] = "ok"
+        resp = await transport.handle_async_request(_telegram_request())
+        assert resp.status_code == 200
+        assert transport._sticky_failure_counts.get("149.154.167.220", 0) == 0
+
+        # ...so the next single blip must NOT instantly demote.
+        behavior["149.154.167.220"] = httpx.ReadError("blip")
+        with pytest.raises(httpx.ReadError):
+            await transport.handle_async_request(_telegram_request())
+        assert transport._sticky_ip == "149.154.167.220", (
+            "Counter was not cleared by the intervening success — a single "
+            "post-recovery blip would falsely demote a healthy sticky IP"
+        )
