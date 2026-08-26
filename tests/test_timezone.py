@@ -14,7 +14,7 @@ import logging
 import sys
 import pytest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
 
 import hermes_time
@@ -85,6 +85,68 @@ class TestGetTimezone:
         tz = hermes_time.get_timezone()
         assert isinstance(tz, ZoneInfo)
         assert str(tz) == "Europe/London"
+
+
+class TestResolveTimezoneNameLogging:
+    """Regression tests for silent config-read failures in
+    _resolve_timezone_name().
+
+    Both the config.yaml read and the managed-overlay application are
+    fail-open by design (a broken config must never crash Hermes), but a
+    failure there used to be swallowed with a bare ``except Exception: pass``
+    and produced zero diagnostic output. These tests assert a debug log
+    record is emitted instead, while still preserving the fail-open
+    fallback-to-"" behavior.
+    """
+
+    def setup_method(self):
+        _reset_hermes_time_cache()
+
+    def teardown_method(self):
+        _reset_hermes_time_cache()
+        os.environ.pop("HERMES_TIMEZONE", None)
+
+    def test_config_read_failure_is_logged_and_falls_back(self, caplog):
+        """A broken config.yaml read should log a debug message and still
+        resolve to "" (server-local fallback) instead of raising."""
+        fake_path = MagicMock()
+        fake_path.exists.return_value = True
+        with patch(
+            "hermes_cli.config.read_raw_config",
+            side_effect=RuntimeError("boom: corrupt config"),
+        ), patch(
+            "hermes_time.get_config_path", return_value=fake_path
+        ), patch(
+            "builtins.open", side_effect=RuntimeError("boom: cannot open config")
+        ):
+            with caplog.at_level(logging.DEBUG, logger="hermes_time"):
+                result = hermes_time._resolve_timezone_name()
+
+        assert result == ""
+        assert any(
+            "falling back to" in record.message.lower()
+            for record in caplog.records
+        ), "expected a debug log record explaining the fallback"
+
+    def test_managed_overlay_failure_is_logged_and_falls_back(self, caplog):
+        """A broken managed_scope overlay should log a debug message and
+        still return the unmanaged config value instead of raising."""
+        with patch(
+            "hermes_cli.config.read_raw_config",
+            return_value={"timezone": "Asia/Kolkata"},
+        ), patch(
+            "hermes_cli.managed_scope.apply_managed_overlay",
+            side_effect=RuntimeError("boom: overlay failed"),
+        ):
+            with caplog.at_level(logging.DEBUG, logger="hermes_time"):
+                result = hermes_time._resolve_timezone_name()
+
+        # Overlay failed, but we still recover the raw config's timezone.
+        assert result == "Asia/Kolkata"
+        assert any(
+            "managed timezone overlay" in record.message.lower()
+            for record in caplog.records
+        ), "expected a debug log record explaining the overlay failure"
 
 
 
