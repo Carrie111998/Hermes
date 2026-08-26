@@ -22,7 +22,7 @@ from typing import Any
 import uuid
 
 from agent.transports.codex_app_server import CodexAppServerClient
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root
 
 from .claude_adapter import (
     CLAUDE_PLACEHOLDER_MAX_BUDGET_USD,
@@ -88,6 +88,30 @@ _PROVIDER_REQUIRED_FIELDS = frozenset({
     "cleanup",
     "error_code",
 })
+
+
+def characterization_store_root() -> Path:
+    """Canonical machine-global characterization store.
+
+    Characterization reports prove facts about the machine's installed
+    provider CLIs, so every process must resolve ONE store regardless of
+    profile scoping.  ``get_hermes_home()`` resolves profile-scoped when
+    ``HERMES_HOME`` (or the serve ``--config-home`` context override) names
+    ``<root>/profiles/<name>``; that forked the store in two diverged
+    directories on 2026-08-25, with which one a process read decided by its
+    environment.  Anchoring on :func:`get_default_hermes_root` — the same
+    repair ``events.paths`` made for the notification layer — keeps custom
+    deployment homes (tests, Docker) hermetic while mapping any
+    profile-scoped home back to its root.
+    """
+
+    return get_default_hermes_root() / "session-bridge" / "characterization"
+
+
+def characterization_source_root() -> Path:
+    """Claude visibility source records live inside the one store."""
+
+    return characterization_store_root() / "claude-visibility-sources"
 
 
 def _new_characterization_operation_id() -> str:
@@ -2192,7 +2216,7 @@ def _gate_report_root(report_root: Path | None) -> Path:
         Path(
             report_root
             if report_root is not None
-            else get_hermes_home() / "session-bridge" / "characterization"
+            else characterization_store_root()
         )
         .expanduser()
         .absolute()
@@ -2467,7 +2491,7 @@ def load_codex_characterization_origins(
         Path(
             report_root
             if report_root is not None
-            else get_hermes_home() / "session-bridge" / "characterization"
+            else characterization_store_root()
         )
         .expanduser()
         .absolute()
@@ -3005,7 +3029,7 @@ def write_characterization_report(
     resolved_report_root = (
         Path(report_root)
         if report_root is not None
-        else get_hermes_home() / "session-bridge" / "characterization"
+        else characterization_store_root()
     )
     root = _safe_directory_root(
         resolved_report_root.expanduser(),
@@ -3129,7 +3153,7 @@ def quarantine_claude_transcript(
     destination_root = (
         Path(quarantine_root).expanduser()
         if quarantine_root is not None
-        else get_hermes_home() / "session-bridge" / "characterization" / "quarantine"
+        else characterization_store_root() / "quarantine"
     )
     try:
         destination_root = _safe_directory_root(
@@ -3218,7 +3242,7 @@ def run_live_characterization(
     resolved_report_root = (
         Path(report_root)
         if report_root is not None
-        else get_hermes_home() / "session-bridge" / "characterization"
+        else characterization_store_root()
     )
     title = f"[Hermes Bridge Characterization] {characterization_id}"
     marker_secret = secrets.token_bytes(32)

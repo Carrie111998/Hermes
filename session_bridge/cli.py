@@ -34,6 +34,7 @@ from .characterize import (
     resolve_characterization_gate,
     resolve_cli_executable,
     claim_claude_visibility_characterization_abort,
+    characterization_source_root,
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
     load_codex_characterization_origins,
@@ -2290,12 +2291,7 @@ class ProductionBackend:
         marker_secret = resolve_marker_key()
         store = self._require_store()
         if apply:
-            source_root = (
-                Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-                / "session-bridge"
-                / "characterization"
-                / "claude-visibility-sources"
-            )
+            source_root = characterization_source_root()
             _sync_claude_characterization_records(
                 store=store,
                 source_root=source_root,
@@ -2513,12 +2509,7 @@ class ProductionBackend:
 
         if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
             raise ConfigurationFailure("live_characterization_not_enabled")
-        source_root = (
-            Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-            / "session-bridge"
-            / "characterization"
-            / "claude-visibility-sources"
-        )
+        source_root = characterization_source_root()
         active_record = source_root / ".claude-visibility-operation.json"
         marker_secret = resolve_marker_key()
         try:
@@ -2727,12 +2718,7 @@ class ProductionBackend:
     ) -> Mapping[str, Any]:
         if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
             raise ConfigurationFailure("live_characterization_not_enabled")
-        source_root = (
-            Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-            / "session-bridge"
-            / "characterization"
-            / "claude-visibility-sources"
-        )
+        source_root = characterization_source_root()
         if cleanup_token is not None:
             marker_secret = resolve_marker_key()
             result = cleanup_characterized_claude_visibility(
