@@ -856,6 +856,141 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
 
 
+def test_agent_build_discards_result_after_session_is_claimed_for_close(monkeypatch):
+    """A build finishing after close cannot publish a discarded runtime."""
+    build_started = threading.Event()
+    release_build = threading.Event()
+    agent_closed = threading.Event()
+    side_effects = []
+
+    class _Agent:
+        model = "test-model"
+
+        def close(self):
+            agent_closed.set()
+
+    def _make_agent(*_args, **_kwargs):
+        build_started.set()
+        assert release_build.wait(timeout=2)
+        return _Agent()
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: side_effects.append("wire"))
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda *_args, **_kwargs: side_effects.append("poll") or threading.Event(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda *_args, **_kwargs: side_effects.append("boundary"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: side_effects.append("emit"))
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_load_memory_notifications", lambda: "off")
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_args, **_kwargs: None)
+
+    sid = "late-build-sid"
+    session = {
+        "agent": None,
+        "agent_error": None,
+        "agent_ready": threading.Event(),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": "late-build-key",
+        "source": "desktop",
+    }
+    server._sessions.clear()
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert build_started.wait(timeout=2)
+        claimed = server._pop_session_by_id(sid)
+        assert claimed is session
+        release_build.set()
+        build_thread = session["_agent_build_thread"]
+        build_thread.join(timeout=5)
+
+        assert not build_thread.is_alive()
+        assert session.get("agent") is None
+        assert agent_closed.wait(timeout=2)
+        assert side_effects == []
+    finally:
+        release_build.set()
+        build_thread = session.get("_agent_build_thread")
+        if build_thread is not None:
+            build_thread.join(timeout=5)
+        server._sessions.pop(sid, None)
+
+
+def test_resume_hydration_does_not_commit_after_session_claim(monkeypatch):
+    """Deferred history publication must serialize with a close claim."""
+    history_entered = threading.Event()
+    pop_done = threading.Event()
+    closing_at_commit = []
+    original_history_lock = threading.Lock()
+
+    class _HistoryGate:
+        def __enter__(self):
+            history_entered.set()
+            pop_done.wait(timeout=2)
+            closing_at_commit.append(session.get("_closing", False))
+            return original_history_lock.__enter__()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return original_history_lock.__exit__(exc_type, exc, traceback)
+
+    class _DB:
+        def reopen_session(self, _stored_id):
+            return None
+
+        def get_resume_conversations(self, _stored_id):
+            return ([], [])
+
+        def get_ancestor_display_prefix(self, _stored_id):
+            return []
+
+        def close(self):
+            return None
+
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "history": [{"role": "user", "content": "before"}],
+        "history_lock": _HistoryGate(),
+        "resume_history_ready": threading.Event(),
+        "resume_hydrating": True,
+        "session_key": "hydration-key",
+    }
+    sid = "hydration-sid"
+    server._sessions.clear()
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    def _pop():
+        assert server._pop_session_by_id(sid) is session
+        pop_done.set()
+
+    try:
+        server._schedule_resume_hydration(sid, "hydration-key", _DB(), close_db=True)
+        assert history_entered.wait(timeout=2)
+        pop_thread = threading.Thread(target=_pop)
+        pop_thread.start()
+        assert session["resume_history_ready"].wait(timeout=5)
+        pop_thread.join(timeout=2)
+        assert not pop_thread.is_alive()
+        assert closing_at_commit == [False]
+    finally:
+        pop_done.set()
+        server._sessions.pop(sid, None)
+
+
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
     """A profile's own terminal.cwd is read from its config.yaml."""
     project = tmp_path / "proj"
@@ -1091,6 +1226,22 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
         assert out.parts == []
     finally:
         server._sessions.pop("detached-sid", None)
+
+
+def test_write_json_drops_unregistered_session_frames(monkeypatch):
+    """A late event for a claimed runtime must not fall back to stdio."""
+    out = _ChunkyStdout()
+    monkeypatch.setattr(server, "_real_stdout", out)
+    server._sessions.pop("claimed-sid", None)
+
+    assert server.write_json(
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"session_id": "claimed-sid", "type": "session.info"},
+        }
+    ) is False
+    assert out.parts == []
 
 
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):

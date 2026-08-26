@@ -167,6 +167,10 @@ _cfg_path = None
 # lock.  Re-entrant acquisition is required because the live-payload helper is
 # called from the session.resume fast path while it already owns this lock.
 _session_resume_lock = threading.RLock()
+# Per-runtime lifecycle code follows this order when nesting locks:
+# _lifecycle_lock -> _session_resume_lock -> _sessions_lock -> history_lock.
+# Teardown acquires only _lifecycle_lock after popping the registry entry, so
+# slow finalization never holds either global registry lock.
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -784,6 +788,16 @@ def _is_gateway_owned_source(source: str) -> bool:
 
 
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
+    """Serialize the finalization chokepoint with deferred runtime setup."""
+    if not session:
+        return
+    with _session_lifecycle_lock(session):
+        _finalize_session_body(session, end_reason=end_reason)
+
+
+def _finalize_session_body(
+    session: dict | None, end_reason: str = "tui_close"
+) -> None:
     """Best-effort finalize hook + memory commit for a session.
 
     Fires ``on_session_end`` plugin hook and attempts to persist any
@@ -966,7 +980,22 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
+def _session_lifecycle_lock(session: dict) -> threading.RLock:
+    """Return the per-runtime lock shared by builders and teardown."""
+    return session.setdefault("_lifecycle_lock", threading.RLock())
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
+    """Serialize finalization with deferred runtime setup effects."""
+    if not session:
+        return
+    with _session_lifecycle_lock(session):
+        _teardown_session_body(session, end_reason=end_reason)
+
+
+def _teardown_session_body(
+    session: dict | None, *, end_reason: str = "tui_close"
+) -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
     Shared by ``session.close`` and the orphaned-WS-session reaper. The
@@ -1058,6 +1087,71 @@ def _teardown_popped_session(
             logger.debug("failed waiting for session turn thread", exc_info=True)
     _teardown_session(session, end_reason=end_reason)
     return True
+
+
+def _session_is_live_for_commit(sid: str, session: dict) -> bool:
+    """Return whether ``session`` still owns ``sid`` and may be mutated."""
+    with _session_resume_lock:
+        with _sessions_lock:
+            return (
+                _sessions.get(sid) is session
+                and not session.get("_closing")
+                and not session.get("_finalized")
+            )
+
+
+def _run_live_build_effect(
+    sid: str, session: dict, effect: Callable[[], object]
+) -> bool:
+    """Run a deferred-build side effect before teardown can finalize."""
+    with _session_lifecycle_lock(session):
+        if not _session_is_live_for_commit(sid, session):
+            return False
+        result = effect()
+    return True if result is None else bool(result)
+
+
+def _commit_agent_build(
+    sid: str, session: dict, agent, config_model_seen
+) -> bool:
+    """Publish a built agent only while its runtime still owns the registry id."""
+    with _session_lifecycle_lock(session):
+        with _session_resume_lock:
+            with _sessions_lock:
+                if (
+                    _sessions.get(sid) is not session
+                    or session.get("_closing")
+                    or session.get("_finalized")
+                ):
+                    return False
+                session["agent"] = agent
+                session["config_model_seen"] = config_model_seen
+                return True
+
+
+def _commit_resume_hydration(
+    sid: str,
+    session: dict,
+    history: list,
+    display_history_prefix: list,
+    message_count: int,
+) -> bool:
+    """Publish deferred resume history only for the current live runtime."""
+    with _session_lifecycle_lock(session):
+        with _session_resume_lock:
+            with _sessions_lock:
+                if (
+                    _sessions.get(sid) is not session
+                    or session.get("_closing")
+                    or session.get("_finalized")
+                ):
+                    return False
+                with session["history_lock"]:
+                    session["history"] = history
+                    session["display_history_prefix"] = display_history_prefix
+                    session["resume_hydrating"] = False
+                    session["resume_message_count"] = message_count
+        return True
 
 
 def _close_session_by_id(
@@ -2065,11 +2159,26 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            from tui_gateway.event_replay import _stamp_event
+        if sid:
+            with _sessions_lock:
+                session = _sessions.get(sid)
+            if session is None or session.get("_closing") or session.get("_finalized"):
+                return False
+            with _session_lifecycle_lock(session):
+                with _sessions_lock:
+                    if (
+                        _sessions.get(sid) is not session
+                        or session.get("_closing")
+                        or session.get("_finalized")
+                    ):
+                        return False
+                    t = session.get("transport")
+                if t is None:
+                    return False
+                from tui_gateway.event_replay import _stamp_event
 
-            _stamp_event(obj)
-            return t.write(obj)
+                _stamp_event(obj)
+                return t.write(obj)
 
     from tui_gateway.event_replay import _stamp_event
 
@@ -2743,6 +2852,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         secret_token = None
         session_db = None
         owns_db = False
+        built_agent = None
+        agent_committed = False
         profile_home = current.get("profile_home")
         try:
             history_ready = current.get("resume_history_ready")
@@ -2813,6 +2924,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
+                built_agent = agent
             finally:
                 _clear_session_context(tokens)
 
@@ -2826,10 +2938,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
-            current["config_model_seen"] = _config_model_target()
+            config_model_seen = _config_model_target()
+            if not _run_live_build_effect(
+                sid,
+                current,
+                lambda: _commit_agent_build(sid, current, agent, config_model_seen),
+            ):
+                return
+            agent_committed = True
 
             # No eager slash-worker pre-warm: slash.exec spawns one on demand
             # (its error path already relies on that respawn to recover from a
@@ -2841,62 +2959,95 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # never reaped, so with the desktop app open for days those
             # fleets accumulate until the OS refuses new process spawns.
 
-            try:
-                from tools.approval import (
-                    register_gateway_notify,
-                    load_permanent_allowlist,
-                )
+            def _register_approval() -> None:
+                nonlocal notify_registered
+                try:
+                    from tools.approval import (
+                        register_gateway_notify,
+                        load_permanent_allowlist,
+                    )
 
-                register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
-                )
-                notify_registered = True
-                load_permanent_allowlist()
-            except Exception:
-                pass
+                    register_gateway_notify(
+                        key, lambda data: _emit_approval_request(sid, data)
+                    )
+                    notify_registered = True
+                    load_permanent_allowlist()
+                except Exception:
+                    pass
 
-            _wire_callbacks(sid)
+            if not _run_live_build_effect(sid, current, _register_approval):
+                return
+
+            if not _run_live_build_effect(sid, current, lambda: _wire_callbacks(sid)):
+                return
             # Surface the self-improvement review's "💾 …" summary as an event
             # the TUI/desktop render in-transcript, honoring
             # display.memory_notifications. _init_session wires this for the
             # eager/branch paths; deferred-built sessions (session.create and the
             # default cold resume) build through here, so without this their
             # review summaries would leak to stdout instead of the chat.
-            try:
-                agent.background_review_callback = lambda message, _sid=sid: _emit(
-                    "review.summary", _sid, {"text": str(message)}
-                )
-                agent.memory_notifications = _load_memory_notifications()
-            except Exception:
-                pass
+            def _configure_agent_notifications() -> None:
+                try:
+                    agent.background_review_callback = lambda message, _sid=sid: _emit(
+                        "review.summary", _sid, {"text": str(message)}
+                    )
+                    agent.memory_notifications = _load_memory_notifications()
+                except Exception:
+                    pass
+
+            if not _run_live_build_effect(
+                sid, current, _configure_agent_notifications
+            ):
+                return
             # Hydrate credits notices at session OPEN (not just on the first
             # message), so depletion / usage-band warnings show at "ready". Runs
             # off the build thread, after the notice_callback is wired. Fail-open.
-            try:
-                from agent.credits_tracker import seed_credits_at_session_start
+            def _seed_credits() -> None:
+                try:
+                    from agent.credits_tracker import seed_credits_at_session_start
 
-                seed_credits_at_session_start(agent)
-            except Exception:
-                pass
-            with _sessions_lock:
-                if sid in _sessions:
-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key, _session_source(current))
+                    seed_credits_at_session_start(agent)
+                except Exception:
+                    pass
 
-            info = _session_info(agent, current)
-            cfg_warn = _probe_config_health(_load_cfg())
-            if cfg_warn:
-                info["config_warning"] = cfg_warn
-                logger.warning(cfg_warn)
-            _emit("session.info", sid, info)
+            if not _run_live_build_effect(sid, current, _seed_credits):
+                return
+
+            def _start_poller() -> bool:
+                with _sessions_lock:
+                    if _sessions.get(sid) is not current:
+                        return False
+                    current["_notif_stop"] = _start_notification_poller(sid, current)
+                return True
+
+            if not _run_live_build_effect(sid, current, _start_poller):
+                return
+
+            def _emit_session_info() -> None:
+                _notify_session_boundary("on_session_reset", key, _session_source(current))
+                info = _session_info(agent, current)
+                cfg_warn = _probe_config_health(_load_cfg())
+                if cfg_warn:
+                    info["config_warning"] = cfg_warn
+                    logger.warning(cfg_warn)
+                _emit("session.info", sid, info)
+
+            if not _run_live_build_effect(sid, current, _emit_session_info):
+                return
             # If MCP discovery is still in flight (a server slower than the
             # bounded wait_for_mcp_discovery join in _make_agent), the agent
             # was built without those tools. Catch up once they land — see
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
-            _schedule_mcp_late_refresh(sid, agent)
+            if not _run_live_build_effect(
+                sid, current, lambda: _schedule_mcp_late_refresh(sid, agent)
+            ):
+                return
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            def _emit_build_error() -> None:
+                current["agent_error"] = str(e)
+                _emit("error", sid, {"message": f"agent init failed: {e}"})
+
+            _run_live_build_effect(sid, current, _emit_build_error)
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -2919,6 +3070,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            if not agent_committed and built_agent is not None:
+                try:
+                    close = getattr(built_agent, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    logger.debug("failed closing discarded late-built agent", exc_info=True)
             # Dedicated profile handle: hand it to the agent that will actually
             # be torn down, or close it here when no such agent exists. Both
             # non-transfer cases are real: the except above (build raised, so
@@ -7884,6 +8042,7 @@ def _init_session(
             "session_key": key,
             "history": history,
             "history_lock": threading.Lock(),
+            "_lifecycle_lock": threading.RLock(),
             "history_version": 0,
             "inflight_turn": None,
             "created_at": now,
@@ -9295,6 +9454,7 @@ def _deferred_session_record(
         "explicit_cwd": False,
         "history": history,
         "history_lock": threading.Lock(),
+        "_lifecycle_lock": threading.RLock(),
         "history_version": 0,
         "image_counter": 0,
         "inflight_turn": None,
@@ -9448,14 +9608,19 @@ def _schedule_resume_hydration(
             prefix = db.get_ancestor_display_prefix(stored_id)
             history = sanitize_replay_history(raw_history)
 
-            if _sessions.get(sid) is not session:
+            if not _commit_resume_hydration(
+                sid,
+                session,
+                history,
+                prefix,
+                len(display_history),
+            ):
+                session["resume_history_error"] = "session resume cancelled"
+                session["resume_history_ready"].set()
                 return
-            with session["history_lock"]:
-                session["history"] = history
-                session["display_history_prefix"] = prefix
-                session["resume_hydrating"] = False
-                session["resume_message_count"] = len(display_history)
             session["resume_history_ready"].set()
+            if not _session_is_live_for_commit(sid, session):
+                return
             _emit(
                 "session.resume_progress",
                 sid,
@@ -9465,10 +9630,14 @@ def _schedule_resume_hydration(
                     "status": "complete",
                 },
             )
+            if not _session_is_live_for_commit(sid, session):
+                return
             _maybe_schedule_auto_continue(sid, session, stored_id)
+            if not _session_is_live_for_commit(sid, session):
+                return
             _start_agent_build(sid, session)
         except Exception as exc:
-            if _sessions.get(sid) is not session:
+            if not _session_is_live_for_commit(sid, session):
                 return
             message = f"resume failed: {exc}"
             session["resume_hydrating"] = False
