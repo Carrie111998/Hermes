@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import project_venv_dir, venv_python_path
 
 logger = logging.getLogger(__name__)
 
@@ -4260,7 +4260,13 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     Returns ``(healthy, detail)``. Never raises; unknown states report
     healthy so a probe failure can't force needless reinstalls.
     """
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    # project_venv_dir() prefers live introspection (sys.prefix) over
+    # guessing "venv" by name, so a custom-named venv (e.g. venv-py313,
+    # a Python-version workaround) is still recognized correctly instead
+    # of silently falling through every check below. Falls back to the
+    # same "venv" guess when this process isn't the one driving the venv
+    # being probed (e.g. a bootstrapper on a different interpreter).
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or (_m().PROJECT_ROOT / "venv")
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
     if not venv_python.exists():
         # No venv interpreter at all. In a dev checkout that's normal (the
@@ -4338,7 +4344,13 @@ def _detect_venv_python_processes(
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    # project_venv_dir() prefers live introspection (sys.prefix) over
+    # guessing "venv" by name, so a custom-named venv (e.g. venv-py313,
+    # a Python-version workaround) is still recognized correctly instead
+    # of silently falling through every check below. Falls back to the
+    # same "venv" guess when this process isn't the one driving the venv
+    # being probed (e.g. a bootstrapper on a different interpreter).
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or (_m().PROJECT_ROOT / "venv")
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
@@ -4759,7 +4771,13 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    # project_venv_dir() prefers live introspection (sys.prefix) over
+    # guessing "venv" by name, so a custom-named venv (e.g. venv-py313,
+    # a Python-version workaround) is still recognized correctly instead
+    # of silently falling through every check below. Falls back to the
+    # same "venv" guess when this process isn't the one driving the venv
+    # being probed (e.g. a bootstrapper on a different interpreter).
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or (_m().PROJECT_ROOT / "venv")
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:

@@ -1640,16 +1640,38 @@ def venv_bin_dir(venv_dir, *, windows: bool | None = None) -> Path:
 
 
 def project_venv_dir(project_root) -> Path | None:
-    """The project's venv directory, ``venv`` or ``.venv``, when one exists.
+    """The project's venv directory, wherever it actually lives.
 
-    ``uv venv`` defaults to ``.venv`` while our installers create ``venv``, so
-    both layouts are in the wild. Call sites that only knew about ``venv``
-    silently no-oped on a ``.venv`` install — that is how the Windows
-    shim-lock preflight skipped itself entirely (#79542). ``venv`` wins when
-    both exist, matching what the installers write.
+    Prefers live introspection: if this process is itself running from a
+    venv directly under *project_root*, that venv is authoritative
+    regardless of what it's named. A custom-named venv (e.g. ``venv-py313``,
+    the kind of rename people reach for as a Python-version workaround) was
+    invisible to the old name-only guess below — that's how a Windows
+    install's global-launcher self-heal silently rebuilt `hermes`'s
+    launchers from a stale, wrong-Python ``venv`` sibling instead of the
+    real, custom-named venv actually in use (2026-08-26 incident: every
+    tool call failed with an AttributeError from a launcher quietly
+    running the wrong CPython).
+
+    Falls back to the two conventional installer-created names — ``venv``
+    (our installers) then ``.venv`` (``uv venv``'s default), both layouts
+    are in the wild — for callers probing a root other than the one
+    currently executing, or when this process isn't running from a venv at
+    all. Call sites that only knew about ``venv`` silently no-oped on a
+    ``.venv`` install — that is how the Windows shim-lock preflight skipped
+    itself entirely (#79542). ``venv`` wins when both exist, matching what
+    the installers write.
     """
+    root = Path(project_root)
+    if sys.prefix != sys.base_prefix:
+        try:
+            live = Path(sys.prefix).resolve()
+            if live.parent == root.resolve():
+                return live
+        except OSError:
+            pass
     for name in ("venv", ".venv"):
-        candidate = Path(project_root) / name
+        candidate = root / name
         if candidate.is_dir():
             return candidate
     return None

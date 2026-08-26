@@ -1169,9 +1169,20 @@ def _refresh_managed_uv_catalog(uv_bin: str) -> bool:
 def _default_live_venv(root: Path) -> Path:
     """Return the venv that runtime repair should target for *root*.
 
-    Managed installs create ``<checkout>/venv``, but uv-default and dev
-    checkouts use ``<checkout>/.venv``.  Historically only ``venv`` was
-    probed, so a ``.venv`` install linking a vulnerable SQLite returned
+    Prefers live introspection: if this process is itself running from a
+    venv directly under *root*, that IS the live venv, whatever it's
+    named. A custom-named venv (e.g. a Python-version workaround) is
+    invisible to the name-only fallback below, which is exactly what let
+    this function disagree with other resolvers (like the launcher
+    self-heal in ``_install_repair.py``) about which venv was actually
+    live on a 2026-08-26 incident install.
+
+    Falls back to the conventional names when this process isn't running
+    from a venv under root at all (e.g. repair invoked against a
+    different profile/root than the one currently executing). Managed
+    installs create ``<checkout>/venv``, but uv-default and dev checkouts
+    use ``<checkout>/.venv``.  Historically only ``venv`` was probed, so a
+    ``.venv`` install linking a vulnerable SQLite returned
     ``not-applicable`` on every ``hermes update`` and stayed on
     journal_mode=DELETE forever — even though the WAL fallback warning
     promises that ``hermes update`` repairs the runtime (issue class:
@@ -1182,6 +1193,13 @@ def _default_live_venv(root: Path) -> Path:
     When neither has an interpreter, return the ``venv`` path so the
     caller's existing ``not-applicable`` handling fires unchanged.
     """
+    if sys.prefix != sys.base_prefix:
+        try:
+            live = Path(sys.prefix).resolve()
+            if live.parent == root.resolve() and _venv_python(live).is_file():
+                return live
+        except OSError:
+            pass
     primary = root / _VENV_NAME
     if _venv_python(primary).is_file():
         return primary

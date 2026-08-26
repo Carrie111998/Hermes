@@ -355,7 +355,26 @@ def _run_repair_install(specs: list[str], project_root: Path) -> bool:
     if externally_managed:
         uv = _find_uv_binary()
         if uv:
-            env = {**os.environ, "VIRTUAL_ENV": str(project_root / "venv")}
+            # This repair pass usually runs as the venv it's trying to fix
+            # (that's what "base interpreter is externally managed" means
+            # here), so sys.prefix names it directly when it actually sits
+            # under project_root — no need to guess a folder name, which
+            # would miss a custom-named venv (e.g. venv-py313, a
+            # Python-version workaround). Verify the parent match first:
+            # a caller repairing a *different* root than the one currently
+            # running must still fall back to the conventional guess
+            # rather than pointing uv at this process's own unrelated venv.
+            live_venv = None
+            if sys.prefix != sys.base_prefix:
+                try:
+                    candidate = Path(sys.prefix).resolve()
+                    if candidate.parent == project_root.resolve():
+                        live_venv = candidate
+                except OSError:
+                    pass
+            if live_venv is None:
+                live_venv = project_root / "venv"
+            env = {**os.environ, "VIRTUAL_ENV": str(live_venv)}
             env.pop("PYTHONHOME", None)
             env.pop("PYTHONPATH", None)
             try:
