@@ -271,7 +271,6 @@ import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition
 import { resolvePackageUpdate } from './package-update'
 import {
   createParentStartMarkerResolver,
-  electronProcessStartMarker,
   parentWatchdogEnv
 } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'

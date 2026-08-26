@@ -59,7 +59,7 @@ def test_launch_with_native_backend_starts_native_backend_and_passes_only_local_
     # Mock the tempfile to use our controlled ready file
     import tempfile
     import secrets
-    
+
     def mock_named_temporary_file(*args, **kwargs):
         class FakeFile:
             def __init__(self):
@@ -67,10 +67,10 @@ def test_launch_with_native_backend_starts_native_backend_and_passes_only_local_
             def close(self):
                 pass
         return FakeFile()
-    
+
     monkeypatch.setattr(tempfile, "NamedTemporaryFile", mock_named_temporary_file)
     monkeypatch.setattr(secrets, "token_urlsafe", lambda n: "one-time-token")
-    
+
     monkeypatch.setattr(flatpak_desktop, "ensure_installed", lambda: True)
     monkeypatch.setattr(flatpak_desktop, "_flatpak", lambda: "/usr/bin/flatpak")
     monkeypatch.setattr(flatpak_desktop.subprocess, "Popen", FakePopen)
