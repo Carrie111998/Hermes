@@ -31,8 +31,10 @@ def _ensure_alias_installed():
     sibling test files."""
     from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES as _seq
     saved = dict(_seq)
+    saved_call_handler = Vt100Parser._call_handler
     install_modify_other_keys_aliases()
     yield
+    Vt100Parser._call_handler = saved_call_handler
     _seq.clear()
     _seq.update(saved)
     # Drop the parser's prefix cache too — it was computed against the
@@ -262,6 +264,48 @@ def test_modify_other_keys_shift_letter_produces_uppercase(letter):
     assert _parse(csiu_seq) == [upper], (
         f"CSI-u Shift+{letter} ({csiu_seq!r}) should produce '{upper}'"
     )
+
+
+@pytest.mark.parametrize("seq", [
+    "\x1b[27;2;83~",   # modifyOtherKeys, already-shifted codepoint
+    "\x1b[27;2;115~",  # modifyOtherKeys, lowercase codepoint
+    "\x1b[83;2u",      # Kitty CSI-u
+])
+def test_modify_other_keys_shift_letter_inserts_uppercase_not_escape_payload(seq):
+    """The printable key and its insertion payload must both be uppercase.
+
+    prompt_toolkit's generic self-insert binding inserts ``KeyPress.data``, not
+    ``KeyPress.key``.  Mapping the sequence to ``"S"`` while leaving ``data``
+    as the raw escape sequence reproduces the user-visible ``[27;2;83~`` leak.
+    """
+    out = []
+    parser = Vt100Parser(out.append)
+    parser.feed(seq)
+    parser.flush()
+
+    assert len(out) == 1
+    assert out[0].key == "S"
+    assert out[0].data == "S"
+
+
+def test_printable_payload_patch_is_idempotent():
+    from hermes_cli.pt_input_extras import _install_printable_extended_key_payload_patch
+
+    assert _install_printable_extended_key_payload_patch() is False
+
+
+def test_printable_payload_patch_does_not_rewrite_control_tuple_data():
+    from hermes_cli.pt_input_extras import install_shift_enter_alias
+
+    install_shift_enter_alias()
+    seq = "\x1b[27;2;13~"
+    out = []
+    parser = Vt100Parser(out.append)
+    parser.feed(seq)
+    parser.flush()
+
+    assert [press.key for press in out] == [Keys.Escape, Keys.ControlM]
+    assert [press.data for press in out] == [seq, ""]
 
 
 def test_does_not_clobber_shift_enter_alias():
