@@ -14,6 +14,7 @@ import { Network } from '@capacitor/network'
 import type { HermesNotification } from '@/global'
 
 interface MobileCapabilitiesPlugin {
+  enableActiveSession(): Promise<{ enabled: boolean }>
   requestBackgroundReliability(): Promise<{ exempt: boolean; requested: boolean; supported: boolean }>
   requestMedia(): Promise<{ granted: boolean; supported: boolean }>
 }
@@ -98,6 +99,16 @@ export async function requestBackgroundReliabilityPermission(): Promise<boolean>
   try {
     const result = await MobileCapabilities.requestBackgroundReliability()
     return result.requested || result.exempt
+  } catch {
+    return false
+  }
+}
+
+export async function enableMobileBackgroundSession(): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false
+
+  try {
+    return (await MobileCapabilities.enableActiveSession()).enabled
   } catch {
     return false
   }

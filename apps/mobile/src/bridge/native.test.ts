@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { mobileCapabilities } = vi.hoisted(() => ({
-  mobileCapabilities: { requestBackgroundReliability: vi.fn(), requestMedia: vi.fn() },
+  mobileCapabilities: { enableActiveSession: vi.fn(), requestBackgroundReliability: vi.fn(), requestMedia: vi.fn() },
 }))
 
 vi.mock('@capacitor/app', () => ({ App: { addListener: vi.fn() } }))
@@ -38,6 +38,7 @@ import { LocalNotifications } from '@capacitor/local-notifications'
 import { Network } from '@capacitor/network'
 import {
   captureCameraPhoto,
+  enableMobileBackgroundSession,
   notify,
   onPowerResume,
   openExternal,
@@ -56,6 +57,7 @@ beforeEach(() => {
   vi.mocked(LocalNotifications.schedule).mockReset()
   mobileCapabilities.requestBackgroundReliability.mockReset()
   mobileCapabilities.requestMedia.mockReset()
+  mobileCapabilities.enableActiveSession.mockReset()
   vi.unstubAllGlobals()
 })
 
@@ -153,6 +155,15 @@ describe('requestInitialMobilePermissions', () => {
     expect(stop).toHaveBeenCalledOnce()
     expect(mobileCapabilities.requestMedia).toHaveBeenCalledOnce()
     expect(mobileCapabilities.requestBackgroundReliability).toHaveBeenCalledOnce()
+  })
+})
+
+describe('enableMobileBackgroundSession', () => {
+  it('arms the visible Android active-session service without starting a hidden agent', async () => {
+    mobileCapabilities.enableActiveSession.mockResolvedValue({ enabled: true })
+
+    await expect(enableMobileBackgroundSession()).resolves.toBe(true)
+    expect(mobileCapabilities.enableActiveSession).toHaveBeenCalledOnce()
   })
 })
 

@@ -44,6 +44,27 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
+    public void onStart() {
+        ActiveSessionService.stopForForeground(this);
+        super.onStart();
+    }
+
+    @Override
+    public void onStop() {
+        // A visible foreground service is the supported Android path for an
+        // active remote session. Never start it across configuration changes.
+        if (!isChangingConfigurations()) {
+            try {
+                ActiveSessionService.startForBackground(this);
+            } catch (Exception ignored) {
+                // The activity remains usable; a device may reject a foreground
+                // service start under its own battery/background policy.
+            }
+        }
+        super.onStop();
+    }
+
+    @Override
     public void onResume() {
         super.onResume();
         try {

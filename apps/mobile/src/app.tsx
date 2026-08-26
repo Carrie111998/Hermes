@@ -9,7 +9,7 @@ import { useEffect, useRef, useState } from 'react'
 import DesktopController from '@/app'
 
 import { verifyTokenGateway, type ProbeResult } from '~bridge/auth'
-import { requestInitialMobilePermissions } from '~bridge/native'
+import { enableMobileBackgroundSession, requestInitialMobilePermissions } from '~bridge/native'
 import { $reauthNonce, loadTarget, setTarget, setTransientTarget, type GatewayTarget } from '~bridge/state'
 
 import { ConnectScreen } from '~mobile/connect/ConnectScreen'
@@ -76,21 +76,28 @@ export function MobileRoot() {
 
     initialCapabilityRequest.current = true
     void (async () => {
+      let requestInitialCapabilities = true
       try {
         const marker = await Preferences.get({ key: INITIAL_MOBILE_CAPABILITIES_KEY })
-        if (!shouldRequestInitialMobileCapabilities(marker.value)) return
+        requestInitialCapabilities = shouldRequestInitialMobileCapabilities(marker.value)
       } catch {
         // A failed non-secret marker must not stop the explicitly requested
         // first-connection prompts. The in-memory ref still prevents duplicates.
       }
 
-      await requestInitialMobilePermissions()
-      try {
-        await Preferences.set({ key: INITIAL_MOBILE_CAPABILITIES_KEY, value: 'requested' })
-      } catch {
-        // Marker persistence is convenience only; native permission state stays
-        // authoritative even if this write fails.
+      if (requestInitialCapabilities) {
+        await requestInitialMobilePermissions()
+        try {
+          await Preferences.set({ key: INITIAL_MOBILE_CAPABILITIES_KEY, value: 'requested' })
+        } catch {
+          // Marker persistence is convenience only; native permission state stays
+          // authoritative even if this write fails.
+        }
       }
+
+      // This only arms Android's visible foreground-service path for the next
+      // background transition; it never starts a hidden local agent.
+      await enableMobileBackgroundSession()
     })()
   }, [view])
 
