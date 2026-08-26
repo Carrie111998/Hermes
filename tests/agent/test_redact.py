@@ -1051,3 +1051,20 @@ class TestMaskSecretControlStripping:
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
+
+
+class TestForcedFileContentRedaction:
+    """File-content mode must cover opaque structured credential values."""
+
+    def test_file_read_redacts_opaque_assignment_and_nested_json(self):
+        assignment = "opaqueassignment123456789"
+        nested_json = "nestedjsonsecret987654321"
+        content = (
+            f"SERVICE_API_KEY={assignment}\n"
+            f'{{"credentials": {{"apiKey": "{nested_json}"}}}}'
+        )
+
+        result = redact_sensitive_text(content, force=True, file_read=True)
+
+        assert assignment not in result
+        assert nested_json not in result

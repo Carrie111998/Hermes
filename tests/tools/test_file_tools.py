@@ -1033,3 +1033,37 @@ class TestSSHConfigWriteGateSingleQuery:
             f"required kwargs {missing}; it would raise TypeError instead "
             f"of showing an approval prompt"
         )
+
+
+class TestForcedFileContentRedaction:
+    """All file-reader content must use the forced structured redaction path."""
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_unrecognized_reader_content_is_redacted_as_file_content(self, mock_get):
+        assignment = "opaqueassignment123456789"
+        nested_json = "nestedjsonsecret987654321"
+        split_prefix = "sk-" + "a" * 8 + "\x1b" + "b" * 24
+        content = (
+            f" 1|SERVICE_API_KEY={assignment}\n"
+            f' 2|{{"credentials": {{"apiKey": "{nested_json}"}}}}\n'
+            f" 3|CONTROL_TOKEN={split_prefix}\n"
+        )
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.content = content
+        result_obj.to_dict.return_value = {
+            "content": content,
+            "total_lines": 3,
+            "file_size": len(content),
+        }
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import read_file_tool
+
+        result = json.loads(read_file_tool("/tmp/indirect-reader-output.txt"))
+        returned = result["content"]
+
+        assert assignment not in returned
+        assert nested_json not in returned
+        assert "b" * 24 not in returned

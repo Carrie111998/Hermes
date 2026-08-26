@@ -825,10 +825,8 @@ def redact_sensitive_text(
     if not (force or _REDACT_ENABLED):
         return text
 
-    # file_read content shouldn't hit the source-code ENV/JSON false-positive
-    # paths either (it's config/data, not log lines).
-    if file_read:
-        code_file = True
+    # File content must also run the structured assignment/JSON/YAML passes;
+    # source-code callers keep the explicit code_file opt-out.
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -842,8 +840,16 @@ def redact_sensitive_text(
         text = _mask_control_split_tokens(text, _prefix_sub)
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
 
-    # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
-    if not code_file:
+    # ENV assignments: OPENAI_API_KEY=*** (skip only for non-file source code)
+    # File content must also run the structured assignment/JSON/YAML passes.
+    if file_read or not code_file:
+        def _mask_structured_value(value):
+            # The prefix pass already produced a safe file-content sentinel;
+            # keep it intact instead of replacing it with a reusable mask.
+            if file_read and value.startswith("«redacted:") and value.endswith("»"):
+                return value
+            return _mask_token_nonreusable(value) if file_read else _mask_token(value)
+
         if "=" in text:
             def _redact_env(m):
                 name, quote, value = m.group(1), m.group(2), m.group(3)
@@ -859,7 +865,7 @@ def redact_sensitive_text(
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                return f"{name}={quote}{_mask_structured_value(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
@@ -894,7 +900,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                return f'{key}: "{_mask_structured_value(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -913,7 +919,7 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                return f"{key}{sep}{_mask_structured_value(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
