@@ -997,10 +997,17 @@ def _collect_gateway_skill_entries(
     skill_triples: list[tuple[str, str, str]] = []
     try:
         from agent.skill_commands import get_skill_commands
-        from tools.skills_tool import SKILLS_DIR
+        # Profile-aware skills root. ``SKILLS_DIR`` is import-time bound and in a
+        # multiplexed gateway points at the DEFAULT profile, so a secondary
+        # profile's skills failed the allowed-prefix check below and were
+        # silently dropped from the menu even though get_skill_commands() found
+        # them. ``_skills_dir()`` resolves the live profile home per call and
+        # still honors a patched ``SKILLS_DIR``.
+        from tools.skills_tool import _skills_dir as _active_skills_dir
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
-        _skills_dir = str(SKILLS_DIR.resolve())
-        _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
+        _root = _active_skills_dir()
+        _skills_dir = str(_root.resolve())
+        _hub_dir = str((_root / ".hub").resolve()).rstrip("/") + "/"
         # Build set of allowed directory prefixes: local skills dir + any
         # user-configured ``skills.external_dirs`` + trusted project dirs.
         # Ensure each prefix ends
@@ -1183,10 +1190,14 @@ def discord_skill_commands_by_category(
     try:
         from agent.skill_commands import get_skill_commands
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
-        from tools.skills_tool import SKILLS_DIR
+        # Profile-aware skills root — see the note in
+        # ``_collect_gateway_skill_entries``; import-time SKILLS_DIR is stale under
+        # gateway multiplexing.
+        from tools.skills_tool import _skills_dir as _active_skills_dir
 
-        _skills_dir = SKILLS_DIR.resolve()
-        _hub_dir = (SKILLS_DIR / ".hub").resolve()
+        _root = _active_skills_dir()
+        _skills_dir = _root.resolve()
+        _hub_dir = (_root / ".hub").resolve()
         # Build list of (resolved_root, is_local) tuples. Each external dir
         # becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".

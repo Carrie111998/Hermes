@@ -236,7 +236,13 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     try:
-        from tools.skills_tool import SKILLS_DIR, skill_view
+        # ``_skills_dir()`` not the module-level ``SKILLS_DIR``: under gateway
+        # multiplexing the module was imported before the profile's
+        # ``_profile_runtime_scope`` installed its HERMES_HOME override, so
+        # ``SKILLS_DIR`` is frozen on the DEFAULT profile. ``_skills_dir()``
+        # resolves the live profile home per call while still honoring a
+        # patched ``SKILLS_DIR`` (tests / external patchers).
+        from tools.skills_tool import _skills_dir, skill_view
         from agent.skill_utils import normalize_skill_lookup_name
 
         normalized = normalize_skill_lookup_name(raw_identifier)
@@ -262,7 +268,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         skill_dir = Path(abs_skill_dir)
     elif skill_path:
         try:
-            skill_dir = SKILLS_DIR / Path(skill_path).parent
+            skill_dir = _skills_dir() / Path(skill_path).parent
         except Exception:
             skill_dir = None
 
@@ -317,7 +323,8 @@ def _build_skill_message(
     session_id: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
+    # Profile-aware: see the note in ``_load_skill_payload``.
+    from tools.skills_tool import _skills_dir
 
     content = str(loaded_skill.get("content") or "")
 
@@ -386,7 +393,7 @@ def _build_skill_message(
 
     if supporting and skill_dir:
         try:
-            skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
+            skill_view_target = str(skill_dir.relative_to(_skills_dir()))
         except ValueError:
             # Skill is from an external dir — use the skill name instead
             skill_view_target = skill_dir.name
@@ -438,7 +445,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     # each naming the same skill as its own incumbent (#74574).
     commands: Dict[str, Dict[str, Any]] = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
             get_external_skills_dirs,
             get_project_skills_dirs,
@@ -453,8 +460,15 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         # Project dirs iterate through the quarantine chokepoint.
         project_dirs = list(get_project_skills_dirs())
         dirs_to_scan = list(project_dirs)
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        # Resolve the ACTIVE profile's skills dir at scan time. The module-level
+        # ``SKILLS_DIR`` is bound when ``tools.skills_tool`` is first imported,
+        # which in a multiplexed gateway happens before any profile's
+        # ``_profile_runtime_scope`` installs its HERMES_HOME override — so it
+        # points at the default profile and profile-only skills (e.g. the
+        # learning profile's ``/review``) were never scanned (#88023 follow-up).
+        local_skills_dir = _skills_dir()
+        if local_skills_dir.exists():
+            dirs_to_scan.append(local_skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:

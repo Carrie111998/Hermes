@@ -930,7 +930,7 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     # module cycle (tools.skills_tool imports agent.skill_utils).
     try:
         from tools import skills_tool as _skills_tool
-        primary_root = Path(_skills_tool.SKILLS_DIR)
+        primary_root = Path(_skills_tool._skills_dir())
     except Exception:
         primary_root = get_skills_dir()
 

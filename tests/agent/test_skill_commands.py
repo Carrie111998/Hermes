@@ -879,3 +879,187 @@ class TestStackedSkillCommands:
         assert loaded == ["skill-a"]
         assert missing == ["gone"]
         assert "Skills missing (skipped): gone" in msg
+
+
+class TestMultiplexProfileSkillCommands:
+    """A multiplexed gateway routes each turn through ``_profile_runtime_scope``,
+    which installs a context-local ``HERMES_HOME`` override *after*
+    ``tools.skills_tool`` was already imported for the default profile.
+
+    These tests deliberately do NOT patch ``tools.skills_tool.SKILLS_DIR`` —
+    that is the whole point. The import-time constant stays pointed at the
+    default profile, exactly as it is in the live gateway, and discovery must
+    still find the routed profile's skills via the live profile home.
+    """
+
+    @staticmethod
+    def _profile_with_skill(tmp_path, profile_name, skill_name):
+        """Build a profile home containing a single skill, and no config.yaml
+        (so no external/project dirs bleed in from the profile side)."""
+        home = tmp_path / "profiles" / profile_name
+        skills = home / "skills"
+        skills.mkdir(parents=True)
+        _make_skill(skills, skill_name)
+        (home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        return home
+
+    def _scan_in_profile(self, profile_home):
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        with (
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_home", None),
+        ):
+            token = set_hermes_home_override(profile_home)
+            try:
+                return dict(get_skill_commands())
+            finally:
+                reset_hermes_home_override(token)
+
+    def test_scan_finds_profile_only_skill_with_stale_import_time_skills_dir(
+        self, tmp_path
+    ):
+        """Regression: a profile-only skill command was reported as an
+        unrecognized slash command because ``scan_skill_commands()`` scanned the
+        import-time ``SKILLS_DIR`` (the default profile) instead of the active
+        profile's skills dir."""
+        profile_home = self._profile_with_skill(tmp_path, "learning", "studynotes")
+
+        # Precondition: the import-time constant is NOT the profile's dir, so a
+        # pass here really does exercise the runtime resolution.
+        assert skills_tool_module.SKILLS_DIR != profile_home / "skills"
+
+        commands = self._scan_in_profile(profile_home)
+
+        assert "/studynotes" in commands, sorted(commands)
+        assert commands["/studynotes"]["skill_md_path"] == str(
+            profile_home / "skills" / "studynotes" / "SKILL.md"
+        )
+
+    def test_profile_skills_do_not_leak_between_profiles(self, tmp_path):
+        """Each routed profile sees only its own skills."""
+        learning = self._profile_with_skill(tmp_path, "learning", "studynotes")
+        other = self._profile_with_skill(tmp_path, "other", "other-only")
+
+        learning_commands = self._scan_in_profile(learning)
+        other_commands = self._scan_in_profile(other)
+
+        assert "/studynotes" in learning_commands
+        assert "/other-only" not in learning_commands
+        assert "/other-only" in other_commands
+        assert "/studynotes" not in other_commands
+
+    def test_telegram_menu_includes_profile_only_skill(self, tmp_path):
+        """The Telegram command menu registered for a secondary profile's bot
+        must contain that profile's skills. The allowed-prefix filter in
+        ``_collect_gateway_skill_entries`` previously rejected them because the
+        prefix was built from the stale import-time ``SKILLS_DIR``."""
+        import agent.skill_commands as sc_mod
+        from hermes_cli.commands import telegram_menu_commands
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_home = self._profile_with_skill(tmp_path, "learning", "studynotes")
+
+        with (
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_home", None),
+        ):
+            token = set_hermes_home_override(profile_home)
+            try:
+                entries, _hidden = telegram_menu_commands()
+            finally:
+                reset_hermes_home_override(token)
+
+        names = [name for name, _desc in entries]
+        assert "studynotes" in names, names
+
+    def _invoke_in_profile(self, profile_home, command_key):
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import (
+            build_skill_invocation_message,
+            scan_skill_commands,
+        )
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        with (
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_home", None),
+        ):
+            token = set_hermes_home_override(profile_home)
+            try:
+                scan_skill_commands()
+                return build_skill_invocation_message(
+                    command_key, user_instruction="go"
+                )
+            finally:
+                reset_hermes_home_override(token)
+
+    def test_profile_skill_actually_invokes_not_just_registers(self, tmp_path):
+        """Registration and menu presence are not enough: a profile skill that
+        scans fine can still fail to produce an invocation message, which looks
+        to the user like a command that exists and silently does nothing.
+
+        ``_load_skill_payload`` resolves the skill through ``skill_view()``, so
+        it needs a target that is valid under the ACTIVE profile root — the
+        surface the other tests in this class never reach.
+        """
+        profile_home = self._profile_with_skill(tmp_path, "learning", "studynotes")
+
+        message = self._invoke_in_profile(profile_home, "/studynotes")
+
+        assert message, "profile skill registered but produced no invocation"
+        assert str(profile_home / "skills" / "studynotes") in message, message
+
+    def test_profile_skill_with_bom_invokes(self, tmp_path):
+        """A SKILL.md authored with a UTF-8 BOM (Notepad) is stripped by the
+        canonical frontmatter parser, so it registers during the scan. The
+        invocation path must tolerate the BOM too, or exactly those skills
+        register and then fail to load."""
+        profile_home = tmp_path / "profiles" / "learning"
+        skills = profile_home / "skills"
+        (skills / "bomskill").mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        # utf-8-sig writes the BOM ahead of the frontmatter fence.
+        (skills / "bomskill" / "SKILL.md").write_text(
+            "---\nname: bomskill\ndescription: Description for bomskill.\n---\n\n"
+            "# bomskill\n\nDo the thing.\n",
+            encoding="utf-8-sig",
+        )
+
+        message = self._invoke_in_profile(profile_home, "/bomskill")
+
+        assert message, "BOM-authored profile skill registered but did not load"
+        assert str(skills / "bomskill") in message, message
+
+    def test_profile_skill_with_colliding_name_invokes(self, tmp_path):
+        """Two skills in the profile share a frontmatter name. The scan keeps
+        the first and records its explicit ``skill_dir``; that path is the only
+        thing distinguishing them. Resolving by bare name instead makes
+        ``skill_view()`` refuse with "Ambiguous skill name ... load one
+        explicitly by its categorized path", so the command registers and then
+        cannot be invoked."""
+        profile_home = tmp_path / "profiles" / "learning"
+        skills = profile_home / "skills"
+        skills.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        _make_skill(skills, "dupskill", category="alpha")
+        _make_skill(skills, "dupskill", category="beta")
+
+        message = self._invoke_in_profile(profile_home, "/dupskill")
+
+        assert message, "colliding-name profile skill registered but did not load"
+        assert "Ambiguous" not in message, message
