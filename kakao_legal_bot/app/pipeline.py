@@ -19,6 +19,7 @@ import contextlib
 import logging
 import time
 
+from . import intake as intake_states
 from .commands import handle_command
 from .db import Message, pseudonymise
 from .iris import IrisEvent
@@ -319,6 +320,13 @@ class Pipeline:
             result.latency_ms,
         )
 
+        # The intake is state the *next* turn depends on, so it is written
+        # before the follow-ups rather than alongside them.
+        if result.state.intake_actions:
+            await asyncio.to_thread(
+                _apply_intake_actions, services.db, room_id, result.state.intake_actions
+            )
+
         # Follow-ups. Fire-and-forget: the client already has their answer.
         if result.state.draft_request or result.state.escalation:
             asyncio.create_task(self._follow_up(event, result))  # noqa: RUF006
@@ -367,6 +375,36 @@ class Pipeline:
         since = time.time() - 86400
         count = await asyncio.to_thread(self.services.db.count_answers_since, room_id, since)
         return count >= cap
+
+
+def _apply_intake_actions(db, room_id: str, actions) -> None:  # noqa: ANN001
+    """Write the intake steps the model took during this turn."""
+    for action in actions:
+        try:
+            if action.kind == "start":
+                db.open_intake(room_id, action.doc_kind, action.case_type)
+                continue
+
+            intake = db.active_intake(room_id)
+            if intake is None:
+                # The model reported a case type or a report without ever
+                # opening an intake — open one rather than lose the work.
+                intake = db.open_intake(room_id, action.doc_kind, action.case_type)
+
+            if action.kind == "case_type" and action.case_type:
+                db.update_intake(
+                    int(intake["id"]), case_type=action.case_type, status=intake_states.COLLECTING
+                )
+            elif action.kind == "report":
+                db.update_intake(
+                    int(intake["id"]),
+                    report=action.report,
+                    missing=action.missing,
+                    status=intake_states.REPORT_REVIEW,
+                    **({"doc_kind": action.doc_kind} if action.doc_kind else {}),
+                )
+        except Exception:  # noqa: BLE001 — bookkeeping must not break the room
+            log.exception("could not record intake action %s in room %s", action.kind, room_id)
 
 
 def _is_lawyer_row(event: IrisEvent, settings) -> bool:  # noqa: ANN001

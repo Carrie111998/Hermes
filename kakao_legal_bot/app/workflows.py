@@ -50,9 +50,33 @@ async def create_draft(
         if consultation is not None:
             email = str(consultation["client_email"] or "")
 
+    # A finished intake means there is a consultation report — that is a far
+    # better brief for the writer than the raw chat log.
+    intake = await asyncio.to_thread(db.active_intake, room_id)
+    if intake is not None and str(intake["report"] or "").strip():
+        request = DraftRequest(
+            kind=request.kind or str(intake["doc_kind"] or ""),
+            title=request.title,
+            instructions=(
+                f"{request.instructions}\n\n"
+                f"[상담보고서 — 상담자 확인 완료]\n{intake['report']}"
+            ).strip(),
+        )
+
     if settings.draft_generator == "worker":
-        return await _queue_for_worker(services, room_id, request, consult_id, email, history)
-    return await _generate_here(services, room_id, request, consult_id, email, history)
+        draft_id = await _queue_for_worker(
+            services, room_id, request, consult_id, email, history
+        )
+    else:
+        draft_id = await _generate_here(
+            services, room_id, request, consult_id, email, history
+        )
+
+    if intake is not None:
+        await asyncio.to_thread(
+            db.update_intake, int(intake["id"]), status="confirmed", draft_id=draft_id
+        )
+    return draft_id
 
 
 async def _queue_for_worker(

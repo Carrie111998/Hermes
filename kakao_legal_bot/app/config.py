@@ -189,6 +189,12 @@ class Settings:
     persona_path: Path = field(
         default_factory=lambda: Path(_env("PERSONA_PATH", "./kakao_legal_bot/persona.md"))
     )
+    # 문서작성 인테이크 절차. 페르소나와 함께 캐시되는 고정 블록입니다.
+    intake_playbook_path: Path = field(
+        default_factory=lambda: Path(
+            _env("INTAKE_PLAYBOOK_PATH", "./kakao_legal_bot/intake_playbook.md")
+        )
+    )
 
     # ── RAG ──────────────────────────────────────────────────────────────
     corpus_dir: Path = field(default_factory=lambda: Path(_env("CORPUS_DIR", "./corpus")))

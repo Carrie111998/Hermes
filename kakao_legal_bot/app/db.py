@@ -96,6 +96,22 @@ CREATE TABLE IF NOT EXISTS drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts(status, id DESC);
 
+CREATE TABLE IF NOT EXISTS intakes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id      TEXT NOT NULL,
+    consult_id   INTEGER,
+    doc_kind     TEXT NOT NULL DEFAULT '',
+    case_type    TEXT NOT NULL DEFAULT '',
+    -- form_sent | collecting | report_review | quoted | confirmed | cancelled
+    status       TEXT NOT NULL DEFAULT 'form_sent',
+    report       TEXT NOT NULL DEFAULT '',
+    missing      TEXT NOT NULL DEFAULT '',
+    draft_id     INTEGER,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_intakes_room ON intakes(room_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS answers (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     room_id      TEXT NOT NULL,
@@ -424,6 +440,70 @@ class Database:
             ),
         )
         return int(cur.lastrowid or 0)
+
+    # ── document intake ──────────────────────────────────────────────────
+    def open_intake(
+        self,
+        room_id: str,
+        doc_kind: str,
+        case_type: str = "",
+        consult_id: int | None = None,
+    ) -> sqlite3.Row:
+        """Start an intake, or return the one already running in this room.
+
+        One room can only be collecting facts for one document at a time —
+        two interleaved questionnaires would produce two half-filled reports.
+        """
+        existing = self.active_intake(room_id)
+        if existing is not None:
+            self._exec(
+                "UPDATE intakes SET doc_kind = CASE WHEN ? != '' THEN ? ELSE doc_kind END, "
+                "case_type = CASE WHEN ? != '' THEN ? ELSE case_type END, updated_at = ? "
+                "WHERE id = ?",
+                (doc_kind, doc_kind, case_type, case_type, time.time(), existing["id"]),
+            )
+            found = self._query_one("SELECT * FROM intakes WHERE id = ?", (existing["id"],))
+            assert found is not None
+            return found
+
+        now = time.time()
+        cur = self._exec(
+            "INSERT INTO intakes(room_id, consult_id, doc_kind, case_type, status, "
+            "created_at, updated_at) VALUES(?, ?, ?, ?, 'form_sent', ?, ?)",
+            (room_id, consult_id, doc_kind, case_type, now, now),
+        )
+        found = self._query_one("SELECT * FROM intakes WHERE id = ?", (cur.lastrowid,))
+        assert found is not None
+        return found
+
+    def active_intake(self, room_id: str) -> sqlite3.Row | None:
+        return self._query_one(
+            "SELECT * FROM intakes WHERE room_id = ? "
+            "AND status IN ('form_sent','collecting','report_review','quoted') "
+            "ORDER BY id DESC LIMIT 1",
+            (room_id,),
+        )
+
+    def get_intake(self, intake_id: int) -> sqlite3.Row | None:
+        return self._query_one("SELECT * FROM intakes WHERE id = ?", (intake_id,))
+
+    def update_intake(self, intake_id: int, **fields: Any) -> None:
+        allowed = {"doc_kind", "case_type", "status", "report", "missing", "draft_id"}
+        sets = {k: v for k, v in fields.items() if k in allowed}
+        if not sets:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in sets)
+        self._exec(
+            f"UPDATE intakes SET {assignments}, updated_at = ? WHERE id = ?",  # noqa: S608
+            (*sets.values(), time.time(), intake_id),
+        )
+
+    def list_intakes(self, status: str = "", limit: int = 50) -> list[sqlite3.Row]:
+        if status:
+            return self._query(
+                "SELECT * FROM intakes WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit)
+            )
+        return self._query("SELECT * FROM intakes ORDER BY id DESC LIMIT ?", (limit,))
 
     # ── draft generation queue (Codex worker on the lawyer's PC) ─────────
     def claim_draft_jobs(self, limit: int = 1) -> list[Draft]:

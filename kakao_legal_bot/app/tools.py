@@ -14,6 +14,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from .intake import INTAKE_FORM, quote_text, tier_for
+from .knowledge import case_type_index, find_case_type, requisite_facts_for
 from .lawapi.client import LawApiClient, LawApiError
 from .lawapi.models import LawDoc
 from .llm import ToolSpec
@@ -38,20 +40,32 @@ class Escalation:
 
 
 @dataclass
+class IntakeAction:
+    """An intake step the pipeline must persist after the reply is sent."""
+
+    kind: str  # start | report | case_type
+    doc_kind: str = ""
+    case_type: str = ""
+    report: str = ""
+    missing: str = ""
+
+
+@dataclass
 class TurnState:
     """Side effects and citations collected while answering one message."""
 
     citations: list[str] = field(default_factory=list)
     draft_request: DraftRequest | None = None
     escalation: Escalation | None = None
+    intake_actions: list[IntakeAction] = field(default_factory=list)
 
     def cite(self, text: str) -> None:
         if text and text not in self.citations:
             self.citations.append(text)
 
 
-def _clip(text: str) -> str:
-    return text if len(text) <= MAX_TOOL_CHARS else text[:MAX_TOOL_CHARS] + "\n…(이하 생략)"
+def _clip(text: str, limit: int = MAX_TOOL_CHARS) -> str:
+    return text if len(text) <= limit else text[:limit] + "\n…(이하 생략)"
 
 
 def _format_docs(docs: list[LawDoc], state: TurnState, max_body: int = 800) -> str:
@@ -309,6 +323,139 @@ def build_tools(
         ]
     )
     return tools
+
+
+def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
+    """The document-intake flow: form → requisite facts → report → quote.
+
+    These tools do the *thinking* work inline (they are pure lookups over
+    bundled knowledge, no network) but leave the *writing* to the pipeline,
+    which persists the intake after the client already has a reply.
+    """
+
+    async def start_document_intake(arguments: dict[str, Any]) -> str:
+        doc_kind = str(arguments.get("doc_kind") or "법률문서").strip()
+        raw_case = str(arguments.get("case_type") or "").strip()
+        case = find_case_type(raw_case)
+        state.intake_actions.append(
+            IntakeAction(
+                kind="start", doc_kind=doc_kind, case_type=case.key if case else raw_case
+            )
+        )
+        tier = tier_for(doc_kind)
+        parts = [
+            "아래 [보낼 폼] 을 그대로 상담자에게 보내고 기다리세요. "
+            "질문을 덧붙이지 마세요.",
+            f"(내부 참고 — 이 문서는 '{tier.label}' 등급, "
+            f"{tier.price_krw:,}원 / {tier.lead_time}. 지금 말하지 말고 "
+            "상담보고서 확인 단계에서 안내합니다.)",
+            "\n[보낼 폼]\n" + INTAKE_FORM,
+        ]
+        if case is not None:
+            facts = requisite_facts_for(case.key)
+            parts.append(
+                f"\n[내부 참고 — 폼 답변이 오면 이 요건사실과 하나씩 대조하세요]\n{facts}"
+            )
+        else:
+            parts.append(
+                "\n[내부 참고] 사건유형을 아직 특정하지 못했습니다. 폼 답변이 오면 "
+                f"get_requisite_facts 를 호출하세요. 가능한 유형:\n{case_type_index()}"
+            )
+        return _clip("\n".join(parts))
+
+    async def get_requisite_facts(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("case_type") or "").strip()
+        case = find_case_type(query)
+        if case is None:
+            return (
+                f"'{query}' 에 맞는 사건유형을 찾지 못했습니다. 아래 중에서 고르세요.\n"
+                f"{case_type_index()}"
+            )
+        state.intake_actions.append(IntakeAction(kind="case_type", case_type=case.key))
+        return _clip(requisite_facts_for(case.key), limit=12000)
+
+    async def submit_consultation_report(arguments: dict[str, Any]) -> str:
+        report = str(arguments.get("report") or "").strip()
+        doc_kind = str(arguments.get("doc_kind") or "법률문서").strip()
+        missing = str(arguments.get("still_missing") or "").strip()
+        if not report:
+            return "report 가 비어 있습니다. 상담보고서 본문을 넣어 다시 호출하세요."
+        state.intake_actions.append(
+            IntakeAction(kind="report", doc_kind=doc_kind, report=report, missing=missing)
+        )
+        return (
+            "상담보고서를 저장했습니다. 이제 아래 두 가지를 상담자에게 "
+            "**그대로 이어서** 보내고 확인을 받으세요.\n\n"
+            "① 위에서 작성하신 상담보고서 전문\n"
+            "② 아래 안내문\n\n"
+            f"{quote_text(doc_kind, lawyer_name)}\n\n"
+            "상담자가 '진행하겠다'고 하면 그때 request_document_draft 를 호출하고, "
+            "instructions 에 상담보고서 전문을 넣으세요. 정정 요청이 오면 고쳐서 "
+            "다시 확인받으세요."
+        )
+
+    return [
+        ToolSpec(
+            name="start_document_intake",
+            description=(
+                "상담자가 문서 작성을 요청했을 때 가장 먼저 호출한다. 정보입력폼과 "
+                "해당 사건유형의 요건사실을 돌려준다. 초안을 바로 만들지 말고 이것부터."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "doc_kind": {
+                        "type": "string",
+                        "description": "문서 종류 (내용증명 / 소장 / 답변서 / 준비서면 등)",
+                    },
+                    "case_type": {
+                        "type": "string",
+                        "description": "사건유형. 모르면 비워둔다 (예: 대여금, 임대차보증금반환)",
+                    },
+                },
+                "required": ["doc_kind"],
+            },
+            handler=start_document_intake,
+        ),
+        ToolSpec(
+            name="get_requisite_facts",
+            description=(
+                "사건유형의 청구원인 요건사실·자주 나오는 항변·관련 민법 요건사실을 가져온다. "
+                "상담자에게 무엇을 더 물어야 하는지 판단할 때 쓴다."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "case_type": {
+                        "type": "string",
+                        "description": "사건유형 또는 상담자의 표현 (예: 전세금을 못 받았어요)",
+                    }
+                },
+                "required": ["case_type"],
+            },
+            handler=get_requisite_facts,
+        ),
+        ToolSpec(
+            name="submit_consultation_report",
+            description=(
+                "사실관계 수집이 끝나면 상담보고서를 제출한다. 저장 후 상담자에게 보여줄 "
+                "비용·소요기간 안내문을 돌려준다."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "report": {"type": "string", "description": "상담보고서 전문"},
+                    "doc_kind": {"type": "string", "description": "문서 종류"},
+                    "still_missing": {
+                        "type": "string",
+                        "description": "아직 확인하지 못한 사항 (없으면 비움)",
+                    },
+                },
+                "required": ["report", "doc_kind"],
+            },
+            handler=submit_consultation_report,
+        ),
+    ]
 
 
 def build_action_tools(state: TurnState) -> list[ToolSpec]:

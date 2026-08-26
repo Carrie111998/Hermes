@@ -15,10 +15,11 @@ from typing import Any
 
 from .config import Settings
 from .db import Message
+from .knowledge import case_type_index
 from .lawapi.client import LawApiClient
 from .llm import LlmClient, LlmError, LlmResult
 from .rag.store import RagStore
-from .tools import TurnState, build_action_tools, build_tools
+from .tools import TurnState, build_action_tools, build_intake_tools, build_tools
 
 log = logging.getLogger(__name__)
 
@@ -111,9 +112,25 @@ class LegalAgent:
         self.law = law
         self.embed_query = embed_query
         self._persona = load_persona(settings.persona_path)
+        self._playbook = load_persona(settings.intake_playbook_path)
 
     def reload_persona(self) -> None:
         self._persona = load_persona(self.settings.persona_path)
+        self._playbook = load_persona(self.settings.intake_playbook_path)
+
+    def stable_prefix(self) -> str:
+        """The part of the prompt that never changes between requests.
+
+        Kept byte-identical and first so provider-side caching can hit it —
+        the persona, the intake playbook and the case-type index together are
+        a few thousand tokens that would otherwise be re-billed every message.
+        The date and other volatile facts go *after* this, never inside it.
+        """
+        return (
+            f"{self._persona}\n\n"
+            f"{self._playbook}\n\n"
+            f"## 다룰 수 있는 사건유형\n\n{case_type_index()}"
+        )
 
     def system_prompt(self) -> str:
         brief = _RUNTIME_BRIEF.format(
@@ -121,7 +138,7 @@ class LegalAgent:
             lawyer_name=self.settings.lawyer_name,
             today=time.strftime("%Y년 %m월 %d일"),
         )
-        return f"{self._persona}\n\n{brief}"
+        return f"{self.stable_prefix()}\n\n{brief}"
 
     async def answer(self, question: str, history: list[Message]) -> AnswerResult:
         started = time.monotonic()
@@ -133,6 +150,7 @@ class LegalAgent:
             rag_top_k=self.settings.rag_top_k,
             embed_query=self.embed_query,
         )
+        tools.extend(build_intake_tools(state, self.settings.lawyer_name))
         tools.extend(build_action_tools(state))
 
         messages = build_messages(history, question, self.settings.bot_name)
