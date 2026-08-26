@@ -131,7 +131,9 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
-    assert args.query == "work kanban task t_spawn_tools"
+    # Query is now the full spawn packet, not the four-word stub
+    assert "t_spawn_tools" in args.query
+    assert "kanban_request_review" in args.query
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):

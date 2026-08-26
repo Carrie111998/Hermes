@@ -31,6 +31,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
 
     def _fake_popen(cmd, **kwargs):
         captured["env"] = kwargs["env"]
+        captured["cmd"] = cmd
         return _Proc()
 
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
@@ -40,7 +41,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     task = kb.Task(
         id="t_b21733fb",
         title="ship it",
-        body=None,
+        body="MANUALS:\n  - skill_view: kanban-factory\n",
         assignee="default",
         status="in_progress",
         priority=0,
@@ -60,6 +61,12 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+    # Verify the prompt is the spawn packet, not the four-word stub
+    q_idx = captured["cmd"].index("-q")
+    prompt = captured["cmd"][q_idx + 1]
+    assert prompt.strip() != "work kanban task t_b21733fb"
+    assert "t_b21733fb" in prompt
+    assert "kanban_request_review" in prompt
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):

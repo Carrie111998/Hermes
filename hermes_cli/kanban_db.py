@@ -1425,6 +1425,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
+-- Guard against non-epoch created_at values (e.g., ISO-8601 strings written
+-- by a worker that bypassed the create_task path with a raw INSERT). Coerce
+-- any string to its integer epoch value. (2026-08-25 scar: t_test_free_01..05
+-- wrote ISO strings, crashed the board's timeAgo/relativeTime Intl formatter.)
+-- This trigger fires on every INSERT into tasks, converting created_at to
+-- int(created_at) if it's a string, or passing through actual integers.
+CREATE TRIGGER IF NOT EXISTS tasks_coerce_created_at_before_insert
+BEFORE INSERT ON tasks
+BEGIN
+  SELECT CASE
+    WHEN typeof(NEW.created_at) = 'text' THEN
+      RAISE(ABORT, 'tasks.created_at must be an integer epoch (seconds), got string: ' || NEW.created_at)
+    WHEN typeof(NEW.created_at) = 'real' OR typeof(NEW.created_at) = 'blob' THEN
+      RAISE(ABORT, 'tasks.created_at must be an integer epoch, got ' || typeof(NEW.created_at))
+    ELSE 1
+  END;
+END;
+
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
@@ -5425,9 +5443,125 @@ def complete_task(
     else:
         verified_cards = []
 
+def _task_requires_evidence_review(title: Optional[str], body: Optional[str]) -> bool:
+    """Check if a task requires explicit review before completion.
+    
+    Robust check that handles:
+    1. Explicit tags: [requires-review], [requires_review], [measured], [evidence-required]
+    2. Structured sections (DONE-CONDITION, ACCEPTANCE CRITERIA, MEASURABLE DELIVERABLE)
+       containing quantitative/measurement terms (measure, points, count, metric, recall, benchmark, etc.)
+    """
+    text_title = (title or "").lower()
+    text_body = (body or "")
+
+    if any(tag in text_title or tag in text_body.lower() for tag in ["[requires-review]", "[requires_review]", "[measured]", "[evidence-required]"]):
+        return True
+
+    # Search for structured section headers
+    match = re.search(r"(?:DONE[-_ ]CONDITION|ACCEPTANCE[-_ ]CRITERIA|MEASURABLE[-_ ]DELIVERABLE)[\s\S]*", text_body, re.IGNORECASE)
+    if match:
+        section = match.group(0).lower()
+        keywords = [
+            "measure", "points_count", "points count", "points", "recall",
+            "metric", "benchmark", "count", "point-count", "quantitative", "audit"
+        ]
+        if any(kw in section for kw in keywords):
+            return True
+
+    return False
+
+
+def complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    Accepts a task that is merely ``ready`` too, so a manual CLI
+    completion (``hermes kanban complete <id>``) works without requiring
+    a claim/start/complete sequence. ``review`` is accepted so a human
+    (or reviewer) can approve a task parked in the review lane by
+    :func:`request_review` — even when it has no active run
+    (``current_run_id IS NULL``), the handoff fields are preserved via
+    :func:`_synthesize_ended_run`.
+
+    ``summary`` and ``metadata`` are stored on the closing run (if any)
+    and surfaced to downstream children via :func:`build_worker_context`.
+    When ``summary`` is omitted we fall back to ``result`` so single-run
+    callers do not have to pass both. ``metadata`` is a free-form dict
+    (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
+    are encouraged to use it for structured handoff facts.
+
+    ``created_cards`` is an optional list of task ids the completing
+    worker claims to have created. Each id is verified against
+    ``tasks.created_by``. If any id is phantom (does not exist or was
+    not created by this worker's assignee profile), completion is blocked
+    with a ``HallucinatedCardsError`` and a
+    ``completion_blocked_hallucination`` event is emitted so the rejected
+    attempt is auditable. When all ids verify, they are recorded on the
+    ``completed`` event payload.
+
+    After a successful completion, ``summary`` and ``result`` are scanned
+    for prose references like ``t_deadbeefcafe`` that do not resolve.
+    Any suspected phantom references are recorded as a
+    ``suspected_hallucinated_references`` event. This pass is advisory
+    and never blocks.
+    """
+    now = int(time.time())
+    # Fail before validating cards or staging artifacts; re-check inside the
+    # final write transaction below to close the parent-reopen race.
+    if not _parents_satisfied(conn, task_id):
+        return False
+
+    # Gate: verify created_cards BEFORE the main write txn. A rejected
+    # completion still needs an auditable event, so we emit it in a
+    # tiny dedicated txn, then raise. The caller is responsible for
+    # surfacing HallucinatedCardsError to the worker; this function
+    # never mutates task state on a phantom-card rejection.
+    if created_cards:
+        verified_cards, phantom_cards = _verify_created_cards(
+            conn, task_id, created_cards
+        )
+        if phantom_cards:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_hallucination",
+                    {
+                        "phantom_cards": phantom_cards,
+                        "verified_cards": verified_cards,
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise HallucinatedCardsError(phantom_cards, task_id)
+    else:
+        verified_cards = []
+
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    
+    raw_artifacts = metadata.get("artifacts") if metadata else None
+    if isinstance(raw_artifacts, (list, tuple)):
+        for item in raw_artifacts:
+            artifact = str(item).strip() if isinstance(item, str) else ""
+            if artifact:
+                src = Path(artifact).expanduser()
+                if not src.exists():
+                    raise ArtifactPreservationError(
+                        f"declared artifact is unavailable or does not exist: {artifact}"
+                    )
+
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5435,10 +5569,14 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, title, body FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        
+        if prior_status != "review" and prior and _task_requires_evidence_review(prior["title"], prior["body"]):
+            raise ValueError("Task has a measurable done-condition. You must use kanban_request_review instead of completing directly.")
+            
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -10732,7 +10870,6 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -10759,6 +10896,17 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    
+    # Build the spawn packet using the full prompt builder (not the four-word stub).
+    from hermes_cli.kanban_worker_prompt import build_worker_spawn_prompt
+    prompt = build_worker_spawn_prompt(
+        task.id,
+        body=task.body,
+        board=board,
+        assignee=task.assignee,
+        profile_home=env.get("HERMES_HOME"),
+    )
+    
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -10857,14 +11005,34 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    
+    # Apply free-first classifier: if task is eligible and has no explicit
+    # model override, route via free models first (OpenCode -> OpenRouter -> Haiku).
+    # This extends the EXISTING model resolution; does not add new hooks.
+    _resolved_model = task.model_override
+    _resolved_provider = task.provider_override
+    try:
+        from hermes_cli.free_model_classifier import resolve_model_for_free_routing
+        _resolved_model, _resolved_provider = resolve_model_for_free_routing(
+            task.id,
+            task.title,
+            task.body,
+            model_override=task.model_override,
+            provider_override=task.provider_override,
+        )
+    except Exception as e:
+        # Classifier import/execution failure: silently fall back to the explicit
+        # override (if any). This ensures a classifier bug never blocks dispatch.
+        _log.debug(f"free_model_classifier error on task {task.id}: {e}", exc_info=True)
+    
+    if _resolved_model:
+        cmd.extend(["-m", _resolved_model])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
         # profile's configured provider (mixing model X with provider Y is
         # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
+        if _resolved_provider:
+            cmd.extend(["--provider", _resolved_provider])
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
