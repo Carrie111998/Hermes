@@ -1,0 +1,85 @@
+diff --git a/apps/desktop/src/app/contrib/controller.tsx b/apps/desktop/src/app/contrib/controller.tsx
+index c82ac082db4f..55e9e2711b8a 100644
+--- a/apps/desktop/src/app/contrib/controller.tsx
++++ b/apps/desktop/src/app/contrib/controller.tsx
+@@ -21,6 +21,7 @@ import {
+   registerLayoutResetHandler,
+   registerPaneCloser,
+   registerPaneOpener,
++  registerPaneOpenGetter,
+   resetLayoutTree,
+   revealTreePane,
+   setPaneCollapsed,
+@@ -468,6 +469,7 @@ function bindPaneCollapse(
+   $open.listen(isOpen => setPaneCollapsed(paneId, !isOpen))
+   registerPaneCloser(paneId, close)
+   registerPaneOpener(paneId, open)
++  registerPaneOpenGetter(paneId, () => $open.get())
+ }
+ 
+ // SIDES have one source of truth: the TREE. The legacy $panesFlipped flag is
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+index 8988e374a751..de7c9b6cbb96 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+@@ -204,7 +204,13 @@ export function TreeGroup({
+   // empty column, so the minimized form is a narrow vertical rail instead
+   // (tabs reading top-to-bottom). In a column (stacked zones) the horizontal
+   // header IS the collapsed form, exactly as before.
+-  const verticalCollapse = Boolean(node.minimized) && parentAxis === 'row' && !isEmpty
++  //
++  // EXCEPTION: when the zone has ≥2 shown panes, keep the horizontal tab bar
++  // even when minimized — the user can still switch between terminal/logs
++  // without expanding the zone first. The vertical rail is only for a lone
++  // pane where the strip adds no value.
++  const verticalCollapse =
++    Boolean(node.minimized) && parentAxis === 'row' && !isEmpty && shown.length <= 1
+   const headerVisible = !isEmpty && !verticalCollapse && (Boolean(node.minimized) || !headerHidden)
+ 
+   // Drag handles preventDefault pointerdown (no native dblclick), so the
+diff --git a/apps/desktop/src/components/pane-shell/tree/store.ts b/apps/desktop/src/components/pane-shell/tree/store.ts
+index 12bab46bf010..e6e05bf47013 100644
+--- a/apps/desktop/src/components/pane-shell/tree/store.ts
++++ b/apps/desktop/src/components/pane-shell/tree/store.ts
+@@ -164,6 +164,7 @@ function setDismissed(paneId: string, dismissed: boolean) {
+ 
+ const paneClosers: Record<string, () => void> = {}
+ const paneOpeners: Record<string, () => void> = {}
++const paneOpenGetters: Record<string, () => boolean> = {}
+ 
+ /** Route a pane's Close through the app store that owns its visibility. */
+ export function registerPaneCloser(paneId: string, close: () => void) {
+@@ -181,6 +182,13 @@ export function registerPaneOpener(paneId: string, open: () => void) {
+   paneOpeners[paneId] = open
+ }
+ 
++/** Register a getter that reads a tool pane's open/closed state from its
++ *  owning store — so `setPaneCollapsed` can check if a sibling in the same
++ *  zone is still open before folding the whole zone. */
++export function registerPaneOpenGetter(paneId: string, getOpen: () => boolean) {
++  paneOpenGetters[paneId] = getOpen
++}
++
+ // TOOL PANELS (terminal, logs, …): their toggle COLLAPSES the zone to a rail
+ // (tab stays) instead of hiding it, and the tab's ✕ REMOVES it (vs a session
+ // tile, whose ✕ closes the session). Membership tells the renderer which
+@@ -1067,7 +1075,18 @@ export function setPaneCollapsed(paneId: string, collapsed: boolean) {
+ 
+         activateTreePane(group.id, group.panes[at - 1] ?? group.panes[at + 1])
+       } else {
+-        toggleTreeGroupMinimized(group.id, true) // pure tool zone folds as a unit
++        // Pure tool zone: if another tool pane in this zone is still open,
++        // switch to it instead of folding the whole zone — so the tab bar
++        // stays visible and the user can switch between terminal/logs freely.
++        const openSibling = group.panes.find(
++          id => id !== paneId && isCollapsePane(id) && paneOpenGetters[id]?.()
++        )
++
++        if (openSibling) {
++          activateTreePane(group.id, openSibling)
++        } else {
++          toggleTreeGroupMinimized(group.id, true) // no open sibling — fold as a unit
++        }
+       }
+     } else if (!collapsed) {
+       revealTreePane(paneId)
