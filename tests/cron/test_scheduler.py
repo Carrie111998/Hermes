@@ -1,10 +1,14 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import concurrent.futures
 import contextlib
 import itertools
 import json
 import logging
 import os
+import re
+import threading
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -7595,3 +7599,300 @@ class TestSuspendAwareTimeouts:
         from cron.scheduler import inactivity_exceeded
         assert inactivity_exceeded(1e9, 0.0, None) is False
 
+
+
+@pytest.mark.usefixtures("_tick_lock_isolated")
+class TestSuspendAwareTimeoutWiring:
+    """Covers the poll-loop WIRING, which the pure-helper tests above cannot.
+
+    ``TestSuspendAwareTimeouts`` proves ``suspended_seconds`` /
+    ``wallclock_exceeded`` / ``inactivity_exceeded`` behave correctly in
+    isolation. It says nothing about whether ``run_job``'s poll loop actually
+    FEEDS them the accumulated suspend — reverting either call site to a
+    literal ``0.0`` (i.e. restoring the pre-fix "bill raw elapsed" behaviour)
+    fails none of those tests.
+
+    The seam is ``concurrent.futures.wait``: the loop's only blocking call, so
+    it is where a host suspend surfaces as an oversized poll gap. Faking it
+    lets a test jump a fake ``time.monotonic`` across one poll exactly as a
+    suspend does, with no real waiting and nothing left running afterwards.
+
+    A previous attempt at this test drove the loop with a patched clock ALONE
+    and passed with the fix reverted: the mock agent's future was already done,
+    so the loop broke at ``if done:`` on its first poll and never reached
+    either watchdog check. Every test here therefore asserts the "poll loop
+    stalled" warning (or its absence) as a positive control that the loop
+    really ran and really classified the gap.
+    """
+
+    SUSPEND = 6.67 * 3600  # the 2026-08-25 fleet-wide gap
+    HARD_LIMIT = 3600.0
+    IDLE_LIMIT = 600.0
+
+    def _run(self, tmp_path, monkeypatch, caplog, *, gaps,
+             hard_timeout, inactivity_timeout, idle_tracks_clock=False,
+             activity_resumes_after_poll=None):
+        """Drive ``run_job``'s poll loop over a scripted sequence of poll gaps.
+
+        ``gaps`` is one float per poll iteration: the seconds the fake clock
+        jumps while that poll is blocked in ``concurrent.futures.wait``. Once
+        the script is exhausted the real ``wait`` runs and the (already
+        finished) agent future completes the loop normally.
+
+        ``idle_tracks_clock`` makes the agent report idle time measured against
+        the same fake clock, which is what a real agent does: its last-activity
+        stamp predates a suspend, so raw idle is inflated by the full suspend.
+        ``activity_resumes_after_poll`` restamps that last-activity marker to
+        NOW once, after the given poll — the agent waking up and doing work.
+        """
+        monkeypatch.setenv("HERMES_CRON_HARD_TIMEOUT", str(hard_timeout))
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", str(inactivity_timeout))
+
+        # BOTH fakes below are scoped to THIS thread. The agent runs in a
+        # worker thread and other subsystems keep background threads alive
+        # across tests; an unscoped fake would let one of them consume a
+        # scripted gap (silently disarming the test) or read a clock jumped
+        # 6.67h forward (expiring deadlines it holds).
+        this_thread = threading.current_thread()
+        real_monotonic = time.monotonic
+        real_wait = concurrent.futures.wait
+
+        # Seeded from the real clock so a value that does escape to another
+        # thread is still in the real monotonic domain — and only ever AHEAD
+        # of it, which makes a foreign deadline look pending, never expired.
+        clock = {"t": real_monotonic()}
+        started = clock["t"]
+        polls = {"n": 0}
+        scripted = list(gaps)
+
+        def fake_monotonic():
+            if threading.current_thread() is this_thread:
+                return clock["t"]
+            return real_monotonic()
+
+        def fake_wait(fs, timeout=None, **kwargs):
+            if threading.current_thread() is not this_thread:
+                return real_wait(fs, timeout=timeout, **kwargs)
+            if polls["n"] < len(scripted):
+                clock["t"] += scripted[polls["n"]]
+                polls["n"] += 1
+                # Report NOT done so the loop reaches the watchdog checks.
+                return set(), set(fs)
+            polls["n"] += 1
+            return real_wait(fs, timeout=timeout, **kwargs)
+
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(concurrent.futures, "wait", fake_wait)
+
+        job = {"id": "suspend-wiring", "name": "suspend-wiring", "prompt": "hello"}
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "ok"}
+
+        resumed = {"at": None}
+
+        def _activity():
+            if (
+                activity_resumes_after_poll is not None
+                and resumed["at"] is None
+                and polls["n"] > activity_resumes_after_poll
+            ):
+                resumed["at"] = clock["t"]
+            since = started if resumed["at"] is None else resumed["at"]
+            return {
+                "seconds_since_activity": (
+                    clock["t"] - since if idle_tracks_clock else 0.0
+                ),
+                "last_activity_desc": "waiting for non-streaming API response",
+                "current_tool": None,
+                "api_call_count": 1,
+                "max_iterations": 10,
+            }
+
+        agent.get_activity_summary.side_effect = _activity
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=MagicMock()), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent_cls.return_value = agent
+            with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+                success, output, final_response, error = run_job(job)
+
+        # The loop is the only consumer of the script; if it broke out early
+        # (or something else ate a gap) the rest of this test is vacuous.
+        assert polls["n"] >= 1, "the poll loop never ran"
+        return {
+            "success": success,
+            "error": error,
+            "polls": polls["n"],
+            "logs": [r.getMessage() for r in caplog.records],
+            "agent": agent,
+        }
+
+    @staticmethod
+    def _stalled(run):
+        return [m for m in run["logs"] if "poll loop stalled" in m]
+
+    # --- wall-clock wiring -------------------------------------------------
+
+    def test_suspend_is_discounted_from_the_wallclock_check(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """The loop must charge ACTIVE elapsed, not raw, against the hard limit.
+
+        MUTATION GUARD: replacing ``_suspended_total`` with ``0.0`` in the
+        ``wallclock_exceeded(...)`` call fails this test.
+        """
+        run = self._run(
+            tmp_path, monkeypatch, caplog,
+            gaps=[self.SUSPEND],
+            hard_timeout=self.HARD_LIMIT,
+            inactivity_timeout=self.IDLE_LIMIT,
+        )
+        # Positive control: the loop ran and saw the stall. Without it a green
+        # result proves nothing (see the class docstring).
+        assert self._stalled(run), run["logs"]
+        assert run["success"] is True, run["error"]
+        assert run["error"] is None
+        run["agent"].interrupt.assert_not_called()
+
+    def test_a_genuine_overrun_still_kills_through_the_loop(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """Control for the test above: the harness CAN produce a kill.
+
+        Many sub-threshold gaps are ordinary jitter on a loaded host, are
+        charged to the job in full, and must still trip the limit — otherwise
+        the previous test's green would only prove the watchdog is inert.
+        """
+        run = self._run(
+            tmp_path, monkeypatch, caplog,
+            gaps=[50.0] * 80,  # 4000s of charged time vs a 3600s limit
+            hard_timeout=self.HARD_LIMIT,
+            inactivity_timeout=self.IDLE_LIMIT,
+        )
+        assert not self._stalled(run), "sub-threshold gaps are not a suspend"
+        assert run["success"] is False
+        assert "exceeded wall-clock limit" in (run["error"] or "")
+        run["agent"].interrupt.assert_called_once()
+
+    def test_active_time_past_the_limit_still_kills_after_a_suspend(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """A suspend buys time back; it does not grant immunity."""
+        run = self._run(
+            tmp_path, monkeypatch, caplog,
+            gaps=[self.SUSPEND] + [50.0] * 80,
+            hard_timeout=self.HARD_LIMIT,
+            inactivity_timeout=self.IDLE_LIMIT,
+        )
+        assert self._stalled(run), run["logs"]
+        assert run["success"] is False
+        assert "exceeded wall-clock limit" in (run["error"] or "")
+
+    def test_timeout_log_reports_active_raw_and_discounted(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """The kill line must be self-explaining about a suspend.
+
+        MUTATION GUARD for the SECOND wiring site: the diagnostic
+        ``_wc_elapsed = _wc_raw - _suspended_total`` in the timeout branch,
+        which is what made the 2026-08-25 kill read as a hung API call.
+        """
+        with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+            run = self._run(
+                tmp_path, monkeypatch, caplog,
+                gaps=[self.SUSPEND] + [50.0] * 80,
+                hard_timeout=self.HARD_LIMIT,
+                inactivity_timeout=self.IDLE_LIMIT,
+            )
+        kill = [m for m in run["logs"] if "exceeded wall-clock limit" in m]
+        assert kill, run["logs"]
+        # Three distinct numbers — active, raw, discounted — so a suspend can
+        # never again be read off this line as an overrun. Parsed rather than
+        # string-matched so the assertion is on the ARITHMETIC: billing raw
+        # here would make active == raw while discounted stayed non-zero.
+        m = re.search(
+            r"active (\S+?)s of (\S+?)s raw; (\S+?)s discounted", kill[0]
+        )
+        assert m, kill[0]
+        active, raw, discounted = (float(x) for x in m.groups())
+        assert discounted == pytest.approx(self.SUSPEND - 5.0)
+        assert raw - active == pytest.approx(discounted)
+        # The kill lands on the first poll past the limit: 5s of active time
+        # survived the suspend, then 72 charged 50s gaps.
+        assert active == pytest.approx(3605.0)
+        assert active < self.SUSPEND < raw
+
+    # --- inactivity wiring -------------------------------------------------
+
+    def test_suspend_is_discounted_from_the_inactivity_check(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """The idle watchdog fires FIRST in the loop and inflates the same way.
+
+        MUTATION GUARD: replacing ``_suspend_since_activity`` with ``0.0`` in
+        the ``inactivity_exceeded(...)`` call fails this test.
+        """
+        run = self._run(
+            tmp_path, monkeypatch, caplog,
+            gaps=[self.SUSPEND],
+            hard_timeout=0,  # unlimited: isolate the inactivity path
+            inactivity_timeout=self.IDLE_LIMIT,
+            idle_tracks_clock=True,
+        )
+        assert self._stalled(run), run["logs"]
+        assert run["success"] is True, run["error"]
+        run["agent"].interrupt.assert_not_called()
+
+    def test_a_genuine_stall_still_kills_through_the_loop(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """Control: real idleness with no suspend must still trip the limit."""
+        run = self._run(
+            tmp_path, monkeypatch, caplog,
+            gaps=[50.0] * 20,  # 1000s idle vs a 600s limit
+            hard_timeout=0,
+            inactivity_timeout=self.IDLE_LIMIT,
+            idle_tracks_clock=True,
+        )
+        assert not self._stalled(run), "sub-threshold gaps are not a suspend"
+        assert run["success"] is False
+        assert "idle for" in (run["error"] or ""), run["error"]
+
+    def test_fresh_activity_retires_the_suspend_credit(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """A suspend must not immunise the job against LATER idleness.
+
+        The credit is only valid while the idle reading it inflated is still
+        the one being measured. Once the agent does something, the stamp moves
+        past the suspend and the credit has to be dropped, or a job that wakes
+        up and then genuinely wedges is never killed again for the rest of its
+        run.
+
+        MUTATION GUARD: turning ``_suspend_since_activity = 0.0`` into a no-op
+        (``+= 0.0``) fails this test and nothing else in the suite.
+        """
+        run = self._run(
+            tmp_path, monkeypatch, caplog,
+            gaps=[self.SUSPEND] + [50.0] * 20,
+            hard_timeout=0,  # unlimited: isolate the inactivity path
+            inactivity_timeout=self.IDLE_LIMIT,
+            idle_tracks_clock=True,
+            activity_resumes_after_poll=1,  # the agent wakes after the suspend
+        )
+        assert self._stalled(run), run["logs"]
+        assert run["success"] is False, "post-suspend stall must still be killed"
+        assert "idle for" in (run["error"] or ""), run["error"]
