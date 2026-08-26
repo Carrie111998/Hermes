@@ -57,6 +57,30 @@ def _format_discord_markdown_link(label: str, url: str) -> str:
     return f"[{escaped_label}](<{escaped_url}>)"
 
 
+def measure_host_suspension_gap(
+    wall_now: float,
+    wall_prev: float,
+    mono_now: float,
+    mono_prev: float,
+) -> float:
+    """Return wall-clock seconds the host slept while monotonic time did not.
+
+    macOS clamshell sleep pauses ``time.perf_counter()`` / ``time.monotonic()``
+    (mach_absolute_time) while ``time.time()`` still jumps. Discord heartbeat
+    ACK age is sampled with ``perf_counter``, so a multi-minute lid-close looks
+    like a healthy socket after wake. A material wall-minus-monotonic gap is
+    the signal that the Gateway transport must be treated as stale.
+    """
+    try:
+        wall_delta = float(wall_now) - float(wall_prev)
+        mono_delta = float(mono_now) - float(mono_prev)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(wall_delta) or not math.isfinite(mono_delta):
+        return 0.0
+    return max(0.0, wall_delta - max(0.0, mono_delta))
+
+
 class _Snowflake:
     """Minimal object exposing ``.id`` — satisfies discord.py's Snowflake
     protocol for ``channel.history(before=...)`` without constructing a
@@ -1147,8 +1171,14 @@ class DiscordAdapter(BasePlatformAdapter):
             "websocket_max_latency_seconds",
             30.0,
         )
+        self._suspension_gap_seconds = self._finite_positive_config_float(
+            "websocket_suspension_gap_seconds",
+            5.0,
+        )
         self._liveness_task: Optional[asyncio.Task] = None
         self._liveness_notification_task: Optional[asyncio.Task] = None
+        self._suspension_watch_stop = threading.Event()
+        self._suspension_watch_thread: Optional[threading.Thread] = None
         # True while disconnect() is intentionally closing discord.py. The
         # bot task's done callback uses this to distinguish an operator/service
         # shutdown from a runtime websocket crash.
@@ -1476,6 +1506,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._running = True
             self._start_liveness_probe()
+            self._start_suspension_watch()
             return True
 
         except asyncio.TimeoutError:
@@ -1921,6 +1952,103 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         self._liveness_task = asyncio.create_task(self._liveness_loop())
 
+    def _start_suspension_watch(self) -> None:
+        """Watch wall-vs-monotonic time so clamshell sleep cannot hide a stale WS."""
+        if self._suspension_gap_seconds <= 0:
+            return
+        if self._suspension_watch_thread and self._suspension_watch_thread.is_alive():
+            return
+        self._suspension_watch_stop.clear()
+        self._suspension_watch_thread = threading.Thread(
+            target=self._suspension_watch_loop,
+            name="discord-suspension-watch",
+            daemon=True,
+        )
+        self._suspension_watch_thread.start()
+
+    def _stop_suspension_watch(self) -> None:
+        self._suspension_watch_stop.set()
+        thread = self._suspension_watch_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        if thread.is_alive():
+            thread.join(timeout=1.5)
+        self._suspension_watch_thread = None
+
+    def _suspension_watch_loop(self) -> None:
+        last_wall = time.time()
+        last_mono = time.perf_counter()
+        while not self._suspension_watch_stop.wait(1.0):
+            if not self._running or self._disconnecting:
+                return
+            wall_now = time.time()
+            mono_now = time.perf_counter()
+            gap = measure_host_suspension_gap(wall_now, last_wall, mono_now, last_mono)
+            last_wall = wall_now
+            last_mono = mono_now
+            if gap >= self._suspension_gap_seconds:
+                self._trip_host_suspension(gap)
+                return
+
+    def _trip_host_suspension(self, gap: float) -> None:
+        """Invalidate a pre-sleep Discord transport after a host sleep gap.
+
+        Prefer aborting the stale Gateway socket so the still-running
+        ``Bot.start()`` loop can Discord-resume and replay sequence-covered
+        events. Fall back to the existing retryable-fatal rebuild only when
+        the transport cannot be aborted.
+        """
+        if self._disconnecting or not self._running:
+            return
+        client = self._client
+        if client is None:
+            return
+        logger.error(
+            "[%s] Host suspension gap %.1fs; treating Discord Gateway transport as stale",
+            self.name,
+            gap,
+        )
+        try:
+            aborted = _abort_discord_websocket_transport(getattr(client, "ws", None))
+        except Exception:
+            aborted = False
+        if aborted:
+            logger.warning(
+                "[%s] Aborted Discord Gateway transport after %.1fs host sleep so the session can resume",
+                self.name,
+                gap,
+            )
+            return
+        self._disconnecting = True
+        self._set_fatal_error(
+            "discord_host_suspended",
+            f"Host was suspended for {gap:.1f}s; Discord Gateway transport is stale",
+            retryable=True,
+        )
+        loop = getattr(client, "loop", None)
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = None
+        if loop is None or not loop.is_running():
+            return
+
+        def _schedule() -> None:
+            if self._liveness_notification_task and not self._liveness_notification_task.done():
+                return
+            self._liveness_notification_task = loop.create_task(
+                self._notify_liveness_fatal_error(client)
+            )
+
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            return
+
     def _read_websocket_health(self, client: Any) -> tuple[bool, str]:
         """Return current Discord Gateway health without making a REST request."""
         try:
@@ -1969,6 +2097,8 @@ class DiscordAdapter(BasePlatformAdapter):
         interval = self._liveness_interval_seconds
         threshold = self._liveness_failure_threshold
         failures = 0
+        last_wall = time.time()
+        last_mono = time.perf_counter()
         while self._running:
             try:
                 await asyncio.sleep(interval)
@@ -1976,6 +2106,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             client = self._client
             if not self._running or client is None or self._disconnecting:
+                return
+            wall_now = time.time()
+            mono_now = time.perf_counter()
+            gap = measure_host_suspension_gap(wall_now, last_wall, mono_now, last_mono)
+            last_wall = wall_now
+            last_mono = mono_now
+            if self._suspension_gap_seconds > 0 and gap >= self._suspension_gap_seconds:
+                self._trip_host_suspension(gap)
                 return
             try:
                 healthy, reason = self._read_websocket_health(client)
@@ -2159,6 +2297,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._disconnecting = True
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
+        self._stop_suspension_watch()
         await self._cancel_liveness_task()
         # Clean up all active voice connections *before* cancelling the bot task.
         # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
@@ -10528,6 +10667,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ),
         ("websocket_heartbeat_ack_max_age_seconds", None, None),
         ("websocket_max_latency_seconds", None, None),
+        ("websocket_suspension_gap_seconds", None, None),
     )
     for primary_key, legacy_key, env_key in _websocket_liveness_keys:
         value = _websocket_liveness_cfg.get(primary_key)

@@ -424,7 +424,8 @@ class TestLoadGatewayConfig:
             "  websocket_liveness_interval_seconds: 17\n"
             "  websocket_liveness_failure_threshold: 4\n"
             "  websocket_heartbeat_ack_max_age_seconds: 75\n"
-            "  websocket_max_latency_seconds: 30\n",
+            "  websocket_max_latency_seconds: 30\n"
+            "  websocket_suspension_gap_seconds: 8\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -441,6 +442,7 @@ class TestLoadGatewayConfig:
         assert extra["websocket_liveness_failure_threshold"] == 4
         assert extra["websocket_heartbeat_ack_max_age_seconds"] == 75
         assert extra["websocket_max_latency_seconds"] == 30
+        assert extra["websocket_suspension_gap_seconds"] == 8
 
     def test_session_reset_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.session_reset`` (nested form) must reach default_reset_policy,

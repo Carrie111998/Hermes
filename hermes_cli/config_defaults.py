@@ -2318,6 +2318,9 @@ DEFAULT_CONFIG = {
         "websocket_liveness_failure_threshold": 2,
         "websocket_heartbeat_ack_max_age_seconds": 60,
         "websocket_max_latency_seconds": 30,
+        # Wall-clock minus monotonic gap that means the host slept (macOS
+        # clamshell). ACK age uses perf_counter, which pauses across sleep.
+        "websocket_suspension_gap_seconds": 5,
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
