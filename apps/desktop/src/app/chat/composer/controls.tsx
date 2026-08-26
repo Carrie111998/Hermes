@@ -151,6 +151,8 @@ export function ComposerControls({
           label={
             showStop ? (
               <TipKeybindLabel actionId="composer.send" text={c.stop} />
+            ) : mobileRenderer ? (
+              c.send
             ) : (
               <TipKeybindLabel actionId="composer.send" text={c.send} />
             )
@@ -159,6 +161,7 @@ export function ComposerControls({
           <Button
             aria-label={showStop ? c.stop : c.send}
             className={PRIMARY_ICON_BTN}
+            data-composer-send=""
             disabled={disabled || !canSubmit}
             type="submit"
           >

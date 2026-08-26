@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -137,10 +138,19 @@ public class ActiveSessionService extends Service {
         Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
+        Intent open = new Intent(this, MainActivity.class)
+                .setAction(Intent.ACTION_MAIN)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        Intent newTask = new Intent(this, MainActivity.class)
+                .setAction(HermesWidgetProvider.ACTION_NEW_TASK)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
         return builder
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle("Hermes active session")
                 .setContentText("Keeping your remote session ready")
+                .setContentIntent(PendingIntent.getActivity(this, 4101, open, flags))
+                .addAction(android.R.drawable.ic_input_add, "New task", PendingIntent.getActivity(this, 4102, newTask, flags))
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setOngoing(true)
                 .setShowWhen(false)

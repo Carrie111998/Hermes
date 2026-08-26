@@ -193,6 +193,12 @@ export function extractClipboardFiles(clipboard: DataTransfer): File[] {
   return files
 }
 
+/** A phone keyboard's Enter key is a writing key. The mobile renderer keeps it
+ * as a newline; an explicit Send control is the only submit affordance. */
+export function mobileComposerKeepsEnterAsNewline(isMobileRenderer: boolean, key: string): boolean {
+  return isMobileRenderer && key === 'Enter'
+}
+
 /** Caret-anchored text before the cursor, or null if the selection isn't a
  *  collapsed caret inside `editor`.
  *

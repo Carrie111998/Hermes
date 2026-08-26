@@ -129,31 +129,22 @@ describe('requestNotificationPermission', () => {
 })
 
 describe('requestInitialMobilePermissions', () => {
-  it('requests the user-approved notification, camera/gallery, microphone, and background-reliability capabilities', async () => {
+  it('requests only notification/background consent and never acquires capture hardware at first connection', async () => {
     vi.mocked(LocalNotifications.checkPermissions).mockResolvedValue({ display: 'prompt' })
     vi.mocked(LocalNotifications.requestPermissions).mockResolvedValue({ display: 'granted' })
     vi.mocked(LocalNotifications.createChannel).mockResolvedValue()
-    vi.mocked(Camera.checkPermissions).mockResolvedValue({ camera: 'prompt', photos: 'granted' })
-    vi.mocked(Camera.requestPermissions).mockResolvedValue({ camera: 'granted', photos: 'granted' })
-    mobileCapabilities.requestMedia.mockResolvedValue({ granted: true, supported: true })
     mobileCapabilities.requestBackgroundReliability.mockResolvedValue({ exempt: false, requested: true, supported: true })
-    const stop = vi.fn()
-    Object.defineProperty(navigator, 'mediaDevices', {
-      configurable: true,
-      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop }] })) },
-    })
 
     await expect(requestInitialMobilePermissions()).resolves.toEqual({
       backgroundReliabilityRequested: true,
-      camera: true,
-      microphone: true,
+      camera: false,
+      microphone: false,
       notifications: true,
-      photos: true,
+      photos: false,
     })
     expect(LocalNotifications.requestPermissions).toHaveBeenCalledOnce()
-    expect(Camera.requestPermissions).toHaveBeenCalledWith({ permissions: ['camera'] })
-    expect(stop).toHaveBeenCalledOnce()
-    expect(mobileCapabilities.requestMedia).toHaveBeenCalledOnce()
+    expect(Camera.requestPermissions).not.toHaveBeenCalled()
+    expect(mobileCapabilities.requestMedia).not.toHaveBeenCalled()
     expect(mobileCapabilities.requestBackgroundReliability).toHaveBeenCalledOnce()
   })
 })

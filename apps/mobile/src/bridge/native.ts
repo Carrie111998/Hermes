@@ -190,19 +190,21 @@ export interface InitialMobilePermissionResult {
   photos: boolean
 }
 
-/** Issue the user's first-connection capability requests in a deliberate order. */
+/**
+ * Request only the non-capture first-connection permissions. Microphone,
+ * camera, and gallery grants are deliberately deferred until the user chooses
+ * dictation, voice conversation, capture photo, or a picker.
+ */
 export async function requestInitialMobilePermissions(): Promise<InitialMobilePermissionResult> {
   const notifications = await requestNotificationPermission()
-  const media = await requestCameraAndGalleryAccess()
-  const microphone = await requestMicrophoneAccess()
   const backgroundReliabilityRequested = await requestBackgroundReliabilityPermission()
 
   return {
     backgroundReliabilityRequested,
-    camera: media.camera,
-    microphone,
+    camera: false,
+    microphone: false,
     notifications,
-    photos: media.photos,
+    photos: false,
   }
 }
 
