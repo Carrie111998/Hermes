@@ -2115,6 +2115,12 @@ def init_agent(
         )
     except (TypeError, ValueError):
         agent._oversized_input_char_threshold = 50000
+    for _key, _default in (("max_age_hours", 24.0), ("max_cache_mb", 100.0)):
+        try:
+            _value = float(_oversized_cfg.get(_key, _default))
+        except (TypeError, ValueError):
+            _value = _default
+        setattr(agent, f"_oversized_input_{_key}", max(0.0, _value))
 
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5

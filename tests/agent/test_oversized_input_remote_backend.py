@@ -1,6 +1,9 @@
 """Remote backend coverage for oversized input persistence."""
 
 import json
+import os
+import shutil
+import stat
 import subprocess
 import types
 from pathlib import Path
@@ -74,7 +77,7 @@ def test_translated_path_round_trips_exact_bytes_through_task_file_tool(
         def sync(self, force=False):
             assert force is True
             for source in (home / "pastes").glob("paste_*.txt"):
-                (remote_dir / source.name).write_bytes(source.read_bytes())
+                shutil.copy2(source, remote_dir / source.name)
 
     env._sync_manager = _SyncManager()
     _register_remote_env(monkeypatch, task_id, env)
@@ -94,6 +97,11 @@ def test_translated_path_round_trips_exact_bytes_through_task_file_tool(
     assert visible_path is not None
     assert str(visible_path) in message
     assert Path(visible_path).read_bytes() == payload.encode("utf-8")
+    if os.name != "nt":
+        assert stat.S_IMODE((home / "pastes").stat().st_mode) == 0o700
+        host_file = next((home / "pastes").glob("paste_*.txt"))
+        assert stat.S_IMODE(host_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(Path(visible_path).stat().st_mode) == 0o600
     read_result = json.loads(read_file_tool(str(visible_path), task_id=task_id))
     assert read_result["content"] == f"1|{payload}"
 
@@ -123,5 +131,8 @@ def test_unreadable_translation_uses_remote_temp_and_round_trips(
     assert str(visible_path).startswith(str(temp_dir / "hermes-results"))
     assert str(visible_path) in message
     assert Path(visible_path).read_bytes() == payload.encode("utf-8")
+    if os.name != "nt":
+        assert stat.S_IMODE(Path(visible_path).parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(Path(visible_path).stat().st_mode) == 0o600
     read_result = json.loads(read_file_tool(str(visible_path), task_id=task_id))
     assert read_result["content"] == f"1|{payload}"

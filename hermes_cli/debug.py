@@ -106,9 +106,16 @@ def _load_pending() -> list[dict]:
 def _save_pending(entries: list[dict]) -> None:
     path = _pending_file()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        from tools.spill_safety import ensure_spill_dir, write_text_exclusive
+
+        ensure_spill_dir(path.parent, private=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        write_text_exclusive(
+            tmp,
+            json.dumps(entries, indent=2),
+            private=True,
+            overwrite=True,
+        )
         atomic_replace(tmp, path)
     except OSError:
         # Non-fatal — worst case the user has to run ``hermes debug delete``

@@ -3624,6 +3624,13 @@ DEFAULT_CONFIG = {
         # the "dumped a whole log / minified JSON / giant file" blobs that
         # produce the broken `[...]` references. Set 0 to disable.
         "char_threshold": 50000,
+        # Paste files contain raw user input, so retention is bounded by age
+        # and aggregate size. A just-created file is protected from the prune
+        # that follows its write and remains readable even when it alone is
+        # larger than the configured cache cap. Set either value to 0 to
+        # disable that individual bound.
+        "max_age_hours": 24,
+        "max_cache_mb": 100,
     },
 
     # Computer Use (cua-driver) toolset settings.

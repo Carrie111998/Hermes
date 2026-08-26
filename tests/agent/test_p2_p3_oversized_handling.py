@@ -11,6 +11,9 @@ Coverage:
   * under-threshold paste -> untouched (no file, message unchanged).
   * config defaults present (enabled + char_threshold) and behaviour toggles.
 """
+import os
+import stat
+import time
 import types
 from pathlib import Path
 
@@ -25,6 +28,8 @@ def test_oversized_input_config_defaults_present():
     section = DEFAULT_CONFIG["oversized_input"]
     assert section["enabled"] is True
     assert section["char_threshold"] == 50_000
+    assert section["max_age_hours"] == 24
+    assert section["max_cache_mb"] == 100
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -116,6 +121,85 @@ def test_reference_path_round_trips_full_bytes(tmp_path, monkeypatch):
     assert p.is_absolute()
     assert p.exists()
     assert p.read_text(encoding="utf-8") == big
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_paste_directory_and_file_are_private_at_creation(tmp_path, monkeypatch):
+    hermes_home, _ = _isolate_home(monkeypatch, tmp_path)
+    from agent.oversized_paste import maybe_offload_oversized_message
+
+    old_umask = os.umask(0)
+    try:
+        _message, _persist, path = maybe_offload_oversized_message(
+            _make_agent(threshold=10), "private paste contents"
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert path is not None
+    assert stat.S_IMODE((hermes_home / "pastes").stat().st_mode) == 0o700
+    assert stat.S_IMODE(Path(path).stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_paste_publish_replaces_symlink_without_touching_target(tmp_path, monkeypatch):
+    hermes_home, _ = _isolate_home(monkeypatch, tmp_path)
+    from agent.oversized_paste import _stable_paste_filename, write_paste_file
+
+    paste_dir = hermes_home / "pastes"
+    paste_dir.mkdir()
+    target = tmp_path / "target.txt"
+    target.write_text("unchanged", encoding="utf-8")
+    payload = "sensitive paste"
+    paste_path = paste_dir / _stable_paste_filename(payload)
+    paste_path.symlink_to(target)
+
+    returned = write_paste_file(payload)
+
+    assert returned is not None
+    assert not paste_path.is_symlink()
+    assert paste_path.read_text(encoding="utf-8") == payload
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_retention_prunes_expired_and_oldest_over_size(tmp_path, monkeypatch):
+    hermes_home, _ = _isolate_home(monkeypatch, tmp_path)
+    from agent.oversized_paste import cleanup_paste_cache
+
+    paste_dir = hermes_home / "pastes"
+    paste_dir.mkdir()
+    expired = paste_dir / "paste_expired.txt"
+    oldest = paste_dir / "paste_oldest.txt"
+    newest = paste_dir / "paste_newest.txt"
+    for path in (expired, oldest, newest):
+        path.write_bytes(b"x" * 10)
+    now = time.time()
+    os.utime(expired, (now - 48 * 3600, now - 48 * 3600))
+    os.utime(oldest, (now - 20, now - 20))
+    os.utime(newest, (now - 10, now - 10))
+
+    removed = cleanup_paste_cache(max_age_hours=24, max_bytes=10)
+
+    assert removed == 2
+    assert not expired.exists()
+    assert not oldest.exists()
+    assert newest.exists()
+
+
+def test_retention_never_deletes_just_returned_oversize_path(tmp_path, monkeypatch):
+    _isolate_home(monkeypatch, tmp_path)
+    from agent.oversized_paste import maybe_offload_oversized_message
+
+    agent = _make_agent(threshold=10)
+    agent._oversized_input_max_age_hours = 24
+    agent._oversized_input_max_cache_mb = 0.000001
+    payload = "larger than the configured cache cap"
+
+    message, _persist, path = maybe_offload_oversized_message(agent, payload)
+
+    assert path is not None
+    assert str(path) in message
+    assert Path(path).read_text(encoding="utf-8") == payload
 
 
 def test_identical_paste_reuses_one_file(tmp_path, monkeypatch):

@@ -2,6 +2,8 @@
 
 import io
 import json
+import os
+import stat
 import sys
 import threading
 import time
@@ -117,6 +119,21 @@ def test_err_envelope(server):
     assert server._err("r2", 4001, "nope") == {
         "jsonrpc": "2.0", "id": "r2", "error": {"code": 4001, "message": "nope"},
     }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_paste_collapse_creates_private_cache_and_file(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_paste_counter", 0)
+
+    response = server.handle_request(
+        {"id": "paste-private", "method": "paste.collapse", "params": {"text": "secret\ntext"}}
+    )
+
+    path = Path(response["result"]["path"])
+    assert path.read_text(encoding="utf-8") == "secret\ntext"
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("kind", ["legacy", "hard-only", "dynamic-getattr"])

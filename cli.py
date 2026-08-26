@@ -19091,9 +19091,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if (lines_hit or chars_hit) and not buf.text.strip().startswith('/'):
                     _paste_counter[0] += 1
                     paste_dir = _hermes_home / "pastes"
-                    paste_dir.mkdir(parents=True, exist_ok=True)
+                    from tools.spill_safety import ensure_spill_dir, write_text_exclusive
+
+                    ensure_spill_dir(paste_dir, private=True)
                     paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
-                    paste_file.write_text(pasted_text, encoding="utf-8")
+                    write_text_exclusive(
+                        paste_file,
+                        pasted_text,
+                        private=True,
+                        overwrite=True,
+                    )
+                    from agent.oversized_paste import cleanup_paste_cache
+
+                    cleanup_paste_cache(protected_paths=(paste_file,))
                     logger.info("Collapsed paste #%d: %d lines, %d chars -> %s", _paste_counter[0], line_count + 1, len(pasted_text), paste_file)
                     placeholder = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines \u2192 {paste_file}]"
                     prefix = ""
@@ -19262,9 +19272,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if (lines_hit or chars_hit) and is_paste and not text.startswith('/'):
                 _paste_counter[0] += 1
                 paste_dir = _hermes_home / "pastes"
-                paste_dir.mkdir(parents=True, exist_ok=True)
+                from tools.spill_safety import ensure_spill_dir, write_text_exclusive
+
+                ensure_spill_dir(paste_dir, private=True)
                 paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
-                paste_file.write_text(text, encoding="utf-8")
+                write_text_exclusive(
+                    paste_file,
+                    text,
+                    private=True,
+                    overwrite=True,
+                )
+                from agent.oversized_paste import cleanup_paste_cache
+
+                cleanup_paste_cache(protected_paths=(paste_file,))
                 logger.info("Collapsed paste #%d: %d lines, %d chars -> %s (fallback)", _paste_counter[0], line_count + 1, len(text), paste_file)
                 _paste_just_collapsed[0] = True
                 buf.text = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines \u2192 {paste_file}]"

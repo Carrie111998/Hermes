@@ -148,18 +148,48 @@ def _write_to_host_cache(
     *,
     host_subdir: str = SPILLOVER_SUBDIR,
     encoding_errors: str = "replace",
+    private: bool = False,
 ):
     """Write content under the active profile's Hermes home.
 
-    Returns the absolute path string on success, None on failure.
+    Returns the absolute path string on success, None on failure. Private
+    writes publish a mode-0600 staging file atomically, so there is no
+    permissive creation window and readers never observe partial content.
     """
     try:
         from hermes_constants import get_hermes_home
+        from tools.spill_safety import ensure_spill_dir, write_text_exclusive
 
-        storage_dir = get_hermes_home() / host_subdir
-        storage_dir.mkdir(parents=True, exist_ok=True)
+        storage_dir = ensure_spill_dir(
+            get_hermes_home() / host_subdir,
+            private=private,
+        )
         path = storage_dir / filename
-        path.write_text(content, encoding="utf-8", errors=encoding_errors)
+        if private:
+            staging = storage_dir / f".{filename}.{uuid.uuid4().hex}.tmp"
+            try:
+                write_text_exclusive(
+                    staging,
+                    content,
+                    private=True,
+                    encoding="utf-8",
+                    errors=encoding_errors,
+                )
+                os.replace(staging, path)
+            finally:
+                try:
+                    staging.unlink()
+                except FileNotFoundError:
+                    pass
+        else:
+            write_text_exclusive(
+                path,
+                content,
+                private=False,
+                overwrite=True,
+                encoding="utf-8",
+                errors=encoding_errors,
+            )
     except OSError as exc:
         logger.warning("Backend-visible write failed for %s: %s", filename, exc)
         return None
@@ -260,7 +290,13 @@ def _heredoc_marker(content: str) -> str:
     return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
 
 
-def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
+def _write_to_sandbox(
+    content: str,
+    remote_path: str,
+    env,
+    *,
+    private: bool = False,
+) -> bool:
     """Write content into the sandbox via env.execute(). Returns True on success.
 
     Pushes ``content`` through stdin rather than embedding it in the command
@@ -274,7 +310,17 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     the exec-arg ceiling.
     """
     storage_dir = os.path.dirname(remote_path)
-    cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
+    if private:
+        quoted_dir = shlex.quote(storage_dir)
+        quoted_path = shlex.quote(remote_path)
+        cmd = (
+            "umask 077 && "
+            f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && "
+            f"tmp=$(mktemp {quoted_dir}/.paste.XXXXXX) && "
+            f"cat > \"$tmp\" && mv -f \"$tmp\" {quoted_path}"
+        )
+    else:
+        cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
     result = env.execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
 
@@ -286,6 +332,7 @@ def persist_backend_visible_content(
     env=None,
     host_subdir: str = SPILLOVER_SUBDIR,
     encoding_errors: str = "replace",
+    private: bool = False,
 ) -> str | None:
     """Persist text and return the path visible to the active backend.
 
@@ -301,6 +348,7 @@ def persist_backend_visible_content(
             filename,
             host_subdir=host_subdir,
             encoding_errors=encoding_errors,
+            private=private,
         )
     if _is_host_side_env(env):
         return host_path
@@ -314,7 +362,7 @@ def persist_backend_visible_content(
 
     remote_path = f"{_resolve_storage_dir(env)}/{filename}"
     try:
-        if _write_to_sandbox(content, remote_path, env):
+        if _write_to_sandbox(content, remote_path, env, private=private):
             return remote_path
     except Exception as exc:
         logger.warning("Sandbox write failed for %s: %s", filename, exc)
