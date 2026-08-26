@@ -98,15 +98,21 @@ Any deliverable that contains Arabic MUST use the **Cairo** font — the
 office-suite default (Calibri) renders Arabic badly. Use the helper at
 `scripts/arabic_style.py` in this skill's directory:
 
-- docx: `style_docx(doc)` after building the Document
-- pptx: `style_pptx(prs)` after building the Presentation (tables included)
+- docx: `style_docx(doc)` after building the Document — covers named styles
+  AND every run (body, nested tables, text boxes, headers/footers), because
+  a run with direct formatting overrides its style
+- pptx: `style_pptx(prs)` after building the Presentation — covers tables,
+  grouped shapes at any nesting depth, and speaker notes
 - pdf (reportlab): `register_pdf_font()`, then draw with
   `canvas.setFont("Cairo", size)`; shape Arabic first with
   `arabic_reshaper.reshape(...)` + `bidi.algorithm.get_display(...)`
 
 Setting `font.name` alone is NOT enough — Arabic is shaped from the
 complex-script font slot (`w:cs` in docx, `a:cs` in pptx), which these
-helpers also set. `register_pdf_font` locates the Cairo TTF across
+helpers also set. Call them AFTER all content is added — they font what is
+in the document at call time, and runs added later carry only their style.
+Text in monospace styles (code, macros, preformatted) is deliberately left
+alone. `register_pdf_font` locates the Cairo TTF across
 Linux/macOS/Windows font directories and raises an install hint if Cairo
 is missing (free at fonts.google.com/specimen/Cairo). Pure-English
 deliverables may use the suite defaults.

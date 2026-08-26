@@ -23,10 +23,20 @@ from pathlib import Path
 
 FONT = "Cairo"
 
-_DOCX_STYLES = (
-    "Normal", "Title", "Heading 1", "Heading 2", "Heading 3",
-    "List Bullet", "List Number",
-)
+# Styles are enumerated from the document rather than listed here: a fixed
+# tuple silently missed whatever the template happened to use (Heading 4-6,
+# Caption, Quote, table styles), producing a report whose H4s render in the
+# fallback font while its body is Cairo. These substrings mark the styles to
+# LEAVE ALONE — monospace is load-bearing for code and Cairo would destroy
+# the alignment that makes it readable.
+_DOCX_KEEP_MONOSPACE = ("code", "macro", "preformatted", "plain text")
+
+
+def _is_monospace_style(name) -> bool:
+    if not name:
+        return False
+    lowered = str(name).lower()
+    return any(hint in lowered for hint in _DOCX_KEEP_MONOSPACE)
 
 
 def _font_dirs():
@@ -70,23 +80,84 @@ def find_font_ttf(family: str = FONT) -> str:
     )
 
 
+def _docx_set_rfonts(element, qn) -> None:
+    """Point an element's rPr at Cairo in the Latin AND complex-script slots."""
+    rfonts = element.get_or_add_rPr().get_or_add_rFonts()
+    for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+        rfonts.set(qn(attr), FONT)
+
+
+def _docx_bodies(doc):
+    """Yield every XML body that can hold text: document + headers/footers.
+
+    Headers and footers live in separate parts, so a run in a running head
+    is invisible to a walk of the document body alone. Only parts this
+    document actually defines are touched — reading ``header._element`` on
+    an inherited header would CREATE an empty one, so linked-to-previous
+    headers are skipped rather than materialized.
+    """
+    yield doc.element.body
+    for section in doc.sections:
+        for attr in (
+            "header", "footer",
+            "first_page_header", "first_page_footer",
+            "even_page_header", "even_page_footer",
+        ):
+            part = getattr(section, attr, None)          # older python-docx
+            if part is None:
+                continue
+            try:
+                if part.is_linked_to_previous:
+                    continue
+                element = part._element
+            except (AttributeError, ValueError):
+                continue
+            if element is not None:
+                yield element
+
+
 def style_docx(doc) -> None:
-    """Apply Cairo to a python-docx Document's base + heading styles.
+    """Apply Cairo to every style AND every run in a python-docx Document.
 
     Sets the Latin (ascii/hAnsi) AND complex-script (cs) slots — Arabic is
     shaped from the cs slot, so setting only ``font.name`` leaves Arabic on
-    the fallback font."""
+    the fallback font.
+
+    Styling styles alone is not enough: a run carrying DIRECT formatting
+    (its own ``w:rFonts``, which is what most docx-generating code and
+    Word-authored templates emit) overrides its style, so a style-only pass
+    returns success while the deliverable comes out half-Cairo,
+    half-Calibri. Every run is therefore visited too — across the body,
+    tables at any nesting depth, text boxes, and headers/footers.
+
+    Runs in monospace-ish styles (code, macros, preformatted) keep their
+    font: there the alignment is the point.
+    """
     from docx.oxml.ns import qn
 
-    for name in _DOCX_STYLES:
-        try:
-            style = doc.styles[name]
-        except KeyError:
+    # 1. Styles — covers text that carries no direct formatting, plus any
+    #    style-driven text added to the document after this call.
+    for style in doc.styles:
+        name = getattr(style, "name", None)
+        if _is_monospace_style(name):
             continue
-        style.font.name = FONT
-        rfonts = style.element.get_or_add_rPr().get_or_add_rFonts()
-        for attr in ("w:ascii", "w:hAnsi", "w:cs"):
-            rfonts.set(qn(attr), FONT)
+        try:
+            style.font.name = FONT
+        except (AttributeError, NotImplementedError):
+            pass  # table/numbering styles expose no .font — the XML below still applies
+        try:
+            _docx_set_rfonts(style.element, qn)
+        except (AttributeError, TypeError):
+            continue
+
+    # 2. Direct run formatting — the half that actually decides the render.
+    for body in _docx_bodies(doc):
+        for paragraph in body.iter(qn("w:p")):
+            pstyle = paragraph.find(qn("w:pPr") + "/" + qn("w:pStyle"))
+            if pstyle is not None and _is_monospace_style(pstyle.get(qn("w:val"))):
+                continue
+            for run in paragraph.iter(qn("w:r")):
+                _docx_set_rfonts(run, qn)
 
 
 def _pptx_run_font(run) -> None:
@@ -101,21 +172,46 @@ def _pptx_run_font(run) -> None:
     cs.set("typeface", FONT)
 
 
+def _pptx_frame_font(text_frame) -> None:
+    for para in text_frame.paragraphs:
+        for run in para.runs:
+            _pptx_run_font(run)
+
+
+def _pptx_walk_shapes(shapes) -> None:
+    """Font every run under ``shapes``, descending into grouped shapes.
+
+    A group shape has no ``text_frame`` of its own, so text inside it —
+    common in real decks, and groups nest — is invisible to a flat pass
+    over ``slide.shapes``. Recursion is depth-unbounded for that reason.
+    """
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            _pptx_walk_shapes(shape.shapes)
+            continue
+        if shape.has_text_frame:
+            _pptx_frame_font(shape.text_frame)
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    _pptx_frame_font(cell.text_frame)
+
+
 def style_pptx(prs) -> None:
-    """Set Cairo on every text run in a python-pptx Presentation,
-    including table cells."""
+    """Set Cairo on every text run in a python-pptx Presentation.
+
+    Covers table cells, grouped shapes at any nesting depth, and speaker
+    notes — notes ship with the deliverable and render in the same fallback
+    font as anything else when left alone.
+    """
     for slide in prs.slides:
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
-                        _pptx_run_font(run)
-            if getattr(shape, "has_table", False) and shape.has_table:
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        for para in cell.text_frame.paragraphs:
-                            for run in para.runs:
-                                _pptx_run_font(run)
+        _pptx_walk_shapes(slide.shapes)
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame
+            if notes is not None:
+                _pptx_frame_font(notes)
 
 
 def register_pdf_font() -> str:
