@@ -32,3 +32,8 @@ docker/entrypoint.sh text eol=lf
 *.html  text eol=lf
 *.svg   text eol=lf
 *.ps1   text eol=crlf
+
+# Unified-diff grammar represents a blank context line as one leading space.
+# Keep that structural whitespace in checked-in dependency patches without
+# turning `git diff --check` into a false failure for every mobile review.
+patches/*.patch whitespace=-trailing-space
