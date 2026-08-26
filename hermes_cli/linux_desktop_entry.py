@@ -60,13 +60,25 @@ def icon_path(project_root: Path) -> Path:
 def resolve_exec_command() -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
-    Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
-    runs as a module with no launcher installed, use the current
-    interpreter, also absolute.
+    Prefer the PATH-installed ``hermes`` wrapper (falling back to the
+    canonical ``~/.local/bin/hermes``, then argv[0]). Desktop activation
+    (Plasma click, systemd-run, autostart) runs outside a login shell,
+    where a bare ``#!/usr/bin/env python3`` launcher can resolve to a
+    system Python that lacks the repo's dependencies (e.g. PyYAML,
+    #90292). The wrapper execs the repo's venv interpreter with
+    PYTHONPATH unset, so it works under any activation context — and the
+    entry is regenerated on every launch, so a PATH/home rung keeps it
+    stable no matter how the previous launch was invoked.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
-    bin_path = resolve_hermes_bin()
+    bin_path = shutil.which("hermes")
+    if not bin_path:
+        candidate = Path.home() / ".local" / "bin" / "hermes"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            bin_path = str(candidate)
+    if not bin_path:
+        bin_path = resolve_hermes_bin()
     if bin_path:
         resolved = Path(bin_path).resolve()
         if _needs_interpreter(resolved):
@@ -77,12 +89,15 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly. Do NOT .resolve() it: a venv
+            # interpreter is usually a symlink to its base Python, and
+            # resolving bypasses pyvenv.cfg, losing the venv site-packages
+            # under desktop activation.
+            argv = [str(sys.executable), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [str(sys.executable), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -105,8 +120,11 @@ def _needs_interpreter(bin_path: Path) -> bool:
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    # a system path) would escape the venv when spawned by the DE. Compare
+    # against the UNRESOLVED interpreter dir: a venv interpreter is usually a
+    # symlink to its base Python, and resolving it would make every venv
+    # script look like it needs an external interpreter.
+    exe_dir = str(Path(sys.executable).parent)
     return exe_dir not in shebang
 
 
