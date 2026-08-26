@@ -94,6 +94,7 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
 # resolved bin that is a python script escaping the running venv.
 def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
+    import os
     import sys
 
     root = _make_project(tmp_path)
@@ -107,10 +108,106 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    # NOT Path(...).resolve(): a venv's bin/python is a symlink to the base
+    # interpreter, and the resolved target cannot see the venv's site-packages.
+    # Prefixing with it would reintroduce the very ModuleNotFoundError the
+    # prefix exists to prevent.
+    interpreter = os.path.abspath(sys.executable)
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+def test_exec_interpreter_prefix_keeps_venv_symlink_unresolved(tmp_path, xdg_home, monkeypatch):
+    """Regression: the prefix must be the venv's own python, not its symlink target.
+
+    ``Path(sys.executable).resolve()`` follows ``<venv>/bin/python`` out to the
+    base interpreter, which has no access to the venv's ``site-packages``. The
+    resulting ``Exec=`` died with ``ModuleNotFoundError: No module named
+    'hermes_cli'`` — silently, because the entry is ``Terminal=false``.
+    """
+    root = _make_project(tmp_path)
+
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    base_interpreter = tmp_path / "base" / "bin" / "python3"
+    base_interpreter.parent.mkdir(parents=True)
+    base_interpreter.write_text("", encoding="utf-8")
+    base_interpreter.chmod(0o755)
+    venv_python = venv / "bin" / "python"
+    venv_python.symlink_to(base_interpreter)
+    (venv / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "_interpreter_imports_hermes_cli", lambda _i: True)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(base_interpreter) not in exec_line
+
+
+def test_exec_omits_interpreter_prefix_when_it_cannot_import_hermes_cli(tmp_path, xdg_home, monkeypatch):
+    """Regression: a cwd-dependent interpreter must not be baked into ``Exec=``.
+
+    Hermes' bootstrap runtime python imports ``hermes_cli`` only because it is
+    started from the checkout. The DE launches with its own cwd, so prefixing
+    with that interpreter produced a launcher entry that always died on import.
+    Fall back to the launcher's own shebang instead.
+    """
+    root = _make_project(tmp_path)
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "_interpreter_imports_hermes_cli", lambda _i: False)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{hermes_bin} desktop"
+
+
+def test_exec_leaves_foreign_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch):
+    """A console script whose shebang names ANOTHER venv is already correct.
+
+    pip writes a console script's shebang to the environment it installed into.
+    The process writing this entry can legitimately be a different interpreter
+    (the bootstrap runtime python), so 'not my sys.executable' does not mean
+    'broken' — only ``/usr/bin/env python3`` and bare system paths do.
+    """
+    root = _make_project(tmp_path)
+
+    other_venv = tmp_path / "other-venv"
+    (other_venv / "bin").mkdir(parents=True)
+    other_python = other_venv / "bin" / "python3"
+    other_python.write_text("", encoding="utf-8")
+    other_python.chmod(0o755)
+    (other_venv / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text(f"#!{other_python}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{hermes_bin} desktop"
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
@@ -130,12 +227,15 @@ def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypat
 
 
 def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch):
+    import os
     import sys
 
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
+    # The running interpreter's own path, symlink intact — see
+    # test_exec_interpreter_prefix_keeps_venv_symlink_unresolved.
+    interpreter = os.path.abspath(sys.executable)
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))

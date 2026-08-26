@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import builtins
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -1265,3 +1267,101 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     mock_detect.assert_not_called()
     launch_env = mock_run.call_args_list[1].kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
+
+# ── Linux sandbox helper: userns-capable hosts must not require sudo ──
+
+
+def _fake_proc_reader(values: dict[str, str]):
+    """Build an ``open`` replacement that serves only the given /proc paths.
+
+    Any path not in ``values`` raises OSError, matching a kernel that lacks
+    that knob entirely.
+    """
+    real_open = builtins.open
+
+    def _fake_open(path, *args, **kwargs):
+        name = str(path)
+        if name.startswith("/proc/sys/"):
+            if name in values:
+                return io.StringIO(values[name])
+            raise FileNotFoundError(name)
+        return real_open(path, *args, **kwargs)
+
+    return _fake_open
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox helper is Linux-only")
+def test_sandbox_fixup_skips_sudo_when_userns_sandbox_available(tmp_path, monkeypatch):
+    """A host with working unprivileged user namespaces must NOT shell out to sudo.
+
+    Chromium consults the SUID ``chrome-sandbox`` helper only when it cannot
+    create user namespaces. Escalating anyway buys no security and hard-fails
+    every non-TTY launch (the XDG entry is Terminal=false and can never answer a
+    password prompt), so the app never opens from the GNOME/KDE launcher.
+    """
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    exe = _make_packaged_executable(root, monkeypatch)
+    # Helper present but user-owned 0755 — the state electron-builder emits.
+    (exe.parent / "chrome-sandbox").chmod(0o755)
+
+    userns_ok = _fake_proc_reader({"/proc/sys/user/max_user_namespaces": "63379\n"})
+
+    with patch("builtins.open", side_effect=userns_ok), \
+         patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
+         patch("hermes_cli.main.subprocess.run") as mock_run:
+        assert cli_main._desktop_linux_sandbox_fixup(exe) is True
+
+    mock_run.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox helper is Linux-only")
+def test_sandbox_fixup_still_escalates_when_userns_is_clamped(tmp_path, monkeypatch):
+    """AppArmor-restricted hosts genuinely need the SUID helper — keep the sudo path."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    exe = _make_packaged_executable(root, monkeypatch)
+    (exe.parent / "chrome-sandbox").chmod(0o755)
+
+    clamped = _fake_proc_reader({
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns": "1\n",
+        "/proc/sys/user/max_user_namespaces": "63379\n",
+    })
+
+    with patch("builtins.open", side_effect=clamped), \
+         patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
+         patch(
+             "hermes_cli.main.subprocess.run",
+             return_value=subprocess.CompletedProcess([], 0),
+         ) as mock_run:
+        assert cli_main._desktop_linux_sandbox_fixup(exe) is True
+
+    assert [c.args[0][:2] for c in mock_run.call_args_list] == [
+        ["/usr/bin/sudo", "chown"],
+        ["/usr/bin/sudo", "chmod"],
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox helper is Linux-only")
+def test_no_sandbox_fallback_covers_userns_disabled_without_apparmor(monkeypatch):
+    """The ``--no-sandbox`` fallback must not be gated on one distro's knob.
+
+    Gating on ``apparmor_restrict_unprivileged_userns`` alone made the fallback
+    unreachable on any host lacking that file (all non-Debian distros), so a
+    failed fixup exited 1 with no window instead of degrading gracefully.
+    """
+    monkeypatch.delenv("ELECTRON_DISABLE_SANDBOX", raising=False)
+    no_userns = _fake_proc_reader({"/proc/sys/user/max_user_namespaces": "0\n"})
+
+    with patch("builtins.open", side_effect=no_userns):
+        assert cli_main._desktop_linux_needs_no_sandbox() is True
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox helper is Linux-only")
+def test_no_sandbox_not_requested_when_userns_sandbox_works(monkeypatch):
+    monkeypatch.delenv("ELECTRON_DISABLE_SANDBOX", raising=False)
+    userns_ok = _fake_proc_reader({"/proc/sys/user/max_user_namespaces": "63379\n"})
+
+    with patch("builtins.open", side_effect=userns_ok):
+        assert cli_main._desktop_linux_needs_no_sandbox() is False

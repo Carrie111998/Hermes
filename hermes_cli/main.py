@@ -8046,18 +8046,19 @@ def _force_adhoc_macos_signing(env: dict, *, source_mode: bool) -> bool:
 def _desktop_linux_needs_no_sandbox() -> bool:
     """Return True when Chromium/Electron should bypass the Linux sandbox.
 
-    Ubuntu 23.10+ can enable AppArmor's
-    ``apparmor_restrict_unprivileged_userns`` hardening, which breaks
-    Chromium/Electron's user-namespace sandbox for normal users unless the app
-    ships a working root-owned 4755 ``chrome-sandbox`` helper. In headless or
-    non-interactive CLI contexts we may be unable to ``sudo chown/chmod`` that
-    helper, so detect the host restriction and fall back to ``--no-sandbox``
-    rather than hard-failing the launcher.
+    Chromium sandboxes itself with unprivileged user namespaces when the host
+    allows them, and falls back to the root-owned 4755 ``chrome-sandbox``
+    helper when it does not. A host that permits neither — e.g. Ubuntu 23.10+
+    with AppArmor's ``apparmor_restrict_unprivileged_userns`` hardening on, or
+    a kernel with user namespaces disabled — leaves ``--no-sandbox`` as the only
+    way to start when we cannot ``sudo chown/chmod`` the helper (headless or
+    non-interactive CLI contexts). Detect that dead end rather than hard-failing
+    the launcher.
 
     We intentionally do NOT return True for root users here: running Electron as
     root without a sandbox is a qualitatively riskier path than launching as an
-    unprivileged desktop user on an AppArmor-restricted host. The root case
-    should remain an explicit user choice.
+    unprivileged desktop user on a hardened host. The root case should remain an
+    explicit user choice.
     """
     if os.environ.get("ELECTRON_DISABLE_SANDBOX", 0) == "1":
         return True
@@ -8066,11 +8067,12 @@ def _desktop_linux_needs_no_sandbox() -> bool:
         return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return False
-    try:
-        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
-            return f.read().strip() == "1"
-    except OSError:
-        return False
+    # No usable user-namespace sandbox and no usable SUID helper leaves
+    # ``--no-sandbox`` as the only way to start. AppArmor's
+    # ``apparmor_restrict_unprivileged_userns`` (Ubuntu 23.10+) is the common
+    # cause, but a kernel with namespaces disabled outright reaches the same
+    # dead end, so gate on the capability rather than on one distro's knob.
+    return not _desktop_linux_userns_sandbox_available()
 
 
 def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> bool:
@@ -8083,6 +8085,42 @@ def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> 
     except OSError:
         return False
     return stat.S_ISREG(sandbox_lstat.st_mode)
+
+
+def _desktop_linux_userns_sandbox_available() -> bool:
+    """Return True when Chromium can sandbox itself WITHOUT the SUID helper.
+
+    Chromium only needs the root-owned 4755 ``chrome-sandbox`` helper when it
+    cannot create unprivileged user namespaces. When it can, the namespace
+    sandbox is used and the SUID helper is never consulted — so demanding
+    ``sudo chown root`` on such a host buys no security and, from a
+    ``Terminal=false`` launcher entry, deterministically prevents the app from
+    starting at all (sudo has no TTY to prompt on).
+
+    A host qualifies when unprivileged user namespaces are permitted AND
+    AppArmor's ``apparmor_restrict_unprivileged_userns`` hardening (Ubuntu
+    23.10+) is not clamping them. Absent files mean the kernel lacks the knob,
+    which is the permissive case for that knob.
+    """
+    if sys.platform != "linux":
+        return False
+
+    def _read_int(path: str) -> int | None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    if _read_int("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == 1:
+        return False
+    # Debian/Ubuntu-only knob; when present it must be enabled.
+    if _read_int("/proc/sys/kernel/unprivileged_userns_clone") == 0:
+        return False
+    max_userns = _read_int("/proc/sys/user/max_user_namespaces")
+    if max_userns is not None and max_userns <= 0:
+        return False
+    return True
 
 
 
@@ -8109,6 +8147,15 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
         return False
 
     if sandbox_lstat.st_uid == 0 and stat.S_IMODE(sandbox_lstat.st_mode) == 0o4755:
+        return True
+
+    # Chromium only consults the SUID helper when it cannot use the
+    # unprivileged user-namespace sandbox. On a host where namespaces work
+    # (most non-Ubuntu distros), escalating to sudo buys nothing and hard-fails
+    # every non-TTY launch — notably the XDG desktop entry, which is
+    # Terminal=false and therefore can never answer a password prompt. Leave
+    # the helper alone and let Electron sandbox itself.
+    if _desktop_linux_userns_sandbox_available():
         return True
 
     sudo = shutil.which("sudo")

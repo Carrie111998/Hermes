@@ -76,14 +76,58 @@ def resolve_exec_command() -> str:
             # installer's bash wrapper). Launched from the .desktop entry that
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
-            # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # ``sys.executable`` (NOT resolved: a venv's ``bin/python`` is a
+            # symlink to the base interpreter, and following it discards the
+            # venv's site-packages — the very thing the prefix exists to
+            # preserve) is the interpreter actually running Hermes. Prefix it
+            # only once it is proven to import hermes_cli on its own: it may
+            # only see the package through the current working directory (the
+            # bootstrap runtime interpreter run from the checkout does), and the
+            # DE launches with a cwd of its own choosing, so an unverified
+            # prefix trades one silent death for another.
+            interpreter = _running_interpreter()
+            if _interpreter_imports_hermes_cli(interpreter):
+                argv = [interpreter, str(resolved), "desktop"]
+            else:
+                argv = [str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [_running_interpreter(), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _running_interpreter() -> str:
+    """Absolute path to the interpreter running Hermes, venv symlink intact.
+
+    ``Path.resolve()`` is deliberately avoided: inside a virtual environment
+    ``bin/python`` is a symlink to the base interpreter, and invoking the
+    resolved target runs WITHOUT the venv's ``site-packages``. Only
+    ``os.path.abspath`` is applied, which makes the path absolute without
+    following links.
+    """
+    return os.path.abspath(sys.executable)
+
+
+def _interpreter_imports_hermes_cli(interpreter: str) -> bool:
+    """Whether ``interpreter`` can import ``hermes_cli`` independent of cwd.
+
+    Run the probe from a neutral directory with ``-I`` so neither the current
+    working directory nor a user site-packages tree can make an interpreter
+    look capable when the desktop entry's own launch context would not.
+    """
+    try:
+        result = subprocess.run(
+            [interpreter, "-I", "-c", "import hermes_cli"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=os.sep,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -104,10 +148,33 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # python itself — leave it alone.
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
-    # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # already resolves correctly.
+    exe_dir = os.path.dirname(_running_interpreter())
+    if exe_dir in shebang:
+        return False
+    # Otherwise the shebang may still be right and sys.executable wrong: pip
+    # writes a console script's shebang to the environment it installed into,
+    # while the process writing this entry can be a DIFFERENT interpreter (the
+    # bootstrap runtime python) that only reaches hermes_cli through its cwd.
+    # An absolute shebang pointing into a real virtual environment is
+    # authoritative; only ``/usr/bin/env python3`` and bare system paths — the
+    # #90292 case — need the override.
+    return not _shebang_targets_virtualenv(shebang)
+
+
+def _shebang_targets_virtualenv(shebang: str) -> bool:
+    """Whether an absolute shebang points at an interpreter inside a venv.
+
+    A virtual environment is identified by ``pyvenv.cfg`` next to the ``bin``
+    directory holding the interpreter — the same marker CPython itself uses.
+    """
+    interpreter = shebang.lstrip("#!").strip().split()[0] if shebang.lstrip("#!").strip() else ""
+    if not interpreter.startswith("/") or interpreter.endswith("/env"):
+        return False
+    interpreter_path = Path(interpreter)
+    if not interpreter_path.is_file():
+        return False
+    return (interpreter_path.parent.parent / "pyvenv.cfg").is_file()
 
 
 def _quote_exec_arg(arg: str) -> str:
