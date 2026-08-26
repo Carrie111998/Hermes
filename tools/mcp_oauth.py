@@ -658,6 +658,15 @@ class HermesTokenStorage:
 
     def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write."""
+        allowed = {
+            self._tokens_path().name,
+            self._client_info_path().name,
+            self._meta_path().name,
+        }
+        invalid = [fname for fname in snapshot if not isinstance(fname, str) or fname not in allowed]
+        if invalid:
+            names = ", ".join(repr(fname) for fname in invalid)
+            raise ValueError(f"Invalid OAuth snapshot filename(s): {names}")
         if only_if_absent and any(
             path.exists()
             for path in (self._tokens_path(), self._client_info_path(), self._meta_path())

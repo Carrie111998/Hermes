@@ -160,6 +160,34 @@ class TestHermesTokenStorage:
         import asyncio
         assert asyncio.run(storage.get_tokens()) is None
 
+    def test_restore_rejects_legacy_client_backup(self, tmp_path, monkeypatch):
+        """Rollback must not recreate the secret-bearing legacy backup."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("srv")
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True)
+        token_path = token_dir / "srv.json"
+        token_path.write_bytes(b'{"access_token":"still-valid"}')
+
+        with pytest.raises(ValueError, match="Invalid OAuth snapshot filename"):
+            storage.restore({"srv.client.json.bak": b"secret-bearing"})
+
+        assert not (token_dir / "srv.client.json.bak").exists()
+        assert token_path.read_bytes() == b'{"access_token":"still-valid"}'
+
+    def test_restore_rejects_paths_outside_token_directory(self, tmp_path, monkeypatch):
+        """Rollback filenames must be exact basenames within mcp-tokens/."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("srv")
+        token_dir = tmp_path / "mcp-tokens"
+        outside = tmp_path / "escape.txt"
+
+        with pytest.raises(ValueError, match="Invalid OAuth snapshot filename"):
+            storage.restore({"../escape.txt": b"secret"})
+
+        assert not outside.exists()
+        assert not token_dir.exists()
+
 
 # ---------------------------------------------------------------------------
 # build_oauth_auth
