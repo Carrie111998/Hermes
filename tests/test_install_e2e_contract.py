@@ -43,7 +43,16 @@ def test_installer_authorities_keep_browser_and_npm_in_scope() -> None:
     assert "include-browser:" in reusable
     assert "args+=(--include-browser)" in reusable
     assert "include-browser: true" in scheduled
-    assert "include-browser: true" in acceptance
+    assert "include-browser: ${{ matrix.route == 'installer' }}" in acceptance
+
+
+def test_pull_request_acceptance_executes_both_flag_probe_routes() -> None:
+    acceptance = ACCEPTANCE.read_text()
+
+    assert "route: [installer, update]" in acceptance
+    assert "route: ${{ matrix.route }}" in acceptance
+    assert "include-browser: ${{ matrix.route == 'installer' }}" in acceptance
+    assert "include-browser: true" not in acceptance
 
 
 def test_pull_request_receipt_binds_to_the_submitted_head() -> None:
