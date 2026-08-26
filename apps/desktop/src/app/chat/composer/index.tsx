@@ -610,6 +610,9 @@ export function ChatBar({
     if (isUndoShortcut(event.nativeEvent)) {
       event.preventDefault()
       undo()
+      // Undo restores text without an input event; refresh the markers so a
+      // previously flagged word doesn't stay unflagged until the next edit.
+      scheduleMisspellMarks(event.currentTarget, { skipIf: () => composingRef.current })
 
       return
     }
@@ -617,6 +620,7 @@ export function ChatBar({
     if (isRedoShortcut(event.nativeEvent)) {
       event.preventDefault()
       redo()
+      scheduleMisspellMarks(event.currentTarget, { skipIf: () => composingRef.current })
 
       return
     }
