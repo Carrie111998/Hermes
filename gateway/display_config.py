@@ -171,6 +171,13 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "wecom":           _TIER_LOW,
     "wecom_callback":  _TIER_LOW,
     "dingtalk":        _TIER_LOW,
+    # ntfy is a push-notification platform with no message-editing support
+    # (the adapter has no edit_message; each publish is a permanent message),
+    # so it stays TIER_LOW just like signal/photon/bluebubbles. Without this
+    # entry ntfy inherited the noisy global defaults (tool_progress='all',
+    # interim_assistant_messages=true, long_running_notifications=true) and
+    # published every progress chunk as its own permanent push.
+    "ntfy":            _TIER_LOW,
 
     # Tier 4 — batch or non-interactive delivery
     "email":           _TIER_MINIMAL,
