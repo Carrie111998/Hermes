@@ -40,7 +40,14 @@ logger = logging.getLogger(__name__)
 #: Shared feature-flag env var. Read per-call, never cached at process start.
 FRONTIER_DOWNGRADE_CHECK_ENV = "HERMES_FRONTIER_DOWNGRADE_CHECK"
 
+#: Literal per-call override for the caller's frontier assertion (IGN-252
+#: blocker #3, board decision "both"). Truthy asserts the requirement even when
+#: the model name does not carry the intent; falsey suppresses it even for an
+#: explicitly-named frontier model. Unset means "derive it".
+FRONTIER_REQUIRED_ENV = "HERMES_FRONTIER_REQUIRED"
+
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSEY = {"0", "false", "no", "off"}
 
 #: Candidate homes for the shared classifier delivered by IGN-195 (A1). A1 owns
 #: the final location; this list is tried in order so A3 keeps working wherever
@@ -64,6 +71,65 @@ def frontier_downgrade_check_enabled() -> bool:
     off takes effect on the next call without a restart.
     """
     return (os.environ.get(FRONTIER_DOWNGRADE_CHECK_ENV) or "").strip().lower() in _TRUTHY
+
+
+def frontier_required_override() -> Optional[bool]:
+    """Return the caller's literal ``HERMES_FRONTIER_REQUIRED`` assertion.
+
+    ``True``/``False`` when the env var is set to a recognised value, ``None``
+    when unset/blank (meaning: no literal assertion, derive it). An
+    unrecognised value is logged and treated as unset rather than guessed —
+    guessing here would silently switch a fail-loud check on or off.
+    """
+    raw = (os.environ.get(FRONTIER_REQUIRED_ENV) or "").strip().lower()
+    if not raw:
+        return None
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSEY:
+        return False
+    logger.warning(
+        "%s=%r is not a recognised boolean (expected one of %s / %s); ignoring it "
+        "and deriving the frontier requirement instead",
+        FRONTIER_REQUIRED_ENV,
+        raw,
+        sorted(_TRUTHY),
+        sorted(_FALSEY),
+    )
+    return None
+
+
+def resolve_frontier_required(
+    requested_model: Any,
+    *,
+    explicitly_requested: bool,
+) -> bool:
+    """Decide whether a call asserts a frontier requirement.
+
+    Precedence, per the IGN-252 board decision (option "both"):
+
+    1. The literal ``HERMES_FRONTIER_REQUIRED`` override, in either direction.
+    2. Otherwise, derive it: the caller *explicitly named* a model (``--model``
+       / ``HERMES_INFERENCE_MODEL``, not the configured default) and that model
+       classifies as ``frontier``.
+
+    Deriving from the caller's own explicit model choice is not the inference
+    the design doc forbids — that was inferring the requirement from *task
+    content*. Here the caller has already named the model it wants; this only
+    reads that choice back.
+
+    Returns ``False`` when the classifier is unavailable on the derive path:
+    with no verdict there is no evidence the caller asked for frontier, and
+    asserting one would manufacture ``frontier_check_unavailable`` warnings on
+    every call. A caller that knows better sets the override, which does reach
+    the guard and does report unavailability.
+    """
+    override = frontier_required_override()
+    if override is not None:
+        return override
+    if not explicitly_requested:
+        return False
+    return classify_model(requested_model) == "frontier"
 
 
 def _resolve_model_class():
@@ -230,7 +296,10 @@ def check_frontier_downgrade(
 
 __all__ = [
     "FRONTIER_DOWNGRADE_CHECK_ENV",
+    "FRONTIER_REQUIRED_ENV",
     "frontier_downgrade_check_enabled",
+    "frontier_required_override",
+    "resolve_frontier_required",
     "classify_model",
     "build_frontier_downgrade_warning",
     "check_frontier_downgrade",
