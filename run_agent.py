@@ -332,13 +332,48 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
     In that case we must fall back to the configured ``fallback_model``
     instead.  Returns True only when rotation has somewhere to go.
 
+    Codex OAuth pools add a second trap: usage quota is scoped by the JWT's
+    ``chatgpt_account_id``, so several stored rows re-authenticating the SAME
+    ChatGPT account share one quota wall. Rotating between duplicate rows of
+    one account cannot clear an account-quota 429 (``usage_limit_reached``,
+    multi-hour ``resets_in_seconds``) — the wall is account-wide, so treat a
+    single-account snapshot like a single-credential pool and defer to the
+    fallback chain (#95066). Pools with two or more distinct ChatGPT accounts
+    (or any non-Codex pool, where rows are independent keys) keep rotation.
+
     See issues #11314 and #13636.
     """
     if pool is None:
         return False
     if not pool.has_available():
         return False
-    return len(pool.entries()) > 1
+    entries = pool.entries()
+    if len(entries) <= 1:
+        return False
+    # Codex OAuth rows: quota is scoped by the ChatGPT account the row's JWT
+    # re-authenticates, so N rows of ONE account share a single quota wall —
+    # rotating between them cannot clear an account-quota 429. When every
+    # entry that decodes resolves to the SAME single account id, rotation has
+    # nowhere to go (rows that fail to decode cannot demonstrate a second
+    # account either). Distinct ids prove independent quotas and keep
+    # rotation; pools where nothing decodes (plain API keys: Vertex, custom
+    # providers) never reach the Codex branch and always keep rotation.
+    try:
+        from hermes_cli.fallback_config import codex_pool_account_ids
+
+        accounts = codex_pool_account_ids(entries)
+        if len(accounts) == 1:
+            logger.info(
+                "Codex credential pool resolves to a single ChatGPT account "
+                "(quota is account-scoped) — deferring to fallback chain"
+            )
+            return False
+    except Exception:
+        logger.debug(
+            "codex_pool_account_ids failed; keeping pool-rotation recovery",
+            exc_info=True,
+        )
+    return True
 
 
 def _qwen_portal_headers() -> dict:
