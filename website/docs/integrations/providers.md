@@ -1177,7 +1177,9 @@ ClawRouter requires a USDC-funded wallet on Base or Solana for payment. All requ
 ### AIHubMix — Multi-Provider Aggregator
 
 [AIHubMix](https://aihubmix.com) fronts models from many vendors behind a single
-OpenAI-compatible endpoint and a single API key.
+OpenAI-compatible endpoint and a single API key. Create the key in the AIHubMix
+dashboard, then check its model list for the exact IDs available to your
+account.
 
 ```yaml
 model:
@@ -1191,8 +1193,9 @@ A community model-provider plugin,
 [hermes-provider-aihubmix](https://github.com/AIhubmix/hermes-provider-aihubmix),
 registers it as a named `aihubmix` provider instead, so `--provider aihubmix`
 works and the `/model` picker is filtered to entries that advertise tool
-calling. It installs into `~/.hermes/plugins/model-providers/` and changes no
-core files. See [Model Provider Plugins](/developer-guide/model-provider-plugin).
+calling. Install it into `~/.hermes/plugins/model-providers/` as its README
+describes; it changes no core files. See
+[Model Provider Plugins](/developer-guide/model-provider-plugin).
 
 ---
 
