@@ -208,10 +208,12 @@ class TestCronjobToolReasoningEffort:
         import tools.cronjob_tools as mod
 
         assert "reasoning_effort" not in mod.CRONJOB_SCHEMA["parameters"]["properties"]
+        assert "routing_slot" not in mod.CRONJOB_SCHEMA["parameters"]["properties"]
         # The registry handler lambda must not forward the agent's args to
         # the parameter (mirrors the intentional model/provider omission).
         source = inspect.getsource(self._tool_handler())
         assert 'args.get("reasoning_effort")' not in source
+        assert 'args.get("routing_slot")' not in source
 
     def test_tool_dispatch_drops_reasoning_effort_arg(self, tmp_cron_dir):
         """Even if a model hallucinates the argument, dispatch ignores it:
@@ -222,7 +224,7 @@ class TestCronjobToolReasoningEffort:
             self._tool_handler()(
                 {
                     "action": "create",
-                    "prompt": "daily digest",
+                    "prompt": "Compare the daily inputs, then draft a digest.",
                     "schedule": "every 1h",
                     "reasoning_effort": "max",
                 }
@@ -230,3 +232,22 @@ class TestCronjobToolReasoningEffort:
         )
         assert out["success"] is True
         assert load_jobs()[0].get("reasoning_effort") is None
+
+    def test_tool_dispatch_drops_routing_slot_arg(self, tmp_cron_dir):
+        """A model cannot override the shared capability classifier."""
+        import json
+
+        out = json.loads(
+            self._tool_handler()(
+                {
+                    "action": "create",
+                    "prompt": "Compare the daily inputs, then draft a digest.",
+                    "schedule": "every 1h",
+                    "routing_slot": "critical",
+                }
+            )
+        )
+        assert out["success"] is True
+        stored = load_jobs()[0]
+        assert stored.get("routing_slot") is None
+        assert stored["routing"]["slot"] == "synthesis"

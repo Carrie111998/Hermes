@@ -1022,6 +1022,40 @@ async def test_dashboard_cron_noop_inference_fields_keep_existing_snapshots(
     assert updated["model_snapshot"] == "test-model"
 
 
+def test_dashboard_cron_persists_shared_routing_contract(isolated_profiles):
+    from hermes_cli import web_server
+
+    created = web_server._create_cron_job_sync(
+        web_server.CronJobCreate(
+            prompt="produce a release report",
+            schedule="every 1h",
+            name="routed-dashboard-job",
+            model="selected-model",
+            provider="nous",
+            reasoning_effort="ultra",
+            routing_slot="synthesis",
+        ),
+        profile="worker_alpha",
+    )
+
+    assert created["routing"]["slot"] == "synthesis"
+    assert created["routing"]["requested_model"] == "selected-model"
+    assert created["routing"]["requested_provider"] == "nous"
+    assert created["routing"]["reasoning_effort"] == "ultra"
+
+    updated = web_server._update_cron_job_sync(
+        created["id"],
+        web_server.CronJobUpdate(
+            updates={"routing_slot": "critical", "reasoning_effort": "high"}
+        ),
+        profile="worker_alpha",
+    )
+
+    assert updated["routing_slot"] == "critical"
+    assert updated["routing"]["slot"] == "critical"
+    assert updated["routing"]["reasoning_effort"] == "high"
+
+
 @pytest.mark.asyncio
 async def test_update_cron_job_clears_snapshots_for_no_agent(
     isolated_profiles,

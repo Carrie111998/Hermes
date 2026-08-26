@@ -763,6 +763,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "model": job.get("model"),
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
+        "routing": job.get("routing"),
+        "routing_slot": job.get("routing_slot"),
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
@@ -1371,6 +1373,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    routing_slot: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1481,12 +1484,13 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
-                    # reasoning_effort reaches here from the CLI
-                    # (hermes cron create --reasoning-effort) ONLY — it is
-                    # deliberately absent from CRONJOB_SCHEMA and the model
-                    # dispatch below: models do not make model-config
-                    # decisions (standing policy).
+                    # reasoning_effort and routing_slot reach here from the
+                    # user-owned CLI/API paths. They are deliberately absent
+                    # from the model-facing CRONJOB_SCHEMA and registry
+                    # dispatch below: models do not make model-config or
+                    # capability-route decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    routing_slot=routing_slot,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1697,6 +1701,8 @@ def cronjob(
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
                 updates["reasoning_effort"] = reasoning_effort
+            if routing_slot is not None:
+                updates["routing_slot"] = routing_slot
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may

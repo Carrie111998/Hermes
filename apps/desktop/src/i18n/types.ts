@@ -1719,6 +1719,10 @@ export interface Translations {
     deliverNeedsHomeChannel: string
     modelLabel: string
     modelDefault: string
+    routingLabel: string
+    routingSlotLabel: string
+    routingSlotDefault: string
+    routingSlots: Record<string, string>
     customScheduleLabel: string
     customPlaceholder: string
     customHint: string

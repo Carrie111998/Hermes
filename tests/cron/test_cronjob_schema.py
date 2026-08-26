@@ -19,3 +19,14 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
+def test_cronjob_schema_keeps_model_routing_decisions_user_owned():
+    """The model-facing tool may classify jobs, but cannot pin the route."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    properties = CRONJOB_SCHEMA["parameters"]["properties"]
+    assert "model" not in properties
+    assert "provider" not in properties
+    assert "reasoning_effort" not in properties
+    assert "routing_slot" not in properties
+
+

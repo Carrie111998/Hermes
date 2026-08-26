@@ -2229,6 +2229,15 @@ export const zh: Translations = {
     deliverNeedsHomeChannel: '请先设置主频道',
     modelLabel: '模型',
     modelDefault: '默认（全局模型）',
+    routingLabel: '能力路由',
+    routingSlotLabel: '能力槽位',
+    routingSlotDefault: '自动（推荐）',
+    routingSlots: {
+      deterministic: '确定性',
+      interpretation: '解读',
+      synthesis: '综合',
+      critical: '关键'
+    },
     customScheduleLabel: '自定义排程',
     customPlaceholder: '0 9 * * * 或 weekdays at 9am',
     customHint: 'Cron 表达式，或类似"每小时""工作日上午 9 点"的短语。',

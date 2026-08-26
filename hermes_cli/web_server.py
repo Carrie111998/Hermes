@@ -12902,9 +12902,11 @@ def _normalize_dashboard_cron_updates(
     """
     normalized = dict(updates or {})
 
-    for key in ("model", "provider", "workdir"):
+    for key in ("model", "provider", "workdir", "routing_slot"):
         if key in normalized:
             normalized[key] = _cron_optional_text(normalized[key])
+    if "reasoning_effort" in normalized:
+        normalized["reasoning_effort"] = _cron_optional_text(normalized["reasoning_effort"])
     if "script" in normalized:
         normalized["script"] = _normalize_dashboard_cron_script(
             normalized["script"],
@@ -13272,6 +13274,8 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            reasoning_effort=_cron_optional_text(body.reasoning_effort),
+            routing_slot=_cron_optional_text(body.routing_slot),
         )
     except HTTPException:
         raise

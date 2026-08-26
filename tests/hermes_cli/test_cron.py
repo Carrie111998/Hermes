@@ -22,6 +22,21 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestCronCommandLifecycle:
 
+    def test_parser_accepts_user_owned_routing_slot(self):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        create_args = parser.parse_args(
+            ["cron", "create", "every 1h", "report", "--routing-slot", "synthesis"]
+        )
+        edit_args = parser.parse_args(
+            ["cron", "edit", "job-id", "--routing-slot", "critical"]
+        )
+
+        assert create_args.routing_slot == "synthesis"
+        assert edit_args.routing_slot == "critical"
+
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Daily report", schedule="every 1h")
         parser = argparse.ArgumentParser(prog="hermes")

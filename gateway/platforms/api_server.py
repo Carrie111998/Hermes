@@ -6561,7 +6561,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled",
+        "model", "provider", "base_url", "reasoning_effort", "routing_slot",
+        "script", "context_from", "enabled_toolsets", "workdir", "no_agent",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -6639,6 +6643,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
 
+            # The core storage choke point owns canonical reasoning/slot
+            # validation. API accepts the same fields as dashboard/CLI and
+            # never performs model selection locally.
+
             kwargs = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -6650,11 +6658,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            for key in (
+                "model", "provider", "base_url", "reasoning_effort", "routing_slot",
+                "script", "context_from", "enabled_toolsets", "workdir", "no_agent",
+            ):
+                if key in body:
+                    kwargs[key] = body[key]
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
         except _CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
+        except ValueError as e:
+            # Validation owned by cron.jobs (including the shared routing slot
+            # and reasoning grammar) is a client error, not a server failure.
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6712,6 +6730,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

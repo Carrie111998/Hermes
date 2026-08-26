@@ -90,6 +90,11 @@ const DEFAULT_DELIVER = 'local'
 // the model picker carries this sentinel and is mapped back to '' on save.
 const MODEL_DEFAULT_VALUE = '__default__'
 
+// Radix <SelectItem> rejects empty-string values. This sentinel represents
+// the backend's deterministic classifier; the empty string is sent on save so
+// the server, not the desktop, remains the routing authority.
+const ROUTING_SLOT_DEFAULT_VALUE = '__routing_default__'
+
 // "Start from" default: the manual editor (blank cron). Any other value is a
 // blueprint key. Blueprint keys never collide with this sentinel.
 const CUSTOM_TEMPLATE = 'custom'
@@ -146,6 +151,42 @@ function jobModel(job: CronJob): string {
 
 function jobProvider(job: CronJob): string {
   return asText(job.provider).trim()
+}
+
+function jobRouting(job: CronJob): Record<string, unknown> {
+  return job.routing && typeof job.routing === 'object' ? job.routing : {}
+}
+
+function jobRoutingSlot(job: CronJob): string {
+  const routing = jobRouting(job)
+  if (job.no_agent || asText(routing.mode) === 'no_agent') {
+    return ''
+  }
+  return asText(job.routing_slot).trim() || asText(routing.slot).trim()
+}
+
+function jobRoutingReasoning(job: CronJob): string {
+  const routing = jobRouting(job)
+  if (job.no_agent || asText(routing.mode) === 'no_agent') {
+    return ''
+  }
+  return asText(job.reasoning_effort).trim() || asText(routing.reasoning_effort).trim()
+}
+
+function jobRoutingModel(job: CronJob): string {
+  const routing = jobRouting(job)
+  if (job.no_agent || asText(routing.mode) === 'no_agent') {
+    return ''
+  }
+  return asText(routing.effective_model).trim() || asText(routing.requested_model).trim() || jobModel(job)
+}
+
+function jobRoutingProvider(job: CronJob): string {
+  const routing = jobRouting(job)
+  if (job.no_agent || asText(routing.mode) === 'no_agent') {
+    return ''
+  }
+  return asText(routing.effective_provider).trim() || asText(routing.requested_provider).trim() || jobProvider(job)
 }
 
 function cronParts(expr: string): null | string[] {
@@ -796,7 +837,10 @@ function CronJobDetail({
   const isPaused = state === 'paused'
   const deliver = jobDeliver(job)
   const prompt = jobPrompt(job)
-  const modelOverride = jobModel(job)
+  const routeSlot = jobRoutingSlot(job)
+  const routeReasoning = jobRoutingReasoning(job)
+  const routeModel = jobRoutingModel(job)
+  const routeProvider = jobRoutingProvider(job)
 
   return (
     <PanelDetail>
@@ -822,7 +866,15 @@ function CronJobDetail({
             { label: c.last.replace(/:$/, ''), value: formatTime(job.last_run_at) },
             { label: c.next.replace(/:$/, ''), value: formatTime(job.next_run_at) },
             { label: c.deliverLabel, value: c.deliveryLabels[deliver] ?? deliver },
-            ...(modelOverride ? [{ label: c.modelLabel, value: modelOverride }] : [])
+            ...(routeModel ? [{ label: c.modelLabel, value: routeModel }] : []),
+            ...(routeSlot
+              ? [
+                  {
+                    label: c.routingLabel,
+                    value: `${c.routingSlots[routeSlot] ?? routeSlot}${routeProvider ? ` · ${routeProvider}` : ''}${routeReasoning ? ` · ${routeReasoning}` : ''}`
+                  }
+                ]
+              : [])
           ]}
         />
 
@@ -1040,6 +1092,9 @@ function CronEditorDialog({
   // Per-job model override, encoded as `${providerSlug}:${model}` (split on the
   // first ':' when saving). MODEL_DEFAULT_VALUE = follow the global default.
   const [modelChoice, setModelChoice] = useState(MODEL_DEFAULT_VALUE)
+  // Empty means the backend's deterministic classifier. The UI only sends an
+  // explicit override when the user picks one; it never resolves models here.
+  const [routingSlot, setRoutingSlot] = useState('')
   // Blueprint fills typed slots (time/enum/weekdays/text) instead of the raw
   // cron fields; the backend renders the prompt + schedule from them.
   const [slotValues, setSlotValues] = useState<Record<string, string>>({})
@@ -1094,6 +1149,7 @@ function CronEditorDialog({
     setSchedulePreset(initial ? scheduleOptionForExpr(jobScheduleExpr(initial)).value : 'daily')
     setDeliver(initial ? jobDeliver(initial) : DEFAULT_DELIVER)
     setModelChoice(initial && jobModel(initial) ? `${jobProvider(initial)}:${jobModel(initial)}` : MODEL_DEFAULT_VALUE)
+    setRoutingSlot(initial ? asText(initial.routing_slot).trim() : '')
     setSlotValues({})
     setTemplateChoice(editor.mode === 'create' ? (editor.blueprintKey ?? CUSTOM_TEMPLATE) : CUSTOM_TEMPLATE)
     setError(null)
@@ -1175,6 +1231,7 @@ function CronEditorDialog({
         name: name.trim(),
         prompt: prompt.trim(),
         provider: overrideProvider,
+        ...(routingSlot ? { routing_slot: routingSlot } : {}),
         schedule: schedule.trim()
       })
     } catch (err) {
@@ -1366,6 +1423,27 @@ function CronEditorDialog({
               </Field>
             )}
 
+            {!scriptOnlyJob && (
+              <Field htmlFor="cron-routing-slot" label={c.routingSlotLabel} optional optionalLabel={c.optional}>
+                <Select
+                  onValueChange={value => setRoutingSlot(value === ROUTING_SLOT_DEFAULT_VALUE ? '' : value)}
+                  value={routingSlot || ROUTING_SLOT_DEFAULT_VALUE}
+                >
+                  <SelectTrigger className="h-9 rounded-md" id="cron-routing-slot">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ROUTING_SLOT_DEFAULT_VALUE}>{c.routingSlotDefault}</SelectItem>
+                    {(['deterministic', 'interpretation', 'synthesis', 'critical'] as const).map(slot => (
+                      <SelectItem key={slot} value={slot}>
+                        {c.routingSlots[slot] ?? slot}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+            )}
+
             {schedulePreset === 'custom' ? (
               <Field htmlFor="cron-schedule" label={c.customScheduleLabel}>
                 <Input
@@ -1423,6 +1501,7 @@ interface EditorValues {
   prompt: string
   /** Provider slug for the model override ('' = none). */
   provider: string
+  routingSlot: string
   schedule: string
 }
 

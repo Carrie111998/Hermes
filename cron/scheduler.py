@@ -601,6 +601,113 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
     return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
 
 
+def _resolve_cron_routing(job: dict, cfg: dict):
+    """Resolve the shared deterministic cron route before agent construction.
+
+    Jobs written before the routing contract existed deliberately return None;
+    the scheduler keeps their legacy model/provider/fallback semantics. New
+    jobs created through ``cron.jobs.create_job`` always carry ``routing`` and
+    therefore use the fail-closed contract.
+    """
+    if not isinstance(job.get("routing"), dict):
+        return None
+    from cron.routing import resolve_cron_route
+
+    return resolve_cron_route(job, cfg)
+
+
+def _cron_routing_audit_fields(
+    *,
+    route=None,
+    audit: Optional[dict] = None,
+    status: Optional[str] = None,
+    failure_reason: Optional[str] = None,
+) -> dict:
+    """Return non-secret, flat + nested routing fields for run audit logs."""
+    payload = dict(audit or {})
+    if route is not None:
+        payload = dict(route.audit)
+        payload.setdefault("slot", route.slot)
+        payload.setdefault("effective_model", route.model)
+        payload.setdefault("effective_provider", route.provider)
+        payload.setdefault("reasoning_effort", route.reasoning_effort)
+    if status is not None:
+        payload["status"] = status
+    if failure_reason is not None:
+        payload["failure_reason"] = failure_reason
+    return {
+        "routing_slot": payload.get("slot"),
+        "routing_requested_model": payload.get("requested_model"),
+        "routing_requested_provider": payload.get("requested_provider"),
+        "routing_effective_model": payload.get("effective_model"),
+        "routing_effective_provider": payload.get("effective_provider"),
+        "routing_reasoning_effort": payload.get("reasoning_effort"),
+        "routing_status": payload.get("status"),
+        "routing_failure_reason": payload.get("failure_reason"),
+        "routing_audit": payload,
+    }
+
+
+def _block_cron_routing_job(
+    job_id: str,
+    job_name: str,
+    reason: str,
+    *,
+    audit: Optional[dict] = None,
+    deliver_target: Optional[str] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Return a loud routing failure without silently executing or downgrading.
+
+    Unlike malformed-job auto-pause, route unavailability can be transient
+    (credential cooldown, provider outage, or a capacity window). Leave the
+    job scheduled so the next tick can retry the same selected route, while
+    exposing the failure through the normal cron error delivery path.
+    """
+    logger.error("Job '%s': cron routing blocked: %s audit=%s", job_id, reason, audit or {})
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    route_fields = _cron_routing_audit_fields(
+        audit=audit,
+        status="blocked",
+        failure_reason=reason,
+    )
+    route_audit = route_fields["routing_audit"]
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        "**Status:** BLOCKED (cron routing)\n\n"
+        "The selected capability route was not executed and no model call was "
+        "made. Automatic fallback or family switching is disabled for cron "
+        "routing.\n\n"
+        f"**Reason:** {reason}\n\n"
+        "## Routing audit\n\n"
+        f"- Slot: `{route_audit.get('slot') or 'unknown'}`\n"
+        f"- Requested model: `{route_audit.get('requested_model') or 'unknown'}`\n"
+        f"- Requested provider: `{route_audit.get('requested_provider') or 'unknown'}`\n"
+        f"- Effective model: `{route_audit.get('effective_model') or 'not resolved'}`\n"
+        f"- Effective provider: `{route_audit.get('effective_provider') or 'not resolved'}`\n"
+        f"- Reasoning: `{route_audit.get('reasoning_effort') or 'unknown'}`\n"
+        f"- Failure reason: `{route_audit.get('failure_reason') or reason}`\n"
+    )
+    alert = f"⚠ Cron job '{job_name}' blocked by routing\n\n{reason}"
+    _write_usage_audit({
+        "ts": _utcnow_iso_ms(),
+        "job_id": job_id,
+        "fire_id": uuid.uuid4().hex,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "response_silent": False,
+        "deliver_target": deliver_target,
+        "model": route_fields["routing_effective_model"]
+        or route_fields["routing_requested_model"],
+        "duration_ms": 0,
+        "error": reason,
+        **route_fields,
+    })
+    return False, doc, alert, reason
+
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -4997,6 +5104,12 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     blocking here would break that contract (and burning zero LLM calls is
     already guaranteed by the fallback resolution being config-local).
     """
+    # Routed jobs have already passed the canonical provider/credential
+    # resolver and eligibility check immediately before preflight. Re-running
+    # it here would select another pooled credential and break route atomicity;
+    # the remaining preflight checks (skills and delivery) still run.
+    if isinstance(job.get("routing"), dict) and job["routing"].get("mode") != "no_agent":
+        return None
     try:
         if get_fallback_chain(cfg):
             return None
@@ -5336,6 +5449,20 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    cron_route = None
+    route_policy_audit = {}
+    if isinstance(job.get("routing"), dict):
+        _policy = job["routing"]
+        route_policy_audit = {
+            "version": _policy.get("version", 1),
+            "status": "blocked",
+            "slot": _policy.get("slot"),
+            "requested_model": _policy.get("requested_model"),
+            "requested_provider": _policy.get("requested_provider"),
+            "reasoning_effort": _policy.get("reasoning_effort"),
+            "fallback_policy": _policy.get("fallback_policy", "fail_closed"),
+            "family_switch": False,
+        }
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -5865,12 +5992,10 @@ def run_job(
                 else str(delivery_target["thread_id"])
             )
 
-        # Model resolution precedence: per-job override > cron.model (the
-        # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
-        # (string or ``{default: ...}``). The per-job value is intentionally
-        # re-read from storage every tick so a ``hermes cron edit --model``
-        # after a failed run takes effect on the next tick — there is no
-        # in-memory cache.
+        # Model resolution is completed by the shared deterministic cron
+        # router immediately before dispatch. Keep this initial value only for
+        # compatibility with the config-loading block below; the route record
+        # is authoritative once loaded.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
@@ -5923,9 +6048,64 @@ def run_job(
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
-        # Fail fast if no model resolved from job / env / config.yaml: an empty
-        # model otherwise reaches the provider as an opaque 400 (#23979).
-        if not (isinstance(model, str) and model.strip()):
+        # The route record may carry a base_url/provider pair that differs from
+        # the legacy top-level fields. Vet that effective pair BEFORE the route
+        # resolver can attach a credential to it; otherwise a hand-edited route
+        # could bypass the F8 credential-exfiltration backstop.
+        _route_guard_job = job
+        if isinstance(job.get("routing"), dict):
+            _route_policy = job["routing"]
+            _route_guard_job = {
+                **job,
+                "provider": _route_policy.get("requested_provider")
+                or job.get("provider"),
+                "base_url": _route_policy.get("requested_base_url")
+                or job.get("base_url"),
+            }
+        try:
+            _guard_job_credential_exfil(_route_guard_job)
+        except Exception as guard_exc:
+            if route_policy_audit:
+                return _block_cron_routing_job(
+                    job_id,
+                    job_name,
+                    f"Cron routing safety gate blocked the selected route: {guard_exc}",
+                    audit=route_policy_audit,
+                    deliver_target=job.get("deliver"),
+                )
+            raise
+
+        # Shared deterministic routing gate. It runs after the existing cheap
+        # monitor/script gates and before provider/agent construction. The
+        # route is atomic: no provider fallback or family switch is attempted
+        # here when the selected slot is unavailable.
+        if route_policy_audit:
+            _audit_fire_id = uuid.uuid4().hex
+            _audit_t_start = time.monotonic()
+        try:
+            cron_route = _resolve_cron_routing(job, _cfg if isinstance(_cfg, dict) else {})
+        except Exception as route_exc:
+            route_audit = getattr(route_exc, "audit", {}) or {}
+            logger.warning(
+                "Job '%s': cron routing blocked before agent construction: %s audit=%s",
+                job_id,
+                route_exc,
+                route_audit,
+            )
+            return _block_cron_routing_job(
+                job_id,
+                job_name,
+                str(route_exc),
+                audit=route_audit,
+                deliver_target=job.get("deliver"),
+            )
+
+        if cron_route is not None:
+            model = cron_route.model
+        elif not (isinstance(model, str) and model.strip()):
+            # Preserve the legacy diagnostic for pre-routing records. New
+            # records fail through the shared route gate above; old jobs must
+            # keep their established missing-model behavior.
             raise RuntimeError(
                 f"Cron job '{job_name}' has no model configured "
                 f"(job.model={job.get('model')!r}, "
@@ -5983,7 +6163,10 @@ def run_job(
             _mt = _cfg.get("max_turns")
         max_iterations = _resolve_turn_limit(_mt)
 
-        # Provider routing
+        # Provider routing. The shared cron route has already resolved and
+        # eligibility-checked the selected primary route. Reuse its exact
+        # transport metadata below; legacy jobs continue through the existing
+        # resolver/fallback path.
         pr = _cfg.get("provider_routing") or {}
 
         from hermes_cli.runtime_provider import (
@@ -5991,14 +6174,6 @@ def run_job(
             format_runtime_provider_error,
         )
         from hermes_cli.auth import AuthError
-
-        # F8 runtime backstop: never resolve a stored provider/base_url pair that
-        # would ship a named provider's stored credential to an off-host endpoint
-        # (CWE-200/CWE-522). The cron tool validates this on create/update, but a
-        # job persisted before that guard — or written directly to the jobs store
-        # — reaches this sink unchecked. Fail closed before resolution so no
-        # off-host call is ever made with a stored key.
-        _guard_job_credential_exfil(job)
 
         # ---------------------------------------------------------------
         # Pre-dispatch configuration validation (T1-26).
@@ -6090,7 +6265,10 @@ def run_job(
                 # Per-job user pin wins; otherwise the cron-fleet default
                 # provider (cron.model_provider); otherwise resolve from
                 # persisted global config.
-                "requested": job.get("provider") or _cron_default_provider or None,
+                "requested": (
+                    cron_route.provider if cron_route is not None
+                    else job.get("provider") or _cron_default_provider or None
+                ),
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -6099,12 +6277,31 @@ def run_job(
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
-            runtime = resolve_runtime_provider(**runtime_kwargs)
+            # Reuse the route's already-authenticated runtime for new jobs. A
+            # second resolution can select another pooled credential and, more
+            # importantly, can reintroduce implicit fallback semantics after
+            # the fail-closed routing decision. Legacy jobs retain the old
+            # resolver/fallback path below.
+            if cron_route is not None:
+                runtime = dict(cron_route.runtime)
+                runtime.setdefault("provider", cron_route.provider)
+                runtime.setdefault("requested_provider", cron_route.provider)
+                runtime["model"] = cron_route.model
+            else:
+                runtime = resolve_runtime_provider(**runtime_kwargs)
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()
                 or primary_provider_for_drift
             )
         except Exception as resolve_exc:
+            if cron_route is not None:
+                # The route was already resolved atomically. An unexpected
+                # failure while transferring its transport metadata must not
+                # reopen the legacy fallback chain or switch model families.
+                raise RuntimeError(
+                    "Cron routed runtime handoff failed after atomic route "
+                    f"resolution: {resolve_exc}"
+                ) from resolve_exc
             # Primary provider resolution failed. Walk fallback_providers for:
             #   1) AuthError (missing/expired credential)
             #   2) Transient network/DNS failures during OAuth refresh or
@@ -6169,6 +6366,10 @@ def run_job(
         reasoning_config = _resolve_job_reasoning_config(
             job, _cfg if isinstance(_cfg, dict) else {}, str(model)
         )
+        if cron_route is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning_config = parse_reasoning_effort(cron_route.reasoning_effort)
 
         # Provider/model-drift fail-closed guard (#44585).
         #
@@ -6193,7 +6394,7 @@ def run_job(
         # cron.model / cron.model_provider: an axis resolved from the explicit
         # cron-fleet default is NOT drift — the user deliberately routed
         # unpinned cron jobs there, so the guard is skipped for that axis.
-        if cron_model_drift_guard_enabled(_cfg):
+        if cron_route is None and cron_model_drift_guard_enabled(_cfg):
             _drift: list[str] = []
             _current_provider = str(
                 primary_provider_for_drift or runtime.get("provider") or ""
@@ -6266,23 +6467,33 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        # Legacy jobs retain the pre-routing fallback chain. New routed jobs
+        # have an atomic family decision and must not silently switch family.
+        fallback_model = None if cron_route is not None else (get_fallback_chain(_cfg) or None)
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
+        if cron_route is not None and runtime.get("credential_pool") is not None:
+            # The route resolver may have selected a pooled credential. Reuse
+            # that exact pool object instead of loading/selecting a second pool
+            # after the atomic route decision.
+            credential_pool = runtime.get("credential_pool")
         if runtime_provider:
-            try:
-                from agent.credential_pool import load_pool
-                pool = load_pool(runtime_provider)
-                if pool.has_credentials():
-                    credential_pool = pool
-                    logger.info(
-                        "Job '%s': loaded credential pool for provider %s with %d entries",
-                        job_id,
-                        runtime_provider,
-                        len(pool.entries()),
-                    )
-            except Exception as e:
-                logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+            if credential_pool is not None:
+                runtime_provider = str(runtime.get("provider") or "").strip().lower()
+            else:
+                try:
+                    from agent.credential_pool import load_pool
+                    pool = load_pool(runtime_provider)
+                    if pool.has_credentials():
+                        credential_pool = pool
+                        logger.info(
+                            "Job '%s': loaded credential pool for provider %s with %d entries",
+                            job_id,
+                            runtime_provider,
+                            len(pool.entries()),
+                        )
+                except Exception as e:
+                    logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
@@ -6600,7 +6811,7 @@ def run_job(
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
         _audit_response_silent = _is_cron_silence_response(final_response or "")
-        _write_usage_audit({
+        _audit_record = {
             "ts": _utcnow_iso_ms(),
             "job_id": job_id,
             "fire_id": _audit_fire_id,
@@ -6612,7 +6823,15 @@ def run_job(
             "model": model or None,
             "duration_ms": _audit_duration_ms,
             "error": None,
-        })
+        }
+        if cron_route is not None:
+            _audit_record.update(
+                _cron_routing_audit_fields(
+                    route=cron_route,
+                    status="completed",
+                )
+            )
+        _write_usage_audit(_audit_record)
         return True, output, final_response, None
 
     except Exception as e:
@@ -6623,7 +6842,7 @@ def run_job(
         # with a None check so the audit write itself never raises.
         if "_audit_fire_id" in locals():
             _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
-            _write_usage_audit({
+            _audit_record = {
                 "ts": _utcnow_iso_ms(),
                 "job_id": job_id,
                 "fire_id": _audit_fire_id,
@@ -6635,7 +6854,24 @@ def run_job(
                 "model": model or None,
                 "duration_ms": _audit_duration_ms,
                 "error": error_msg,
-            })
+            }
+            if cron_route is not None:
+                _audit_record.update(
+                    _cron_routing_audit_fields(
+                        route=cron_route,
+                        status="failed",
+                        failure_reason=error_msg,
+                    )
+                )
+            elif route_policy_audit:
+                _audit_record.update(
+                    _cron_routing_audit_fields(
+                        audit=route_policy_audit,
+                        status="blocked",
+                        failure_reason=error_msg,
+                    )
+                )
+            _write_usage_audit(_audit_record)
         
         output = f"""# Cron Job: {job_name} (FAILED)
 

@@ -1830,6 +1830,26 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_routing_slot(value: Any) -> Optional[str]:
+    """Validate and normalize a user-owned capability-slot override."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Invalid routing_slot {value!r}. Valid slots: "
+            "deterministic, interpretation, synthesis, critical "
+            "(empty string clears the override)."
+        )
+    text = value.strip().lower()
+    if not text:
+        return None
+    from cron.routing import ROUTING_SLOTS
+
+    if text not in ROUTING_SLOTS:
+        raise ValueError(f"Unknown cron routing slot: {value!r}")
+    return text
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1933,6 +1953,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    routing_slot: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2000,6 +2021,11 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        routing_slot: Optional explicit capability slot override. When omitted,
+                the shared deterministic cron classifier selects one of
+                ``deterministic``, ``interpretation``, ``synthesis``, or
+                ``critical``. The selected policy is persisted in ``routing``
+                and resolved fail-closed at fire time.
 
     Returns:
         The created job dict
@@ -2033,6 +2059,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_routing_slot = _normalize_routing_slot(routing_slot)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2074,12 +2101,47 @@ def create_job(
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
+    # One shared deterministic routing contract for every creation surface.
+    # ``create_job`` is the storage choke point used by the model tool, CLI,
+    # dashboard/API, blueprints, and suggestions; keeping the policy record
+    # here prevents adapter-specific routing drift. Pure script jobs are
+    # explicitly marked no_agent and skip classification/model selection.
+    from cron.routing import build_cron_routing_record
+
     provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
         provider=normalized_provider,
         model=normalized_model,
         base_url=normalized_base_url,
         no_agent=normalized_no_agent,
     )
+
+    routing_input = {
+        "prompt": prompt_text,
+        "skills": normalized_skills,
+        "enabled_toolsets": normalized_toolsets,
+        "schedule": parsed_schedule,
+        "context_from": context_from,
+        "monitor_script": normalized_monitor_script,
+        "monitor_url": normalized_monitor_url,
+        "script": normalized_script,
+        "no_agent": normalized_no_agent,
+        "model": normalized_model,
+        "provider": normalized_provider,
+        "base_url": normalized_base_url,
+        "reasoning_effort": normalized_reasoning_effort,
+        "routing_slot": normalized_routing_slot,
+        # If the global config stores no provider/model axis but the
+        # runtime resolver can identify one, use the creation snapshot as
+        # the durable routing assignment. This keeps every new agent job
+        # executable/auditable without making creation itself a paid call.
+        "provider_snapshot": provider_snapshot,
+        "model_snapshot": model_snapshot,
+    }
+    # The creation snapshots are intentionally calculated before the policy
+    # record so an unpinned job receives a concrete, auditable route without a
+    # second provider-resolution call. The shared builder still owns all slot
+    # and override validation.
+    routing_record = build_cron_routing_record(routing_input)
 
     next_run_at = compute_next_run(parsed_schedule)
     if parsed_schedule.get("kind") == "once" and next_run_at is None:
@@ -2103,6 +2165,8 @@ def create_job(
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": normalized_model,
         "provider": normalized_provider,
+        "routing_slot": normalized_routing_slot,
+        "routing": routing_record,
         # Provider/model resolution captured at creation for unpinned jobs
         # (#44585). None for pinned axes, no_agent jobs, resolution failures, and
         # any pre-existing job written before these fields existed (back-compat).
@@ -2264,6 +2328,22 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["reasoning_effort"]
                 )
 
+            if "routing_slot" in updates:
+                updates["routing_slot"] = _normalize_routing_slot(updates["routing_slot"])
+
+            # Keep the storage contract for inference axes identical on create
+            # and update. Dashboard/API callers often send empty strings to
+            # clear an override; store ``None`` rather than a false pin.
+            for _inference_field in ("model", "provider"):
+                if _inference_field in updates:
+                    updates[_inference_field] = _normalize_job_optional_text(
+                        updates[_inference_field]
+                    )
+            if "base_url" in updates:
+                updates["base_url"] = _normalize_job_optional_text(
+                    updates["base_url"], strip_trailing_slash=True
+                )
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
 
@@ -2301,6 +2381,26 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
+
+            routing_fields_changed = bool(
+                {
+                    "prompt",
+                    "schedule",
+                    "skills",
+                    "skill",
+                    "script",
+                    "monitor_script",
+                    "monitor_url",
+                    "context_from",
+                    "enabled_toolsets",
+                    "no_agent",
+                    "model",
+                    "provider",
+                    "base_url",
+                    "reasoning_effort",
+                    "routing_slot",
+                }.intersection(updates)
+            )
 
             if "skills" in updates or "skill" in updates:
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
@@ -2353,6 +2453,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 )
                 updated["provider_snapshot"] = provider_snapshot
                 updated["model_snapshot"] = model_snapshot
+
+            # New jobs carry the shared routing record. Reclassify/rebuild it
+            # whenever routing inputs change so all mutation surfaces retain
+            # one auditable policy. Legacy records without ``routing`` remain
+            # on the pre-feature execution path until explicitly opted into a
+            # slot, preserving backwards compatibility.
+            if routing_fields_changed and (
+                "routing" in job or bool(updated.get("routing_slot"))
+            ):
+                from cron.routing import build_cron_routing_record
+
+                updated["routing"] = build_cron_routing_record(updated)
 
             if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 next_run = compute_next_run(updated["schedule"])

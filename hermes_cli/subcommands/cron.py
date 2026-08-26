@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
+from cron.routing import ROUTING_SLOTS
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
@@ -118,6 +119,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "and agent.reasoning_overrides for this job; unsupported levels are "
             "clamped by the provider at request time. Omit to follow config."
         ),
+    )
+    cron_create.add_argument(
+        "--routing-slot",
+        choices=ROUTING_SLOTS,
+        help="Override the deterministic CRON capability slot for this job.",
     )
     cron_create.add_argument(
         "--continuity",
@@ -253,6 +259,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
         ),
+    )
+    cron_edit.add_argument(
+        "--routing-slot",
+        choices=ROUTING_SLOTS,
+        help="Override the CRON capability slot. Omit to keep the current slot.",
     )
 
     # lifecycle actions
