@@ -40,6 +40,10 @@ interface UseComposerVoiceArgs {
   target: ComposerTarget
 }
 
+export function canSubmitVoiceTurn({ busy, disabled }: Pick<UseComposerVoiceArgs, 'busy' | 'disabled'>): boolean {
+  return !busy && !disabled
+}
+
 /**
  * The composer's voice engine: push-to-talk dictation (transcript → draft), the
  * full voice-conversation loop, and auto-speak of replies. Self-contained — it
@@ -117,7 +121,7 @@ export function useComposerVoice({
   }
 
   const submitVoiceTurn = async (text: string) => {
-    if (busy) {
+    if (!canSubmitVoiceTurn({ busy, disabled })) {
       return
     }
 

@@ -20,6 +20,7 @@ import { ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } f
 import { useComposerSubmit } from './use-composer-submit'
 
 interface SubmitHarnessOptions {
+  actionsDisabled?: boolean
   attachments?: ComposerAttachment[]
   busy?: boolean
   compacting?: boolean
@@ -35,6 +36,7 @@ interface SubmitHarnessOptions {
 let surfaceSequence = 0
 
 function renderSubmitHook({
+  actionsDisabled = false,
   attachments = [],
   busy = false,
   compacting = false,
@@ -93,6 +95,7 @@ function renderSubmitHook({
   const hook = renderHook(
     () =>
       useComposerSubmit({
+        actionsDisabled,
         activeQueueSessionKey: sessionKey,
         activeQueueSessionKeyRef: { current: sessionKey },
         attachments,
@@ -262,6 +265,14 @@ describe('useComposerSubmit external request routing', () => {
 
     expect(disabled.onSubmit).not.toHaveBeenCalled()
   })
+
+  it('does not externally submit through a route-transitioning composer', () => {
+    const transitioning = renderSubmitHook({ actionsDisabled: true })
+
+    requestComposerSubmit('do not cross the session boundary', { target: 'main' })
+
+    expect(transitioning.onSubmit).not.toHaveBeenCalled()
+  })
 })
 
 describe('useComposerSubmit busy-turn routing', () => {
@@ -284,6 +295,24 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('keeps a busy draft untouched while route and active session disagree', () => {
+    const { clearDraft, hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      actionsDisabled: true,
+      busy: true,
+      text: 'this belongs to session B'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
   })
 
   it('queues a plain-text follow-up while the active turn is compacting', () => {

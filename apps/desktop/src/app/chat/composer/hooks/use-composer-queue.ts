@@ -28,6 +28,7 @@ import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerQueueArgs {
+  actionsDisabled: boolean
   activeQueueSessionKey: string | null
   attachments: ComposerAttachment[]
   busy: boolean
@@ -53,6 +54,7 @@ interface UseComposerQueueArgs {
  * without a back-reference. Behaviour-identical to the inline original.
  */
 export function useComposerQueue({
+  actionsDisabled,
   activeQueueSessionKey,
   attachments,
   busy,
@@ -181,7 +183,7 @@ export function useComposerQueue({
   const queueCurrentDraft = useCallback(() => {
     const text = draftRef.current
 
-    if (!activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
+    if (actionsDisabled || !activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
       return false
     }
 
@@ -194,13 +196,13 @@ export function useComposerQueue({
     triggerHaptic('selection')
 
     return true
-  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
+  }, [actionsDisabled, activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
 
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
-      if (drainingQueueRef.current || !activeQueueSessionKey) {
+      if (actionsDisabled || drainingQueueRef.current || !activeQueueSessionKey) {
         return false
       }
 
@@ -243,7 +245,7 @@ export function useComposerQueue({
         drainingQueueRef.current = false
       }
     },
-    [activeQueueSessionKey, onSubmit, sessionId]
+    [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId]
   )
 
   const pickDrainHead = useCallback(
@@ -259,7 +261,7 @@ export function useComposerQueue({
 
   const sendQueuedNow = useCallback(
     (id: string) => {
-      if (!activeQueueSessionKey || id === queueEdit?.entryId) {
+      if (actionsDisabled || !activeQueueSessionKey || id === queueEdit?.entryId) {
         return false
       }
 
@@ -283,7 +285,7 @@ export function useComposerQueue({
 
       return runDrain(entries => entries.find(e => e.id === id))
     },
-    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
+    [actionsDisabled, activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
   )
 
   // Deliver a queued entry as a mid-turn redirect — the queue-panel sibling of
@@ -294,7 +296,7 @@ export function useComposerQueue({
   // busy — idle has no turn to redirect, and `sendQueuedNow` already covers it.
   const steerQueuedNow = useCallback(
     async (id: string): Promise<boolean> => {
-      if (!onSteer || !busy || !activeQueueSessionKey || id === queueEditRef.current?.entryId) {
+      if (actionsDisabled || !onSteer || !busy || !activeQueueSessionKey || id === queueEditRef.current?.entryId) {
         return false
       }
 
@@ -323,7 +325,7 @@ export function useComposerQueue({
 
       return true
     },
-    [activeQueueSessionKey, busy, onSteer, queueEditRef]
+    [actionsDisabled, activeQueueSessionKey, busy, onSteer, queueEditRef]
   )
 
   // Edge-independent auto-drain: send the head whenever the session is idle and
@@ -331,7 +333,7 @@ export function useComposerQueue({
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
   // drain lock serializes sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey) {
+    if (actionsDisabled || busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey) {
       return
     }
 
@@ -362,7 +364,7 @@ export function useComposerQueue({
         }
       })
       .catch(onFail)
-  }, [activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
+  }, [actionsDisabled, activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
   // never churns, so a change there is a real session switch and must NOT

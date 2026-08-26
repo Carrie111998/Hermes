@@ -23,7 +23,14 @@ import { useComposerQueue } from './use-composer-queue'
 
 const SESSION_KEY = 'stored-session-queue-hook'
 
-function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void; onSteer?: ChatBarProps['onSteer'] } = {}) {
+function renderQueueHook(
+  overrides: {
+    actionsDisabled?: boolean
+    busy?: boolean
+    onCancel?: () => void
+    onSteer?: ChatBarProps['onSteer']
+  } = {}
+) {
   const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
   const onCancel = overrides.onCancel ?? vi.fn()
   const onSteer = overrides.onSteer
@@ -32,6 +39,7 @@ function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void; onS
   const hook = renderHook(
     ({ busy }: { busy: boolean }) =>
       useComposerQueue({
+        actionsDisabled: overrides.actionsDisabled ?? false,
         activeQueueSessionKey: SESSION_KEY,
         attachments: [],
         busy,
@@ -73,6 +81,28 @@ describe('useComposerQueue park integration', () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('holds every queued action while route and active session disagree', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'belongs to the new route' })
+    const onSteer = vi.fn(async () => true)
+    const { hook, onCancel, onSubmit } = renderQueueHook({ actionsDisabled: true, busy: true, onSteer })
+
+    act(() => {
+      expect(hook.result.current.sendQueuedNow(entry!.id)).toBe(false)
+    })
+
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedNow(entry!.id)).toBe(false)
+      expect(await hook.result.current.drainNextQueued()).toBe(false)
+      hook.rerender({ busy: false })
+      await Promise.resolve()
+    })
+
+    expect(onCancel).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
   })
 
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {

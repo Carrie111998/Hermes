@@ -48,7 +48,7 @@ import {
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
-import { $focusedStoredSessionId, sessionTileDelegate } from '@/store/session-states'
+import { $focusedStoredSessionId, $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -393,6 +393,11 @@ const ChatViewContent = memo(function ChatViewContent({
   const composerSurfaceId = useComposerSurfaceId()
   const isPrimary = view.kind === 'primary'
   const activeSessionId = useStore(view.$runtimeId)
+
+  const activeRuntimeStoredId = useStoreSelector($sessionStates, states =>
+    activeSessionId ? (states[activeSessionId]?.storedSessionId ?? null) : null
+  )
+
   const storedId = useStore(view.$storedId)
   // Multi-pane dimming: only the focused surface paints at full strength, so
   // two sessions side by side read as "this one, and that one over there".
@@ -488,6 +493,15 @@ const ChatViewContent = memo(function ChatViewContent({
   // waiting for the resume effect (which paints a frame later) to clear them.
   const routeSessionMismatch = isPrimary ? isRouteSessionMismatch(routedSessionId, selectedSessionId, sessions) : false
 
+  const activeRuntimeRouteMismatch =
+    isPrimary && isRoutedSessionView
+      ? !activeSessionId ||
+        !activeRuntimeStoredId ||
+        isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
+      : false
+
+  const sessionTransitioning = routeSessionMismatch || activeRuntimeRouteMismatch
+
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state. The Appearance toggle
   // turns it off everywhere else.
@@ -526,15 +540,21 @@ const ChatViewContent = memo(function ChatViewContent({
     knownHistory: routedHasHistory,
     messagesEmpty,
     resumeExhausted,
-    routeSessionMismatch,
+    routeSessionMismatch: sessionTransitioning,
     routedSessionView: isRoutedSessionView
   })
 
   const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
-  // Hide the composer in the exhausted error state too: there's no live runtime
-  // to send to until a retry rebinds one. Watch windows are pure spectators of a
-  // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+
+  // Keep the DOM/editor mounted through the transient route ↔ selected-session
+  // split write so focus, draft, and selection survive. A mismatch is also a
+  // genuine navigation seam, though: the route/draft can already mean B while
+  // busy/session actions still point at A. ChatBar receives an independent
+  // action fence below — typing stays enabled, every submit/steer/cancel/queue
+  // path fails closed until the identities converge.
+  const showChatBar =
+    !(isRoutedSessionView && messagesEmpty && !activeSessionId) && !resumeExhausted && !isWatchWindow()
+
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
@@ -647,7 +667,7 @@ const ChatViewContent = memo(function ChatViewContent({
         onEdit={onEdit}
         onReload={onReload}
         onThreadMessagesChange={onThreadMessagesChange}
-        suppressMessages={routeSessionMismatch}
+        suppressMessages={sessionTransitioning}
       >
         <div
           className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
@@ -714,6 +734,7 @@ const ChatViewContent = memo(function ChatViewContent({
         {showChatBar && (
           <Suspense fallback={<ChatBarFallback />}>
             <ChatBar
+              actionsDisabled={sessionTransitioning}
               busy={busy}
               cwd={currentCwd}
               disabled={!gatewayOpen}

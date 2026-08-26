@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useNavigate } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -19,6 +20,7 @@ import {
   $selectedStoredSessionId,
   $sessions
 } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 
 const threadRenderCount = vi.hoisted(() => ({ current: 0 }))
 
@@ -48,7 +50,19 @@ vi.mock('@/lib/model-options', () => ({
 }))
 vi.mock('./chat-drop-overlay', () => ({ ChatDropOverlay: () => null }))
 vi.mock('./chat-swap-overlay', () => ({ ChatSwapOverlay: () => null, ChatSyncBadge: () => null }))
-vi.mock('./composer', () => ({ ChatBar: () => null, ChatBarFallback: () => null }))
+vi.mock('./composer', async () => {
+  const React = await import('react')
+
+  return {
+    ChatBar: ({ actionsDisabled, busy }: { actionsDisabled?: boolean; busy: boolean }) =>
+      React.createElement('textarea', {
+        'data-actions-disabled': actionsDisabled ? 'true' : 'false',
+        'data-busy': busy ? 'true' : 'false',
+        'data-testid': 'composer'
+      }),
+    ChatBarFallback: () => null
+  }
+})
 vi.mock('./hooks/use-file-drop-zone', () => ({
   useFileDropZone: () => ({ dragKind: null, dropHandlers: {} })
 }))
@@ -71,6 +85,33 @@ function assistantMessage(id: string, text: string): ChatMessage {
   }
 }
 
+function chatViewProps() {
+  return {
+    gateway: null,
+    maxVoiceRecordingSeconds: 120,
+    onAddContextRef: vi.fn(),
+    onAddUrl: vi.fn(),
+    onAttachDroppedItems: vi.fn(),
+    onAttachImageBlob: vi.fn(),
+    onBranchInNewChat: vi.fn(),
+    onCancel: vi.fn(),
+    onDeleteSelectedSession: vi.fn(),
+    onEdit: vi.fn(),
+    onPasteClipboardImage: vi.fn(),
+    onPickFiles: vi.fn(),
+    onPickFolders: vi.fn(),
+    onPickImages: vi.fn(),
+    onReload: vi.fn(),
+    onRemoveAttachment: vi.fn(),
+    onRetryResume: vi.fn(),
+    onSteer: vi.fn(),
+    onSubmit: vi.fn(),
+    onThreadMessagesChange: vi.fn(),
+    onToggleSelectedPin: vi.fn(),
+    onTranscribeAudio: vi.fn()
+  }
+}
+
 describe('ChatView render isolation', () => {
   beforeEach(() => {
     threadRenderCount.current = 0
@@ -83,8 +124,16 @@ describe('ChatView render isolation', () => {
     $currentProvider.set('test-provider')
     $freshDraftReady.set(false)
     $gatewayState.set('closed')
-    $messages.set([assistantMessage('assistant-1', 'Stable historical answer')])
+    const initialMessages = [assistantMessage('assistant-1', 'Stable historical answer')]
+
+    $messages.set(initialMessages)
     $selectedStoredSessionId.set('stored-1')
+    $sessionStates.set({
+      'runtime-1': {
+        ...createClientSessionState('stored-1'),
+        messages: initialMessages
+      }
+    })
     $sessions.set([{ id: 'stored-1', message_count: 1, title: 'Stable chat' } as never])
   })
 
@@ -102,34 +151,12 @@ describe('ChatView render isolation', () => {
     $gatewayState.set('idle')
     $messages.set([])
     $selectedStoredSessionId.set(null)
+    $sessionStates.set({})
     $sessions.set([])
   })
 
   it('does not re-render chat history when an unrelated parent idle tick updates', () => {
-    const props = {
-      gateway: null,
-      maxVoiceRecordingSeconds: 120,
-      onAddContextRef: vi.fn(),
-      onAddUrl: vi.fn(),
-      onAttachDroppedItems: vi.fn(),
-      onAttachImageBlob: vi.fn(),
-      onBranchInNewChat: vi.fn(),
-      onCancel: vi.fn(),
-      onDeleteSelectedSession: vi.fn(),
-      onEdit: vi.fn(),
-      onPasteClipboardImage: vi.fn(),
-      onPickFiles: vi.fn(),
-      onPickFolders: vi.fn(),
-      onPickImages: vi.fn(),
-      onReload: vi.fn(),
-      onRemoveAttachment: vi.fn(),
-      onRetryResume: vi.fn(),
-      onSteer: vi.fn(),
-      onSubmit: vi.fn(),
-      onThreadMessagesChange: vi.fn(),
-      onToggleSelectedPin: vi.fn(),
-      onTranscribeAudio: vi.fn()
-    }
+    const props = chatViewProps()
 
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } }
@@ -160,5 +187,128 @@ describe('ChatView render isolation', () => {
     // memo(ChatView) with stable props must absorb the parent's idle tick —
     // the transcript (Thread) must not re-render. This is PR #38470's contract.
     expect(threadRenderCount.current).toBe(1)
+  })
+
+  it('keeps the focused composer mounted but action-blocked through a transient route-session mismatch', () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    const props = chatViewProps()
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <ChatView {...props} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    const composer = screen.getByTestId('composer') as HTMLTextAreaElement
+    composer.value = 'draft in progress'
+    composer.focus()
+    composer.setSelectionRange(5, 5)
+
+    act(() => {
+      $sessions.set([
+        { id: 'stored-1', message_count: 1, title: 'Stable chat' } as never,
+        { id: 'stored-2', message_count: 1, title: 'Incoming update' } as never
+      ])
+      $selectedStoredSessionId.set('stored-2')
+    })
+
+    const composerAfterMismatch = screen.getByTestId('composer') as HTMLTextAreaElement
+
+    expect(composerAfterMismatch).toBe(composer)
+    expect(globalThis.document.activeElement).toBe(composer)
+    expect(composerAfterMismatch.value).toBe('draft in progress')
+    expect(composerAfterMismatch.selectionStart).toBe(5)
+    expect(composerAfterMismatch.selectionEnd).toBe(5)
+    expect(composerAfterMismatch.dataset.actionsDisabled).toBe('true')
+  })
+
+  it('blocks busy session A actions during a route-first navigation to session B', () => {
+    $sessionStates.set({
+      'runtime-1': {
+        ...createClientSessionState('stored-1'),
+        busy: true,
+        messages: [assistantMessage('assistant-a', 'A is still running')]
+      }
+    })
+    $sessions.set([
+      { id: 'stored-1', message_count: 1, title: 'Busy A' } as never,
+      { id: 'stored-2', message_count: 1, title: 'Target B' } as never
+    ])
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    const props = chatViewProps()
+
+    function RouteFirstHarness() {
+      const navigate = useNavigate()
+
+      return (
+        <>
+          <button onClick={() => navigate('/stored-2')} type="button">
+            Navigate to B
+          </button>
+          <ChatView {...props} />
+        </>
+      )
+    }
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <RouteFirstHarness />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    const composer = screen.getByTestId('composer') as HTMLTextAreaElement
+    expect(composer.dataset.busy).toBe('true')
+    expect(composer.dataset.actionsDisabled).toBe('false')
+    composer.value = 'draft for B'
+    composer.focus()
+    composer.setSelectionRange(7, 7)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate to B' }))
+
+    const composerDuringMismatch = screen.getByTestId('composer') as HTMLTextAreaElement
+
+    expect(composerDuringMismatch).toBe(composer)
+    expect(composerDuringMismatch.dataset.busy).toBe('true')
+    expect(composerDuringMismatch.dataset.actionsDisabled).toBe('true')
+    expect(globalThis.document.activeElement).toBe(composer)
+
+    // Selected B can publish before runtime A is replaced. Route-vs-selected is
+    // now clean, but the active runtime still owns busy/session actions for A —
+    // the fence must remain until runtime identity converges too.
+    act(() => $selectedStoredSessionId.set('stored-2'))
+
+    const composerAfterSelectionConverges = screen.getByTestId('composer') as HTMLTextAreaElement
+
+    expect(composerAfterSelectionConverges).toBe(composer)
+    expect(composerAfterSelectionConverges.dataset.busy).toBe('true')
+    expect(composerAfterSelectionConverges.dataset.actionsDisabled).toBe('true')
+
+    act(() => {
+      $sessionStates.set({
+        ...$sessionStates.get(),
+        'runtime-2': {
+          ...createClientSessionState('stored-2'),
+          messages: [assistantMessage('assistant-b', 'B is ready')]
+        }
+      })
+      $activeSessionId.set('runtime-2')
+    })
+
+    const composerAfterRuntimeConverges = screen.getByTestId('composer') as HTMLTextAreaElement
+
+    expect(composerAfterRuntimeConverges).toBe(composer)
+    expect(composerAfterRuntimeConverges.dataset.busy).toBe('false')
+    expect(composerAfterRuntimeConverges.dataset.actionsDisabled).toBe('false')
   })
 })
