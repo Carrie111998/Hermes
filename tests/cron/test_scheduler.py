@@ -894,6 +894,38 @@ class TestRunJobSessionPersistence:
             "heartbeat-job", expected_owner="owner-token"
         )
 
+    def test_run_job_submit_failure_keeps_known_zero_usage(self, tmp_path):
+        job = {"id": "submit-failure", "name": "submit failure", "prompt": "hello"}
+        fake_db = MagicMock()
+        fake_pool = MagicMock()
+        fake_pool.submit.side_effect = RuntimeError("worker unavailable")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent"), \
+             patch(
+                 "cron.scheduler.concurrent.futures.ThreadPoolExecutor",
+                 return_value=fake_pool,
+             ):
+            from cron.scheduler import _capture_execution_usage
+
+            with _capture_execution_usage() as usage:
+                success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "worker unavailable" in error
+        assert usage["api_calls"] == 0
+
     def test_run_job_resets_secret_source_cache_before_reload(self, tmp_path, monkeypatch):
         """Each run must clear the secret-source cache before re-reading the
         env, so a long-running gateway re-resolves Bitwarden/BSM-backed secrets

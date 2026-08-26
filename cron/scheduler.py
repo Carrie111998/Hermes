@@ -6235,9 +6235,17 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
-        if usage_out is not None:
-            usage_out["api_calls"] = None
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+
+        def _run_agent_conversation():
+            # Flip measured zero to unknown only once the worker actually starts.
+            # A submit failure means no model call was attempted.
+            if usage_out is not None:
+                usage_out["api_calls"] = None
+            return agent.run_conversation(prompt)
+
+        _cron_future = _cron_pool.submit(
+            _cron_context.run, _run_agent_conversation
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
