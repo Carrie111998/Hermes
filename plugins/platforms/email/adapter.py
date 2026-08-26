@@ -413,6 +413,14 @@ def _originating_auth_verdict(trusted: str) -> str:
     for token in result.split():
         key, eq, value = token.partition("=")
         if eq and key.lower() == "auth":
+            value = value.strip()
+            # RFC 7489 allows quoted result values. Strip surrounding quotes
+            # only when the token is fully quoted — a fragment like
+            # ``"pass`` from a quoted value that the whitespace split cut
+            # mid-string must stay malformed (fail closed), never normalize
+            # to ``pass``.
+            if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                value = value[1:-1]
             return value.lower()
     return ""
 

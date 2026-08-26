@@ -1164,6 +1164,28 @@ class TestSenderAuthentication(unittest.TestCase):
         )
         self.assertFalse(ok, reason)
 
+    def test_originating_quoted_auth_verdict_authenticates(self):
+        """RFC 7489 allows quoted result values: a fully quoted verdict
+        ``auth="pass"`` carries the same meaning as the unquoted form."""
+        ok, reason = self._verify(
+            "andreas@eglimail.net",
+            ['ORIGINATING; auth="pass" smtp.auth=andreas@eglimail.net '
+             "smtp.mailfrom=andreas@eglimail.net"],
+        )
+        self.assertTrue(ok, reason)
+
+    def test_originating_quoted_value_cut_by_split_rejected(self):
+        """A quoted verdict containing whitespace (``auth="pass with
+        caveat"``) is cut into a fragment by the whitespace tokenization; the
+        fragment ``"pass`` must stay malformed and fail closed rather than
+        normalize to ``pass``."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            ['ORIGINATING; auth="pass with caveat" smtp.auth=admin@example.com '
+             "smtp.mailfrom=admin@example.com"],
+        )
+        self.assertFalse(ok, reason)
+
     def test_originating_username_only_rejected(self):
         """A bare username in ``smtp.auth`` (e.g. a submission stack that
         logs only the local part, Dovecot ``auth_username_format=%n``)
