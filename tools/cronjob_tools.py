@@ -1438,6 +1438,12 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+        if attach_to_session is not None and type(attach_to_session) is not bool:
+            return tool_error(
+                "attach_to_session must be a boolean.",
+                success=False,
+                error_kind="invalid_argument",
+            )
 
         if normalized == "create":
             if not schedule:
@@ -1834,12 +1840,6 @@ def cronjob(
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
-                if type(attach_to_session) is not bool:
-                    return tool_error(
-                        "attach_to_session must be a boolean.",
-                        success=False,
-                        error_kind="invalid_argument",
-                    )
                 updates["attach_to_session"] = attach_to_session
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);

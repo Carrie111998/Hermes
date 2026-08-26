@@ -562,6 +562,27 @@ class TestRegisteredHandlerForwardsAttachToSession:
         assert listed.get("attach_to_session") is False
 
     @pytest.mark.parametrize("invalid", ["false", 0, 1, [], {}])
+    def test_create_rejects_non_boolean_attach_to_session(self, invalid):
+        from cron.jobs import list_jobs
+        from tools.registry import registry
+
+        result = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "schedule": "1h",
+                    "prompt": "fire and forget",
+                    "attach_to_session": invalid,
+                },
+            )
+        )
+
+        assert result["success"] is False
+        assert "boolean" in result["error"].lower()
+        assert list_jobs(include_disabled=True) == []
+
+    @pytest.mark.parametrize("invalid", ["false", 0, 1, [], {}])
     def test_update_rejects_non_boolean_attach_to_session(self, invalid):
         from cron.jobs import get_job
         from tools.registry import registry
