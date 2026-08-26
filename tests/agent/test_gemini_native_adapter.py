@@ -683,7 +683,12 @@ def test_text_only_tool_result_has_no_parts():
 
 
 def _fc_event(*calls):
-    """Build a native Gemini SSE event carrying one functionCall part per call."""
+    """Build a native Gemini SSE event carrying one functionCall part per call.
+
+    Deliberately id-less: this is the shape Gemini 2.5 produces, and it is what
+    exercises the value-based fallback. Tests for the id-carrying path build
+    their events with ``_live_fc_event``.
+    """
     return {
         "candidates": [
             {
@@ -899,3 +904,82 @@ def test_signed_first_call_then_unsigned_calls_each_get_their_own_slot():
     ]
     # Each slot keeps the id the model assigned to the call that opened it.
     assert [d.id for d in deltas] == ["call_371934", "call_371938", "call_371942"]
+
+
+def test_calls_with_equal_arguments_but_distinct_ids_get_distinct_slots():
+    """Two calls to one tool with byte-identical arguments and different
+    provider ids are two calls, not a resend.
+
+    Value equality cannot tell them apart -- the second payload is a prefix of
+    the first, which is what a resend looks like -- so on an adapter that keys
+    slots by value the second call is erased and rewritten as an empty delta on
+    the first. The provider id is the only discriminator available, so it wins
+    whenever the model supplies one.
+    """
+    import json
+
+    from agent.gemini_native_adapter import translate_stream_event
+
+    events = [
+        _live_fc_event("web_search", {"query": "A"}, call_id="call_1"),
+        _live_fc_event("web_search", {"query": "A"}, call_id="call_2"),
+    ]
+
+    tool_call_indices: dict = {}
+    deltas = []
+    for event in events:
+        for chunk in translate_stream_event(
+            event, model="gemini-3.5-flash", tool_call_indices=tool_call_indices
+        ):
+            deltas.append(chunk.choices[0].delta.tool_calls[0])
+
+    assert len(tool_call_indices) == 2, tool_call_indices
+    assert [d.index for d in deltas] == [0, 1]
+    assert [d.id for d in deltas] == ["call_1", "call_2"]
+    # Both slots carry the full argument payload; neither is emptied as a resend.
+    assert [json.loads(d.function.arguments) for d in deltas] == [
+        {"query": "A"},
+        {"query": "A"},
+    ]
+
+
+def test_repeated_provider_id_is_one_slot_even_when_the_signature_drifts():
+    """The same provider id arriving again is the same call, and a
+    ``thoughtSignature`` that appears, changes or disappears between events
+    does not split it.
+
+    Only the first call of a turn carries a signature, so the signature drifts
+    across the events of a stream by design. Keying an id-carrying call by
+    ``(name, id)`` alone keeps it in one slot; the repeat is emitted as an empty
+    argument delta, the way a resend should be.
+    """
+    from agent.gemini_native_adapter import translate_stream_event
+
+    events = [
+        _live_fc_event(
+            "web_search",
+            {"query": "A"},
+            call_id="call_1",
+            thought_signature="Ep8JCpwJARFNMg9geVAyMFMIa5ND0OFd",
+        ),
+        _live_fc_event("web_search", {"query": "A"}, call_id="call_1"),
+        _live_fc_event(
+            "web_search",
+            {"query": "A"},
+            call_id="call_1",
+            thought_signature="ZZZZZZZZdifferentsignatureZZZZZZ",
+        ),
+    ]
+
+    tool_call_indices: dict = {}
+    deltas = []
+    for event in events:
+        for chunk in translate_stream_event(
+            event, model="gemini-3.5-flash", tool_call_indices=tool_call_indices
+        ):
+            deltas.append(chunk.choices[0].delta.tool_calls[0])
+
+    assert len(tool_call_indices) == 1, tool_call_indices
+    assert [d.index for d in deltas] == [0, 0, 0]
+    assert [d.id for d in deltas] == ["call_1", "call_1", "call_1"]
+    assert [d.function.arguments for d in deltas] == ['{"query": "A"}', "", ""]
