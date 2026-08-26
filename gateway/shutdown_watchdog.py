@@ -55,6 +55,8 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # for genuine wedges. Deployments with legitimately slow loops can tune via
 # gateway.loop_watchdog_* in config.yaml.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+DEFAULT_HEARTBEAT_TICK_TIMEOUT_S = 2.0
+DEFAULT_HEARTBEAT_STALE_AFTER_S = 90.0
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
@@ -175,6 +177,21 @@ def start_loop_liveness_watchdog(
 
             if stop_event.is_set():
                 return
+            # Second witness: a fresh off-loop heartbeat means the loop still
+            # ticked recently enough to schedule a write. Do not hard-exit 75
+            # on a lone probe miss.
+            if _heartbeat_is_fresh():
+                try:
+                    logger.error(
+                        "Gateway event loop missed %d consecutive liveness "
+                        "probes, but heartbeat is still fresh; holding exit %d",
+                        strikes,
+                        exit_code,
+                    )
+                except Exception:
+                    pass
+                strikes = max(strikes_limit - 1, 0)
+                continue
             try:
                 logger.critical(
                     "Gateway event loop missed %d consecutive liveness probes; "
@@ -227,6 +244,24 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     """Return ``<HERMES_HOME>/state/gateway.heartbeat``."""
     base = home if home is not None else _process_hermes_home()
     return base.joinpath(*_HEARTBEAT_RELATIVE)
+
+
+def _heartbeat_is_fresh(
+    *,
+    home: Optional[Path] = None,
+    stale_after: float = DEFAULT_HEARTBEAT_STALE_AFTER_S,
+) -> bool:
+    """True when the heartbeat file exists and is newer than ``stale_after``."""
+    path = get_loop_heartbeat_path(home)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    try:
+        budget = max(float(stale_after), 0.0)
+    except (TypeError, ValueError):
+        budget = DEFAULT_HEARTBEAT_STALE_AFTER_S
+    return age <= budget
 
 
 def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
@@ -441,18 +476,17 @@ async def loop_heartbeat_forever(
     home: Optional[Path] = None,
     should_continue: Optional[Callable[[], bool]] = None,
 ) -> None:
-    """Rewrite the loop heartbeat file on a cadence until cancelled / gated off.
+    """Legacy on-loop writer. Production uses :func:`start_loop_heartbeat`.
 
-    Runs as an asyncio task on the gateway loop — if the loop freezes, this
-    task stops and the file mtime/updated_at goes stale for external monitors.
+    Kept so older tests and out-of-tree callers still import a stable name.
+    Writing the heartbeat on the loop can stall the loop it monitors; do not
+    arm this from GatewayRunner.
     """
     try:
         interval = max(float(interval_s), 1.0)
     except (TypeError, ValueError):
         interval = DEFAULT_HEARTBEAT_INTERVAL_S
 
-    # Immediate first write so monitors see a fresh file as soon as the
-    # gateway is running, not after the first interval.
     write_loop_heartbeat(start_time=start_time, home=home)
     while True:
         if should_continue is not None and not should_continue():
@@ -461,3 +495,79 @@ async def loop_heartbeat_forever(
         if should_continue is not None and not should_continue():
             return
         write_loop_heartbeat(start_time=start_time, home=home)
+
+
+class LoopHeartbeatHandle:
+    """Stoppable owner for the off-loop heartbeat writer thread."""
+
+    def __init__(self, thread: threading.Thread, stop_event: threading.Event):
+        self._thread = thread
+        self._stop_event = stop_event
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout)
+
+    def done(self) -> bool:
+        return not self.is_alive()
+
+    def cancel(self) -> None:
+        self.stop()
+
+
+def start_loop_heartbeat(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+    start_time: Optional[float] = None,
+    home: Optional[Path] = None,
+    tick_timeout_s: float = DEFAULT_HEARTBEAT_TICK_TIMEOUT_S,
+) -> LoopHeartbeatHandle:
+    """Write the heartbeat off-loop, gated by a loop tick.
+
+    A frozen loop stops ticks, so the file goes stale for CLI probes. The
+    write itself never runs on the loop, so a slow disk cannot stall the
+    loop and trip the watchdog.
+    """
+    try:
+        interval = max(float(interval_s), 0.01)
+    except (TypeError, ValueError):
+        interval = DEFAULT_HEARTBEAT_INTERVAL_S
+    try:
+        tick_timeout = max(float(tick_timeout_s), 0.01)
+    except (TypeError, ValueError):
+        tick_timeout = DEFAULT_HEARTBEAT_TICK_TIMEOUT_S
+    started = time.time() if start_time is None else start_time
+    stop_event = threading.Event()
+
+    def _run() -> None:
+        while not stop_event.is_set():
+            tick = threading.Event()
+            try:
+                loop.call_soon_threadsafe(tick.set)
+            except RuntimeError:
+                return
+            except Exception:
+                logger.debug("Failed to schedule loop heartbeat tick", exc_info=True)
+                if stop_event.wait(timeout=interval):
+                    return
+                continue
+            if not tick.wait(timeout=tick_timeout):
+                if stop_event.wait(timeout=interval):
+                    return
+                continue
+            try:
+                write_loop_heartbeat(start_time=started, home=home)
+            except Exception:
+                logger.debug("Failed to write loop heartbeat", exc_info=True)
+            if stop_event.wait(timeout=interval):
+                return
+
+    thread = threading.Thread(target=_run, name="hermes-loop-heartbeat", daemon=True)
+    thread.start()
+    return LoopHeartbeatHandle(thread, stop_event)

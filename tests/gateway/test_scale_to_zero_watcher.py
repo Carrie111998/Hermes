@@ -374,12 +374,9 @@ async def test_done_supervised_watcher_is_ignored_either_way():
 
 # ── permanent tasks spawned OUTSIDE _spawn_supervised must also be tagged ──
 #
-# _loop_heartbeat_task and _heartbeat_poll_task are both infinite while-True
-# loops added to _background_tasks via plain asyncio.create_task() + manual
-# add(), NOT through _spawn_supervised — so they were untagged and defeated
-# the fix above: _loop_heartbeat_task starts unconditionally on every
-# gateway boot (start()), which would make the busy check return True
-# forever regardless of the _spawn_supervised fix, on every armed instance.
+# _loop_heartbeat_task is an off-loop daemon thread (RTC-260), not an
+# asyncio task, so it cannot pin scale-to-zero idle. Keep this test so a
+# regression that puts the writer back on `_background_tasks` is caught.
 
 
 @pytest.mark.asyncio
@@ -391,12 +388,13 @@ async def test_loop_heartbeat_task_does_not_block_idle():
     r._gateway_started_at = time.time()
 
     r._start_loop_heartbeat_task()
-    await asyncio.sleep(0)  # let the task start
     try:
         assert r._scale_to_zero_has_live_background_work() is False
     finally:
-        r._loop_heartbeat_task.cancel()
-        await asyncio.gather(r._loop_heartbeat_task, return_exceptions=True)
+        handle = r._loop_heartbeat_task
+        if handle is not None:
+            handle.stop()
+            handle.join(timeout=1.0)
 
 
 @pytest.mark.asyncio

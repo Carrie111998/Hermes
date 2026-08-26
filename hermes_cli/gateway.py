@@ -388,21 +388,15 @@ GATEWAY_LOOP_UNKNOWN = "unknown"
 # Heartbeat cadence is 30s (gateway.shutdown_watchdog.DEFAULT_HEARTBEAT_INTERVAL_S).
 # Three missed beats is decisive without false-positiving on one slow write.
 DEFAULT_LOOP_LIVENESS_STALE_AFTER_S = 90.0
+DEFAULT_LOOP_LIVENESS_CONFIRM_S = 1.0
 
 
-def probe_gateway_loop_liveness(
+def _classify_loop_heartbeat(
     pid: int,
     *,
-    stale_after: float = DEFAULT_LOOP_LIVENESS_STALE_AFTER_S,
-    home: Path | None = None,
+    stale_after: float,
+    home: Path | None,
 ) -> str:
-    """Classify a gateway PID's event loop as alive / wedged / unknown.
-
-    Reads the loop-liveness heartbeat file the gateway rewrites every 30s
-    while its loop is dispatching.  Never raises; any ambiguity (missing
-    file, unreadable JSON, PID mismatch) returns ``GATEWAY_LOOP_UNKNOWN``
-    so callers default to the safe graceful-drain path.
-    """
     try:
         stale_budget = max(float(stale_after), 0.0)
     except (TypeError, ValueError):
@@ -417,13 +411,42 @@ def probe_gateway_loop_liveness(
     except Exception:
         return GATEWAY_LOOP_UNKNOWN
     if heartbeat_pid <= 0 or int(pid) <= 0 or heartbeat_pid != int(pid):
-        # No heartbeat for THIS process — old gateway version, still starting
-        # up, or a stale file from a previous PID.  Not evidence of a wedge.
         return GATEWAY_LOOP_UNKNOWN
     age = time.time() - mtime
     if age > stale_budget:
         return GATEWAY_LOOP_WEDGED
     return GATEWAY_LOOP_ALIVE
+
+
+def probe_gateway_loop_liveness(
+    pid: int,
+    *,
+    stale_after: float = DEFAULT_LOOP_LIVENESS_STALE_AFTER_S,
+    home: Path | None = None,
+    confirm_s: float = 0.0,
+) -> str:
+    """Classify a gateway PID's event loop as alive / wedged / unknown.
+
+    Reads the loop-liveness heartbeat file the gateway rewrites every 30s
+    while its loop is dispatching.  Never raises; any ambiguity (missing
+    file, unreadable JSON, PID mismatch) returns ``GATEWAY_LOOP_UNKNOWN``
+    so callers default to the safe graceful-drain path.
+
+    A single stale sample is not enough to escalate (exit 75 / SIGKILL).
+    Pass ``confirm_s > 0`` to re-read after a pause; only two consecutive
+    WEDGED samples confirm a dead loop.
+    """
+    status = _classify_loop_heartbeat(pid, stale_after=stale_after, home=home)
+    if status != GATEWAY_LOOP_WEDGED:
+        return status
+    try:
+        confirm = max(float(confirm_s), 0.0)
+    except (TypeError, ValueError):
+        confirm = 0.0
+    if confirm <= 0:
+        return GATEWAY_LOOP_WEDGED
+    time.sleep(confirm)
+    return _classify_loop_heartbeat(pid, stale_after=stale_after, home=home)
 
 
 def _escalate_wedged_gateway(
@@ -4146,7 +4169,7 @@ def systemd_restart(system: bool = False):
     from gateway.status import get_running_pid
 
     pid = get_running_pid() or _systemd_main_pid(system=system)
-    if pid is not None and probe_gateway_loop_liveness(pid) == GATEWAY_LOOP_WEDGED:
+    if pid is not None and probe_gateway_loop_liveness(pid, confirm_s=DEFAULT_LOOP_LIVENESS_CONFIRM_S) == GATEWAY_LOOP_WEDGED:
         # Health probe says the event loop is provably dead (#81642): SIGUSR1
         # can never drain it, so the graceful wait below would burn the full
         # budget. Bounded escalation (SIGTERM grace → SIGKILL, ~10s) then let
@@ -5385,7 +5408,7 @@ def launchd_restart():
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
-        if pid is not None and probe_gateway_loop_liveness(pid) == GATEWAY_LOOP_WEDGED:
+        if pid is not None and probe_gateway_loop_liveness(pid, confirm_s=DEFAULT_LOOP_LIVENESS_CONFIRM_S) == GATEWAY_LOOP_WEDGED:
             # Health probe says the event loop is provably dead (#81642):
             # the gateway cannot process a graceful shutdown, so waiting the
             # full drain budget only stalls the restart (and `hermes update`

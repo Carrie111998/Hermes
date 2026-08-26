@@ -2690,8 +2690,8 @@ from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     _arm_loop_floor_timer,
     arm_shutdown_watchdog,
-    loop_heartbeat_forever,
     resolve_shutdown_watchdog_delay,
+    start_loop_heartbeat,
     start_loop_liveness_watchdog,
 )
 from gateway.restart import (
@@ -6843,7 +6843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Loop-liveness heartbeat / watchdog handles (#66892, #69089). Class-level
     # defaults so partial construction in tests doesn't blow up on access; the
     # real values are set in __init__ / start() / stop().
-    _loop_heartbeat_task: Optional["asyncio.Task"] = None
+    _loop_heartbeat_task: Optional[Any] = None
     _loop_floor_timer_handle: Optional[Any] = None
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
@@ -7256,11 +7256,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
-        # Event-loop liveness heartbeat (#66892): rewritten every 30s while
-        # the loop is dispatching. External supervisors use the file mtime /
-        # updated_at to distinguish "process alive" from "loop frozen".
+        # Event-loop liveness heartbeat (#66892 / RTC-260): rewritten off-loop
+        # every 30s, gated by a loop tick. External supervisors use the file
+        # mtime / updated_at to distinguish "process alive" from "loop frozen".
         self._gateway_started_at: float = time.time()
-        self._loop_heartbeat_task: Optional[asyncio.Task] = None
+        self._loop_heartbeat_task = None
         self._loop_floor_timer_handle = None
         self._loop_liveness_watchdog = None
 
@@ -12539,7 +12539,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 watchdog.stop()
             except Exception:
-                logger.debug("Failed to stop gateway loop liveness watchdog", exc_info=True)
+                logger.debug("Failed to stop loop liveness watchdog", exc_info=True)
+        heartbeat = getattr(self, "_loop_heartbeat_task", None)
+        self._loop_heartbeat_task = None
+        if heartbeat is not None:
+            stop = getattr(heartbeat, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    logger.debug("Failed to stop loop heartbeat writer", exc_info=True)
 
         floor_timer = getattr(self, "_loop_floor_timer_handle", None)
         self._loop_floor_timer_handle = None
@@ -12581,32 +12590,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return exact, fallback
 
     def _start_loop_heartbeat_task(self) -> None:
-        """Start the loop-liveness heartbeat task (#66892), idempotent.
+        """Arm the off-loop heartbeat writer, gated by a loop tick.
 
-        An asyncio task so a frozen loop stops refreshing
-        ``state/gateway.heartbeat``. Cancelled with the other background
-        tasks during stop(). Best-effort — a liveness probe must never be
-        able to abort startup.
+        The write never runs on the gateway loop (a slow fsync cannot stall
+        it and trip the watchdog). A frozen loop stops ticks, so the file
+        goes stale for CLI probes. The writer is a daemon thread, not an
+        asyncio task, so it cannot pin scale-to-zero idle.
         """
         try:
-            _existing_hb = getattr(self, "_loop_heartbeat_task", None)
-            if _existing_hb is not None and not _existing_hb.done():
+            existing = getattr(self, "_loop_heartbeat_task", None)
+            if existing is not None and getattr(existing, "is_alive", lambda: False)():
                 return
-            self._loop_heartbeat_task = asyncio.create_task(
-                loop_heartbeat_forever(
-                    interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
-                    start_time=getattr(self, "_gateway_started_at", 0.0),
-                )
+            loop = asyncio.get_running_loop()
+            self._loop_heartbeat_task = start_loop_heartbeat(
+                loop,
+                interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
+                start_time=getattr(self, "_gateway_started_at", 0.0) or None,
             )
-            # PERMANENT for the process lifetime, same as a
-            # _spawn_supervised watcher — tag it so
-            # _scale_to_zero_has_live_background_work() doesn't treat an
-            # armed, otherwise-idle gateway as busy forever.
-            self._loop_heartbeat_task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
-            _bg = getattr(self, "_background_tasks", None)
-            if _bg is not None:
-                _bg.add(self._loop_heartbeat_task)
-                self._loop_heartbeat_task.add_done_callback(_bg.discard)
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
 

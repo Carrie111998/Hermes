@@ -7946,13 +7946,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _graceful_ok = False
                         if _main_pid > 0:
                             from hermes_cli.gateway import (
+                                DEFAULT_LOOP_LIVENESS_CONFIRM_S,
                                 GATEWAY_LOOP_WEDGED,
                                 _escalate_wedged_gateway,
                                 probe_gateway_loop_liveness,
                             )
 
                             if (
-                                probe_gateway_loop_liveness(_main_pid)
+                                probe_gateway_loop_liveness(
+                                    _main_pid, confirm_s=DEFAULT_LOOP_LIVENESS_CONFIRM_S
+                                )
                                 == GATEWAY_LOOP_WEDGED
                             ):
                                 # Loop-liveness probe says the gateway's event
@@ -8248,12 +8251,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"(up to {int(_drain_budget)}s)..."
                 )
                 from hermes_cli.gateway import (
+                    DEFAULT_LOOP_LIVENESS_CONFIRM_S,
                     GATEWAY_LOOP_WEDGED,
                     _escalate_wedged_gateway,
                     probe_gateway_loop_liveness,
                 )
 
-                if probe_gateway_loop_liveness(pid) == GATEWAY_LOOP_WEDGED:
+                if probe_gateway_loop_liveness(
+                    pid, confirm_s=DEFAULT_LOOP_LIVENESS_CONFIRM_S
+                ) == GATEWAY_LOOP_WEDGED:
                     # Loop-liveness probe: this gateway's event loop is
                     # provably dead (#81642) — SIGUSR1/SIGTERM shutdown can
                     # never run, so the drain wait would burn the full budget
