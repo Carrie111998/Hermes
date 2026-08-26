@@ -610,6 +610,104 @@ def regenerate_title(
         return None
 
 
+def retitle_session(
+    session_db,
+    session_id: str,
+    conversation_history: Any,
+    *,
+    turns_window: int = 10,
+    force: bool = False,
+    touch_platform_names: bool = False,
+) -> Optional[str]:
+    """Regenerate a session's title from recent history and persist it.
+
+    Shared sync worker for every retitle entry point: the ``maybe_auto_retitle``
+    daemon thread, the ``/retitle`` slash handler (via ``asyncio.to_thread``),
+    and the future ``hermes sessions retitle`` CLI. Writes with
+    ``source="llm"`` — the same tier as the initial auto-title upgrade — so
+    the provenance ladder (``derived < llm < user``) at the storage layer
+    still protects any name the user typed.
+
+    Guards:
+
+    - ``session_db`` missing or ``session_id`` empty → returns None.
+    - Unless ``force=True``, a title of ``user`` provenance is left alone.
+      The CLI's ``--force`` flag is the one place that opts in to overwriting.
+
+    Returns the title persisted, or ``None`` if nothing was written (empty
+    condensed history, model returned nothing, or a higher-authority title
+    held the row). Never raises — this is a daemon-thread target when called
+    from :func:`maybe_auto_retitle`, and an escaping exception would spray a
+    raw traceback into the user's terminal via the default threading
+    excepthook.
+
+    ``touch_platform_names`` is accepted but not acted on here: the platform
+    rename callback lives on the agent and isn't threaded through to this
+    worker. TODO(task-6-or-7): wire the callback when the ``/retitle`` slash
+    handler and turn_context integration land.
+    """
+    if session_db is None or not session_id:
+        return None
+
+    try:
+        # Provenance guard. A user-set title is the only tier we refuse to
+        # overwrite silently — force=True (the CLI opt-in) skips this check.
+        if not force:
+            try:
+                source_fn = getattr(session_db, "get_session_title_source", None)
+                if source_fn is not None:
+                    existing_source = source_fn(session_id)
+                    if existing_source == "user":
+                        logger.debug(
+                            "Retitle skipped: session %s carries a user-set title",
+                            session_id,
+                        )
+                        return None
+            except Exception:
+                # If we can't read provenance, fall through to the write; the
+                # storage layer's own precedence check is the backstop.
+                logger.debug(
+                    "Retitle provenance check failed for %s",
+                    session_id, exc_info=True,
+                )
+
+        # Publish accounting + Portal contexts from the session id we hold,
+        # so the LLM call's token usage and conversation tag land on this
+        # session. Imported lazily to match _auto_title_session's post-update
+        # stale-module hygiene — a daemon thread reloading NEW source here
+        # while agent.portal_tags is still OLD would ImportError forever.
+        from agent.aux_accounting import set_accounting_context
+        from agent.portal_tags import set_conversation_context
+
+        try:
+            conversation_id = session_db.get_conversation_root(session_id) or session_id
+        except Exception:
+            conversation_id = session_id
+        set_conversation_context(conversation_id)
+        set_accounting_context(session_db, session_id)
+
+        condensed = _condense_history(conversation_history, turns_window=turns_window)
+        if not condensed:
+            return None
+
+        title = regenerate_title(condensed)
+        if title is None:
+            return None
+
+        persisted = _persist_session_title(
+            session_db, session_id, title, source="llm"
+        )
+        if persisted is None:
+            return None
+
+        logger.debug("Retitled session %s: %s", session_id, persisted)
+        return persisted
+    except Exception as e:
+        logger.warning("Retitle failed (harmless): %s", e)
+        logger.debug("Retitle traceback", exc_info=True)
+        return None
+
+
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
     """Persist a title at *source* authority, recovering from name collisions.
 
@@ -977,5 +1075,58 @@ def maybe_auto_title(
         },
         daemon=True,
         name="auto-title",
+    )
+    thread.start()
+
+
+def maybe_auto_retitle(
+    session_db,
+    session_id: str,
+    conversation_history: Optional[list] = None,
+    *,
+    auto_at_turn: int = 10,
+    turns_window: int = 10,
+) -> None:
+    """One-shot retitle trigger: fire exactly once at the auto_at_turn mark.
+
+    Called from the per-turn prologue. Uses **exactly-N** semantics — fires
+    when ``user_msg_count == auto_at_turn`` and never fires again for the
+    same session. Reasoning: this is a one-shot checkpoint, not periodic
+    drift. If we used ``>=`` we would re-fire every turn afterwards; if the
+    auto-fire got skipped for any reason (user-set title, disabled surface),
+    we accept "manual retitle via /retitle only" over slow-motion spam.
+
+    Nothing runs on the caller's thread beyond a cheap message count and a
+    daemon-thread spawn. ``auto_at_turn=0`` disables the auto-fire.
+    """
+    if session_db is None or not session_id:
+        return
+
+    # Cheap guards first — the config read (below) is deferred so a long
+    # session doesn't touch the config file every turn.
+    if not _retitle_enabled():
+        return
+    if auto_at_turn <= 0:
+        return
+
+    user_msg_count = sum(
+        1 for m in (conversation_history or []) if _is_real_user_turn(m)
+    )
+    if user_msg_count != auto_at_turn:
+        return
+
+    cfg = _retitle_config()
+    touch = bool(cfg.get("touch_platform_names", False))
+
+    thread = threading.Thread(
+        target=retitle_session,
+        args=(session_db, session_id, conversation_history),
+        kwargs={
+            "turns_window": turns_window,
+            "force": False,  # auto-fire never forces
+            "touch_platform_names": touch,
+        },
+        daemon=True,
+        name="auto-retitle",
     )
     thread.start()

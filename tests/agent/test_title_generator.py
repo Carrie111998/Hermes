@@ -14,6 +14,8 @@ from agent.title_generator import (
     _condense_history,
     _looks_like_title,
     regenerate_title,
+    retitle_session,
+    maybe_auto_retitle,
     MAX_TITLE_INPUT_CHARS,
 )
 from hermes_state import SessionDB
@@ -949,3 +951,235 @@ class TestRegenerateTitle:
 
         user_content = captured["messages"][1]["content"]
         assert len(user_content) == MAX_TITLE_INPUT_CHARS
+
+
+class TestRetitleSession:
+    """Unit tests for retitle_session() — the sync worker."""
+
+    def test_returns_none_when_session_db_is_none(self):
+        assert retitle_session(None, "sess-1", []) is None
+
+    def test_returns_none_when_session_id_is_empty(self):
+        db = MagicMock()
+        assert retitle_session(db, "", []) is None
+        assert retitle_session(db, None, []) is None
+
+    def test_skips_when_user_title_and_not_forced(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "user"
+        with patch("agent.title_generator._persist_session_title") as mock_persist, \
+             patch("agent.title_generator.regenerate_title") as mock_regen:
+            result = retitle_session(db, "sess-1", [{"role": "user", "content": "hi"}])
+        assert result is None
+        mock_persist.assert_not_called()
+        mock_regen.assert_not_called()
+
+    def test_proceeds_when_user_title_and_force_is_true(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "user"
+        db.get_conversation_root.return_value = "sess-1"
+        with patch("agent.title_generator._condense_history", return_value="User: hi\nAssistant: hello"), \
+             patch("agent.title_generator.regenerate_title", return_value="Cool title") as mock_regen, \
+             patch("agent.title_generator._persist_session_title", return_value="Cool title") as mock_persist, \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context"):
+            result = retitle_session(db, "sess-1", [{"role": "user", "content": "hi"}], force=True)
+        assert result == "Cool title"
+        mock_regen.assert_called_once()
+        mock_persist.assert_called_once()
+        # Persist called with source="llm"
+        _, kwargs = mock_persist.call_args
+        assert kwargs.get("source") == "llm"
+
+    def test_condenses_history_and_persists_llm_title(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.return_value = "sess-1"
+        history = [
+            {"role": "user", "content": "postgres pool exhausted"},
+            {"role": "assistant", "content": "let's check settings"},
+        ]
+        with patch("agent.title_generator._condense_history", return_value="User: postgres\nAssistant: check") as mock_cond, \
+             patch("agent.title_generator.regenerate_title", return_value="Debugging Postgres pool") as mock_regen, \
+             patch("agent.title_generator._persist_session_title", return_value="Debugging Postgres pool") as mock_persist, \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context"):
+            result = retitle_session(db, "sess-1", history, turns_window=7)
+
+        assert result == "Debugging Postgres pool"
+        mock_cond.assert_called_once_with(history, turns_window=7)
+        mock_regen.assert_called_once_with("User: postgres\nAssistant: check")
+        args, kwargs = mock_persist.call_args
+        assert args[0] is db
+        assert args[1] == "sess-1"
+        assert args[2] == "Debugging Postgres pool"
+        assert kwargs["source"] == "llm"
+
+    def test_returns_none_when_condensed_empty(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.return_value = "sess-1"
+        with patch("agent.title_generator._condense_history", return_value=""), \
+             patch("agent.title_generator.regenerate_title") as mock_regen, \
+             patch("agent.title_generator._persist_session_title") as mock_persist, \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context"):
+            result = retitle_session(db, "sess-1", [])
+        assert result is None
+        mock_regen.assert_not_called()
+        mock_persist.assert_not_called()
+
+    def test_returns_none_when_regenerate_returns_none(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.return_value = "sess-1"
+        with patch("agent.title_generator._condense_history", return_value="User: hi"), \
+             patch("agent.title_generator.regenerate_title", return_value=None), \
+             patch("agent.title_generator._persist_session_title") as mock_persist, \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context"):
+            result = retitle_session(db, "sess-1", [{"role": "user", "content": "hi"}])
+        assert result is None
+        mock_persist.assert_not_called()
+
+    def test_returns_none_when_persist_returns_none(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.return_value = "sess-1"
+        with patch("agent.title_generator._condense_history", return_value="User: hi"), \
+             patch("agent.title_generator.regenerate_title", return_value="Some title"), \
+             patch("agent.title_generator._persist_session_title", return_value=None), \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context"):
+            result = retitle_session(db, "sess-1", [{"role": "user", "content": "hi"}])
+        assert result is None
+
+    def test_never_raises_on_internal_exception(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.return_value = "sess-1"
+        with patch("agent.title_generator._condense_history", side_effect=RuntimeError("boom")), \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context"):
+            # Must not raise
+            result = retitle_session(db, "sess-1", [{"role": "user", "content": "hi"}])
+        assert result is None
+
+    def test_sets_accounting_and_conversation_context(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.return_value = "root-sess"
+        with patch("agent.title_generator._condense_history", return_value=""), \
+             patch("agent.aux_accounting.set_accounting_context") as mock_acc, \
+             patch("agent.portal_tags.set_conversation_context") as mock_conv:
+            retitle_session(db, "sess-1", [])
+        mock_conv.assert_called_once_with("root-sess")
+        mock_acc.assert_called_once_with(db, "sess-1")
+
+    def test_falls_back_to_session_id_when_conversation_root_raises(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = "llm"
+        db.get_conversation_root.side_effect = RuntimeError("db locked")
+        with patch("agent.title_generator._condense_history", return_value=""), \
+             patch("agent.aux_accounting.set_accounting_context"), \
+             patch("agent.portal_tags.set_conversation_context") as mock_conv:
+            retitle_session(db, "sess-1", [])
+        mock_conv.assert_called_once_with("sess-1")
+
+
+class TestMaybeAutoRetitle:
+    """Tests for maybe_auto_retitle() — one-shot fire-and-forget trigger."""
+
+    def _make_history(self, n_user_turns):
+        """Build a history with n real user turns interleaved with assistant."""
+        history = []
+        for i in range(n_user_turns):
+            history.append({"role": "user", "content": f"user message {i} is a real question"})
+            history.append({"role": "assistant", "content": f"assistant reply {i}"})
+        return history
+
+    def test_returns_early_when_session_db_none(self):
+        with patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(None, "sess-1", self._make_history(10))
+            mock_thread.assert_not_called()
+
+    def test_returns_early_when_session_id_empty(self):
+        db = MagicMock()
+        with patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "", self._make_history(10))
+            mock_thread.assert_not_called()
+
+    def test_returns_early_when_disabled_by_config(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=False), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(10))
+            mock_thread.assert_not_called()
+
+    def test_returns_early_when_auto_at_turn_is_zero(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(10), auto_at_turn=0)
+            mock_thread.assert_not_called()
+
+    def test_fires_thread_at_exactly_10_user_turns(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._retitle_config", return_value={"touch_platform_names": False}), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(10), auto_at_turn=10)
+            assert mock_thread.call_count == 1
+            _, kwargs = mock_thread.call_args
+            assert kwargs["target"] is retitle_session
+            mock_thread.return_value.start.assert_called_once()
+
+    def test_does_not_fire_at_9_user_turns(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._retitle_config", return_value={"touch_platform_names": False}), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(9), auto_at_turn=10)
+            mock_thread.assert_not_called()
+
+    def test_does_not_fire_at_11_user_turns(self):
+        # Exactly-N semantics — one-shot trigger, not "N or more".
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._retitle_config", return_value={"touch_platform_names": False}), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(11), auto_at_turn=10)
+            mock_thread.assert_not_called()
+
+    def test_thread_is_daemon_with_correct_name(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._retitle_config", return_value={"touch_platform_names": False}), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(10), auto_at_turn=10)
+            _, kwargs = mock_thread.call_args
+            assert kwargs["daemon"] is True
+            assert kwargs["name"] == "auto-retitle"
+            # kwargs passed to retitle_session
+            call_kwargs = kwargs["kwargs"]
+            assert call_kwargs["force"] is False
+            assert "turns_window" in call_kwargs
+            assert "touch_platform_names" in call_kwargs
+
+    def test_passes_touch_platform_names_from_config(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._retitle_config", return_value={"touch_platform_names": True}), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(10), auto_at_turn=10)
+            _, kwargs = mock_thread.call_args
+            assert kwargs["kwargs"]["touch_platform_names"] is True
+
+    def test_passes_turns_window_to_thread_kwargs(self):
+        db = MagicMock()
+        with patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._retitle_config", return_value={"touch_platform_names": False}), \
+             patch("agent.title_generator.threading.Thread") as mock_thread:
+            maybe_auto_retitle(db, "sess-1", self._make_history(10), auto_at_turn=10, turns_window=15)
+            _, kwargs = mock_thread.call_args
+            assert kwargs["kwargs"]["turns_window"] == 15
