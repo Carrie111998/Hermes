@@ -1,13 +1,88 @@
 /**
- * Canonical registry route identity for Desktop.
+ * Canonical registry route identity for Desktop — Magnum #94724 Phase 1.
  *
  * Identity is frozen before dialing, while the complete auth/transport
  * envelope still exists. Compatibility callers may reuse the same contract,
  * but must never reconstruct a stronger identity from post-dial metadata.
+ *
+ * Phase 1 adds:
+ *  - branded ConnectionId / ProfileKey (opaque strings)
+ *  - generation-bound RouteKey (connectionId + generation + desktopProfile/targetProfile)
+ *  - discriminated ResolvedRoute (registered vs legacy-unregistered)
+ *  - helpers to mint and validate RouteKey without weakening it downstream
  */
 
 import { normalizeRemoteBaseUrl, normalizeRemoteHeaders, normalizeSshConfig, normAuthMode } from './connection-config'
 import type { ConnectionRegistry, RegistryConnection } from './connection-registry'
+
+// ── Branded ids — makes cross-route aliasing a type error ──────────────────
+export type ConnectionId = string & { readonly __brand: 'ConnectionId' }
+export type ProfileKey = string & { readonly __brand: 'ProfileKey' }
+export function asConnectionId(id: string): ConnectionId {
+  return String(id).trim() as ConnectionId
+}
+export function asProfileKey(profile: string): ProfileKey {
+  return (String(profile || '').trim() || 'default') as ProfileKey
+}
+export function normalizeProfileKeyBranded(profile: unknown): ProfileKey {
+  return asProfileKey(String(profile ?? ''))
+}
+
+// ── RouteKey — immutable, generation-bound (§3.1) ──────────────────────────
+export type RouteKey = Readonly<{
+  connectionId: ConnectionId
+  generation: number
+  desktopProfile: ProfileKey
+  targetProfile: ProfileKey
+}>
+
+// ── ResolvedRoute — registered identity is sticky, legacy is fenceable (§3.1, §11)
+export type RegisteredRoute = Readonly<{
+  kind: 'registered'
+  key: RouteKey
+}>
+export type LegacyRouteIntent = Readonly<{
+  kind: 'legacy'
+  descriptor: StoredRoute
+  provenance: 'environment' | 'profile-v1' | 'settings-v1' | 'unknown'
+}>
+export type ResolvedRoute = LegacyRouteIntent | RegisteredRoute
+export type UnresolvedRoute = Readonly<{ kind: 'unresolved'; reason: string }>
+
+export function makeRouteKey(connection: RegistryConnection, desktopProfile: string): RouteKey {
+  const generation = Number.isInteger((connection as { generation?: unknown }).generation)
+    ? (connection as { generation: number }).generation
+    : 1
+  const desktop = asProfileKey(desktopProfile)
+  // SSH remotes may map desktopProfile → remoteProfile (target namespace)
+  const targetRaw =
+    connection.kind === 'ssh' && String(connection.remoteProfile || '').trim()
+      ? String(connection.remoteProfile).trim()
+      : String(desktopProfile || '').trim() || 'default'
+  return {
+    connectionId: asConnectionId(connection.id),
+    generation,
+    desktopProfile: desktop,
+    targetProfile: asProfileKey(targetRaw)
+  } as RouteKey
+}
+
+export function isRouteKeyCurrent(registry: ConnectionRegistry, key: RouteKey): boolean {
+  const stored = registry.connections.find(c => c.id === (key.connectionId as string))
+  if (!stored) return false
+  const gen = Number.isInteger((stored as { generation?: unknown }).generation)
+    ? (stored as { generation: number }).generation
+    : 1
+  return gen === key.generation
+}
+
+export function routeKeyScopeKey(key: RouteKey): string {
+  // Reuses the same composite language as backendScopeKey for pool/socket maps
+  const conn = key.connectionId as string
+  const profile = key.desktopProfile as string
+  if (!conn || conn === 'local') return profile
+  return `conn:${conn}::${profile}`
+}
 
 interface SshRouteConfig {
   host: string

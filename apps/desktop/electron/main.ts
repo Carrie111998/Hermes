@@ -9089,7 +9089,13 @@ async function saveRegistryConnection(input: any = {}) {
       : input.headers
 
   const merged = mergeConnectionInput({ ...input, token, headers }, existing)
-  const entry = normalizeConnectionInput(merged, registry)
+  let entry = normalizeConnectionInput(merged, registry)
+  // Generation bump: same id slot with different dial material is a new authority.
+  // Stale sockets/results from the prior generation must never overwrite it (§3.1 §20).
+  if (existing && connectionDialFieldsChanged(existing, entry)) {
+    const priorGen = Number.isInteger((existing as { generation?: unknown }).generation) ? (existing as { generation: number }).generation : 1
+    entry = { ...entry, generation: priorGen + 1 }
+  }
 
   // Token-auth remotes must actually have a token to be dialable. OAuth and
   // cloud entries authenticate via cookies/native tokens instead.
