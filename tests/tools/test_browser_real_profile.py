@@ -587,3 +587,29 @@ class TestSnapshotIsCredentialStore:
             dst, err = bc.snapshot_real_profile("chrome", src=str(tmp_path / "real"))
         assert err is None
         assert called.get("p") == dst  # secured through the canonical owner
+
+    def test_snapshot_dir_secured_on_every_launch(self, tmp_path, monkeypatch):
+        """Permissions are re-asserted on refresh, not only on creation.
+
+        _secure_dir is best-effort, so a first attempt that failed must not
+        leave a credential store loose for the rest of its life.
+        """
+        import hermes_cli.browser_connect as bc
+        src = tmp_path / "real" / "Default"
+        src.mkdir(parents=True)
+        (tmp_path / "real" / "Local State").write_text("{}", encoding="utf-8")
+        (src / "Cookies").write_text("db", encoding="utf-8")
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
+
+        seen = []
+        with patch("hermes_cli.config._secure_dir", side_effect=seen.append):
+            dst, _ = bc.snapshot_real_profile("chrome", src=str(tmp_path / "real"))
+            first = list(seen)
+            seen.clear()
+            # Second call takes the refresh path (the copy already exists).
+            bc.snapshot_real_profile("chrome", src=str(tmp_path / "real"))
+
+        assert dst in first
+        assert dst in seen, "refresh path must re-secure the snapshot dir"
+        # The parent holds one entry per browser we keep cookies for.
+        assert os.path.dirname(dst) in seen

@@ -609,9 +609,16 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     dst = real_profile_copy_dir(browser)
     fresh = not os.path.isdir(os.path.join(dst, "Default"))
     try:
+        os.makedirs(dst, exist_ok=True)
+        # Re-assert on EVERY launch, not just on creation. _secure_dir is
+        # best-effort (it swallows and debug-logs), so a first attempt that
+        # failed would otherwise leave a credential store world-readable for
+        # the rest of its life. Also covers a dir created by an older build.
+        # The parent is secured too: makedirs creates browser-profile/ under
+        # the process umask, and it names every browser we hold cookies for.
+        _secure_snapshot_root(os.path.dirname(dst))
+        _secure_snapshot_root(dst)
         if fresh:
-            os.makedirs(dst, exist_ok=True)
-            _secure_snapshot_root(dst)
             try:
                 shutil.copytree(
                     src,
