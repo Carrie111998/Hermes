@@ -617,6 +617,121 @@ class TestPauseResumeJob:
         assert _coherent(pause_job(job["id"], reason="second pause"))
         assert _coherent(resume_job(job["id"]))
 
+    # ---------------------------------------------------------------------
+    # The INCOHERENT legacy shape as an INPUT state.
+    #
+    # Every lockstep test above starts from `paused: True` or from a coherent
+    # record. None of them seeds shape B —
+    #     paused=False + enabled=False + state="paused"
+    # — the "contained job reads as live" half of the hazard, which is the
+    # shape three live rows actually carried on 2026-08-25 (jobflow-tracker-
+    # followup 708527597900, jobflow-tracker-weekly 9a68c6219ff3, tracker-
+    # operator-drain 2eef3807aa71, all in cron/snapshots/jobs-20260825T0420
+    # .json). The fix was PREDICTED to normalise them on their next pause or
+    # resume, and that prediction was never exercised: a sweep wrote the
+    # `paused` key on all three before any of them transitioned, so the store
+    # going coherent is NOT evidence for it. The two remaining rows are
+    # enabled=False under a Gate-2 containment hold, so neither the schedule
+    # path nor the wake channel (scheduler.py:4669 gates on `enabled`) can
+    # move them, and forcing a transition is Diego's call — hence the
+    # prediction is closed here rather than in production.
+    #
+    # Schedules are "every 1h" for hermeticity; the real rows are
+    # `0 10 * * *` and `0 9 * * 1`, and the invariant is schedule-independent.
+    # ---------------------------------------------------------------------
+
+    def _seed_incoherent_legacy_row(self, prompt):
+        """A record in shape B: contained, but its legacy flag says live."""
+        job = create_job(prompt=prompt, schedule="every 1h")
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused": False,
+                "paused_at": "2026-08-24T22:38:18.585988-04:00",
+                "paused_reason": None,
+            },
+        )
+        seeded = get_job(job["id"])
+        # Precondition: the fixture really is the hazard, not a coherent row.
+        assert seeded["paused"] is False
+        assert seeded["state"] == "paused"
+        assert "paused_history" not in seeded
+        return job
+
+    def test_incoherent_legacy_row_normalises_on_resume(self, tmp_cron_dir):
+        """Resuming shape B must produce a fully coherent live record.
+
+        Version-distinguishing on `paused_history`, not on `paused`: the flag
+        is ALREADY False here, so a pre-fix resume would leave it looking
+        right by accident. What a pre-fix resume could not do is archive the
+        pause it was ending — it cleared paused_at/paused_reason outright — so
+        the history entry is the assertion that fails on the old code.
+        """
+        job = self._seed_incoherent_legacy_row("Contained, flag says live")
+
+        resumed = resume_job(job["id"])
+
+        assert resumed["paused"] is False
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["paused_at"] is None
+        assert resumed["paused_reason"] is None
+        assert resumed["paused"] is (resumed["state"] == "paused")
+
+        history = resumed["paused_history"]
+        assert len(history) == 1
+        assert history[0]["paused_at"] == "2026-08-24T22:38:18.585988-04:00"
+        assert history[0]["resumed_at"]
+        # And it survives the round trip to disk, not just the return value.
+        assert get_job(job["id"])["paused_history"] == history
+
+    def test_incoherent_legacy_row_normalises_on_repause(self, tmp_cron_dir):
+        """Re-pausing shape B must lift the flag to True, not leave it False.
+
+        This is the leg that fails loudly on the pre-fix code: pause_job had
+        no `if "paused" in job` mirror, so pausing an already-contained record
+        left `paused: False` sitting next to enabled=False + state="paused" —
+        the hazard preserved verbatim through the very transition that was
+        supposed to clear it.
+
+        A fresh `paused_at` is asserted for a second reason: it is the
+        discriminator that separates a real transition from a sweep that only
+        wrote the `paused` key. A sweep leaves paused_at byte-identical.
+        """
+        job = self._seed_incoherent_legacy_row("Contained, re-contained")
+
+        repaused = pause_job(job["id"], reason="Gate-2 containment, re-applied")
+
+        assert repaused["paused"] is True
+        assert repaused["enabled"] is False
+        assert repaused["state"] == "paused"
+        assert repaused["paused"] is (repaused["state"] == "paused")
+        assert repaused["paused_reason"] == "Gate-2 containment, re-applied"
+        assert repaused["paused_at"] != "2026-08-24T22:38:18.585988-04:00"
+
+    def test_incoherent_legacy_row_stays_coherent_across_a_round_trip(
+        self, tmp_cron_dir
+    ):
+        """Shape B must not re-appear at any later step, in either direction.
+
+        The single-transition tests above prove the first hop normalises. This
+        proves normalisation is a fixed point rather than a one-off: the
+        invariant `paused == (state == "paused")` holds at every step of
+        resume -> pause -> resume -> pause starting FROM the hazard.
+        """
+        job = self._seed_incoherent_legacy_row("Round trip from the hazard")
+
+        def _coherent(record):
+            return record["paused"] is (record["state"] == "paused")
+
+        assert _coherent(resume_job(job["id"]))
+        assert _coherent(pause_job(job["id"], reason="re-contained"))
+        assert _coherent(resume_job(job["id"]))
+        assert _coherent(pause_job(job["id"], reason="re-contained again"))
+        assert _coherent(get_job(job["id"]))
+
     def test_genuinely_paused_records_keep_their_flag(self, tmp_cron_dir):
         """The negative control for the stale-flag sweep.
 
