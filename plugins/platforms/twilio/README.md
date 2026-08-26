@@ -170,6 +170,33 @@ them on).
 
 ## Architecture notes
 
+The plugin is split into three layers so that adding a new channel later
+never requires touching another channel's code:
+
+- **`adapter.py`** — thin `BasePlatformAdapter` glue only. Handles
+  connect/disconnect lifecycle and the `SendResult`/dict shape Hermes
+  expects; contains zero channel-specific logic. It holds a single
+  `_CHANNEL` instance (`RcsChannel()` today) and delegates every
+  channel-specific decision to it.
+- **`channels/`** — one file per channel, each implementing the
+  `MessagingChannel` interface declared in `channels/base.py`
+  (`check_requirements`, `connect_requirements_ok`, `is_connected`,
+  `parse_target_ref`, `validate_target_ref`, `format_message`,
+  `build_send_requests`). `channels/rcs.py` is fully self-contained — the
+  `CONTENT:` directive parsing, the E.164 target regex, and
+  `MAX_RCS_LENGTH` all live only there. A future `channels/sms.py` would
+  be a new file implementing the same interface; it would not edit
+  `rcs.py`, and a bug in one can't reach into the other.
+- **`core/`** — infra genuinely shared across channels: `credentials.py`
+  (Account SID / Auth Token resolution, Basic Auth header) and
+  `messages_api.py` (the POST loop against Twilio's Messages resource —
+  reusable by RCS, and later SMS/MMS/WhatsApp, since they're the same
+  REST resource; **not** applicable to Voice or Email, which use
+  different Twilio/provider APIs and would need their own transport
+  module here).
+
+Other notes:
+
 - `TwilioAdapter.connect()`/`disconnect()` are no-ops (`_mark_connected`/
   `_mark_disconnected` only) — there's nothing to actually connect to.
 - `_standalone_send()` is the primary delivery path in practice, since
@@ -178,21 +205,45 @@ them on).
 - `register(ctx)` in `adapter.py` wires everything into
   `gateway.platform_registry` — no core Hermes files were touched to add
   this plugin (see `website/docs/developer-guide/adding-platform-adapters.md`).
-- The platform is registered under the single name `"twilio"`. If/when a
-  second channel (SMS, WhatsApp, Voice, Email) is added, it'll need its
-  own way to pick a channel per send — nothing in `register_platform()`
-  currently distinguishes channels within one platform name. Worth
-  deciding deliberately (e.g. a channel prefix in the target ref, or
-  separate registered platform names per channel) before adding the next
-  one, rather than bolting it on ad hoc.
+- The platform is registered under the single name `"twilio"`, with one
+  active channel (`_CHANNEL` in `adapter.py`). If/when a second channel
+  (SMS, WhatsApp, Voice, Email) is added, it'll need its own way to pick
+  a channel per send — nothing in `register_platform()` currently
+  distinguishes channels within one platform name, and this refactor
+  only isolates each channel's *code*, not the *selection* between them
+  at send time. Worth deciding deliberately (e.g. a channel prefix in
+  the target ref or message, or separate registered platform names per
+  channel) before wiring in the next one, rather than bolting it on ad
+  hoc.
+
+### Adding a new channel
+
+1. Create `channels/<name>.py` implementing `MessagingChannel` from
+   `channels/base.py`. If it sends via the Messages API resource (SMS,
+   MMS, WhatsApp), reuse `core/messages_api.send_message_requests()` for
+   the actual HTTP call — don't reimplement the POST loop. If it doesn't
+   (Voice, Email), add a new module under `core/` for that transport
+   instead of forcing it through `messages_api.py`.
+2. Do **not** edit `channels/rcs.py` to do this — if you find yourself
+   needing to, the shared piece you need probably belongs in `core/`
+   instead.
+3. Decide and implement the channel-selection strategy in `adapter.py`
+   (see the note above) — this is the one place multi-channel dispatch
+   is expected to live.
 
 ## Files
 
 ```
 twilio/
-  __init__.py           # re-exports register() for plugin discovery
-  plugin.yaml            # kind: platform, env var declarations
-  adapter.py             # TwilioAdapter, _standalone_send, register(ctx)
+  __init__.py              # re-exports register() for plugin discovery
+  plugin.yaml               # kind: platform, env var declarations
+  adapter.py                 # BasePlatformAdapter glue only — no channel logic
+  core/
+    credentials.py           # Account SID/Auth Token resolution, Basic Auth header
+    messages_api.py          # shared POST loop against the Messages API resource
+  channels/
+    base.py                  # MessagingChannel interface every channel implements
+    rcs.py                    # RCS channel — CONTENT: directive, E.164 targets, MAX_RCS_LENGTH
   scripts/
     manage_content.py    # Content API template create/list/get helper
 ```
