@@ -1271,6 +1271,47 @@ _CWD_LOCK_TIMEOUT_FLOOR_SECONDS = 120.0
 _CWD_LOCK_TIMEOUT_MARGIN_SECONDS = 60.0
 
 
+def _cron_job_positive_limit(job: dict, key: str, default: int) -> int:
+    """Return a per-job positive cap, otherwise retain the safe caller default."""
+    raw = job.get(key) if isinstance(job, dict) else None
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron job %s=%r; using default %s", key, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Non-positive cron job %s=%r; using default %s", key, raw, default)
+        return default
+    return value
+
+
+def _cron_job_wall_limit(job: dict) -> Optional[int]:
+    """Return a positive job wall in seconds; invalid/non-positive disables it."""
+    raw = job.get("max_wall_seconds") if isinstance(job, dict) else None
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron job max_wall_seconds=%r; hard wall disabled", raw)
+        return None
+    if value <= 0:
+        logger.warning("Non-positive cron job max_wall_seconds=%r; hard wall disabled", raw)
+        return None
+    return value
+
+
+def _poll_cron_future_once(done, future, abort_if_claim_lost, check_hard_wall):
+    """Consume a completed run before enforcing its wall-clock deadline."""
+    if done:
+        abort_if_claim_lost()
+        return True, future.result()
+    check_hard_wall()
+    return False, None
+
+
 def _cron_inactivity_seconds() -> float:
     """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600.
 
@@ -5224,8 +5265,13 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Max iterations: a positive per-job cap is narrower than the global default.
+        _configured_max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        try:
+            _default_max_iterations = int(_configured_max_iterations)
+        except (TypeError, ValueError):
+            _default_max_iterations = 500
+        max_iterations = _cron_job_positive_limit(job, "max_turns", _default_max_iterations)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -5594,6 +5640,9 @@ def run_job(
         # _touch_activity() on every tool call, API call, and stream delta).
         _cron_timeout = _cron_inactivity_seconds()
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+        # Optional job-local hard wall. Unlike inactivity, active tool loops do
+        # not reset this deadline. Invalid/non-positive values disable the wall.
+        _cron_wall_limit = _cron_job_wall_limit(job)
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
@@ -5620,6 +5669,23 @@ def run_job(
             raise RuntimeError(
                 f"Cron job '{job_name}' lost its durable fire claim ownership"
             )
+
+        def _check_hard_wall() -> None:
+            if _cron_wall_limit is None:
+                return
+            elapsed = time.monotonic() - _audit_t_start
+            if elapsed >= _cron_wall_limit:
+                request_hard_interrupt(agent, "Cron job hard wall budget reached")
+                raise TimeoutError(
+                    f"BUDGET_STOP: cron job '{job_name}' reached its hard wall "
+                    f"budget of {_cron_wall_limit}s"
+                )
+
+        def _next_poll_timeout() -> float:
+            if _cron_wall_limit is None:
+                return _POLL_INTERVAL
+            remaining = _cron_wall_limit - (time.monotonic() - _audit_t_start)
+            return max(0.01, min(_POLL_INTERVAL, remaining))
 
         def _heartbeat_run_claim_if_due():
             nonlocal _last_claim_heartbeat
@@ -5650,15 +5716,20 @@ def run_job(
             if _cron_inactivity_limit is None:
                 # Unlimited — no inactivity watchdog, but a one-shot still
                 # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot or cancel_event is not None:
+                if _is_oneshot or cancel_event is not None or _cron_wall_limit is not None:
                     result = None
                     while True:
                         done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
+                            {_cron_future}, timeout=_next_poll_timeout(),
                         )
-                        if done:
-                            _abort_if_fire_claim_lost()
-                            result = _cron_future.result()
+                        finished, finished_result = _poll_cron_future_once(
+                            done,
+                            _cron_future,
+                            _abort_if_fire_claim_lost,
+                            _check_hard_wall,
+                        )
+                        if finished:
+                            result = finished_result
                             break
                         _abort_if_fire_claim_lost()
                         _heartbeat_run_claim_if_due()
@@ -5668,11 +5739,16 @@ def run_job(
                 result = None
                 while True:
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_next_poll_timeout(),
                     )
-                    if done:
-                        _abort_if_fire_claim_lost()
-                        result = _cron_future.result()
+                    finished, finished_result = _poll_cron_future_once(
+                        done,
+                        _cron_future,
+                        _abort_if_fire_claim_lost,
+                        _check_hard_wall,
+                    )
+                    if finished:
+                        result = finished_result
                         break
                     _abort_if_fire_claim_lost()
                     _heartbeat_run_claim_if_due()
