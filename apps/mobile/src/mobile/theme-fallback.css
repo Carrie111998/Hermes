@@ -157,6 +157,17 @@ html:has([data-overlay-surface]) .mobile-session-drawer-trigger {
   display: none !important;
 }
 
+[data-mobile-master-detail] [hidden] {
+  display: none !important;
+}
+[data-mobile-master-detail] [data-master-detail-list],
+[data-mobile-master-detail] [data-master-detail-detail] {
+  min-height: 0;
+}
+[data-mobile-master-detail] [data-master-detail-select] {
+  min-height: 2.75rem;
+}
+
 /* Bottom actions retain full 44px targets. The old horizontal strip made an
    off-screen action effectively invisible; a compact primary cluster plus More
    keeps the full Desktop status surface reachable without relying on swiping. */
