@@ -24,6 +24,17 @@ Design constraints this module encodes (from the approved IGN-192 design doc
   degrading into a no-op, because a no-op check is indistinguishable from a
   clean result.
 
+Scope of "caller-visible" (IGN-252 blocker #2, board decision recorded
+2026-08-26). Layer A's caller-visible surface is ``result["warnings"]`` plus the
+log line below — the shape approved in design rev 1. That is genuinely visible
+to in-process callers (CLI, cron, delegated) and, on the oneshot path where
+logging is disabled, via the ``--usage-file`` report and stderr. It is
+deliberately *not* serialised onto the HTTP response body: the API-server
+response builders emit only ``final_response``/``usage``/``runtime`` and
+``_sanitize_runtime_metadata`` whitelists keys, so carrying warnings there is a
+public response-schema change that gets its own ticket and its own back-compat
+review rather than riding along on this branch.
+
 Rollback: set ``HERMES_FRONTIER_DOWNGRADE_CHECK`` to a falsey value (or unset
 it). ``git revert`` of the implementing commit is the documented backstop if the
 flag mechanism itself misbehaves.
