@@ -4016,6 +4016,20 @@ class ContextCompressor(ContextEngine):
 
         return result, pruned
 
+    def would_proactively_prune(self, current_tokens: int | None = None) -> bool:
+        """Is the proactive prune configured on AND above its trigger?
+
+        The two state-free preconditions ``prune_tool_results_only`` checks
+        first, published so the host can tell a withheld prune from a no-op.
+        Deliberately not a prediction that a prune would commit: tail size,
+        rearm runway and the reclaim gate need the scan.
+        """
+        if self.proactive_prune_tokens <= 0:
+            return False
+        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
+            return False
+        return True
+
     def prune_tool_results_only(
         self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
@@ -4060,9 +4074,7 @@ class ContextCompressor(ContextEngine):
         Returns ``(messages, 0)`` — the input object — when disabled, below
         the trigger, or when the reclaim gate rejects the commit.
         """
-        if self.proactive_prune_tokens <= 0:
-            return messages, 0
-        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
+        if not self.would_proactively_prune(current_tokens):
             return messages, 0
         # Nothing to reclaim until there are messages outside the protected tail.
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:

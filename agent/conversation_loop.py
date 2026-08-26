@@ -1768,6 +1768,27 @@ def _apply_context_engine_selection(
     return api_messages
 
 
+_checkpoint_gate_warned: set[str] = set()
+
+
+def _warn_checkpoint_gate_suppressed(authority: str) -> None:
+    """Warn once per process per authority the checkpoint gate withholds.
+
+    The suppression itself is re-evaluated on every call; only the log is
+    deduplicated, and per authority so an operator sees which path was lost.
+    """
+    if authority in _checkpoint_gate_warned:
+        return
+    _checkpoint_gate_warned.add(authority)
+    logger.warning(
+        "compression.checkpoint_required is enabled: %s is withheld so the "
+        "checkpoint-gated compressor stays the only lossy authority. If the "
+        "checkpoint provider is unavailable, compaction fails closed and the "
+        "session halts instead of compacting unarchived context.",
+        authority,
+    )
+
+
 def _notify_context_engine_turn_complete(
     agent: Any,
     messages: List[Dict[str, Any]],
@@ -1817,6 +1838,98 @@ def _notify_context_engine_turn_complete(
             getattr(agent, "session_id", None) or "-",
             exc_info=True,
         )
+
+
+def _prune_would_have_run(compressor: Any, current_tokens: int) -> bool:
+    """Only a prune that would have run is a suppressed authority.
+
+    The built-in answers via ``would_proactively_prune()``. An engine that
+    overrides ``prune_tool_results_only`` owns its trigger policy, so occupying
+    the hook is the precondition; the inherited ABC no-op is not an authority.
+    A raising predicate reads as "would have run" — the call was withheld.
+    """
+    _prune = getattr(compressor, "prune_tool_results_only", None)
+    if not callable(_prune):
+        return False
+    try:
+        from agent.context_engine import ContextEngine as _CE
+        if getattr(_prune, "__func__", None) is _CE.prune_tool_results_only:
+            return False
+    except Exception:
+        pass
+    _predicate = getattr(compressor, "would_proactively_prune", None)
+    if not callable(_predicate):
+        return True
+    try:
+        return bool(_predicate(current_tokens))
+    except Exception:
+        logger.debug(
+            "would_proactively_prune() failed; treating the suppressed prune "
+            "as a real reclamation path",
+            exc_info=True,
+        )
+        return True
+
+
+def _proactive_tool_result_prune(
+    agent: Any,
+    compressor: Any,
+    messages: List[Dict[str, Any]],
+    current_tokens: int,
+) -> List[Dict[str, Any]]:
+    """Reclaim re-sent tool output between compactions, or suppress it.
+
+    Returns the pruned list when a prune committed, otherwise the same
+    ``messages`` object. No-op unless ``proactive_prune_tokens`` is configured
+    and ``current_tokens`` is above it; commits only when it reclaims at least
+    ``proactive_prune_min_reclaim_tokens`` (see
+    ``ContextCompressor.prune_tool_results_only``). Under
+    ``compression.checkpoint_required`` it is suppressed entirely: the prune
+    rewrites the durable transcript between compactions, so no checkpoint
+    precedes it. Gating the call site covers plugin engines that override the
+    hook. Suppression, not refusal — the material stays in context until the
+    checkpointed threshold compaction.
+    """
+    if getattr(agent, "compression_checkpoint_required", False) is True:
+        # Suppress unconditionally; count and log only a prune that would have
+        # run (see _prune_would_have_run).
+        if _prune_would_have_run(compressor, current_tokens):
+            agent._checkpoint_gate_suppression_count = (
+                getattr(agent, "_checkpoint_gate_suppression_count", 0) + 1
+            )
+            _warn_checkpoint_gate_suppressed("the proactive tool-result prune")
+        return messages
+
+    # getattr guard: plugin context engines predating the hook and minimal
+    # test doubles (SimpleNamespace compressors) lack the method — treat
+    # absence as a no-op.
+    _prune = getattr(compressor, "prune_tool_results_only", None)
+    if not callable(_prune):
+        return messages
+
+    try:
+        _pruned_msgs, _pruned_n = _prune(messages, current_tokens=current_tokens)
+    except Exception:
+        logger.debug(
+            "proactive tool-result prune failed; skipping",
+            exc_info=True,
+        )
+        return messages
+
+    # Standard no-op caller contract: only commit when the engine returned a
+    # NEW list object with a non-zero count.
+    if _pruned_n and _pruned_msgs is not messages:
+        # Do NOT rebuild conversation_history at the call site. The compressor
+        # atomically rewrites the active transcript with the durable rearm
+        # threshold, then stamps every returned row with _DB_PERSISTED_MARKER,
+        # so the marker-based flush dedup (see _flush_messages_to_session_db)
+        # prevents duplicate writes. Calling
+        # conversation_history_after_compression (a compaction-only helper
+        # keyed on the _last_compaction_in_place flag) would be a no-op at
+        # best, and on a stale in-place flag could seed the turn's fresh,
+        # not-yet-persisted rows into history_ids and skip writing them.
+        return _pruned_msgs
+    return messages
 
 
 def run_conversation(
@@ -7608,44 +7721,11 @@ def run_conversation(
                         )
                     # Proactive tool-result prune: reclaim re-sent history on
                     # large-window models long before should_compress() (≈50% of
-                    # the window) would ever fire. Deterministic, no LLM call;
-                    # protects the recent tail. No-op unless proactive_prune_tokens
-                    # is configured and _real_tokens is above it — and even then
-                    # the prune only commits when it reclaims at least
-                    # proactive_prune_min_reclaim_tokens, so prompt-cache breaks
-                    # stay episodic like compression's (the one sanctioned cache
-                    # break) instead of firing every tool iteration. See
-                    # ContextCompressor.prune_tool_results_only.
-                    # getattr guard: plugin context engines predating the hook and
-                    # minimal test doubles (SimpleNamespace compressors) lack the
-                    # method — treat absence as a no-op.
-                    _prune = getattr(_compressor, "prune_tool_results_only", None)
-                    if callable(_prune):
-                        try:
-                            _pruned_msgs, _pruned_n = _prune(
-                                messages, current_tokens=_real_tokens
-                            )
-                        except Exception:
-                            logger.debug(
-                                "proactive tool-result prune failed; skipping",
-                                exc_info=True,
-                            )
-                            _pruned_msgs, _pruned_n = messages, 0
-                        # Standard no-op caller contract: only commit when the
-                        # engine returned a NEW list object with a non-zero count.
-                        if _pruned_n and _pruned_msgs is not messages:
-                            # Do NOT rebuild conversation_history here. The compressor
-                            # atomically rewrites the active transcript with the durable
-                            # rearm threshold, then stamps every returned row with
-                            # _DB_PERSISTED_MARKER, so the marker-based flush dedup (see
-                            # _flush_messages_to_session_db) prevents duplicate writes.
-                            # Calling
-                            # conversation_history_after_compression (a compaction-only
-                            # helper keyed on the _last_compaction_in_place flag) would be
-                            # a no-op at best, and on a stale in-place flag could seed
-                            # this turn's fresh, not-yet-persisted rows into history_ids
-                            # and skip writing them.
-                            messages = _pruned_msgs
+                    # the window) would ever fire — suppressed entirely while
+                    # compression.checkpoint_required is armed.
+                    messages = _proactive_tool_result_prune(
+                        agent, _compressor, messages, _real_tokens
+                    )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

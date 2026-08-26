@@ -581,3 +581,262 @@ def test_explicit_declaration_overrides_inference():
 
     assert engine_compacts_outside_compress(_AutoAttributeEngine())[0] is True
 
+
+# --- Proactive tool-result prune (agent/conversation_loop.py) -------------
+
+
+class _CountingPruneCompressor:
+    """Built-in-shaped compressor double: counts instead of asserting, because
+    the call site swallows exceptions. Publishes ``would_proactively_prune``
+    with a configured trigger by default (a suppression counts only when a
+    prune would have run)."""
+
+    def __init__(self, proactive_prune_tokens: int = 48_000):
+        self.calls = 0
+        self.proactive_prune_tokens = proactive_prune_tokens
+
+    def would_proactively_prune(self, current_tokens=None):
+        if self.proactive_prune_tokens <= 0:
+            return False
+        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
+            return False
+        return True
+
+    def prune_tool_results_only(self, messages, current_tokens=None):
+        self.calls += 1
+        return list(messages) + [{"role": "system", "content": "pruned"}], 3
+
+
+def _prune_agent(checkpoint_required: bool):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(compression_checkpoint_required=checkpoint_required)
+
+
+def test_proactive_prune_is_suppressed_when_checkpoint_required():
+    """The gate reaches the prune and the transcript survives intact:
+    suppression, not refusal."""
+    from agent.conversation_loop import _proactive_tool_result_prune
+
+    compressor = _CountingPruneCompressor()
+    messages = [{"role": "user", "content": "scan"}]
+    agent = _prune_agent(True)
+
+    result = _proactive_tool_result_prune(agent, compressor, messages, 400_000)
+
+    assert compressor.calls == 0
+    assert result is messages
+    assert agent._checkpoint_gate_suppression_count == 1
+
+
+def test_proactive_prune_still_runs_when_gate_is_off():
+    """Sabotage control: gate off, the harness really reaches the prune."""
+    from agent.conversation_loop import _proactive_tool_result_prune
+
+    compressor = _CountingPruneCompressor()
+    messages = [{"role": "user", "content": "scan"}]
+
+    result = _proactive_tool_result_prune(
+        _prune_agent(False), compressor, messages, 400_000
+    )
+
+    assert compressor.calls == 1
+    assert result is not messages
+    assert result[-1]["content"] == "pruned"
+
+
+def test_engine_override_of_prune_is_suppressed_too():
+    """One call site covers the built-in and every engine overriding the hook."""
+    from agent.conversation_loop import _proactive_tool_result_prune
+
+    compress_only, _turn_complete = _engine_stubs()
+
+    class _PruningEngine(compress_only):
+        calls = 0
+
+        def prune_tool_results_only(self, messages, current_tokens=None):
+            type(self).calls += 1
+            return list(messages), 3
+
+    engine = _PruningEngine()
+    messages = [{"role": "user", "content": "scan"}]
+    agent = _prune_agent(True)
+
+    assert _proactive_tool_result_prune(agent, engine, messages, 400_000) is messages
+    assert _PruningEngine.calls == 0
+    # An overriding engine owns its trigger policy; the host would have
+    # dispatched the hook, so this suppression IS reported.
+    assert agent._checkpoint_gate_suppression_count == 1
+
+    # Same engine, gate off: the override is reached (sabotage control).
+    _proactive_tool_result_prune(_prune_agent(False), engine, messages, 400_000)
+    assert _PruningEngine.calls == 1
+
+
+def test_prune_suppression_logs_once_and_names_the_availability_consequence(
+    caplog, monkeypatch,
+):
+    """One warning per process, naming the trade: with compaction fail-closed,
+    a checkpoint-provider outage halts the session."""
+    import logging
+
+    from agent import conversation_loop
+    from agent.conversation_loop import _proactive_tool_result_prune
+
+    monkeypatch.setattr(
+        conversation_loop, "_checkpoint_gate_warned", set(), raising=True
+    )
+    compressor = _CountingPruneCompressor()
+    agent = _prune_agent(True)
+
+    with caplog.at_level(logging.WARNING, logger=conversation_loop.__name__):
+        for _ in range(2):
+            _proactive_tool_result_prune(agent, compressor, [], 400_000)
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "checkpoint_required" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "tool-result prune" in message
+    assert "halt" in message
+    # Suppression itself is re-evaluated every call — only the log is deduped.
+    assert agent._checkpoint_gate_suppression_count == 2
+
+
+def _prune_warnings(caplog):
+    import logging
+
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "tool-result prune" in r.getMessage()
+    ]
+
+
+def test_disabled_prune_is_not_reported_as_a_suppressed_authority(
+    caplog, monkeypatch,
+):
+    """The shipping default (``proactive_prune_tokens: 0``) suppresses nothing,
+    so it must report nothing."""
+    import logging
+
+    from agent import conversation_loop
+    from agent.conversation_loop import _proactive_tool_result_prune
+
+    monkeypatch.setattr(
+        conversation_loop, "_checkpoint_gate_warned", set(), raising=True
+    )
+    compressor = _CountingPruneCompressor(proactive_prune_tokens=0)
+    messages = [{"role": "user", "content": "scan"}]
+    agent = _prune_agent(True)
+
+    with caplog.at_level(logging.WARNING, logger=conversation_loop.__name__):
+        result = _proactive_tool_result_prune(agent, compressor, messages, 400_000)
+
+    # Still suppressed: the prune is not reached and the transcript is intact.
+    assert compressor.calls == 0
+    assert result is messages
+    # ...but nothing was withheld, so nothing is reported.
+    assert getattr(agent, "_checkpoint_gate_suppression_count", 0) == 0
+    assert _prune_warnings(caplog) == []
+
+
+def test_prune_below_its_trigger_is_not_reported_as_a_suppressed_authority(
+    caplog, monkeypatch,
+):
+    """Configured but below the trigger is equally a non-event: the withheld
+    call would have returned the input untouched."""
+    import logging
+
+    from agent import conversation_loop
+    from agent.conversation_loop import _proactive_tool_result_prune
+
+    monkeypatch.setattr(
+        conversation_loop, "_checkpoint_gate_warned", set(), raising=True
+    )
+    compressor = _CountingPruneCompressor(proactive_prune_tokens=400_000)
+    agent = _prune_agent(True)
+
+    with caplog.at_level(logging.WARNING, logger=conversation_loop.__name__):
+        _proactive_tool_result_prune(agent, compressor, [], 399_999)
+
+    assert getattr(agent, "_checkpoint_gate_suppression_count", 0) == 0
+    assert _prune_warnings(caplog) == []
+
+    # One token more and the same compressor IS a suppressed authority: the
+    # threshold, not the harness, decided above.
+    with caplog.at_level(logging.WARNING, logger=conversation_loop.__name__):
+        _proactive_tool_result_prune(agent, compressor, [], 400_000)
+
+    assert agent._checkpoint_gate_suppression_count == 1
+    assert len(_prune_warnings(caplog)) == 1
+
+
+def test_would_proactively_prune_is_the_compressors_own_precondition():
+    """The predicate is answered by the real ``ContextCompressor`` (not a
+    double), so the host's report cannot drift from the compressor's trigger."""
+    from unittest.mock import patch
+
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_loop import _prune_would_have_run
+
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=1_000_000
+    ):
+        default = ContextCompressor(model="test", quiet_mode=True)
+        configured = ContextCompressor(
+            model="test", quiet_mode=True, proactive_prune_tokens=48_000
+        )
+
+    # Shipping default: opt-in, so off.
+    assert default.proactive_prune_tokens == 0
+    assert default.would_proactively_prune(400_000) is False
+    assert _prune_would_have_run(default, 400_000) is False
+
+    assert configured.would_proactively_prune(47_999) is False
+    assert configured.would_proactively_prune(48_000) is True
+    assert _prune_would_have_run(configured, 47_999) is False
+    assert _prune_would_have_run(configured, 48_000) is True
+
+    # An unknown token count cannot rule the prune out; the prune proceeds on None.
+    assert configured.would_proactively_prune(None) is True
+
+
+def test_prune_hookless_and_broken_predicate_shapes_are_handled():
+    """No hook = no authority; a raising predicate reads as "would have run"
+    (the call was withheld) rather than silencing the report."""
+    from types import SimpleNamespace
+
+    from agent.conversation_loop import _prune_would_have_run
+
+    assert _prune_would_have_run(SimpleNamespace(), 400_000) is False
+
+    class _BrokenPredicate:
+        def would_proactively_prune(self, current_tokens=None):
+            raise RuntimeError("engine blew up")
+
+        def prune_tool_results_only(self, messages, current_tokens=None):
+            return messages, 0
+
+    assert _prune_would_have_run(_BrokenPredicate(), 400_000) is True
+
+
+def test_engine_that_never_overrode_the_prune_hook_is_not_a_suppressed_authority():
+    """The inherited ABC no-op is not an authority the gate withheld; the
+    ``__func__`` identity check tells occupancy from inheritance."""
+    from agent.conversation_loop import _prune_would_have_run
+
+    compress_only, _turn_complete = _engine_stubs()
+
+    class _InheritsTheDefault(compress_only):
+        pass
+
+    class _OccupiesTheHook(compress_only):
+        def prune_tool_results_only(self, messages, current_tokens=None):
+            return list(messages), 1
+
+    assert _prune_would_have_run(_InheritsTheDefault(), 400_000) is False
+    assert _prune_would_have_run(_OccupiesTheHook(), 400_000) is True
