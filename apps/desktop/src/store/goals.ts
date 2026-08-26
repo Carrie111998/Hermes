@@ -3,6 +3,8 @@ import { atom } from 'nanostores'
 import { keyedTimeouts } from '@/lib/keyed-timeouts'
 
 import { $gateway } from './gateway'
+import { isSessionNotFoundError, isSessionRpcBlocked, markSessionRpcBlocked } from './session-rpc-guard'
+import { requestForOwnedSession } from './session-states'
 
 export type GoalStatus = 'active' | 'done' | 'paused' | 'waiting'
 
@@ -163,15 +165,26 @@ export function applyGoalStatusText(sid: string, text: string, opts?: { hydrate?
 export async function refreshSessionGoal(sid: string): Promise<void> {
   const gateway = $gateway.get()
 
-  if (!sid || !gateway) {
+  if (!sid || !gateway || isSessionRpcBlocked(sid)) {
     return
   }
 
   try {
-    const result = await gateway.request<{ output?: string }>('slash.exec', { command: 'goal status', session_id: sid })
+    const ambientRequest = <T>(method: string, params?: Record<string, unknown>) =>
+      gateway.request<T>(method, params ?? {})
+    const result = await requestForOwnedSession<{ output?: string }>(
+      sid,
+      ambientRequest,
+      'slash.exec',
+      { command: 'goal status', session_id: sid }
+    )
 
     applyGoalStatusText(sid, result?.output ?? '', { hydrate: true })
-  } catch {
+  } catch (error) {
+    if (isSessionNotFoundError(error)) {
+      markSessionRpcBlocked(sid)
+    }
+
     // Best-effort: older gateways or detached sessions simply won't hydrate it.
   }
 }

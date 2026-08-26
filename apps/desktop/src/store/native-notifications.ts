@@ -7,6 +7,7 @@ import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
 import { clearApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
+import { isSessionNotFoundError, markSessionRpcBlocked } from './session-rpc-guard'
 import { requestForOwnedSession } from './session-states'
 
 export type { HermesOpenTarget }
@@ -373,7 +374,11 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
       { choice, session_id: sessionId ?? undefined }
     )
     clearApprovalRequest(sessionId)
-  } catch {
+  } catch (error) {
+    if (isSessionNotFoundError(error)) {
+      markSessionRpcBlocked(sessionId)
+    }
+
     // Leave the prompt parked so the user can still resolve it in-app.
   }
 }

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { isSessionRpcBlocked, markSessionRpcBlocked, resetSessionRpcGuard } from './session-rpc-guard'
+
 // Regression coverage for the #89206 wake-failure class: session-scoped RPCs
 // routed to a backend that does not own the session's profile. Three layers:
 //   1. The registry publishes the ACTIVE route's profile ($activeGatewayRoute)
@@ -105,6 +107,7 @@ beforeEach(() => {
   secondaryGateways.length = 0
   promptAckStatus = null
   $connectionsRegistry.set(null)
+  resetSessionRpcGuard()
   configureGatewayRegistry({ onEvent: vi.fn() })
   closeSecondaryGateways()
 })
@@ -112,6 +115,7 @@ beforeEach(() => {
 afterEach(() => {
   closeSecondaryGateways()
   vi.clearAllMocks()
+  resetSessionRpcGuard()
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
 })
 
@@ -179,6 +183,29 @@ describe('sessionRpcNeedsProfileRoute', () => {
 })
 
 describe('requestForSessionProfile', () => {
+  it('clears a dead-runtime latch only after a successful resume or activate', async () => {
+    const ambient = vi.fn(async () => ({ session_id: 'rt-rebound' }))
+
+    markSessionRpcBlocked('rt-rebound')
+    expect(isSessionRpcBlocked('rt-rebound')).toBe(true)
+
+    await requestForSessionProfile(null, ambient as never, 'session.activate', { session_id: 'rt-rebound' })
+    expect(isSessionRpcBlocked('rt-rebound')).toBe(false)
+
+    markSessionRpcBlocked('rt-rebound')
+    await expect(
+      requestForSessionProfile(
+        null,
+        vi.fn(async () => {
+          throw new Error('resume failed')
+        }) as never,
+        'session.resume',
+        { session_id: 'rt-rebound' }
+      )
+    ).rejects.toThrow('resume failed')
+    expect(isSessionRpcBlocked('rt-rebound')).toBe(true)
+  })
+
   it('keeps routing a bare profile owner through its legacy profile pool when a connection registry exists', async () => {
     // A profile pick on the primary or the explicit `local` source takes the
     // legacy profile-only door (store/profile activateOnCurrentSource), so a

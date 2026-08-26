@@ -1,11 +1,16 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { $goalsBySession, applyGoalStatusText, clearSessionGoal } from './goals'
+import { $gateway } from './gateway'
+import { $goalsBySession, applyGoalStatusText, clearSessionGoal, refreshSessionGoal } from './goals'
+import { resetSessionRpcGuard } from './session-rpc-guard'
 
 describe('goal store', () => {
   afterEach(() => {
     vi.useRealTimers()
     $goalsBySession.set({})
+    $gateway.set(null as never)
+    resetSessionRpcGuard()
   })
 
   it('stores active goals from /goal output', () => {
@@ -106,5 +111,18 @@ describe('goal store', () => {
     applyGoalStatusText('s2', '⏸ Goal (paused, 20/20 turns): other work', { hydrate: true })
 
     expect($goalsBySession.get().s2).toMatchObject({ status: 'paused', title: 'other work' })
+  })
+
+  it('does not retry goal hydration for a runtime rejected as session-not-found', async () => {
+    const request = vi.fn(async () => {
+      throw new JsonRpcGatewayError('session not found', { code: 4001 })
+    })
+
+    $gateway.set({ request } as never)
+
+    await refreshSessionGoal('dead-runtime')
+    await refreshSessionGoal('dead-runtime')
+
+    expect(request).toHaveBeenCalledTimes(1)
   })
 })

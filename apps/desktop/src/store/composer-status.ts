@@ -1,4 +1,3 @@
-import { JsonRpcGatewayError } from '@hermes/shared'
 import { atom, computed } from 'nanostores'
 
 import { translateNow } from '@/i18n'
@@ -10,7 +9,13 @@ import { $goalsBySession, type GoalStatus } from './goals'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
 import { $sessions, lineageAliases } from './session'
-import { $sessionStates } from './session-states'
+import {
+  isSessionNotFoundError,
+  isSessionRpcBlocked,
+  markSessionRpcBlocked,
+  resetSessionRpcGuard
+} from './session-rpc-guard'
+import { $sessionStates, requestForOwnedSession } from './session-states'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
@@ -378,67 +383,39 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
   writeBackground(sid, next)
 }
 
-/** Session ids the gateway has told us are gone. A session-scoped RPC against a
- *  runtime the gateway no longer holds fails 4001 "session not found" — a
- *  TERMINAL condition, not the transient socket loss the catch below assumes.
- *
- *  The status stack re-polls `process.list` every 5s while a running row is on
- *  screen, so treating 4001 as transient meant re-sending the same dead id
- *  forever: one runtime id accumulated 18,614 gateway rejections in a single day
- *  (#94219 fallout). Latch the id here and skip it until something rebinds it. */
-const goneSessions = new Set<string>()
-
-/** Gateway JSON-RPC code for "session not found" (tui_gateway _sess_nowait). */
-const GATEWAY_SESSION_NOT_FOUND_CODE = 4001
-
-/** A gone session is unrecoverable for THIS runtime id; a timeout or transport
- *  blip is not. Only the former may stop the poll — misclassifying a transient
- *  failure would silently freeze the status stack on a healthy session.
- *
- *  Match the gateway's 4001 code when the error carries one (JsonRpcGatewayError
- *  from a structured RPC rejection) — a message substring alone could latch on
- *  an unrelated error class that merely mentions "session not found" (e.g. a
- *  wrapped tool/report string). The message fallback survives only for errors
- *  with no numeric code at all, where the frame's structure was lost. */
-export function isSessionGoneForBackgroundPolling(error: unknown): boolean {
-  if (error instanceof JsonRpcGatewayError && typeof error.code === 'number') {
-    return error.code === GATEWAY_SESSION_NOT_FOUND_CODE
-  }
-
-  const message = error instanceof Error ? error.message : String(error ?? '')
-
-  return /session not found/i.test(message)
-}
+/** Compatibility export for the status-stack tests and callers. */
+export const isSessionGoneForBackgroundPolling = isSessionNotFoundError
 
 /** Clear the gone-latch. Called with a session id when a fresh runtime binds to
  *  it (so polling resumes), or with no argument to reset everything (tests). */
 export function resetBackgroundPollingGuard(sid?: string): void {
-  if (sid) {
-    goneSessions.delete(sid)
-
-    return
-  }
-
-  goneSessions.clear()
+  resetSessionRpcGuard(sid)
 }
 
 /** Pull the session's live process snapshot from the gateway. */
 export async function refreshBackgroundProcesses(sid: string): Promise<void> {
   const gateway = $gateway.get()
 
-  if (!sid || !gateway || goneSessions.has(sid)) {
+  if (!sid || !gateway || isSessionRpcBlocked(sid)) {
     return
   }
 
   try {
-    const result = await gateway.request<{ processes?: GatewayProcessEntry[] }>('process.list', { session_id: sid })
+    const ambientRequest = <T>(method: string, params?: Record<string, unknown>) =>
+      gateway.request<T>(method, params ?? {})
+    const result = await requestForOwnedSession<{ processes?: GatewayProcessEntry[] }>(
+      sid,
+      ambientRequest,
+      'process.list',
+      { session_id: sid }
+    )
 
     reconcileBackgroundProcesses(sid, result?.processes ?? [])
   } catch (error) {
     // A gone session never comes back under this runtime id: stop polling it,
     // or the 5s timer hammers the gateway with 4001s for the window's lifetime.
     if (isSessionGoneForBackgroundPolling(error)) {
-      goneSessions.add(sid)
+      markSessionRpcBlocked(sid)
 
       return
     }
@@ -468,10 +445,34 @@ export function dismissBackgroundProcess(sid: string, id: string) {
  *  row while the process lived on, stranding rogue tasks. On failure the row
  *  stays so the user can retry / see it didn't die. */
 export async function stopBackgroundProcess(sid: string, id: string): Promise<void> {
+  const gateway = $gateway.get()
+
+  if (isSessionRpcBlocked(sid)) {
+    // The backend has already declared this runtime gone, so there is no
+    // authoritative process left to kill through this session. Remove the
+    // stale local row instead of leaving the Stop button permanently inert.
+    dismissBackgroundProcess(sid, id)
+
+    return
+  }
+
+  if (!gateway) {
+    return
+  }
+
   try {
-    await $gateway.get()?.request('process.kill', { process_id: id, session_id: sid })
+    const ambientRequest = <T>(method: string, params?: Record<string, unknown>) =>
+      gateway.request<T>(method, params ?? {})
+    await requestForOwnedSession(sid, ambientRequest, 'process.kill', { process_id: id, session_id: sid })
     dismissBackgroundProcess(sid, id)
   } catch (err) {
+    if (isSessionGoneForBackgroundPolling(err)) {
+      dismissBackgroundProcess(sid, id)
+      markSessionRpcBlocked(sid)
+
+      return
+    }
+
     notifyError(err, 'Could not stop the process')
   }
 }
@@ -498,7 +499,18 @@ export function resetSessionBackground(sid: string) {
     dismissed.add(item.id)
 
     if (item.state === 'running') {
-      void gateway?.request('process.kill', { process_id: item.id, session_id: sid }).catch(() => undefined)
+      if (gateway && !isSessionRpcBlocked(sid)) {
+        const ambientRequest = <T>(method: string, params?: Record<string, unknown>) =>
+          gateway.request<T>(method, params ?? {})
+        void requestForOwnedSession(sid, ambientRequest, 'process.kill', {
+          process_id: item.id,
+          session_id: sid
+        }).catch(error => {
+          if (isSessionGoneForBackgroundPolling(error)) {
+            markSessionRpcBlocked(sid)
+          }
+        })
+      }
     }
   }
 
