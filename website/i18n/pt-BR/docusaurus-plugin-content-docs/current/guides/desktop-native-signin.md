@@ -12,8 +12,10 @@ formas:
 
 1. **Login nativo (RFC 8252)** — o app abre seu **navegador real do sistema**,
    você aprova no navegador em que já confia, e o app recebe tokens que
-   armazena no keychain do seu sistema operacional. **Sem webview embutida, sem cookies
-   de sessão do navegador.** Este é o padrão sempre que o gateway o suporta.
+   armazena como arquivos owner-only no diretório user-data do app (opcionalmente criptografados
+   com o keychain do SO — Settings → Gateway). **Sem webview embutida, sem
+   cookies de sessão do navegador.** Este é o padrão sempre que o gateway
+   suporta.
 2. **Login embutido (fallback legado)** — o app abre uma pequena janela de navegador
    embutida no app e captura o cookie de sessão do gateway. Usado automaticamente
    quando o gateway é uma versão mais antiga que não anuncia o login nativo.
@@ -37,8 +39,9 @@ Especificamente para o Hermes, o login nativo significa:
   Firefox / Edge — o que você usar — com seus logins, extensões e
   passkeys intactos.
 - **Sem cookies de sessão.** O app mantém um **access token** OAuth (de vida curta)
-  e um **refresh token**, criptografados em repouso via o keychain do seu sistema operacional (`safeStorage`
-  do Electron). Chamadas REST e tickets de WebSocket são autenticados com um
+  e um **refresh token**, armazenados como arquivos owner-only — criptografados at-rest via
+  keychain do SO (`safeStorage` do Electron) quando o toggle opt-in de keychain em
+  Settings → Gateway está ligado. Chamadas REST e tickets de WebSocket são autenticados com um
   header `Authorization: Bearer`, não com um cookie jar.
 
 ## Como funciona {#how-it-works}
@@ -53,7 +56,7 @@ Desktop app                Gateway (/auth/native/*)          Nous Portal (IDP)
    │ ◄─ 302 127.0.0.1/cb?code=… ─┘
    │ 4. POST /auth/native/token (code + PKCE verifier)
    │ ◄─ 5. { access_token, refresh_token, expires_at } ───────┘
-   │ 6. store in OS keychain; use Bearer for REST + WS tickets
+   │ 6. store in local token store; use Bearer for REST + WS tickets
 ```
 
 O gateway **intermedia** o fluxo: ele é o servidor de autorização *para o
@@ -88,11 +91,11 @@ de segurança bloqueia o listener loopback, ou você fecha a aba do navegador �
   toda chamada REST e ao emitir um ticket de WebSocket.
 - **Refresh token**: de vida mais longa, rotativo. Quando o access token está perto de
   expirar, o app chama `/auth/native/refresh` para rotacionar ambos os tokens, então
-  atualiza o keychain.
+  atualiza seu token store.
 - **Expiração terminal**: se o refresh token está morto (expirado / revogado / com
   reuso detectado), o app limpa seus tokens armazenados e solicita um novo
   login.
-- **Sign out**: limpa tanto os tokens nativos (keychain) quanto qualquer cookie de sessão
+- **Sign out**: limpa tanto os tokens nativos armazenados quanto qualquer cookie de sessão
   legado para aquele gateway.
 
 ## Para operadores de gateway {#for-gateway-operators}

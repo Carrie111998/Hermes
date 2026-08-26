@@ -52,8 +52,8 @@ Se `web.backend` não estiver definido, o backend é detectado automaticamente a
 
 O Hermes inclui automação completa de browser com várias opções de backend para navegar em sites, preencher formulários e extrair informações:
 
-- **Browserbase** — Browsers gerenciados na nuvem com ferramentas anti-bot, resolução de CAPTCHA e proxies residenciais
-- **Browser Use** — Provedor alternativo de browser na nuvem
+- **Browser Use Cloud** — Chromium gerenciado com stealth, proxies residenciais, resolução de CAPTCHA e profiles de browser reutilizáveis
+- **Browserbase** — Provedor alternativo de browser na nuvem com browsers gerenciados, ferramentas anti-bot, resolução de CAPTCHA e proxies residenciais
 - **CDP local Chromium-family** — Conecte ao seu Chrome, Brave, Chromium ou Edge em execução usando `/browser connect`
 - **Chromium local** — Browser local headless via CLI `agent-browser`
 

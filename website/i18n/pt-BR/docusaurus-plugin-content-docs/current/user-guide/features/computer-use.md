@@ -148,6 +148,19 @@ do manifest falha closed dentro do cua-driver. Um manifest faltando ou ilegível
 falha ruidosamente no início da sessão em vez de dar downgrade silencioso. YOLO da sessão
 ainda sobrescreve bounded para aquela sessão.
 
+No macOS, daemons de sessão privada lançam pelo bundle
+`CuaDriver.app` instalado (para que grants de permissão atribuam à identidade
+própria do driver em vez de resetar a cada build do Hermes), e o Hermes verifica
+a assinatura de código do bundle — identificador exato `com.trycua.driver` e o
+team de signing oficial — antes de lançá-lo. Se você builda cua-driver do
+source (unsigned), opt in explicitamente:
+
+```yaml
+# config.yaml
+computer_use:
+  allow_unsigned_driver: true   # local driver development only
+```
+
 Cada transporte MCP possui uma sessão de lifecycle privada dentro do runtime. Um
 nome de sessão público é só um label para identidade de cursor e estado
 escopado à sessão. Não seleciona, compartilha ou mantém um runtime vivo. Desligar `/yolo`,
@@ -215,6 +228,15 @@ execução Hermes declara um **session name** público cua-driver (algo como
 `hermes-3a7b9c14d2e8`). O nome rotula identidade de cursor e estado relacionado, então
 execuções e subagentes concorrentes ganham cursores distintos. O transporte MCP possui a
 sessão de lifecycle privada dentro do runtime; o nome público não.
+
+O cursor overlay é cosmético — captures, clicks e typing funcionam
+sem ele. O Hermes o desabilita automaticamente onde é failure mode
+conhecido: macOS (idle CPU burn), Linux headless / WSL2 / containers, e
+**desktops Linux X11** (o overlay é uma janela fullscreen always-on-top
+que pode ficar stuck sobre todo workspace após fim de sessão unclean,
+wedging input do desktop). Linux Wayland e Windows mantêm o overlay. Defina
+`computer_use.no_overlay: false` em `config.yaml` para forçar o cursor em
+(ou `true` para forçá-lo off) em qualquer plataforma.
 
 Ajuste o cursor com flags CLI do `cua-driver` ou a ferramenta MCP runtime
 `set_agent_cursor_style` — veja
@@ -300,6 +322,17 @@ salvo.
 
 Só os 20 arquivos de captura mais recentes são mantidos, e screenshots
 nunca são enviados automaticamente — só quando você pede um.
+
+### Tela inteira vs. superfície desktop {#whole-screen-vs-desktop-surface}
+
+"Screenshot my screen" captura **tudo que está exibido** — um
+grab composto de todas as janelas visíveis, como pressionar PrtScn. Esta imagem não tem
+elementos clicáveis, então para *agir* sobre algo nela o agente re-captura
+o app específico.
+
+Pedir o **desktop** em vez disso mira a superfície shell do SO —
+wallpaper, ícones desktop, taskbar — com seus elementos clicáveis, então pedidos
+como "open the Recycle Bin on my desktop" ainda funcionam.
 
 ## Compatibilidade de providers {#provider-compatibility}
 

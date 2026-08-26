@@ -1,10 +1,10 @@
 ---
-title: "Provedores de IA"
+title: "Provedores de LLM e modelos"
 sidebar_label: "Provedores de IA"
 sidebar_position: 1
 ---
 
-# Provedores de IA {#ai-providers}
+# Provedores de LLM e modelos {#llm-and-model-providers}
 
 Esta página aborda a configuração de provedores de inferência para o Hermes Agent — de APIs em nuvem como OpenRouter e Anthropic, a endpoints auto-hospedados como Ollama e vLLM, até configurações avançadas de roteamento e fallback. Você precisa de pelo menos um provedor configurado para usar o Hermes.
 

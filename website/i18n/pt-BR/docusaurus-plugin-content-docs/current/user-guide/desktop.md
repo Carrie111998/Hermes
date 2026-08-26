@@ -1,10 +1,10 @@
 ---
 sidebar_position: 3
-title: "App Desktop"
+title: "Hermes Desktop"
 description: "O app desktop nativo do Hermes — uma experiência polida para conversar com o Hermes, com saída de ferramentas em streaming, previews lado a lado, navegador de arquivos, voz, cron, profiles, skills e configurações. macOS, Windows e Linux."
 ---
 
-# App Desktop
+# Hermes Desktop
 
 O app desktop do Hermes é um aplicativo nativo construído em torno do **mesmo** agente que você obtém do CLI e do gateway — mesma config, mesmas API keys, mesmas sessões, mesmas skills, mesma memória. Não é um produto separado nem um clone leve; usa o mesmo core do Hermes Agent e as mesmas configurações, e o dirige por uma UI moderna e cuidadosamente projetada. Se você já usou `hermes` no terminal, tudo que configurou lá já está aqui, e qualquer coisa que fizer aqui aparece lá.
 
@@ -22,7 +22,7 @@ Escolha o que couber no momento. Eles compartilham estado, então você pode ini
 
 ## Instalação {#install}
 
-Siga as [instruções de instalação do Hermes Desktop](../getting-started/installation.md).
+Baixe o app na [página do produto Hermes Desktop](https://hermes-agent.nousresearch.com/desktop), ou siga as [instruções de instalação do Hermes Desktop](../getting-started/installation.md).
 
 Se você já tem o Hermes instalado, basta rodar
 
@@ -131,10 +131,26 @@ Converse com o Hermes e ouça de volta, o mesmo [voice mode](./features/voice-mo
 
 **⌘/Ctrl+Shift+H** (ou o botão da titlebar) destaca o chat numa barra flutuante sem chrome, always-on-top, que fica sobre o que você estiver trabalhando. A janela do app sai do caminho; o HUD mantém sua conversa ao vivo e um composer. Onde você o estaciona é contexto — a posição da barra diz ao Hermes qual app e tela você está perguntando, então "isto", "aqui" e "essa página" resolvem para o que está embaixo dela.
 
-- **Mover a barra** — **pressione e segure** em qualquer lugar do composer por um instante, depois arraste. Um toque rápido ainda digita; um pressionar segurado pega a janela. Esta é a única forma de mover o HUD — não há titlebar para arrastar.
-- **Redimensionar** — arraste o canto inferior direito da barra.
-- **Snap para o ponteiro** — **⌘/Ctrl+Shift+G** (hotkey global, funciona de qualquer app) salta o HUD para onde está o cursor.
+- **Mover a barra** — no macOS e Windows, **pressione e segure** em qualquer lugar do composer por um instante, depois arraste. No Linux/X11, segure **Ctrl** e arraste com o botão primário do mouse para um grab imediato (inclusive sobre texto selecionado); press-and-hold também continua disponível. Mantenha o grab pressionado enquanto invoca o atalho de troca de desktop do seu ambiente para levar o HUD a outro desktop virtual. No Wayland nativo a barra do composer é um drag handle do compositor (a única forma de movê-la, porque um app não pode posicionar sua própria janela).
+- **Redimensionar** — arraste qualquer borda ou canto da barra; a borda oposta permanece ancorada. No Wayland nativo as bordas direita e inferior ficam expostas porque o compositor não permite que apps posicionem janelas top-level.
+- **Reset layout** — o controle de discard na barra restaura o tamanho padrão e (no X11 / macOS / Windows) a posição. Use se um tamanho persistido deixar o HUD inutilizável.
+- **Snap para o ponteiro** — **⌘/Ctrl+Shift+G** (hotkey global, funciona de qualquer app) salta o HUD para onde está o cursor. No Wayland nativo isso é no-op — o compositor controla o posicionamento.
 - **Sair** — clique o botão de saída na barra, ou pressione **⌘/Ctrl+Shift+H** de novo. A janela do app volta com sua sessão intacta.
+
+#### Linux / Wayland {#linux--wayland}
+
+Electron 20+ já roda como cliente Wayland nativo numa sessão Wayland. Drag, click-through e resize funcionam nesse caminho.
+
+No **Hyprland** (inclusive Omarchy) o HUD é floated e pinned via IPC do compositor depois que mapeia — senão o Hyprland o tileia como qualquer janela, `always-on-top` é ignorado e compositor drag não faz nada. Nenhuma window rule extra é necessária.
+
+Alguns compositors (notavelmente COSMIC) ignoram `always-on-top` para janelas Wayland nativas. Para restaurar pinning, rode o app sob XWayland:
+
+```yaml
+desktop:
+  ozone_platform_hint: x11
+```
+
+Isso faz bridge para `ELECTRON_OZONE_PLATFORM_HINT` no launch (uma env var explícita ainda vence). A troca: X11 não consegue restaurar uma janela que ignorou o mouse, então o HUD permanece janela sólida em vez de click-through. Alguns setups KDE também reportam teclado quebrado com o backend ozone X11 — deixe o hint em `auto` a menos que precise de always-on-top.
 
 ### Settings e onboarding {#settings--onboarding}
 
@@ -409,6 +425,37 @@ agent plugins de outro profile sem trocar o app inteiro (o RPC
 
 ## Solução de problemas {#troubleshooting-1}
 
+### Turnos falhos nomeiam a camada que falhou {#failed-turns-name-the-failing-layer}
+
+Quando um turno falha, o chat renderiza um card de erro que nomeia **qual camada
+falhou** — provider/model, endpoint custom, conexão de streaming,
+autenticação, billing, gateway, runtime local ou disco — em vez de um
+toast genérico. O card oferece ações de recuperação adequadas à falha:
+
+- **Retry** — reexecuta o turno falho no lugar (oculto quando retry
+  reproduziria deterministicamente a falha, ex.: rejeição de content policy).
+- **Switch provider** — salta para Settings → Models para falhas de provider, endpoint,
+  auth e billing.
+- **Open logs** — abre `HERMES_HOME/logs` no file manager. Num remote
+  ou conexão Cloud o botão lê **Open Desktop logs**: abre os
+  logs locais do lado Desktop (evidência de transporte), já que os logs
+  gateway/agent do turno falho vivem na máquina remota.
+- **Send diagnostics** — envia um bundle de debug redigido para storage interno da Nous
+  após prompt explícito de consentimento (mesmo pipeline de
+  `hermes debug share --nous`; segredos sempre redigidos, o bundle é
+  visível só para staff Nous e auto-deleta após 14 dias). No sucesso você
+  recebe um link de view privado para colar no thread de suporte, mais links rápidos
+  para GitHub Issues, Nous Portal Support e Discord. Num remote ou Cloud
+  o backend empacota seus próprios logs agent/gateway e o log local do
+  Desktop é anexado junto, para suporte ver as duas metades.
+- **Copy error details** — copia um resumo plain-text compacto (camada, code,
+  provider/model, mensagem de erro) que você pode colar num bug report ou Discord.
+
+A camada vem do mesmo classificador de erro que o retry loop do agente usa,
+então reflete a semântica real da falha, não um chute a partir do texto da mensagem.
+Backends mais antigos que predatam o descriptor ainda renderizam o card com
+título genérico e as ações Retry / Open logs / Copy error details.
+
 Boot logs caem em `HERMES_HOME/logs/desktop.log` (inclui saída do backend e tracebacks Python recentes) — confira primeiro se o app reporta boot failure. Você também pode tail pelo CLI:
 
 ```bash
@@ -493,29 +540,66 @@ Signing e notarization macOS/Windows rodam automaticamente quando as credenciais
 
 ### Permissões macOS e rebuilds locais (TCC) {#macos-permissions-and-local-rebuilds-tcc}
 
+**Silencie todo prompt de pasta com um switch.** O macOS pede por categoria
+(Desktop, depois Downloads, depois Documents, ...) conforme o Hermes toca cada pasta.
+Um único grant de **Full Disk Access** cobre todos, permanentemente — e
+com as identidades de signing estáveis do Hermes sobrevive a todo update:
+
+1. System Settings → **Privacy & Security → Full Disk Access** (ou rode
+   `open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"`)
+2. Habilite seu terminal app — e **Hermes.app** se usa Desktop.
+3. Feche completamente e relance uma vez.
+
+`hermes doctor` reporta se o contexto de terminal atual já tem o
+grant, e `hermes setup` mostra esta dica no macOS quando não tem.
+
 O macOS lembra grants de permissão (Full Disk Access, Desktop/Downloads/Documents,
 Accessibility, Automation, microfone) contra a *identidade de code-signing* do app,
 não seu path. Apps built localmente e self-updated são assinados com assinatura ad-hoc
-pinned por identificador estável, então grants persistem entre updates out of the
-box.
+pinned por identificador estável, então grants persistem entre updates.
+
+Nota one-time: grants feitos a builds *antes* do fix de signing
+pinned por identificador (PR #73681) carregam o requisito antigo pinned por cdhash. O macOS
+continua mostrando o toggle como ON para esses grants stale mas ainda re-prompta, porque o
+grant armazenado não bate mais com o binário rebuilt — e o prompt moderno não tem botão Allow,
+então parece que não há nada para re-check. Se isso acontecer, reset o
+grant stale uma vez e re-grant:
+
+```bash
+tccutil reset ScreenCapture com.nousresearch.hermes   # repeat per service
+```
+
+depois ligue a entrada fresh ON em System Settings e fully quit & relaunch
+Hermes. Grants ficam estáveis daí em diante.
 
 Para a garantia mais forte — identidade ancorada em certificado, o mesmo
 mecanismo em que usuários yabai/skhd confiam — crie um certificado de code-signing
-self-signed uma vez e diga ao Hermes para usá-lo:
+self-signed uma vez e diga ao Hermes para usá-lo. O comando one-shot faz
+tudo (cria o certificado no login keychain, concede acesso a `codesign`,
+grava a config e re-assina o app empacotado):
+
+```bash
+hermes desktop --setup-tcc-identity
+```
+
+Ou faça manualmente:
 
 1. Keychain Access → Certificate Assistant → **Create a Certificate…**
 2. Name: `Hermes Local Signing`, Identity Type: *Self-Signed Root*,
    Certificate Type: **Code Signing**.
-3. `hermes config set desktop.macos_signing_identity "Hermes Local Signing"`
+3. No Keychain Access, double-click no certificado novo → **Trust** → defina
+   **Code Signing** para *Always Trust* (certificado self-signed importado não é
+   identidade de signing válida até ser trusted para code signing —
+   `security find-identity -v -p codesigning` deve listá-lo depois).
+4. `hermes config set desktop.macos_signing_identity "Hermes Local Signing"`
+
+Use `--identity <name>` com o comando para criar/usar certificado com nome diferente
+(default: `Hermes Local Signing`). O comando é idempotente —
+re-rode depois de updates para re-apontar a config e re-assinar o app rebuilt.
 
 O próximo update re-assina o app rebuilt com aquele certificado; todo grant TCC
 sobrevive. Nenhuma conta Apple Developer é necessária. Builds de release notarized são
 detectados e nunca re-assinados.
-
-Nota one-time: mudar a identidade de signing (incluindo o primeiro update após
-este fix) muda a identidade do app uma vez, então o macOS re-promptará uma última
-vez. Grants ficam estáveis daí em diante. Se uma permissão ficar stuck, reset com
-`tccutil reset All com.nousresearch.hermes` e re-grant.
 
 ## Veja também {#see-also}
 

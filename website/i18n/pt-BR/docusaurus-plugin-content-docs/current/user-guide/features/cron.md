@@ -335,18 +335,48 @@ ledger está incluído em quick backups.
 
 ### Nudge de revisão por falhas repetidas {#repeated-failure-review-nudge}
 
-Cada job rastreia um `failure_streak` — execuções consecutivas em que o agente falhou
-(falhas de entrega não contam). Quando o streak de um job *recorrente* atinge o
-limiar, a mensagem de falha entregue no chat ganha um nudge de revisão dizendo
-que o job falhou N execuções seguidas e sugerindo que você conserte, pause
-(`hermes cron pause <job>`), ou remova. Qualquer execução bem-sucedida zera o
-streak, e `hermes cron list` mostra o streak ao lado da última execução de um job
-falhando. Jobs one-shot nunca enviam nudge.
+Cada job rastreia um `failure_streak` — execuções consecutivas falhadas (falhas
+de entrega não contam). Uma run que falha antes do agente ser alcançado —
+import ruim após update half-applied, client de provider que não pode ser
+construído — conta e alerta igual a uma que o próprio agente falhou. Quando
+o streak de um job *recorrente* atinge o limiar, a mensagem de falha
+entregue no chat ganha um nudge de revisão dizendo que o job falhou N execuções
+seguidas e sugerindo que você conserte, pause (`hermes cron pause <job>`), ou remova
+it. Qualquer execução bem-sucedida zera o streak, e `hermes cron list` mostra o
+streak ao lado da última execução de um job falhando. Jobs one-shot nunca enviam nudge.
 
 ```yaml
 cron:
   failure_nudge_threshold: 3   # default; 0 disables the nudge
 ```
+
+### Incidentes de falha: reconhecer uma falha conhecida {#failure-incidents-acknowledge-a-known-failure}
+
+Um job recorrente que continua falhando com o *mesmo* erro te pinga a cada
+run. Cada falha também é registrada como um **incident** durável, keyed pelo
+job mais uma assinatura normalizada do texto de erro, no mesmo ledger database
+por profile do histórico de execução.
+
+```bash
+hermes cron incidents                 # list incidents (newest activity first)
+hermes cron incidents --state alerted # filter: detected | alerted | closed
+hermes cron incidents ack <id>        # acknowledge — stop re-pinging
+```
+
+Reconhecer um incident silencia o ping de falha por run para aquela assinatura
+exata só. Nada mais muda: o histórico de runs ainda registra toda
+falha, o failure streak continua contando, e no momento em que o job começa
+a falhar com um erro *diferente* um incident novo é mintado e alertas disparam
+de novo. Uma run bem-sucedida não toca incidents — eles são por assinatura, não
+por job.
+
+Ciclo de vida do incident: `detected` (falha registrada) → `alerted` (pelo menos um
+ping de falha chegou à entrega) → `closed` (acknowledged; terminal para aquela
+assinatura). Texto de erro armazenado é secret-redacted e truncado antes de ser
+escrito.
+
+O registro está sempre ligado e não custa nada ignorar — nenhum ping é
+suprimido até você `ack` explicitamente.
 
 ## Opções de entrega {#delivery-options}
 
@@ -375,11 +405,22 @@ Ao agendar jobs, você especifica para onde vai a saída:
 | `"weixin"` | Weixin (WeChat) | |
 | `"bluebubbles"` | BlueBubbles (iMessage) | |
 | `"qqbot"` | QQ Bot (Tencent QQ) | |
+| `"bot-chat"` | Bot Chat canônico deste profile — o bot lê a saída e responde | Machine-local |
+| `"bot-chat:research"` | Bot Chat de outro profile local | Validado na criação |
 | `"all"` | Fan-out para todo canal home conectado | Resolvido no fire time |
 | `"telegram,discord"` | Fan-out para conjunto específico de canais | Lista separada por vírgula |
 | `"origin,all"` | Entrega na origem **mais** todo outro canal conectado | Combine quaisquer tokens |
 
 A resposta final do agente é entregue automaticamente ao target `deliver:` configurado — o agente não envia mensagens sozinho, então não há nada para chamar no prompt cron.
+
+### Entrega Bot Chat (`bot-chat`) {#bot-chat-delivery-bot-chat}
+
+`bot-chat` entrega a saída **na sessão canônica "Bot Chat" de um profile como mensagem real**. Diferente de todo outro target — onde o destinatário é um humano lendo um canal — aqui o destinatário é o próprio bot: ele recebe a saída como mensagem entrante, age no que precisa de ação e responde no chat. Use quando a saída agendada deve ser *processada*, não só postada.
+
+- `bot-chat` (bare) mira o profile do próprio job.
+- `bot-chat:<profile>` mira outro profile **na mesma máquina**. Nomes são validados contra `hermes profile list` na criação do job; profiles em outros gateways ou máquinas nunca podem ser alvo, então profiles de mesmo nome entre máquinas são unambiguous.
+- Cada entrega custa ao bot alvo um turno completo de agente — atente à frequência do schedule.
+- Compõe com outros targets (`bot-chat,telegram`) mas nunca entra em `all`.
 
 ### Intenção de roteamento (`all`) {#routing-intent-all}
 
@@ -438,7 +479,7 @@ cron:
   mirror_delivery: false   # true para tornar entregas cron continuáveis
 ```
 
-Comportamento é **thread-preferred**, escopado ao chat de origem do job:
+Comportamento é **thread-preferred**, escopado à conversa do próprio job:
 
 - **Plataformas com thread** (tópicos Telegram, threads Discord/Slack): cada
   entrega abre thread dedicada própria e o brief é seeded na sessão dessa
@@ -447,8 +488,19 @@ Comportamento é **thread-preferred**, escopado ao chat de origem do job:
 - **Plataformas só DM** (WhatsApp, Signal, SMS): threads não existem, então o brief
   é espelhado na sessão DM de origem — o próprio DM é a superfície de continuação.
 
-Só o chat de origem é tocado: targets fan-out / broadcast (`all`,
-entregas explícitas em outros chats) nunca são tornados continuáveis. O espelho é
+Só a **conversa do próprio job** é tocada:
+
+- o **chat de origem** em que o job foi criado;
+- o **fallback home-channel** quando `deliver: origin` não capturou origem (jobs
+  criados por scripts ou API em vez de um chat gateway live) — a conversa primária do
+  usuário no lugar da origem;
+- um **target explícito único `platform:chat`**, mas só quando o job
+  opta in com `attach_to_session: true` — o autor do job declara aquele
+  target uma conversa. A flag global `mirror_delivery` sozinha nunca torna um
+  chat endereçado explicitamente continuável.
+
+Targets broadcast / fan-out (`all`, home channels bare-platform) nunca são tornados
+continuáveis. O espelho é
 escrito como turno user rotulado (`[Cron delivery: <task name>]`), o que mantém
 alternação do histórico de conversa segura em todos os providers de modelo.
 
@@ -551,6 +603,18 @@ cron:
 ```
 
 Ou defina a variável de ambiente `HERMES_CRON_MEDIA_SEND_TIMEOUT`. A ordem de resolução é: env var → config.yaml → default 300s. Um anexo que estoura o timeout é registrado no status da run do job como falha parcial de entrega (o texto ainda entrega).
+
+## Timeout de entrega Bot Chat {#bot-chat-delivery-timeout}
+
+Uma entrega `bot-chat` roda um turno completo de agente no chat do bot alvo, então seu bound é minutos, não segundos — 600s por padrão:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  bot_chat_delivery_timeout_seconds: 900
+```
+
+Uma entrega que estoura o timeout é registrada em `last_delivery_error`; o turno do bot pode ainda completar por conta própria.
 
 ## Modo no-agent (jobs só script) {#no-agent-mode-script-only-jobs}
 

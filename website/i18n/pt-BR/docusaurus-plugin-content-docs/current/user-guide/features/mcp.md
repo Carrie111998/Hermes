@@ -108,6 +108,13 @@ As linhas pré-marcadas vêm de:
    entradas pré-podam ferramentas mutantes ou raramente úteis)
 3. **Tudo** se nenhum dos dois se aplica
 
+Algumas entradas com superfícies auto-geradas muito grandes (ex.: `cloudflare`,
+~3.300 ferramentas de endpoint OpenAPI) declaram em vez disso `tools.default_excluded` — uma
+block-list curada de nomes e padrões glob. Instalar uma delas pula
+o checklist inteiramente e grava `tools.exclude`; tudo que não corresponder
+permanece habilitado, incluindo ferramentas que o servidor adicionar depois. Edite
+`mcp_servers.<name>.tools.exclude` em config.yaml para reabilitar uma família.
+
 Envie o checklist com ENTER. Só ferramentas marcadas entram em
 `mcp_servers.<name>.tools.include`. Se selecionar tudo, nenhum filtro é
 escrito (formato de config mais limpo, comportamento idêntico).
@@ -237,7 +244,7 @@ Use servidores HTTP quando:
 
 ### Servidores HTTP com autenticação OAuth {#oauth-authenticated-http-servers}
 
-A maioria dos servidores MCP hospedados (Linear, Sentry, Atlassian, Asana, Figma, Stripe, …) exige OAuth 2.1 em vez de bearer token estático. Defina `auth: oauth` e o Hermes cuida de discovery, identificação de cliente, PKCE, troca de token, refresh e step-up auth via MCP Python SDK.
+A maioria dos servidores MCP hospedados (Cloudflare, Linear, Sentry, Atlassian, Asana, Figma, Stripe, …) exige OAuth 2.1 em vez de bearer token estático. Defina `auth: oauth` e o Hermes cuida de discovery, identificação de cliente, PKCE, troca de token, refresh e step-up auth via MCP Python SDK.
 
 O Hermes se identifica com um [Client ID Metadata Document](../../reference/mcp-config-reference.md#client-identification-cimd-and-dcr) em servidores que suportam um, e faz fallback para Dynamic Client Registration nos que não suportam. Ambos são automáticos; não há nada a configurar.
 
@@ -515,6 +522,12 @@ mcp_servers:
 ```
 
 Só essas ferramentas MCP do servidor são registradas.
+
+Entradas em `include`/`exclude` também podem ser padrões glob (`*`, `?`, `[...]`,
+correspondência case-sensitive): `include: ["*_dns_*"]` registra toda ferramenta cujo
+nome contém `_dns_`. Entradas simples sem metacaracteres continuam em correspondência exata.
+Globs são a forma prática de filtrar servidores que expõem milhares de
+ferramentas de endpoint auto-geradas por família de produto.
 
 ### Blacklist de ferramentas do servidor {#blacklist-server-tools}
 

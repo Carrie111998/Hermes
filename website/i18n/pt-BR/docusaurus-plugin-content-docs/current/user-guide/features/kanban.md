@@ -1020,6 +1020,8 @@ Uma subscription se remove automaticamente quando a tarefa atinge `done` ou `arc
 
 Um "wake" forja uma mensagem inbound sintética ao agente gateway destino para ele tomar um turno normal (lê o comment + result, raciocina, responde) em vez de receber uma notificação passiva de uma linha. Só dispara quando o notifier roda dentro de um processo gateway live; caso contrário uma subscription `notify+wake` ainda entrega sua mensagem passiva, enquanto uma subscription só `wake` não faz nada naquele processo.
 
+**Quais eventos acordam.** Os que devolvem uma decisão à origem: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (um worker terminou a implementação e repassou via `kanban_request_review`) e `block_loop_detected` (a tarefa foi roteada para `triage` após blocks repetidos). `status`, `archived` e `unblocked` são entregues mas nunca acordam — são transições de bookkeeping, não decisões. Quando um evento `completed` ou `review_requested` carrega um summary, esse repasse viaja no turno de wake, então o agente acordado vê o que o worker de fato fez.
+
 `--chat-type` (`dm` | `group` | `channel` | `thread`) registra o tipo do chat originador para um turno woken resolver a sessão **real** do operador: `build_session_key` chaveia groups, channels e threads diferente de DMs, então um `chat_type` impreciso rotearia o wake para uma sessão separada, sem contexto. Os paths de auto-subscribe `/kanban` e slash-command capturam isso automaticamente — você só seta na mão ao inscrever um chat de um script ou cron. Omita para deixar uma subscription existente inalterada (subscriptions novas default para `dm`).
 
 ## Runs — uma linha por tentativa {#runs-one-row-per-attempt}

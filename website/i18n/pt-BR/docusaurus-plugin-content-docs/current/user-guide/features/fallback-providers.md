@@ -11,7 +11,7 @@ O Hermes Agent tem três camadas de resiliência que mantêm suas sessões rodan
 
 1. **[Credential pools](./credential-pools.md)** — rotaciona entre múltiplas API keys para o *mesmo* provider (tentado primeiro)
 2. **Fallback do modelo primário** — troca automaticamente para um par provider:modelo *diferente* quando seu modelo principal falha
-3. **Fallback de tarefas auxiliares** — resolução independente de provider para tarefas auxiliares como visão, compressão e extração web
+3. **Fallback de tarefas auxiliares** — resolução independente de provider para tarefas auxiliares como visão e compressão
 
 Credential pools lidam com rotação no mesmo provider (ex.: múltiplas chaves OpenRouter). Esta página cobre fallback cross-provider. Ambos são opcionais e funcionam de forma independente.
 
@@ -194,12 +194,12 @@ O Hermes usa modelos leves separados para tarefas auxiliares. Cada tarefa tem su
 | Tarefa | O que faz | Chave de config |
 |------|-------------|-----------|
 | Vision | Análise de imagem, screenshots de browser | `auxiliary.vision` |
-| Web Extract | Sumarização de páginas web | `auxiliary.web_extract` |
 | Compression | Resumos de compressão de contexto | `auxiliary.compression` |
 | Skills Hub | Busca e descoberta de skills | `auxiliary.skills_hub` |
 | MCP | Operações helper MCP | `auxiliary.mcp` |
 | Approval | Classificação inteligente de aprovação de comandos | `auxiliary.approval` |
 | Title Generation | Resumos de título de sessão | `auxiliary.title_generation` |
+| Review | Subagent revisor do `/review` (agente completo, não uma única chamada LLM) | `auxiliary.review` |
 | Triage Specifier | `hermes kanban specify` / botão ✨ do dashboard — expande uma tarefa de triagem one-liner em spec real | `auxiliary.triage_specifier` |
 
 ### Chain de auto-detecção {#auto-detection-chain}
@@ -240,10 +240,6 @@ auxiliary:
     model: ""                     # e.g. "openai/gpt-4o"
     base_url: ""                  # direct endpoint (takes precedence over provider)
     api_key: ""                   # API key for base_url
-
-  web_extract:
-    provider: "auto"
-    model: ""
 
   compression:
     provider: "auto"
@@ -426,7 +422,6 @@ Veja [Tarefas Agendadas (Cron)](/user-guide/features/cron) para detalhes complet
 | Tarefas auxiliares (qualquer) — usuários auto | Chain de auto-detecção completa (modelo do agente principal primeiro, depois chain de providers) em erros de capacity | `auxiliary.<task>.provider: auto` |
 | Tarefas auxiliares (qualquer) — provider explícito | `fallback_chain` (se definida) → modelo do agente principal → warn + raise, apenas em erros de capacity | `auxiliary.<task>.fallback_chain` |
 | Vision | Em camadas (veja acima) + retry interno OpenRouter | `auxiliary.vision` |
-| Web extraction | Em camadas (veja acima) + retry interno OpenRouter | `auxiliary.web_extract` |
 | Compressão de contexto | Em camadas (veja acima); degrada para no-summary se todas as camadas indisponíveis | `auxiliary.compression` |
 | Skills hub | Em camadas (veja acima) | `auxiliary.skills_hub` |
 | Helpers MCP | Em camadas (veja acima) | `auxiliary.mcp` |

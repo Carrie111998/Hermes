@@ -246,6 +246,27 @@ A flag `--deliver` controla para onde os resultados vão:
 | `slack` | `--deliver slack` | Seu canal principal do Slack |
 | Chat específico | `--deliver telegram:-1001234567890` | Um grupo específico do Telegram |
 | Em thread | `--deliver telegram:-1001234567890:17585` | Uma thread de tópico específica do Telegram |
+| Bot Chat | `--deliver bot-chat` | Injeta a saída no Bot Chat canônico deste profile — o bot lê e responde |
+| Bot Chat (nomeado) | `--deliver bot-chat:research` | Bot Chat de outro profile local |
+
+### Entrega Bot Chat {#bot-chat-delivery}
+
+`bot-chat` entrega a saída do job **na sessão canônica "Bot Chat" de um profile como mensagem real** — o bot recebe como qualquer outra mensagem,
+age no que precisa de ação e responde naquele chat. Este é o
+target a usar quando você quer que um bot *veja e reaja* à saída agendada
+em vez de só arquivá-la no histórico de Run.
+
+Coisas a saber:
+
+- **Machine-local.** O profile deve existir na máquina que roda o
+  scheduler (`hermes profile list`). Nomes são validados na criação;
+  profiles em outros gateways/máquinas não podem ser alvo.
+- **Custa um turno de bot.** Cada entrega roda um turno completo de agente no
+  Bot Chat alvo — orçamente de acordo para jobs de alta frequência.
+- **Combinável.** `--deliver bot-chat,telegram` posta no bot E no seu
+  canal home Telegram. O token `all` nunca expande para targets bot-chat.
+- A mensagem entregue é prefixada para o bot saber que veio de um job agendado,
+  não de você.
 
 ---
 

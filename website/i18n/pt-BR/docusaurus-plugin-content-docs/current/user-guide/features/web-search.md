@@ -32,7 +32,7 @@ Brave Search, DDGS e xAI são **search-only** — combine qualquer um com Firecr
 
 **Split por capacidade:** você pode usar providers diferentes para search e extract independentemente — por exemplo SearXNG (grátis) para search e Firecrawl para extract. Veja [Configuração por capacidade](#per-capability-configuration) abaixo.
 
-:::info Funciona out of the box — rotação keyless de free-tier {#works-out-of-the-box--keyless-free-tier-rotation}
+:::info Funciona out of the box — rotação keyless de free-tier
 Uma instalação nova **sem nenhuma credencial web** já tem `web_search` e `web_extract` funcionando: requests rotacionam round-robin pelos free tiers públicos de cinco vendors — **Exa, Parallel, Tavily, Firecrawl e Keenable** — espalhando carga de forma uniforme, e um request rate-limited automaticamente retenta no próximo vendor do ring (multi-hop, até um servir ou todos estarem throttled). Sem signup, sem chave. Esse tier é estritamente last-resort — qualquer backend configurado ou chave de API presente sempre vence — e os requests não carregam identificadores de usuário (só um session id aleatório por processo, rotacionado no restart). Para serviço garantido e sem throttle, configure um provider com chave. Desabilite o tier keyless por completo com `web.keyless_fallback: false`.
 :::
 
@@ -79,6 +79,42 @@ Veja [Auxiliary Models](/user-guide/configuration#auxiliary-models) para referê
 ### Quando a sumarização atrapalha {#when-summarization-gets-in-the-way}
 
 Se você precisa especificamente de conteúdo cru, não sumarizado — por exemplo, está raspando uma página estruturada onde o resumo LLM droparia campos importantes — use `browser_navigate` + `browser_snapshot`. A ferramenta browser retorna a árvore de acessibilidade live sem reescrita do modelo auxiliar (sujeito ao próprio cap de snapshot de 8 000 chars em páginas enormes).
+
+---
+
+## Cache de resultados {#result-caching}
+
+Chamadas web repetidas numa janela curta vêm do cache em vez do backend pago — isso economiza credits e latência nos dois padrões onde duplicatas são comuns: fan-outs de subagent (vários agentes delegados pesquisando o mesmo tópico) e o agente re-checar uma página que leu minutos atrás.
+
+| Call | Cache | Scope |
+|------|-------|-------|
+| `web_search` — mesma query (case/whitespace-insensitive), mesmo provider | In-memory memo | Per process |
+| `web_extract` — mesma URL, mesmo format, mesmo provider | Full text stored under `~/.hermes/cache/web/` | Shared across CLI, gateway, cron, and subagent processes |
+
+Buscas idênticas concorrentes (fan-out paralelo de subagent disparando a mesma query ao mesmo tempo) são **coalesced num único backend request** — o primeiro caller paga; o resto compartilha a resposta. Limits de busca solicitados são bucketed até 10/20/50/100 para requests quase idênticos (`limit=5` vs `limit=8`) compartilharem uma entry, com cada caller recebendo sua contagem solicitada.
+
+Só respostas bem-sucedidas são cached. Falhas sempre retentam o backend, respostas servidas pelo one-shot keyless rescue nunca são cached (a próxima chamada tenta seu backend escolhido de novo), e URLs matched pelo seu `security.website_blocklist` nunca vêm do cache. Extracts cached re-executam o pipeline normal de truncamento, então um `char_limit` diferente na segunda chamada funciona a partir do mesmo scrape armazenado.
+
+**URLs de desenvolvimento local nunca são cached.** Qualquer coisa em `localhost`, `127.0.0.1`, `*.local`, hostnames LAN single-label, ou ranges IP private/link-local (`192.168.*`, `10.*`, `172.16-31.*`) bypassa o extract cache por completo — dev servers, builds hot-reload e previews de artifact de chat-GUI mudam a cada save, e uma cópia cached mostraria um build stale. Todo fetch de página local é live. (Essas URLs só são alcançáveis quando `security.allow_private_urls` está habilitado.)
+
+**Testando pela internet pública?** Deploys de staging e tunnel URLs são DNS público, então a regra de local-dev não pega — liste-as em `web.cache_exempt_hosts` e sempre são fetched live também. Entries casam exatamente, como wildcard `*.`, ou como suffix de domínio (`mysite.dev` também cobre `preview.mysite.dev`):
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  cache_exempt_hosts:
+    - mysite.vercel.app
+    - "*.ngrok-free.app"
+```
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  cache_enabled: true      # default; set false to disable both caches
+  cache_ttl_minutes: 20    # freshness window, clamped 1–1440
+```
+
+Se você pesquisa dados genuinamente live (placares, preços, breaking news) e precisa de toda chamada fresh, baixe o TTL ou defina `web.cache_enabled: false`.
 
 ---
 

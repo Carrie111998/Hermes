@@ -9,9 +9,9 @@ sidebar_position: 5
 
 O Hermes Agent inclui um conjunto completo de ferramentas de automação de navegador com várias opções de backend:
 
-- **Modo na nuvem Browserbase** via [Browserbase](https://browserbase.com) para navegadores gerenciados na nuvem e ferramentas anti-bot
-- **Modo na nuvem Browser Use** via [Browser Use](https://browser-use.com) como provedor alternativo de navegador na nuvem
-- **Modo Browser Use** via a [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) — um harness de navegador novo que é SOTA para tarefas web; automatiza seu Chrome local ou navegadores na nuvem do Browser Use
+- **Modo na nuvem Browser Use** via [Browser Use](https://browser-use.com) para Chromium gerenciado com stealth, proxies residenciais, resolução de CAPTCHA e profiles de browser reutilizáveis
+- **Modo na nuvem Browserbase** via [Browserbase](https://browserbase.com) como provedor alternativo de navegador na nuvem com ferramentas anti-bot
+- **Modo Browser Use** via a [Browser Use CLI 3.0](https://github.com/browser-use/browser-use), o driver de browser default para Chrome local e navegadores na nuvem do Browser Use
 - **Modo na nuvem Firecrawl** via [Firecrawl](https://firecrawl.dev) para navegadores na nuvem com scraping integrado
 - **Modo local Camofox** via [Camofox](https://github.com/jo-inc/camofox-browser) para navegação local anti-detecção (spoofing de fingerprint baseado em Firefox)
 - **Engine local Lightpanda** via [Lightpanda](https://lightpanda.io) — um navegador headless construído do zero em Zig para máquinas; startup instantâneo, 16x menos memória e 9x mais rápido que o Chrome, com fallback automático para Chrome nas ações que ainda não suporta
@@ -26,9 +26,10 @@ As páginas são representadas como **árvores de acessibilidade** (snapshots ba
 
 Principais capacidades:
 
-- **Execução na nuvem com vários provedores** — Browserbase, Browser Use ou Firecrawl — sem necessidade de navegador local
+- **Execução na nuvem com vários provedores** — Browser Use, Browserbase ou Firecrawl — sem necessidade de navegador local
 - **Integração local da família Chromium** — conecte-se ao seu Chrome, Brave, Chromium ou Edge em execução via CDP para navegação prática
-- **Stealth integrado** — fingerprints aleatórios, resolução de CAPTCHA, proxies residenciais (Browserbase)
+- **Suporte anti-bot na nuvem** — Browser Use Cloud inclui stealth, proxies residenciais e resolução de CAPTCHA
+- **Profiles persistentes na nuvem** — Browser Use Cloud pode reutilizar cookies, localStorage e senhas salvas entre sessões
 - **Isolamento de sessão** — cada tarefa recebe sua própria sessão de navegador
 - **Limpeza automática** — sessões inativas são fechadas após um timeout
 - **Análise de visão** — screenshot + análise por IA para compreensão visual
@@ -38,6 +39,19 @@ Principais capacidades:
 :::tip Assinantes Nous
 Se você tem uma assinatura paga do [Nous Portal](https://portal.nousresearch.com), pode usar a automação de navegador pelo **[Tool Gateway](tool-gateway.md)** sem chaves de API separadas. Instalações novas podem executar `hermes setup --portal` para fazer login e ativar todas as ferramentas do gateway de uma vez; instalações existentes podem escolher **Nous Subscription** como provedor de navegador via `hermes model` ou `hermes tools`.
 :::
+
+### Modo na nuvem Browser Use
+
+Para usar o Browser Use como seu provedor de navegador na nuvem, adicione:
+
+```bash
+# Add to ~/.hermes/.env
+BROWSER_USE_API_KEY=***
+```
+
+Obtenha sua chave de API em [browser-use.com](https://browser-use.com).
+
+Browser Use Cloud roda Chromium gerenciado com [stealth](https://docs.browser-use.com/cloud/browser/stealth) e [proxies residenciais](https://docs.browser-use.com/cloud/browser/proxies) habilitados por padrão, inclui resolução de CAPTCHA e suporta [profiles persistentes](https://docs.browser-use.com/cloud/guides/authentication) para cookies, localStorage e senhas salvas.
 
 ### Modo na nuvem Browserbase
 
@@ -51,24 +65,13 @@ BROWSERBASE_PROJECT_ID=your-project-id-here
 
 Obtenha suas credenciais em [browserbase.com](https://browserbase.com).
 
-### Modo na nuvem Browser Use
-
-Para usar o Browser Use como seu provedor de navegador na nuvem, adicione:
-
-```bash
-# Add to ~/.hermes/.env
-BROWSER_USE_API_KEY=***
-```
-
-Obtenha sua chave de API em [browser-use.com](https://browser-use.com).
-
 :::note Selecionando o provider
 As chaves `.env` acima fornecem **apenas credenciais**. O navegador cloud ativo é escolhido pela seleção `browser.cloud_provider` gravada por `hermes tools` → Browser Automation (`browserbase`, `browser-use`, `camofox`, ou `nous` para a Nous Subscription). Depois que uma seleção existe, adicionar ou remover uma chave não troca providers — e um provider selecionado com chave faltando erra com orientação para rodar `hermes tools` em vez de rerrotear silenciosamente. Setups nunca configurados ainda autodetectam a partir das credenciais disponíveis.
 :::
 
 ### Modo Browser Use (padrão) {#browser-use-mode-default}
 
-O modo Browser Use usa a [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) — um harness de navegador novo que é state-of-the-art em tarefas web — em vez das ferramentas de navegador built-in. O agente escreve e executa Python no navegador para clicar, digitar, arrastar, scrapear e interagir com páginas.
+O modo Browser Use usa a [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) em vez das ferramentas de navegador built-in. O agente escreve e executa Python no navegador para clicar, digitar, arrastar, scrapear e interagir com páginas.
 
 **Este é o modo de navegador padrão**: quando `browser.backend` está indefinido e a CLI `browser-use` é executável (instalada, ou disponível via `uvx`), o agente recebe a única ferramenta `browser_exec`. Se a CLI não puder rodar, o Hermes recua automaticamente para as ferramentas de navegador built-in.
 
@@ -509,7 +512,17 @@ Obtém um snapshot baseado em texto da árvore de acessibilidade da página atua
 - **`full=false`** (padrão): visualização compacta mostrando apenas elementos interativos
 - **`full=true`**: conteúdo completo da página
 
-Snapshots com mais de 15.000 caracteres são automaticamente truncados ou resumidos por um LLM (o mesmo orçamento por página de `web_extract`). Quando isso acontece, o snapshot completo é salvo em `~/.hermes/cache/web/` e a saída da ferramenta inclui o caminho do arquivo mais uma chamada pronta para uso de `read_file`, para que o agente possa percorrer a árvore de acessibilidade completa — incluindo refs de elementos além do corte — sem refazer snapshot.
+Snapshots maiores que `browser.snapshot_threshold` (default 15.000 caracteres — o mesmo orçamento por página de `web_extract`) são automaticamente truncados em limites de linha; sem sumarização por LLM. Quando isso acontece, o snapshot completo é salvo em `~/.hermes/cache/web/` e a saída da ferramenta inclui o caminho do arquivo mais uma chamada pronta para uso de `read_file`, para que o agente possa percorrer a árvore de acessibilidade completa — incluindo refs de elementos além do corte — sem refazer snapshot.
+
+Aumente o threshold para páginas longas onde mais conteúdo fonte deve chegar ao agente inline:
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  snapshot_threshold: 30000
+```
+
+Você também pode rodar `hermes config set browser.snapshot_threshold 30000`. A configuração aplica a chamadas explícitas de `browser_snapshot` e ao snapshot automático retornado após navegação, inclusive no backend Camofox (mínimo 1000). Reinicie a sessão Hermes atual depois de mudar para o cache de config de browser recarregar.
 
 ### `browser_click`
 
@@ -741,7 +754,7 @@ Se recursos pagos não estiverem disponíveis no seu plano, o Hermes faz fallbac
 ## Limitações {#limitations}
 
 - **Interação baseada em texto** — depende da árvore de acessibilidade, não de coordenadas de pixel
-- **Tamanho do snapshot** — páginas grandes podem ser truncadas ou resumidas por LLM em 15.000 caracteres (igual a `web_extract`); o snapshot completo é salvo em `~/.hermes/cache/web/` e a saída aponta para ele para paginação com `read_file`
+- **Tamanho do snapshot** — páginas grandes são truncadas em `browser.snapshot_threshold` (default 15.000 caracteres, igual a `web_extract`; sem sumarização por LLM); o snapshot completo é salvo em `~/.hermes/cache/web/` e a saída aponta para ele para paginação com `read_file`
 - **Timeout de sessão** — sessões na nuvem expiram conforme as configurações do plano do seu provedor
 - **Custo** — sessões na nuvem consomem créditos do provedor; sessões são limpas automaticamente quando a conversa termina ou após inatividade. Use `/browser connect` para navegação local gratuita.
 - **Sem downloads de arquivo** — não é possível baixar arquivos pelo navegador

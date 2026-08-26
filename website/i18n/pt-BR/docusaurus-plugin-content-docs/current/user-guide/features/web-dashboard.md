@@ -1,10 +1,10 @@
 ---
 sidebar_position: 15
-title: "Web Dashboard"
+title: "Hermes Web Dashboard"
 description: "Painel de administração no browser para gerenciar configuração, API keys, servidores MCP, pairing de mensagens, webhooks, gateway, memória, credenciais, sessões, logs, analytics, cron jobs e skills"
 ---
 
-# Web Dashboard {#web-dashboard}
+# Hermes Web Dashboard {#web-dashboard}
 
 O web dashboard é uma UI no browser para gerenciar sua instalação Hermes Agent. Em vez de editar arquivos YAML ou rodar comandos CLI, você pode configurar settings, gerenciar API keys e monitorar sessões numa interface web limpa.
 
@@ -941,6 +941,34 @@ dashboard:
 
 Quando definido, OAuth callback URL vira `<public_url>/auth/callback` verbatim — `X-Forwarded-Prefix` é ignorado nesse code path porque operador declarou explicitamente a URL pública. Isso é intencional: empilhar prefix em cima double-prefixaria o caso comum onde prefix já está baked em `public_url`.
 
+O hostname em `public_url` também é aceito como valor **exato** de HTTP `Host` e
+WebSocket `Origin`. Isso suporta um reverse proxy que preserva o
+hostname visto pelo browser enquanto encaminha para um dashboard bindado em
+`127.0.0.1`. Wildcards e suffix matches não são permitidos, então um host atacante
+como `dashboard.example.com.evil.test` continua rejeitado pelo guard de DNS-rebinding.
+
+Declarar um `public_url` non-loopback sempre aciona o auth gate do dashboard,
+mesmo quando o backend binda em loopback. Configure password ou provider OAuth
+primeiro; sem um, o Hermes falha closed no startup. Isso impede que o token de sessão
+da SPA local vire mecanismo de autenticação remota pelo
+proxy. Uvicorn também habilita processamento de proxy headers confiável neste modo para um
+terminador TLS local poder fornecer `X-Forwarded-Proto: https` para cookies seguros.
+
+```bash
+# Backend remains reachable only on this machine.
+hermes dashboard --host 127.0.0.1 --port 9119 --no-open
+```
+
+Aponte o reverse proxy TLS em `http://127.0.0.1:9119` e use
+a mesma origin externa em `dashboard.public_url`.
+
+Tailscale Serve é um exemplo deste shape de deploy: pode terminar
+HTTPS só-tailnet num hostname `https://<machine>.<tailnet>.ts.net` enquanto
+proxia para o dashboard loopback. Use essa origin HTTPS exata como
+`dashboard.public_url`. Ainda é tratada como origin browser-facing non-loopback
+e portanto exige um provider de auth do dashboard; isso não exige
+tornar o serviço alcançável da internet pública.
+
 Mesma precedência das outras settings do dashboard — env vence `config.yaml`:
 
 | Superfície | Caminho de override | Quando usar |
@@ -971,10 +999,10 @@ Access tokens têm TTL de 15 minutos. **Não há refresh token no contract v1** 
 | Nome | Lifetime | Notas |
 |------|----------|-------|
 | `hermes_session_at` | Token TTL (15 min) | HttpOnly, SameSite=Lax, Secure-when-HTTPS |
-| `hermes_session_pkce` | 10 min | HttpOnly; guarda PKCE verifier + provider hint durante round trip |
+| `hermes_session_pkce` | 10 min | HttpOnly; guarda PKCE verifier + provider hint durante round trip. SameSite=None + Secure over HTTPS (deve sobreviver à cadeia de redirect cross-site do IDP — Chromium descarta cookies SameSite=Lax setados num 302 numa cadeia cross-site); SameSite=Lax em loopback HTTP |
 | `hermes_session_rt` | unused in v1 | Reservado forward-compat; não escrito quando `refresh_token` vazio |
 
-Os três são `Path=/` e `SameSite=Lax`. Flag `Secure` é definida quando dashboard é alcançado via HTTPS (detectado via request URL scheme — honra `X-Forwarded-Proto` de terminador TLS upstream sob `proxy_headers=True`).
+Todos são `Path=/`. Os cookies de sessão são `SameSite=Lax`; o cookie PKCE é `SameSite=None` quando setado over HTTPS (veja tabela). Flag `Secure` é definida quando dashboard é alcançado via HTTPS (detectado via request URL scheme — honra `X-Forwarded-Proto` de terminador TLS upstream sob `proxy_headers=True`).
 
 ### Logout {#logout}
 

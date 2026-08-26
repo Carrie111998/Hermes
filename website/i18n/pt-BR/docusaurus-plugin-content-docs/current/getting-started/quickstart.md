@@ -1,10 +1,10 @@
 ---
 sidebar_position: 1
-title: "Início rápido"
+title: "Início rápido do Hermes Agent"
 description: "Sua primeira conversa com o Hermes Agent — da instalação ao chat em menos de 5 minutos"
 ---
 
-# Início rápido
+# Início rápido do Hermes Agent
 
 Este guia leva você do zero até um setup Hermes que aguenta uso real. Instale, escolha um provider, verifique um chat funcionando e saiba exatamente o que fazer quando algo quebrar.
 

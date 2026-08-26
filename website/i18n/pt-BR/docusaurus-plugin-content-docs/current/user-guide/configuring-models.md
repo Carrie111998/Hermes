@@ -199,15 +199,15 @@ providers:
 
 Com discovery off, o model picker (`hermes model`, `/model`) mostra a lista configurada em vez de probe live.
 
-Para um gateway compatível com Anthropic que resolve um alias bare de modelo só
-depois de receber a requisição, opte o alias em marcadores nativos de prompt-cache
+Para um gateway que resolve um alias bare de modelo só
+depois de receber a requisição, opte o alias em marcadores de prompt-cache
 com a capability per-model `prompt_caching`:
 
 ```yaml
 providers:
-  anthropic-proxy:
-    api: https://gateway.example.com/anthropic
-    transport: anthropic_messages
+  model-proxy:
+    api: https://gateway.example.com/v1
+    transport: openai_chat  # or anthropic_messages
     models:
       fable:
         context_length: 1000000
@@ -215,9 +215,12 @@ providers:
 ```
 
 O Hermes casa esta declaração com a rota exata do provider e o id de modelo
-em runtime, sem reescrever o alias. Defina `prompt_caching: false` para
-desabilitar explicitamente marcadores de cache para um modelo; quando omitido, o Hermes
-mantém sua detecção normal de capability de provider e modelo.
+em runtime, sem reescrever o alias ou inferir suporte pelo nome do provider,
+host ou família de modelo. O layout de marcadores segue o transport configurado:
+`openai_chat` usa o layout envelope OpenAI-compatible e
+`anthropic_messages` usa o layout inner-block nativo. Defina
+`prompt_caching: false` para desabilitar explicitamente marcadores de cache para um modelo; quando
+omitido, o Hermes mantém sua detecção normal de capability de provider e modelo.
 
 :::note Formato legacy
 Configs antigos usavam lista top-level `custom_providers:` (com `base_url` em vez de `api`). Ainda funciona e é auto-migrado para dict `providers:` no `hermes update` (config v12).

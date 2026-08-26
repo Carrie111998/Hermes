@@ -38,7 +38,7 @@ Se preferir editar a configuração diretamente, use a URL base nativa da API do
 
 ```yaml
 model:
-  default: gemini-3-flash-preview
+  default: gemini-3.7-flash
   provider: gemini
   base_url: https://generativelanguage.googleapis.com/v1beta
 ```
@@ -49,7 +49,7 @@ Depois de executar `hermes model`, seu `~/.hermes/config.yaml` conterá:
 
 ```yaml
 model:
-  default: gemini-3-flash-preview
+  default: gemini-3.7-flash
   provider: gemini
   base_url: https://generativelanguage.googleapis.com/v1beta
 ```
@@ -104,20 +104,21 @@ O seletor do `hermes model` mostra os modelos do Gemini mantidos no registro de 
 
 | Modelo | ID | Notas |
 |-------|----|-------|
-| Gemini 3.1 Pro Preview | `gemini-3.1-pro-preview` | Modelo de preview mais capaz quando disponível |
-| Gemini 3 Pro Preview | `gemini-3-pro-preview` | Modelo forte em raciocínio e código |
-| Gemini 3 Flash Preview | `gemini-3-flash-preview` | Equilíbrio padrão recomendado entre velocidade e capacidade |
-| Gemini 3.1 Flash Lite Preview | `gemini-3.1-flash-lite-preview` | Opção mais rápida / de menor custo quando disponível |
+| Gemini 3.7 Flash | `gemini-3.7-flash` | Equilíbrio padrão recomendado entre velocidade, capacidade e compreensão multimodal |
+| Gemini 3.1 Pro Preview | `gemini-3.1-pro-preview` | Modelo mais capaz em raciocínio, matemática e código |
+| Gemini 3.5 Flash Lite | `gemini-3.5-flash-lite` | Opção mais rápida e de menor custo para tarefas leves |
+| Gemini 2.5 Flash | `gemini-2.5-flash` | Modelo rápido da geração anterior com capacidades de thinking |
+| Gemini 2.5 Pro | `gemini-2.5-pro` | Modelo de raciocínio complexo da geração anterior |
 
 A disponibilidade dos modelos muda com o tempo. Se um modelo desaparecer ou não estiver habilitado para sua chave, execute `hermes model` novamente e escolha um da lista atual.
 
 :::info IDs de modelo
-Use os IDs nativos de modelo do Gemini, como `gemini-3-flash-preview`, e não IDs no estilo OpenRouter, como `google/gemini-3-flash-preview`, quando `provider: gemini`.
+Use os IDs nativos de modelo do Gemini, como `gemini-3.7-flash`, e não IDs no estilo OpenRouter, como `google/gemini-3.7-flash`, quando `provider: gemini`.
 :::
 
 ### Aliases Mais Recentes {#latest-aliases}
 
-O Google publica aliases móveis para as famílias Pro e Flash do Gemini. `gemini-pro-latest` e `gemini-flash-latest` são úteis quando você quer que o Google avance o modelo automaticamente sem alterar sua configuração do Hermes.
+O Google publica aliases móveis para as famílias Pro e Flash do Gemini. `gemini-pro-latest` e `gemini-flash-latest` são úteis quando você quer que o Google avance o modelo automaticamente sem alterar sua configuração do Hermes. Note que suas cobranças de uso podem ser afetadas se modelos mais novos introduzirem tarifas diferentes.
 
 | Alias | Atualmente aponta para | Notas |
 |-------|------------------|-------|
@@ -131,7 +132,7 @@ model:
   base_url: https://generativelanguage.googleapis.com/v1beta
 ```
 
-Se você precisar de reprodutibilidade estrita, prefira IDs de modelo explícitos, como `gemini-3.1-pro-preview` ou `gemini-3-flash-preview`.
+Se você precisar de reprodutibilidade estrita, prefira IDs de modelo explícitos, como `gemini-3.1-pro-preview` ou `gemini-3.7-flash`.
 
 ### Gemma via a API do Gemini {#gemma-via-the-gemini-api}
 
@@ -160,9 +161,9 @@ model:
 Use o comando `/model` durante uma conversa:
 
 ```text
-/model gemini-3-flash-preview
+/model gemini-3.7-flash
 /model gemini-flash-latest
-/model gemini-3-pro-preview
+/model gemini-3.1-pro-preview
 /model gemini-pro-latest
 /model gemma-4-31b-it
 /model gemini-3.1-flash-lite-preview

@@ -1,10 +1,10 @@
 ---
 sidebar_position: 2
-title: "Configuração"
+title: "Hermes Agent Configuration"
 description: "Configure o Hermes Agent — config.yaml, provedores, modelos, chaves de API e mais"
 ---
 
-# Configuração
+# Hermes Agent Configuration
 
 Todas as configurações ficam no diretório `~/.hermes/` para fácil acesso.
 
@@ -257,6 +257,7 @@ terminal:
   # Cross-process container reuse (defaults match the "one long-lived
   # container shared across sessions" contract — see Container lifecycle).
   docker_persist_across_processes: true   # Reuse container across Hermes restarts
+  docker_shared_container_key: ""         # Opt in trusted profiles to one identity
   docker_orphan_reaper: true              # Sweep abandoned Exited containers at startup
 
   # Cross-backend lifecycle settings (apply to docker as well)
@@ -278,9 +279,9 @@ Todo container gerenciado pelo Hermes é rotulado com três labels para processo
 
 - `hermes-agent=1` — marca como gerenciado pelo Hermes
 - `hermes-task-id=<sanitized task_id>` — chaveia a sonda de reutilização por task
-- `hermes-profile=<sanitized profile name>` — escopa reutilização e reaping ao perfil Hermes ativo
+- `hermes-profile=<sanitized profile name>` — escopa reuse e reaping ao profile Hermes ativo por padrão; quando `docker_shared_container_key` está definido, seu valor sanitizado é usado no lugar
 
-Na inicialização, o Hermes executa `docker ps --filter label=hermes-task-id=<id> --filter label=hermes-profile=<profile>` e **anexa ao container existente** quando encontra um. Se o container está `exited` (ex.: após reinício do daemon Docker), é `docker start`'d e reutilizado — estado do filesystem e pacotes instalados sobrevivem, mas processos em segundo plano in-container não.
+Na inicialização, o Hermes executa `docker ps --filter label=hermes-task-id=<id> --filter label=hermes-profile=<identity>` e **anexa ao container existente** quando encontra um. A identidade é o profile ativo a menos que `docker_shared_container_key` opte explicitamente profiles confiáveis num valor comum. Se o container está `exited` (ex.: após reinício do daemon Docker), é `docker start`'d e reutilizado — estado do filesystem e pacotes instalados sobrevivem, mas processos em segundo plano in-container não.
 
 Quando um processo Hermes termina — `/quit`, fechar sessão TUI, shutdown do gateway, até SIGKILL — o caminho de cleanup é **no-op para o container no modo padrão**. O container continua rodando. O próximo processo Hermes anexa em milissegundos via sonda de label. Esse é o comportamento que o contrato "um container de longa duração compartilhado entre sessões" exige: é a única forma de processos em segundo plano (watchers npm, dev servers, pytest longo) sobreviverem entre sessões.
 
@@ -297,6 +298,7 @@ Casos extremos que valem saber:
 
 - **OOM kill do PID 1 in-container** transiciona o container para `Exited`. Próxima reutilização fará `docker start`; estado do filesystem sobrevive, processos bg não.
 - **Trocar perfis** isola containers entre si — um container rotulado `hermes-profile=work` é invisível a um processo Hermes rodando sob `hermes-profile=research`. O orphan reaper também é escopado por perfil, então containers cross-profile não são reaped acidentalmente, mas também não são limpos automaticamente até você iniciar o Hermes novamente sob o perfil original.
+- **Compartilhamento explícito cross-profile** — defina o mesmo `docker_shared_container_key` não vazio sob `terminal:` para profiles que colaboram intencionalmente num workspace confiável. Isso substitui só o label de identidade do container; checks de task, egress e compatibilidade de rede ainda aplicam. Profiles sem a key permanecem isolados. O label de identidade deriva da key com um sufixo digest curto, então keys parecidas (`team/workspace` vs `team_workspace`) nunca colidem num container. **Importante: um container compartilhado é criado uma vez, pelo profile que o inicia primeiro** — `docker_image`, volumes, shm size e outras settings Docker imutáveis daquele profile vencem, e profiles posteriores anexam as-is; settings diferentes nas configs deles são ignoradas até o container ser removido e recriado. Profiles que compartilham uma key devem concordar em imagem e mounts.
 
 Subagentes paralelos gerados via `delegate_task(tasks=[...])` compartilham este container — `cd` concorrente, mutações de env e escritas no mesmo caminho colidirão. Se um subagente precisa de sandbox isolado, deve registrar sobrescrita de imagem por task via `register_task_env_overrides()`, que ambientes RL e benchmark (TerminalBench2, HermesSweEnv, etc.) fazem automaticamente para suas imagens Docker por task.
 
@@ -323,6 +325,7 @@ Toda chave sob `terminal:` tem uma sobrescrita de env var da forma `TERMINAL_<KE
 | `TERMINAL_DOCKER_RUN_AS_HOST_USER` | `docker_run_as_host_user` | `true` / `false` |
 | `TERMINAL_DOCKER_NETWORK` | `docker_network` | `true` / `false` — padrão `true`; `false` = `--network=none` |
 | `TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES` | `docker_persist_across_processes` | `true` / `false` — padrão `true` |
+| `TERMINAL_DOCKER_SHARED_CONTAINER_KEY` | `docker_shared_container_key` | Identidade compartilhada explícita para profiles confiáveis; vazio por padrão |
 | `TERMINAL_DOCKER_ORPHAN_REAPER` | `docker_orphan_reaper` | `true` / `false` — padrão `true` |
 | `TERMINAL_CONTAINER_CPU` | `container_cpu` | Núcleos CPU |
 | `TERMINAL_CONTAINER_MEMORY` | `container_memory` | MB |
@@ -816,7 +819,7 @@ compression:
   threshold: 0.50                                   # Compress at this % of context limit
   threshold_tokens: null                            # Absolute token cap (optional) — takes lower of ratio vs absolute
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
-  tail_mode: legacy                                 # Tail retention: "legacy" (0.20×window verbatim tail) or "lean" (clamped 2.5% tail, 10K-25K, with digests + anchor index + session_search recovery pointers in the summary — ~3x fewer retained tokens after compaction)
+  tail_mode: lean                                   # Tail retention: "lean" (default — clamped 2.5% tail, 10K-25K, with digests + anchor index + session_search recovery pointers in the summary; ~3x fewer retained tokens after compaction) or "legacy" (0.20×threshold verbatim tail)
   protect_last_n: 20                                # Min recent messages to keep uncompressed
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
   in_place: true                                    # Compact on the same session id (no rotation) — see below
@@ -1152,7 +1155,7 @@ prompt_caching:
 
 ## Modelos auxiliares {#auxiliary-models}
 
-O Hermes usa modelos "auxiliares" para tarefas laterais como análise de imagem, summarização de página web, análise de screenshot de browser, geração de título de sessão e compressão de contexto. Por padrão (`auxiliary.*.provider: "auto"`), o Hermes roteia toda tarefa auxiliar ao **modelo de chat principal** — o mesmo provider/model que você escolheu em `hermes model`. Você não precisa configurar nada para começar, mas esteja ciente de que em modelos de raciocínio caros (Opus, MiniMax M2.7, etc.) tarefas auxiliares somam custo significativo. Se quer tarefas laterais baratas e rápidas independentemente do modelo principal, defina `auxiliary.<task>.provider` e `auxiliary.<task>.model` explicitamente (por exemplo, Gemini Flash no OpenRouter para vision e web extraction).
+O Hermes usa modelos "auxiliares" para tarefas laterais como análise de imagem, análise de screenshot de browser, geração de título de sessão e compressão de contexto. Por padrão (`auxiliary.*.provider: "auto"`), o Hermes roteia toda tarefa auxiliar ao **modelo de chat principal** — o mesmo provider/model que você escolheu em `hermes model`. Você não precisa configurar nada para começar, mas esteja ciente de que em modelos de raciocínio caros (Opus, MiniMax M2.7, etc.) tarefas auxiliares somam custo significativo. Se quer tarefas laterais baratas e rápidas independentemente do modelo principal, defina `auxiliary.<task>.provider` e `auxiliary.<task>.model` explicitamente (por exemplo, Gemini Flash no OpenRouter para vision). (`web_extract` não é tarefa auxiliar: `web_extract` e snapshots de browser truncam conteúdo longo deterministicamente e armazenam o texto completo para paginação via `read_file` — sem LLM envolvido.)
 
 :::note Por que "auto" usa seu modelo principal
 Builds anteriores separavam usuários de agregador (OpenRouter, Nous Portal) para um default barato do lado do provedor. Isso era surpreendente — usuários que pagaram assinatura de agregador viam modelo diferente tratando tráfego auxiliar. `auto` agora usa o modelo principal para todos, e sobrescritas por task em `config.yaml` ainda vencem (veja [Referência completa de config auxiliar](#full-auxiliary-config-reference) abaixo).
@@ -1167,7 +1170,6 @@ $ hermes model
 → Configure auxiliary models
 
 [ ] vision               currently: auto / main model
-[ ] web_extract          currently: auto / main model
 [ ] title_generation     currently: openrouter / google/gemini-3-flash-preview
 [ ] tts_audio_tags       currently: auto / main model
 [ ] compression          currently: auto / main model
@@ -1188,7 +1190,7 @@ Se não quiser que o Hermes auto-gere títulos após a primeira troca, defina
 
 ### Endpoints stream-only {#stream-only-endpoints}
 
-Alguns endpoints OpenAI-compatible rejeitam requisições de chat não-streaming outright (ex.: Tencent Copilot retorna HTTP 400 `"Non-stream chat request is currently not supported"`). Chat interativo já faz stream, mas tarefas auxiliares (title generation, compression, web extraction) usam chamadas não-streaming e falhariam a cada tentativa. O Hermes sempre trata `copilot.tencent.com` como stream-only; para qualquer outro endpoint assim, liste um substring de URL em `auxiliary.stream_only_base_urls`:
+Alguns endpoints OpenAI-compatible rejeitam requisições de chat não-streaming outright (ex.: Tencent Copilot retorna HTTP 400 `"Non-stream chat request is currently not supported"`). Chat interativo já faz stream, mas tarefas auxiliares (title generation, compression, vision) usam chamadas não-streaming e falhariam a cada tentativa. O Hermes sempre trata `copilot.tencent.com` como stream-only; para qualquer outro endpoint assim, liste um substring de URL em `auxiliary.stream_only_base_urls`:
 
 ```yaml
 auxiliary:
@@ -1226,7 +1228,7 @@ Blocos de tarefa auxiliar aceitam adicionalmente um knob `reasoning_effort`:
 |-----|-------------|---------|
 | `reasoning_effort` | Nível de thinking para chamadas LLM dessa task: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | não definido (default do provedor) |
 
-Este é o counterpart por task do `agent.reasoning_effort` global: rode compression em `low` ou vision em `none` para cortar latência e custo de side-task quando seu modelo principal é um modelo de raciocínio caro, sem tocar comportamento de chat principal. Funciona em todo bloco de tarefa auxiliar (`vision`, `web_extract`, `compression`, `title_generation`, `curator`, `background_review`, ...), em todos os três formatos wire auxiliares (chat completions, Codex Responses, Anthropic Messages). Um `extra_body.reasoning` explícito na mesma task vence sobre o shorthand.
+Este é o counterpart por task do `agent.reasoning_effort` global: rode compression em `low` ou vision em `none` para cortar latência e custo de side-task quando seu modelo principal é um modelo de raciocínio caro, sem tocar comportamento de chat principal. Funciona em todo bloco de tarefa auxiliar (`vision`, `compression`, `title_generation`, `curator`, `background_review`, ...), em todos os três formatos wire auxiliares (chat completions, Codex Responses, Anthropic Messages). Um `extra_body.reasoning` explícito na mesma task vence sobre o shorthand.
 
 MoA é a exceção: profundidade de raciocínio para Mixture-of-Agents é configurada **por slot** no preset MoA (`moa.presets.<name>.reference_models[].reasoning_effort` / `aggregator.reasoning_effort`), não nos blocos auxiliares `moa_reference`/`moa_aggregator` — veja [Mixture of Agents](/user-guide/features/mixture-of-agents).
 
@@ -1271,14 +1273,6 @@ auxiliary:
                                # CPU-bound encode step so a video-frame fan-out can't saturate
                                # every core and starve the event loop; LLM calls stay fully
                                # concurrent. Minimum 1; values < 1 are ignored.
-
-  # Web page summarization + browser page text extraction
-  web_extract:
-    provider: "auto"
-    model: ""                  # e.g. "google/gemini-2.5-flash"
-    base_url: ""
-    api_key: ""
-    timeout: 360               # seconds (6min) — per-attempt LLM summarization
 
   # Dangerous command approval classifier
   approval:
@@ -1359,7 +1353,7 @@ auxiliary:
 ```
 
 :::tip
-Cada tarefa auxiliar tem `timeout` configurável (em segundos). Padrões: vision 120s, web_extract 360s, approval 30s, compression 120s. Aumente se usa modelos locais lentos para tarefas auxiliares. Vision também tem `download_timeout` separado (padrão 30s) para download HTTP de imagem — aumente para conexões lentas ou servidores de imagem self-hosted.
+Cada tarefa auxiliar tem `timeout` configurável (em segundos). Padrões: vision 120s, approval 30s, compression 120s. Aumente se usa modelos locais lentos para tarefas auxiliares. Vision também tem `download_timeout` separado (padrão 30s) para download HTTP de imagem — aumente para conexões lentas ou servidores de imagem self-hosted.
 :::
 
 :::info
@@ -1392,7 +1386,7 @@ Cada entrada suporta os mesmos três knobs de qualquer config de tarefa auxiliar
 | `model` | Nome do modelo para esse provider |
 | `base_url` | (Opcional) Endpoint OpenAI-compatible customizado |
 
-`fallback_chain` está disponível em qualquer tarefa auxiliar — `compression`, `vision`, `web_extract`, `approval`, `skills_hub`, `mcp`, etc.
+`fallback_chain` está disponível em qualquer tarefa auxiliar — `compression`, `vision`, `approval`, `skills_hub`, `mcp`, etc.
 
 ### Limitando concorrência auxiliar {#limiting-auxiliary-concurrency}
 
@@ -1554,12 +1548,8 @@ Modelos auxiliares também podem ser configurados via variáveis de ambiente. Po
 | Vision model | `AUXILIARY_VISION_MODEL` |
 | Vision endpoint | `AUXILIARY_VISION_BASE_URL` |
 | Vision API key | `AUXILIARY_VISION_API_KEY` |
-| Web extract provider | `AUXILIARY_WEB_EXTRACT_PROVIDER` |
-| Web extract model | `AUXILIARY_WEB_EXTRACT_MODEL` |
-| Web extract endpoint | `AUXILIARY_WEB_EXTRACT_BASE_URL` |
-| Web extract API key | `AUXILIARY_WEB_EXTRACT_API_KEY` |
 
-Configurações de compression e fallback model são só config.yaml.
+Configurações de compression e fallback model são config.yaml-only. (Variáveis `AUXILIARY_WEB_EXTRACT_*` estão obsoletas — web extraction não usa mais LLM auxiliar.)
 
 :::tip
 Execute `hermes config` para ver suas configurações atuais de modelo auxiliar. Sobrescritas só aparecem quando diferem dos padrões.
@@ -1994,6 +1984,15 @@ Quando `redact_pii` é `true`, o gateway redige informação pessoal identificá
 **Suporte de plataforma:** Redação aplica-se a WhatsApp, Signal e Telegram. Discord e Slack são excluídos porque seus sistemas de mention (`<@user_id>`) exigem o ID real no contexto LLM.
 
 Hashes são determinísticos — o mesmo usuário sempre mapeia para o mesmo hash, então o modelo ainda distingue usuários em group chats. Roteamento e entrega usam valores originais internamente.
+
+### Identidade de requisição OpenAI Codex {#openai-codex-request-identity}
+
+A OpenAI exige que harnesses Codex de terceiros se identifiquem.
+Requisições autenticadas via ChatGPT ao endpoint Codex oficial enviam automaticamente
+`originator: hermes-agent` e `User-Agent: HermesAgent/<version>`.
+O header de conta ChatGPT existente é preservado. Nenhum conteúdo extra de prompt
+ou requisição de telemetria é enviado.
+Requisições diretas à API OpenAI e endpoints proxy custom permanecem inalteradas.
 
 ## Speech-to-Text (STT) {#speech-to-text-stt}
 
@@ -2503,6 +2502,8 @@ O provider de delegation usa a mesma resolução de credencial que startup CLI/g
 
 **Largura e profundidade:** `max_concurrent_children` limita quantos subagentes rodam em paralelo por lote (padrão `3`, mínimo 1, sem teto). Também pode ser definido via env var `DELEGATION_MAX_CONCURRENT_CHILDREN`. Quando o modelo submete array `tasks` maior que o cap, `delegate_task` retorna erro de ferramenta explicando o limite em vez de truncar silenciosamente. `max_spawn_depth` controla profundidade da árvore de delegation (limitado a 1-3). No padrão `1`, delegation é plana: filhos não podem spawnar netos, e passar `role="orchestrator"` degrada silenciosamente para `leaf`. Aumente para `2` para filhos orquestradores spawnarem netos folha; `3` para árvores de três níveis. O agente opta por orquestração por chamada via `role="orchestrator"`; `orchestrator_enabled: false` força todo filho de volta a leaf. Custo escala multiplicativamente — com `max_spawn_depth: 3` e `max_concurrent_children: 3`, a árvore pode atingir 3×3×3 = 27 agentes folha concorrentes. Veja [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) para padrões de uso.
 
+**Notificações de processo filho:** processos em background iniciados por subagentes roteiam suas notificações de completion/watch para a conversa pai, mas são **suprimidas** lá por padrão — o result consolidado do filho é o deliverable. Defina `delegation.surface_child_process_notifications: true` para entregá-las (com atribuição de subagent). Results de delegation nunca são suprimidos. Veja [Subagent Delegation → Child background-process notifications](features/delegation.md#child-background-process-notifications).
+
 ## Clarify {#clarify}
 
 Configure quanto tempo o gateway espera resposta a pergunta esclarecedora. A chave canônica é `agent.clarify_timeout` (padrão `3600` segundos); chave legada top-level `clarify.timeout` ainda é honrada se definida explicitamente:
@@ -2598,9 +2599,16 @@ dashboard:
   drain_auth:                 # Drain-control service-credential gate (dashboard_auth/drain plugin)
     scope: "drain"            # capability label on the verified principal
     min_secret_chars: 43      # entropy bar (url-safe-b64 chars; 43 ≈ 256 bits)
+  ws_ping_interval: 20.0      # Non-loopback WebSocket keepalive ping interval (seconds)
+  ws_ping_timeout: 20.0       # Non-loopback WebSocket keepalive pong timeout (seconds)
+  ws_orphan_reap_grace_s: 20.0 # Grace before a WS-detached session is reaped (seconds)
+  startup_orphan_sweep: true  # Close session rows orphaned by a dead gateway process at boot
 ```
 
 - `theme` — tema visual do dashboard.
 - `show_token_analytics` — desligado por padrão. A página Analytics e figuras token/cost são **estimativa local lower-bound** (excluem chamadas auxiliares, retries, fallbacks e cache writes), então podem ler muito abaixo da fatura do provider. Defina `true` só se entende que não são billing.
 - `public_url` — quando definido, esta é a authority completa (scheme + host + optional path prefix) de onde o OAuth `redirect_uri` é construído. Defina para deploys atrás de reverse proxies que não encaminham headers `X-Forwarded-*` de forma confiável. Deixe vazio para usar reconstrução proxy-header.
 - `oauth` / `basic_auth` / `drain_auth` — config de auth provider lida pelos plugins dashboard-auth incluídos. O segredo drain em si **não** é definido aqui; é provisionado via env var `HERMES_DASHBOARD_DRAIN_SECRET`. Veja [Web Dashboard](/user-guide/features/web-dashboard) para setup auth completo.
+- `ws_ping_interval` / `ws_ping_timeout` — tuning de keepalive WebSocket para binds non-loopback (conexões loopback nunca pingam). Aumente em links de alta latência (Tailscale, túneis SSH distantes) onde os defaults de 20 s podem fabricar disconnects 1006 espúrios.
+- `ws_orphan_reap_grace_s` — quanto tempo uma sessão WS-detached espera antes do orphan reaper coletá-la. Aumente junto com os valores de keepalive se clientes reconectam devagar. (`HERMES_TUI_WS_ORPHAN_REAP_GRACE_S` permanece como override interno.)
+- `startup_orphan_sweep` (default `true`) — o timer de reap WS-orphan acima é in-process, então restart de gateway (update, crash, systemd) antes de disparar deixa a row de sessão aberta forever — trabalho "ativo" fantasma em `/resume` e dashboards. Em todo boot de gateway — tanto a TUI stdio (`entry.main`) quanto o sidecar WebSocket desktop/dashboard (`handle_ws`) — rows com source `tui` / `desktop` / `subagent` cujo start time **e** mensagem mais nova são ambos mais antigos que o session TTL (`HERMES_TUI_SESSION_TTL_S`, default 6 horas) são fechadas com `end_reason: startup_orphan_reap`. Sessões de plataformas de messaging (Telegram, Discord, …) nunca são tocadas, sessões live in-memory (client que já retomou) são excluídas, e sessões swept permanecem resumíveis.

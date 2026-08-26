@@ -1,10 +1,10 @@
 ---
 sidebar_position: 7
-title: "Docker"
+title: "Configuração Docker do Hermes"
 description: "Executando o Hermes Agent no Docker e usando Docker como backend de terminal"
 ---
 
-# Hermes Agent — Docker
+# Configuração Docker do Hermes
 
 Há duas formas distintas em que o Docker intersecta com o Hermes Agent:
 
@@ -799,6 +799,16 @@ docker run -d \
 ```
 
 `docker exec hermes <cmd>` também drop automaticamente para UID 10000 — veja [`docker exec` automatically drops to the `hermes` user](#docker-exec-automatically-drops-to-the-hermes-user) para detalhes e opt-out por invocação.
+
+### "Permission denied" em todo `docker exec` (dir de instalação bloqueado em 0700) {#permission-denied-on-every-docker-exec-install-dir-locked-to-0700}
+
+Imagens construídas antes de final de agosto de 2026 tinham um bug em que gravar um arquivo de credencial diretamente sob `/opt/hermes` restringia esse diretório a `0700`, bloqueando o usuário `hermes` (UID 10000) fora da árvore de instalação. Todo `docker exec` novo então falha com `Permission denied`.
+
+Puxar uma imagem mais nova e recriar o container corrige permanentemente (o dir de instalação vem como `0755` e releases atuais não o restringem mais). Se precisar recuperar um container em execução in place sem recriá-lo:
+
+```sh
+docker exec -u root hermes chmod 0755 /opt/hermes
+```
 
 ### Browser tools not working {#browser-tools-not-working}
 

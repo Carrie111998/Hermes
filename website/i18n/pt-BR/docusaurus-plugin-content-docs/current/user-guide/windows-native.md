@@ -75,7 +75,7 @@ De cima a baixo, em ordem:
 6. **`uv pip install` em camadas** — tenta `.[all]` primeiro, faz fallback para conjuntos progressivamente menores (`[messaging,dashboard,ext]` → `[messaging]` → `.`) se uma dep `git+https` falhar com rate limit no GitHub. Evita o modo de falha "um flake te deixa com instalação mínima".
 7. **Auto-instala SDKs de mensagens** conforme `.env` — se `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `WHATSAPP_ENABLED` estiverem presentes, executa `python -m ensurepip --upgrade` e `pip install` direcionados para que o SDK de cada plataforma seja importável de fato.
 8. **Define `HERMES_GIT_BASH_PATH`** para o `bash.exe` resolvido, para o Hermes encontrá-lo deterministicamente em shells novos.
-9. **Adiciona `%LOCALAPPDATA%\hermes\hermes-agent\bin` ao User PATH e define `HERMES_HOME=%LOCALAPPDATA%\hermes`** — expõe o comando `hermes` (e aponta para seu dir de dados) depois que você abrir um terminal novo. Só os launchers `hermes.exe` / `hermes-acp.exe` são copiados para este diretório `bin`; o `venv\Scripts` completo é deliberadamente **não** colocado no PATH para o Hermes nunca ofuscar seu próprio comando `python`.
+9. **Adiciona `%LOCALAPPDATA%\hermes\bin` ao User PATH e define `HERMES_HOME=%LOCALAPPDATA%\hermes`** — expõe o comando `hermes` (e aponta para seu dir de dados) depois que você abrir um terminal novo. Só os launchers `hermes.exe` / `hermes-acp.exe` são copiados para este diretório `bin`; o `venv\Scripts` completo é deliberadamente **não** colocado no PATH para o Hermes nunca ofuscar seu próprio comando `python`.
 10. **Executa `hermes setup`** — o wizard normal de primeira execução (modelo, provedor, toolsets). Pule com `-SkipSetup`.
 
 :::tip Pule a caça a chaves de API no Windows
@@ -202,10 +202,10 @@ Serviços exigem direitos de admin para instalar e amarram o ciclo de vida do ga
 
 | Path | Contents |
 |---|---|
-| `%LOCALAPPDATA%\hermes\hermes-agent\` | Git checkout + venv. O launcher `bin\hermes.exe` (copiado de `venv\Scripts\hermes.exe`) é o comando adicionado ao User PATH. Safe to `Remove-Item -Recurse` and reinstall. |
+| `%LOCALAPPDATA%\hermes\hermes-agent\` | Git checkout + venv. Safe to `Remove-Item -Recurse` and reinstall. |
 | `%LOCALAPPDATA%\hermes\git\` | PortableGit (only if the installer provisioned it). |
 | `%LOCALAPPDATA%\hermes\node\` | Portable Node.js (only if the installer provisioned it). |
-| `%LOCALAPPDATA%\hermes\bin\` | Hermes's managed `uv.exe` (the Python manager it uses for updates). |
+| `%LOCALAPPDATA%\hermes\bin\` | Os launchers `hermes` / `hermes-acp` e o `uv.exe` gerenciado pelo Hermes (o gerenciador Python usado para updates). |
 | `%LOCALAPPDATA%\hermes\` (root) | Your config, auth, skills, sessions, logs (`config.yaml`, `.env`, `skills\`, `sessions\`, `logs\`, …). **Survives reinstalls.** |
 
 No Windows nativo, o instalador define `HERMES_HOME=%LOCALAPPDATA%\hermes`, então seus dados e a instalação descartável ficam sob a **mesma** raiz `%LOCALAPPDATA%\hermes`: instalação/runtime são os subdiretórios `hermes-agent\`, `git\`, `node\` e `bin\`, enquanto seus arquivos de dados ficam diretamente em `%LOCALAPPDATA%\hermes`. Reinstalar só substitui o checkout `hermes-agent\`, então seus dados sobrevivem — mas como os dois compartilham uma raiz, **não** faça `Remove-Item -Recurse %LOCALAPPDATA%\hermes` se quiser manter seus dados; delete o subdiretório `hermes-agent\` em vez disso. Seu diretório de dados tem forma idêntica a um `~/.hermes` Linux, então você pode espelhá-lo entre máquinas.

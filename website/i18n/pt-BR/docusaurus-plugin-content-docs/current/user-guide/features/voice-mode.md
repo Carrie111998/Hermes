@@ -175,6 +175,24 @@ Com TTS habilitado, o agente fala a resposta **frase a frase** conforme gera tex
 
 O mesmo pipeline roda na CLI clássica, TUI e app desktop. Em conversa de voz no desktop o texto da resposta é alimentado **ao vivo** num WebSocket de fala por resposta conforme o modelo gera, então a fala sobrepõe a geração — um socket e um relógio de áudio por resposta, sem gaps de conexão por frase.
 
+### Desktop remoto: voz client-direct (caminho de menor hop) {#desktop-remote-client-direct-voice-lowest-hop-path}
+
+Quando o Hermes Desktop está conectado a um **gateway remoto**, o áudio não precisa ser retransmitido pelo gateway. No início da sessão de voz, o desktop busca as configurações STT/TTS resolvidas do profile ativo (provider, model, language/voice e credencial) no gateway pelo canal REST autenticado (`GET /api/audio/voice-config`) e então chama os providers **diretamente**:
+
+- **Ditado / entrada de voz:** a gravação do microfone vai direto do seu desktop para o provider STT do profile; só o *texto* resultante é enviado ao gateway como prompt.
+- **Respostas faladas:** o texto da resposta já faz stream para o desktop pelo socket de chat, então o desktop sintetiza localmente com o provider TTS do profile e reproduz — o link com o gateway nunca carrega áudio.
+
+Não há nada a configurar no client: o profile com o qual você está falando é a única fonte de verdade para providers e chaves, exatamente como se o gateway tivesse feito o trabalho. As chaves ficam só na memória do desktop durante a sessão — nunca são gravadas em disco no client.
+
+Providers que só podem rodar no host do gateway (whisper local, TTS `edge`, command providers, plugins) fazem fallback automaticamente para o caminho de relay (`/api/audio/transcribe` e o WebSocket de fala), assim como qualquer backend antigo sem o endpoint. Para forçar o relay para todo provider, defina:
+
+```yaml
+voice:
+  client_direct: false
+```
+
+Suporte wire client-direct: OpenAI (incl. áudio gerenciado pela Nous), Groq, Mistral e DeepInfra via shapes compatíveis com OpenAI, xAI Grok STT, e ElevenLabs STT + TTS. xAI configurado via OAuth permanece no relay (o bearer OAuth renova no servidor).
+
 ### Barge-in {#barge-in}
 
 Você pode interromper o agente em QUALQUER ponto do turno — o microfone fica ativo desde o momento em que você termina de falar até a resposta ter tocado por completo (full duplex):

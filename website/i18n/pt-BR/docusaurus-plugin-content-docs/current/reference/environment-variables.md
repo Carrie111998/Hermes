@@ -501,7 +501,7 @@ Três provedores de autenticação de dashboard acompanham o pacote. Para uma co
 | `HERMES_DASHBOARD_BASIC_AUTH_SECRET` | Chave HMAC (32+ bytes, base64/hex/raw) assinando os tokens de sessão sem estado do provedor basic. Defina explicitamente para que as sessões sobrevivam a reinicializações / abranjam vários workers; vazio → aleatório por processo (você será deslogado a cada reinicialização). Sobrescreve `dashboard.basic_auth.secret`. |
 | `HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS` | Tempo de vida do token de acesso para o provedor basic (padrão 12h). Sobrescreve `dashboard.basic_auth.session_ttl_seconds`. |
 | `HERMES_DASHBOARD_OAUTH_CLIENT_ID` | ID de cliente OAuth (`agent:{instance_id}`) para o dashboard restrito/público, ativando o provedor Nous (`plugins/dashboard_auth/nous`). Sobrescreve `dashboard.oauth.client_id`. Provisione com `hermes dashboard register`. |
-| `HERMES_DASHBOARD_PUBLIC_URL` | URL pública completa em que o dashboard é acessado, para construção do callback OAuth atrás de reverse proxies. Sobrescreve `dashboard.public_url`. |
+| `HERMES_DASHBOARD_PUBLIC_URL` | URL pública completa em que o dashboard é acessado atrás de um reverse proxy. Controla a construção do callback OAuth, adiciona o hostname exato à guarda HTTP Host/WebSocket Origin e exige o portão de auth para hosts públicos não-loopback mesmo quando o backend escuta em loopback. Sobrescreve `dashboard.public_url`. |
 | `HERMES_DASHBOARD_OIDC_ISSUER` | URL do issuer OIDC para o provedor OIDC auto-hospedado incluído (`plugins/dashboard_auth/self_hosted`). Obrigatória para ativá-lo. Sobrescreve `dashboard.oauth.self_hosted.issuer`. |
 | `HERMES_DASHBOARD_OIDC_CLIENT_ID` | ID de cliente OIDC público (authorization-code + PKCE) para o provedor OIDC auto-hospedado. Obrigatório para ativá-lo. Sobrescreve `dashboard.oauth.self_hosted.client_id`. |
 | `HERMES_DASHBOARD_OIDC_SCOPES` | Scopes OIDC solicitados para o provedor OIDC auto-hospedado (padrão `openid profile email`). Sobrescreve `dashboard.oauth.self_hosted.scopes`. |
@@ -832,10 +832,10 @@ Configs antigas com `compression.summary_model`, `compression.summary_provider`,
 | `AUXILIARY_VISION_MODEL` | Sobrescreve o modelo para tarefas de visão |
 | `AUXILIARY_VISION_BASE_URL` | Endpoint direto compatível com OpenAI para tarefas de visão |
 | `AUXILIARY_VISION_API_KEY` | Chave de API pareada com `AUXILIARY_VISION_BASE_URL` |
-| `AUXILIARY_WEB_EXTRACT_PROVIDER` | Sobrescreve o provedor para extração/sumarização web |
-| `AUXILIARY_WEB_EXTRACT_MODEL` | Sobrescreve o modelo para extração/sumarização web |
-| `AUXILIARY_WEB_EXTRACT_BASE_URL` | Endpoint direto compatível com OpenAI para extração/sumarização web |
-| `AUXILIARY_WEB_EXTRACT_API_KEY` | Chave de API pareada com `AUXILIARY_WEB_EXTRACT_BASE_URL` |
+
+:::note
+As variáveis `AUXILIARY_WEB_EXTRACT_*` estão obsoletas: `web_extract` e snapshots de browser não usam mais um LLM auxiliar. Páginas longas e snapshots são truncados deterministicamente com o texto completo armazenado em disco para paginação via `read_file`.
+:::
 
 Para endpoints diretos específicos de tarefa, o Hermes usa a chave de API configurada da tarefa ou `OPENAI_API_KEY`. Ele não reutiliza `OPENROUTER_API_KEY` para esses endpoints customizados.
 

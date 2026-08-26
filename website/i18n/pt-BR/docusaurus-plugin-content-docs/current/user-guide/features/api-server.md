@@ -256,6 +256,95 @@ Retorna descrição legível por máquina da superfície estável do API server 
 
 Use este endpoint ao integrar dashboards, UIs de browser ou planos de controle para descobrirem se a versão Hermes em execução suporta runs, streaming, cancelamento e continuidade de sessão sem depender de internals Python privados.
 
+## Controle por extensão de browser {#browser-extension-control}
+
+O Hermes pode rotear ferramentas de browser por uma extensão autenticada que controla
+a sessão de browser associada à sessão Hermes atual. O recurso está
+desabilitado por padrão; defina `browser.extension_control.enabled` como `true` para opt in:
+
+```yaml
+browser:
+  extension_control:
+    enabled: true
+```
+
+O caminho de API local também exige a bearer key do API server. Um controller pode
+registrar-se só para uma sessão de server existente. O Hermes deriva o principal do
+controller do state autenticado do server; um `principal_id` fornecido pelo client é
+ignorado.
+
+Descubra o contrato live via `GET /v1/capabilities`. O objeto
+`browser_extension_control` reporta se o recurso está habilitado, a
+versão do protocolo, nomes de transport e a allowlist exata de capabilities:
+
+```text
+controller.noop
+browser_back
+browser_click
+browser_navigate
+browser_press
+browser_screenshot
+browser_scroll
+browser_snapshot
+browser_tab_activate
+browser_tabs
+browser_type
+```
+
+Capabilities solicitadas fora dessa lista são filtradas. CDP raw, avaliação arbitrária de
+script, acesso a console, uploads, extração de imagem e vision não fazem
+parte do protocolo do controller.
+
+Quando uma requisição não tem identidade de controller bound, ou quando o recurso está desabilitado,
+o Hermes preserva o backend de browser existente. Uma vez que o gateway faz bind de um
+principal de controller e família de transport à requisição, aquela lane de extensão
+é autoritativa: controllers ausentes, ambíguos, desconectados ou incapazes
+falham closed em vez de trocar silenciosamente para outro browser local/cloud.
+Depois que um controller exato é selecionado, seu result ou error é autoritativo e
+o Hermes nunca retenta a mesma ação por outro backend.
+
+### Registro via API local {#local-api-registration}
+
+1. Envie um `POST /v1/browser-control/register` autenticado com
+   `protocol_version`, `session_id`, `controller_id`, `browser_profile_id` e
+   as `capabilities` solicitadas.
+2. O Hermes retorna um ticket de uso único com TTL de 30 segundos e o escopo de
+   controller filtrado e bound ao server.
+3. Abra `GET /v1/browser-control/ws` com ambos os subprotocolos WebSocket:
+   `hermes-browser-control-v1` e
+   `hermes-browser-control-ticket.<ticket>`.
+
+O ticket nunca é aceito na query string. Tickets desconhecidos, expirados, reutilizados ou
+malformados falham antes do upgrade WebSocket.
+
+### Frames do controller {#controller-frames}
+
+O Hermes envia frames `browser.controller.command` contendo `command_id`,
+`action`, `arguments` imutáveis, ids de browser/controller e o
+`tool_call_id` de origem. O controller responde com `browser.controller.result`, o
+mesmo `command_id`, um boolean `ok` exato, e `result` ou `error`.
+Cancelamento e timeout emitem `browser.controller.cancel`; results tardios são
+ignorados.
+
+Perda inesperada de socket marca o controller offline e preserva trabalho
+já em flight até o deadline original de cada command. Um reconnect com o
+mesmo principal, profile, session, controller id, browser profile e identidade de transport
+refresca o transport sem admitir trabalho novo antes de qualquer cancel
+deferido ser flushed. Capabilities negociadas podem mudar nesse reconnect; elas
+não são campo de identidade. Um controller id ou browser profile diferente na
+mesma lane de session autenticada é replacement hard: trabalho pending antigo é
+cancelado antes do sucessor ficar routable. Envie
+`browser.controller.detach` no transport autenticado do controller para um
+hard detach intencional — isso cancela imediatamente trabalho pending. Apenas fechar
+o socket é tratado como disconnect recuperável.
+
+O transport autenticado do dashboard expõe o mesmo registro, result,
+heartbeat, capability e semântica de ownership pelo canal Gateway RPC/event.
+Em ambos os transports, a seleção exige um match exato unambiguous em
+principal, profile, session, controller, browser profile, família de transport e
+capability. Uma vez selecionado, falha de controller é autoritativa e nunca
+é retentada por outro backend de browser.
+
 ## Seleção de model por requisição {#per-request-model-selection}
 
 Clientes autenticados podem sobrescrever a seleção padrão de model do Hermes por requisição

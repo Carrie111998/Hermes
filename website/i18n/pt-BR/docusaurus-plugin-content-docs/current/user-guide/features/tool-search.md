@@ -31,21 +31,38 @@ Quando Tool Search ativa para um turno, o modelo vê três ferramentas novas no
 lugar das adiadas:
 
 ```
-tool_search(query, limit?)     — search the deferred-tool catalog
-tool_describe(name)            — load the full schema for one tool
+tool_search(queries, limit?)   — search the deferred-tool catalog (one or more queries)
+tool_describe(names)           — load the full schemas for one or more tools
 tool_call(name, arguments)     — invoke a deferred tool
 ```
 
 Uma interação típica parece com:
 
 ```
-Model: tool_search("create a github issue")
-  → { matches: [{ name: "mcp_github_create_issue", ... }, ...] }
-Model: tool_describe("mcp_github_create_issue")
-  → { parameters: { type: "object", properties: { ... } } }
+Model: tool_search(["create a github issue", "send a slack message"])
+  → { results: [ { query: "create a github issue",
+                   matches: ["mcp_github_create_issue", ...] },
+                 { query: "send a slack message",
+                   matches: ["mcp_slack_post_message", ...] } ],
+      tools: { mcp_github_create_issue: { description: "...",
+                                          required: ["title"], ... },
+               mcp_slack_post_message: { ... } } }
+Model: tool_describe(["mcp_github_create_issue", "mcp_slack_post_message"])
+  → { tools: { mcp_github_create_issue: { parameters: { ... } },
+               mcp_slack_post_message: { parameters: { ... } } } }
 Model: tool_call("mcp_github_create_issue", { title: "...", body: "..." })
   → { ok: true, issue_number: 42 }
 ```
+
+Cada query numa chamada `tool_search` é buscada independentemente no
+mesmo catálogo (`limit` aplica por query); os grupos por query carregam só nomes de
+ferramenta, enquanto o mapa compartilhado `tools` guarda descrição e nomes de parâmetros
+obrigatórios de cada match uma vez. Queries são stemmed, então
+"issues" encontra `create_issue`. Cada grupo de query sem matches inclui um resumo
+`available_sources` dos servers conectados para um miss lexical não ser confundido com
+capability ausente.
+`tool_describe` resolve todo nome solicitado numa chamada; nomes desconhecidos
+são reportados em `not_found` sem falhar o resto do batch.
 
 Quando o modelo invoca `tool_call`, o Hermes **desembrulha a bridge** e
 despacha a ferramenta subjacente exatamente como se o modelo a tivesse chamado
@@ -79,19 +96,22 @@ tools:
     enabled: auto       # auto (default), on, or off
     threshold_pct: 5    # listing budget as a percentage of context
     search_default_limit: 5
-    max_search_limit: 20
+    max_search_limit: 25
     listing: auto       # embed a grouped name+description catalog manifest
     listing_max_tokens: 4000
 ```
 
 | Chave | Padrão | Significado |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto`/`on` ativam sempre que existir pelo menos uma ferramenta deferível; `off` desabilita totalmente (tudo permanece eager). |
+| `enabled` | `auto` | `auto`/`on` ativam sempre que existir pelo menos uma ferramenta deferível; `off` desabilita totalmente (tudo permanece eager). `auto` hoje é alias de `on` — reservado para um modo futuro que inline schemas quando cabem no context e defer só quando não cabem. Fixe `on` ou `off` se quer o comportamento de hoje garantido entre upgrades. |
 | `threshold_pct` | `5` | Budget de listing como porcentagem do context length do modelo ativo. Faixa 0–100. |
-| `search_default_limit` | `5` | Hits retornados quando o modelo chama `tool_search` sem `limit`. |
-| `max_search_limit` | `20` | Limite superior rígido que o modelo pode pedir via `limit`. Faixa 1–50. |
+| `search_default_limit` | `5` | Hits retornados por query quando o modelo chama `tool_search` sem `limit`. |
+| `max_search_limit` | `25` | Limite superior rígido que o modelo pode pedir via `limit` (por query). Faixa 1–50. |
 | `listing` | `auto` | Embute um manifest estilo skills de toda ferramenta adiada (nome + primeira frase da descrição, ≤60 chars, agrupado por servidor MCP) na descrição da bridge `tool_search`. `auto` inclui quando cabe no budget (caindo para só nomes, depois para o resumo tier-2 por servidor); `on`/`off` forçam de um jeito ou outro. |
 | `listing_max_tokens` | `4000` | Cap absoluto no listing embutido, independentemente do tamanho do contexto. Faixa 200–60000. Catálogos grandes degradam para só nomes ou resumos por servidor, mantendo schemas completos disponíveis via search. |
+
+Caps de array por chamada são bounds internos de segurança, não configuração. Chamadas
+over-cap retornam erro para o modelo retentar com batch menor.
 
 ### Por que o listing existe {#why-the-listing-exists}
 
@@ -149,11 +169,20 @@ a qualquer design de progressive disclosure, não específicos desta implementa�
 
 ## Detalhes de implementação {#implementation-details}
 
-- **Retrieval:** BM25 sobre nome de ferramenta tokenizado + descrição + nomes de
-  parâmetros. Cai para match literal de substring no nome da ferramenta quando
-  BM25 retorna zero hits com score positivo, o que protege contra
-  casos degenerados de zero-IDF (ex.: buscar `"github"` contra um
-  catálogo onde todo nome de ferramenta contém "github").
+- **Retrieval:** BM25 sobre nome de ferramenta tokenizado, nome da source (o servidor MCP
+  ou toolset de plugin ao qual a ferramenta pertence, para buscar `"linear"`
+  encontrar ferramentas daquele server mesmo quando o nome da ferramenta não carrega
+  o serviço), descrição e nomes de parâmetros, com stemming Snowball
+  (inglês) aplicado ao índice e à query para variantes morfológicas casarem ("issues" encontra
+  `create_issue`). Cai para match literal de substring no nome da ferramenta quando nenhum token da
+  query casa com documento (ex.: buscar `"hub"` onde o token é
+  `github`).
+- **Parallel execution desembrulha a bridge.** O batch planner decide
+  concorrência na ferramenta *subjacente* de um `tool_call`, não no
+  nome literal da bridge — então um servidor MCP opt-in via
+  `supports_parallel_tool_calls: true` mantém sua concorrência quando suas
+  ferramentas são chamadas pela bridge, e lookups `tool_search` /
+  `tool_describe` batcham concorrentemente como qualquer ferramenta read-only.
 - **Catálogo é stateless entre turnos.** Reconstrói da lista atual de tool-defs
   a cada montagem — sem `Map` keyed por sessão. Isso evita
   a classe de bug onde um catálogo armazenado deriva do sync com o

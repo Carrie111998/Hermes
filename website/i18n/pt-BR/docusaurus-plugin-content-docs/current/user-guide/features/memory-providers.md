@@ -312,6 +312,9 @@ echo "OPENVIKING_API_KEY=..." >> ~/.hermes/.env
 
 `OPENVIKING_ACCOUNT` e `OPENVIKING_USER` são usados para modo local/trusted.
 `OPENVIKING_AGENT` é o peer ID do Hermes no OpenViking para memórias com escopo de peer.
+O Hermes envia `User-Agent: openviking-memory-hermes/<version>` em requisições
+OpenViking. Este identificador padrão de harness não contém identificador por usuário e
+não adiciona uma requisição separada.
 
 ---
 

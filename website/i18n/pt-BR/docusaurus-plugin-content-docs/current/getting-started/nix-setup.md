@@ -600,7 +600,8 @@ O conjunto de opções é o mesmo conjunto que o módulo NixOS usa. É `services
 | Roda como | um system user que você declara, com `user`, `group` e `createUser` | você |
 | Diretório de estado | `stateDir` e `/.hermes` | `hermesHome`, definido diretamente. O default é `~/.hermes`. |
 | Serviço | `systemd.services` | `systemd.user.services` no Linux, `launchd.agents` no macOS |
-| CLI no PATH | `addToSystemPackages`, que exporta `HERMES_HOME` para o sistema inteiro | `installPackage`, que o exporta só para sua sessão |
+| CLI no PATH | `addToSystemPackages`, que exporta `HERMES_HOME` para o sistema inteiro | `programs.hermes-agent.enable`, que o exporta só para sua sessão |
+| Aplicativo Desktop | não suportado, porque um system service não pode ser dono de uma user session | `programs.hermes-agent.desktop.enable` |
 | Modo container | suportado | não suportado, porque precisa de root e do socket Docker |
 
 ### Adicionar o input do flake {#add-the-flake-input-1}
@@ -1031,8 +1032,49 @@ Esta opção roda o processo ao qual Hermes Desktop e o web dashboard conectam, 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `hermesHome` | `str` | `"${config.home.homeDirectory}/.hermes"` | `HERMES_HOME` diretamente. O módulo NixOS o monta a partir de `stateDir`. |
-| `installPackage` | `bool` | `true` | Adiciona o CLI `hermes` a `home.packages`, e exporta `HERMES_HOME` para seus shells |
 | `gateway.enable` | `bool` | `false` | Roda o messaging gateway. No módulo NixOS o gateway é o serviço, então aquele módulo não tem essa opção. |
+
+### `programs.hermes-agent` (só Home Manager) {#programshermes-agent-home-manager-only}
+
+O Home Manager separa "instale este aplicativo para mim" de "rode este
+daemon". `services.hermes-agent` mantém state, configuração e
+daemons. `programs.hermes-agent` instala o que você usa, e lê
+`hermesHome` e o endereço do backend dos services.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enable` | `bool` | `false` | Adiciona o CLI `hermes` a `home.packages`, e exporta `HERMES_HOME` para seus shells |
+| `package` | `package` | `services.hermes-agent.package` | O package a instalar. O default aplica `extraPythonPackages` e `extraDependencyGroups` dos services, então ambos são um build. |
+| `desktop.enable` | `bool` | `false` | Adiciona o aplicativo Hermes Desktop, com launcher entry no Linux |
+| `desktop.package` | `package` | `package.hermesDesktop` | O package desktop. O default segue `package`, então aplicativo e services rodam um runtime Hermes. |
+
+```nix
+programs.hermes-agent = {
+  enable = true;
+  desktop.enable = true;
+};
+
+services.hermes-agent = {
+  enable = true;
+  backend.mode = "serve";
+  backend.sessionTokenFile = config.sops.secrets."hermes/desktop-token".path;
+};
+```
+
+O launcher carrega `HERMES_HOME` sozinho. Um menu desktop não lê
+profile de shell, então o valor que `programs.hermes-agent.enable` exporta com
+`home.sessionVariables` chega a um shell interativo só. Sem o
+valor no launcher, o aplicativo abre `~/.hermes` enquanto os
+services usam `hermesHome`, e você não vê sessões nem keys.
+
+Com `backend.sessionTokenFile`, o aplicativo conecta ao backend
+do serviço em vez de iniciar um próprio. Ambos os lados leem o
+arquivo no start time, então o token não entra em nenhum path do Nix store. Sem a
+opção, cada lado roda seu próprio backend.
+
+`services.hermes-agent.installPackage` foi removido por este split. Uma
+configuração que ainda o define recebe erro que nomeia o
+replacement.
 
 ### Container (só NixOS)
 

@@ -170,10 +170,31 @@ que vivem num gateway.
   profile permanecem um controle separado depois do divisor. O mesmo seletor escala
   de dois gateways a uma frota maior sem transformar backends em glyphs estilo
   profile nem empurrar ações de profile para fora do rail.
-- Selecionar um gateway restaura o último profile usado lá. O rail de profiles
-  então mostra só os profiles daquele gateway; o pill home volta ao default
-  dele e o pill de camadas mostra **All profiles on this gateway**.
-  **Cmd/Ctrl+1–9** continuam trocando profiles dentro do gateway ativo.
+- Selecionar um gateway restaura o último profile usado lá. O pill home
+  volta ao default dele e o pill de camadas mostra **All profiles on
+  this gateway**. **Cmd/Ctrl+1–9** continuam trocando profiles dentro do
+  gateway ativo.
+- Com vários gateways o rail de profiles vira um **fleet rail**: os profiles de todo gateway
+  registrado ficam na mesma faixa, cada grupo liderado pelo glyph de kind daquele gateway
+  (device, network, terminal, cloud) — o mesmo glyph do seletor de gateway.
+  Os squares do gateway ativo parecem exatamente como num Desktop single-gateway; os dos
+  outros gateways ficam dimmed ("at rest").
+  Hover num square at-rest nomeia sua máquina (`omer · This device`), então dois
+  profiles de mesmo nome em máquinas diferentes nunca parecem iguais.
+- Clicar num square at-rest faz o mesmo switch do seletor de gateway,
+  aterrando naquele `(gateway, profile)` exato: o square gira enquanto o
+  target é discado, o gateway anterior permanece pintado até o target
+  responder, e um target morto falha o click com mensagem em vez de
+  deixar a janela half-switched. Grupos mantêm ordem de registry qualquer que seja o
+  gateway ativo, então um square nunca se move sob o ponteiro que clicou
+  nele. Right-click num square at-rest oferece **Switch to**, **Color**,
+  **Rename**, **Edit SOUL.md** e **Delete**, todos executados no gateway
+  daquele square; a confirmação de delete nomeia a máquina.
+- Um gateway que a última enumeração não alcançou mantém seus squares, marcados
+  com um dot âmbar no glyph — uma caixa dormindo ainda é sua. Duas
+  registrations de um backend colapsam num grupo só. Passados treze
+  squares na frota, a faixa condensa num menu seccionado por
+  gateway.
 - O gateway selecionado sobrevive a um quit e relaunch só quando **Settings →
   Gateways → At startup, return to Sessions on the last-used gateway** está on.
   A preferência e o id do gateway vivem no registry de user-data do app, então
@@ -211,10 +232,11 @@ gerenciamento, não um segundo fluxo de add.
 
 Sessions intencionalmente mostram um gateway ativo de cada vez: isso mantém files,
 tools, channels, cron e histórico de sessão num contexto de execução
-compreensível. Bot Mode serve um job diferente e pode apresentar o roster união,
-agrupado por gateway, para um usuário abrir um agente num NAS e outro num VPS
-de uma superfície. Abrir um bot ainda ativa a rota exata `(gateway, profile)`
-dele.
+compreensível. O fleet profile rail alarga só o *picker* — o workspace ainda
+vive em exatamente um `(gateway, profile)` após cada click. Bot Mode serve um
+job diferente e pode apresentar o roster união, agrupado por gateway, para um usuário
+abrir um agente num NAS e outro num VPS de uma superfície. Abrir um
+bot ainda ativa a rota exata `(gateway, profile)` dele.
 
 Mentions diretas de bot e delegation permanecem gateway-local por padrão. Cruzar um
 boundary de backend muda filesystem, credenciais, tools e contexto de trust, então
@@ -247,19 +269,21 @@ o próprio app desktop por último. Veja
 
 ## Notas de segurança {#security-notes}
 
-- **Onde os tokens vivem.** Session tokens de remote-gateway são criptografados em rest
-  com o `safeStorage` do Electron (o keychain do SO — Keychain no macOS, DPAPI
-  no Windows, o backend de keyring da sessão no Linux) e ficam no processo
-  main do Electron; o renderer e os plugins nunca veem bytes de token. Tokens OAuth
-  de native sign-in são armazenados do mesmo jeito, chaveados pela URL base do gateway, e
-  renovados automaticamente antes de expirar.
-- **Linux sem keyring.** Numa sessão Linux sem keychain usável o
-  app não consegue criptografar o token; salvar um abre um diálogo explícito de opt-in
-  antes de armazenar o
-  token em texto puro.
+- **Onde os tokens vivem.** Session tokens de remote-gateway (e tokens OAuth de
+  native sign-in, keyed pela URL base do gateway) ficam no diretório user-data
+  do app como arquivos owner-only (0600), no processo main do Electron; o
+  renderer e os plugins nunca veem bytes de token.
+- **Criptografia opcional via keychain.** Por padrão os tokens **não** passam
+  pelo keychain do SO — no macOS em particular, o `safeStorage` do Electron
+  guarda uma chave por app no login keychain, e um keychain locked ou quebrado
+  vira password prompt a cada launch. Se quer criptografia at-rest além das
+  permissões de arquivo, ligue **Settings → Gateway →
+  "Encrypt saved secrets with the OS keychain"**; segredos armazenados existentes são
+  re-criptografados in place (Keychain no macOS, DPAPI no Windows, backend de keyring
+  da sessão no Linux). Desligar de novo descriptografa.
 - **O arquivo de registry** (`connections.json` no diretório de user-data
   do app) guarda labels, URLs e hosts — segredos só aparecem dentro de
-  envelopes criptografados.
+  envelopes criptografados quando a opção de keychain está ligada.
 - O `host.connections()` do plugin SDK de propósito retorna labels, kinds
   e o id primary — nunca material de token.
 

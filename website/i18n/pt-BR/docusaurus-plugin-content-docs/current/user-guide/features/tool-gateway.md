@@ -84,6 +84,15 @@ O Tool Gateway é recurso de **assinatura paga**. Contas Nous free-tier podem us
 
 Algumas contas também têm direito a um **free tool pool** — uma pequena cota de ferramentas gerenciadas que cobre chamadas do gateway sem assinatura paga. Quando um free pool está disponível, o gateway o exibe e mostra um prompt de setup no primeiro uso, para você optar in e começar a usar ferramentas gerenciadas imediatamente.
 
+## O checklist de habilitação {#the-enablement-checklist}
+
+Escolher um model Nous (`hermes model`) oferece um checklist por ferramenta de backends do gateway. O comportamento respeita seu setup existente:
+
+- Ferramentas que você apontou explicitamente para outro backend (ex.: `web.backend: searxng`, `browser.cloud_provider: camofox`) **nunca são oferecidas** — sua seleção não pode ser sobrescrita acidentalmente.
+- Ferramentas configuradas só via variáveis de ambiente (ex.: `SEARXNG_URL`, `CAMOFOX_URL`) aparecem **desmarcadas**, rotuladas para manter seu próprio backend.
+- Só ferramentas genuinamente não configuradas vêm pré-marcadas.
+- Recusas persistem: se você enviar o checklist com uma ferramenta desmarcada, ela não será pré-marcada em trocas futuras de model Nous (armazenado em `tool_gateway_declined_tools` em `config.yaml`; marcá-la depois limpa a recusa).
+
 ## Misture como quiser {#mix-and-match}
 
 O gateway é por ferramenta. Ligue só o que quiser:

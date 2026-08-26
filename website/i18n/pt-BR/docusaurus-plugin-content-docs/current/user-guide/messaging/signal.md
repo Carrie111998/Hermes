@@ -181,6 +181,10 @@ As mensagens Signal são renderizadas com **formatação nativa** em vez de cara
 
 Nada disso exige configuração adicional — vem habilitado por padrão em builds recentes do signal-cli. Se sua versão do `signal-cli` for antiga demais, o Hermes faz fallback para entrega em texto simples e registra um aviso único.
 
+### Mensagens longas {#long-messages}
+
+O Signal limita uma única mensagem a **8.000 caracteres**. O Hermes divide respostas mais longas em chunks numerados (`(1/3)`, `(2/3)`, …) automaticamente em vez de truncá-las. Isso se aplica a todo caminho de entrega — respostas de conversa ao vivo, entregas de cron job, `hermes send` e chamadas MCP `send_message` — e a formatação nativa (bold, italic, code, spoilers) é preservada nos limites dos chunks.
+
 ### Indicadores de digitação {#typing-indicators}
 
 O bot envia indicadores de digitação enquanto processa mensagens, atualizando a cada 8 segundos.

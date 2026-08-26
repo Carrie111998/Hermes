@@ -37,6 +37,8 @@ delegate_task(tasks=[
 Subagentes começam com uma **conversa completamente nova**. Eles não têm conhecimento do histórico de conversa do pai, de chamadas de ferramentas anteriores nem de nada discutido antes da delegação. O único contexto do subagente vem dos campos `goal` e `context` que o agente pai preenche ao chamar `delegate_task`.
 :::
 
+Uma exceção: quando o pai tem um diretório de workspace resolvido, o system prompt de todo subagente embute os **project context files** daquele workspace (`.hermes.md` > cadeia AGENTS.md > CLAUDE.md > `.cursorrules` — mesma descoberta, prioridade e caps de tamanho do system prompt do agente principal; SOUL.md é excluído). Subagentes trabalhando num repo operam sob as convenções do próprio repo sem precisar redescobri-las.
+
 Isso significa que o agente pai deve passar **tudo** que o subagente precisa na chamada:
 
 ```python
@@ -131,6 +133,25 @@ Quando uma delegação em segundo plano termina, o Hermes armazena seu evento de
 
 Isso não retoma a execução do filho após uma falha. Uma delegação cujo processo proprietário desaparece enquanto ainda está em execução é registrada como `unknown`, porque o Hermes não pode provar se seus efeitos colaterais externos ocorreram. Registros pendentes e entregues são limitados e locais ao perfil.
 
+### Notificações de processo em background do filho {#child-background-process-notifications}
+
+Processos em background que um subagente inicia (ex.: `npm ci` com
+`notify_on_complete`) tecnicamente roteiam suas notificações de completion e watch-pattern
+para a conversa **pai**, porque qualquer coisa que sobrevive ao
+filho precisa de um consumidor durável. Por padrão essas notificações são
+**suprimidas** no chat pai — o result consolidado de delegation do filho
+é o deliverable, e paredes mid-conversation de "process finished" de builds
+internos do filho são ruído. Eventos suprimidos são logados em nível debug
+com o session ID do processo e o task ID do subagent, então permanecem diagnosticáveis.
+
+O result de delegation em si nunca é suprimido. Para restaurar a entrega das
+notificações de processo do filho (cada uma carrega uma linha de atribuição "Started by subagent …"):
+
+```yaml
+delegation:
+  surface_child_process_notifications: true   # default: false
+```
+
 ## Substituição de modelo {#model-override}
 
 Você pode configurar um modelo diferente para subagentes via `config.yaml` — útil para delegar tarefas simples a modelos mais baratos/rápidos:
@@ -160,6 +181,39 @@ delegation:
 Ordem de resolução: `delegation.base_url` (endpoint direto) tem precedência, depois `delegation.provider` (bundle completo de credenciais resolvido via o sistema de providers em runtime), e quando nenhum está definido os filhos herdam o provider e as credenciais do pai; `delegation.model` aplica em todos os casos, e quando está vazio os filhos herdam o modelo do pai.
 
 Note que o pin é global: `delegate_task` não tem parâmetro de modelo por tarefa, então todo filho em um lote roda no modelo de delegação configurado. Para subtarefas sensíveis a qualidade que precisam de um modelo mais forte, ou deixe `delegation.model` indefinido para aquela sessão ou entregue a tarefa ao [quadro kanban](kanban.md#per-task-model-override), que de fato suporta override de modelo por tarefa.
+
+## O comando `/review` {#the-review-command}
+
+`/review` spawna um subagente em background independente, com privilégios completos, cujo único job é revisar o trabalho que sua conversa acabou de produzir — um PR, um diff, código, documentação, um design. Funciona em toda superfície: CLI, TUI, Desktop app e toda plataforma de messaging gateway.
+
+```
+/review                       # review whatever the last 10 messages presented
+/review focus on security     # add extra instructions for the reviewer
+```
+
+O que acontece:
+
+1. As últimas 10 mensagens user/assistant são snapshotadas como evidência inicial do reviewer (saída de ferramentas e mensagens de system são excluídas).
+2. Um subagente reviewer é despachado no mesmo rail de delegation em background que `delegate_task` — recebe o toolset completo normal de subagent (terminal, web, files, browser...), então de fato abre o PR, lê o diff e roda código em vez de julgar só pelo excerpt.
+3. O reviewer herda o contexto de trabalho do agente primário: quaisquer skills que o agente primário tinha carregadas (launch-preloaded ou via `skill_view` durante a sessão) são nomeadas no briefing com instrução para carregá-las e julgar o trabalho contra suas convenções. Como todo subagent, seu system prompt também embute os project context files do workspace (AGENTS.md / CLAUDE.md / .cursorrules) como convenções vinculantes.
+4. Quando termina, a review completa reentra a mesma sessão como completion normal de subagent em background — seu agente primário a vê e pode agir (corrigir achados, follow-ups, responder a você).
+
+O fluxo canônico: seu agente principal abre um PR, você digita `/review`, e um segundo par de olhos investiga enquanto você continua trabalhando; a review aterrisa de volta no chat endereçada ao agente que criou o PR.
+
+### Model de review {#review-model}
+
+Por padrão o reviewer roda no seu model principal. Para fixar um model dedicado de review, defina `auxiliary.review` em `config.yaml`:
+
+```yaml
+auxiliary:
+  review:
+    provider: openrouter               # or nous, anthropic, a direct base_url, ...
+    model: anthropic/claude-opus-4.6   # a strong reviewer model
+```
+
+Credenciais resolvem exatamente como um pin `delegation.provider` (bundle completo de runtime-provider: base_url, api key, api_mode). `provider: auto` com `model` vazio significa "herdar o model do agente principal" — o default.
+
+`/review` é deliberadamente separado de `/refine`: `/refine` revisa a conversa para atualizar memória e skills, `/review` revisa o *produto de trabalho* que a conversa criou.
 
 ## Acesso herdado a ferramentas {#inherited-tool-access}
 

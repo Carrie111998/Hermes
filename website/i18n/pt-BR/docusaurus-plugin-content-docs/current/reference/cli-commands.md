@@ -830,7 +830,7 @@ hermes debug share --local      # Print report to terminal (no upload)
 hermes backup [options]
 ```
 
-Cria um arquivo zip da sua configuração, skills, sessões e dados do Hermes. O backup exclui o próprio código-fonte do hermes-agent.
+Cria um arquivo zip da sua configuração, skills, sessões e dados do Hermes. O backup exclui o próprio código-fonte do hermes-agent e não aninha artefatos de backup anteriores (`backups/`, `state-snapshots/`) — cada um deles já contém sua própria cópia de `state.db`.
 
 | Opção | Descrição |
 |--------|-------------|
@@ -1503,6 +1503,8 @@ hermes serve [options]
 ```
 
 Inicia o **servidor backend** do Hermes — o gateway JSON-RPC/WebSocket ao qual o [app desktop](/user-guide/desktop) e clientes remotos se conectam. É o mesmo servidor que `hermes dashboard` executa, mas **sem interface**: nunca abre uma UI no navegador. O app desktop inicia seu próprio backend `hermes serve`; use este comando diretamente quando quiser um backend sem interface em um host remoto. Aceita as mesmas opções `--host` / `--port` / `--insecure` / `--skip-build` / `--stop` / `--status` de `hermes dashboard` abaixo (um bind não-loopback ativa o mesmo portão de autenticação). Requer o extra `[web]`; o socket de Chat embutido também precisa de `[pty]` em um host POSIX.
+
+**Conflitos de porta:** se a porta solicitada (padrão `9119`) já estiver ocupada por outro processo (ex.: um segundo `hermes serve` ou o gateway), o comando imprime uma linha sentinela legível por máquina `BACKEND_PORT_IN_USE port=<port>` em stdout, uma dica humana nomeando o provável ocupante, e sai com código **75** (`EX_TEMPFAIL`) em vez de um erro genérico — para scripts e o app desktop distinguirem "porta ocupada" de "backend quebrado". Passe `--port 0` para bind em uma porta efêmera livre (o boot bem-sucedido anuncia a porta escolhida via `HERMES_BACKEND_READY port=<port>`).
 
 ## `hermes dashboard`
 

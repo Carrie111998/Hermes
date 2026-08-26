@@ -40,6 +40,8 @@ Tarefas cron são disparadas pela thread de ticker em segundo plano do gateway, 
 
 Se você espera que as tarefas disparem automaticamente, você precisa de um gateway em execução (`hermes gateway` em primeiro plano, ou `hermes gateway start` para o serviço instalado). Para depuração pontual, você pode disparar manualmente um tick com `hermes cron tick`.
 
+**App desktop:** o backend primário do desktop roda seu próprio ticker, e ele faz tick no cron store de **todo profile local** — então jobs em um profile secundário continuam disparando mesmo enquanto o backend daquele profile está dormindo (o desktop coloca backends de profile ociosos para dormir após ~10 minutos). Você não precisa manter um profile aberto para que seus jobs agendados rodem.
+
 ### Verificação 4: Verifique o relógio do sistema e o fuso horário {#check-4-check-the-system-clock-and-timezone}
 
 As tarefas usam o fuso horário local. Se o relógio da sua máquina estiver errado ou em um fuso horário diferente do esperado, as tarefas dispararão nos horários errados. Verifique:

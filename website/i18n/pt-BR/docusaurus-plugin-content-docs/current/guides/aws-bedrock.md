@@ -1,12 +1,22 @@
 ---
 sidebar_position: 14
 title: "AWS Bedrock"
-description: "Use o Hermes Agent com o Amazon Bedrock — API Converse nativa, autenticação IAM, Guardrails e inferência entre regiões"
+description: "Use o Hermes Agent com o Amazon Bedrock — API Converse nativa, roteamento Anthropic SDK, modelos OpenAI via Bedrock Mantle, autenticação IAM, Guardrails e inferência entre regiões"
 ---
 
 # AWS Bedrock {#aws-bedrock}
 
-O Hermes Agent oferece suporte ao Amazon Bedrock como provedor nativo usando a **API Converse** — não o endpoint compatível com OpenAI. Isso dá acesso total ao ecossistema Bedrock: autenticação IAM, Guardrails, perfis de inferência entre regiões e todos os modelos de fundação.
+O Hermes Agent oferece suporte ao Amazon Bedrock como provedor nativo. Isso dá acesso total ao ecossistema Bedrock: autenticação IAM, Guardrails, perfis de inferência entre regiões e todos os modelos de fundação.
+
+O Hermes roteia cada família de modelo pela API que melhor a serve:
+
+| Família de modelo | Rota de API | Por quê |
+|---|---|---|
+| Anthropic Claude | Anthropic SDK (`AnthropicBedrock`) | Prompt caching, thinking budgets, adaptive thinking — recursos não expostos via Converse |
+| OpenAI GPT-5.5 / GPT-5.6 (Sol, Terra, Luna) | Endpoint Bedrock Mantle **OpenAI Responses** (`bedrock-mantle.<region>.api.aws/openai/v1`) | Esses modelos são Mantle-only — seus model cards listam bedrock-runtime/Converse como unsupported |
+| Todo o resto (Nova, DeepSeek, Llama, GPT-OSS, …) | **Converse API** nativa (`bedrock-runtime`) | Feature set Bedrock completo: Guardrails, inference profiles, streaming |
+
+As três rotas compartilham a mesma cadeia de credenciais AWS e resolução de região — nenhuma configuração separada é necessária. Requisições ao endpoint Mantle são autenticadas com `AWS_BEARER_TOKEN_BEDROCK` quando definido, ou assinadas SigV4 via a cadeia padrão boto3 caso contrário.
 
 ## Pré-requisitos {#prerequisites}
 
@@ -97,13 +107,17 @@ Os modelos do Bedrock usam **IDs de perfil de inferência** para invocação sob
 | Claude Sonnet 4.6 | `us.anthropic.claude-sonnet-4-6` | Recomendado — melhor equilíbrio entre velocidade e capacidade |
 | Claude Opus 4.6 | `us.anthropic.claude-opus-4-6-v1` | Mais capaz |
 | Claude Haiku 4.5 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Claude mais rápido |
+| OpenAI GPT-5.6 Sol | `openai.gpt-5.6-sol` | Modelo frontier OpenAI (via Bedrock Mantle) |
+| OpenAI GPT-5.6 Terra | `openai.gpt-5.6-terra` | Equilibrado (via Bedrock Mantle) |
+| OpenAI GPT-5.6 Luna | `openai.gpt-5.6-luna` | Rápido, acessível (via Bedrock Mantle) |
+| OpenAI GPT-5.5 | `openai.gpt-5.5` | Flagship OpenAI anterior (via Bedrock Mantle) |
 | Amazon Nova Pro | `us.amazon.nova-pro-v1:0` | O carro-chefe da Amazon |
 | Amazon Nova Micro | `us.amazon.nova-micro-v1:0` | Mais rápido e mais barato |
 | DeepSeek V3.2 | `deepseek.v3.2` | Modelo aberto forte |
 | Llama 4 Scout 17B | `us.meta.llama4-scout-17b-instruct-v1:0` | O mais recente da Meta |
 
 :::info Inferência entre regiões
-Modelos com o prefixo `us.` usam perfis de inferência entre regiões, que oferecem melhor capacidade e failover automático entre regiões da AWS. Modelos com o prefixo `global.` roteiam por todas as regiões disponíveis no mundo.
+Modelos com o prefixo `us.` usam perfis de inferência entre regiões, que oferecem melhor capacidade e failover automático entre regiões da AWS. Modelos com o prefixo `global.` roteiam por todas as regiões disponíveis no mundo. IDs de modelo OpenAI `openai.*` são servidos pelo Bedrock Mantle na região configurada e não usam prefixes de inference profile.
 :::
 
 ## Trocando de Modelo Durante a Sessão {#switching-models-mid-session}
