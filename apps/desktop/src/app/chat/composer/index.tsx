@@ -74,7 +74,7 @@ import { useComposerScope } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
 import { SuggestionPills } from './suggestion-pills'
-import { extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
+import { extractClipboardFiles, extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
 import { isRedoShortcut, isUndoShortcut } from './undo-history'
@@ -507,13 +507,19 @@ export function ChatBar({
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     const imageBlobs = extractClipboardImageBlobs(event.clipboardData)
+    const files = extractClipboardFiles(event.clipboardData)
+
+    if ((imageBlobs.length > 0 || files.length > 0) && (onAttachImageBlob || onAttachDroppedItems)) {
+      triggerHaptic('selection')
+    }
 
     if (imageBlobs.length > 0 && onAttachImageBlob) {
-      triggerHaptic('selection')
-
       for (const blob of imageBlobs) {
         void onAttachImageBlob(blob)
       }
+    }
+    if (files.length > 0 && onAttachDroppedItems) {
+      void onAttachDroppedItems(files.map(file => ({ file, path: '' })))
     }
 
     // Trim surrounding whitespace so a copy that dragged along leading/trailing
@@ -525,7 +531,7 @@ export function ChatBar({
     if (!pastedText) {
       event.preventDefault()
 
-      if (imageBlobs.length > 0) {
+      if (imageBlobs.length > 0 || files.length > 0) {
         return
       }
 

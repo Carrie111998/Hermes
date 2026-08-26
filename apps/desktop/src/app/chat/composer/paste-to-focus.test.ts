@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { onComposerAttachImagesRequest, onComposerFocusRequest, onComposerInsertRequest } from './focus'
+import { onComposerAttachFilesRequest, onComposerAttachImagesRequest, onComposerFocusRequest, onComposerInsertRequest } from './focus'
 import { handleWindowPaste, routeClipboardToComposer } from './paste-to-focus'
 
 /** Minimal DataTransfer stand-in: text/plain + optional image file items. */
@@ -68,6 +68,18 @@ describe('routeClipboardToComposer', () => {
     expect(attached).toHaveLength(1)
     expect(attached[0]).toHaveLength(1)
     expect(focused).toHaveLength(1)
+  })
+
+  it('routes a pasted video file to the same file attachment path as an Android picker or share', async () => {
+    const attached: File[][] = []
+    const video = new File(['video'], 'clip.mp4', { type: 'video/mp4' })
+    const offAttach = onComposerAttachFilesRequest(({ files }) => attached.push(files))
+
+    expect(routeClipboardToComposer(clipboard({ files: [video] }))).toBe(true)
+    await flushBus()
+    offAttach()
+
+    expect(attached).toEqual([[video]])
   })
 
   it('takes both from a mixed paste — images attach AND the text inserts', async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { blobDedupeKey, detectTrigger, extractClipboardImageBlobs } from './text-utils'
+import { blobDedupeKey, detectTrigger, extractClipboardFiles, extractClipboardImageBlobs } from './text-utils'
 
 describe('detectTrigger', () => {
   it('detects a bare slash trigger with an empty query', () => {
@@ -252,6 +252,28 @@ describe('extractClipboardImageBlobs', () => {
     } as unknown as DataTransfer
 
     expect(extractClipboardImageBlobs(clipboard)).toEqual([])
+  })
+})
+
+describe('extractClipboardFiles', () => {
+  it('keeps pasted video and document files while leaving images to the image attachment path', () => {
+    const image = new File(['image'], 'photo.png', { type: 'image/png', lastModified: 1 })
+    const video = new File(['video'], 'clip.mp4', { type: 'video/mp4', lastModified: 2 })
+    const document = new File(['notes'], 'notes.txt', { type: 'text/plain', lastModified: 3 })
+    const clipboard = {
+      files: {
+        length: 3,
+        item: (index: number) => [image, video, document][index] ?? null
+      },
+      getData: () => '',
+      items: [
+        { kind: 'file', type: image.type, getAsFile: () => image },
+        { kind: 'file', type: video.type, getAsFile: () => video },
+        { kind: 'file', type: document.type, getAsFile: () => document }
+      ]
+    } as unknown as DataTransfer
+
+    expect(extractClipboardFiles(clipboard)).toEqual([video, document])
   })
 })
 

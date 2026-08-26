@@ -153,6 +153,46 @@ export function extractClipboardImageBlobs(clipboard: DataTransfer): Blob[] {
   return blobs
 }
 
+/** Non-image clipboard files (documents, video, audio, archives). Images stay
+ * on `extractClipboardImageBlobs` so they retain the dedicated vision/preview
+ * attachment path. `items` and `files` often mirror one clipboard entry, so
+ * dedupe them by stable File metadata before dispatching to the composer. */
+export function extractClipboardFiles(clipboard: DataTransfer): File[] {
+  const files: File[] = []
+  const seen = new Set<string>()
+
+  const push = (file: File | null) => {
+    if (!file || file.size === 0 || file.type.startsWith('image/')) {
+      return
+    }
+
+    const key = blobDedupeKey(file)
+
+    if (seen.has(key)) {
+      return
+    }
+
+    seen.add(key)
+    files.push(file)
+  }
+
+  if (clipboard.items?.length) {
+    for (const item of clipboard.items) {
+      if (item.kind === 'file') {
+        push(item.getAsFile())
+      }
+    }
+  }
+
+  if (clipboard.files?.length) {
+    for (let i = 0; i < clipboard.files.length; i += 1) {
+      push(clipboard.files.item(i))
+    }
+  }
+
+  return files
+}
+
 /** Caret-anchored text before the cursor, or null if the selection isn't a
  *  collapsed caret inside `editor`.
  *
