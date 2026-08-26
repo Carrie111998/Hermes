@@ -14,7 +14,23 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from .intake import INTAKE_FORM, quote_text, tier_for
+from .criminal import (
+    crime_elements_for,
+    crime_name_index,
+    find_crime,
+    find_crimes,
+)
+from .intake import (
+    CIVIL,
+    CRIMINAL,
+    CRIMINAL_INTAKE_FORM,
+    INTAKE_FORM,
+    criminal_report_template,
+    is_criminal_doc,
+    quote_text,
+    report_template,
+    tier_for,
+)
 from .knowledge import case_type_index, find_case_type, requisite_facts_for
 from .lawapi.client import LawApiClient, LawApiError
 from .lawapi.models import LawDoc
@@ -45,9 +61,10 @@ class IntakeAction:
 
     kind: str  # start | report | case_type
     doc_kind: str = ""
-    case_type: str = ""
+    case_type: str = ""  # 민사 사건유형 또는 형사 죄명
     report: str = ""
     missing: str = ""
+    track: str = ""  # civil | criminal (빈 값이면 기존 값을 바꾸지 않는다)
 
 
 @dataclass
@@ -336,10 +353,16 @@ def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
     async def start_document_intake(arguments: dict[str, Any]) -> str:
         doc_kind = str(arguments.get("doc_kind") or "법률문서").strip()
         raw_case = str(arguments.get("case_type") or "").strip()
-        case = find_case_type(raw_case)
+        criminal = is_criminal_doc(doc_kind) or (
+            find_case_type(raw_case) is None and find_crime(raw_case) is not None
+        )
+        case = find_crime(raw_case) if criminal else find_case_type(raw_case)
         state.intake_actions.append(
             IntakeAction(
-                kind="start", doc_kind=doc_kind, case_type=case.key if case else raw_case
+                kind="start",
+                doc_kind=doc_kind,
+                case_type=case.key if case else raw_case,
+                track=CRIMINAL if criminal else CIVIL,
             )
         )
         tier = tier_for(doc_kind)
@@ -349,19 +372,33 @@ def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
             f"(내부 참고 — 이 문서는 '{tier.label}' 등급, "
             f"{tier.price_krw:,}원 / {tier.lead_time}. 지금 말하지 말고 "
             "상담보고서 확인 단계에서 안내합니다.)",
-            "\n[보낼 폼]\n" + INTAKE_FORM,
+            "\n[보낼 폼]\n" + (CRIMINAL_INTAKE_FORM if criminal else INTAKE_FORM),
         ]
-        if case is not None:
-            facts = requisite_facts_for(case.key)
+        if criminal:
+            if case is not None:
+                parts.append(
+                    "\n[내부 참고 — 폼 답변이 오면 이 구성요건과 하나씩 대조하세요]\n"
+                    + crime_elements_for(case.key)
+                )
+                parts.append("\n" + criminal_report_template(doc_kind, case.label))
+            else:
+                parts.append(
+                    "\n[내부 참고] 죄명을 아직 특정하지 못했습니다. **죄명 확정이 먼저입니다.** "
+                    "폼 답변이 오면 get_crime_elements 를 호출하세요. 데이터에 있는 죄명:\n"
+                    + crime_name_index()
+                )
+        elif case is not None:
             parts.append(
-                f"\n[내부 참고 — 폼 답변이 오면 이 요건사실과 하나씩 대조하세요]\n{facts}"
+                f"\n[내부 참고 — 폼 답변이 오면 이 요건사실과 하나씩 대조하세요]\n"
+                f"{requisite_facts_for(case.key)}"
             )
+            parts.append("\n" + report_template(doc_kind, case.label))
         else:
             parts.append(
                 "\n[내부 참고] 사건유형을 아직 특정하지 못했습니다. 폼 답변이 오면 "
                 f"get_requisite_facts 를 호출하세요. 가능한 유형:\n{case_type_index()}"
             )
-        return _clip("\n".join(parts))
+        return _clip("\n".join(parts), limit=14000)
 
     async def get_requisite_facts(arguments: dict[str, Any]) -> str:
         query = str(arguments.get("case_type") or "").strip()
@@ -371,8 +408,32 @@ def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
                 f"'{query}' 에 맞는 사건유형을 찾지 못했습니다. 아래 중에서 고르세요.\n"
                 f"{case_type_index()}"
             )
-        state.intake_actions.append(IntakeAction(kind="case_type", case_type=case.key))
+        state.intake_actions.append(
+            IntakeAction(kind="case_type", case_type=case.key, track=CIVIL)
+        )
         return _clip(requisite_facts_for(case.key), limit=12000)
+
+    async def get_crime_elements(arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("crime") or "").strip()
+        crime = find_crime(query)
+        if crime is None:
+            candidates = find_crimes(query)
+            if candidates:
+                names = ", ".join(c.name for c in candidates)
+                return (
+                    f"'{query}' 로는 죄명이 하나로 좁혀지지 않습니다. 후보: {names}\n"
+                    "상담자에게 사실관계를 한 가지만 더 물어 죄명을 확정한 뒤 다시 호출하세요."
+                )
+            return (
+                f"'{query}' 에 맞는 죄명을 데이터에서 찾지 못했습니다. **조문을 기억으로 "
+                "지어내지 마세요.** 아래 중에 해당하는 것이 있으면 그 이름으로 다시 "
+                "호출하고, 없으면 escalate_to_lawyer 로 변호사에게 넘기세요.\n"
+                f"{crime_name_index()}"
+            )
+        state.intake_actions.append(
+            IntakeAction(kind="case_type", case_type=crime.key, track=CRIMINAL)
+        )
+        return _clip(crime_elements_for(crime.key), limit=12000)
 
     async def submit_consultation_report(arguments: dict[str, Any]) -> str:
         report = str(arguments.get("report") or "").strip()
@@ -434,6 +495,26 @@ def build_intake_tools(state: TurnState, lawyer_name: str) -> list[ToolSpec]:
                 "required": ["case_type"],
             },
             handler=get_requisite_facts,
+        ),
+        ToolSpec(
+            name="get_crime_elements",
+            description=(
+                "형사사건(고소장·고발장 포함)에서 **죄명을 확정한 뒤** 그 죄의 "
+                "범죄구성요건·미수/예비음모/상습범/과실범 처벌규정·친고죄 여부·"
+                "공소시효·질문항목을 가져온다. 형법 조문은 절대 기억으로 말하지 말고 "
+                "반드시 이 도구를 거친다."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "crime": {
+                        "type": "string",
+                        "description": "죄명 또는 상담자의 표현 (예: 절도, 물건을 훔쳐갔어요)",
+                    }
+                },
+                "required": ["crime"],
+            },
+            handler=get_crime_elements,
         ),
         ToolSpec(
             name="submit_consultation_report",

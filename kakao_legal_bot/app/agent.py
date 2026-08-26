@@ -15,6 +15,7 @@ from typing import Any
 
 from .config import Settings
 from .db import Message
+from .criminal import crime_name_index
 from .knowledge import case_type_index
 from .lawapi.client import LawApiClient
 from .llm import LlmClient, LlmError, LlmResult
@@ -126,10 +127,20 @@ class LegalAgent:
         a few thousand tokens that would otherwise be re-billed every message.
         The date and other volatile facts go *after* this, never inside it.
         """
+        crimes = crime_name_index()
+        criminal_block = (
+            f"\n\n## 구성요건 데이터가 있는 죄명 (형사)\n\n{crimes}\n\n"
+            "죄명이 정해지면 `get_crime_elements` 로 구성요건을 꺼내 쓴다. "
+            "형법 조문 번호·법정형은 도구가 준 것만 쓰고, 목록에 없는 죄는 "
+            "지어내지 말고 변호사에게 넘긴다."
+            if crimes
+            else ""
+        )
         return (
             f"{self._persona}\n\n"
             f"{self._playbook}\n\n"
-            f"## 다룰 수 있는 사건유형\n\n{case_type_index()}"
+            f"## 다룰 수 있는 사건유형 (민사)\n\n{case_type_index()}"
+            f"{criminal_block}"
         )
 
     def system_prompt(self) -> str:

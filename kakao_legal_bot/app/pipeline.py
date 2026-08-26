@@ -381,19 +381,25 @@ def _apply_intake_actions(db, room_id: str, actions) -> None:  # noqa: ANN001
     """Write the intake steps the model took during this turn."""
     for action in actions:
         try:
+            track = getattr(action, "track", "") or ""
             if action.kind == "start":
-                db.open_intake(room_id, action.doc_kind, action.case_type)
+                db.open_intake(room_id, action.doc_kind, action.case_type, track=track)
                 continue
 
             intake = db.active_intake(room_id)
             if intake is None:
                 # The model reported a case type or a report without ever
                 # opening an intake — open one rather than lose the work.
-                intake = db.open_intake(room_id, action.doc_kind, action.case_type)
+                intake = db.open_intake(
+                    room_id, action.doc_kind, action.case_type, track=track
+                )
 
             if action.kind == "case_type" and action.case_type:
                 db.update_intake(
-                    int(intake["id"]), case_type=action.case_type, status=intake_states.COLLECTING
+                    int(intake["id"]),
+                    case_type=action.case_type,
+                    status=intake_states.COLLECTING,
+                    **({"track": track} if track else {}),
                 )
             elif action.kind == "report":
                 db.update_intake(

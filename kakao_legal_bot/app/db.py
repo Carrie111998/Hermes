@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_done"})
 
@@ -31,6 +31,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("drafts", "attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("drafts", "last_error", "TEXT NOT NULL DEFAULT ''"),
     ("drafts", "claimed_at", "REAL"),
+    ("intakes", "track", "TEXT NOT NULL DEFAULT 'civil'"),
 )
 
 _SCHEMA = """
@@ -102,6 +103,8 @@ CREATE TABLE IF NOT EXISTS intakes (
     consult_id   INTEGER,
     doc_kind     TEXT NOT NULL DEFAULT '',
     case_type    TEXT NOT NULL DEFAULT '',
+    -- civil | criminal — 민사는 요건사실로, 형사는 구성요건으로 묻는다
+    track        TEXT NOT NULL DEFAULT 'civil',
     -- form_sent | collecting | report_review | quoted | confirmed | cancelled
     status       TEXT NOT NULL DEFAULT 'form_sent',
     report       TEXT NOT NULL DEFAULT '',
@@ -448,6 +451,7 @@ class Database:
         doc_kind: str,
         case_type: str = "",
         consult_id: int | None = None,
+        track: str = "",
     ) -> sqlite3.Row:
         """Start an intake, or return the one already running in this room.
 
@@ -458,9 +462,19 @@ class Database:
         if existing is not None:
             self._exec(
                 "UPDATE intakes SET doc_kind = CASE WHEN ? != '' THEN ? ELSE doc_kind END, "
-                "case_type = CASE WHEN ? != '' THEN ? ELSE case_type END, updated_at = ? "
+                "case_type = CASE WHEN ? != '' THEN ? ELSE case_type END, "
+                "track = CASE WHEN ? != '' THEN ? ELSE track END, updated_at = ? "
                 "WHERE id = ?",
-                (doc_kind, doc_kind, case_type, case_type, time.time(), existing["id"]),
+                (
+                    doc_kind,
+                    doc_kind,
+                    case_type,
+                    case_type,
+                    track,
+                    track,
+                    time.time(),
+                    existing["id"],
+                ),
             )
             found = self._query_one("SELECT * FROM intakes WHERE id = ?", (existing["id"],))
             assert found is not None
@@ -468,9 +482,9 @@ class Database:
 
         now = time.time()
         cur = self._exec(
-            "INSERT INTO intakes(room_id, consult_id, doc_kind, case_type, status, "
-            "created_at, updated_at) VALUES(?, ?, ?, ?, 'form_sent', ?, ?)",
-            (room_id, consult_id, doc_kind, case_type, now, now),
+            "INSERT INTO intakes(room_id, consult_id, doc_kind, case_type, track, status, "
+            "created_at, updated_at) VALUES(?, ?, ?, ?, ?, 'form_sent', ?, ?)",
+            (room_id, consult_id, doc_kind, case_type, track or "civil", now, now),
         )
         found = self._query_one("SELECT * FROM intakes WHERE id = ?", (cur.lastrowid,))
         assert found is not None
