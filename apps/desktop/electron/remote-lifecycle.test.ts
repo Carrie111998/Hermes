@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, execFile, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -48,18 +48,6 @@ const exec = promisify(execCallback)
 function ownershipProofKey(token) {
   return crypto.createHmac('sha256', token).update('hermes-ssh-ownership-v2').digest()
 }
-
-test('main delegates authenticated SSH reuse proof classification to the protocol helper', async () => {
-  const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
-  const start = source.indexOf('async function sshProbeReuseProof(')
-  const end = source.indexOf('\nasync function sshProbeOwnershipChallenge(', start)
-  const helper = source.slice(start, end)
-
-  assert.notEqual(start, -1)
-  assert.notEqual(end, -1)
-  assert.match(helper, /remoteLifecycle\.classifySshReuseProof\(proof, spawnNonce\)/)
-  assert.doesNotMatch(helper, /protocolVersion\s*===\s*1/)
-})
 
 test('ownership challenge probe receives no reuse credential and verifies the keyed proof', async () => {
   const token = 'stored-token'

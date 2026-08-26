@@ -597,7 +597,7 @@ def _ssh_runtime_intact() -> bool:
     if _SSH_RUNTIME_MARKER is not None:
         return os.path.isfile(_SSH_RUNTIME_MARKER)
     if _SSH_RUNTIME_PURELIB is None:
-        return True
+        return False
     purelib, device, inode = _SSH_RUNTIME_PURELIB
     try:
         st = os.stat(purelib)

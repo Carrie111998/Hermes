@@ -33,27 +33,39 @@ def test_ssh_ownership_valid_challenge_returns_verifiable_protocol_2_proof(monke
     )
 
 
-def test_ssh_ownership_endpoint_requires_token_and_returns_exact_nonce(monkeypatch):
+def test_ssh_ownership_endpoint_requires_token_and_returns_exact_nonce(
+    tmp_path, monkeypatch
+):
     token = "t" * 64
     nonce = "0123456789abcdef"
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
     monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
-    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", nonce)
-    web_server.app.state.auth_required = False
-    client = TestClient(web_server.app)
-
-    assert client.get("/api/ssh/ownership").status_code == 401
-    response = client.get(
-        "/api/ssh/ownership",
-        headers={"X-Hermes-Session-Token": token},
+    monkeypatch.setattr(
+        web_server,
+        "sysconfig",
+        types.SimpleNamespace(get_paths=lambda *args, **kwargs: {"purelib": str(purelib)}),
     )
-    assert response.status_code == 200
-    assert response.json() == {
-        "ok": True,
-        "sshOwnerNonce": nonce,
-        "protocolVersion": 2,
-        "runtimeIntact": True,
-        "pid": os.getpid(),
-    }
+    web_server.app.state.auth_required = False
+    web_server._apply_ssh_owner_nonce(nonce)
+    try:
+        client = TestClient(web_server.app)
+
+        assert client.get("/api/ssh/ownership").status_code == 401
+        response = client.get(
+            "/api/ssh/ownership",
+            headers={"X-Hermes-Session-Token": token},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "sshOwnerNonce": nonce,
+            "protocolVersion": 2,
+            "runtimeIntact": True,
+            "pid": os.getpid(),
+        }
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
 
 
 @pytest.mark.parametrize("challenge", ["", "a" * 63, "A" * 64, "g" * 64])
@@ -78,6 +90,32 @@ def test_ssh_ownership_challenge_requires_an_active_ssh_owner(monkeypatch):
     response = client.get("/api/ssh/ownership", params={"challenge": "a" * 64})
 
     assert response.status_code == 401
+
+
+def test_ssh_ownership_fails_closed_without_runtime_identity_baseline(monkeypatch):
+    token = "t" * 64
+
+    def missing_purelib(*args, **kwargs):
+        raise OSError("runtime path unavailable")
+
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+    monkeypatch.setattr(
+        web_server, "sysconfig", types.SimpleNamespace(get_paths=missing_purelib)
+    )
+    web_server.app.state.auth_required = False
+    web_server._apply_ssh_owner_nonce("0123456789abcdef")
+    try:
+        client = TestClient(web_server.app)
+
+        response = client.get(
+            "/api/ssh/ownership",
+            headers={"X-Hermes-Session-Token": token},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["runtimeIntact"] is False
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
 
 
 def test_ssh_ownership_reports_replaced_runtime(tmp_path, monkeypatch):
