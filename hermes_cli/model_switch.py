@@ -2176,6 +2176,7 @@ def switch_model(
     runtime_capabilities = resolve_native_compaction_capabilities(
         model=new_model,
         base_url=base_url,
+        provider=target_provider,
         is_codex_backend=target_provider.strip().lower() == "openai-codex",
     )
 
