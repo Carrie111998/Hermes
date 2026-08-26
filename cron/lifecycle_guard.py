@@ -369,6 +369,69 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _mask_shell_comments(text: str) -> str:
+    """Blank shell comments while preserving quoted and word-internal hashes.
+
+    The quote dialect intentionally matches :func:`_split_logical_lines`: it
+    models POSIX single and double quotes, not ANSI-C ``$'...'`` or locale
+    ``$\"...\"`` strings.  Keeping the two state machines aligned preserves
+    the conservative tokenization fallback for unsupported quote forms.
+
+    This is deliberately a conservative comment model rather than exact shell
+    emulation.  In particular, redirects are not treated as word boundaries,
+    so text after a redirect-adjacent ``#`` remains visible to the guard.
+    """
+    masked = list(text)
+    in_single = False
+    in_double = False
+    escaped = False
+    comment = False
+    word_start = True
+
+    for index, char in enumerate(text):
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+            else:
+                masked[index] = " "
+            continue
+        if in_single:
+            if char == "'":
+                in_single = False
+            continue
+        if escaped:
+            escaped = False
+            word_start = False
+            continue
+        if char == "\\":
+            escaped = True
+            word_start = False
+            continue
+        if in_double:
+            if char == '"':
+                in_double = False
+            continue
+        if char == "'":
+            in_single = True
+            word_start = False
+            continue
+        if char == '"':
+            in_double = True
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            masked[index] = " "
+            comment = True
+            continue
+        if char == "\n" or char.isspace() or char in _CONTROL_CHARS:
+            word_start = True
+        else:
+            word_start = False
+
+    return "".join(masked)
+
+
 def _split_logical_lines(text: str) -> list[str]:
     """Split text on newlines that are not inside quotes.
 
@@ -418,7 +481,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
     (unbalanced quotes), fall back to per-physical-line tokenization for
     that logical line.
     """
-    normalized = command.replace("\\\n", "")
+    normalized = _mask_shell_comments(command.replace("\\\n", ""))
     logical_lines = _split_logical_lines(normalized)
 
     for line in logical_lines:
@@ -430,7 +493,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                 punctuation_chars=";&|()",
             )
             lexer.whitespace_split = True
-            lexer.commenters = "#"
+            lexer.commenters = ""
             tokens = list(lexer)
         except ValueError:
             # Fall back to per-physical-line tokenization for this logical line.
@@ -443,7 +506,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                         punctuation_chars=";&|()",
                     )
                     lexer.whitespace_split = True
-                    lexer.commenters = "#"
+                    lexer.commenters = ""
                     tokens = list(lexer)
                 except ValueError:
                     continue
