@@ -207,6 +207,85 @@ class TestCleanStreamEndBeforeAnyToolArgs:
         assert getattr(response, "_dropped_tool_names", None) == ["write_file"]
 
 
+# ── Complete-looking payload without terminal evidence ────────────────────
+
+class TestToolCallsRequireTerminalEvidence:
+    """Valid JSON and iterator EOF do not authorize tool execution."""
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '{"confirm":true}',
+            '{"confirm":true,}',
+        ],
+        ids=["valid-json", "repairable-json"],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_payload_without_finish_reason_routes_to_stub(
+        self, _mock_close, mock_create, monkeypatch, arguments,
+    ):
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+
+        def _unterminated_stream():
+            yield _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(
+                    index=0,
+                    tc_id="call_unterminated",
+                    name="dangerous_tool",
+                    arguments=arguments,
+                ),
+            ])
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = (
+            lambda *a, **kw: _unterminated_stream()
+        )
+        mock_create.return_value = mock_client
+
+        response = _make_agent()._interruptible_streaming_api_call({})
+
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
+        assert response.choices[0].message.tool_calls is None
+        assert response._dropped_tool_names == ["dangerous_tool"]
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_explicit_tool_calls_terminal_preserves_payload(
+        self, _mock_close, mock_create, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+
+        def _complete_stream():
+            yield _make_stream_chunk(
+                tool_calls=[
+                    _make_tool_call_delta(
+                        index=0,
+                        tc_id="call_complete",
+                        name="read_file",
+                        arguments='{"path":"README.md"}',
+                    ),
+                ],
+                finish_reason="tool_calls",
+            )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = (
+            lambda *a, **kw: _complete_stream()
+        )
+        mock_create.return_value = mock_client
+
+        response = _make_agent()._interruptible_streaming_api_call({})
+
+        assert response.id != PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].finish_reason == "tool_calls"
+        tool_calls = response.choices[0].message.tool_calls
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert tool_calls[0].function.arguments == '{"path":"README.md"}'
+
+
 # ── Mixed response: one complete call, one dropped (#80498) ─────────────────
 
 class TestMixedToolCallsOneDroppedOneComplete:

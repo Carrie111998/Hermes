@@ -4427,8 +4427,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "(possible upstream error or malformed SSE response)."
             )
 
-        # A stream that delivered a tool call but only partial/unparseable
-        # JSON args splits into two very different cases:
+        # A stream that delivered a tool call without an explicit finish
+        # marker is not executable, even if its JSON parses or can be repaired.
+        # Iterator EOF proves only that transport consumption stopped; it does
+        # not authorize the tool-call boundary. The two terminal cases are:
         #
         #   1. Provider sent finish_reason="length" → a genuine output-cap
         #      truncation.  Boosting max_tokens on retry is the right move.
@@ -4446,17 +4448,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         #      due to output length limit" — the red herring this guards
         #      against.  Route it through the partial-stream-stub path
         #      instead so the loop reports an honest mid-tool-call stream
-        #      drop and fails fast rather than escalating output budget.
-        _tool_args_dropped_no_finish = has_truncated_tool_args and finish_reason is None
-        if _tool_args_dropped_no_finish:
+        #      drop and fails fast rather than escalating output budget. This
+        #      also covers complete-looking JSON: payload validity is not
+        #      terminal evidence or permission to execute.
+        _tool_call_dropped_no_finish = bool(tool_calls_acc) and finish_reason is None
+        if _tool_call_dropped_no_finish:
             _dropped_names = [
                 (tool_calls_acc[idx]["function"]["name"] or "?")
                 for idx in sorted(tool_calls_acc)
             ]
             logger.warning(
-                "Stream ended with no finish_reason while a tool call's "
-                "arguments were still incomplete (tools=%s); treating as a "
-                "mid-tool-call stream drop, not an output-length truncation.",
+                "Stream ended with no finish_reason after delivering tool-call "
+                "payload (tools=%s); treating as a mid-tool-call stream drop, "
+                "not permission to execute or an output-length truncation.",
                 _dropped_names,
             )
             return _build_partial_stream_stub(
