@@ -1,13 +1,16 @@
 import { useStore } from '@nanostores/react'
 import { App } from '@capacitor/app'
 import { Keyboard } from '@capacitor/keyboard'
-import { useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
 import { SETTINGS_ROUTE } from '@/app/routes'
 import { requestComposerAttachFiles, requestComposerInsert } from '@/app/chat/composer/focus'
+import { allPaneIds } from '@/components/pane-shell/tree/model'
+import { $hiddenTreePanes, $layoutTree } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+import { useContributions } from '@/contrib/react/use-contributions'
 import { useI18n } from '@/i18n'
 import { $previewTabs, closeRightRail } from '@/store/preview'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
@@ -21,6 +24,7 @@ import {
   setSidebarOpen,
 } from '@/store/layout'
 
+import { mobileWorkspacePanes } from './mobile-workspace-menu'
 import {
   mobileDrawerForEdgeSwipe,
   mobileDrawerForPane,
@@ -66,12 +70,27 @@ export function MobileBehaviors() {
   const navigate = useNavigate()
   const { t } = useI18n()
   const sidebarOpen = useStore($sidebarOpen)
+  const tree = useStore($layoutTree)
+  const hiddenPanes = useStore($hiddenTreePanes)
+  const panes = useContributions('panes')
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
+  const workspaceMenuOpenRef = useRef(false)
+  workspaceMenuOpenRef.current = workspaceMenuOpen
+  const workspacePanes = useMemo(
+    () => mobileWorkspacePanes(panes, new Set(tree ? allPaneIds(tree) : []), hiddenPanes),
+    [hiddenPanes, panes, tree],
+  )
 
   // Navigating (selecting a session) dismisses an open chat drawer.
   useEffect(() => {
     if (shouldDismissDrawerAfterSessionChange(anyDrawerOpen())) closeOpenDrawer()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname])
+
+  useEffect(() => {
+    document.documentElement.toggleAttribute('data-mobile-workspace-menu-open', workspaceMenuOpen)
+    return () => document.documentElement.removeAttribute('data-mobile-workspace-menu-open')
+  }, [workspaceMenuOpen])
 
   // A share is an explicit Android user action. Keep its text in the draft and
   // stage its files as ordinary composer attachments; never auto-send content
@@ -154,6 +173,7 @@ export function MobileBehaviors() {
     let swipeStart: { insideDrawer: boolean; x: number; y: number } | null = null
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Element | null
+      if (workspaceMenuOpenRef.current) return
       const insideDrawer = Boolean(target?.closest('[data-narrow-pane-overlay]'))
 
       // Tap outside an open chat drawer → dismiss it.
@@ -206,6 +226,10 @@ export function MobileBehaviors() {
         void Keyboard.hide()
         return
       }
+      if (workspaceMenuOpenRef.current) {
+        setWorkspaceMenuOpen(false)
+        return
+      }
       if (dismissTopOverlay()) {
         return
       }
@@ -246,9 +270,28 @@ export function MobileBehaviors() {
     setSidebarOpen(!sidebarOpen)
   }
 
+  const openWorkspacePane = (id: string) => {
+    setWorkspaceMenuOpen(false)
+    const drawer = mobileDrawerForPane(id)
+    if (drawer === 'sessions') {
+      setFileBrowserOpen(false)
+      setSidebarOpen(true)
+      return
+    }
+    if (drawer === 'files') {
+      setSidebarOpen(false)
+      setFileBrowserOpen(true)
+      return
+    }
+
+    closeOpenDrawer()
+    revealPane(id, 'open')
+  }
+
   // Desktop titlebar controls can be intentionally absent on the native shell.
-  // Keep a permanent, thumb-sized session entry point instead of making Android
-  // Back the only way to recover the session drawer.
+  // Keep direct Sessions, Settings, and a complete workspace-pane menu rather
+  // than making Android Back or hidden desktop shortcuts the only way to reach
+  // a collapsed surface.
   return (
     <>
       <button
@@ -260,6 +303,16 @@ export function MobileBehaviors() {
         <Codicon name="menu" size="1.35rem" />
       </button>
       <button
+        aria-expanded={workspaceMenuOpen}
+        aria-haspopup="dialog"
+        aria-label="Open workspace panes"
+        className="mobile-workspace-trigger"
+        onClick={() => setWorkspaceMenuOpen(open => !open)}
+        type="button"
+      >
+        <Codicon name="layout" size="1.2rem" />
+      </button>
+      <button
         aria-label={t.titlebar.openSettings}
         className="mobile-settings-trigger"
         onClick={() => navigate(SETTINGS_ROUTE)}
@@ -267,6 +320,31 @@ export function MobileBehaviors() {
       >
         <Codicon name="settings-gear" size="1.35rem" />
       </button>
+      {workspaceMenuOpen && (
+        <>
+          <button
+            aria-label="Close workspace panes"
+            className="mobile-workspace-scrim"
+            onClick={() => setWorkspaceMenuOpen(false)}
+            type="button"
+          />
+          <section aria-label="Workspace panes" className="mobile-workspace-menu" role="dialog">
+            <header>
+              <span>Workspace</span>
+              <button aria-label="Close workspace panes" onClick={() => setWorkspaceMenuOpen(false)} type="button">
+                <Codicon name="close" size="1.1rem" />
+              </button>
+            </header>
+            <div role="menu">
+              {workspacePanes.map(pane => (
+                <button key={pane.id} onClick={() => openWorkspacePane(pane.id)} role="menuitem" type="button">
+                  {pane.title}
+                </button>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
     </>
   )
 }
