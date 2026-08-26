@@ -26,6 +26,17 @@ class FakeRecognition {
   }
 }
 
+class FakeNativeBridge {
+  messages: string[] = [];
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  postMessage(message: string) { this.messages.push(message); }
+  emit(event: string, text?: string) {
+    this.onmessage?.(new MessageEvent("message", {
+      data: JSON.stringify({ version: 1, event, ...(text === undefined ? {} : { text }) }),
+    }));
+  }
+}
+
 describe("ChatVoiceControl browser speech input", () => {
   let host: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
@@ -158,6 +169,119 @@ describe("ChatVoiceControl browser speech input", () => {
     await act(async () => surface.click());
     expect(FakeRecognition.instances).toHaveLength(0);
     expect(host.textContent).toContain("not connected");
+  });
+
+  it("checks the native bridge and falls back when on-device recognition is unavailable", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { surface } = await render();
+
+    await act(async () => surface.click());
+    expect(bridge.messages).toEqual([JSON.stringify({ version: 1, command: "check" })]);
+    await act(async () => bridge.emit("availability", "on-device-unavailable;fallback-choice-required"));
+
+    expect(FakeRecognition.instances).toHaveLength(1);
+    expect(FakeRecognition.instances[0].start).toHaveBeenCalledOnce();
+  });
+
+  it("does not trust ready or final events before confirmed native availability", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { submit, surface } = await render();
+
+    await act(async () => surface.click());
+    await act(async () => bridge.emit("ready"));
+    await act(async () => bridge.emit("final", "must not send"));
+    await act(async () => vi.advanceTimersByTime(1_000));
+
+    expect(submit).not.toHaveBeenCalled();
+    expect(FakeRecognition.instances).toHaveLength(1);
+  });
+
+  it("uses confirmed native partials for display and submits a final exactly once", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { submit, surface } = await render();
+
+    await act(async () => surface.click());
+    await act(async () => bridge.emit("availability", "on-device"));
+    expect(bridge.messages.at(-1)).toBe(JSON.stringify({ version: 1, command: "start" }));
+    await act(async () => bridge.emit("ready"));
+    await act(async () => bridge.emit("partial", "Call the cr"));
+    expect(host.textContent).toContain("Call the cr");
+    expect(submit).not.toHaveBeenCalled();
+    const staleHandler = bridge.onmessage;
+    await act(async () => bridge.emit("final", "Call   the crew"));
+    await act(async () => staleHandler?.(new MessageEvent("message", {
+      data: JSON.stringify({ version: 1, event: "final", text: "duplicate" }),
+    })));
+
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit).toHaveBeenCalledWith("Call the crew");
+  });
+
+  it("falls back after a bounded native handshake timeout", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { surface } = await render();
+    await act(async () => surface.click());
+    await act(async () => vi.advanceTimersByTime(999));
+    expect(FakeRecognition.instances).toHaveLength(0);
+    await act(async () => vi.advanceTimersByTime(1));
+    expect(FakeRecognition.instances).toHaveLength(1);
+    expect(bridge.messages.at(-1)).toBe(JSON.stringify({ version: 1, command: "cancel" }));
+  });
+
+  it.each(["ended", "error"])("falls back when native emits %s while listening", async (event) => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { surface } = await render();
+    await act(async () => surface.click());
+    await act(async () => bridge.emit("availability", "on-device"));
+    await act(async () => bridge.emit("listening"));
+    await act(async () => bridge.emit(event, "native-ended"));
+    await act(async () => vi.advanceTimersByTime(500));
+    expect(FakeRecognition.instances).toHaveLength(1);
+    expect(FakeRecognition.instances[0].start).toHaveBeenCalledOnce();
+  });
+
+  it("accepts the concrete Android consumer final that follows speech-ended", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { submit, surface } = await render();
+    await act(async () => surface.click());
+    await act(async () => bridge.emit("availability", "on-device"));
+    await act(async () => bridge.emit("ready"));
+    await act(async () => bridge.emit("ended", "speech-ended"));
+    await act(async () => bridge.emit("final", "Android final"));
+    await act(async () => vi.advanceTimersByTime(500));
+    expect(submit).toHaveBeenCalledOnce();
+    expect(submit).toHaveBeenCalledWith("Android final");
+    expect(FakeRecognition.instances).toHaveLength(0);
+  });
+
+  it("falls back if native stop never produces a final or ended event", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { surface } = await render();
+    await act(async () => surface.click());
+    await act(async () => bridge.emit("availability", "on-device"));
+    await act(async () => bridge.emit("ready"));
+    await act(async () => surface.click());
+    expect(bridge.messages.at(-1)).toBe(JSON.stringify({ version: 1, command: "stop" }));
+    await act(async () => vi.advanceTimersByTime(1_000));
+    expect(FakeRecognition.instances).toHaveLength(1);
+  });
+
+  it("cancels the native bridge and detaches its event handler on unmount", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { surface } = await render();
+    await act(async () => surface.click());
+    await act(async () => root.unmount());
+    expect(bridge.messages.at(-1)).toBe(JSON.stringify({ version: 1, command: "cancel" }));
+    expect(bridge.onmessage).toBeNull();
+    root = createRoot(host);
   });
 
 });

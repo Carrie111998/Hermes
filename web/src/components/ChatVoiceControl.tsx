@@ -5,6 +5,8 @@ import { Button } from "@nous-research/ui/ui/components/button";
 
 const RESTART_DELAY_MS = 250;
 const MAX_RESTARTS = 6;
+const NATIVE_HANDSHAKE_TIMEOUT_MS = 1_000;
+const NATIVE_FINAL_GRACE_MS = 250;
 
 type VoiceState = "idle" | "listening" | "sent" | "error";
 
@@ -29,12 +31,24 @@ interface SpeechRecognitionLike {
   abort(): void;
 }
 
+interface NativeVoiceBridge {
+  postMessage(message: string): void;
+  onmessage: ((event: MessageEvent<string>) => void) | null;
+}
+
+interface NativeVoiceEvent {
+  version: 1;
+  event: "availability" | "ready" | "listening" | "partial" | "final" | "error" | "ended";
+  text?: string;
+}
+
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
 declare global {
   interface Window {
     SpeechRecognition?: SpeechRecognitionConstructor;
     webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    zer0Voice?: NativeVoiceBridge;
   }
 }
 
@@ -61,11 +75,25 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
   const generationRef = useRef(0);
   const finalRef = useRef("");
   const interimRef = useRef("");
+  const nativeRef = useRef<NativeVoiceBridge | null>(null);
+  const nativeTimerRef = useRef<number | null>(null);
+  const nativeAvailableRef = useRef(false);
+  const nativeSelectedRef = useRef(false);
+  const submittedRef = useRef(false);
 
   const clearRestart = useCallback(() => {
     if (restartTimerRef.current !== null) window.clearTimeout(restartTimerRef.current);
     restartTimerRef.current = null;
   }, []);
+
+  const clearNativeTimer = useCallback(() => {
+    if (nativeTimerRef.current !== null) window.clearTimeout(nativeTimerRef.current);
+    nativeTimerRef.current = null;
+  }, []);
+
+  const sendNativeCommand = (command: "check" | "start" | "stop" | "cancel") => {
+    nativeRef.current?.postMessage(JSON.stringify({ version: 1, command }));
+  };
 
   const updateFinal = (value: string) => {
     finalRef.current = value;
@@ -142,6 +170,82 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     }
   }
 
+  function fallbackToBrowser(generation: number) {
+    if (generation !== generationRef.current || !listeningRef.current) return;
+    clearNativeTimer();
+    const bridge = nativeRef.current;
+    nativeRef.current = null;
+    nativeAvailableRef.current = false;
+    nativeSelectedRef.current = false;
+    if (bridge) {
+      bridge.onmessage = null;
+      bridge.postMessage(JSON.stringify({ version: 1, command: "cancel" }));
+    }
+    startRecognition(generation);
+  }
+
+  function startNative(bridge: NativeVoiceBridge, generation: number) {
+    nativeRef.current = bridge;
+    nativeAvailableRef.current = false;
+    nativeSelectedRef.current = false;
+    bridge.onmessage = (message) => {
+      if (generation !== generationRef.current || !listeningRef.current) return;
+      let event: NativeVoiceEvent;
+      try {
+        event = JSON.parse(message.data) as NativeVoiceEvent;
+      } catch {
+        fallbackToBrowser(generation);
+        return;
+      }
+      if (event.version !== 1) return;
+      switch (event.event) {
+        case "availability":
+          if (event.text !== "on-device") fallbackToBrowser(generation);
+          else {
+            nativeAvailableRef.current = true;
+            sendNativeCommand("start");
+          }
+          break;
+        case "ready":
+        case "listening":
+          if (!nativeAvailableRef.current) return;
+          nativeSelectedRef.current = true;
+          clearNativeTimer();
+          setError("");
+          setState("listening");
+          break;
+        case "partial":
+          if (nativeSelectedRef.current) updateInterim(event.text ?? "");
+          break;
+        case "final": {
+          const transcript = (event.text ?? "").replace(/\s+/g, " ").trim();
+          if (!nativeSelectedRef.current || !transcript || submittedRef.current) return;
+          submittedRef.current = true;
+          listeningRef.current = false;
+          generationRef.current += 1;
+          clearNativeTimer();
+          bridge.onmessage = null;
+          nativeRef.current = null;
+          updateFinal("");
+          updateInterim("");
+          submit(transcript);
+          setError("");
+          setState("sent");
+          break;
+        }
+        case "error":
+          fallbackToBrowser(generation);
+          break;
+        case "ended":
+          clearNativeTimer();
+          nativeTimerRef.current = window.setTimeout(() => fallbackToBrowser(generation), NATIVE_FINAL_GRACE_MS);
+          break;
+      }
+    };
+    sendNativeCommand("check");
+    nativeTimerRef.current = window.setTimeout(() => fallbackToBrowser(generation), NATIVE_HANDSHAKE_TIMEOUT_MS);
+  }
+
   const begin = () => {
     if (!connected) {
       setError("Chat is not connected yet.");
@@ -152,15 +256,25 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     clearRestart();
     fatalRef.current = false;
     restartCountRef.current = 0;
+    submittedRef.current = false;
     listeningRef.current = true;
     const generation = generationRef.current + 1;
     generationRef.current = generation;
     setError("");
     setState("listening");
-    startRecognition(generation);
+    const bridge = window.zer0Voice;
+    if (bridge?.postMessage) startNative(bridge, generation);
+    else startRecognition(generation);
   };
 
   const commit = () => {
+    if (nativeRef.current && nativeSelectedRef.current) {
+      sendNativeCommand("stop");
+      clearNativeTimer();
+      const generation = generationRef.current;
+      nativeTimerRef.current = window.setTimeout(() => fallbackToBrowser(generation), NATIVE_HANDSHAKE_TIMEOUT_MS);
+      return;
+    }
     const transcript = `${finalRef.current} ${interimRef.current}`.replace(/\s+/g, " ").trim();
     if (!transcript) {
       setError("No speech heard yet — keep talking, then tap anywhere to send.");
@@ -182,13 +296,22 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     listeningRef.current = false;
     generationRef.current += 1;
     clearRestart();
+    clearNativeTimer();
+    const bridge = nativeRef.current;
+    nativeRef.current = null;
+    nativeAvailableRef.current = false;
+    nativeSelectedRef.current = false;
+    if (bridge) {
+      bridge.onmessage = null;
+      bridge.postMessage(JSON.stringify({ version: 1, command: "cancel" }));
+    }
     recognitionRef.current?.abort();
     recognitionRef.current = null;
     updateFinal("");
     updateInterim("");
     setError("");
     setState("idle");
-  }, [clearRestart]);
+  }, [clearNativeTimer, clearRestart]);
 
   useEffect(() => cancel, [cancel]);
 
