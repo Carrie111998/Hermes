@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -27,6 +28,44 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+@pytest.fixture
+def routed_task(kanban_home):
+    """Create and claim a task through the production routing admission gate.
+
+    Broader DB tests exercise worker lifecycle behavior, not routing policy,
+    but their real claims must still carry the authorized snapshot a dispatcher
+    worker receives. This prevents hand-written route snapshots in test setup.
+    """
+    (kanban_home / "config.yaml").write_text(
+        """
+model_routing:
+  enabled: true
+  tiers:
+    T1:
+      - {provider: nous, model: small}
+  classification:
+    P1: {tier: T1}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    def create_and_claim(conn, *, title: str, assignee: str, **kwargs):
+        claimer = kwargs.pop("claimer", None)
+        task_id = kb.create_task(conn, title=title, assignee=assignee, **kwargs)
+        claimed = kb.claim_task(conn, task_id, claimer=claimer)
+        assert claimed is not None
+        assert claimed.route_snapshot is not None
+        assert json.loads(claimed.route_snapshot) == {
+            "priority": "P1",
+            "tier": "T1",
+            "provider": "nous",
+            "model": "small",
+        }
+        return task_id, claimed
+
+    return create_and_claim
 
 
 def _init_git_repo(repo: Path) -> None:
@@ -207,7 +246,7 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
 
 def test_stale_claim_reclaim_event_records_diagnostic_payload(
-    kanban_home, monkeypatch,
+    routed_task, monkeypatch,
 ):
     """``reclaimed`` events should carry claim_expires, last_heartbeat_at,
     and worker_pid so operators can diagnose why a claim went stale
@@ -217,9 +256,10 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        t, _claimed = routed_task(
+            conn, title="x", assignee="a", claimer=f"{host}:worker"
+        )
         kb._set_worker_pid(conn, t, 12345)
         old_expires = int(time.time()) - 3600
         hb_at = int(time.time()) - 1800
@@ -265,7 +305,7 @@ def _exited_status(code: int) -> int:
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(
-    kanban_home, monkeypatch,
+    routed_task, monkeypatch,
 ):
     """A rate-limit sentinel exit releases the task to ``ready`` and leaves
     ``consecutive_failures`` untouched — the breaker must never trip on a
@@ -277,16 +317,18 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
     with kb.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
-        tid = kb.create_task(conn, title="rl", assignee="a")
+        tid, claimed = routed_task(conn, title="rl", assignee="a", claimer=f"{host}:w0")
 
         # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
         # If any of these counted as a failure the task would be blocked.
         for i in range(6):
             pid = 70000 + i
-            # Claim to open a real run (so detect_crashed_workers can close
-            # it with a rate_limited outcome), then point the claim at this
-            # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            # The helper supplies the first production claim; every requeue
+            # must be re-claimed through the same routing admission gate.
+            if i:
+                claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+                assert claimed is not None
+            route_snapshot = claimed.route_snapshot
             conn.execute(
                 "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
                 "WHERE id=?",
@@ -311,6 +353,15 @@ def test_rate_limit_exit_requeues_without_counting_failure(
                 f"hit {i}: rate-limit must not count a failure, "
                 f"got {task.consecutive_failures}"
             )
+            # Rate-limit requeue preserves the real admission snapshot on both
+            # the task and the run; it must not create an un-routed retry.
+            assert task.route_snapshot == route_snapshot
+            run = conn.execute(
+                "SELECT route_snapshot FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert run is not None
+            assert run["route_snapshot"] == route_snapshot
 
         # Last failure error stamped so the respawn guard recognizes the
         # quota wall.
@@ -329,7 +380,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
-    kanban_home, monkeypatch,
+    routed_task, monkeypatch,
 ):
     """Within the cooldown after a rate-limit requeue, the guard defers the
     respawn; after the cooldown it allows a probe — and crucially does NOT
@@ -340,9 +391,8 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
     now = 5_000_000
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rl-guard", assignee="a")
+        tid, claimed = routed_task(conn, title="rl-guard", assignee="a")
         # Seed a rate_limited run that just ended + the stamped error.
-        kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
         conn.execute(
             "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
@@ -356,6 +406,9 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
             ("pid 1 exited rate-limited (quota wall) — requeued", tid),
         )
         conn.commit()
+        task_after_requeue = kb.get_task(conn, tid)
+        assert task_after_requeue is not None
+        assert task_after_requeue.route_snapshot == claimed.route_snapshot
 
         # Inside cooldown → defer with the rate-limit-specific reason.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
@@ -796,7 +849,7 @@ class TestSharedBoardPaths:
 
 
     def test_dispatcher_spawn_injects_kanban_paths_without_stale_session(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, routed_task
     ):
         # The dispatcher must pin board paths while stripping any unrelated
         # HERMES_SESSION_* identity inherited from the long-lived gateway.
@@ -804,7 +857,6 @@ class TestSharedBoardPaths:
         # re-sets to its own `kanban` tag AFTER the strip — a value it owns,
         # never one inherited from whatever the gateway last routed.
         default_home = tmp_path / ".hermes"
-        default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
 
         from gateway import session_context as sc
@@ -825,24 +877,15 @@ class TestSharedBoardPaths:
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
 
-        task = kb.Task(
-            id="t_dispatch_env",
-            title="x",
-            body=None,
-            assignee="coder",
-            status="ready",
-            priority=0,
-            created_by=None,
-            created_at=0,
-            started_at=None,
-            completed_at=None,
-            workspace_kind="worktree",
-            workspace_path=str(tmp_path / "ws"),
-            claim_lock=None,
-            claim_expires=None,
-            tenant=None,
-            branch_name="wt/t_dispatch_env",
-        )
+        with kb.connect() as conn:
+            task_id, task = routed_task(
+                conn,
+                title="x",
+                assignee="coder",
+                workspace_kind="worktree",
+                workspace_path=str(tmp_path / "ws"),
+                branch_name="wt/t_dispatch_env",
+            )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -850,7 +893,7 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
         )
-        assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
+        assert env["HERMES_KANBAN_TASK"] == task_id
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:
             if key == "HERMES_SESSION_SOURCE":
@@ -1247,7 +1290,7 @@ def _make_task(**overrides) -> "kb.Task":
 
 
 def test_dispatch_max_in_progress_blocks_review_when_at_limit(
-    kanban_home, all_assignees_spawnable,
+    routed_task, all_assignees_spawnable,
 ):
     """Review-only backlog must still respect max_in_progress."""
     spawns = []
@@ -1257,8 +1300,7 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
         return 42
 
     with kb.connect() as conn:
-        running = kb.create_task(conn, title="running", assignee="alice")
-        kb.claim_task(conn, running)
+        running, _claimed = routed_task(conn, title="running", assignee="alice")
         review = kb.create_task(conn, title="review", assignee="bob")
         _set_task_status(conn, review, "review")
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
