@@ -11278,6 +11278,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 api_key=result.api_key or self.api_key or "",
                 model_info=mi,
                 config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
+                user_providers=getattr(self.agent, "_user_providers", None) if self.agent else None,
                 custom_providers=getattr(self.agent, "_custom_providers", None) if self.agent else None,
             )
             if ctx:
@@ -11674,6 +11675,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             api_key=result.api_key or self.api_key or "",
             model_info=mi,
             config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
+            user_providers=getattr(self.agent, "_user_providers", None) if self.agent else None,
             custom_providers=getattr(self.agent, "_custom_providers", None) if self.agent else None,
         )
         if ctx:
