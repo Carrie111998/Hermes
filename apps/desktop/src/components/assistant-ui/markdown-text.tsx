@@ -143,12 +143,12 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
   )
 }
 
-function MediaAttachment({ path }: { path: string }) {
+function MediaAttachment({ label, path }: { label?: string; path: string }) {
   const [src, setSrc] = useState('')
   const [failed, setFailed] = useState(false)
   const { open, openFailed } = useOpenMediaFile(path)
   const kind = mediaKind(path)
-  const name = mediaName(path)
+  const name = label || mediaName(path)
 
   useEffect(() => {
     let cancelled = false
@@ -254,6 +254,13 @@ function childrenToText(children: unknown): string {
   return ''
 }
 
+function generatedMediaLabel(children: unknown): string | undefined {
+  const text = childrenToText(children)
+  const match = /^(?:Audio|File|Image|Video):\s*(.+)$/i.exec(text)
+
+  return match?.[1]?.trim() || undefined
+}
+
 function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a'>) {
   const mediaPath = mediaPathFromMarkdownHref(href)
 
@@ -266,7 +273,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
       return <PreviewAttachment source="tool-result" target={mediaPath} />
     }
 
-    return <MediaAttachment path={mediaPath} />
+    return <MediaAttachment label={generatedMediaLabel(children)} path={mediaPath} />
   }
 
   const previewTarget = previewTargetFromMarkdownHref(href)
