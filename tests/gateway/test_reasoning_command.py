@@ -176,6 +176,66 @@ class TestReasoningCommand:
         result = runner._resolve_session_reasoning_config(source=source, task_id=session_key)
         assert result == {"enabled": True, "effort": "medium"}
 
+    def test_last_viewed_skill_in_turn_N_applies_to_turn_N_plus_1(self, tmp_path, monkeypatch):
+        """Lifecycle: a skill viewed during turn N is consumed at the start of
+        the NEXT resolution (turn N+1) and applies to that turn.
+
+        This pins the documented last-viewed-skill → next-turn contract (review
+        blocker #1): the record written during turn N is read exactly once at
+        the next resolution, so it cannot stick for every future turn.
+        """
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: medium\n  reasoning_by_skill_optin: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        from tools import skills_tool as st
+
+        runner = _make_runner()
+        source = _make_event("/reasoning").source
+        session_key = runner._session_key_for_source(source)
+
+        # Turn N: a skill is viewed; its record is written.
+        st.record_active_skill(session_key, "plan", "xhigh")
+
+        # The next resolution (turn N+1) consumes the record and applies it.
+        result = runner._resolve_session_reasoning_config(source=source, task_id=session_key)
+        assert result == {"enabled": True, "effort": "xhigh"}
+
+        # Consumed once — a further resolution does NOT re-apply the skill;
+        # it falls back to the global default.
+        result = runner._resolve_session_reasoning_config(source=source, task_id=session_key)
+        assert result == {"enabled": True, "effort": "medium"}
+
+    def test_multiple_skills_viewed_last_one_wins(self, tmp_path, monkeypatch):
+        """Lifecycle: when several skills are viewed in a turn, the LAST one
+        viewed wins the attribution (incidental tool-call order decides).
+        """
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: medium\n  reasoning_by_skill_optin: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        from tools import skills_tool as st
+
+        runner = _make_runner()
+        source = _make_event("/reasoning").source
+        session_key = runner._session_key_for_source(source)
+
+        # Two skills viewed in the same turn: first 'plan' (xhigh), then
+        # 'brainstorm' (low). The last one wins for the next turn.
+        st.record_active_skill(session_key, "plan", "xhigh")
+        st.record_active_skill(session_key, "brainstorm", "low")
+
+        result = runner._resolve_session_reasoning_config(source=source, task_id=session_key)
+        assert result == {"enabled": True, "effort": "low"}
+
 
     def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
