@@ -3515,3 +3515,29 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
 [data-hud-shell] [data-slot='composer-bounds'] *::-webkit-scrollbar {
   display: none;
 }
+
+/* ---------------------------------------------------------------------------
+ * Live misspelling markers (renderer-owned) — see src/lib/spellcheck/marker.ts.
+ * High contrast ON PURPOSE: the chat window can run at partial native opacity
+ * (translucency) and is often viewed over remote displays (RDP/VNC), where
+ * Chromium's thin default spelling underline washes out to invisibility.
+ * A thick wavy underline PLUS a tinted chip reads through either.
+ * ------------------------------------------------------------------------- */
+.hermes-miss {
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: rgb(255 77 77);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+  background-color: rgb(255 77 77 / 0.16);
+  border-radius: 3px;
+  -webkit-text-decoration-skip-ink: none;
+}
+
+/* Nudge Chromium's native decoration too, wherever it does paint: make it
+   thick and red instead of the nearly-invisible UA default. */
+::spelling-error {
+  text-decoration-color: rgb(255 77 77) !important;
+  text-decoration-thickness: 2px !important;
+  text-underline-offset: 2px !important;
+}

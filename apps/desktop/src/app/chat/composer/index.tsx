@@ -14,6 +14,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { useStoresSelector } from '@/lib/use-session-slice'
+import { cancelMisspellMarks, scheduleMisspellMarks } from '@/lib/spellcheck/marker'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
 import { sessionCompacting } from '@/store/compaction'
@@ -465,6 +466,14 @@ export function ChatBar({
     []
   )
 
+  // Mark a restored draft once after mount; clear any pending pass on unmount.
+  useEffect(() => {
+    scheduleMisspellMarks(editorRef.current, { ms: 300 })
+
+    return cancelMisspellMarks
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot on mount
+  }, [])
+
   const handleEditorInput = (event: FormEvent<HTMLDivElement>) => {
     // During IME composition the DOM contains uncommitted preedit text
     // mixed with real content.  Skip state writes — compositionend flushes
@@ -474,6 +483,8 @@ export function ChatBar({
     }
 
     scheduleFlushEditorToDraft(event.currentTarget)
+    // Live misspelling markers (renderer-owned high-contrast underlines).
+    scheduleMisspellMarks(event.currentTarget, { skipIf: () => composingRef.current })
   }
 
   // Native typing/deleting mutates the DOM through Chromium's editing pipeline,
@@ -1075,6 +1086,7 @@ export function ChatBar({
           // `hasComposerPayload` stays false and the send button stays hidden
           // until an unrelated edit forces a sync (#39614).
           flushEditorToDraft(event.currentTarget)
+          scheduleMisspellMarks(event.currentTarget, { skipIf: () => composingRef.current })
         }}
         onCompositionStart={event => {
           composingRef.current = true
@@ -1094,7 +1106,7 @@ export function ChatBar({
         onPaste={handlePaste}
         ref={editorRef}
         role="textbox"
-        spellCheck={false}
+        spellCheck={true}
         suppressContentEditableWarning
       />
       <ComposerDirectiveActions editorRef={editorRef} />
@@ -1120,7 +1132,7 @@ export function ChatBar({
           autoComplete="off"
           autoCorrect="off"
           className="sr-only"
-          spellCheck={false}
+          spellCheck={true}
           tabIndex={-1}
         />
       </ComposerPrimitive.Input>
