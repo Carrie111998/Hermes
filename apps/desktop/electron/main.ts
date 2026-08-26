@@ -9530,13 +9530,12 @@ async function teardownSshConnection(profile) {
                   return false
                 }
 
-                return (
-                  (await sshProbeReuseProof(
-                    `http://127.0.0.1:${state.localPort}`,
-                    state.token,
-                    lock.spawnNonce
-                  )) === 'authenticated-ok'
+                const proof: any = await fetchJson(
+                  `http://127.0.0.1:${state.localPort}/api/ssh/ownership`,
+                  state.token
                 )
+
+                return remoteLifecycle.isSshOwnershipProof(proof, lock.spawnNonce)
               })
     }
   )

@@ -46,6 +46,16 @@ const READY_POLL_INTERVAL_MS = 750
 // Keep startup portable: restricted hosts retain their existing limit.
 const REMOTE_NOFILE_SOFT_LIMIT = 65_536
 
+function isSshOwnershipProof(proof, spawnNonce) {
+  return proof?.ok === true && proof.sshOwnerNonce === spawnNonce && proof.protocolVersion === PROTOCOL_VERSION
+}
+
+function classifySshReuseProof(proof, spawnNonce) {
+  return isSshOwnershipProof(proof, spawnNonce) && proof.runtimeIntact !== false
+    ? 'authenticated-ok'
+    : 'authenticated-stale'
+}
+
 function mintToken() {
   return crypto.randomBytes(32).toString('hex')
 }
@@ -931,7 +941,17 @@ async function connect(deps) {
       }
     } else {
       assertBootstrapNotSuperseded(signal)
-      await cleanupStale(ssh, ownershipId, lock, pidAlive)
+      const cleaned = await cleanupStale(ssh, ownershipId, lock, pidAlive, undefined, true)
+
+      if (!cleaned) {
+        const error: any = new Error(
+          'The existing SSH backend is alive but its ownership could not be verified. ' +
+            'Refusing to replace it without a safe teardown.'
+        )
+
+        error.kind = 'foreign-backend'
+        throw error
+      }
     }
   }
 
@@ -1032,6 +1052,7 @@ export {
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,
+  isSshOwnershipProof,
   listRemoteHermesProfiles,
   locateHermes,
   LOCKFILE_SCHEMA_VERSION,

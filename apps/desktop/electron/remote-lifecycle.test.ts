@@ -15,6 +15,7 @@ import {
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,
+  isSshOwnershipProof,
   listRemoteHermesProfiles,
   locateHermes,
   LOCKFILE_SCHEMA_VERSION,
@@ -39,6 +40,38 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+
+test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
+  assert.equal(
+    classifySshReuseProof(
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, runtimeIntact: false },
+      SPAWN_NONCE
+    ),
+    'authenticated-stale'
+  )
+})
+
+test('SSH ownership proof remains valid when the owned backend runtime was replaced', () => {
+  assert.equal(
+    isSshOwnershipProof(
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, runtimeIntact: false },
+      SPAWN_NONCE
+    ),
+    true
+  )
+  assert.equal(
+    isSshOwnershipProof({ ok: true, sshOwnerNonce: 'fedcba9876543210', protocolVersion: 1 }, SPAWN_NONCE),
+    false
+  )
+  assert.equal(isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 2 }, SPAWN_NONCE), false)
+})
+
+test('SSH reuse proof remains compatible when runtime state is absent', () => {
+  assert.equal(
+    classifySshReuseProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1 }, SPAWN_NONCE),
+    'authenticated-ok'
+  )
+})
 
 function ownedLock(over: any = {}) {
   return {
@@ -990,6 +1023,28 @@ test('connect() reuses a healthy dashboard when fingerprint + probe pass', async
   assert.ok(!ssh.calls.some(c => /setsid/.test(c)), 'reuse path must not spawn a new dashboard')
 })
 
+test('connect refuses to replace an alive process whose ownership cannot be proved', async () => {
+  const lock = ownedLock({ tokenFingerprint: fingerprintToken('stored-token') })
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh, { reuseToken: 'stored-token' })),
+    (error: any) => {
+      assert.equal(error.kind, 'foreign-backend')
+
+      return true
+    }
+  )
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+  assert.ok(!ssh.calls.some(command => /setsid|nohup/.test(command)))
+})
+
 test('connect() respawns when the requested remote profile differs from the lockfile profile', async () => {
   const reuseToken = 'stored-token'
   const lock = ownedLock({ profile: 'desktop-work', tokenFingerprint: fingerprintToken(reuseToken) })
@@ -1029,7 +1084,7 @@ test('connect() respawns when the lockfile hermesPath differs from the resolved 
     [/\[ -x/, 'OK'],
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0/, 'ALIVE'],
-    [/print\("OWNED"/, 'FOREIGN\n'],
+    [/print\("OWNED"/, 'OWNED\n'],
     [/--version/, 'Hermes Agent v0.18.2\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [/python3 -c/, ''],
