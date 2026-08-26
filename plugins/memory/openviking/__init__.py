@@ -45,7 +45,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 
@@ -1636,7 +1636,7 @@ def _start_local_openviking_server(
             command.extend(["--config", str(config_path)])
         command.extend(["--host", host, "--port", str(port)])
         with log_path.open("ab") as log_file:
-            common_kwargs = {
+            common_kwargs: dict[str, Any] = {
                 "stdout": log_file,
                 "stderr": log_file,
                 "stdin": subprocess.DEVNULL,
@@ -2676,9 +2676,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 display["account"] = settings["account"]
             if settings.get("user"):
                 display["user"] = settings["user"]
-            env_overrides = [key for key in _OPENVIKING_ENV_KEYS if _env_value(key) is not None]
-            if env_overrides:
-                display["env_overrides"] = ", ".join(env_overrides)
+            if provider_config.get("deployment") != quick_local.DEPLOYMENT:
+                env_overrides = [
+                    key for key in _OPENVIKING_ENV_KEYS if _env_value(key) is not None
+                ]
+                if env_overrides:
+                    display["env_overrides"] = ", ".join(env_overrides)
             return display
 
         display = dict(provider_config)
