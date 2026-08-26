@@ -36,6 +36,18 @@ flowchart LR
 
 The bridge is deliberately explicit. Desktop-only capabilities must either map to a meaningful phone capability (for example, clipboard, file picker, haptics, or microphone permission) or be disabled cleanly. A missing bridge capability must never silently pretend to work.
 
+## 🧭 Touch navigation
+
+Hermes Mobile preserves the Desktop renderer instead of rebuilding it as a separate chat app, but gives its navigation a phone-native home:
+
+- One compact top toolbar keeps **Sessions** one tap or left-edge swipe away.
+- A right-edge swipe opens the Files/preview drawer.
+- The toolbar’s overflow sheet contains every visible workspace pane plus New session, Command Center, Command palette, Settings, Layout editor, HUD, haptics, pane flip, Keyboard Shortcuts, and page-specific Desktop toolbar actions.
+- Sheets and drawers have explicit close controls, scrims, Android Back priority, and keyboard Escape behavior. Focus returns to the invoking toolbar control after a sheet closes.
+- Native mobile never keeps a desktop rail docked beside chat, even on an unfolded Fold. Drawers overlay the full-width chat canvas instead.
+
+This is intentional adaptation, not a separate dashboard: existing Desktop pages, sessions, composer behavior, overlays, and visual language remain shared.
+
 ## 🔐 Security model
 
 - Connect only to a user-controlled remote Hermes gateway over **HTTPS/WSS**.
