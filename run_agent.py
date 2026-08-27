@@ -2566,6 +2566,7 @@ class AIAgent:
                     "reasoning": msg.get("reasoning"),
                     "reasoning_content": msg.get("reasoning_content"),
                     "reasoning_details": msg.get("reasoning_details"),
+                    "_reasoning_route": msg.get("_reasoning_route"),
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
@@ -8441,6 +8442,12 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
         from agent.agent_runtime_helpers import copy_reasoning_content_for_api
         return copy_reasoning_content_for_api(self, source_msg, api_msg)
+
+    def _reasoning_replay_field_for_api(self) -> str | None:
+        """Return the configured provider-facing reasoning replay field."""
+        from agent.agent_runtime_helpers import reasoning_replay_field_for_api
+
+        return reasoning_replay_field_for_api(self)
 
     def _reapply_reasoning_echo_for_provider(self, api_messages: list) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.reapply_reasoning_echo_for_provider``."""

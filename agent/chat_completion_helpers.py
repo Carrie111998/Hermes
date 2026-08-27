@@ -2366,6 +2366,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         if preserved:
             msg["reasoning_details"] = preserved
 
+    if reasoning_text or msg.get("reasoning_content") or msg.get("reasoning_details"):
+        # Internal provenance for route-safe historical replay. These keys are
+        # stripped from every provider-facing clone before transport.
+        from agent.agent_runtime_helpers import reasoning_route_fingerprint
+
+        msg["_reasoning_route"] = reasoning_route_fingerprint(
+            getattr(agent, "provider", None),
+            getattr(agent, "model", None),
+            getattr(agent, "base_url", None),
+        )
+
     # Anthropic interleaved-thinking replay: when a turn interleaves signed
     # thinking blocks with tool_use, the parallel reasoning_details +
     # tool_calls fields lose the cross-type ordering, and reconstruction
@@ -2794,6 +2805,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.
         agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
+        _replay_field = fb.get("reasoning_replay_field")
+        if isinstance(_replay_field, str):
+            _replay_field = _replay_field.strip().lower()
+        agent._reasoning_replay_field = (
+            _replay_field
+            if _replay_field in {"reasoning", "reasoning_content"}
+            else None
+        )
+        _compressor = getattr(agent, "context_compressor", None)
+        if _compressor is not None:
+            _compressor.replay_historical_reasoning = bool(
+                agent._reasoning_replay_field
+            )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -3110,8 +3134,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         for msg in messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
-            for internal_field in ("reasoning", "finish_reason"):
-                api_msg.pop(internal_field, None)
+            if agent._reasoning_replay_field_for_api() != "reasoning":
+                api_msg.pop("reasoning", None)
+            api_msg.pop("finish_reason", None)
             # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
             # Mistral, Moonshot/Kimi) reject any message key outside the Chat
             # Completions schema. The main loop drops these via

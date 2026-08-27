@@ -2487,9 +2487,12 @@ def run_conversation(
             # This ensures multi-turn reasoning context is preserved
             agent._copy_reasoning_content_for_api(msg, api_msg)
 
-            # Remove 'reasoning' field - it's for trajectory storage only
-            # We've copied it to 'reasoning_content' for the API above
-            if "reasoning" in api_msg:
+            # ``reasoning`` is normally trajectory-only. An explicitly
+            # configured replay provider may consume it as a wire field.
+            if (
+                "reasoning" in api_msg
+                and agent._reasoning_replay_field_for_api() != "reasoning"
+            ):
                 api_msg.pop("reasoning")
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
@@ -3156,6 +3159,16 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        # This freshly rebuilt list was shaped for the route active above.
+        # Reset the in-place retry marker so restoration or a same-fallback
+        # rebuild is not mistaken for a cross-provider transition.
+        from agent.agent_runtime_helpers import reasoning_api_route_identity
+
+        agent._reasoning_replay_api_route = (
+            *reasoning_api_route_identity(agent),
+            agent._needs_thinking_reasoning_pad(),
+            agent._reasoning_replay_field_for_api(),
+        )
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
