@@ -7,8 +7,8 @@ failed fast — correctly — but nothing asked the server task to respawn the
 subprocess, so every subsequent call kept failing until the idle keepalive
 probe eventually noticed. Both fast-fail sites must signal a reconnect:
 
-- pre-call gate (children already dead when the call arrives): return a clean
-  "reconnecting" tool error and set ``_reconnect_event``;
+- pre-call gate (children already dead when the call arrives): rebuild the
+  transport and execute the original call on the replacement session;
 - mid-call watcher race (children die while the RPC is in flight): raise the
   fast-fail TimeoutError and set ``_reconnect_event``.
 """
@@ -16,7 +16,7 @@ probe eventually noticed. Both fast-fail sites must signal a reconnect:
 import asyncio
 import json
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -64,36 +64,82 @@ def _cleanup(mcp_tool_module, name: str) -> None:
         mcp_tool_module._server_breaker_opened_at.pop(name, None)
 
 
-def test_precall_dead_children_signal_reconnect(monkeypatch, tmp_path):
-    """Dead-at-call-time subprocess → clean reconnecting error + reconnect
-    signal, instead of a bare fast-fail that leaves the server dead."""
+def test_precall_dead_children_reconnect_before_call(monkeypatch, tmp_path):
+    """Dead-at-call-time subprocess → respawn and run on the fresh session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    stale_called = {"n": 0}
+
+    async def _stale_call_tool(*a, **kw):
+        stale_called["n"] += 1
+        return MagicMock(is_error=False, content=[])
+
+    server = _install_stub_server(
+        mcp_tool, "srv-dead", _stale_call_tool, children_dead=lambda: True
+    )
+    fresh_session = MagicMock()
+
+    async def _fresh_call_tool(*a, **kw):
+        return MagicMock(is_error=False, content=[])
+
+    fresh_session.call_tool = _fresh_call_tool
+
+    def _reconnect(server_name, srv, *, op_description, timeout):
+        assert server_name == "srv-dead"
+        assert srv is server
+        assert op_description == "tools/call tool1 after stdio child exit"
+        assert timeout == 10.0
+        srv.session = fresh_session
+        srv._stdio_children_dead = lambda: False
+        return True
+
+    mcp_tool._ensure_mcp_loop()
+    try:
+        handler = _make_tool_handler("srv-dead", "tool1", 10.0)
+        with patch(
+            "tools.mcp_tool._signal_reconnect_and_wait",
+            side_effect=_reconnect,
+        ) as reconnect:
+            result = handler({})
+        parsed = json.loads(result)
+        assert parsed == {"result": ""}, parsed
+        reconnect.assert_called_once()
+        assert stale_called["n"] == 0, "stale RPC must never be attempted"
+        assert mcp_tool._server_error_counts.get("srv-dead", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv-dead")
+
+
+def test_precall_dead_children_reconnect_timeout_is_bounded(monkeypatch, tmp_path):
+    """A failed respawn returns an error without touching the stale session."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from tools import mcp_tool
     from tools.mcp_tool import _make_tool_handler
 
     called = {"n": 0}
 
-    async def _call_tool(*a, **kw):
+    async def _stale_call_tool(*a, **kw):
         called["n"] += 1
-        return MagicMock(is_error=False, content=[])
 
-    server = _install_stub_server(
-        mcp_tool, "srv-dead", _call_tool, children_dead=lambda: True
+    _install_stub_server(
+        mcp_tool, "srv-timeout", _stale_call_tool, children_dead=lambda: True
     )
     mcp_tool._ensure_mcp_loop()
     try:
-        handler = _make_tool_handler("srv-dead", "tool1", 10.0)
-        result = handler({})
-        parsed = json.loads(result)
+        handler = _make_tool_handler("srv-timeout", "tool1", 10.0)
+        with patch(
+            "tools.mcp_tool._signal_reconnect_and_wait", return_value=False
+        ) as reconnect:
+            parsed = json.loads(handler({}))
         assert "error" in parsed, parsed
-        assert "reconnect" in parsed["error"].lower(), parsed
-        assert server._reconnect_event.set_calls == 1
-        assert called["n"] == 0, "RPC must not be attempted on a dead transport"
-        # The error payload flows through the handler's JSON parse, which
-        # bumps the breaker exactly once (no double-bump at the gate).
-        assert mcp_tool._server_error_counts.get("srv-dead", 0) == 1
+        assert "did not recover" in parsed["error"], parsed
+        reconnect.assert_called_once()
+        assert called["n"] == 0
+        assert mcp_tool._server_error_counts.get("srv-timeout", 0) == 1
     finally:
-        _cleanup(mcp_tool, "srv-dead")
+        _cleanup(mcp_tool, "srv-timeout")
 
 
 def test_midcall_child_exit_signals_reconnect(monkeypatch, tmp_path):

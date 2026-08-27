@@ -6142,6 +6142,34 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        # A stdio child can exit while the SDK still leaves a stale session
+        # object installed. Recover before scheduling the user's RPC so the
+        # first call after an idle/external process exit lands on the respawned
+        # transport instead of becoming a throwaway "retry in a few seconds"
+        # failure (#96497). Requiring a distinct ready session prevents the
+        # reconnect request from immediately reusing the stale object.
+        _stdio_dead = getattr(server, "_stdio_children_dead", None)
+        if (
+            callable(_stdio_dead)
+            and isinstance(_stdio_dead_result := _stdio_dead(), bool)
+            and _stdio_dead_result
+        ):
+            reconnect_timeout = min(
+                _RECYCLED_RECONNECT_TIMEOUT,
+                max(0.1, float(tool_timeout or _RECYCLED_RECONNECT_TIMEOUT)),
+            )
+            if not _signal_reconnect_and_wait(
+                server_name,
+                server,
+                op_description=f"tools/call {tool_name} after stdio child exit",
+                timeout=reconnect_timeout,
+            ):
+                _bump_server_error(server_name)
+                return tool_error(
+                    f"MCP server '{server_name}' stdio subprocess exited and "
+                    f"did not recover within {reconnect_timeout:.0f}s"
+                )
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock, _track_inflight_rpc(
@@ -6153,35 +6181,6 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    # Fast-fail (#81995): a stdio subprocess that is already
-                    # dead must not own this call slot — fail immediately
-                    # instead of waiting out the full tool timeout on a
-                    # transport nobody will ever answer.
-                    _stdio_dead = getattr(server, "_stdio_children_dead", None)
-                    # callable() + real-bool result: MagicMock attributes return
-                    # truthy Mocks, which would spuriously trip the fast-fail.
-                    if (
-                        callable(_stdio_dead)
-                        and isinstance(_stdio_dead_result := _stdio_dead(), bool)
-                        and _stdio_dead_result
-                    ):
-                        # Dead children but stale server.session, so the
-                        # transport-down path above never fired — signal the
-                        # server task to respawn and return a clean
-                        # reconnecting error. No explicit _bump_server_error:
-                        # the error return flows through the handler's JSON
-                        # parse, which already bumps once.
-                        if _signal_reconnect(server):
-                            return tool_error(
-                                f"MCP server '{server_name}' stdio subprocess is "
-                                f"dead and reconnect was requested. Do NOT retry "
-                                f"immediately — give it a few seconds to respawn."
-                            )
-                        raise TimeoutError(
-                            f"MCP stdio subprocess for '{server_name}' has "
-                            f"exited; failing the call fast instead of "
-                            f"waiting {float(tool_timeout):.0f}s"
-                        )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
