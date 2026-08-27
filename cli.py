@@ -38,6 +38,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+import socket
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
@@ -6278,6 +6279,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "hostname": self._status_bar_hostname(),
             "duration": format_duration_compact(elapsed_seconds),
             "session_title": self._get_status_bar_session_title(),
             "prompt_elapsed": self._format_prompt_elapsed(
@@ -6443,6 +6445,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._status_bar_title_cache = title
         self._status_bar_title_checked_at = now
         return title
+
+    @staticmethod
+    def _status_bar_hostname() -> str:
+        """Return a short hostname label for the status bar.
+
+        Reads ``socket.gethostname()``; empty string on any failure so a
+        bare/remote backend never crashes the status bar renderer. Truncated to
+        keep the single-row layout uncluttered.
+        """
+        try:
+            name = (socket.gethostname() or "").strip()
+        except Exception:
+            return ""
+        if len(name) > 18:
+            name = f"{name[:15]}..."
+        return name
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
@@ -7032,6 +7050,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_prefix = f"{battery_label} │ " if battery_label else ""
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            hostname = snapshot.get("hostname") or ""
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
@@ -7045,7 +7064,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += " · ⚠ YOLO"
                 return self._right_align_status_title(text, session_title, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if hostname:
+                    parts.append(hostname)
+                parts.append(percent_label)
                 if battery_label:
                     parts.insert(0, battery_label)
                 compressions = snapshot.get("compressions", 0)
@@ -7077,7 +7099,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {snapshot['model_short']}"]
+            if hostname:
+                parts.append(hostname)
+            parts += [context_label, percent_label]
             if battery_label:
                 parts.insert(0, battery_label)
             if compressions:
@@ -7126,6 +7151,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            hostname = snapshot.get("hostname") or ""
 
             if width < 52:
                 frags = [
@@ -7155,6 +7181,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if hostname:
+                        frags += [
+                            ("class:status-bar-dim", " · "),
+                            ("class:status-bar-strong", hostname),
+                        ]
+                    frags += [
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
                     ]
@@ -7200,6 +7233,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if hostname:
+                        frags += [
+                            ("class:status-bar-dim", " · "),
+                            ("class:status-bar-dim", hostname),
+                        ]
+                    frags += [
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
