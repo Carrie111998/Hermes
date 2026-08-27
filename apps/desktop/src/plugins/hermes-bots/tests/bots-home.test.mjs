@@ -1102,6 +1102,6 @@ test('Bot Mode copy says bot, not agent', () => {
   assert.doesNotMatch(pluginSource, /children: busy \? 'Creating…' : 'Create Agent'/)
   assert.doesNotMatch(pluginSource, /`Agent "\$\{displayName\(\{ name: slug, title \}\)\}" created/)
   assert.match(pluginSource, /Name the bot first/)
-  assert.match(pluginSource, /children: busy \? 'Creating…' : 'Create Bot'/)
+  assert.match(pluginSource, /children: busy \? k\.create\.creating : k\.create\.createAgent/)
   assert.match(pluginSource, /`Bot "\$\{displayName\(\{ name: slug, title \}\)\}" created/)
 })

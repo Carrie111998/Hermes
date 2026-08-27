@@ -16,6 +16,220 @@
  */
 
 import * as sdk from '@hermes/plugin-sdk'
+
+// ── plugin i18n (inline — plugin.js is the single-file bundle) ─────────────
+// Mirrors the core plugin-i18n contract (#67303): bundles register under the
+// plugin id at load, components bind the en template through the SDK
+// translator. En lives inline because the direct-file plugin loader (and the
+// .mjs test harness) evaluates plugin.js alone — no sibling imports.
+
+const BOTS_EN = {
+  pluginName: 'Bots',
+  pluginDescription:
+    'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
+  pane: {
+    title: 'Bots',
+    activityToastsOn: 'Activity toasts on — click to silence',
+    activityToastsOff: 'Activity toasts off — click to enable',
+    showHiddenBots: n => `Show ${n} hidden bot${n === 1 ? '' : 's'}`,
+    hideHiddenBotsAgain: 'Hide hidden bots again',
+    hideHiddenBotsAria: 'Hide hidden bots',
+    showHiddenBotsAria: 'Show hidden bots',
+    hiddenUnreadAria: 'a hidden bot has unread activity',
+    newMenuTip: 'New…',
+    newMenuAria: 'New bot or group chat',
+    newAgent: 'New Bot',
+    newGroupChat: 'New Group Chat',
+    pinnedTip: 'Pinned',
+    hiddenTip: 'Hidden from the roster',
+    pinToggle: (name, pinned) => `${name} ${pinned ? 'unpinned' : 'pinned to top'}`,
+    waitingGateway:
+      'Waiting for the gateway connection… (remote gateways can take a few seconds; retries automatically)',
+    retryNow: 'Retry now',
+    deleteBotTitle: 'Delete bot and profile?',
+    deleteBotDescPrefix: 'This will permanently delete the bot ',
+    deleteBotDescMid: ' and its associated Hermes profile at ',
+    deleteBotDescSuffix: '. This cannot be undone.',
+    deleteConfirm: 'Delete',
+    deleting: 'Deleting…',
+    noAgentsYet: 'No bots yet',
+    emptyStateDescription: 'Create your first bot.',
+    searchBotsAria: 'Search bots and group chats',
+    searchBotsPlaceholder: 'Search bots and group chats…',
+    rosterUnavailable: message =>
+      `Roster unavailable: ${message}. If your gateway predates profiles.list, update Hermes and restart the gateway.`,
+  },
+  create: {
+    title: 'New Bot',
+    description:
+      'A named teammate with its own memory, skills, and chat. It can message your other agents.',
+    name: 'Name',
+    namePlaceholder: 'inbox-triage',
+    titleField: 'Title',
+    titlePlaceholder: 'Inbox Triage',
+    descriptionField: 'Description',
+    descriptionPlaceholder: 'What should this Bot help with?',
+    createOn: 'Create on',
+    createOnNote: target =>
+      `The agent is created on ${target} and appears in the roster as a Connections bot. Chat routes to that machine.`,
+    takenLocal: slug => `An agent named "${slug}" already exists.`,
+    takenRemote: (slug, target) => `An agent named "${slug}" already exists on ${target}.`,
+    advanced: 'Advanced',
+    generalTab: 'General',
+    capabilitiesTab: 'Capabilities',
+    skillsTab: 'Skills',
+    toolsTab: 'Tools',
+    mcpTab: 'MCP',
+    cloneFrom: 'Clone from profile',
+    cloneFromOn: target => `Clone from profile (on ${target})`,
+    freshProfile: 'Fresh profile (bundled skills)',
+    createEmpty: 'Create empty (skip bundled skills)',
+    inheritedModel: 'inherited from launch profile',
+    soulLabel: 'SOUL.md (optional — replaces the generated persona)',
+    soulPlaceholder:
+      'Leave blank to auto-generate from name/title/description + agent-messaging roster.',
+    shareKeys: 'Share keys & accounts with the main profile',
+    shareKeysDetail:
+      'Subscriptions, OAuth logins, and API keys stay shared (not copied), so token refreshes never invalidate each other. Uncheck for an isolated snapshot copy.',
+    createEmptyCheckedNote: '“Create empty” is checked — no bundled skills will be installed.',
+    filterSkills: 'Filter skills…',
+    createFailed: 'Could not create the profile yet',
+    createAgent: 'Create Bot',
+    creating: 'Creating…',
+    draftDiscarded: draft => `Draft agent "${draft}" discarded`,
+    draftCleanupFailed: draft => `Could not clean up draft profile "${draft}"`,
+    defaultToolsetNote:
+      'Leaving all (or none) checked keeps the default toolset behavior.',
+  },
+  edit: {
+    title: 'Edit Profile',
+    description: (displayName, profileId) =>
+      `Appearance and role for ${displayName} (${profileId}).`,
+    titleField: 'Title',
+    descriptionField: 'Description',
+    descriptionPlaceholder: 'What should this agent help with?',
+    advancedDisclosure: 'Advanced — model, skills, toolsets, SOUL.md',
+    advancedFailed: 'Advanced configuration failed',
+    sectionsFailed: list => `Some sections failed: ${list}`,
+    updated: name => `${name} updated`,
+  },
+  advanced: {
+    gatewayTooOld: 'Full configuration needs a newer gateway (restart it after updating Hermes).',
+    noMcp: 'No MCP servers configured or in the catalog.',
+    skillsHub: 'Skills Hub',
+    skillsHubTitle: 'Hermes Skills Hub',
+    searchHubPlaceholder: 'Search the hub (community + well-known sources)…',
+    searchingHub: 'Searching community + well-known sources — can take ~10s…',
+    noHubMatches: 'No hub skills matched.',
+    filterSkills: 'Filter skills…',
+    skillInstalled: label => `Skill "${label}" installed`,
+  },
+  menu: {
+    hideBot: 'Hide',
+    unhideBot: 'Unhide',
+    backInRoster: name => `${name} is back in the roster`,
+    hiddenNotice: name =>
+      `${name} hidden — use the eye button in the Bots header to see hidden bots`,
+    editProfile: 'Edit Profile',
+    manageGroups: 'Manage groups…',
+    groups: list => `Groups: ${list}…`,
+    duplicate: 'Duplicate',
+    duplicating: name => `Duplicating ${name}…`,
+    duplicateCreated: (name, source) => `Created ${name} — full copy of ${source}`,
+    duplicateFailed: 'Duplicate failed',
+    newChat: 'New chat with this agent',
+    delete: 'Delete',
+    // Sibling menu item of the pin/unpin toast (pane.pinToggle) — both flip
+    // together on the same bot state.
+    pin: 'Pin to top',
+    unpin: 'Unpin',
+  },
+  composer: {
+    neverResetsTitle: 'This chat never resets',
+    neverResetsMessage:
+      'Bot chats are one continuous conversation — compacting instead. For a throwaway session with this agent, use Sessions mode.',
+  },
+  common: {
+    cancel: 'Cancel',
+    save: 'Save',
+    saving: 'Saving…',
+    deleted: 'Deleted',
+  },
+}
+
+const BOTS_LOCALES = { en: BOTS_EN }
+
+// TODO(i18n sweep, out of scope for this first en bundle — these still
+// hardcode English and move into the bundle when the zh locale lands):
+//  - group activity feed (GROUP_ACTIVITY_LABELS + `did something` fallback)
+//  - inbound-activity toasts (`🫆 New message for ${…}` / `${…} has new
+//    activity` / `Open the chat to see it.`)
+//  - connection failures (`Could not reach ${…}`, `Could not open ${…} chat —
+//    try again`, roster-render copies included)
+//  - canonical-chat/session titles + cross-machine notices (`Bot Chat`,
+//    `Agent Inbox`, `Hey, tell me about yourself!`, `This Hermes Desktop
+//    version cannot open stored sessions`, `Still on ${…} …`, `No remote
+//    session`, `Messaged @… will relay …`)
+//  - avatar/face editor (lock/unlock, `Describe your avatar…`, generation
+//    errors, pet picker, image-too-large toasts)
+//  - cron/Routines UI (job editor, schedule summaries, `Untitled cronjob`,
+//    `Could not refresh/load cronjobs. …`, paused-for-security notice)
+//  - group chat UI (disband dialog, room header/footer, thread actions,
+//    activity view, member search `Search bots to add…`, group settings,
+//    clarify/answer cards)
+//  - roster rows + Active-Now strip (`Working on a task right now`,
+//    `Last message came from @…`, `Lives on ${…}`, stale-roster notices)
+//  - empty/filter states (`No bots match “…”`, `All bots are hidden …`,
+//    `No conversations yet — say hi`)
+//  - MCP/capabilities setup UI (`Could not add server`, `Could not start
+//    OAuth`, catalog notes, install toasts) + `Could not create the agent.`
+//  - model/provider + connection pickers and hub browser controls
+//    (`← Back to dropdowns`, `✏️ Enter manually…`, `e.g. model name`,
+//    `${connection.label} (current)`, `hide the hub browser`, install rows)
+//  - mention-completion rows (`Bot · ${display}${source}`, ` · ${label}`)
+//  - misc toasts (`Deleted profile …`, `Deleted group “…”`, duplicate/delete
+//    errors like `No free name for the duplicate.`, `can't delete a bot`,
+//    `Could not delete profile ${…}.`, group name-collision, pet failures)
+//  - palette/command copy (`New Agent…` label + hint, `@<bot> do the thing`)
+//  - static contribution metadata is ALREADY sourced from BOTS_EN
+//    (export name/description); the pane/palette `title: 'Bots'`,
+//    `title: 'Cronjobs'` registrations are the same static-metadata case.
+//  - SOUL.md protocol + @-mention handoff PROMPT text and avatar/group-picture
+//    image-generation prompts (model-facing, not UI) are deliberately
+//    excluded from UI localization — a separate decision.
+
+function bindBotsText(t, template, prefix = '') {
+  const out = {}
+  for (const [key, value] of Object.entries(template)) {
+    const path = prefix ? `${prefix}.${key}` : key
+    out[key] =
+      typeof value === 'function'
+        ? (...args) => t(path, ...args)
+        : value && typeof value === 'object'
+          ? bindBotsText(t, value, path)
+          : t(path)
+  }
+  return out
+}
+
+function useBots() {
+  // Graceful degradation: hosts without plugin i18n (or the .mjs test
+  // sandbox, which strips the SDK import) get the en template verbatim —
+  // byte-identical to the hardcoded strings this replaced.
+  const usePluginI18n =
+    typeof sdk !== 'undefined' && typeof sdk.usePluginI18n === 'function'
+      ? sdk.usePluginI18n
+      : null
+  if (!usePluginI18n) return BOTS_EN
+  const t = usePluginI18n('hermes-bots')
+  // Memoize the bound wrapper tree on the translator identity. The SDK keeps
+  // `t` stable per (plugin, locale, registry version), so the tree rebuilds
+  // only on a real locale switch or (re)registration — not on every render
+  // of every Bot component. Fresh function identities per render would loop
+  // any future useEffect(..., [k.pane.pinToggle]) pattern.
+  return useMemo(() => bindBotsText(t, BOTS_EN), [t])
+}
+
 import {
   atom,
   Button,
@@ -8920,6 +9134,7 @@ function botRowOwnsWorkspace(
 // ── bot row ──────────────────────────────────────────────────────────────────
 
 function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
+  const k = useBots()
   const activeProfile = useValue(host.state.profile)
   const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
   const selectedRosterKey = useValue($selectedRosterKey)
@@ -9070,7 +9285,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 children: [
                   pinned
                     ? jsx(Tip, {
-                        label: 'Pinned',
+                        label: k.pane.pinnedTip,
                         children: jsx(Codicon, {
                           name: 'pinned',
                           className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)'
@@ -9079,7 +9294,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                     : null,
                   hidden
                     ? jsx(Tip, {
-                        label: 'Hidden from the roster',
+                        label: k.pane.hiddenTip,
                         children: jsx(Codicon, {
                           name: 'eye-closed',
                           className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)'
@@ -9158,11 +9373,11 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 void saveBotMeta(bot, { pinned: !pinned })
                 host.notify({
                   kind: 'info',
-                  message: `${displayName(bot, current)} ${pinned ? 'unpinned' : 'pinned to top'}`
+                  message: k.pane.pinToggle(displayName(bot, current), pinned)
                 })
               }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
-            children: pinned ? 'Unpin' : 'Pin to top'
+            children: pinned ? k.menu.unpin : k.menu.pin
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
@@ -9177,33 +9392,33 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 host.notify({
                   kind: 'info',
                   message: hidden
-                    ? `${displayName(bot, current)} is back in the roster`
-                    : `${displayName(bot, current)} hidden — use the eye button in the Bots header to see hidden bots`
+                    ? k.menu.backInRoster(displayName(bot, current))
+                    : k.menu.hiddenNotice(displayName(bot, current))
                 })
               }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
-            children: hidden ? 'Unhide' : 'Hide'
+            children: hidden ? k.menu.unhideBot : k.menu.hideBot
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onEdit(bot)).catch(error => host.notifyError?.(error, 'Could not load bot')),
-            children: 'Edit Profile'
+            children: k.menu.editProfile
           }),
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onGroup(bot)).catch(error => host.notifyError?.(error, 'Could not load bot groups')),
-            children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
+            children: groups.length ? k.menu.groups(groups.join(', ')) : k.menu.manageGroups
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
-              host.notify({ kind: 'info', message: `Duplicating ${displayName(bot, meta)}…` })
+              host.notify({ kind: 'info', message: k.menu.duplicating(displayName(bot, meta)) })
               duplicateBot(bot, $lastRoster.get())
                 .then(name => {
                   queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
-                  host.notify({ kind: 'success', message: `Created ${name} — full copy of ${bot.name}` })
+                  host.notify({ kind: 'success', message: k.menu.duplicateCreated(name, bot.name) })
                 })
-                .catch(err => host.notifyError(err, 'Duplicate failed'))
+                .catch(err => host.notifyError(err, k.menu.duplicateFailed))
             },
-            children: 'Duplicate'
+            children: k.menu.duplicate
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
@@ -9212,7 +9427,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
               setBotsWorkspaceOwner(botWorkspaceOwnerKey(bot), bot)
               newBotChat(bot)
             },
-            children: 'New chat with this agent'
+            children: k.menu.newChat
           }),
           isDefaultBot(bot) ? null : jsx(ContextMenuSeparator, {}),
           isDefaultBot(bot)
@@ -9220,7 +9435,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
             : jsx(ContextMenuItem, {
                 onSelect: () => onDelete(bot),
                 variant: 'destructive',
-                children: 'Delete'
+                children: k.menu.delete
               })
         ]
       })
@@ -9480,6 +9695,7 @@ function CheckList({ items, onToggle, columns = 2 }) {
 }
 
 function AdvancedProfileConfig({ bot, state, setState }) {
+  const k = useBots()
   const [loaded, setLoaded] = useState(false)
   const [unsupported, setUnsupported] = useState(false)
   const [skillFilter, setSkillFilter] = useState('')
@@ -9527,7 +9743,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
   if (unsupported) {
     return jsx('div', {
       className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-      children: 'Full configuration needs a newer gateway (restart it after updating Hermes).'
+      children: k.advanced.gatewayTooOld
     })
   }
 
@@ -9648,7 +9864,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           children: [
             jsx(Input, {
               className: 'h-7 text-xs',
-              placeholder: 'Filter skills…',
+              placeholder: k.create.filterSkills,
               value: skillFilter,
               onChange: event => setSkillFilter(event.target.value)
             }),
@@ -9728,7 +9944,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
             : mcpList.length === 0
               ? jsx('div', {
                   className: 'px-1 py-2 text-center text-xs text-(--ui-text-tertiary)',
-                  children: 'No MCP servers configured or in the catalog.'
+                  children: k.advanced.noMcp
                 })
               : jsx(ScrollArea, {
                   className: 'hermes-scroll-cap',
@@ -9894,7 +10110,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         ...(forProfile ? { profile: forProfile } : {})
       })
       setInstalled(prev => ({ ...prev, [label]: true }))
-      host.notify({ kind: 'success', message: `Skill "${label}" installed` })
+      host.notify({ kind: 'success', message: k.advanced.skillInstalled(label) })
 
       if (typeof onInstalled === 'function') {
         onInstalled(label)
@@ -9916,7 +10132,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         children: [
           jsx('div', {
             className: 'text-[0.7rem] font-medium text-(--ui-text-secondary)',
-            children: 'Skills Hub'
+            children: k.advanced.skillsHub
           }),
           jsx('button', {
             type: 'button',
@@ -9950,7 +10166,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
                 },
                 children: jsx('iframe', {
                   src: HUB_PICKER_URL,
-                  title: 'Hermes Skills Hub',
+                  title: k.advanced.skillsHubTitle,
                   ref: frameRef,
                   style: {
                     width: '133.34%',
@@ -9978,7 +10194,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         children: [
           jsx(Input, {
             className: 'h-7 flex-1 text-xs',
-            placeholder: 'Search the hub (community + well-known sources)…',
+            placeholder: k.advanced.searchHubPlaceholder,
             value: query,
             onChange: event => setQuery(event.target.value),
             onKeyDown: event => {
@@ -10004,7 +10220,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
       searching
         ? jsx('div', {
             className: 'px-1 text-[0.65rem] text-(--ui-text-quaternary)',
-            children: 'Searching community + well-known sources — can take ~10s…'
+            children: k.advanced.searchingHub
           })
         : null,
       results === null
@@ -10012,7 +10228,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         : results.length === 0
           ? jsx('div', {
               className: 'px-1 py-1.5 text-[0.7rem] text-(--ui-text-quaternary)',
-              children: 'No hub skills matched.'
+              children: k.advanced.noHubMatches
             })
           : jsx(ScrollArea, {
               className: 'hermes-scroll-cap',
@@ -10173,6 +10389,7 @@ function labeled(label, control) {
 }
 
 function EditProfileDialog({ bot, open, onClose }) {
+  const k = useBots()
   const metaAll = useValue($botMeta)
   const meta = bot ? botRosterMeta(bot, metaAll) : null
   const appearance = bot ? botAppearance(bot.name, meta) : { shape: 'circle', color: AVATAR_COLORS[3] }
@@ -10252,16 +10469,16 @@ function EditProfileDialog({ bot, open, onClose }) {
 
         if (failed.length) {
           advancedFailed = true
-          host.notify({ kind: 'error', message: `Some sections failed: ${failed.map(([k]) => k).join(', ')}` })
+          host.notify({ kind: 'error', message: k.edit.sectionsFailed(failed.map(([x]) => x).join(', ')) })
         }
       } catch (err) {
         advancedFailed = true
-        host.notifyError(err, 'Advanced configuration failed')
+        host.notifyError(err, k.edit.advancedFailed)
       }
     }
 
     if (!advancedFailed && !lookFailed) {
-      host.notify({ kind: 'success', message: `${displayName(bot, { title })} updated` })
+      host.notify({ kind: 'success', message: k.edit.updated(displayName(bot, { title })) })
     }
     setBusy(false)
     onClose()
@@ -10279,8 +10496,8 @@ function EditProfileDialog({ bot, open, onClose }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'Edit Profile' }),
-            jsx(DialogDescription, { children: `Appearance and role for ${displayName(bot, null)} (${bot.name}).` })
+            jsx(DialogTitle, { children: k.edit.title }),
+            jsx(DialogDescription, { children: k.edit.description(displayName(bot, null), bot.name) })
           ]
         }),
         jsxs('div', {
@@ -10300,7 +10517,7 @@ function EditProfileDialog({ bot, open, onClose }) {
               generateSeed: { name: bot.name, title, description }
             }),
             labeled(
-              'Title',
+              k.edit.titleField,
               jsx(Input, {
                 placeholder: displayName(bot, null),
                 value: title,
@@ -10308,10 +10525,10 @@ function EditProfileDialog({ bot, open, onClose }) {
               })
             ),
             labeled(
-              'Description',
+              k.edit.descriptionField,
               jsx(Textarea, {
                 className: 'min-h-16',
-                placeholder: 'What should this agent help with?',
+                placeholder: k.edit.descriptionPlaceholder,
                 value: description,
                 onChange: event => setDescription(event.target.value)
               })
@@ -10323,7 +10540,7 @@ function EditProfileDialog({ bot, open, onClose }) {
               onClick: () => setAdvanced(v => !v),
               children: [
                 jsx(Codicon, { name: advanced ? 'chevron-down' : 'chevron-right', className: 'text-[0.8rem]' }),
-                'Advanced — model, skills, toolsets, SOUL.md'
+                k.edit.advancedDisclosure
               ]
             }),
             advanced
@@ -10336,8 +10553,8 @@ function EditProfileDialog({ bot, open, onClose }) {
         }),
         jsxs(DialogFooter, {
           children: [
-            jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: 'Cancel' }),
-            jsx(Button, { disabled: busy, onClick: submit, children: busy ? 'Saving…' : 'Save' })
+            jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: k.common.cancel }),
+            jsx(Button, { disabled: busy, onClick: submit, children: busy ? k.common.saving : k.common.save })
           ]
         })
       ]
@@ -10348,6 +10565,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 // ── create dialog ────────────────────────────────────────────────────────────
 
 function CreateAgentDialog({ open, onClose, roster }) {
+  const k = useBots()
   const [name, setName] = useState('')
   // Create mode: the profile is created LAZILY. Capability toggles are staged in
   // component state; the profile is materialized either on Create (submit) or on
@@ -10454,8 +10672,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
       ? requestForTarget('cli.exec', { argv: ['profile', 'delete', draft, '--yes'] })
       : deleteBot({ name: draft })
     void Promise.resolve(discard)
-      .then(() => host.notify({ kind: 'success', message: `Draft agent "${draft}" discarded` }))
-      .catch(err => host.notifyError(err, `Could not clean up draft profile "${draft}"`))
+      .then(() => host.notify({ kind: 'success', message: k.create.draftDiscarded(draft) }))
+      .catch(err => host.notifyError(err, k.create.draftCleanupFailed(draft)))
   }
 
   const reset = () => {
@@ -10719,9 +10937,9 @@ function CreateAgentDialog({ open, onClose, roster }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'New Bot' }),
+            jsx(DialogTitle, { children: k.create.title }),
             jsx(DialogDescription, {
-              children: 'A named teammate with its own memory, skills, and chat. It can message your other agents.'
+              children: k.create.description
             })
           ]
         }),
@@ -10742,10 +10960,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
               generateSeed: { name: slug || 'agent', title, description }
             }),
             labeled(
-              'Name',
+              k.create.name,
               jsx(Input, {
                 autoFocus: true,
-                placeholder: 'inbox-triage',
+                placeholder: k.create.namePlaceholder,
                 value: name,
                 onChange: event => setName(event.target.value)
               })
@@ -10754,8 +10972,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
               ? jsx('div', {
                   className: 'text-xs text-(--ui-accent)',
                   children: remoteTarget
-                    ? `An agent named "${slug}" already exists on ${targetLabel}.`
-                    : `An agent named "${slug}" already exists.`
+                    ? k.create.takenRemote(slug, targetLabel)
+                    : k.create.takenLocal(slug)
                 })
               : null,
             // Multi-connection desktops choose WHERE the agent lives. Hidden
@@ -10763,7 +10981,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
             // possible home, exactly the old behavior.
             Array.isArray(connections) && connections.length > 1
               ? labeled(
-                  'Create on',
+                  k.create.createOn,
                   jsxs(Select, {
                     value: targetConnection || activeConnectionId || 'local',
                     onValueChange: value => {
@@ -10803,22 +11021,22 @@ function CreateAgentDialog({ open, onClose, roster }) {
             remoteTarget
               ? jsx('div', {
                   className: 'text-[0.7rem] leading-5 text-(--ui-text-tertiary)',
-                  children: `The agent is created on ${targetLabel} and appears in the roster as a Connections bot. Chat routes to that machine.`
+                  children: k.create.createOnNote(targetLabel)
                 })
               : null,
             labeled(
-              'Title',
+              k.create.titleField,
               jsx(Input, {
-                placeholder: 'Inbox Triage',
+                placeholder: k.create.titlePlaceholder,
                 value: title,
                 onChange: event => setTitle(event.target.value)
               })
             ),
             labeled(
-              'Description',
+              k.create.descriptionField,
               jsx(Textarea, {
                 className: 'min-h-16',
-                placeholder: 'What should this Bot help with?',
+                placeholder: k.create.descriptionPlaceholder,
                 value: description,
                 onChange: event => setDescription(event.target.value)
               })
@@ -10837,7 +11055,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
               },
               children: [
                 jsx(Codicon, { name: advanced ? 'chevron-down' : 'chevron-right', className: 'text-[0.8rem]' }),
-                'Advanced'
+                k.create.advanced
               ]
             }),
             advanced
@@ -10857,14 +11075,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
                       // reads already route to the target).
                       children: (SkillsView && (!remoteTarget || skillsViewRoutesConnections)
                         ? [
-                            ['general', 'General'],
-                            ['capabilities', 'Capabilities']
+                            ['general', k.create.generalTab],
+                            ['capabilities', k.create.capabilitiesTab]
                           ]
                         : [
-                            ['general', 'General'],
-                            ['skills', 'Skills'],
-                            ['toolsets', 'Tools'],
-                            ['mcp', 'MCP']
+                            ['general', k.create.generalTab],
+                            ['skills', k.create.skillsTab],
+                            ['toolsets', k.create.toolsTab],
+                            ['mcp', k.create.mcpTab]
                           ]
                       ).map(([id, label]) =>
                         jsx(
@@ -10886,7 +11104,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                 // the MCP setup buttons use).
                                 void ensureAgentCreated()
                                   .then(created => created && setCreatedForCaps(created))
-                                  .catch(err => host.notifyError(err, 'Could not create the profile yet'))
+                                  .catch(err => host.notifyError(err, k.create.createFailed))
                               } else if (id !== 'general') {
                                 ensureCaps()
                               }
@@ -10902,7 +11120,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                           className: 'grid gap-3.5',
                           children: [
                             labeled(
-                              remoteTarget ? `Clone from profile (on ${targetLabel})` : 'Clone from profile',
+                              remoteTarget ? k.create.cloneFromOn(targetLabel) : k.create.cloneFrom,
                               jsxs(Select, {
                                 disabled: remoteTarget,
                                 value: remoteTarget ? 'default' : cloneFrom,
@@ -10920,7 +11138,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                     children: [
                                       jsx(SelectItem, {
                                         value: '__none__',
-                                        children: 'Fresh profile (bundled skills)'
+                                        children: k.create.freshProfile
                                       }),
                                       ...roster.map(b => jsx(SelectItem, { value: b.name, children: b.name }, b.name))
                                     ]
@@ -10938,10 +11156,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   setModel(patch.model)
                                 }
                               },
-                              placeholderModel: 'inherited from launch profile'
+                              placeholderModel: k.create.inheritedModel
                             }),
                             labeled(
-                              'SOUL.md (optional — replaces the generated persona)',
+                              k.create.soulLabel,
                               jsx(Textarea, {
                                 className: 'min-h-24 font-mono text-xs leading-5',
                                 placeholder:
@@ -10957,13 +11175,13 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   checked: shareAuth,
                                   onCheckedChange: value => setShareAuth(Boolean(value))
                                 }),
-                                'Share keys & accounts with the main profile'
+                                k.create.shareKeys
                               ]
                             }),
                             jsx('div', {
                               className: 'pl-6 pt-0.5 text-[0.7rem] leading-5 text-(--ui-text-tertiary)',
                               children:
-                                'Subscriptions, OAuth logins, and API keys stay shared (not copied), so token refreshes never invalidate each other. Uncheck for an isolated snapshot copy.'
+                                k.create.shareKeysDetail
                             }),
                             jsxs('label', {
                               className: 'flex items-center gap-2 text-xs text-(--ui-text-secondary)',
@@ -10972,7 +11190,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   checked: noSkills,
                                   onCheckedChange: value => setNoSkills(Boolean(value))
                                 }),
-                                'Create empty (skip bundled skills)'
+                                k.create.createEmpty
                               ]
                             })
                           ]
@@ -11026,14 +11244,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
                             ? noSkills
                               ? jsx('div', {
                                   className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                                  children: '“Create empty” is checked — no bundled skills will be installed.'
+                                  children: k.create.createEmptyCheckedNote
                                 })
                               : jsxs('div', {
                                   className: 'grid gap-1.5',
                                   children: [
                                     jsx(Input, {
                                       className: 'h-7 text-xs',
-                                      placeholder: 'Filter skills…',
+                                      placeholder: k.advanced.filterSkills,
                                       value: capFilter,
                                       onChange: event => setCapFilter(event.target.value)
                                     }),
@@ -11080,14 +11298,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                     }),
                                     jsx('div', {
                                       className: 'text-[0.65rem] leading-4 text-(--ui-text-quaternary)',
-                                      children: 'Leaving all (or none) checked keeps the default toolset behavior.'
+                                      children: k.create.defaultToolsetNote
                                     })
                                   ]
                                 })
                               : caps.mcp.length === 0
                                 ? jsx('div', {
                                     className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                                    children: 'No MCP servers configured or in the catalog.'
+                                    children: k.advanced.noMcp
                                   })
                                 : jsxs('div', {
                                     className: 'grid gap-1.5',
@@ -11191,12 +11409,12 @@ function CreateAgentDialog({ open, onClose, roster }) {
                 reset()
                 onClose()
               },
-              children: 'Cancel'
+              children: k.common.cancel
             }),
             jsx(Button, {
               disabled: busy || !valid || taken,
               onClick: submit,
-              children: busy ? 'Creating…' : 'Create Bot'
+              children: busy ? k.create.creating : k.create.createAgent
             })
           ]
         })
@@ -14820,6 +15038,7 @@ function GatewaySectionHeading({ collapsed, count, onToggle, option }) {
 }
 
 function BotsPane() {
+  const k = useBots()
   const { data, error, isLoading, refetch } = useRoster()
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
@@ -15183,13 +15402,13 @@ function BotsPane() {
         children: [
           jsx('span', {
             className: 'text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
-            children: 'Bots'
+            children: k.pane.title
           }),
           jsxs('div', {
             className: 'flex items-center gap-0.5',
             children: [
               jsx(Tip, {
-                label: activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable',
+                label: activityToasts ? k.pane.activityToastsOn : k.pane.activityToastsOff,
                 children: jsx('button', {
                   type: 'button',
                   className:
@@ -15198,15 +15417,16 @@ function BotsPane() {
                   children: jsx(Codicon, { name: activityToasts ? 'bell' : 'bell-slash' })
                 })
               }),
+
               jsxs(DropdownMenu, {
                 children: [
                   jsx(Tip, {
-                    label: 'New…',
+                    label: k.pane.newMenuTip,
                     children: jsx(DropdownMenuTrigger, {
                       asChild: true,
                       children: jsx('button', {
                         type: 'button',
-                        'aria-label': 'New bot or group chat',
+                        'aria-label': k.pane.newMenuAria,
                         className:
                           'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
                         children: jsx(Codicon, { name: 'add' })
@@ -15218,12 +15438,12 @@ function BotsPane() {
                     children: [
                       jsxs(DropdownMenuItem, {
                         onSelect: () => setCreateOpen(true),
-                        children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Bot']
+                        children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), k.pane.newAgent]
                       }),
                       jsxs(DropdownMenuItem, {
                         disabled: activeSourceRoster.length < 2,
                         onSelect: () => setGroupCreateOpen(true),
-                        children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
+                        children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), k.pane.newGroupChat]
                       })
                     ]
                   })
@@ -15250,14 +15470,14 @@ function BotsPane() {
                 ? jsx(
                     SearchField,
                     {
-                      'aria-label': 'Search bots and group chats',
+                      'aria-label': k.pane.searchBotsAria,
                       containerClassName: cn(
                         'min-w-0 flex-1',
                         query ? 'opacity-100!' : 'opacity-50 focus-within:opacity-100'
                       ),
                       inputClassName:
                         'w-full text-[0.75rem] placeholder:text-(--ui-text-tertiary)',
-                      placeholder: 'Search bots and group chats…',
+                      placeholder: k.pane.searchBotsPlaceholder,
                       value: query,
                       onChange: setQuery
                     },
@@ -15406,23 +15626,23 @@ function BotsPane() {
               children: [
                 jsx('div', {
                   children: gatewayUp
-                    ? `Roster unavailable: ${error instanceof Error ? error.message : 'gateway error'}. If your gateway predates profiles.list, update Hermes and restart the gateway.`
-                    : 'Waiting for the gateway connection… (remote gateways can take a few seconds; retries automatically)'
+                    ? k.pane.rosterUnavailable(error instanceof Error ? error.message : 'gateway error')
+                    : k.pane.waitingGateway
                 }),
                 jsx(Button, {
                   variant: 'secondary',
                   size: 'sm',
                   className: 'justify-self-start',
                   onClick: () => void refetch(),
-                  children: 'Retry now'
+                  children: k.pane.retryNow
                 })
               ]
             })
           : roster.length === 0
             ? jsx(EmptyState, {
                 icon: 'hubot',
-                title: 'No bots yet',
-                description: 'Create your first bot.'
+                title: k.pane.noAgentsYet,
+                description: k.pane.emptyStateDescription
               })
             : allBotsHidden && !hiddenExpanded
               ? jsxs('div', {
@@ -15550,22 +15770,22 @@ function BotsPane() {
       grouping ? jsx(GroupDialog, { bot: grouping, onClose: () => setGrouping(null) }) : null,
       jsx(ConfirmDialog, {
         open: Boolean(deleting),
-        title: 'Delete bot and profile?',
+        title: k.pane.deleteBotTitle,
         description: deleting
           ? jsxs('span', {
               children: [
-                'This will permanently delete the bot ',
+                k.pane.deleteBotDescPrefix,
                 jsx('span', { className: 'font-medium text-foreground', children: deleting.name }),
-                ' and its associated Hermes profile at ',
+                k.pane.deleteBotDescMid,
                 jsx('span', { className: 'font-mono text-xs', children: deleting.path }),
-                '. This cannot be undone.'
+                k.pane.deleteBotDescSuffix
               ]
             })
           : null,
         destructive: true,
-        confirmLabel: 'Delete',
-        busyLabel: 'Deleting…',
-        doneLabel: 'Deleted',
+        confirmLabel: k.pane.deleteConfirm,
+        busyLabel: k.pane.deleting,
+        doneLabel: k.common.deleted,
         onClose: () => setDeleting(null),
         onConfirm: async () => {
           if (!deleting) {
@@ -15587,7 +15807,7 @@ function BotsPane() {
         destructive: true,
         confirmLabel: 'Delete Group',
         busyLabel: 'Deleting…',
-        doneLabel: 'Deleted',
+        doneLabel: k.common.deleted,
         onClose: () => setDeletingGroup(null),
         onConfirm: async () => {
           if (!deletingGroup) return
@@ -15603,10 +15823,21 @@ function BotsPane() {
 
 export default {
   id: ID,
-  name: 'Bots',
-  description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
+  // Static plugin metadata is read by the host at plugin load — before any
+  // translator exists — so name/description stay sourced from the en
+  // template's canonical strings rather than a t() call. A localized
+  // description would need host-side metadata resolution (out of scope for
+  // this bundle); pulling from BOTS_EN keeps ONE canonical copy.
+  name: BOTS_EN.pluginName,
+  description: BOTS_EN.pluginDescription,
   register(ctx) {
     pluginCtx = ctx
+    // Older hosts without plugin i18n (pre-#67303) must not crash here:
+    // registration is optional and components fall back to the en template.
+    if (typeof ctx?.i18n?.register === 'function') {
+      ctx.i18n.register(BOTS_LOCALES)
+    }
+    const i18nT = typeof ctx?.i18n?.t === 'function' ? ctx.i18n.t.bind(ctx.i18n) : null
     groupChatSyncDisposed = false
     startFaceClock()
     // The cross-connection relay rides every gateway socket this Desktop
@@ -16137,10 +16368,10 @@ export default {
             if (activeBot && currentId && canonicalIds.includes(String(currentId))) {
               host.notify({
                 kind: 'info',
-                title: 'This chat never resets',
-                message:
-                  'Bot chats are one continuous conversation — compacting instead. ' +
-                  'For a throwaway session with this agent, use Sessions mode.'
+                title: i18nT ? i18nT('composer.neverResetsTitle') : BOTS_EN.composer.neverResetsTitle,
+                message: i18nT
+                  ? i18nT('composer.neverResetsMessage')
+                  : BOTS_EN.composer.neverResetsMessage
               })
 
               return { ...draft, text: '/compact' }
