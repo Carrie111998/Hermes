@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { ALL_PROFILES } from '@/store/profile'
 import type { SessionInfo } from '@/types/hermes'
 
+import { ALL_PROFILES } from './profile'
 import { filterSessionsByProfileScope } from './profile-scope'
 
 /** Build the smallest session row needed by the profile-scope tests. */

@@ -478,6 +478,10 @@ export interface Translations {
       introSplashDesc: string
       reactionsTitle: string
       reactionsDesc: string
+      profileSwitchTitle: string
+      profileSwitchDesc: string
+      profileSwitchFresh: string
+      profileSwitchRestore: string
       composerPopoutTitle: string
       composerPopoutDesc: string
       vibeHeartsTitle: string

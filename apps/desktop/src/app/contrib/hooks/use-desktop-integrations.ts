@@ -31,16 +31,20 @@ import type { SessionInfo } from '@/types/hermes'
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
 
+import { useProfileSwitchContinuity } from './use-profile-switch-continuity'
+
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
 
 interface DesktopIntegrationsParams {
   activeProfile: string
   chatOpen: boolean
+  descriptorConnectionId: null | string
+  descriptorProfile: null | string
   hasPreview: boolean
   locationPathname: string
   navigate: (to: string, options?: { replace?: boolean }) => void
   profileReady: boolean
-  refreshSessions: () => Promise<unknown> | unknown
+  refreshSessions: (shouldPublish?: () => boolean) => Promise<boolean>
   resumeExhaustedSessionId: null | string
   routedSessionId: null | string
   runtimeIdByStoredSessionId: { readonly current: Map<string, string> }
@@ -56,6 +60,8 @@ interface DesktopIntegrationsParams {
  */
 export function useDesktopIntegrations({
   activeProfile,
+  descriptorConnectionId,
+  descriptorProfile,
   locationPathname,
   navigate,
   profileReady,
@@ -90,6 +96,16 @@ export function useDesktopIntegrations({
   }, [])
 
   const restoredRef = useRef(false)
+
+  useProfileSwitchContinuity({
+    activeProfile,
+    descriptorConnectionId,
+    descriptorProfile,
+    locationPathname,
+    navigate,
+    profileReady,
+    refreshSessions
+  })
 
   // Wait until boot has adopted the primary profile, then restore that profile's
   // navigation exactly once. The same effect owns subsequent writes so the

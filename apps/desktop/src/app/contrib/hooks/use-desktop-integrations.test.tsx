@@ -102,6 +102,8 @@ describe('useDesktopIntegrations', () => {
         useDesktopIntegrations({
           activeProfile,
           chatOpen: false,
+          descriptorConnectionId: null,
+          descriptorProfile: null,
           hasPreview: false,
           locationPathname,
           navigate,

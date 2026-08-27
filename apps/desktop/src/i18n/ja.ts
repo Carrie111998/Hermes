@@ -411,6 +411,11 @@ export const ja = defineLocale({
       reactionsTitle: 'メッセージリアクション',
       reactionsDesc:
         'iMessage風の絵文字タップバック — メッセージにリアクションでき、Hermesもあなたのメッセージにリアクションします。',
+      profileSwitchTitle: 'プロフィール切り替え',
+      profileSwitchDesc:
+        'このデスクトップクライアントにのみ適用されます。「新しい下書き」は Hermes の標準動作を維持し、「前回のセッション」は戻ったときに最後に表示していたセッションを再び開きます。',
+      profileSwitchFresh: '新しい下書き',
+      profileSwitchRestore: '前回のセッション',
       composerPopoutTitle: 'フローティング入力欄',
       composerPopoutDesc: '入力欄をドックからドラッグして外せるようにします。オフにすると画面下部に固定されます。',
       vibeHeartsTitle: 'バイブハート',

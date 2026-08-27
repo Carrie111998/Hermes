@@ -469,6 +469,11 @@ export const ar = defineLocale({
       introSplashDesc: 'الشعار النصي والعبارة التمهيدية في محادثة فارغة.',
       reactionsTitle: 'تفاعلات الرسائل',
       reactionsDesc: 'تفاعلات إيموجي بأسلوب iMessage — تفاعل مع الرسائل، ويمكن لـ Hermes التفاعل مع رسائلك.',
+      profileSwitchTitle: 'تبديل الملف الشخصي',
+      profileSwitchDesc:
+        'ينطبق على عميل سطح المكتب هذا فقط. يحافظ «مسودة جديدة» على سلوك Hermes الأصلي، بينما تعيد «الجلسة الأخيرة» فتح آخر جلسة مرئية عند العودة.',
+      profileSwitchFresh: 'مسودة جديدة',
+      profileSwitchRestore: 'الجلسة الأخيرة',
       composerPopoutTitle: 'محرر عائم',
       composerPopoutDesc: 'السماح بسحب محرر الرسائل خارج موضعه. عطّل هذا الخيار لإبقائه مثبتًا في الأسفل.',
       vibeHeartsTitle: 'قلوب المزاج',
