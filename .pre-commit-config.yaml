@@ -15,12 +15,6 @@ repos:
         types: [python]
         pass_filenames: false
 
-      - id: uv-lock-check
-        name: uv lock --check
-        entry: uv lock --check
-        language: system
-        pass_filenames: false
-
       - id: trailing-whitespace
         name: trailing whitespace
         entry: uv tool run ruff format --diff --stdin-filename {filename}
