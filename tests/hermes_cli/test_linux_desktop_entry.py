@@ -770,3 +770,62 @@ def test_needs_interpreter_case_insensitive_match(tmp_path, monkeypatch):
     monkeypatch.setattr(lde.sys, "executable", str(interpreter))
 
     assert lde._needs_interpreter(console_script) is False
+
+
+def test_needs_interpreter_rejects_sibling_directory(tmp_path, monkeypatch):
+    """``<venv>/bin-extra/python`` is NOT inside ``<venv>/bin``.
+
+    Substring matching accepted it (the parent dir appears verbatim inside
+    the sibling path), skipping the interpreter prefix for a script whose
+    shebang actually points OUTSIDE the venv. Path-component comparison
+    rejects it.
+    """
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    interp = venv_bin / "python"
+    interp.write_text("", encoding="utf-8")
+    monkeypatch.setattr(lde.sys, "executable", str(interp))
+
+    sibling_script = tmp_path / "sibling"
+    sibling_script.write_text(
+        f"#!{tmp_path}/venv/bin-extra/python\nimport hermes_cli\n",
+        encoding="utf-8",
+    )
+    assert lde._needs_interpreter(sibling_script) is True
+
+
+def test_needs_interpreter_strips_flags_before_comparing(tmp_path, monkeypatch):
+    """A flagged own-venv shebang is not misclassified by the flag token."""
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    interp = venv_bin / "python"
+    interp.write_text("", encoding="utf-8")
+    monkeypatch.setattr(lde.sys, "executable", str(interp))
+
+    flagged = tmp_path / "flagged"
+    flagged.write_text(f"#!{interp} -S\nimport hermes_cli\n", encoding="utf-8")
+    assert lde._needs_interpreter(flagged) is False
+
+
+def test_needs_interpreter_env_shebang_always_escapes(tmp_path, monkeypatch):
+    """``env`` resolves through the DE's PATH - not the installer's."""
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    interp = venv_bin / "python"
+    interp.write_text("", encoding="utf-8")
+    monkeypatch.setattr(lde.sys, "executable", str(interp))
+
+    # Even when env itself sits in the venv bin (parent equality would
+    # pass), the PATH resolution semantics mean the shebang escapes.
+    env_script = tmp_path / "envscript"
+    env_script.write_text(
+        f"#!{venv_bin}/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    assert lde._needs_interpreter(env_script) is True
+
+    # ...unless env carries an absolute venv interpreter after -S.
+    env_abs = tmp_path / "envabs"
+    env_abs.write_text(
+        f"#!/usr/bin/env -S {interp}\nimport hermes_cli\n", encoding="utf-8"
+    )
+    assert lde._needs_interpreter(env_abs) is False

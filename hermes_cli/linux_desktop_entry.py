@@ -441,24 +441,59 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
         # loader is self-sufficient.
         return False
-    shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    shebang = head.decode("utf-8", errors="replace").strip()
+    if "python" not in shebang.lower():
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
-    # A python shebang pointing INSIDE the running interpreter's environment
-    # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    # Compare the LEXICAL interpreter directory (abspath, not resolve()):
-    # on uv venvs the resolved parent is the base interpreter's dir, which
-    # makes a perfectly valid ``.venv/bin/python`` shebang look foreign
-    # (#94443 review case 1). Both sides use the SAME case operation: the
-    # shebang is .lower()-ed above, and interpreter paths legitimately carry
-    # uppercase (conda env names, usernames, uv's ephemeral build dirs) — an
-    # asymmetric compare would flag the venv's own console script as
-    # foreign and prefix it spuriously.
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable)).lower()
-    return exe_dir not in shebang
+    return _shebang_escapes_running_env(shebang)
+
+
+def _shebang_escapes_running_env(shebang: str) -> bool:
+    """Whether a python shebang resolves OUTSIDE the running interpreter's env.
+
+    Tokenizes the shebang (interpreter path plus any flags) and compares
+    PATH COMPONENTS, never substrings: ``<venv>/bin-extra/python`` is not
+    inside ``<venv>/bin`` even though it starts with it (sibling-directory
+    confusion; independently surfaced in nosliwhtes' #92122 hardening
+    ``b96427d0`` — reimplemented here with two extensions).
+
+    Extensions over the parent-equality form:
+
+    * ``env`` shebangs (``#!/usr/bin/env python3``) ALWAYS escape: ``env``
+      resolves through PATH, which in the DE's cold environment is not the
+      interactive PATH that installed the venv — the parent-equality form
+      could be fooled when the resolved ``env`` binary happens to sit in
+      the same directory tree.
+    * Flags after the interpreter (``-S``, ``-E``...) are stripped before
+      comparing, so a legitimate ``#!<venv>/bin/python -S`` is not
+      misclassified by comparing against the flag token.
+
+    The comparison uses the LEXICAL interpreter directory (abspath, not
+    resolve()): on uv venvs the resolved parent is the base interpreter's
+    dir, which makes a valid ``.venv/bin/python`` shebang look foreign
+    (#94443 review case 1). Both sides use the SAME case operation
+    (``.lower()``): interpreter paths legitimately carry uppercase (conda
+    env names, usernames, uv's ephemeral build dirs) and an asymmetric
+    compare would flag the venv's own console script as foreign.
+    """
+    tokens = shebang[2:].strip().split()
+    if not tokens:
+        # Bare "#!python" with no path: resolves via PATH — escapes.
+        return True
+    interp = Path(tokens[0])
+    if interp.name in ("env", "env.exe"):
+        # PATH-resolved interpreter: the DE environment's PATH decides,
+        # not the installing shell's — treat as escaping. A real
+        # ``env -S`` venv-absolute form (`env -S <abs>`), rare but valid,
+        # still resolves the actual interpreter from the second token.
+        rest = [t for t in tokens[1:] if not t.startswith("-")]
+        if rest and Path(rest[0]).is_absolute():
+            interp = Path(rest[0])
+        else:
+            return True
+    running_dir = os.path.dirname(os.path.abspath(sys.executable)).lower()
+    return str(interp.parent).lower() != running_dir
 
 
 def _quote_exec_arg(arg: str) -> str:
