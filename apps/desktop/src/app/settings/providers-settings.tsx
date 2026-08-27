@@ -28,7 +28,7 @@ import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
 import { CustomEndpointsSettings } from './custom-endpoints-settings'
 import { SettingsCategoryHeading, useEnvCredentials } from './env-credentials'
-import { providerGroup, providerMeta, providerPriority } from './helpers'
+import { providerGroup, providerMeta, providerMetaForLocale, providerPriority, providerPriorityForLocale } from './helpers'
 import { SettingsContent, SettingsSkeleton } from './primitives'
 
 // The embedded terminal (and thus the "run disconnect command" path) only
@@ -62,7 +62,7 @@ export type ProviderView = (typeof PROVIDER_VIEWS)[number]
 //   2. Desktop prefix match (`providerGroup`) — legacy fallback for provider
 //      env vars that predate the backend tagging.
 // Only entries that resolve to neither (the "Other" bucket) are skipped.
-function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGroup[] {
+function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>, locale?: string | null): ProviderKeyGroup[] {
   const buckets = new Map<string, [string, EnvVarInfo][]>()
 
   for (const [key, info] of Object.entries(vars)) {
@@ -93,7 +93,7 @@ function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGr
     // Presentation overlay (priority, blurb, docs) is keyed by the prefix-based
     // group name; when the backend introduced this provider it may have no
     // overlay entry, so fall back to the backend/env metadata for display.
-    const meta = providerMeta(name)
+    const meta = locale ? providerMetaForLocale(name, locale) : providerMeta(name)
 
     groups.push({
       // Advanced = the provider's non-key knobs (base URL, region, deployment).
@@ -108,7 +108,7 @@ function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGr
       hasAnySet: entries.some(([, i]) => i.is_set),
       name,
       primary,
-      priority: providerPriority(name)
+      priority: locale ? providerPriorityForLocale(name, locale) : providerPriority(name)
     })
   }
 
@@ -339,7 +339,7 @@ export function ProvidersSettings({
   onViewChange,
   view
 }: ProvidersSettingsProps) {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const { rowProps, vars } = useEnvCredentials()
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
   const [openProvider, setOpenProvider] = useState<null | string>(null)
@@ -452,7 +452,7 @@ export function ProvidersSettings({
   // providers there's nothing for the "Accounts" view to show, so fall to keys.
   const showApiKeys = view === 'keys' || (!hasOauth && view !== 'custom-endpoints')
 
-  const keyGroups = buildProviderKeyGroups(vars)
+  const keyGroups = buildProviderKeyGroups(vars, locale)
 
   if (showApiKeys) {
     const q = normalize(keyQuery)

@@ -2,7 +2,7 @@
 // Translates visible UI strings; missing keys fall back to English.
 // Regenerate with scripts/i18n/gen_ru.py.
 import { defineLocale } from './define-locale'
-import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
+import { FIELD_DESCRIPTIONS_RU, FIELD_LABELS_RU } from '@/app/settings/constants'
 
 export const ru = defineLocale({
 
@@ -655,8 +655,8 @@ export const ru = defineLocale({
         turnOffFailed: 'Не удалось выключить питомца.'
       }
     },
-    fieldLabels: FIELD_LABELS,
-    fieldDescriptions: FIELD_DESCRIPTIONS,
+    fieldLabels: FIELD_LABELS_RU,
+    fieldDescriptions: FIELD_DESCRIPTIONS_RU,
     about: {
       heading: 'Hermes Desktop',
       version: value => `Version ${value}`,

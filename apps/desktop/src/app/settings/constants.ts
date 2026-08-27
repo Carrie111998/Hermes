@@ -228,6 +228,189 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
   }
 ]
 
+export const PROVIDER_GROUPS_RU: ProviderPrefix[] = [
+  {
+    prefix: 'NOUS_',
+    name: 'Nous Portal',
+    description: 'Хостинг Hermes и модели Nous',
+    docsUrl: 'https://portal.nousresearch.com',
+    priority: 0
+  },
+  {
+    prefix: 'FIREWORKS_',
+    name: 'Fireworks AI',
+    description: 'Прямой API моделей, совместимый с OpenAI',
+    docsUrl: 'https://app.fireworks.ai/settings/users/api-keys',
+    priority: 1
+  },
+  {
+    prefix: 'OPENROUTER_',
+    name: 'OpenRouter',
+    description: 'Агрегатор сотен моделей',
+    docsUrl: 'https://openrouter.ai/keys',
+    priority: 1
+  },
+  {
+    prefix: 'ANTHROPIC_',
+    name: 'Anthropic',
+    description: 'Доступ к API Claude (Sonnet, Opus, Haiku)',
+    docsUrl: 'https://console.anthropic.com/settings/keys',
+    priority: 2
+  },
+  {
+    prefix: 'XAI_',
+    name: 'xAI',
+    description: 'Модели Grok (используйте OAuth для SuperGrok / Premium+)',
+    docsUrl: 'https://console.x.ai/',
+    priority: 3
+  },
+  {
+    prefix: 'GOOGLE_',
+    name: 'Gemini',
+    description: 'Google AI Studio (Gemini 1.5 / 2.0 / 2.5)',
+    docsUrl: 'https://aistudio.google.com/app/apikey',
+    priority: 4
+  },
+  { prefix: 'GEMINI_', name: 'Gemini', priority: 4 },
+  {
+    prefix: 'DEEPSEEK_',
+    name: 'DeepSeek',
+    description: 'Прямой API DeepSeek (V3.x, R1)',
+    docsUrl: 'https://platform.deepseek.com/api_keys',
+    priority: 5
+  },
+  {
+    prefix: 'DASHSCOPE_',
+    name: 'DashScope (Qwen)',
+    description: 'Alibaba Cloud DashScope — модели Qwen и других провайдеров',
+    docsUrl: 'https://modelstudio.console.alibabacloud.com/',
+    priority: 6
+  },
+  { prefix: 'HERMES_QWEN_', name: 'DashScope (Qwen)', priority: 6 },
+  {
+    prefix: 'GLM_',
+    name: 'GLM / Z.AI',
+    description: 'Хостинг Zhipu GLM-4.6 и Z.AI',
+    docsUrl: 'https://z.ai/',
+    priority: 7
+  },
+  { prefix: 'ZAI_', name: 'GLM / Z.AI', priority: 7 },
+  { prefix: 'Z_AI_', name: 'GLM / Z.AI', priority: 7 },
+  {
+    prefix: 'KIMI_',
+    name: 'Kimi / Moonshot',
+    description: 'Эндпоинты Moonshot Kimi K2 / кодинг',
+    docsUrl: 'https://platform.moonshot.cn/',
+    priority: 8
+  },
+  {
+    prefix: 'KIMI_CN_',
+    name: 'Kimi (China)',
+    description: 'Китайский эндпоинт Moonshot',
+    docsUrl: 'https://platform.moonshot.cn/',
+    priority: 9
+  },
+  {
+    prefix: 'MINIMAX_',
+    name: 'MiniMax',
+    description: 'Международные эндпоинты MiniMax-M2 и Hailuo',
+    docsUrl: 'https://www.minimax.io/',
+    priority: 10
+  },
+  {
+    prefix: 'MINIMAX_CN_',
+    name: 'MiniMax (China)',
+    description: 'Материковый Китай эндпоинт MiniMax',
+    docsUrl: 'https://www.minimaxi.com/',
+    priority: 11
+  },
+  {
+    prefix: 'HF_',
+    name: 'Hugging Face',
+    description: 'Inference Providers — 20+ открытых моделей через router.huggingface.co',
+    docsUrl: 'https://huggingface.co/settings/tokens',
+    priority: 12
+  },
+  {
+    prefix: 'OPENCODE_ZEN_',
+    name: 'OpenCode Zen',
+    description: 'Оплата по мере использования — отборные модели для кода',
+    docsUrl: 'https://opencode.ai/auth',
+    priority: 13
+  },
+  {
+    prefix: 'OPENCODE_GO_',
+    name: 'OpenCode Go',
+    description: 'Подписка $10/мес для открытых моделей кода',
+    docsUrl: 'https://opencode.ai/auth',
+    priority: 14
+  },
+  {
+    prefix: 'NVIDIA_',
+    name: 'NVIDIA NIM',
+    description: 'build.nvidia.com или ваш локальный эндпоинт NIM',
+    docsUrl: 'https://build.nvidia.com/',
+    priority: 15
+  },
+  {
+    prefix: 'OLLAMA_',
+    name: 'Ollama Cloud',
+    description: 'Облачный хостинг открытых моделей с ollama.com',
+    docsUrl: 'https://ollama.com/settings',
+    priority: 16
+  },
+  {
+    prefix: 'LM_',
+    name: 'LM Studio',
+    description: 'Локальный сервер LM Studio (совместим с OpenAI)',
+    docsUrl: 'https://lmstudio.ai/docs/local-server',
+    priority: 17
+  },
+  {
+    prefix: 'STEPFUN_',
+    name: 'StepFun',
+    description: 'Модели StepFun Step для кода',
+    docsUrl: 'https://platform.stepfun.com/',
+    priority: 18
+  },
+  {
+    prefix: 'XIAOMI_',
+    name: 'Xiaomi MiMo',
+    description: 'MiMo-V2.5 и фирменные модели Xiaomi',
+    docsUrl: 'https://platform.xiaomimimo.com',
+    priority: 19
+  },
+  {
+    prefix: 'ARCEEAI_',
+    name: 'Arcee AI',
+    description: 'Хостинг Arcee — малые и средние модели',
+    docsUrl: 'https://chat.arcee.ai/',
+    priority: 20
+  },
+  { prefix: 'ARCEE_', name: 'Arcee AI', priority: 20 },
+  {
+    prefix: 'GMI_',
+    name: 'GMI Cloud',
+    description: 'GMI Cloud — GPU и хостинг моделей',
+    docsUrl: 'https://www.gmicloud.ai/',
+    priority: 21
+  },
+  {
+    prefix: 'AZURE_FOUNDRY_',
+    name: 'Azure Foundry',
+    description: 'Кастомные эндпоинты Azure AI Foundry (совместимы с OpenAI / Anthropic)',
+    docsUrl: 'https://ai.azure.com/',
+    priority: 22
+  },
+  {
+    prefix: 'AWS_',
+    name: 'AWS Bedrock',
+    description: 'Аутентификация через профиль AWS и регион',
+    docsUrl: 'https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-regions.html',
+    priority: 23
+  }
+]
+
 // Schema-side select overrides for desktop-relevant enum fields whose
 // backend schema only declares a string type.
 export const ENUM_OPTIONS: Record<string, string[]> = {
@@ -626,6 +809,309 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
       'When Hermes updates itself from the app (no terminal prompt), keep local source edits (stash) or throw them away (discard). Terminal updates always ask.'
   }
 })
+
+export const FIELD_LABELS_RU: Record<string, string> = defineFieldCopy({
+  model: 'Модель по умолчанию',
+  modelContextLength: 'Окно контекста',
+  fallbackProviders: 'Резервные модели',
+  toolsets: 'Включённые наборы инструментов',
+  timezone: 'Часовой пояс',
+  display: {
+    personality: 'Характер',
+    showReasoning: 'Блоки рассуждений'
+  },
+  desktop: {
+    repoScanEnabled: 'Автообнаружение репозиториев',
+    repoScanRoots: 'Корни поиска репозиториев',
+    repoScanExcludePaths: 'Исключённые пути репозиториев'
+  },
+  agent: {
+    maxTurns: 'Макс. шагов агента',
+    imageInputMode: 'Вложения изображений',
+    apiMaxRetries: 'Повторы API',
+    serviceTier: 'Уровень сервиса',
+    toolUseEnforcement: 'Принудительное использование инструментов'
+  },
+  terminal: {
+    cwd: 'Рабочая директория',
+    backend: 'Бэкенд выполнения',
+    timeout: 'Таймаут команд',
+    persistentShell: 'Постоянная оболочка',
+    envPassthrough: 'Передача переменных окружения',
+    dockerImage: 'Docker-образ',
+    singularityImage: 'Singularity-образ',
+    modalImage: 'Modal-образ',
+    daytonaImage: 'Daytona-образ'
+  },
+  fileReadMaxChars: 'Лимит чтения файла',
+  toolOutput: {
+    maxBytes: 'Лимит вывода терминала',
+    maxLines: 'Лимит страниц файла',
+    maxLineLength: 'Лимит длины строки'
+  },
+  codeExecution: {
+    mode: 'Режим выполнения кода'
+  },
+  approvals: {
+    mode: 'Режим подтверждений',
+    timeout: 'Таймаут подтверждения',
+    mcpReloadConfirm: 'Подтверждать перезагрузку MCP'
+  },
+  commandAllowlist: 'Список разрешённых команд',
+  security: {
+    redactSecrets: 'Скрывать секреты',
+    allowPrivateUrls: 'Разрешить приватные URL'
+  },
+  browser: {
+    allowPrivateUrls: 'Приватные URL браузера',
+    autoLocalForPrivateUrls: 'Локальный браузер для приватных URL',
+    useRealProfile: 'Использовать мой реальный профиль браузера'
+  },
+  checkpoints: {
+    enabled: 'Чекпоинты файлов',
+    maxSnapshots: 'Лимит чекпоинтов'
+  },
+  voice: {
+    recordKey: 'Горячая клавиша голоса',
+    maxRecordingSeconds: 'Макс. длительность записи',
+    autoTts: 'Озвучивать ответы'
+  },
+  stt: {
+    enabled: 'Распознавание речи',
+    echoTranscripts: 'Дублировать транскрипты',
+    provider: 'Провайдер распознавания речи',
+    local: {
+      model: 'Локальная модель транскрибации',
+      language: 'Язык транскрибации'
+    },
+    openai: {
+      model: 'Модель OpenAI STT'
+    },
+    groq: {
+      model: 'Модель Groq STT'
+    },
+    mistral: {
+      model: 'Модель Mistral STT'
+    },
+    elevenlabs: {
+      modelId: 'Модель ElevenLabs STT',
+      languageCode: 'Язык ElevenLabs',
+      tagAudioEvents: 'Тегировать аудио-события',
+      diarize: 'Диаризация говорящих'
+    }
+  },
+  tts: {
+    provider: 'Провайдер синтеза речи',
+    edge: {
+      voice: 'Голос Edge'
+    },
+    openai: {
+      model: 'Модель OpenAI TTS',
+      voice: 'Голос OpenAI'
+    },
+    elevenlabs: {
+      voiceId: 'Голос ElevenLabs',
+      modelId: 'Модель ElevenLabs'
+    },
+    xai: {
+      voiceId: 'Голос xAI (Grok)',
+      language: 'Язык xAI',
+      speed: 'Скорость воспроизведения xAI',
+      autoSpeechTags: 'Авто-теги речи xAI',
+      optimizeStreamingLatency: 'Оптимизация задержки стриминга xAI',
+      sampleRate: 'Частота дискретизации xAI',
+      bitRate: 'Битрейт xAI'
+    },
+    minimax: {
+      model: 'Модель MiniMax TTS',
+      voiceId: 'Голос MiniMax'
+    },
+    mistral: {
+      model: 'Модель Mistral TTS',
+      voiceId: 'Голос Mistral'
+    },
+    gemini: {
+      model: 'Модель Gemini TTS',
+      voice: 'Голос Gemini'
+    },
+    neutts: {
+      model: 'Модель NeuTTS',
+      device: 'Устройство NeuTTS'
+    },
+    kittentts: {
+      model: 'Модель KittenTTS',
+      voice: 'Голос KittenTTS'
+    },
+    piper: {
+      voice: 'Голос Piper'
+    },
+    deepinfra: {
+      model: 'Модель DeepInfra TTS',
+      voice: 'Голос DeepInfra'
+    }
+  },
+  memory: {
+    memoryEnabled: 'Постоянная память',
+    userProfileEnabled: 'Профиль пользователя',
+    memoryCharLimit: 'Бюджет памяти',
+    userCharLimit: 'Бюджет профиля',
+    provider: 'Провайдер памяти'
+  },
+  context: {
+    engine: 'Движок контекста'
+  },
+  compression: {
+    enabled: 'Автосжатие',
+    threshold: 'Порог сжатия',
+    targetRatio: 'Цель сжатия',
+    protectLastN: 'Защищённые последние сообщения'
+  },
+  delegation: {
+    model: 'Модель субагента',
+    provider: 'Провайдер субагента',
+    maxIterations: 'Лимит ходов субагента',
+    maxConcurrentChildren: 'Параллельные субагенты',
+    childTimeoutSeconds: 'Таймаут субагента',
+    reasoningEffort: 'Усилие рассуждения субагента'
+  },
+  updates: {
+    nonInteractiveLocalChanges: 'Локальные изменения при обновлении из приложения'
+  }
+})
+
+export const FIELD_DESCRIPTIONS_RU: Record<string, string> = defineFieldCopy({
+  model: 'Используется для новых чатов, если не выбрана другая модель в поле ввода.',
+  modelContextLength: 'Оставьте 0, чтобы использовать определённое окно контекста выбранной модели.',
+  fallbackProviders: 'Резервные записи provider:model, которые пробуются если модель по умолчанию не сработала.',
+  display: {
+    personality: 'Стиль ассистента по умолчанию для новых сессий.',
+    showReasoning: 'Показывать блоки рассуждений, когда бэкенд их предоставляет.'
+  },
+  desktop: {
+    repoScanEnabled: 'Сканировать локальные папки на Git-репозитории для показа в Проектах.',
+    repoScanRoots: 'Папки для сканирования. Оставьте пустым для сканирования домашней директории.',
+    repoScanExcludePaths: 'Папки и их подпапки, пропускаемые при поиске репозиториев.'
+  },
+  timezone: 'Идентификатор часового пояса IANA. Пусто — используется системный пояс.',
+  browser: {
+    useRealProfile:
+      'Локальный браузинг использует ваши реальные логины. Hermes копирует профиль вашего браузера по умолчанию (куки, логины, настройки) в управляемый снапшот и управляет им через встроенный Chromium — живой профиль никогда не открывается напрямую, копия обновляется при каждом запуске. Также позволяет агенту открыть локальную сессию с реальным профилем по запросу, даже если настроен облачный бэкенд браузера. Поддерживаются только Chromium-браузеры (Chrome, Edge, Brave, Chromium); не-Chromium по умолчанию завершится с понятным сообщением. По умолчанию выключено.'
+  },
+  agent: {
+    imageInputMode: 'Управляет тем, как вложения изображений отправляются модели.',
+    maxTurns: 'Верхняя граница ходов с вызовом инструментов до остановки прогона Hermes.'
+  },
+  terminal: {
+    cwd: 'Папка проекта по умолчанию для инструментов и терминала.',
+    persistentShell: 'Сохранять состояние оболочки между командами, когда бэкенд это поддерживает.',
+    envPassthrough: 'Переменные окружения, передаваемые в выполнение инструментов.',
+    dockerImage: 'Образ контейнера, используемый когда бэкенд выполнения — Docker.',
+    singularityImage: 'Образ, используемый когда бэкенд выполнения — Singularity.',
+    modalImage: 'Образ, используемый когда бэкенд выполнения — Modal.',
+    daytonaImage: 'Образ, используемый когда бэкенд выполнения — Daytona.'
+  },
+  codeExecution: {
+    mode: 'Насколько строго выполнение кода ограничено текущим проектом.'
+  },
+  fileReadMaxChars: 'Максимум символов, которые Hermes может прочитать за один запрос файла.',
+  approvals: {
+    mode: 'Как Hermes обрабатывает команды, требующие явного подтверждения.',
+    timeout: 'Как долго ждать подтверждения до таймаута.'
+  },
+  security: {
+    redactSecrets: 'Скрывать обнаруженные секреты из видимого модели контента, когда возможно.'
+  },
+  checkpoints: {
+    enabled: 'Создавать снапшоты отката перед правками файлов.'
+  },
+  memory: {
+    memoryEnabled: 'Сохранять долговременные воспоминания для будущих сессий.',
+    userProfileEnabled: 'Вести компактный профиль предпочтений пользователя.'
+  },
+  context: {
+    engine: 'Стратегия управления длинными беседами у лимита контекста.'
+  },
+  compression: {
+    enabled: 'Суммировать старый контекст, когда беседы становятся большими.'
+  },
+  voice: {
+    autoTts: 'Автоматически озвучивать ответы ассистента.'
+  },
+  tts: {
+    xai: {
+      voiceId: 'ID голоса xAI (напр. eve) или кастомный ID голоса.',
+      language: 'Код разговорного языка (напр. en, pt-BR) или "auto" для автоопределения.',
+      speed: 'Скорость воспроизведения. 0.7 = медленнее, 1.0 = нормально, 1.5 = быстрее.',
+      autoSpeechTags: 'Позволить LLM вставлять выразительные аудио-теги ([laughing], [sighs]) в скрипт перед синтезом.',
+      optimizeStreamingLatency: 'Компромисс задержки и качества. 0 = лучшее качество, 2 = минимальная задержка.',
+      sampleRate: 'Частота дискретизации аудио в Гц. Выше = лучше качество, больше файлы.',
+      bitRate: 'Битрейт MP3 в bps. Применяется только когда кодек — mp3.'
+    },
+    neutts: {
+      device: 'Локальное устройство инференса для NeuTTS.'
+    }
+  },
+  stt: {
+    enabled: 'Включить локальную или провайдерскую транскрибацию речи.',
+    echoTranscripts: 'Отправлять сырой 🎙️ транскрипт голосовых сообщений обратно в чат.',
+    elevenlabs: {
+      languageCode: 'Опциональный код языка ISO-639-3. Пусто — ElevenLabs автоопределяет.'
+    }
+  },
+  updates: {
+    nonInteractiveLocalChanges:
+      'Когда Hermes обновляется из приложения (без запроса в терминале), сохранять локальные правки исходников (stash) или отбрасывать (discard). Обновления из терминала всегда спрашивают.'
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Locale helpers
+// ---------------------------------------------------------------------------
+
+function isRussianLocale(locale: string | null | undefined): boolean {
+  if (!locale) return false
+  return locale.toLowerCase().startsWith('ru')
+}
+
+function resolveAutoLocale(): string {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const stored =
+        localStorage.getItem('hermes-locale') ??
+        localStorage.getItem('hermes_locale') ??
+        localStorage.getItem('display.language')
+      if (stored) return stored
+    }
+  } catch {}
+  try {
+    if (typeof navigator !== 'undefined' && navigator.language) return navigator.language
+  } catch {}
+  return 'en'
+}
+
+export function getFieldLabels(locale?: string | null): Record<string, string> {
+  return isRussianLocale(locale) ? FIELD_LABELS_RU : FIELD_LABELS
+}
+
+export function getFieldDescriptions(locale?: string | null): Record<string, string> {
+  return isRussianLocale(locale) ? FIELD_DESCRIPTIONS_RU : FIELD_DESCRIPTIONS
+}
+
+export function getProviderGroups(locale?: string | null): ProviderPrefix[] {
+  return isRussianLocale(locale) ? PROVIDER_GROUPS_RU : PROVIDER_GROUPS
+}
+
+export function getLocalizedFieldLabels(): Record<string, string> {
+  return getFieldLabels(resolveAutoLocale())
+}
+
+export function getLocalizedFieldDescriptions(): Record<string, string> {
+  return getFieldDescriptions(resolveAutoLocale())
+}
+
+export function getLocalizedProviderGroups(): ProviderPrefix[] {
+  return getProviderGroups(resolveAutoLocale())
+}
 
 // Curated desktop config surface: only fields a user might tune from the app.
 export const SECTIONS: DesktopConfigSection[] = [
