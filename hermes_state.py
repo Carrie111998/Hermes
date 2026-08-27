@@ -5117,6 +5117,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _canonical(db_path + "-wal"),
             _canonical(db_path + "-shm"),
         }
+
+        # A path string does not identify a file.  On a container host the
+        # guest's /root/.hermes/state.db shows up in the host's /proc with a
+        # string-identical path, so a pure path match flags an unrelated
+        # database on another filesystem as a holder and defers automatic FTS
+        # maintenance forever.  Pin identity to (st_dev, st_ino), and keep the
+        # path match only as a same-filesystem fallback for unlinked sidecars,
+        # whose inodes are no longer reachable by path.
+        watched_ids: Set[Tuple[int, int]] = set()
+        db_dev: Optional[int] = None
+        for _candidate in (db_path, db_path + "-wal", db_path + "-shm"):
+            try:
+                _st = os.stat(_candidate)
+            except OSError:
+                continue
+            watched_ids.add((_st.st_dev, _st.st_ino))
+            if _candidate == db_path:
+                db_dev = _st.st_dev
+
         holders: List[Tuple[int, str]] = []
 
         # On Linux, read /proc/<pid>/fd symlinks directly.  psutil's
@@ -5150,11 +5169,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             holders.append((pid, f"uninspectable holder: {cmdline[:80]}"))
                         continue
                     for fd in fds:
+                        fd_path = f"{fd_dir}/{fd}"
                         try:
-                            target = os.readlink(f"{fd_dir}/{fd}")
+                            target = os.readlink(fd_path)
                         except OSError:
                             continue
-                        if _canonical(target) in watched:
+                        if _canonical(target) not in watched:
+                            continue
+                        # Resolve the descriptor itself: this works across
+                        # mount namespaces and for unlinked sidecars, both of
+                        # which defeat a stat() of the literal path.
+                        try:
+                            fd_st = os.stat(fd_path)
+                        except OSError:
+                            # Identity unprovable; treat the path match as a
+                            # holder rather than assume quiescence.
+                            holders.append((pid, target))
+                            continue
+                        if (fd_st.st_dev, fd_st.st_ino) in watched_ids or (
+                            db_dev is not None and fd_st.st_dev == db_dev
+                        ):
                             holders.append((pid, target))
             except Exception as exc:
                 logger.warning(

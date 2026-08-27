@@ -227,6 +227,66 @@ class TestRuntimeFtsRebuild:
         holders = db._foreign_state_db_holders()
         assert holders == [(222, db_path_wal + " (deleted)")]
 
+    def test_foreign_holder_ignores_same_path_on_other_filesystem(
+        self, db, tmp_path, monkeypatch
+    ):
+        """A container guest's state.db is not a holder of the host's.
+
+        On a container host (Proxmox/LXC, Docker), a guest process appears in
+        the host's /proc with a string-identical path -- /root/.hermes/state.db
+        -- for a completely different file on a different filesystem.  Matching
+        on the path string alone flags it as a foreign holder, which defers
+        automatic FTS maintenance forever while corruption compounds.
+
+        Identity must come from (st_dev, st_ino), not the path text.
+        """
+        db_path = tmp_path / "state.db"
+
+        proc_root = tmp_path / "proc"
+        for pid in (111, 222):
+            (proc_root / str(pid) / "fd").mkdir(parents=True)
+        # PID 222 = container process holding ITS OWN state.db, which happens
+        # to have the identical absolute path inside its mount namespace.
+        guest_db = tmp_path / "guest_state.db"
+        guest_db.touch()
+        os.symlink(str(guest_db), str(proc_root / "222" / "fd" / "3"))
+
+        monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
+        monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
+        monkeypatch.setattr(hermes_state.sys, "platform", "linux")
+
+        real_listdir = os.listdir
+        def _listdir(path):
+            if isinstance(path, str):
+                path = path.replace("/proc", str(proc_root))
+            return real_listdir(path)
+        monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
+
+        # The guest fd reports the host's path (identical string), which is
+        # exactly what the kernel shows across mount namespaces.
+        def _readlink(path):
+            path = path.replace("/proc", str(proc_root))
+            if path.endswith(f"{proc_root}/222/fd/3") or "222" in path:
+                return str(db_path)
+            return os.readlink(path)
+        monkeypatch.setattr(hermes_state.os, "readlink", _readlink)
+
+        # ...but stat()ing the descriptor resolves to the guest's own file on
+        # a different device.
+        real_stat = os.stat
+        def _stat(path, *a, **kw):
+            path_s = str(path).replace("/proc", str(proc_root))
+            st = real_stat(path_s, *a, **kw)
+            if path_s.endswith("/222/fd/3"):
+                fields = list(st)
+                # os.stat_result positional layout: st_dev is index 2.
+                fields[2] = st.st_dev + 1000
+                return os.stat_result(fields)
+            return st
+        monkeypatch.setattr(hermes_state.os, "stat", _stat)
+
+        assert db._foreign_state_db_holders() == []
+
     def test_foreign_holder_uninspectable_process_cmdline_fallback(
         self, db, tmp_path, monkeypatch
     ):
