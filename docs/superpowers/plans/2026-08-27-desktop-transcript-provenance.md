@@ -459,6 +459,8 @@ Expected: one local commit containing cold-path proof minting and its positive/n
 - Inspect: `apps/desktop/src/app/session/hooks/use-message-stream.ts`
 - Modify: `apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts`
 - Modify: `apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx`
+- Modify: `apps/desktop/src/app/session/hooks/use-session-state-cache.ts`
+- Modify: `apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx`
 - Modify only the narrow writer(s) proven to replace a persisted base with a runtime-only projection.
 - Add tests beside the writer's existing tests.
 
@@ -492,9 +494,28 @@ npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-prompt-act
 
 Expected RED: the response messages replace the transcript, but the previously seeded `transcriptProvenance` remains present.
 
+The audit also found a scope-identity invalidation boundary in
+`use-session-state-cache.ts`: `ensureSessionState` updates `storedSessionId`
+after an auto-compression rotation but currently retains proof minted for the
+previous stored session. Add a focused test to
+`use-session-state-cache.test.tsx`, seed a state with proof for `stored-A`,
+rotate it to `stored-A-next`, and run:
+
+```powershell
+npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-session-state-cache.test.tsx -t "clears transcript provenance when the stored session id rotates"
+```
+
+Expected RED: the cached state owns `stored-A-next`, but still carries the
+proof for `stored-A`.
+
 - [ ] **Step 3: Clear proof at the narrow replacement boundary**
 
 Use an explicit `transcriptProvenance: undefined` in the `/compress` replacement updater. Preserve proof for append/delta/enrichment operations that retain the same persisted display base.
+
+When `ensureSessionState` changes `storedSessionId`, clear
+`transcriptProvenance` on the new state object. This is an identity-scope
+invalidation, not a message-origin inference; ordinary metadata updates and
+same-id calls continue to preserve proof.
 
 - [ ] **Step 4: Run writer-focused tests plus session actions**
 
