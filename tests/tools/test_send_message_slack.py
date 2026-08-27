@@ -137,3 +137,59 @@ def test_standalone_send_stops_on_non_token_error(monkeypatch, _standalone_send)
 
     assert result == {"error": "Slack API error: msg_too_long"}
     assert len(fake_session.calls) == 1
+
+
+def test_standalone_send_applies_rich_blocks(monkeypatch, _standalone_send):
+    """Out-of-process Slack sends must match the live adapter's rich layout."""
+
+    fake_session = _SlackSession()
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *args, **kwargs: fake_session
+    )
+    message = """# Status
+
+| Item | Result |
+|---|---|
+| Table | OK |"""
+    pconfig = SimpleNamespace(
+        enabled=True,
+        token="good-token",
+        extra={"rich_blocks": True, "feedback_buttons": False},
+    )
+
+    result = asyncio.run(_standalone_send(pconfig, "C123", message))
+
+    assert result["success"] is True
+    payload = fake_session.calls[0][1]
+    assert payload["text"]
+    assert [block["type"] for block in payload["blocks"]] == ["header", "table"]
+
+
+def test_standalone_send_retries_without_rejected_blocks(monkeypatch, _standalone_send):
+    """A formatting rejection must not drop the standalone message."""
+
+    class _RejectBlocksSession(_SlackSession):
+        def post(self, url, *, headers, json, **kwargs):
+            self.calls.append(("good-token", dict(json)))
+            if "blocks" in json:
+                return _SlackPostContext(
+                    _SlackResponse({"ok": False, "error": "invalid_blocks"})
+                )
+            return _SlackPostContext(_SlackResponse({"ok": True, "ts": "171.456"}))
+
+    fake_session = _RejectBlocksSession()
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *args, **kwargs: fake_session
+    )
+    pconfig = SimpleNamespace(
+        enabled=True,
+        token="good-token",
+        extra={"rich_blocks": True, "feedback_buttons": False},
+    )
+
+    result = asyncio.run(_standalone_send(pconfig, "C123", "# Status"))
+
+    assert result["success"] is True
+    assert len(fake_session.calls) == 2
+    assert "blocks" in fake_session.calls[0][1]
+    assert "blocks" not in fake_session.calls[1][1]

@@ -2863,8 +2863,11 @@ class SlackAdapter(BasePlatformAdapter):
                     "ts": stream.stream_ts,
                     "chunks": chunks,
                 }
-                if fallback_text:
-                    append_payload["markdown_text"] = fallback_text
+                # Slack requires exactly one content mode for appendStream:
+                # either ``chunks`` (plan/task cards) OR ``markdown_text``.
+                # ``fallback_text`` is intentionally not forwarded here; the
+                # caller already has a plain-text fallback lane when the native
+                # card send fails.
                 await client.api_call("chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
@@ -9499,6 +9502,29 @@ async def _standalone_send(
     formatted_caption = _format_mrkdwn(caption) if caption else caption
     unfurl_kwargs = _slack_unfurl_kwargs(getattr(pconfig, "extra", None))
 
+    def _render_blocks(text: str) -> Optional[List[Dict[str, Any]]]:
+        """Apply the same opt-in Block Kit renderer as the live adapter.
+
+        Standalone sends run outside the gateway process, so they cannot reuse
+        its live SlackAdapter instance. A lightweight unconnected instance is
+        sufficient because ``_maybe_blocks`` is pure with respect to config and
+        text. Any renderer failure degrades to the existing plain-text path.
+        """
+        if not text:
+            return None
+        try:
+            renderer = SlackAdapter.__new__(SlackAdapter)
+            renderer.config = pconfig
+            return renderer._maybe_blocks(text)
+        except Exception:
+            logger.debug(
+                "Failed to apply Slack Block Kit rendering in _standalone_send",
+                exc_info=True,
+            )
+            return None
+
+    message_blocks = _render_blocks(message)
+
     # --- Media path: AsyncWebClient.files_upload_v2 (+ optional text) ---
     if media_files:
         # Function-local import: tests inject a fake slack_sdk via
@@ -9532,12 +9558,29 @@ async def _standalone_send(
                 "mrkdwn": True,
                 **unfurl_kwargs,
             }
+            if message_blocks:
+                post_kwargs["blocks"] = message_blocks
             if thread_id:
                 post_kwargs["thread_ts"] = thread_id
             try:
-                post_payload = _slack_response_payload(
-                    await client.chat_postMessage(**post_kwargs)
-                )
+                try:
+                    post_payload = _slack_response_payload(
+                        await client.chat_postMessage(**post_kwargs)
+                    )
+                except Exception as exc:
+                    if post_kwargs.get("blocks") and SlackAdapter._is_block_payload_rejection(exc):
+                        retry_kwargs = dict(post_kwargs)
+                        retry_kwargs.pop("blocks", None)
+                        logger.info(
+                            "[Slack] Standalone Block Kit payload rejected; "
+                            "retrying media preface without blocks: %s",
+                            exc,
+                        )
+                        post_payload = _slack_response_payload(
+                            await client.chat_postMessage(**retry_kwargs)
+                        )
+                    else:
+                        raise
                 if not post_payload.get("ok", True):
                     return {
                         "error": f"Slack API error: {post_payload.get('error', 'unknown')}"
@@ -9653,6 +9696,8 @@ async def _standalone_send(
                 "mrkdwn": True,
                 **unfurl_kwargs,
             }
+            if message_blocks:
+                payload["blocks"] = message_blocks
             if thread_id:
                 payload["thread_ts"] = thread_id
             for tok in tokens:
@@ -9660,10 +9705,27 @@ async def _standalone_send(
                     "Authorization": f"Bearer {tok}",
                     "Content-Type": "application/json",
                 }
+                send_payload = dict(payload)
                 async with session.post(
-                    url, headers=headers, json=payload, **_req_kw
+                    url, headers=headers, json=send_payload, **_req_kw
                 ) as resp:
                     data = await resp.json()
+                if (
+                    not data.get("ok")
+                    and send_payload.get("blocks")
+                    and data.get("error")
+                    in {"invalid_blocks", "msg_too_long", "too_many_blocks"}
+                ):
+                    send_payload.pop("blocks", None)
+                    logger.info(
+                        "[Slack] Standalone Block Kit payload rejected; "
+                        "retrying text-only send: %s",
+                        data.get("error"),
+                    )
+                    async with session.post(
+                        url, headers=headers, json=send_payload, **_req_kw
+                    ) as resp:
+                        data = await resp.json()
                 if data.get("ok"):
                     return {
                         "success": True,
