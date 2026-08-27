@@ -30,6 +30,8 @@ test('hosted sends distinguish sending, queued offline, and working', () => {
   assert.match(pluginSource, /\{ state: 'queued', label: 'Queued until the gateway reconnects' \}/)
   assert.match(pluginSource, /\{ state: 'working', label: 'Working' \}/)
   assert.match(pluginSource, /Your message is saved and will send when the gateway reconnects\./)
+  assert.match(pluginSource, /route\?\.status === 'unavailable'/)
+  assert.match(pluginSource, /room\.running && room\.hostedStatus\?\.state !== 'queued'/)
 })
 
 test('hosted approvals retain exact identity and use user-facing choices', () => {
@@ -91,6 +93,7 @@ function load({ persisted = null, fail = false } = {}) {
         armHostedRoomCleanup,
         releaseHostedRoomCleanup,
         dispatchHostedRoomCleanup,
+        hostedRoomDriverDisplayStatus,
         cleanup: $hostedRoomCleanup,
         dispose(value) { hostedRoomSyncDisposed = value }
       }
@@ -106,6 +109,37 @@ function load({ persisted = null, fail = false } = {}) {
   if (persisted) context.__cleanup.cleanup.set(context.__cleanup.normalizeHostedRoomCleanup(persisted))
   return { ...context.__cleanup, calls, writes }
 }
+
+test('authoritative hosted status maps queued unavailable routes without hiding uncertainty', () => {
+  const { hostedRoomDriverDisplayStatus: display } = load()
+  const fallback = { state: 'settled', label: 'All caught up' }
+
+  const queued = display({
+    working: true,
+    blocked: false,
+    counts: { queued: 1 },
+    peer_routes: [{ member_id: 'reviewer', status: 'unavailable' }]
+  }, fallback)
+  assert.equal(queued.state, 'queued')
+  assert.equal(queued.label, 'Queued until the gateway reconnects')
+
+  const uncertain = display({
+    working: true,
+    blocked: true,
+    counts: { queued: 1, indeterminate: 1 },
+    peer_routes: [{ member_id: 'reviewer', status: 'unavailable' }]
+  }, fallback)
+  assert.equal(uncertain.state, 'blocked')
+  assert.equal(uncertain.label, 'Needs attention')
+
+  const working = display({
+    working: true,
+    blocked: false,
+    counts: { queued: 1 },
+    peer_routes: [{ member_id: 'reviewer', status: 'ready' }]
+  }, fallback)
+  assert.equal(working.state, 'working')
+})
 
 test('failed setup cleanup is durable and revokes home plus peer scope', async () => {
   const harness = load()

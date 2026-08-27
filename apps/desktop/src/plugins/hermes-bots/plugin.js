@@ -1757,6 +1757,20 @@ function markHostedConnectionUnavailable(connectionId, { unsupported = false } =
   }
 }
 
+function hostedRoomDriverDisplayStatus(driverStatus, fallback) {
+  const counts = driverStatus?.counts || {}
+  const unavailableRoute = Array.isArray(driverStatus?.peer_routes)
+    && driverStatus.peer_routes.some(route => route?.status === 'unavailable')
+
+  if (counts.stopping) return { state: 'stopping', label: 'Stopping…' }
+  if (driverStatus?.blocked) return { state: 'blocked', label: 'Needs attention' }
+  if (Number(counts.queued || 0) > 0 && unavailableRoute) {
+    return { state: 'queued', label: 'Queued until the gateway reconnects' }
+  }
+  if (driverStatus?.working) return { state: 'working', label: 'Working' }
+  return fallback
+}
+
 async function refreshHostedRooms() {
   if (hostedRoomSyncDisposed || hostedRoomSyncRunning) {
     return
@@ -1895,7 +1909,11 @@ async function refreshHostedRooms() {
         if (hostedRoomSyncDisposed) return
         const replayState = replay.state
         const driverStatus = serverState?.driver_status || {}
-        const driverCounts = driverStatus?.counts || {}
+        const friendly = client.deriveFriendlyHostedRoomStatus(replayState)
+        const hostedStatus = hostedRoomDriverDisplayStatus(
+          driverStatus,
+          { state: friendly.kind, label: friendly.text }
+        )
         const distributed = Array.isArray(roomState.members) && roomState.members.some(
           member => member?.target?.kind === 'peer'
         )
@@ -1920,16 +1938,7 @@ async function refreshHostedRooms() {
             hostedSeq: replayState.cursor,
             continuityMode: distributed ? 'distributed' : 'gateway',
             continuityIssue: null,
-            hostedStatus: driverCounts.stopping
-              ? { state: 'stopping', label: 'Stopping…' }
-              : driverStatus.blocked
-                ? { state: 'blocked', label: 'Needs attention' }
-                : driverStatus.working
-                  ? { state: 'working', label: 'Working' }
-                  : (() => {
-                      const friendly = client.deriveFriendlyHostedRoomStatus(replayState)
-                      return { state: friendly.kind, label: friendly.text }
-                    })(),
+            hostedStatus,
             hostedPendingActions: Array.isArray(driverStatus.pending_actions)
               ? driverStatus.pending_actions
               : [],
@@ -15631,7 +15640,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                   : null
               }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
-            room.running
+            room.running && room.hostedStatus?.state !== 'queued'
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
                   children: pendingPrompts.length
