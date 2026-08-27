@@ -146,6 +146,7 @@ import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
+import { resolveLiveProjectFilter } from './project-filter'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
@@ -355,7 +356,7 @@ export function ChatSidebar({
   const grouping = useStore($sidebarGrouping)
   const ordering = useStore($sidebarOrdering)
   const statusFilter = useStore($sidebarStatusFilter)
-  const projectFilter = useStore($sidebarProjectFilter)
+  const persistedProjectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
   const prFilter = useStore($sidebarPrFilter)
   const prDataWanted = useStore($sidebarPrDataWanted)
@@ -420,6 +421,14 @@ export function ChatSidebar({
   const projectOrderIds = useStore($sidebarProjectOrderIds)
   const projects = useStore($projects)
   const projectTree = useStore($projectTree)
+  // The persisted project filter's storage is shared across profiles, so ids
+  // picked in another profile don't resolve in the active one and the raw
+  // membership whitelist empties every tier of the sidebar (#96246). Narrow
+  // to ids the ACTIVE tree resolves; dead ids are inert, not fatal.
+  const projectFilter = useMemo(
+    () => resolveLiveProjectFilter(persistedProjectFilter, projectTree),
+    [persistedProjectFilter, projectTree]
+  )
   const projectTreeLoading = useStore($projectTreeLoading)
   const removedSessionIds = useStore($removedSessionIds)
   const reposScanning = useStore($reposScanning)
