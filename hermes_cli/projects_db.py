@@ -319,9 +319,101 @@ def _unique_slug(conn: sqlite3.Connection, candidate: str) -> str:
     return slug
 
 
+# ---------------------------------------------------------------------------
+# Filesystem-aware path identity
+# ---------------------------------------------------------------------------
+#
+# ``os.path.normcase`` is a no-op on POSIX, so the case-normalisation below
+# only ever worked on Windows. macOS (APFS, case-insensitive by default) and
+# any case-insensitive mount therefore let two spellings of ONE directory
+# register as two projects, defeating the idempotent-create guard.
+#
+# Measured on macOS 15 / APFS:
+#   realpath('/tmp/x/mixedcase') -> '/private/tmp/x/mixedcase'   (input casing kept)
+#   stat('MixedCase') == stat('mixedcase')  ->  same (st_dev, st_ino)
+#
+# ``realpath`` does NOT canonicalise case, so the filesystem's own identity is
+# the only correct answer. ``(st_dev, st_ino)`` is additionally right for
+# hardlinks and bind mounts, which no string comparison can catch.
+#
+# It is a LOOKUP ACCELERATOR, never the durable project identity: inode numbers
+# do not survive volume recreation, restore-from-backup, or delete-and-recreate.
+# ``projects.id`` remains the durable key; a stale pair is simply re-derived.
+
+
+def fs_identity(path: str) -> Optional[tuple]:
+    """``(st_dev, st_ino)`` for an existing path, else ``None``.
+
+    ``None`` means "cannot be resolved right now" — a path that does not exist
+    yet, or one we may not stat. Callers fall back to :func:`_string_path_key`.
+    """
+    try:
+        st = os.stat(_normalize_path(path))
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _volume_is_case_insensitive(path: str) -> bool:
+    """Probe whether the volume holding ``path`` folds case.
+
+    Walks up to the nearest existing ancestor and tests whether the same entry
+    resolves under a swapped-case spelling. Never assume: on ext4 ``Foo`` and
+    ``foo`` are genuinely different directories, and folding there would merge
+    two real projects.
+    """
+    probe = _normalize_path(path)
+    for _ in range(64):
+        if os.path.exists(probe):
+            break
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return False
+        probe = parent
+    else:
+        return False
+    base = os.path.basename(probe)
+    if not base or base.lower() == base.upper():
+        return False
+    swapped = os.path.join(
+        os.path.dirname(probe),
+        base.lower() if base != base.lower() else base.upper(),
+    )
+    try:
+        return os.path.exists(swapped) and os.path.samefile(probe, swapped)
+    except OSError:
+        return False
+
+
+def _string_path_key(path: str) -> str:
+    """Fallback comparison key for a path that cannot be stat'ed.
+
+    Case-folded ONLY when the volume is measured to be case-insensitive.
+    """
+    norm = os.path.normcase(_normalize_path(path))
+    return norm.lower() if _volume_is_case_insensitive(path) else norm
+
+
+def path_identity_key(path: str) -> str:
+    """Comparison key for one filesystem location.
+
+    Prefers the filesystem's own identity; falls back to a probed string key
+    when the path does not exist yet.
+    """
+    ident = fs_identity(path)
+    if ident is not None:
+        return "fsid:%d:%d" % ident
+    return "path:" + _string_path_key(path)
+
+
 def _primary_path_key(path: str) -> str:
-    """Comparison key for primary-path dedup (absolute + case/sep-normalized)."""
-    return os.path.normcase(_normalize_path(path))
+    """Comparison key for primary-path dedup.
+
+    Filesystem-aware: identical directories reached by different spellings on a
+    case-insensitive volume produce the same key, which is what makes the
+    idempotent-create guard hold on macOS as well as Windows.
+    """
+    return path_identity_key(path)
 
 
 def find_by_primary_path(
@@ -791,10 +883,21 @@ def project_for_path(
         sql += " WHERE p.archived = 0"
     best_pid: Optional[str] = None
     best_len = -1
+    target_key = path_identity_key(path)
+    fold = _volume_is_case_insensitive(path)
+    cmp_target = target.lower() if fold else target
     for row in conn.execute(sql).fetchall():
         folder = row["folder"]
-        if target == folder or target.startswith(folder.rstrip("/\\") + os.sep) or \
-                target.startswith(folder.rstrip("/\\") + "/"):
+        # Exact match first, by filesystem identity — catches differing
+        # spellings, hardlinks, and bind mounts that string prefixes miss.
+        exact = path_identity_key(folder) == target_key
+        cmp_folder = folder.lower() if fold else folder
+        nested = (
+            cmp_target == cmp_folder
+            or cmp_target.startswith(cmp_folder.rstrip("/\\") + os.sep)
+            or cmp_target.startswith(cmp_folder.rstrip("/\\") + "/")
+        )
+        if exact or nested:
             if len(folder) > best_len:
                 best_len = len(folder)
                 best_pid = row["pid"]
