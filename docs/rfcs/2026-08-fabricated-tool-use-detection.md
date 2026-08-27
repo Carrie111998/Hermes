@@ -97,6 +97,28 @@ going in: the JSON check generalizes cleanly from shape and needs no maintenance
 check is inherently reactive and will need new entries as new wordings are observed live, same as
 its prior-art equivalent already has needed twice.
 
+### Refinement found during planning: a real earlier tool call must suppress this check
+
+A genuine post-tool-call summary turn (`finish_reason="stop"`, no `tool_calls` in *that specific*
+turn, since it's just delivering the final text) can legitimately contain the same self-claim
+language the detector looks for — e.g. *"the search returned $2,650/oz"* while accurately
+summarizing a real tool result from an earlier round in the same turn. The existing
+dropped-toolcall check avoids this by construction (it's gated on `finish_reason == "tool_calls"`,
+which a normal summary never has); this new check deliberately does not gate on `finish_reason`,
+so it needs its own guard.
+
+Fix: a new agent attribute, `agent._landed_real_tool_call_this_turn`, set `True` at the same point
+`agent._dropped_toolcall_retries` already gets reset after a successful tool round
+(`conversation_loop.py:~7234`), and reset to `False` alongside the other counters at genuine turn
+end (`~8079`). The new check additionally requires
+`not getattr(agent, "_landed_real_tool_call_this_turn", False)`.
+
+Accepted tradeoff: once any real tool call has landed anywhere in a turn's multi-round loop, later
+text in that same turn is never checked again for fabrication, even if it's a distinct, unrelated
+claim. Favors false-negative risk over false-positive risk here — consistent with this whole
+design's stated posture — and a model that has already demonstrated it can call tools correctly
+this turn is less likely (though not guaranteed) to then also fabricate something unrelated.
+
 ### Response: reuse existing recovery mechanics exactly
 
 Same `continue`-based pattern as the dropped-toolcall block: flag the bad assistant turn
