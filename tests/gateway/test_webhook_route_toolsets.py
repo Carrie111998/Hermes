@@ -50,17 +50,19 @@ class TestWebhookAdapterToolsetsForSource:
         wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
         assert wa.toolsets_for_source(_Src("telegram:123")) is None
 
-    def test_empty_or_non_list_toolsets_returns_none(self):
+    def test_explicit_empty_toolsets_disables_all_tools(self):
         wa = _make_adapter(
             {
                 "empty": {"secret": "x", "toolsets": []},
-                "str": {"secret": "x", "toolsets": "terminal"},
                 "blank": {"secret": "x", "toolsets": ["  ", ""]},
             }
         )
-        assert wa.toolsets_for_source(_Src("webhook:empty:d")) is None
+        assert wa.toolsets_for_source(_Src("webhook:empty:d")) == []
+        assert wa.toolsets_for_source(_Src("webhook:blank:d")) == []
+
+    def test_non_list_toolsets_returns_none(self):
+        wa = _make_adapter({"str": {"secret": "x", "toolsets": "terminal"}})
         assert wa.toolsets_for_source(_Src("webhook:str:d")) is None
-        assert wa.toolsets_for_source(_Src("webhook:blank:d")) is None
 
     def test_base_adapter_default_is_none(self):
         # Non-webhook adapters inherit a None default: no override anywhere.
@@ -99,6 +101,14 @@ class TestGatewayResolveEnabledToolsetsForSource:
         assert res == expected
         # discord_admin is platform-restricted to discord — must be dropped.
         assert "discord_admin" not in res
+
+    def test_explicit_empty_override_disables_platform_tools(self):
+        wa = _make_adapter({"diagnostic": {"secret": "x", "toolsets": []}})
+        gr = _make_runner(wa)
+        res = GatewayRunner._resolve_enabled_toolsets_for_source(
+            gr, BASE_CONFIG, _Src("webhook:diagnostic:d"), "webhook"
+        )
+        assert res == []
 
     def test_no_override_uses_platform_resolution(self):
         wa = _make_adapter({"plain": {"secret": "x"}})

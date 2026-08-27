@@ -540,10 +540,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if not isinstance(route_config, dict):
             return None
         toolsets = route_config.get("toolsets")
-        if not isinstance(toolsets, list) or not toolsets:
+        if not isinstance(toolsets, list):
             return None
-        cleaned = [str(t).strip() for t in toolsets if str(t).strip()]
-        return cleaned or None
+        return [str(t).strip() for t in toolsets if str(t).strip()]
 
     # ------------------------------------------------------------------
     # HTTP handlers
