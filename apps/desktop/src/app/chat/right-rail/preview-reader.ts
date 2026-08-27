@@ -54,30 +54,6 @@ const readers = new Map<RightRailTabId, PageReader>()
 /** Owning session for each registered reader (tabId -> sessionId). */
 const readerSessions = new Map<RightRailTabId, string>()
 
-/** Session-scoped: returns the tab ID of the live preview the given session
- *  owns (or null when the session owns no live reader whose tab is still
- *  open). Every production registration passes a sessionId (see
- *  preview-pane.tsx), so this is the authoritative ownership check. The
- *  returned tab ID is carried into the mutation so admission and effect bind
- *  to the same exact preview identity — a background session can never pass
- *  the gate and then act on a different session's globally-active tab
- *  (#95459). */
-export function getLivePreviewTabIdForSession(sessionId: string): RightRailTabId | null {
-  if (!sessionId) {
-    return null
-  }
-
-  const openIds = new Set($previewTabs.get().map(t => t.id))
-
-  for (const [tabId, owner] of readerSessions.entries()) {
-    if (owner === sessionId && openIds.has(tabId) && readers.has(tabId)) {
-      return tabId
-    }
-  }
-
-  return null
-}
-
 /** True when the given preview tab is a LIVE reader owned by `sessionId` and
  *  still open in `$previewTabs`. This asks about ONE specific tab — the one
  *  the mutation targets — rather than selecting an arbitrary tab owned by the
@@ -91,11 +67,6 @@ export function isLivePreviewTabOwnedBySession(tabId: RightRailTabId, sessionId:
   const openIds = new Set($previewTabs.get().map(t => t.id))
 
   return openIds.has(tabId) && readers.has(tabId) && readerSessions.get(tabId) === sessionId
-}
-
-/** Boolean convenience wrapper for the session-scoped ownership check. */
-export function hasLivePreviewForSession(sessionId: string): boolean {
-  return getLivePreviewTabIdForSession(sessionId) !== null
 }
 
 /** Register a live preview's page reader; returns an idempotent unregister.

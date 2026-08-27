@@ -151,9 +151,11 @@ describe('preview routing', () => {
     it('binds the tab to the opening session, not the ambient-active one', async () => {
       const { $sessionTiles } = await import('@/store/session-states')
       const tiles = $sessionTiles.get()
-      const { getLivePreviewTabIdForSession, registerPreviewPageReader } = await import(
+
+      const { isLivePreviewTabOwnedBySession, registerPreviewPageReader } = await import(
         '@/app/chat/right-rail/preview-reader'
       )
+
       const { $previewTabs } = await import('@/store/preview')
 
       // Foreground is A; B is a background tile.
@@ -174,17 +176,18 @@ describe('preview routing', () => {
         // (PreviewPane does this), NOT from the ambient $activeSessionId.
         const unregister = registerPreviewPageReader(tab.id, async () => ({ text: '', title: '', url: '' }), tab.ownerSessionId)
 
-        // A is ambient-active but must NOT gain authority over B's preview.
-        expect(getLivePreviewTabIdForSession('session-A')).toBeNull()
-        expect(getLivePreviewTabIdForSession('session-B')).toBe(tab.id)
+        // A is ambient-active but must NOT gain authority over B's preview;
+        // B owns the exact live tab.
+        expect(isLivePreviewTabOwnedBySession(tab.id, 'session-A')).toBe(false)
+        expect(isLivePreviewTabOwnedBySession(tab.id, 'session-B')).toBe(true)
 
         // Later active-session changes must not rewrite the tab's owner.
         await act(async () => {
           $activeSessionId.set('session-C')
         })
         expect($previewTabs.get()[0].ownerSessionId).toBe('session-B')
-        expect(getLivePreviewTabIdForSession('session-A')).toBeNull()
-        expect(getLivePreviewTabIdForSession('session-B')).toBe(tab.id)
+        expect(isLivePreviewTabOwnedBySession(tab.id, 'session-A')).toBe(false)
+        expect(isLivePreviewTabOwnedBySession(tab.id, 'session-B')).toBe(true)
 
         unregister()
       } finally {

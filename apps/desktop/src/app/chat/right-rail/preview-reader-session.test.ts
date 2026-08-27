@@ -2,12 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { $previewTabs } from '@/store/preview'
 
-import {
-  getLivePreviewTabIdForSession,
-  hasLivePreviewForSession,
-  isLivePreviewTabOwnedBySession,
-  registerPreviewPageReader
-} from './preview-reader'
+import { isLivePreviewTabOwnedBySession, registerPreviewPageReader } from './preview-reader'
 
 describe('session-scoped preview reader gate (#95459)', () => {
   const setupTabs = () => {
@@ -20,11 +15,11 @@ describe('session-scoped preview reader gate (#95459)', () => {
     setupTabs()
     const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
 
-    // Session B asks: should be rejected (session-A owns the preview)
-    expect(hasLivePreviewForSession('session-B')).toBe(false)
+    // Session B asks about the exact tab: should be rejected (session-A owns it)
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-B')).toBe(false)
 
-    // Session A asks: should be accepted (it owns the preview)
-    expect(hasLivePreviewForSession('session-A')).toBe(true)
+    // Session A asks about the exact tab: should be accepted (it owns it)
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-A')).toBe(true)
 
     unregister()
   })
@@ -33,8 +28,8 @@ describe('session-scoped preview reader gate (#95459)', () => {
     setupTabs()
     const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-owner')
 
-    expect(hasLivePreviewForSession('session-owner')).toBe(true)
-    expect(hasLivePreviewForSession('session-other')).toBe(false)
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-owner')).toBe(true)
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-other')).toBe(false)
 
     unregister()
   })
@@ -44,45 +39,32 @@ describe('session-scoped preview reader gate (#95459)', () => {
     const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
 
     unregister()
-    expect(hasLivePreviewForSession('session-A')).toBe(false)
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-A')).toBe(false)
   })
 
-  it('empty sessionId always rejects', () => {
+  it('empty sessionId or tabId always rejects', () => {
     setupTabs()
     const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
 
-    expect(hasLivePreviewForSession('')).toBe(false)
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', '')).toBe(false)
+    expect(isLivePreviewTabOwnedBySession('' as never, 'session-A')).toBe(false)
 
     unregister()
   })
 
-  it('returns the owned tab ID so admission and effect bind to one identity', () => {
-    setupTabs()
-    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
-
-    // Owning session resolves the exact tab it owns...
-    expect(getLivePreviewTabIdForSession('session-A')).toBe('url:tab-a')
-
-    // ...while a non-owning session resolves nothing.
-    expect(getLivePreviewTabIdForSession('session-B')).toBeNull()
-
-    unregister()
-  })
-
-  it('owned tab ID is null after unregister', () => {
-    setupTabs()
-    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
-
-    unregister()
-    expect(getLivePreviewTabIdForSession('session-A')).toBeNull()
+  it('a tab with no live reader is not owned by any session', () => {
+    $previewTabs.set([
+      { id: 'url:tab-a', target: { kind: 'url', label: 'Browser', source: 'https://example.com', url: 'https://example.com' } },
+    ])
+    // No reader registered for tab-a — the open tab is not a LIVE preview, so
+    // no session owns it (the gate must fail closed).
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-A')).toBe(false)
   })
 
   it('resolves ownership from the exact active tab, not the first owned tab (#95459 review)', () => {
     // Deterministic witness from the review: session S owns live previews A
     // and B (registered in that order), and B is the active one. Authorization
-    // must ask about B specifically — getLivePreviewTabIdForSession(S) would
-    // return A (the first owned tab), which is the wrong identity to compare
-    // against the active preview.
+    // asks about the exact tab being mutated — never a first-owned-tab lookup.
     $previewTabs.set([
       { id: 'url:tab-a', target: { kind: 'url', label: 'Browser', source: 'https://x', url: 'https://x' } },
       { id: 'url:tab-b', target: { kind: 'url', label: 'Browser', source: 'https://y', url: 'https://y' } }
