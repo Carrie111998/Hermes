@@ -14312,6 +14312,19 @@ function groupThreadOf(entry) {
   return entry?.thread || 'legacy'
 }
 
+function groupThreadReplyCount(entries) {
+  const visible = (entries || []).filter(item => {
+    const entry = item?.entry || item
+    return Boolean(
+      String(entry?.text || '').trim() ||
+      (Array.isArray(entry?.images) && entry.images.length) ||
+      (Array.isArray(entry?.attachments) && entry.attachments.length)
+    )
+  })
+
+  return Math.max(0, visible.length - 1)
+}
+
 function mintGroupThreadId() {
   return `t${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 }
@@ -15502,7 +15515,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     const expanded = openThreads[id] ?? isNewest
 
     if (!expanded) {
-      const replies = entries.length - 1
+      const replies = groupThreadReplyCount(entries)
       const headText = stripPreviewMarkdown(head?.text || '').slice(0, 80)
 
       logChildren.push(

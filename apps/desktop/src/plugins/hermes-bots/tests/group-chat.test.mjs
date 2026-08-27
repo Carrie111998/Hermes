@@ -2246,6 +2246,32 @@ test('threads: hydration assigns legacy thread ids — lull splits, follow-ups s
   void gc
 })
 
+test('threads: folded reply counts ignore driver status rows that do not render as messages', () => {
+  const start = pluginSource.indexOf('function groupThreadReplyCount')
+  const end = pluginSource.indexOf('function mintGroupThreadId')
+  assert.ok(start >= 0 && end > start)
+  const countReplies = new Function(`${pluginSource.slice(start, end)}; return groupThreadReplyCount`)()
+  const wrapped = entry => ({ entry })
+
+  assert.equal(
+    countReplies([
+      wrapped({ text: 'Question', from: { kind: 'user' } }),
+      wrapped({ text: '', kind: 'turn.started' }),
+      wrapped({ text: 'Answer A', from: { kind: 'member' } }),
+      wrapped({ text: '', kind: 'turn.settled' }),
+      wrapped({ text: 'Answer B', from: { kind: 'member' } })
+    ]),
+    2
+  )
+  assert.equal(
+    countReplies([
+      wrapped({ text: '', images: [{ name: 'diagram.png' }], from: { kind: 'user' } }),
+      wrapped({ text: 'Reviewed', from: { kind: 'member' } })
+    ]),
+    1
+  )
+})
+
 test('source contract: thread UI — folded rows, per-thread reply box, new-thread composer', () => {
   assert.match(pluginSource, /Open this thread/)
   assert.match(pluginSource, /Collapse thread/)
