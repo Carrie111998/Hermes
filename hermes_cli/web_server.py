@@ -19557,6 +19557,54 @@ def _report_port_in_use(host: str, port: int) -> None:
     )
 
 
+def _probe_hermes_backend(host: str, port: int) -> bool:
+    """Return whether the occupied endpoint is a live Hermes backend."""
+    if not host or port <= 0:
+        return False
+    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    try:
+        request = urllib.request.Request(
+            f"http://{url_host}:{port}/api/health",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=1.0) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read(4096).decode("utf-8"))
+    except Exception:
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and isinstance(payload.get("version"), str)
+    )
+
+
+def _wait_for_supervised_backend_holder(host: str, port: int) -> bool:
+    """Keep a launchd job alive while its prior Hermes child owns the port.
+
+    A launchd wrapper can exit while the long-lived serve child survives and
+    is re-parented to PID 1. Unconditional KeepAlive then starts a replacement
+    every throttle interval. Waiting here preserves one supervised process;
+    when the old child releases the socket, this process proceeds to bind it.
+    Manual launches and non-Hermes holders retain the exit-75 contract.
+    """
+    label = os.environ.get("XPC_SERVICE_NAME", "")
+    if not label.startswith("ai.hermes.") or not _probe_hermes_backend(host, port):
+        return False
+
+    print(
+        f"BACKEND_ALREADY_RUNNING port={port} supervisor=launchd; "
+        "waiting to take ownership",
+        flush=True,
+    )
+    while _port_bind_conflict(host, port):
+        time.sleep(5.0)
+    return True
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -19834,8 +19882,9 @@ def start_server(
     # BACKEND_PORT_IN_USE sentinel + a distinct exit code instead.
     # ``--port 0`` (ephemeral) is skipped by the probe and unaffected.
     if _port_bind_conflict(host, port):
-        _report_port_in_use(host, port)
-        raise SystemExit(PORT_IN_USE_EXIT_CODE)
+        if not _wait_for_supervised_backend_holder(host, port):
+            _report_port_in_use(host, port)
+            raise SystemExit(PORT_IN_USE_EXIT_CODE)
 
     async def _serve():
         # Split startup from main_loop so we can read the bound port

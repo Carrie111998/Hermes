@@ -141,6 +141,30 @@ class TestSweepOrphanedSessionRows:
         for row_id in ("resumed-tui", "gateway-row", "recent-tui"):
             assert db.get_session(row_id)["ended_at"] is None
 
+    def test_spares_session_leased_by_another_live_backend(self, monkeypatch, tmp_path):
+        from hermes_cli.active_sessions import try_acquire_active_session
+
+        home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        db = SessionDB(home / "state.db")
+        stale = time.time() - 8 * 3600
+        _seed_session(db, "other-backend", source="desktop", last_active=stale)
+        _seed_session(db, "dead-backend", source="desktop", last_active=stale)
+        lease, message = try_acquire_active_session(
+            session_id="other-backend", surface="desktop", config={}
+        )
+        assert lease is not None and message is None
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_SESSION_TTL_S", float(IDLE_S))
+        monkeypatch.setattr(server, "_sessions", {})
+
+        try:
+            assert server._sweep_orphaned_session_rows() == ["dead-backend"]
+            assert db.get_session("other-backend")["ended_at"] is None
+            assert db.get_session("dead-backend")["end_reason"] == "startup_orphan_reap"
+        finally:
+            lease.release()
+
     def test_leaves_already_ended_rows_untouched(self, monkeypatch, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         stale = time.time() - 8 * 3600

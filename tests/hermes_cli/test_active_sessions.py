@@ -36,6 +36,27 @@ def test_resolve_max_concurrent_sessions_values(caplog):
     )
 
 
+def test_disabled_limit_still_records_live_session_ownership(tmp_path, monkeypatch):
+    """Ownership is needed by the startup sweep even when no cap is configured."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="live-on-another-backend",
+        surface="desktop",
+        config={},
+    )
+
+    assert lease is not None and message is None
+    assert lease.enabled is True
+    assert [
+        entry["session_id"]
+        for entry in active_sessions.active_session_registry_snapshot()
+    ] == ["live-on-another-backend"]
+
+    lease.release()
+    assert active_sessions.active_session_registry_snapshot() == []
+
+
 
 
 

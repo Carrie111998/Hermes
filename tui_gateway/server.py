@@ -1895,10 +1895,24 @@ def _sweep_orphaned_session_rows() -> list[str]:
     ttl = _SESSION_TTL_S
     if ttl <= 0:
         return []
+    excluded = set(_live_session_ids())
+    try:
+        from hermes_cli.active_sessions import active_session_registry_snapshot
+
+        excluded.update(
+            str(entry.get("session_id"))
+            for entry in active_session_registry_snapshot()
+            if entry.get("session_id")
+        )
+    except Exception:
+        # Ownership lookup is best-effort. Existing in-process exclusions and
+        # dual-clock staleness still provide the pre-registry safety floor.
+        logger.warning("active session ownership lookup failed", exc_info=True)
+
     swept = db.sweep_orphaned_sessions(
         max_idle_seconds=ttl,
         sources=_ORPHAN_SWEEP_SOURCES,
-        exclude_ids=tuple(_live_session_ids()),
+        exclude_ids=tuple(sorted(excluded)),
     )
     if swept:
         logger.info(
