@@ -22,6 +22,7 @@ from .controller import (
     ScanController,
     _claim_with_orphan_recovery,
     _worker_capability_preflight,
+    _worker_write_contract,
 )
 from .github_client import CheckState, GitHubClient, PullRequestMergeState, ReviewState
 from .ledger import FeedbackLedger, LedgerStateError
@@ -416,8 +417,9 @@ def _repair_task(
         _worker_capability_preflight(identity_command)
         + "Use this single literal identity command for the preflight before any fetch, checkout, "
         "edit, test, commit, push, or reply. Require all five "
-        "returned identity fields to match the canonical identity in this task's evidence; stop "
-        "fail-closed on any mismatch. "
+        "returned identity fields to match the canonical identity in this task's evidence before "
+        "the first push; after your own verified push use the resolved-head protocol below. "
+        "Stop fail-closed on any other mismatch. "
     )
     if configured.report_only:
         authority = (
@@ -469,9 +471,9 @@ def _repair_task(
             "reply with commit and test evidence. Do not merge the pull request, approve it, delete "
             "branches, or change repository settings. Do not force-push or rewrite published history. "
             "Do not weaken tests, required checks, validation, or safety gates. Stop fail-closed if "
-            "identity changes or the repair is ambiguous or broad. Immediately before every GitHub "
-            "write, re-run that exact identity preflight and require both base and head identity to "
-            "remain exact. After the verified push and "
+            "identity changes or the repair is ambiguous or broad. "
+            + _worker_write_contract()
+            + "After the verified push and "
             "factual reply both succeed, acknowledge this exact repair with `"
             f"{completion_command}`. Obtain the resolved SHA by running the literal command "
             "`git rev-parse --verify HEAD`, require one full 40-character hexadecimal SHA, and copy "
