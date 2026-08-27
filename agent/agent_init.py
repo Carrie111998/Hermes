@@ -2946,8 +2946,15 @@ def init_agent(
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
+    # Resolve once here so the tracker shares the session's canonical cwd
+    # (session override → TERMINAL_CWD → launch dir) instead of silently
+    # falling back to os.getcwd() — which on desktop/gateway surfaces is the
+    # Hermes install tree. The tracker itself refuses install-tree working
+    # dirs as a second line of defense (see SubdirectoryHintTracker).
+    from agent.runtime_cwd import resolve_agent_cwd
+
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=str(resolve_agent_cwd()),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

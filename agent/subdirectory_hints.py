@@ -60,6 +60,29 @@ _EXCLUDED_DIR_NAMES = frozenset({
 })
 
 
+def _is_install_tree(p: Path) -> bool:
+    """True when *p* is or sits inside the Hermes package/source root.
+
+    Mirrors ``agent.runtime_cwd._is_install_tree`` without importing it at
+    module import time (``agent_init`` imports this module early in the
+    bootstrap; keep the dependency lazy to avoid import cycles).
+    """
+    try:
+        from agent.runtime_cwd import _is_install_tree as _runtime_check
+
+        return _runtime_check(p)
+    except Exception:  # pragma: no cover - defensive during early bootstrap
+        try:
+            from hermes_constants import get_hermes_home
+
+            _ = get_hermes_home  # keep bootstrap import resolved
+            pkg_root = Path(__file__).resolve().parent.parent
+            p = Path(p).resolve()
+            return p == pkg_root or pkg_root in p.parents
+        except Exception:
+            return False
+
+
 def _is_ancestor_or_same(a: Path, b: Path) -> bool:
     """Check if *a* is the same as or an ancestor of *b* (parent directory check)."""
     try:
@@ -83,7 +106,8 @@ class SubdirectoryHintTracker:
     """
 
     def __init__(self, working_dir: Optional[str] = None):
-        self.working_dir = Path(working_dir or os.getcwd()).resolve()
+        resolved = self._resolve_working_dir(working_dir)
+        self.working_dir = resolved
         self._loaded_dirs: Set[Path] = set()
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
@@ -91,6 +115,40 @@ class SubdirectoryHintTracker:
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
         self._seed_working_dir_digest()
+
+    @staticmethod
+    def _resolve_working_dir(working_dir: Optional[str]) -> Path:
+        """Resolve the tracker's working directory, refusing the install tree.
+
+        A fallback into the Hermes package/source root (the desktop app's
+        default spawn location) must never seed subdirectory hints — the repo's
+        contributor AGENTS.md files are development guides, not user project
+        context (#64590, #85668). ``prompt_builder`` already suppresses these
+        for the system prompt; this extends the same invariant to lazy hint
+        discovery. Fall back to the home directory, matching the desktop
+        launcher's own last-resort choice.
+        """
+        candidate: Optional[Path] = None
+        if working_dir and working_dir.strip():
+            try:
+                candidate = Path(working_dir).expanduser().resolve()
+            except OSError:
+                candidate = None
+        if candidate is None:
+            try:
+                from agent.runtime_cwd import resolve_agent_cwd
+
+                candidate = resolve_agent_cwd()
+            except Exception:
+                candidate = Path(os.getcwd())
+        if _is_install_tree(candidate):
+            logger.warning(
+                "subdirectory hints: working directory %s resolves inside the "
+                "Hermes install tree; using home directory instead",
+                candidate,
+            )
+            candidate = Path.home()
+        return candidate.resolve()
 
     def _seed_working_dir_digest(self) -> None:
         """Record the CWD context file's digest so it is never re-injected.
@@ -235,6 +293,13 @@ class SubdirectoryHintTracker:
             if not _is_ancestor_or_same(self.working_dir, path):
                 return False
         if self._is_excluded(path):
+            return False
+        # Never treat a path inside the Hermes install tree as project
+        # context — the repo's contributor AGENTS.md files are development
+        # guides, not user project context (#64590, #85668). Needed even when
+        # working_dir is a legitimate parent (e.g. the home directory), since
+        # the install tree sits below it.
+        if _is_install_tree(path):
             return False
         return True
 
