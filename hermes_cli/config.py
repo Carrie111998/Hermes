@@ -2400,13 +2400,13 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         # module for read_raw_config/_persist_migration/etc. at call time).
         run_migrations(current_ver, results, quiet)
 
-    # ── Version 38 → 39: expand skills.write_approval bool → dict ──
+    # ── Version 39 → 40: expand skills.write_approval bool → dict ──
     # The bare boolean `skills.write_approval: true/false` was replaced by a
     # dict `{enabled: bool, only: [str], exclude: [str]}` so users can gate
     # only specific skills. This migration converts persisted bools to the
     # dict shape; the runtime reader in write_approval._normalize_enabled()
     # handles both shapes for backward compat.
-    if current_ver < 39:
+    if current_ver < 40:
         config = read_raw_config()
         raw_skills = config.get("skills")
         if isinstance(raw_skills, dict) and "write_approval" in raw_skills:
