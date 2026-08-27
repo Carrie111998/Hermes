@@ -19461,6 +19461,26 @@ PORT_IN_USE_EXIT_CODE = 75
 _PORT_IN_USE_SENTINEL = "BACKEND_PORT_IN_USE port={port}"
 
 
+def _announce_stream():
+    """The process's real stdout, for machine-readable launch sentinels.
+
+    ``tui_gateway.server`` reassigns ``sys.stdout`` to stderr at import time so
+    stray library ``print()`` can't corrupt its JSON-RPC stdio transport, and
+    ``start_server`` imports that module during startup. Every plain ``print()``
+    after that import lands on stderr — including the port sentinels, which the
+    desktop watches for on *stdout* only. The backend then boots fine while
+    Electron times out on the port announcement and calls the launch failed.
+    Sentinels therefore address the original stdout explicitly.
+
+    ``sys.__stdout__`` is None under pythonw (Windows Desktop); that launch path
+    announces the port through HERMES_DESKTOP_READY_FILE instead.
+    """
+    stream = getattr(sys, "__stdout__", None)
+    if stream is None or getattr(stream, "closed", False):
+        return sys.stdout
+    return stream
+
+
 def _is_addr_in_use_error(exc: OSError) -> bool:
     """True when ``exc`` is the platform's address-in-use bind failure."""
     import errno
@@ -19517,12 +19537,14 @@ def _port_bind_conflict(host: str, port: int) -> bool:
 
 def _report_port_in_use(host: str, port: int) -> None:
     """Print the machine sentinel + a human hint naming likely holders."""
-    print(_PORT_IN_USE_SENTINEL.format(port=port), flush=True)
+    announce = _announce_stream()
+    print(_PORT_IN_USE_SENTINEL.format(port=port), file=announce, flush=True)
     print(
         f"  Port {port} on {host} is already in use — likely another "
         "'hermes serve' / 'hermes dashboard' backend or the Hermes gateway. "
         "Stop the other process, or pass --port <other> "
         "(--port 0 picks a free ephemeral port).",
+        file=announce,
         flush=True,
     )
 
@@ -19888,7 +19910,8 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            announce = _announce_stream()
+            print(f"{ready_token} port={actual_port}", file=announce, flush=True)
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
@@ -19896,9 +19919,13 @@ def start_server(
                 # block-buffered and can surface MINUTES after the flushed
                 # READY sentinel above, which reads as a slow boot in
                 # support bundles when the backend was actually up.
-                print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
+                print(
+                    f"  Hermes backend listening on {host}:{actual_port}",
+                    file=announce,
+                    flush=True,
+                )
             else:
-                print(f"  Hermes Web UI → http://{host}:{actual_port}")
+                print(f"  Hermes Web UI → http://{host}:{actual_port}", file=announce)
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop

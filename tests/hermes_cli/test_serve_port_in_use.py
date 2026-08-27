@@ -91,7 +91,9 @@ def test_exit_code_is_distinct_tempfail():
 # ---------------------------------------------------------------------------
 
 
-def _spawn_serve(port: int, tmp_path: Path) -> subprocess.Popen:
+def _spawn_serve(
+    port: int, tmp_path: Path, merge_streams: bool = True
+) -> subprocess.Popen:
     home = tmp_path / "hermes_home"
     home.mkdir(exist_ok=True)
     env = dict(os.environ)
@@ -114,7 +116,7 @@ def _spawn_serve(port: int, tmp_path: Path) -> subprocess.Popen:
         cwd=str(REPO_ROOT),
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.STDOUT if merge_streams else subprocess.DEVNULL,
         text=True,
     )
 
@@ -176,6 +178,28 @@ def test_free_port_boots_and_announces_ready(tmp_path):
         assert ready, f"no READY sentinel; output:\n{out}"
         assert f"HERMES_BACKEND_READY port={port}" in out
         assert "BACKEND_PORT_IN_USE" not in out
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_ready_sentinel_lands_on_real_stdout(tmp_path):
+    """The sentinel must reach fd 1, not drift onto stderr.
+
+    ``tui_gateway.server`` reassigns ``sys.stdout`` to stderr at import time and
+    ``start_server`` imports it during startup, so a plain ``print()`` puts the
+    announcement on the wrong stream. The desktop watches the child's *stdout*
+    only: a drifted sentinel boots a perfectly healthy backend that Electron
+    still declares dead after its 90s port-announcement timeout. Every other
+    test in this file merges the two streams and cannot see the difference.
+    """
+    proc = _spawn_serve(0, tmp_path, merge_streams=False)
+    try:
+        ready, lines = _read_until(proc, "HERMES_BACKEND_READY", timeout=90.0)
+        assert ready, "READY sentinel never reached stdout:\n" + "".join(lines)
     finally:
         proc.terminate()
         try:
