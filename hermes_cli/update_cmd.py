@@ -7491,6 +7491,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # commit_count == 0 branch, which returns immediately after: an update
         # that pulled hundreds of upstream commits printed "Already up to
         # date!" and verified nothing).
+        # Preserve the SHA from before the FIRST code mutation. A fork sync can
+        # advance HEAD before the normal merge, so a baseline captured only
+        # around that merge would miss the real update. The same baseline owns
+        # movement verification, syntax rollback, and dependency diffing.
+        pre_apply_sha = None
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
@@ -7505,6 +7510,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # HEAD moving is itself proof of an update. Keep the update
                 # path active even if the informational count cannot be read.
                 commit_count = max(1, synced_count)
+                pre_apply_sha = pre_sync_sha
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -7675,12 +7681,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Pulling updates...")
         update_succeeded = False
-        # Capture the pre-pull SHA so we can auto-roll-back if the new code
+        # Capture the pre-update SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
-        # orphan merge-conflict markers in hermes_cli/config.py bricked
-        # every user who ran ``hermes update`` for the 7 minutes between
-        # the bad commit and the fix landing).
-        pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        # orphan merge-conflict markers in hermes_cli/config.py bricked every
+        # user who updated before the fix landed). When the fork-sync stage
+        # already moved HEAD, use its pre-sync SHA instead of capturing the
+        # updated commit here; dependency diffing below relies on this same
+        # baseline to include every code mutation in the update.
+        if pre_apply_sha is None:
+            pre_apply_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
@@ -7788,11 +7797,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # ~6 lines so the user sees the actual SyntaxError text.
                     for line in str(syntax_error).splitlines()[:6]:
                         print(f"    {line}")
-                if pre_pull_sha:
+                if pre_apply_sha:
                     print()
-                    print(f"→ Rolling back to {pre_pull_sha[:10]}...")
+                    print(f"→ Rolling back to {pre_apply_sha[:10]}...")
                     rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
+                        git_cmd + ["reset", "--hard", pre_apply_sha],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
@@ -7802,7 +7811,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print("  Try ``hermes update`` again later once a fix lands.")
                     else:
                         print("  ✗ Rollback failed. Recover manually with:")
-                        print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
+                        print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_apply_sha}")
                         if rollback_result.stderr.strip():
                             print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
                 else:
@@ -7853,23 +7862,70 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # commit afterward (the branch-switch step re-detaches to the SHA).
         # Before this guard, ``hermes update`` printed "✓ Code updated!" and
         # reinstalled deps + rebuilt the desktop app against the stale tree —
-        # no error, no warning, ``hermes doctor`` healthy. Compare pre-pull
-        # and post-pull HEAD; if they match, surface the no-op instead of
-        # claiming success.
+        # no error, no warning, ``hermes doctor`` healthy. Compare the SHA
+        # from before the first code mutation with the final HEAD; if they
+        # match, surface the no-op instead of claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
-            print()
-            print("✗ Code did not move — update was a no-op.")
-            print(
-                f"  HEAD is pinned to {pre_pull_sha[:10]} (detached checkout); "
-                f"origin/{branch} advanced but the working tree stayed put."
+        if pre_apply_sha and post_pull_sha == pre_apply_sha:
+            target_probe = subprocess.run(
+                git_cmd + ["rev-parse", f"origin/{branch}"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            print(
-                "  Reattach to the branch and retry: "
-                f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
+            target_sha = (
+                target_probe.stdout.strip() if target_probe.returncode == 0 else ""
             )
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-            sys.exit(1)
+            # A same-SHA anomaly is benign only when the working tree
+            # demonstrably contains the fetched target. Branch attachment by
+            # itself is not proof: an attached branch can still be stale after
+            # a concurrent ref/reset race.
+            if target_sha and post_pull_sha == target_sha:
+                print(
+                    f"  ℹ Code is already at origin/{branch} "
+                    f"({target_sha[:10]}) — nothing to pull."
+                )
+            else:
+                branch_probe = subprocess.run(
+                    git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                branch_now = (
+                    branch_probe.stdout.strip()
+                    if branch_probe.returncode == 0
+                    else ""
+                )
+                print()
+                print("✗ Code did not move — update was a no-op.")
+                if branch_now and branch_now != "HEAD":
+                    print(
+                        f"  Checkout is attached to '{branch_now}' at "
+                        f"{pre_apply_sha[:10]}; origin/{branch} is at "
+                        f"{target_sha[:10] or 'an unknown commit'}."
+                    )
+                    print(
+                        "  Complete the fast-forward and retry: "
+                        f"git -C {_m().PROJECT_ROOT} merge --ff-only "
+                        f"origin/{branch} && hermes update"
+                    )
+                else:
+                    print(
+                        f"  Checkout is pinned to {pre_apply_sha[:10]} "
+                        f"(detached from '{branch}'); origin/{branch} advanced "
+                        "but the working tree stayed put."
+                    )
+                    print(
+                        "  Reattach to the branch and retry: "
+                        f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
+                    )
+                _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                sys.exit(1)
 
         # And verify HEAD actually sits on the target branch. The parked-
         # branch guard above should make this unreachable, but if any path
@@ -7936,7 +7992,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # ``.[all]`` install completes — lazy refresh uses a separate marker.
         _write_update_incomplete_marker()
         deps_current = _editable_install_is_current(
-            git_cmd, _m().PROJECT_ROOT, pre_pull_sha
+            git_cmd, _m().PROJECT_ROOT, pre_apply_sha
         )
         if deps_current:
             print("→ Python dependencies unchanged — skipping reinstall")
