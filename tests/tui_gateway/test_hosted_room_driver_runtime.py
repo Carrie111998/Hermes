@@ -361,7 +361,10 @@ def test_worker_settles_without_any_client_transport(db: Path):
     runtime = _runtime(db, FakeSessionRPC())
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(
+        lambda: state.get_task(db, identity)["status"] == "settled"
+        and runtime.status()["cycles"] >= 1
+    )
 
     assert runtime.status()["running"] is True
     assert runtime.status()["cycles"] >= 1

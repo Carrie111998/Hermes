@@ -100,6 +100,13 @@ _TERMINAL_EXTRA_FIELDS = {
     "turn.cancelled": frozenset({"reason"}),
 }
 _TERMINAL_EVENT_KINDS = frozenset(_TERMINAL_EXTRA_FIELDS)
+_ROOM_ACTIVITY_FIELDS = frozenset({
+    "status",
+    "reason_code",
+    "thread_id",
+    "discussion_event_id",
+})
+_ROOM_STOP_FIELDS = frozenset({"cancel_id"})
 
 
 class DiscussionPolicyError(ValueError):
@@ -629,6 +636,38 @@ def _validate_event(
                 f"{kind} authority epoch does not match the room"
             )
         _validate_terminal_event(kind, payload, actor=actor, room=room)
+    elif kind == "room.activity":
+        if raw.get("authority_epoch") != room.authority_epoch:
+            raise DiscussionValidationError(
+                "room.activity authority epoch does not match the room"
+            )
+        _exact_fields(
+            payload,
+            label="room.activity payload",
+            required=_ROOM_ACTIVITY_FIELDS,
+        )
+        if payload.get("status") not in {"settled", "bounded"}:
+            raise DiscussionValidationError("invalid room.activity status")
+        _identifier(payload.get("reason_code"), label="reason_code")
+        _identifier(payload.get("thread_id"), label="thread_id")
+        _identifier(payload.get("discussion_event_id"), label="discussion_event_id")
+        if actor.get("kind") != "gateway" or actor.get("id") != room.gateway_id:
+            raise DiscussionValidationError("room.activity requires the room gateway")
+    elif kind == "room.stop_requested":
+        if raw.get("authority_epoch") != room.authority_epoch:
+            raise DiscussionValidationError(
+                "room.stop_requested authority epoch does not match the room"
+            )
+        _exact_fields(
+            payload,
+            label="room.stop_requested payload",
+            required=_ROOM_STOP_FIELDS,
+        )
+        _identifier(payload.get("cancel_id"), label="cancel_id")
+        if actor.get("kind") != "gateway" or actor.get("id") != room.gateway_id:
+            raise DiscussionValidationError(
+                "room.stop_requested requires the room gateway"
+            )
 
     return _ValidatedEvent(
         raw=raw,
@@ -1016,10 +1055,33 @@ def plan_next_task(
     room = validate_room(room_value, local_profiles=local_profiles)
     validated = _validated_events(events, room=room)
     user_events = _discussion_user_events(validated)
-    if not user_events:
-        return DiscussionDecision(status="idle", reason="no_user_event")
+    stopped_through_seq = max(
+        (
+            event.seq
+            for event in validated
+            if event.kind == "room.stop_requested"
+        ),
+        default=0,
+    )
+    completed_discussion_ids = {
+        str(event.payload["discussion_event_id"])
+        for event in validated
+        if event.kind == "room.activity"
+        and event.payload.get("status") in {"settled", "bounded"}
+    }
+    latest_by_thread: dict[str, _ValidatedEvent] = {}
+    for event in user_events:
+        latest_by_thread[str(event.payload["thread_id"])] = event
+    pending_user_events = tuple(
+        event
+        for event in sorted(latest_by_thread.values(), key=lambda item: item.seq)
+        if event.seq > stopped_through_seq
+        and event.event_id not in completed_discussion_ids
+    )
+    if not pending_user_events:
+        return DiscussionDecision(status="idle", reason="no_pending_user_event")
 
-    discussion = user_events[-1]
+    discussion = pending_user_events[0]
     thread_id = str(discussion.payload["thread_id"])
     committed_member_message_ids = {
         str(event.payload["message_event_id"])
