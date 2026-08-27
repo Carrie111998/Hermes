@@ -46,10 +46,23 @@ else
   bad "graph-run-workflow"
 fi
 
-if grep -q "fake-edge first" "$ROOT/.claude/CLAUDE.md"; then
+if grep -q "always run the fake-edge test" "$ROOT/.claude/CLAUDE.md"; then
   pass "claude-md"
 else
   bad "claude-md"
+fi
+
+if grep -q '\[AUTO\]' "$skill" && grep -q 'MUST use' "$skill"; then
+  pass "skill-auto-trigger"
+else
+  bad "skill-auto-trigger"
+fi
+
+if grep -q 'Always run the fake-edge test' "$ROOT/rules/CODING-RULES.md" \
+    && grep -q '/workflow graph-run' "$ROOT/rules/CODING-RULES.md"; then
+  pass "rule-10-load"
+else
+  bad "rule-10-load"
 fi
 
 if grep -q 'grok/workflows' "$ROOT/install.sh"; then
@@ -71,7 +84,8 @@ else
   bad "portable-skills-set"
 fi
 
-if [ -L "$ROOT/.grok/workflows/graph-run.rhai" ] || [ -f "$ROOT/.grok/workflows/graph-run.rhai" ]; then
+if [ -f "$ROOT/.grok/workflows/graph-run.rhai" ] && [ ! -L "$ROOT/.grok/workflows/graph-run.rhai" ] \
+    && cmp -s "$ROOT/grok/workflows/graph-run.rhai" "$ROOT/.grok/workflows/graph-run.rhai"; then
   pass "project-graph-run"
 else
   bad "project-graph-run"

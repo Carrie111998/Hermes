@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Run a complex task as parallel subagents — plan, fan out N independent workers at once, attack the combined findings with a skeptic, then synthesize what survives. Diamond specialization of graph-engineering. Use when a task splits into 3+ independent work units (research, analysis, writing, design, audits) and serial work would exceed ~15 minutes. Do NOT use for a single work unit, for work under ~15 minutes, or when steps are sequentially dependent (each needs the previous one's output).
+description: Run a complex task as parallel subagents — plan, fan out N independent workers at once, attack the combined findings with a skeptic, then synthesize what survives. Diamond specialization of graph-engineering. Use after the graph-engineering fake-edge test says a graph exists, when a task splits into 3+ independent work units (research, analysis, writing, design, audits) and serial work would exceed ~15 minutes. Do NOT use for a single work unit, for work under ~15 minutes, or when steps are sequentially dependent (each needs the previous one's output).
 ---
 
 # Fanout — plan → parallel workers → skeptic → synthesis

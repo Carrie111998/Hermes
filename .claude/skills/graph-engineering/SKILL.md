@@ -1,16 +1,25 @@
 ---
 name: graph-engineering
 description: >
-  Draw AI work as a graph of independent jobs, cut fake sequential edges,
-  fan out then reduce then verify on a fresh context, then synthesize.
-  Use when the user says graph engineering, fake-edge, diamond, fan-out,
-  parallel agents, workflow of agents, graph of loops, or a task splits
-  into 3+ independent units. Do NOT use for a single sequential job, a
-  tight human-approval loop, or exploratory work you cannot yet name.
-  Slash: /graph-engineering. Parent discipline of fanout.
+  [AUTO] Fake-edge test, then diamond: independent jobs in parallel,
+  reduce in code, verify on a fresh context, synthesize. MUST use on any
+  task with 2+ steps that might be independent, and whenever work splits
+  into 3+ units, parallel agents, fan-out, or a workflow of agents. Do
+  not serialize independent jobs. Do NOT use for a single sequential
+  job, a tight human-approval loop, or exploratory work you cannot yet
+  name. Slash: /graph-engineering. Grok: /workflow graph-run. Parent of
+  fanout.
 ---
 
 # Graph engineering
+
+Always run the fake-edge test before serializing 2+ steps. Load this
+skill; do not reimplement it from memory. Grok: `/workflow graph-run`
+when a graph exists. `fanout` is the diamond after the test says yes.
+
+> `[AUTO]` means the fake-edge test is always-on, not that every task
+> is a diamond. Skip-graph cases below still apply. Do not genericize
+> this into "always fan out."
 
 A graph is a plan: which jobs happen, and which job must wait for which.
 Nodes think. Edges carry results. A chain of "then" is a graph with no

@@ -33,7 +33,9 @@ Interactive diamond without a workflow: spawn `fanout-worker` nodes in
 yourself. Writers take `isolation: "worktree"`.
 
 Source of the workflow: `~/Dev/dotfiles/grok/workflows/graph-run.rhai`
-(user copy: `~/.grok/workflows/graph-run.rhai`).
+(user copy: `~/.grok/workflows/graph-run.rhai`, an independent regular
+file — Grok rejects a symlink for named `/workflow` lookup; a hardlink
+into the git tree is also refused).
 
 ## Claude Code
 
