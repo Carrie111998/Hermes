@@ -48,6 +48,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $turnStartedAt,
+  applyConfiguredDefaultProjectDir,
   getSessionOwnerHint,
   knownSessionOwner,
   sessionMatchesStoredId,
@@ -3530,6 +3531,7 @@ describe('createBackendSessionForSend workspace target', () => {
   it('does not inherit a stale cwd when Home is the active project scope', async () => {
     const params = await createWith(
       () => {
+        applyConfiguredDefaultProjectDir(null)
         $projectScope.set(NO_PROJECT_ID)
       },
       () => {
@@ -3540,6 +3542,20 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).not.toHaveProperty('cwd')
+  })
+
+  it('uses the configured default dir when Home is the active project scope', async () => {
+    const params = await createWith(
+      () => {
+        applyConfiguredDefaultProjectDir('/home/user/configured')
+        $projectScope.set(NO_PROJECT_ID)
+      },
+      () => {
+        $currentCwd.set('/previous-project')
+      }
+    )
+
+    expect(params).toMatchObject({ cwd: '/home/user/configured' })
   })
 })
 
