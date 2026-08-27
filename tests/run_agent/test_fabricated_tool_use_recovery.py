@@ -26,36 +26,10 @@ See docs/rfcs/2026-08-fabricated-tool-use-detection.md.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
-
-
-@pytest.fixture()
-def loop_agent():
-    """AIAgent with a mocked OpenAI client (mirrors
-    test_dropped_tool_call_recovery's fixture)."""
-    from run_agent import AIAgent
-    with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
-    ):
-        agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.client = MagicMock()
-        agent._cached_system_prompt = "You are helpful."
-        agent._use_prompt_caching = False
-        agent.tool_delay = 0
-        agent.compression_enabled = False
-        agent.save_trajectories = False
-        return agent
-
+# `loop_agent` is defined in tests/run_agent/conftest.py (shared across this
+# directory) rather than redefined here.
 
 FAKE_GOLD_SEARCH_TEXT = (
     "I'll perform a quick web search. Here's the result from my "

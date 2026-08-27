@@ -169,9 +169,11 @@ this is a second, more reliable reset point, not a replacement for the first.
 ## Testing
 
 New file `tests/run_agent/test_fabricated_tool_use_recovery.py`, mirroring
-`tests/run_agent/test_dropped_tool_call_recovery.py`'s exact fixture and mocking style
-(`loop_agent` fixture, mocked OpenAI client, a `_fabricated_response(content)` helper analogous
-to `_dropped_tool_call_response(content)`).
+`tests/run_agent/test_dropped_tool_call_recovery.py`'s exact fixture and mocking style. The
+`loop_agent` fixture (mocked-`AIAgent` construction, same shape as `test_dropped_tool_call_recovery.py`'s
+own) was found in post-merge review to already be duplicated verbatim across several files in this
+directory — moved to `tests/run_agent/conftest.py` (which already exists as the designated home
+for shared fixtures in this directory) rather than adding an Nth copy here.
 
 Cases:
 
