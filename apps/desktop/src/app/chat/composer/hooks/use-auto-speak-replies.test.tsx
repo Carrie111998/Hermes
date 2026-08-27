@@ -12,8 +12,14 @@ import { ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 
+const ownsAmbientCueMock = vi.hoisted(() => vi.fn())
+
 vi.mock('@/lib/voice-playback', () => ({
   playSpeechText: vi.fn()
+}))
+
+vi.mock('@/store/ambient', () => ({
+  ownsAmbientCue: ownsAmbientCueMock
 }))
 
 const SESSION_ID = 'session-under-test'
@@ -41,6 +47,7 @@ describe('useAutoSpeakReplies — Edge TTS fallback chain (#93515)', () => {
 
   it('does not re-speak the reply once playback goes idle after an id rewrite mid-fallback', async () => {
     $autoSpeakReplies.set(true)
+    ownsAmbientCueMock.mockResolvedValue(true)
 
     const $messages = atom<ChatMessage[]>([])
 
@@ -128,5 +135,136 @@ describe('useAutoSpeakReplies — Edge TTS fallback chain (#93515)', () => {
 
     expect($voicePlayback.get().status).toBe('idle')
     expect(playSpeechText).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('useAutoSpeakReplies — async ownership', () => {
+  afterEach(() => {
+    cleanup()
+    $autoSpeakReplies.set(false)
+    setVoicePlaybackState({ ...IDLE_STATE })
+    vi.clearAllMocks()
+  })
+
+  it('does not start stale speech after its composer scope is replaced', async () => {
+    $autoSpeakReplies.set(true)
+    const $messages = atom<ChatMessage[]>([])
+    let resolveOwnership: ((owns: boolean) => void) | undefined
+
+    ownsAmbientCueMock.mockReturnValueOnce(
+      new Promise<boolean>(resolve => {
+        resolveOwnership = resolve
+      })
+    )
+    vi.mocked(playSpeechText).mockImplementation(async (_text, options) => {
+      setVoicePlaybackState({
+        audioElement: null,
+        messageId: options.messageId ?? null,
+        sequence: 12,
+        source: options.source,
+        status: 'preparing'
+      })
+
+      return true
+    })
+
+    interface HookProps {
+      pendingReply: () => null | { id: string; pending: boolean; text: string }
+      sessionId: string
+    }
+
+    const hook = renderHook(
+      ({ pendingReply, sessionId }: HookProps) =>
+        useAutoSpeakReplies({
+          conversationActive: false,
+          failureLabel: 'read-aloud failed',
+          markSpoken: vi.fn(),
+          pendingReply,
+          sessionId
+        }),
+      {
+        initialProps: {
+          pendingReply: () => ({ id: 'old-reply', pending: false, text: 'old scope' }),
+          sessionId: 'old-session'
+        } as HookProps,
+        wrapper: ({ children }) => (
+          <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, $messages }}>{children}</ComposerScopeProvider>
+        )
+      }
+    )
+
+    await waitFor(() => expect(ownsAmbientCueMock).toHaveBeenCalledWith('speak:old-reply'))
+
+    act(() => {
+      setVoicePlaybackState({
+        audioElement: null,
+        messageId: 'new-session-reply',
+        sequence: 11,
+        source: 'read-aloud',
+        status: 'preparing'
+      })
+      hook.rerender({ pendingReply: () => null, sessionId: 'new-session' })
+    })
+
+    await act(async () => {
+      resolveOwnership?.(true)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(playSpeechText).not.toHaveBeenCalled()
+    expect($voicePlayback.get()).toMatchObject({ messageId: 'new-session-reply', sequence: 11, status: 'preparing' })
+  })
+
+  it('does not speak an older claim after a newer reply loses ownership', async () => {
+    $autoSpeakReplies.set(true)
+    const $messages = atom<ChatMessage[]>([])
+    const ownershipResolvers = new Map<string, (owns: boolean) => void>()
+    let currentReply: null | { id: string; pending: boolean; text: string } = null
+
+    ownsAmbientCueMock.mockImplementation(
+      (key: string) =>
+        new Promise<boolean>(resolve => {
+          ownershipResolvers.set(key, resolve)
+        })
+    )
+    vi.mocked(playSpeechText).mockResolvedValue(true)
+
+    renderHook(
+      () =>
+        useAutoSpeakReplies({
+          conversationActive: false,
+          failureLabel: 'read-aloud failed',
+          markSpoken: vi.fn(),
+          pendingReply: () => currentReply,
+          sessionId: SESSION_ID
+        }),
+      {
+        wrapper: ({ children }) => (
+          <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, $messages }}>{children}</ComposerScopeProvider>
+        )
+      }
+    )
+
+    act(() => {
+      currentReply = { id: 'older', pending: false, text: 'older reply' }
+      $messages.set([assistantMessage('older', 'older reply')])
+    })
+    await waitFor(() => expect(ownsAmbientCueMock).toHaveBeenCalledWith('speak:older'))
+
+    act(() => {
+      currentReply = { id: 'newer', pending: false, text: 'newer reply' }
+      $messages.set([assistantMessage('older', 'older reply'), assistantMessage('newer', 'newer reply')])
+    })
+    await waitFor(() => expect(ownsAmbientCueMock).toHaveBeenCalledWith('speak:newer'))
+
+    await act(async () => {
+      ownershipResolvers.get('speak:newer')?.(false)
+      await Promise.resolve()
+      ownershipResolvers.get('speak:older')?.(true)
+      await Promise.resolve()
+    })
+
+    expect(playSpeechText).not.toHaveBeenCalled()
   })
 })

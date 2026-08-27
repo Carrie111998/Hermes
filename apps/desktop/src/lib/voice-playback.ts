@@ -531,12 +531,13 @@ export async function startSpeechStream(options: VoicePlaybackOptions): Promise<
 
   if (direct) {
     stopVoicePlayback()
+    const ownSequence = sequence
     setVoicePlaybackState(currentState('preparing', options))
 
     const session = openClientDirectSpeechSession(direct, options)
 
     void session.done.then(outcome => {
-      if (outcome === 'done') {
+      if (outcome === 'done' && ownSequence === sequence && options.isCurrent?.() !== false) {
         setVoicePlaybackState(currentState('idle'))
       }
     })
@@ -551,12 +552,13 @@ export async function startSpeechStream(options: VoicePlaybackOptions): Promise<
   }
 
   stopVoicePlayback()
+  const ownSequence = sequence
   setVoicePlaybackState(currentState('preparing', options))
 
   const session = openSpeechStream(wsUrl, options)
 
   void session.done.then(outcome => {
-    if (outcome === 'done') {
+    if (outcome === 'done' && ownSequence === sequence && options.isCurrent?.() !== false) {
       setVoicePlaybackState(currentState('idle'))
     }
   })
@@ -720,7 +722,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
     const played = await playSpeechDataUrl(speakableText, options, isCurrent)
 
-    if (played) {
+    if (played && isCurrent()) {
       setVoicePlaybackState(currentState('idle'))
     }
 

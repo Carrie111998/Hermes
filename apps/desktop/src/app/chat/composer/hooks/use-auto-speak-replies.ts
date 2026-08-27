@@ -58,11 +58,14 @@ export function useAutoSpeakReplies({
     // Don't read whatever reply already sits at the bottom when the toggle flips
     // on (or a chat opens) — consume it so only later replies are spoken.
     latest.current.markSpoken()
+    let active = true
+    let ownershipGeneration = 0
 
     const speakLatest = () => {
       const { conversationActive, failureLabel, markSpoken, pendingReply } = latest.current
+      const playback = $voicePlayback.get()
 
-      if (conversationActive || $voicePlayback.get().status !== 'idle') {
+      if (conversationActive || playback.status !== 'idle') {
         return
       }
 
@@ -73,11 +76,20 @@ export function useAutoSpeakReplies({
       }
 
       markSpoken()
+      const ownOwnershipGeneration = ++ownershipGeneration
       // Only one window voices a given reply when the same chat is open in
       // several (reply.id is the shared backend message id). markSpoken already
       // ran in every window, so peers just stay quiet.
       void ownsAmbientCue(`speak:${reply.id}`).then(owns => {
-        if (owns) {
+        const currentPlayback = $voicePlayback.get()
+
+        if (
+          owns &&
+          active &&
+          ownOwnershipGeneration === ownershipGeneration &&
+          currentPlayback.sequence === playback.sequence &&
+          currentPlayback.status === 'idle'
+        ) {
           void playSpeechText(reply.text, { messageId: reply.id, source: 'read-aloud' }).catch(error =>
             notifyError(error, failureLabel)
           )
@@ -89,6 +101,10 @@ export function useAutoSpeakReplies({
     // ($voicePlayback → idle), which frees us to read the next held reply.
     const stops = [$messages.subscribe(speakLatest), $voicePlayback.listen(speakLatest)]
 
-    return () => stops.forEach(f => f())
+    return () => {
+      active = false
+      ownershipGeneration += 1
+      stops.forEach(f => f())
+    }
   }, [$messages, enabled, sessionId])
 }
