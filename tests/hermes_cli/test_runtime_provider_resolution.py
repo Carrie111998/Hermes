@@ -1624,6 +1624,40 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["requested_provider"] == "custom:lmstudio"
 
 
+def test_pooled_providers_entry_preserves_config_key_identity(monkeypatch):
+    """A display name must not replace the durable ``providers`` mapping key."""
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "zhipuai": {
+                    "name": "Zhipu GLM",
+                    "api": "https://open.bigmodel.cn/api/paas/v4",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *a, **k: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "api_key": "pooled-key",
+            "source": "pool:zhipuai",
+            "credential_pool": "fake-pool",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:zhipuai")
+
+    assert resolved["provider"] == "custom:zhipuai"
+    assert resolved["requested_provider"] == "custom:zhipuai"
+    assert resolved["api_key"] == "pooled-key"
+
+
 def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
     """OpenCode Free is keyless: an exhausted credential pool must not raise
     a missing-credential error. The provider resolves with the keyless

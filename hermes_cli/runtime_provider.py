@@ -777,6 +777,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 if base_url:
                     result = {
                         "name": entry.get("name", ep_name),
+                        "provider_key": str(ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
