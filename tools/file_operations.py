@@ -308,6 +308,7 @@ class SearchResult:
     counts: Dict[str, int] = field(default_factory=dict)
     total_count: int = 0
     truncated: bool = False
+    content_truncated: bool = False
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
@@ -368,6 +369,8 @@ class SearchResult:
             result["counts"] = self.counts
         if self.truncated:
             result["truncated"] = True
+        if self.content_truncated:
+            result["content_truncated"] = True
         if self.limit_reason:
             result["limit_reason"] = self.limit_reason
         if self.warning:
@@ -623,7 +626,8 @@ class FileOperations(ABC):
     @abstractmethod
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
+               output_mode: str = "content", context: int = 0,
+               max_content_chars: int = 500) -> SearchResult:
         """Search for content or files."""
         ...
 
@@ -843,6 +847,7 @@ DEFAULT_READ_OFFSET = 1
 DEFAULT_READ_LIMIT = 2000
 DEFAULT_SEARCH_OFFSET = 0
 DEFAULT_SEARCH_LIMIT = 50
+DEFAULT_SEARCH_CONTENT_CHARS = 500
 
 # Echoed by the size probe when the path exists but is not a regular file.
 # `wc -c` prints only digits, so this can never collide with a real size.
@@ -882,6 +887,17 @@ def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
     normalized_offset = max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET))
     normalized_limit = max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
     return normalized_offset, normalized_limit
+
+
+def _bound_search_match_content(
+    result: SearchResult, max_content_chars: int
+) -> SearchResult:
+    """Clip returned line content and record whether anything was dropped."""
+    for match in result.matches:
+        if len(match.content) > max_content_chars:
+            match.content = match.content[:max_content_chars]
+            result.content_truncated = True
+    return result
 
 
 _REGEX_NEWLINE_ESCAPE_RE = re.compile(r"(?<!\\)(?:\\\\)*\\n")
@@ -2809,7 +2825,8 @@ class ShellFileOperations(FileOperations):
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
+               output_mode: str = "content", context: int = 0,
+               max_content_chars: int = DEFAULT_SEARCH_CONTENT_CHARS) -> SearchResult:
         """
         Search for content or files.
         
@@ -2822,6 +2839,7 @@ class ShellFileOperations(FileOperations):
             offset: Skip first N results
             output_mode: "content", "files_only", or "count"
             context: Lines of context around matches
+            max_content_chars: Maximum characters returned per matching or context line
         
         Returns:
             SearchResult with matches or file list
@@ -2842,7 +2860,7 @@ class ShellFileOperations(FileOperations):
                 pattern, path, target, file_glob, limit, offset, output_mode, context
             )
             if multi is not None:
-                return multi
+                return _bound_search_match_content(multi, max_content_chars)
             # Try to suggest nearby paths
             parent = os.path.dirname(path) or "."
             basename_query = os.path.basename(path)
@@ -2878,6 +2896,7 @@ class ShellFileOperations(FileOperations):
         else:
             result = self._search_content(pattern, path, file_glob, limit, offset,
                                           output_mode, context)
+        result = _bound_search_match_content(result, max_content_chars)
 
         exclusions = self._macos_search_exclusions(path)
         if exclusions and not result.error:
@@ -3348,7 +3367,7 @@ class ShellFileOperations(FileOperations):
                     matches.append(SearchMatch(
                         path=(m.group(1) or '') + m.group(2),
                         line_number=int(m.group(3)),
-                        content=m.group(4)[:500]
+                        content=m.group(4),
                     ))
                     continue
                 
@@ -3360,7 +3379,7 @@ class ShellFileOperations(FileOperations):
                         matches.append(SearchMatch(
                             path=parsed[0],
                             line_number=parsed[1],
-                            content=parsed[2][:500]
+                            content=parsed[2],
                         ))
             
             total = len(matches)
@@ -3554,7 +3573,7 @@ class ShellFileOperations(FileOperations):
                     matches.append(SearchMatch(
                         path=(m.group(1) or '') + m.group(2),
                         line_number=int(m.group(3)),
-                        content=m.group(4)[:500]
+                        content=m.group(4),
                     ))
                     continue
                 
@@ -3564,7 +3583,7 @@ class ShellFileOperations(FileOperations):
                         matches.append(SearchMatch(
                             path=parsed[0],
                             line_number=parsed[1],
-                            content=parsed[2][:500]
+                            content=parsed[2],
                         ))
 
             

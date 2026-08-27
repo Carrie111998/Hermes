@@ -208,6 +208,60 @@ class TestSearchResultDensify:
         # path with spaces survives as a header line verbatim
         assert "my dir/a b.py" in text.split("\n")[0]
 
+    def test_content_truncation_metadata_preserves_densification(self):
+        matches = self._matches(6)
+        result = SearchResult(
+            matches=matches, total_count=6, content_truncated=True
+        ).to_dict(densify=True)
+
+        assert "matches_text" in result
+        assert result["content_truncated"] is True
+
+
+class TestSearchMatchContentLimit:
+    def test_default_limit_discloses_truncated_match_content(self, mock_env):
+        long_line = "A" * 500 + "TARGET_AFTER_LIMIT"
+        mock_env.execute.return_value = {
+            "output": f"notes.md:1:{long_line}\n",
+            "returncode": 0,
+        }
+        ops = ShellFileOperations(mock_env)
+        ops._has_command = MagicMock(side_effect=lambda command: command == "rg")
+
+        result = ops.search("TARGET_AFTER_LIMIT")
+
+        assert result.matches[0].content == "A" * 500
+        assert result.content_truncated is True
+        assert result.to_dict()["content_truncated"] is True
+
+    def test_larger_limit_returns_complete_match_content(self, mock_env):
+        long_line = "A" * 10_000 + "TARGET_AFTER_LIMIT"
+        mock_env.execute.return_value = {
+            "output": f"notes.md:1:{long_line}\n",
+            "returncode": 0,
+        }
+        ops = ShellFileOperations(mock_env)
+        ops._has_command = MagicMock(side_effect=lambda command: command == "rg")
+
+        result = ops.search("TARGET_AFTER_LIMIT", max_content_chars=20_000)
+
+        assert result.matches[0].content == long_line
+        assert result.content_truncated is False
+        assert "content_truncated" not in result.to_dict()
+
+    def test_grep_reports_the_same_truncation_metadata(self, mock_env):
+        long_line = "B" * 500 + "TARGET_AFTER_LIMIT"
+        mock_env.execute.return_value = {
+            "output": f"notes.md:1:{long_line}\n",
+            "returncode": 0,
+        }
+        ops = ShellFileOperations(mock_env)
+        ops._has_command = MagicMock(side_effect=lambda command: command == "grep")
+
+        result = ops.search("TARGET_AFTER_LIMIT")
+
+        assert result.matches[0].content == "B" * 500
+        assert result.content_truncated is True
 
 class TestLintResult:
     def test_skipped(self):
