@@ -255,26 +255,35 @@ def _systemd_run_user_scope_available() -> bool:
         return available
 
 
-def _is_supervised_gateway_process() -> bool:
-    """Return whether this process is in a supervised Hermes gateway runtime.
+def _is_gateway_process() -> bool:
+    """Return whether this process owns the live Hermes gateway PID file.
 
-    Both supervisor markers and ``_HERMES_GATEWAY`` are inherited by every
-    descendant, and importing ``gateway.run`` also sets the latter. Require
-    this process to own the live gateway PID file as well. That keeps transient
-    systemd scopes limited to the gateway itself instead of terminal children
-    or unrelated interactive CLIs in the same supervised process tree.
+    ``_HERMES_GATEWAY`` is inherited by descendants, so the marker alone is
+    insufficient. PID-file ownership distinguishes the gateway itself from
+    terminal children and unrelated CLI/TUI processes while still recognizing
+    detached Windows gateways that have no external supervisor.
     """
     if os.environ.get("_HERMES_GATEWAY") != "1":
         return False
 
     try:
-        from gateway.restart import is_gateway_supervisor_process
         from gateway.status import get_running_pid
 
-        return (
-            is_gateway_supervisor_process()
-            and get_running_pid(cleanup_stale=False) == os.getpid()
-        )
+        return get_running_pid(cleanup_stale=False) == os.getpid()
+    except Exception as exc:
+        logger.debug("Could not verify gateway process identity: %s", exc)
+        return False
+
+
+def _is_supervised_gateway_process() -> bool:
+    """Return whether this process is the live externally supervised gateway."""
+    if not _is_gateway_process():
+        return False
+
+    try:
+        from gateway.restart import is_gateway_supervisor_process
+
+        return is_gateway_supervisor_process()
     except Exception as exc:
         logger.debug("Could not verify supervised gateway process identity: %s", exc)
         return False

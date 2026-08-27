@@ -438,6 +438,39 @@ class TestCronCreateLifecycleBlock:
 # Defense 1: gateway stop/restart refuse inside gateway
 # ---------------------------------------------------------------------------
 
+class TestGatewayProcessIdentity:
+    """The live gateway identity is distinct from external supervision."""
+
+    def test_detached_gateway_is_live_gateway_without_supervisor(self, monkeypatch):
+        """Regression: a Windows direct-spawn gateway owns the PID file but has
+        no systemd/launchd supervisor. Lifecycle guards must still identify it
+        as the live gateway so it cannot kill its own terminal tool mid-restart.
+        """
+        from gateway import restart, status
+        from tools import process_registry
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(restart, "is_gateway_supervisor_process", lambda: False)
+        monkeypatch.setattr(
+            status, "get_running_pid", lambda cleanup_stale=False: os.getpid()
+        )
+
+        assert process_registry._is_gateway_process() is True
+        assert process_registry._is_supervised_gateway_process() is False
+
+    def test_inherited_marker_without_pid_ownership_is_not_gateway(self, monkeypatch):
+        """Descendants inherit the marker but do not own the live gateway PID."""
+        from gateway import status
+        from tools import process_registry
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(
+            status, "get_running_pid", lambda cleanup_stale=False: os.getpid() + 1
+        )
+
+        assert process_registry._is_gateway_process() is False
+
+
 class TestGatewaySelfTargetingGuard:
     """Verify destructive gateway commands refuse inside the gateway."""
 
@@ -490,6 +523,43 @@ class TestGatewaySelfTargetingGuard:
 # Defense 3: terminal_tool hard-blocks gateway lifecycle commands inside gateway
 # ---------------------------------------------------------------------------
 
+class TestExecuteCodeGatewayLifecycleGuard:
+    """execute_code must not bypass the detached-gateway lifecycle guard."""
+
+    def test_detached_gateway_blocks_lifecycle_code(self, monkeypatch):
+        from tools import approval, code_execution_tool, process_registry, terminal_tool
+
+        monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
+        monkeypatch.setattr(process_registry, "_is_gateway_process", lambda: True)
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process", lambda: False
+        )
+        monkeypatch.setattr(
+            approval,
+            "check_execute_code_guard",
+            lambda *args, **kwargs: {"approved": True},
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {"env_type": "ssh", "host_access": False},
+        )
+        monkeypatch.setattr(
+            code_execution_tool,
+            "_execute_remote",
+            lambda *args, **kwargs: json.dumps({"status": "success"}),
+        )
+
+        result = json.loads(
+            code_execution_tool.execute_code(
+                "import os; os.system('hermes gateway restart')"
+            )
+        )
+
+        assert "error" in result
+        assert "Blocked" in result["error"]
+
+
 class TestTerminalToolGatewayLifecycleGuard:
     """terminal_tool must refuse gateway lifecycle commands when _HERMES_GATEWAY=1.
 
@@ -518,6 +588,10 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
         monkeypatch.setattr(
+            process_registry, "_is_gateway_process",
+            lambda: inside_gateway,
+        )
+        monkeypatch.setattr(
             process_registry, "_is_supervised_gateway_process",
             lambda: inside_gateway,
         )
@@ -544,6 +618,34 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
+
+    def test_detached_gateway_blocks_lifecycle_command(self, monkeypatch):
+        """A Windows direct-spawn gateway is live but not externally supervised.
+        Its own terminal tool must still refuse a self-restart.
+        """
+        import tools.terminal_tool as tt
+        from tools import process_registry
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=False)
+        monkeypatch.setattr(process_registry, "_is_gateway_process", lambda: True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+        assert calls == []
 
     def test_force_true_cannot_bypass_block(self, monkeypatch):
         import tools.terminal_tool as tt
@@ -1836,6 +1938,10 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(
+            process_registry, "_is_gateway_process",
+            lambda: inside_gateway,
+        )
         monkeypatch.setattr(
             process_registry, "_is_supervised_gateway_process",
             lambda: inside_gateway,

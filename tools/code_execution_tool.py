@@ -1305,8 +1305,8 @@ def execute_code(
     # identical command inside `os.system(...)` / `subprocess.run([...])`
     # here sailed through and SIGTERM'd the gateway mid-task. Gated on
     # PID-file ownership, not the inherited env marker (#92560).
-    from tools.process_registry import _is_supervised_gateway_process
-    if _is_supervised_gateway_process():
+    from tools.process_registry import _is_gateway_process
+    if _is_gateway_process():
         from cron.lifecycle_guard import contains_gateway_lifecycle_command
         if contains_gateway_lifecycle_command(code):
             return tool_error(
