@@ -239,6 +239,8 @@ VALID_HOOKS: Set[str] = {
     # and callback error because it is an enforcement boundary, not telemetry.
     # Kwargs: platform, chat_id, content, metadata, operation.
     "pre_gateway_send",
+    # Terminal enforcement policy over the fully transformed payload.
+    "final_gateway_send_policy",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -449,6 +451,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
     "pre_tool_call",
     "pre_gateway_send",
+    "final_gateway_send_policy",
 }
 
 # Documented parent-thread serialization contract — never move the callback
@@ -462,6 +465,13 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running"
 )
+
+
+def _outbound_gate_required_at_startup(config: Mapping[str, Any] | None = None) -> bool:
+    """Whether protected targets make the bundled security gate mandatory."""
+    from hermes_cli.outbound_policy import outbound_policy_settings
+
+    return bool(outbound_policy_settings(config).get("protected_targets"))
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
@@ -4360,6 +4370,7 @@ class PluginManager:
         # winner. Keys are path-derived (``image_gen/openai``,
         # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
         # don't collide even when both manifests say ``name: openai``.
+        outbound_gate_required = _outbound_gate_required_at_startup()
         disabled = _get_disabled_plugins()
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         stale_relay_keys = legacy_relay_plugin_keys(enabled)
@@ -4379,6 +4390,7 @@ class PluginManager:
         to_load: Dict[str, PluginManifest] = {}
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+            is_outbound_gate = manifest.name == "outbound-message-gate"
 
             # Relay lifecycle ownership now lives in the Hermes core. Loading
             # an old user or entry-point copy would let plugin.initialize()
@@ -4400,9 +4412,13 @@ class PluginManager:
                 )
                 continue
 
-            # Explicit disable always wins (matches on key or on legacy
-            # bare name for back-compat with existing user configs).
+            # Explicit disable always wins, except that a configured protected
+            # target makes disabling the bundled security boundary invalid.
             if lookup_key in disabled or manifest.name in disabled:
+                if is_outbound_gate and outbound_gate_required:
+                    raise RuntimeError(
+                        "outbound-message-gate is mandatory while protected_targets are configured"
+                    )
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
@@ -4469,7 +4485,7 @@ class PluginManager:
             is_enabled = (
                 enabled is not None
                 and (lookup_key in enabled or manifest.name in enabled)
-            )
+            ) or (is_outbound_gate and outbound_gate_required)
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = (
@@ -4492,6 +4508,17 @@ class PluginManager:
             self._warn_python_dependencies(manifest)
             self._validate_plugin_config_schema(manifest)
             self._load_plugin(manifest)
+
+        if outbound_gate_required:
+            callbacks = self._hooks.get("final_gateway_send_policy", [])
+            exact = [
+                callback for callback in callbacks
+                if getattr(callback, "_hermes_policy_id", None) == "outbound-message-gate"
+            ]
+            if len(exact) != 1:
+                raise RuntimeError(
+                    "gateway readiness refused: exact outbound-message-gate policy callback is not loaded"
+                )
 
         if manifests:
             logger.info(

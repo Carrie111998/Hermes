@@ -29,6 +29,11 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+_SAFE_OUTBOUND_POLICY_NOTICE = (
+    "DELIVERY BLOCKED\n\n"
+    "The original message was withheld because outbound safety verification failed."
+)
+
 
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
     """Done-callback retrieving a detached fatal-error handler's exception.
@@ -98,24 +103,10 @@ def bind_outbound_receipt_context(
 
 
 def _outbound_gate_required_for_target(platform: str, chat_id: str) -> bool:
-    """Read the profile-scoped required-target list for fail-closed startup gaps."""
-    try:
-        from hermes_cli.config import load_config
+    """Read the canonical profile-scoped required-target policy fail closed."""
+    from hermes_cli.outbound_policy import outbound_policy_required
 
-        config = load_config() or {}
-        entries = (config.get("plugins") or {}).get("entries") or {}
-        entry = entries.get("outbound-message-gate") or entries.get(
-            "outbound_message_gate"
-        ) or {}
-        settings = entry.get("settings") or entry.get("config") or {}
-        targets = settings.get("protected_targets") or []
-        target = f"{str(platform).lower()}:{chat_id}".lower()
-        return target in {str(item).lower() for item in targets}
-    except Exception:
-        # A malformed/unreadable config cannot silently disable a gate whose
-        # presence was already established by a loaded callback. The wrapper's
-        # hook invocation remains the primary enforcement path.
-        return False
+    return outbound_policy_required(platform, chat_id)
 
 
 def _float_env(name: str, default: float) -> float:
@@ -3123,7 +3114,14 @@ class BasePlatformAdapter(ABC):
         same fail-closed plugin policy.
         """
         super().__init_subclass__(**kwargs)
-        for method_name in ("send", "edit_message"):
+        for method_name in (
+            "send", "edit_message", "send_for_platform", "send_draft",
+            "send_native_task_card_progress", "send_slash_confirm", "send_clarify",
+            "send_exec_approval", "send_approval_request", "send_private_notice",
+            "send_with_keyboard", "send_update_prompt", "send_dm", "send_file", "send_sticker",
+            "send_image", "send_multiple_images", "send_animation", "send_image_file",
+            "send_voice", "send_video", "send_document", "_post_interactive", "_send_media",
+        ):
             implementation = cls.__dict__.get(method_name)
             if implementation is None or getattr(
                 implementation, "_hermes_outbound_gate_wrapped", False
@@ -3141,47 +3139,83 @@ class BasePlatformAdapter(ABC):
     def _wrap_outbound_method(method_name: str, implementation):
         signature = inspect.signature(implementation)
 
+        def _visible_strings(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                found: list[str] = []
+                for key, item in value.items():
+                    if str(key).lower() in {"id", "chat_id", "reply_to", "metadata"}:
+                        continue
+                    found.extend(_visible_strings(item))
+                return found
+            if isinstance(value, (list, tuple)):
+                found = []
+                for item in value:
+                    found.extend(_visible_strings(item))
+                return found
+            return []
+
+        async def _constant_notice(self, chat_id: str, metadata: Any) -> SendResult:
+            wrapped_send = getattr(type(self), "send")
+            original_send = getattr(wrapped_send, "_hermes_outbound_original", None)
+            if original_send is None:
+                return SendResult(success=False, error="outbound policy blocked delivery")
+            send_signature = inspect.signature(original_send)
+            notice_bound = send_signature.bind_partial(
+                self, chat_id, _SAFE_OUTBOUND_POLICY_NOTICE
+            )
+            if "metadata" in send_signature.parameters:
+                notice_bound.arguments["metadata"] = metadata
+            return await original_send(*notice_bound.args, **notice_bound.kwargs)
+
         async def _wrapped(self, *args, **kwargs) -> SendResult:
             # Bind exactly as the implementation would.  Besides preserving
             # positional compatibility, this gives the gate one canonical map
             # to inspect and mutate without injecting duplicate keyword values.
             bound = signature.bind(self, *args, **kwargs)
             bound.apply_defaults()
-            chat_id = str(bound.arguments.get("chat_id") or "")
+            chat_id = str(
+                bound.arguments.get("chat_id")
+                or bound.arguments.get("user_id")
+                or bound.arguments.get("to_account")
+                or ""
+            )
             metadata = bound.arguments.get("metadata")
-            original_content = str(bound.arguments.get("content") or "")
+            excluded = {
+                "self", "chat_id", "user_id", "to_account", "logical_platform",
+                "reply_to", "metadata",
+            }
+            visible: list[str] = []
+            for name, value in bound.arguments.items():
+                if name not in excluded:
+                    visible.extend(_visible_strings(value))
+            original_content = "\n".join(item for item in visible if item)
             try:
-                from hermes_cli.lifecycle import has_hook, invoke_hook
+                from hermes_cli.lifecycle import invoke_hook
 
-                platform_name = _platform_name(getattr(self, "platform", ""))
+                logical_platform = bound.arguments.get("logical_platform")
+                if logical_platform is None and isinstance(metadata, dict):
+                    logical_platform = metadata.get("_relay_logical_platform")
+                if logical_platform is None:
+                    logical_platform = getattr(self, "_platform_by_chat", {}).get(chat_id)
+                platform_name = _platform_name(
+                    logical_platform or getattr(self, "platform", "")
+                )
                 required = _outbound_gate_required_for_target(platform_name, chat_id)
-                if required and not has_hook("pre_gateway_send"):
-                    return SendResult(
-                        success=False,
-                        error="required pre_gateway_send policy hook is unavailable",
-                    )
-
-                decisions = invoke_hook(
+                transform_decisions = invoke_hook(
                     "pre_gateway_send",
                     platform=platform_name,
                     chat_id=chat_id,
                     content=original_content,
                     metadata=metadata,
-                    operation="edit" if method_name == "edit_message" else "send",
+                    operation=method_name,
                 )
-                if required and not decisions:
-                    return SendResult(
-                        success=False,
-                        error="required pre_gateway_send policy returned no decision",
-                    )
             except Exception as exc:
-                return SendResult(
-                    success=False,
-                    error=f"pre_gateway_send policy unavailable: {exc}",
-                )
+                return await _constant_notice(self, chat_id, metadata)
 
             gated_content = original_content
-            for decision in decisions:
+            for decision in transform_decisions:
                 if not isinstance(decision, dict):
                     return SendResult(
                         success=False,
@@ -3189,14 +3223,7 @@ class BasePlatformAdapter(ABC):
                     )
                 action = str(decision.get("action") or "").lower()
                 if action == "block":
-                    return SendResult(
-                        success=False,
-                        error=str(
-                            decision.get("reason")
-                            or decision.get("message")
-                            or "pre_gateway_send policy blocked delivery"
-                        ),
-                    )
+                    return await _constant_notice(self, chat_id, metadata)
                 if action == "rewrite":
                     if not isinstance(decision.get("content"), str):
                         return SendResult(
@@ -3210,11 +3237,53 @@ class BasePlatformAdapter(ABC):
                         error=f"pre_gateway_send policy returned unsupported action: {action}",
                     )
 
-            bound.arguments["content"] = gated_content
+            try:
+                policy_decisions = invoke_hook(
+                    "final_gateway_send_policy",
+                    platform=platform_name,
+                    chat_id=chat_id,
+                    content=gated_content,
+                    metadata=metadata,
+                    operation=method_name,
+                )
+            except Exception:
+                return await _constant_notice(self, chat_id, metadata)
+            gate_decisions = [
+                item for item in policy_decisions
+                if isinstance(item, dict) and item.get("policy_id") == "outbound-message-gate"
+            ]
+            if (
+                len(policy_decisions) != len(gate_decisions)
+                or len(gate_decisions) > 1
+                or (required and len(gate_decisions) != 1)
+            ):
+                return await _constant_notice(self, chat_id, metadata)
+            for decision in gate_decisions:
+                if not isinstance(decision, dict):
+                    return await _constant_notice(self, chat_id, metadata)
+                action = str(decision.get("action") or "").lower()
+                if action == "block":
+                    return await _constant_notice(self, chat_id, metadata)
+                if action == "rewrite":
+                    rewritten = decision.get("content")
+                    if not isinstance(rewritten, str):
+                        return await _constant_notice(self, chat_id, metadata)
+                    gated_content = rewritten
+                elif action not in {"", "allow"}:
+                    return await _constant_notice(self, chat_id, metadata)
+
+            if "content" in bound.arguments:
+                bound.arguments["content"] = gated_content
+            elif gated_content != original_content:
+                # Structured/card/media/interactive payloads cannot be safely
+                # partially rewritten. Suppress them and use the adapter's raw
+                # text send implementation for one host-generated constant.
+                return await _constant_notice(self, chat_id, metadata)
             return await implementation(*bound.args, **bound.kwargs)
 
         functools.update_wrapper(_wrapped, implementation)
         setattr(_wrapped, "_hermes_outbound_gate_wrapped", True)
+        setattr(_wrapped, "_hermes_outbound_original", implementation)
         return _wrapped
 
     # Back-reference to the running ``GatewayRunner``, injected by

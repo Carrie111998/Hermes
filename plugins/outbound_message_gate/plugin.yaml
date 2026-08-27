@@ -4,7 +4,7 @@ description: "Fail-closed outbound URL and success-claim receipt gate for protec
 author: "Paul Larche / Neo"
 hooks:
   - post_tool_call
-  - pre_gateway_send
+  - final_gateway_send_policy
 config_schema:
   protected_targets:
     type: list
@@ -15,3 +15,12 @@ config_schema:
   fetch_timeout_seconds:
     type: float
     default: 10
+  max_urls:
+    type: int
+    default: 8
+  status_exceptions:
+    type: list
+    default: []
+  allowed_verifiers:
+    type: dict
+    default: {}

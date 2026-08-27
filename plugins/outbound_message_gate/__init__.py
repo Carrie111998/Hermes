@@ -9,13 +9,16 @@ the enforcement path.
 from __future__ import annotations
 
 import re
+import ipaddress
+import http.client
+import socket
+import ssl
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlsplit
 
 
 _URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\[\]{}\"']+", re.IGNORECASE)
@@ -34,6 +37,10 @@ _PASS_RE = re.compile(r"(?:\bPASS\b|\bpassed\b|\bsuccess\b|\bexit_code\s*[=:]\s*
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}>'\""
 _LINKEDIN_MARKERS = ("authorize=PASS", "post=PASS", "public_url=PASS", "fetch=PASS")
 _MAX_RECEIPTS = 256
+SAFE_POLICY_FAILURE_NOTICE = (
+    "DELIVERY BLOCKED\n\n"
+    "The original message was withheld because outbound safety verification failed."
+)
 
 
 @dataclass(frozen=True)
@@ -41,9 +48,16 @@ class ToolReceipt:
     session_id: str
     turn_id: str
     tool_name: str
-    command: str
-    output: str
-    status: str
+    check_id: str
+    verifier_id: str
+    journey_id: str
+    exit_status: int
+    build_id: str
+    runtime_id: str
+    timestamp: str
+    output_digest: str
+    public_url: str
+    public_fetch_ok: bool
 
 
 _receipts: list[ToolReceipt] = []
@@ -69,21 +83,54 @@ def record_tool_result(
     args: Mapping[str, Any] | None = None,
     result: Any = None,
     status: str = "",
+    allowed_verifiers: Mapping[str, Mapping[str, Any]] | None = None,
     **_: Any,
 ) -> None:
-    if not session_id or not turn_id:
+    if not session_id or not turn_id or not isinstance(result, Mapping):
         return
-    command = ""
-    if isinstance(args, Mapping):
-        command = str(args.get("command") or args.get("code") or "")
+    payload = result.get("outbound_verifier_receipt")
+    if not isinstance(payload, Mapping) or not isinstance(allowed_verifiers, Mapping):
+        return
+    verifier_id = str(payload.get("verifier_id") or "")
+    verifier = allowed_verifiers.get(verifier_id)
+    if not isinstance(verifier, Mapping):
+        return
+    check_id = str(payload.get("check_id") or "")
+    journey_id = str(payload.get("journey_id") or "")
+    if (
+        str(tool_name) != str(verifier.get("tool_name") or "")
+        or check_id != str(verifier.get("check_id") or "")
+        or journey_id != str(verifier.get("journey_id") or "")
+        or str(payload.get("session_id") or "") != str(session_id)
+        or str(payload.get("turn_id") or "") != str(turn_id)
+        or str(status or "").lower() not in {"success", "ok", "completed"}
+    ):
+        return
+    digest = str(payload.get("output_digest") or "")
+    try:
+        exit_status = int(payload.get("exit_status", -1))
+    except (TypeError, ValueError):
+        return
+    if exit_status != 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return
+    public_fetch = payload.get("public_fetch")
     receipt = ToolReceipt(
         session_id=str(session_id),
         turn_id=str(turn_id),
         tool_name=str(tool_name),
-        command=command,
-        output=_stringify_result(result),
-        status=str(status or ""),
+        check_id=check_id,
+        verifier_id=verifier_id,
+        journey_id=journey_id,
+        exit_status=0,
+        build_id=str(payload.get("build_id") or ""),
+        runtime_id=str(payload.get("runtime_id") or ""),
+        timestamp=str(payload.get("timestamp") or ""),
+        output_digest=digest,
+        public_url=str(payload.get("public_url") or ""),
+        public_fetch_ok=bool(isinstance(public_fetch, Mapping) and public_fetch.get("ok") is True),
     )
+    if not receipt.build_id or not receipt.runtime_id or not receipt.timestamp:
+        return
     with _lock:
         _receipts.append(receipt)
         if len(_receipts) > _MAX_RECEIPTS:
@@ -99,41 +146,129 @@ def _extract_urls(content: str) -> list[str]:
     return urls
 
 
-def fetch_url_live(url: str, timeout: float = 10.0) -> dict[str, Any]:
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, hostname: str, port: int, address: str, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._address, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname: str, port: int, address: str, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._address = address
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._address, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+
+def _request_pinned(url: str, addresses: set[ipaddress._BaseAddress], timeout: float) -> dict[str, Any]:
+    """GET one URL through a previously validated and now pinned IP address."""
     parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return {"ok": False, "status": None, "final_url": "", "error": "unsupported or malformed URL"}
-    request = Request(
-        url,
-        headers={"User-Agent": "Hermes-Outbound-Link-Gate/1.0", "Accept": "*/*"},
-        method="GET",
-    )
-    try:
-        with urlopen(request, timeout=max(0.1, float(timeout))) as response:
-            status = int(getattr(response, "status", response.getcode()))
-            final_url = str(response.geturl())
-            response.read(1024)
-    except HTTPError as exc:
-        status = int(exc.code)
-        final_url = str(exc.geturl() or url)
-        # OAuth callbacks and protected resources can be reachable while a bare
-        # probe lacks state/auth.  Dead/not-gone and server failures still block.
-        ok = status not in {404, 410} and status < 500
-        return {
-            "ok": ok,
-            "status": status,
-            "final_url": final_url,
-            "error": "" if ok else f"HTTP {status}",
-        }
-    except (URLError, TimeoutError, OSError, ValueError) as exc:
-        return {"ok": False, "status": None, "final_url": "", "error": str(exc)}
-    ok = status not in {404, 410} and status < 500
-    return {
-        "ok": ok,
-        "status": status,
-        "final_url": final_url,
-        "error": "" if ok else f"HTTP {status}",
-    }
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    last_error: Exception | None = None
+    for address in sorted(addresses, key=str):
+        connection_cls = _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+        connection = connection_cls(str(parsed.hostname), port, str(address), timeout)
+        try:
+            connection.request(
+                "GET",
+                path,
+                headers={"User-Agent": "Hermes-Outbound-Link-Gate/2.0", "Accept": "*/*"},
+            )
+            response = connection.getresponse()
+            return {
+                "status": int(response.status),
+                "headers": {str(k).lower(): str(v) for k, v in response.getheaders()},
+                "body": response.read(1024),
+            }
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            connection.close()
+    raise OSError(str(last_error or "connection failed"))
+
+
+def _status_is_allowed_exception(
+    parsed, status: int, status_exceptions: tuple[Mapping[str, Any], ...]
+) -> bool:
+    for item in status_exceptions:
+        if str(item.get("host") or "").lower() != str(parsed.hostname or "").lower():
+            continue
+        if str(item.get("path") or "") != (parsed.path or "/"):
+            continue
+        statuses = item.get("statuses")
+        if isinstance(statuses, (list, tuple, set)) and status in {int(value) for value in statuses}:
+            return True
+    return False
+
+
+def fetch_url_live(
+    url: str,
+    timeout: float = 10.0,
+    *,
+    resolver: Callable[..., Any] = socket.getaddrinfo,
+    requester: Callable[[str, set[ipaddress._BaseAddress], float], Mapping[str, Any]] = _request_pinned,
+    status_exceptions: tuple[Mapping[str, Any], ...] = (),
+    max_redirects: int = 3,
+) -> dict[str, Any]:
+    """Fetch a public HTTP(S) URL with per-hop validation and DNS pinning."""
+    current = str(url or "")
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    for hop in range(max_redirects + 1):
+        parsed = urlsplit(current)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return {"ok": False, "status": None, "final_url": "", "error": "unsupported or malformed URL"}
+        if parsed.username is not None or parsed.password is not None:
+            return {"ok": False, "status": None, "final_url": "", "error": "credential-bearing URL is forbidden"}
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            return {"ok": False, "status": None, "final_url": "", "error": "unsupported or malformed URL"}
+        if port not in {80, 443}:
+            return {"ok": False, "status": None, "final_url": "", "error": "unsafe destination port"}
+        try:
+            literal = ipaddress.ip_address(str(parsed.hostname))
+            addresses = {literal}
+        except ValueError:
+            try:
+                addresses = {
+                    ipaddress.ip_address(item[4][0])
+                    for item in resolver(parsed.hostname, port, type=socket.SOCK_STREAM)
+                }
+            except (OSError, ValueError, TypeError):
+                addresses = set()
+        if not addresses or any(not address.is_global for address in addresses):
+            return {"ok": False, "status": None, "final_url": "", "error": "destination is not public"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"ok": False, "status": None, "final_url": "", "error": "fetch timeout"}
+        try:
+            response = requester(current, addresses, remaining)
+            status = int(response.get("status"))
+            headers = response.get("headers") or {}
+        except (OSError, TimeoutError, ValueError, TypeError) as exc:
+            return {"ok": False, "status": None, "final_url": "", "error": str(exc)}
+        if status in {301, 302, 303, 307, 308}:
+            location = headers.get("location") if isinstance(headers, Mapping) else None
+            if not location:
+                return {"ok": False, "status": status, "final_url": current, "error": "redirect missing location"}
+            if hop >= max_redirects:
+                return {"ok": False, "status": status, "final_url": current, "error": "too many redirects"}
+            redirected = urljoin(current, str(location))
+            if parsed.scheme == "https" and urlsplit(redirected).scheme != "https":
+                return {"ok": False, "status": status, "final_url": current, "error": "HTTPS downgrade redirect"}
+            current = redirected
+            continue
+        ok = 200 <= status < 300 or _status_is_allowed_exception(parsed, status, status_exceptions)
+        return {"ok": ok, "status": status, "final_url": current, "error": "" if ok else f"HTTP {status}"}
+    return {"ok": False, "status": None, "final_url": current, "error": "too many redirects"}
 
 
 def normalize_target(platform: str, chat_id: str | None = None) -> str:
@@ -183,17 +318,15 @@ def _safe_dead_url_label(url: str) -> str:
     return f"{parsed.netloc} {path}".strip()
 
 
-def _receipt_for_turn(session_id: str, turn_id: str, output: str) -> ToolReceipt | None:
-    if not session_id or not turn_id or not output:
+def _receipt_for_turn(session_id: str, turn_id: str, check_id: str) -> ToolReceipt | None:
+    if not session_id or not turn_id or not check_id:
         return None
     with _lock:
         candidates = tuple(_receipts)
     for receipt in reversed(candidates):
         if receipt.session_id != session_id or receipt.turn_id != turn_id:
             continue
-        if receipt.status.lower() not in {"success", "ok", "completed"}:
-            continue
-        if output not in receipt.output:
+        if receipt.check_id != check_id:
             continue
         return receipt
     return None
@@ -220,92 +353,120 @@ def gate_outbound_message(
         return {"action": "allow"}
 
     text = str(content or "")
-    fetch = fetcher or (
-        lambda url: fetch_url_live(url, float(settings.get("fetch_timeout_seconds", 10.0)))
-    )
+    raw_status_exceptions = settings.get("status_exceptions", [])
+    if not isinstance(raw_status_exceptions, list) or any(
+        not isinstance(item, Mapping) for item in raw_status_exceptions
+    ):
+        raise ValueError("status_exceptions must be a list of mappings")
+    timeout_seconds = max(0.1, float(settings.get("fetch_timeout_seconds", 10.0)))
+    deadline = time.monotonic() + timeout_seconds
+    urls = _extract_urls(text)
+    try:
+        max_urls = int(settings.get("max_urls", 8))
+    except (TypeError, ValueError):
+        max_urls = 8
+    if max_urls < 1 or len(urls) > max_urls:
+        return {
+            "action": "rewrite",
+            "reason": "url_check_failed",
+            "content": SAFE_POLICY_FAILURE_NOTICE,
+        }
+    fetch = fetcher
     failed: list[tuple[str, Mapping[str, Any]]] = []
-    for url in _extract_urls(text):
+    for url in urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            failed.append((url, {"ok": False, "error": "total preflight timeout"}))
+            break
         try:
-            result = fetch(url)
+            result = (
+                fetch(url)
+                if fetch is not None
+                else fetch_url_live(
+                    url,
+                    remaining,
+                    status_exceptions=tuple(raw_status_exceptions),
+                )
+            )
         except Exception as exc:  # policy dependencies fail closed
             result = {"ok": False, "status": None, "error": str(exc), "final_url": ""}
         if not result.get("ok"):
             failed.append((url, result))
     if failed:
-        lines = ["LINK CHECK BLOCKED", "", "The original message was not delivered because a URL failed its immediate live fetch:"]
-        for url, result in failed:
-            detail = result.get("error") or (
-                f"HTTP {result.get('status')}" if result.get("status") is not None else "fetch failed"
-            )
-            lines.append(f"- {_safe_dead_url_label(url)}: {detail}")
-        return {"action": "rewrite", "reason": "url_check_failed", "content": "\n".join(lines)}
+        return {
+            "action": "rewrite",
+            "reason": "url_check_failed",
+            "content": SAFE_POLICY_FAILURE_NOTICE,
+        }
 
     if not _contains_success_claim(text, settings):
         return {"action": "allow"}
 
-    receipt_match = _RECEIPT_RE.search(text)
-    output_match = _OUTPUT_RE.search(text)
-    if not receipt_match or not output_match:
-        return _unverified(
-            text,
-            "claim_receipt_missing",
-            "a named same-turn ratchet or journey receipt and its passing output",
-        )
-    receipt_name = receipt_match.group(1).strip()
-    passing_output = output_match.group(1).strip()
-    if not re.search(r"(?:ratchet|journey)", receipt_name, re.IGNORECASE):
-        return _unverified(text, "claim_receipt_missing", "a named ratchet or journey check")
-    if not _LIVE_BUILD_RE.search(passing_output) or not _PASS_RE.search(passing_output):
-        return _unverified(text, "claim_receipt_missing", "passing output naming the live BUILD_ID")
-
     meta = metadata if isinstance(metadata, Mapping) else {}
+    workflow_id = str(meta.get("outbound_workflow_id") or "").strip().lower()
+    linkedin_claim = workflow_id in {"linkedin", "li-publishing"} or bool(
+        re.search(r"\b(?:linkedin|li\s+publishing|publishing\s+flow)\b", text, re.IGNORECASE)
+    )
+    check_id = "linkedin-public-post-journey" if linkedin_claim else str(
+        meta.get("_outbound_claim_check_id") or ""
+    )
     receipt = _receipt_for_turn(
         str(meta.get("_hermes_session_id") or ""),
         str(meta.get("_hermes_turn_id") or ""),
-        passing_output,
+        check_id,
     )
     if receipt is None:
         return _unverified(
             text,
             "claim_receipt_missing",
-            "passing output produced by a tool in this same session turn",
+            "a structured receipt from an allowlisted verifier in this same session turn",
         )
 
-    if re.search(r"linkedin", text, re.IGNORECASE):
-        missing = [marker for marker in _LINKEDIN_MARKERS if marker not in passing_output]
-        if receipt_name.lower() != "linkedin-public-post-journey" or missing:
+    if linkedin_claim:
+        if (
+            receipt.journey_id != "linkedin-public-post-journey"
+            or not receipt.public_url
+            or not receipt.public_fetch_ok
+        ):
             return _unverified(
                 text,
                 "linkedin_journey_incomplete",
-                "LinkedIn receipt linkedin-public-post-journey with " + ", ".join(_LINKEDIN_MARKERS),
+                "LinkedIn receipt linkedin-public-post-journey with a public URL and passing fresh public fetch",
             )
     return {"action": "allow"}
 
 
 def _build_settings(ctx) -> dict[str, Any]:
-    return {
-        "protected_targets": ctx.get_config("protected_targets", []),
-        "success_terms": ctx.get_config("success_terms", list(_DEFAULT_SUCCESS_TERMS)),
-        "fetch_timeout_seconds": ctx.get_config("fetch_timeout_seconds", 10.0),
-    }
+    del ctx
+    from hermes_cli.outbound_policy import outbound_policy_settings
+
+    return outbound_policy_settings()
 
 
 def register(ctx) -> None:
-    ctx.register_hook("post_tool_call", record_tool_result)
+    def _record(**kwargs: Any) -> None:
+        record_tool_result(
+            **kwargs,
+            allowed_verifiers=_build_settings(ctx).get("allowed_verifiers", {}),
+        )
 
-    def _pre_gateway_send(
+    ctx.register_hook("post_tool_call", _record)
+
+    def _final_gateway_send_policy(
         platform: str = "",
         chat_id: str = "",
         content: str = "",
         metadata: Mapping[str, Any] | None = None,
         **_: Any,
     ) -> dict[str, str]:
-        return gate_outbound_message(
+        decision = gate_outbound_message(
             platform=platform,
             chat_id=chat_id,
             content=content,
             metadata=metadata,
             settings=_build_settings(ctx),
         )
+        return {"policy_id": "outbound-message-gate", **decision}
 
-    ctx.register_hook("pre_gateway_send", _pre_gateway_send)
+    setattr(_final_gateway_send_policy, "_hermes_policy_id", "outbound-message-gate")
+    ctx.register_hook("final_gateway_send_policy", _final_gateway_send_policy)
