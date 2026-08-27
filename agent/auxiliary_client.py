@@ -62,6 +62,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.message_content import flatten_message_text
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -10193,8 +10195,8 @@ def extract_content_or_reasoning(response) -> str:
     Qwen-QwQ, etc.) returns ``content=None`` with reasoning in structured fields.
 
     Resolution order:
-      1. ``message.content`` — strip inline think/reasoning blocks, check for
-         remaining non-whitespace text.
+      1. ``message.content`` — flatten string or typed content-part shapes,
+         strip inline think/reasoning blocks, and check for remaining text.
       2. ``message.reasoning`` / ``message.reasoning_content`` — direct
          structured reasoning fields (DeepSeek, Moonshot, NovitaAI, etc.).
       3. ``message.reasoning_details`` — OpenRouter unified array format.
@@ -10204,7 +10206,7 @@ def extract_content_or_reasoning(response) -> str:
     import re
 
     msg = response.choices[0].message
-    content = (msg.content or "").strip()
+    content = flatten_message_text(msg.content).strip()
 
     if content:
         # Strip inline think/reasoning blocks (mirrors _strip_think_blocks)
