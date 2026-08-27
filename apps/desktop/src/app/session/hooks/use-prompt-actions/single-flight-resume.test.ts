@@ -54,6 +54,42 @@ describe('singleFlightSessionResume', () => {
     expect(requestGateway).toHaveBeenCalledTimes(2)
   })
 
+  it('same stored id resumes independently for different exact owner recovery keys', async () => {
+    const requests: string[] = []
+
+    const requestA = vi.fn(async () => {
+      requests.push('owner-a')
+      await new Promise(resolve => setTimeout(resolve, 10))
+
+      return { session_id: 'rt-owner-a' }
+    })
+
+    const requestB = vi.fn(async () => {
+      requests.push('owner-b')
+
+      return { session_id: 'rt-owner-b' }
+    })
+
+    const [a, b] = await Promise.all([
+      resumeStoredRuntimeSession('stored-shared', {
+        recoveryKey: 'owner-a\0profile\0stored-shared',
+        requestGateway: requestA as never,
+        resolveProfile: async () => 'profile'
+      }),
+      resumeStoredRuntimeSession('stored-shared', {
+        recoveryKey: 'owner-b\0profile\0stored-shared',
+        requestGateway: requestB as never,
+        resolveProfile: async () => 'profile'
+      })
+    ])
+
+    expect(a).toBe('rt-owner-a')
+    expect(b).toBe('rt-owner-b')
+    expect(requests).toEqual(expect.arrayContaining(['owner-a', 'owner-b']))
+    expect(requestA).toHaveBeenCalledOnce()
+    expect(requestB).toHaveBeenCalledOnce()
+  })
+
   it('a rejected flight is not cached: the next caller retries', async () => {
     const run = vi
       .fn<() => Promise<{ session_id: string }>>()
@@ -131,5 +167,36 @@ describe('drift-abort recovered-runtime cache', () => {
 
     expect(takeRecoveredRuntime('stored-a', 'rt-dead')).toBeUndefined()
     expect(takeRecoveredRuntime('stored-a')).toBeUndefined()
+  })
+
+  it('does not reuse a drift-aborted recovered runtime from another exact owner', async () => {
+    const deadThenLive = (deadId: string) => async (liveId: string) => {
+      if (liveId === deadId) {
+        throw new Error(`session not found: ${deadId}`)
+      }
+
+      return liveId
+    }
+
+    await expect(
+      withSessionNotFoundResume('rt-dead-a', 'stored-shared', deadThenLive('rt-dead-a'), {
+        driftReason: () => 'owner A navigated away',
+        recoveryKey: 'owner-a\0profile\0stored-shared',
+        requestGateway: vi.fn(async () => ({ session_id: 'rt-owner-a' })) as never,
+        resolveProfile: async () => 'profile'
+      })
+    ).rejects.toThrow(SessionRecoveryAborted)
+
+    const requestB = vi.fn(async () => ({ session_id: 'rt-owner-b' }))
+
+    const outcome = await withSessionNotFoundResume('rt-dead-b', 'stored-shared', deadThenLive('rt-dead-b'), {
+      recoveryKey: 'owner-b\0profile\0stored-shared',
+      requestGateway: requestB as never,
+      resolveProfile: async () => 'profile'
+    })
+
+    expect(outcome.sessionId).toBe('rt-owner-b')
+    expect(requestB).toHaveBeenCalledOnce()
+    expect(takeRecoveredRuntime('owner-a\0profile\0stored-shared')).toBe('rt-owner-a')
   })
 })
