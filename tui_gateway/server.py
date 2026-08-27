@@ -36,7 +36,10 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
-from agent.context_compressor import awaiting_post_compression_usage
+from agent.context_compressor import (
+    awaiting_post_compression_usage,
+    context_gauge,
+)
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
@@ -6118,9 +6121,10 @@ def _get_usage(agent) -> dict:
             last_prompt = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max and last_prompt:
-            usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
+            usage["context_used"], usage["context_percent"] = context_gauge(
+                last_prompt, ctx_max
+            )
         elif ctx_max and awaiting_post_compression_usage(comp):
             # Bridge the one transitional turn between a compaction and the
             # next provider-reported usage.
@@ -6136,10 +6140,13 @@ def _get_usage(agent) -> dict:
             # awaiting_post_compression_usage() are written only by the built-in
             # compressor's post-compaction path, so an external context engine
             # that doesn't report last_prompt_tokens still emits no gauge.
-            rough = comp.last_compression_rough_tokens
-            usage["context_used"] = rough
             usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(rough / ctx_max * 100)))
+            usage["context_used"], usage["context_percent"] = context_gauge(
+                comp.last_compression_rough_tokens, ctx_max
+            )
+            # Lets a client mark the bridged reading as an estimate. Rendering is
+            # a deliberate follow-up (see the CLI snapshot for the same note).
+            usage["context_estimated"] = True
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status

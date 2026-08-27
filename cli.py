@@ -54,7 +54,10 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
-from agent.context_compressor import awaiting_post_compression_usage
+from agent.context_compressor import (
+    awaiting_post_compression_usage,
+    context_gauge,
+)
 from agent.interrupt_compat import request_hard_interrupt
 
 # prompt_toolkit for fixed input area TUI
@@ -6303,6 +6306,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "context_tokens": 0,
             "context_length": None,
             "context_percent": None,
+            "context_estimated": False,
             "session_input_tokens": 0,
             "session_output_tokens": 0,
             "session_cache_read_tokens": 0,
@@ -6428,11 +6432,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # above, which rendered a hard "0 / 0%" — as if the context had
                 # been emptied rather than summarised. See
                 # awaiting_post_compression_usage() for why both compressor
-                # fields have to be consulted.
+                # fields have to be consulted, and for why this lasts one turn.
                 if not context_tokens and awaiting_post_compression_usage(compressor):
                     context_tokens = compressor.last_compression_rough_tokens
-                    snapshot["context_tokens"] = context_tokens
-                snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+                    # Flagged so read-outs can distinguish this estimate from a
+                    # provider-reported count. Rendering is deliberately left to
+                    # a follow-up: the CLI live bar, `hermes status`, and
+                    # appChrome.tsx all consume this payload, and reworking three
+                    # surfaces is its own change.
+                    snapshot["context_estimated"] = True
+                context_tokens, snapshot["context_percent"] = context_gauge(
+                    context_tokens, context_length
+                )
+                snapshot["context_tokens"] = context_tokens
 
         return snapshot
 

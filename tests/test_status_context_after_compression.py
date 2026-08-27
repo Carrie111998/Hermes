@@ -22,7 +22,10 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import cli as cli_mod  # noqa: F401 - import side effects mirror the other CLI tests
-from agent.context_compressor import awaiting_post_compression_usage
+from agent.context_compressor import (
+    awaiting_post_compression_usage,
+    context_gauge,
+)
 from cli import HermesCLI
 from tui_gateway import server
 
@@ -103,11 +106,13 @@ class TestCLIStatusBarAfterCompression:
         snap = _cli_snapshot(_compressor(last_prompt=-1, awaiting=True, rough=ROUGH))
         assert snap["context_tokens"] == ROUGH
         assert snap["context_percent"] == 60
+        assert snap["context_estimated"] is True
 
     def test_normal_turn_uses_real_usage(self):
         snap = _cli_snapshot(_compressor(last_prompt=50_000, awaiting=False, rough=ROUGH))
         assert snap["context_tokens"] == 50_000
         assert snap["context_percent"] == 25
+        assert snap["context_estimated"] is False
 
     def test_later_zero_usage_turn_does_not_resurrect_the_estimate(self):
         # A provider (or a proxied stream without usage) reporting 0 long after
@@ -133,6 +138,7 @@ class TestGatewayUsageAfterCompression:
         assert usage["context_used"] == ROUGH
         assert usage["context_max"] == CTX_MAX
         assert usage["context_percent"] == 60
+        assert usage["context_estimated"] is True
         # Without context_max the TUI would show this cumulative total instead.
         assert usage["total"] == 1_900_000
 
@@ -142,6 +148,7 @@ class TestGatewayUsageAfterCompression:
         )
         assert usage["context_used"] == 50_000
         assert usage["context_percent"] == 25
+        assert "context_estimated" not in usage
 
     def test_external_context_engine_still_emits_no_gauge(self):
         # #50421: an engine that doesn't track per-window occupancy must not get
@@ -165,3 +172,74 @@ class TestGatewayUsageAfterCompression:
         )
         assert "context_used" not in usage
         assert "context_max" not in usage
+
+
+# ── shared gauge math ─────────────────────────────────────────────────────
+
+
+class TestContextGauge:
+    """One helper owns the clamp + rounding for both surfaces."""
+
+    def test_ordinary_reading(self):
+        assert context_gauge(50_000, 200_000) == (50_000, 25)
+
+    def test_rough_estimate_above_the_window_is_clamped_to_it(self):
+        # The rough estimator intentionally over-counts schema-heavy requests,
+        # so a post-compaction estimate can exceed context_length. Reporting
+        # "180k / 150k" next to a 100%-clamped bar made the two halves of the
+        # read-out contradict each other; clamp the used figure too.
+        assert context_gauge(180_000, 150_000) == (150_000, 100)
+
+    def test_zero_window_yields_zero_percent_not_a_zero_division(self):
+        assert context_gauge(1_000, 0) == (1_000, 0)
+
+    def test_negative_and_none_are_floored(self):
+        assert context_gauge(-5, 200_000) == (0, 0)
+        assert context_gauge(None, 200_000) == (0, 0)
+
+
+# ── the bridge is bounded to one turn ─────────────────────────────────────
+
+
+class TestBridgeIsBoundedToOneTurn:
+    """A usage-less provider must not pin the gauge to a stale estimate.
+
+    Both guarantees live in the real compressor, so exercise the real class
+    rather than a stand-in.
+    """
+
+    def _real_compressor(self):
+        """A really-constructed compressor parked in the post-compaction state.
+
+        Constructed through __init__ rather than assembled attribute-by-attribute
+        so the test exercises the same object the agent loop hands to the status
+        surfaces (threshold_tokens is a lazy property with several dependencies).
+        """
+        from agent.context_compressor import ContextCompressor
+
+        comp = ContextCompressor(model="test-model", config_context_length=CTX_MAX)
+        # What conversation_compression.py leaves behind after a compaction.
+        comp.last_prompt_tokens = -1
+        comp.awaiting_real_usage_after_compression = True
+        comp.last_compression_rough_tokens = ROUGH
+        comp.compression_count = 1
+        return comp
+
+    def test_response_with_no_usage_still_clears_the_flag(self):
+        comp = self._real_compressor()
+        assert awaiting_post_compression_usage(comp)
+        # conversation_loop.py calls update_from_response({}) exactly when a
+        # response carries no usage while this flag is armed.
+        comp.update_from_response({})
+        assert not awaiting_post_compression_usage(comp), (
+            "a usage-less response must consume the pending flag, otherwise the "
+            "estimate would pin the gauge for the rest of the session"
+        )
+
+    def test_real_usage_clears_the_flag(self):
+        comp = self._real_compressor()
+        comp.update_from_response({"prompt_tokens": 140_000, "completion_tokens": 10})
+        assert not awaiting_post_compression_usage(comp)
+        # The estimate itself is deliberately NOT zeroed — it stays available as
+        # a preflight baseline — which is why the predicate needs both fields.
+        assert comp.last_compression_rough_tokens == ROUGH
