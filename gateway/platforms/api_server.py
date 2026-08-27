@@ -7249,6 +7249,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if isinstance(result.get("messages"), list):
                         result["_transcript_mode"] = FULL_TRANSCRIPT_MODE
+                        result["_current_turn_user_idx"] = getattr(
+                            agent, "_persist_user_message_idx", None
+                        )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

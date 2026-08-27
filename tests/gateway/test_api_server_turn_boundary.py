@@ -1,5 +1,6 @@
 """Responses API turn-boundary contract regressions."""
 
+import copy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from agent.context_compressor import (
     SUMMARY_PREFIX,
     _SUMMARY_END_MARKER,
 )
+from agent.agent_runtime_helpers import repair_message_sequence
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.response_turn_boundary import (
@@ -403,6 +405,83 @@ class TestTurnStartRobustnessE2E:
         assert completed_messages[1]["tool_call_id"] == "current-call"
 
     @pytest.mark.asyncio
+    async def test_duplicate_user_text_after_pass2_merge_keeps_only_current_call(
+        self, adapter
+    ):
+        """An older equal-text row cannot steal a rewritten current-turn anchor."""
+        user_message = "repeat this request"
+        prior = [
+            {"role": "user", "content": user_message},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "old-call",
+                    "function": {"name": "old_tool", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "old-call", "content": "old"},
+            {"role": "assistant", "content": "old result"},
+            {"role": "user", "content": "unfinished redirect"},
+        ]
+        transcript = [
+            *copy.deepcopy(prior),
+            {"role": "user", "content": user_message},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "current-call",
+                    "function": {"name": "current_tool", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "current-call", "content": "current"},
+            {"role": "assistant", "content": "current result"},
+        ]
+        owner = MagicMock()
+        owner._persist_user_message_idx = len(prior)
+        assert repair_message_sequence(owner, transcript) == 1
+        assert transcript[4]["content"] == "unfinished redirect\n\nrepeat this request"
+        assert owner._persist_user_message_idx == 4
+        result = {
+            "final_response": "current result",
+            "messages": transcript,
+            "_transcript_mode": "full",
+            "_current_turn_user_idx": owner._persist_user_message_idx,
+        }
+
+        # Canonical boundary witness: typed ownership wins over the older raw
+        # text match that content-only re-anchoring would otherwise select.
+        assert response_messages_turn_start_index(prior, user_message, result) == 5
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": user_message,
+                        "conversation_history": prior,
+                    },
+                )
+                assert response.status == 200
+                data = await response.json()
+
+        assert [item["type"] for item in data["output"]] == [
+            "function_call",
+            "function_call_output",
+            "message",
+        ]
+        assert data["output"][0]["call_id"] == "current-call"
+        assert data["output"][1]["call_id"] == "current-call"
+        assert all(item.get("call_id") != "old-call" for item in data["output"])
+
+    @pytest.mark.asyncio
     async def test_normal_agent_run_marks_list_messages_as_full(self, adapter):
         transcript = [
             {"role": "user", "content": "hello"},
@@ -416,6 +495,7 @@ class TestTurnStartRobustnessE2E:
         mock_agent.session_prompt_tokens = 0
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
+        mock_agent._persist_user_message_idx = 0
 
         with patch.object(adapter, "_create_agent", return_value=mock_agent):
             result, _ = await adapter._run_agent(
@@ -426,6 +506,7 @@ class TestTurnStartRobustnessE2E:
 
         assert result["messages"] == transcript
         assert result["_transcript_mode"] == "full"
+        assert result["_current_turn_user_idx"] == 0
 
     @pytest.mark.parametrize(
         "actual, expected",

@@ -62,7 +62,11 @@ def response_messages_turn_start_index(
         return 0
 
     if result.get("_transcript_mode") == FULL_TRANSCRIPT_MODE:
-        current_user_idx = reanchor_current_turn_user_idx(agent_messages, user_message)
+        current_user_idx = reanchor_current_turn_user_idx(
+            agent_messages,
+            user_message,
+            result.get("_current_turn_user_idx"),
+        )
         return current_user_idx + 1 if current_user_idx >= 0 else len(agent_messages)
 
     prior = list(conversation_history)

@@ -258,7 +258,11 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
 
 
-def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
+def reanchor_current_turn_user_idx(
+    messages: List[Any],
+    user_message: Any,
+    current_turn_user_idx: Optional[int] = None,
+) -> int:
     """Locate this turn's user message after compaction rebuilt ``messages``.
 
     Compression replaces list entries with fresh copies (and may append a
@@ -273,8 +277,22 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     must never become the fallback anchor (#80622) — they are reference-only
     scaffolding, not the active ask. Returns -1 when the list has no
     user-originated message at all.
+
+    A caller that still owns a typed current-turn index should pass it. That
+    provenance is authoritative even when alternation repair merged the ask
+    into an older user row whose rewritten content no longer equals
+    ``user_message``. Content matching remains the compatibility fallback for
+    compaction paths that rebuild the list and invalidate the old index.
     """
     from agent.context_compressor import user_originated_turn_view
+
+    if (
+        isinstance(current_turn_user_idx, int)
+        and 0 <= current_turn_user_idx < len(messages)
+        and isinstance(messages[current_turn_user_idx], dict)
+        and messages[current_turn_user_idx].get("role") == "user"
+    ):
+        return current_turn_user_idx
 
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
