@@ -92,6 +92,27 @@ from typing import Any, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+# Shadow-capture module for training substrate: record every dispatch for eval set
+# Module lives in ~/.hermes/workspace/infra/, managed separately from core
+_shadow_capture_available = False
+_shadow_record_dispatch = None
+_shadow_determine_verdict = None
+try:
+    import importlib.util
+    shadow_capture_path = Path.home() / ".hermes" / "workspace" / "infra" / "shadow_capture.py"
+    if shadow_capture_path.exists():
+        spec = importlib.util.spec_from_file_location("shadow_capture", shadow_capture_path)
+        if spec is not None and spec.loader is not None:
+            shadow_capture_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(shadow_capture_module)
+            _shadow_record_dispatch = getattr(shadow_capture_module, "record_dispatch", None)
+            _shadow_determine_verdict = getattr(shadow_capture_module, "determine_classifier_verdict", None)
+            _shadow_capture_available = bool(_shadow_record_dispatch)
+except Exception:
+    # Best-effort: if shadow_capture module fails to load, dispatch continues normally
+    # Never let shadow-capture failures block real dispatch.
+    pass
+
 _log = logging.getLogger(__name__)
 
 
@@ -5367,81 +5388,11 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-def complete_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    result: Optional[str] = None,
-    summary: Optional[str] = None,
-    metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None,
-    expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True,
-) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
-
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence. ``review`` is accepted so a human
-    (or reviewer) can approve a task parked in the review lane by
-    :func:`request_review` — even when it has no active run
-    (``current_run_id IS NULL``), the handoff fields are preserved via
-    :func:`_synthesize_ended_run`.
-
-    ``summary`` and ``metadata`` are stored on the closing run (if any)
-    and surfaced to downstream children via :func:`build_worker_context`.
-    When ``summary`` is omitted we fall back to ``result`` so single-run
-    callers do not have to pass both. ``metadata`` is a free-form dict
-    (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
-    are encouraged to use it for structured handoff facts.
-
-    ``created_cards`` is an optional list of task ids the completing
-    worker claims to have created. Each id is verified against
-    ``tasks.created_by``. If any id is phantom (does not exist or was
-    not created by this worker's assignee profile), completion is blocked
-    with a ``HallucinatedCardsError`` and a
-    ``completion_blocked_hallucination`` event is emitted so the rejected
-    attempt is auditable. When all ids verify, they are recorded on the
-    ``completed`` event payload.
-
-    After a successful completion, ``summary`` and ``result`` are scanned
-    for prose references like ``t_deadbeefcafe`` that do not resolve.
-    Any suspected phantom references are recorded as a
-    ``suspected_hallucinated_references`` event. This pass is advisory
-    and never blocks.
-    """
-    now = int(time.time())
-    # Fail before validating cards or staging artifacts; re-check inside the
-    # final write transaction below to close the parent-reopen race.
-    if not _parents_satisfied(conn, task_id):
-        return False
-
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
-    # completion still needs an auditable event, so we emit it in a
-    # tiny dedicated txn, then raise. The caller is responsible for
-    # surfacing HallucinatedCardsError to the worker; this function
-    # never mutates task state on a phantom-card rejection.
-    if created_cards:
-        verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
-        )
-        if phantom_cards:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "completion_blocked_hallucination",
-                    {
-                        "phantom_cards": phantom_cards,
-                        "verified_cards": verified_cards,
-                        "summary_preview": (
-                            (summary or result or "").strip().splitlines()[0][:200]
-                            if (summary or result)
-                            else None
-                        ),
-                    },
-                )
-            raise HallucinatedCardsError(phantom_cards, task_id)
-    else:
-        verified_cards = []
+# NOTE: a truncated SECOND module-level `complete_task` used to sit here (a bad-merge
+# stub with no UPDATE, no artifact preservation, no evidence gate). Python kept the
+# later definition, so this one was dead — and that ambiguity is how the review-lane
+# run-id guard stayed hidden. Removed 2026-08-27. _task_requires_evidence_review below
+# was INSIDE the naive delete range and is live (called by complete_task); it stays.
 
 def _task_requires_evidence_review(title: Optional[str], body: Optional[str]) -> bool:
     """Check if a task requires explicit review before completion.
@@ -5574,7 +5525,28 @@ def complete_task(
         ).fetchone()
         prior_status = prior["status"] if prior else None
         
-        if prior_status != "review" and prior and _task_requires_evidence_review(prior["title"], prior["body"]):
+        # A reviewer's run is claimed OUT of the review lane, so the ROW reads 'running'
+        # while the run is genuinely a review. Gating on the row status alone forced every
+        # measurable card back through request_review -> _end_run (current_run_id = NULL)
+        # -> back into the dispatcher's review pool -> re-spawn, without bound. Measured:
+        # t_1e77e30b 201 runs / 0 completions; t_7fc9adf3 24 spawns/hour when found.
+        # The claimed event records source_status='review'; _retry_status_for_run reads it
+        # and exists precisely to stop a reviewer run being mistaken for an implementation
+        # run. The gate itself STAYS — it is the anti-fabrication rule that stops a worker
+        # self-certifying a measurable card. The reviewer is exactly who may pass it.
+        _is_review_run = False
+        if prior_status == "running":
+            try:
+                _is_review_run = _retry_status_for_run(conn, task_id, expected_run_id) == "review"
+            except Exception:
+                _is_review_run = False
+
+        if (
+            prior_status != "review"
+            and not _is_review_run
+            and prior
+            and _task_requires_evidence_review(prior["title"], prior["body"])
+        ):
             raise ValueError("Task has a measurable done-condition. You must use kanban_request_review instead of completing directly.")
             
         if expected_run_id is None:
@@ -5595,6 +5567,17 @@ def complete_task(
                 (result, now, task_id),
             )
         else:
+            # The parentheses around this OR are LOAD-BEARING. Unparenthesised, SQL binds
+            # AND tighter than OR and the statement completes ANY review row with a NULL
+            # run id — measured: it completed t_00c21da3 while targeting t_7fc9adf3.
+            #
+            # The review clause exists because request_review -> _end_run sets
+            # current_run_id = NULL, so `AND current_run_id = ?` could never match a card
+            # parked in review (NULL = N is never true), and every reviewer approval failed
+            # with "unknown id or already terminal" -> re-request review -> re-spawn forever.
+            # complete_task's own docstring already declares review completion legal "even
+            # when it has no active run"; this makes the SQL agree with the contract.
+            # A *running* card is untouched: it keeps requiring its own run id.
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5608,7 +5591,8 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
-                   AND current_run_id = ?
+                   AND (current_run_id = ?
+                        OR (status = 'review' AND current_run_id IS NULL))
                 """,
                 (result, now, task_id, int(expected_run_id)),
             )
@@ -11011,8 +10995,9 @@ def _default_spawn(
     # This extends the EXISTING model resolution; does not add new hooks.
     _resolved_model = task.model_override
     _resolved_provider = task.provider_override
+    _is_free_routed = False
     try:
-        from hermes_cli.free_model_classifier import resolve_model_for_free_routing
+        from hermes_cli.free_model_classifier import resolve_model_for_free_routing, should_route_free_first
         _resolved_model, _resolved_provider = resolve_model_for_free_routing(
             task.id,
             task.title,
@@ -11020,12 +11005,29 @@ def _default_spawn(
             model_override=task.model_override,
             provider_override=task.provider_override,
         )
+        # Mark if this task is being routed via free models (no explicit override)
+        if not task.model_override and should_route_free_first(task.id, task.title, task.body, task.model_override):
+            _is_free_routed = True
     except Exception as e:
         # Classifier import/execution failure: silently fall back to the explicit
         # override (if any). This ensures a classifier bug never blocks dispatch.
         _log.debug(f"free_model_classifier error on task {task.id}: {e}", exc_info=True)
     
-    if _resolved_model:
+    # For free-routed tasks, invoke the free-model wrapper which implements the complete
+    # free-first cycle (OpenCode -> OpenRouter -> Haiku fallback). The wrapper handles
+    # model failures transparently so work is never lost. Do NOT add -m flags for free routes.
+    if _is_free_routed:
+        # Replace the command with an invocation of the wrapper script.
+        # The wrapper takes the prompt as its first argument and returns the output,
+        # implementing fallback logic internally.
+        # The wrapper is deployed to ~/.hermes/scripts/, NOT into the package tree.
+        # The old relative form resolved to ~/.hermes/hermes-agent/scripts/, which has
+        # never existed — so every free-routed card died with
+        #   "can't open file '.../hermes-agent/scripts/free-model-worker-wrapper.py'"
+        # and exit code 2. Measured on t_638490d8 / t_bf960213 (home board, fails=2).
+        wrapper_path = Path.home() / ".hermes" / "scripts" / "free-model-worker-wrapper.py"
+        cmd = [sys.executable, str(wrapper_path), prompt]
+    elif _resolved_model:
         cmd.extend(["-m", _resolved_model])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -11038,20 +11040,24 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # Skip hermes CLI infrastructure for free-routed tasks (they use the wrapper).
+    # For all other routes (explicit model override or Haiku default), build the full
+    # hermes chat command.
+    if not _is_free_routed:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
+        if task.goal_mode:
+            # Goal-mode workers must take the fully-quiet single-query path:
+            # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
+            # cli.py's quiet branch. Without -Q the worker gets exactly one
+            # turn, prints text, exits rc=0, and the dispatcher records a
+            # protocol violation (incident 2026-06-09 t_d9cbe312).
+            cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -11081,6 +11087,27 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    # Record dispatch to shadow-capture log for training substrate (best-effort, non-blocking)
+    if _shadow_capture_available and _shadow_record_dispatch:
+        try:
+            classifier_verdict = _shadow_determine_verdict(
+                task.id,
+                task.title,
+                task.body,
+                model_override=task.model_override,
+                model_used=_resolved_model or "",
+            ) if _shadow_determine_verdict else "unknown"
+            _shadow_record_dispatch(
+                card_id=task.id,
+                card_text=task.body,
+                classifier_verdict=classifier_verdict,
+                model_used=_resolved_model or task.model_override or "",
+                exit_status=0,  # Record 0 at dispatch time; backfiller will update with actual exit
+                needle_shadow_verdict=None,  # Backfiller populates this async
+            )
+        except Exception as e:
+            # Never let shadow-capture failures block dispatch
+            _log.debug(f"shadow_capture write failed for task {task.id}: {e}")
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
