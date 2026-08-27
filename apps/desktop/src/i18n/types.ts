@@ -474,6 +474,7 @@ export interface Translations {
       }
       backdropTitle: string
       backdropDesc: string
+      backdropOpacityTitle: string
       introSplashTitle: string
       introSplashDesc: string
       reactionsTitle: string
