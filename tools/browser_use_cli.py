@@ -75,6 +75,7 @@ del _hermes_ensure_own_tab
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
+_MAX_LEASE_MINUTES = 120
 _STDERR_CAP_CHARS = 4000
 
 # Filesystem-safe task ids for per-task workspace dirs.
@@ -173,6 +174,16 @@ def _read_browser_cfg() -> dict:
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)
         return {}
+
+
+def _resource_hygiene_enabled() -> bool:
+    """Compatibility shim; browser_tool owns tab-lifecycle configuration."""
+    try:
+        from tools.browser_tool import _tab_lifecycle_enabled
+
+        return _tab_lifecycle_enabled()
+    except Exception:
+        return False
 
 
 def get_browser_backend() -> str:
@@ -728,8 +739,11 @@ def browser_exec(
     code: str,
     session: str = "",
     timeout_s: int = _DEFAULT_TIMEOUT_S,
+    lease_minutes: int = 0,
+    lease_reason: str = "",
     task_id: Optional[str] = None,
     local: bool = False,
+    turn_id: Optional[str] = None,
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
@@ -740,6 +754,21 @@ def browser_exec(
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
+
+    try:
+        lease = int(lease_minutes or 0)
+    except (TypeError, ValueError):
+        return tool_error("lease_minutes must be an integer from 0 to 120.")
+    if lease < 0 or lease > _MAX_LEASE_MINUTES:
+        return tool_error(
+            f"lease_minutes must be between 0 and {_MAX_LEASE_MINUTES}."
+        )
+    reason = str(lease_reason or "").strip()
+    if lease and not reason:
+        return tool_error(
+            "lease_reason is required when lease_minutes is non-zero. "
+            "Use a short task-specific reason."
+        )
 
     cmd = _find_cli()
     if not cmd:
@@ -794,8 +823,6 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
-        code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -811,6 +838,31 @@ def browser_exec(
     except (TypeError, ValueError):
         timeout = _DEFAULT_TIMEOUT_S
 
+    hygiene_guard = None
+    hygiene_start_error = None
+    if _resource_hygiene_enabled() and not private_browser:
+        from tools.browser_tool import prepare_browser_tab_lifecycle
+
+        hygiene_guard, hygiene_start_error = prepare_browser_tab_lifecycle(
+            session_name=session,
+            owner_key=turn_id or task_id or "browser-exec-default",
+            lease_minutes=lease,
+            lease_reason=reason,
+            lock_timeout_s=min(60, timeout),
+            cdp_url=str(env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or ""),
+            private_browser=bool(private_browser),
+        )
+        if hygiene_start_error:
+            return tool_error(
+                "Browser tab lifecycle blocked this call before navigation: "
+                f"{hygiene_start_error}. No browser code was executed."
+            )
+
+    if hygiene_guard is not None and hygiene_guard.target_id:
+        code = f"switch_tab({json.dumps(hygiene_guard.target_id)})\n" + code
+    elif session and not private_browser:
+        code = _OWN_TAB_PREAMBLE + code
+
     # Windows: hide the console the .cmd shim would flash (as browser_tool does)
     popen_extra: dict = {}
     if os.name == "nt":
@@ -825,6 +877,8 @@ def browser_exec(
             logger.debug("Windows hide-flags unavailable: %s", e)
 
     started = time.time()
+    proc = None
+    execution_error = None
     try:
         proc = subprocess.run(
             cmd,
@@ -836,7 +890,7 @@ def browser_exec(
             **popen_extra,
         )
     except subprocess.TimeoutExpired:
-        return tool_error(
+        execution_error = (
             f"browser-use exec timed out after {timeout}s. The daemon may "
             "still be working; retry with a larger timeout_s (max "
             f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
@@ -844,7 +898,18 @@ def browser_exec(
             "workspace is preserved."
         )
     except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+        execution_error = f"Failed to launch browser-use CLI: {e}"
+    finally:
+        hygiene_report = hygiene_guard.finish() if hygiene_guard is not None else None
+
+    if execution_error:
+        if hygiene_report and not hygiene_report.get("ok", True):
+            execution_error += " Cleanup also failed: " + "; ".join(
+                hygiene_report.get("errors") or ["unknown hygiene error"]
+            )
+        return tool_error(execution_error)
+
+    assert proc is not None
 
     result = {
         "success": proc.returncode == 0,
@@ -855,6 +920,10 @@ def browser_exec(
         result["workspace"] = workspace
     if session:
         result["session"] = session
+    if hygiene_report is not None:
+        result["hygiene"] = hygiene_report
+        if not hygiene_report.get("ok", False):
+            result["success"] = False
     stderr = (proc.stderr or "").strip()
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
@@ -928,19 +997,31 @@ _DESCRIPTION_HEADER = _HEADER_BASE  # back-compat alias for external imports
 
 
 def _description_header() -> str:
-    """Header tailored to whether the active model can see images natively"""
+    """Header tailored to the active engine, vision, and tab lifecycle."""
     if _lightpanda_engine_in_use():
-        # No screenshots at all on Lightpanda: the vision workflow cannot
-        # apply, whatever the model can see.
+        # Lightpanda sessions are private and one-page-only, so shared-CDP tab
+        # lifecycle instructions do not apply even when the feature is enabled.
         return _HEADER_BASE + _HEADER_TEXT_ONLY + _HEADER_LIGHTPANDA
+
+    hygiene = ""
+    if _resource_hygiene_enabled():
+        hygiene = (
+            "\n\nTAB LIFECYCLE: Local tabs created or claimed from a blank "
+            "baseline close automatically after each browser_exec call, including "
+            "errors and timeouts. The tool verifies closure and leaves one blank "
+            "baseline page. When the NEXT browser_exec call genuinely must reuse "
+            "the current tab, set lease_minutes (1-120) and a task-specific "
+            "lease_reason. On the final call, omit the lease so owned tabs close. "
+            "Never lease a tab merely because it may be useful later."
+        )
     try:
         from tools.vision_tools import _should_use_native_vision_fast_path
 
         if _should_use_native_vision_fast_path():
-            return _HEADER_BASE + _HEADER_VISION
+            return _HEADER_BASE + hygiene + _HEADER_VISION
     except Exception:
         pass
-    return _HEADER_BASE + _HEADER_TEXT_ONLY
+    return _HEADER_BASE + hygiene + _HEADER_TEXT_ONLY
 
 
 def _lightpanda_engine_in_use() -> bool:
@@ -1042,6 +1123,25 @@ BROWSER_EXEC_SCHEMA = {
                 "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S}).",
                 "default": _DEFAULT_TIMEOUT_S,
             },
+            "lease_minutes": {
+                "type": "integer",
+                "description": (
+                    "Keep local task-owned tabs for the next call for 1-120 "
+                    "minutes. Default 0 closes them after this call. Requires "
+                    "lease_reason; omit on the final call."
+                ),
+                "minimum": 0,
+                "maximum": _MAX_LEASE_MINUTES,
+                "default": 0,
+            },
+            "lease_reason": {
+                "type": "string",
+                "description": (
+                    "Short task-specific reason for a non-zero lease. Do not "
+                    "include URLs, credentials, or private page content."
+                ),
+                "maxLength": 500,
+            },
         },
         "required": ["code"],
     },
@@ -1061,8 +1161,11 @@ registry.register(
         code=args.get("code", ""),
         session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S),
+        lease_minutes=args.get("lease_minutes", 0),
+        lease_reason=args.get("lease_reason", ""),
         task_id=kw.get("task_id"),
         local=bool(args.get("local", False)),
+        turn_id=kw.get("turn_id"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

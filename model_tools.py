@@ -1547,6 +1547,9 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:
@@ -1555,6 +1558,9 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
                         user_task=user_task,
                     )
             if skip_tool_execution_middleware:
