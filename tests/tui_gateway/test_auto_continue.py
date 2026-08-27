@@ -18,6 +18,7 @@ time is positive proof the turn never finished. Contract pinned here:
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import types
@@ -118,7 +119,10 @@ def test_marker_roundtrip(tmp_path):
 
 
 def test_marker_survives_corrupt_sidecar(tmp_path):
-    path = tmp_path / "desktop" / "interrupted_turns.json"
+    # The per-session layout reads/writes ``<home>/desktop/interrupted_turns/<key>.json``.
+    # A corrupt per-session file must be treated as "no marker" so a single
+    # bad write can't wedge the next resume.
+    path = tmp_path / "desktop" / "interrupted_turns" / "abc.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not json")
 
@@ -320,6 +324,61 @@ def test_disabled_by_config(schedule_env, marker_home, monkeypatch):
 def test_no_marker_means_no_continuation(schedule_env, marker_home):
     assert server._maybe_schedule_auto_continue("sid", _session(), "session-key") is None
     assert not schedule_env
+
+
+def test_foreign_session_marker_does_not_schedule_continuation(
+    emits, schedule_env, marker_home
+):
+    """Session A dies mid-turn; session B's resume must not auto-continue.
+
+    Directly exercises the scheduling path: the resume of B reads only B's
+    per-session marker file, so A's leftover marker must not produce a
+    continuation, a "Resuming interrupted turn…" notice, or a scheduled flag
+    (issue #94778 — the auto-continue scheduling path)."""
+    record_turn_start(marker_home, "session-A", "finish the migration")
+    session_b = _session(session_key="session-B")
+
+    result = server._maybe_schedule_auto_continue("sid", session_b, "session-B")
+
+    assert result is None
+    assert not schedule_env
+    assert "_auto_continue_scheduled" not in session_b
+    # No misleading interruption notice reached the client.
+    assert emits == []
+    # B's scheduling attempt did not retire A's marker either.
+    assert read_turn_marker(marker_home, "session-A") is not None
+
+
+def test_marker_owned_by_another_session_is_not_crash_evidence(
+    emits, schedule_env, marker_home
+):
+    """A marker file whose recorded owner (in-file ``session_key``) disagrees
+    with the resumed session is never admitted as crash evidence.
+
+    Under the per-session layout the file name already owns the record, but
+    the scheduling path must also verify the writer's claim stamped inside
+    the body before treating a fresh marker as proof of a crash — parity with
+    the owner-checked interrupted-turn records (#86786)."""
+    path = marker_home / "desktop" / "interrupted_turns" / "session-B.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "session_key": "session-A",
+                "prompt": "finish the migration",
+                "attempts": 0,
+                "started_at": time.time(),
+            }
+        )
+    )
+    session_b = _session(session_key="session-B")
+
+    result = server._maybe_schedule_auto_continue("sid", session_b, "session-B")
+
+    assert result is None
+    assert not schedule_env
+    assert "_auto_continue_scheduled" not in session_b
+    assert emits == []
 
 
 def test_running_session_wins_over_continuation(emits, schedule_env, marker_home):
