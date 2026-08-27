@@ -372,7 +372,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # required even when require_mention is globally False. Lets one agent
         # be free-listening in its own channel while only answering to its
         # name in shared channels (offices + meeting-room topology).
-        _mc_raw = os.getenv("BUZZ_MENTION_CHANNELS") or extra.get("mention_channels", [])
+        # config.yaml only — this is behavioral configuration, not a secret,
+        # so it gets no environment surface (AGENTS.md).
+        _mc_raw = extra.get("mention_channels", [])
         if isinstance(_mc_raw, str):
             _mc_raw = [c for c in _mc_raw.split(",")]
         self.mention_channels = {str(c).strip().lower() for c in _mc_raw if str(c).strip()}

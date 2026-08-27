@@ -34,6 +34,9 @@ gateway:
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
         allowed_users: []          # empty = allow all; hex pubkeys or npubs
+        require_mention: false     # false = answer every message in every watched channel
+        mention_channels:          # …except these, where a mention stays required
+          - f28ceae7-c1c9-4190-b36e-4cd7d5461e55
 ```
 
 Plus, in `~/.hermes/.env`:
@@ -99,6 +102,9 @@ gateway:
 
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
 - Direct messages always reach the agent, no mention needed.
+- `require_mention` is global: it applies to every watched channel or to none. `mention_channels` refines it per channel — the UUIDs listed there keep requiring a mention **even when `require_mention` is `false`**. That is what makes the "offices + meeting room" topology expressible: an agent that answers everything in its own dedicated channel, but only speaks when addressed in the shared one.
+- The two settings combine as an OR, never a subtraction: with `require_mention: true` a mention is required everywhere, and listing channels changes nothing. `mention_channels` can only *add* a requirement, never lift one. DMs dispatch regardless of both.
+- Channel UUIDs are trimmed and compared case-insensitively; empty entries are ignored. Unlike most Buzz settings this one is `config.yaml`-only — it is behavior, not a secret, so it has no environment-variable counterpart.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
 
 ## Access control
