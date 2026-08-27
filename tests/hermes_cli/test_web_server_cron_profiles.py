@@ -36,6 +36,42 @@ def _drain_queue(q):
             return values
 
 
+def test_trigger_cron_job_on_a_paused_job_is_409_naming_the_reason(monkeypatch):
+    """The dashboard run-now button must not lift a containment hold.
+
+    ``_call_cron_for_profile`` runs ``cron.jobs.trigger_job`` in-process, so
+    ``JobPaused`` propagates here and becomes a 409 carrying the reason rather
+    than falling through to a generic 500 (or, before 2026-08-26, a 200 over a
+    silently cleared pause).
+    """
+    from cron.jobs import JobPaused
+    from hermes_cli import web_server
+
+    held = {
+        "id": "b74186b2eaa5",
+        "name": "jobflow-matcher",
+        "state": "paused",
+        "enabled": False,
+        "paused_at": "2026-08-25T15:38:09-04:00",
+        "paused_reason": "Gate-2 containment barrier",
+    }
+
+    def _raise(*_args, **_kwargs):
+        raise JobPaused(held)
+
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda _job_id: "main")
+    monkeypatch.setattr(web_server, "_call_cron_for_profile", _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        web_server._trigger_cron_job_sync("b74186b2eaa5")
+
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["paused_reason"] == "Gate-2 containment barrier"
+    assert detail["paused_at"] == "2026-08-25T15:38:09-04:00"
+    assert "Gate-2 containment barrier" in detail["error"]
+
+
 def test_call_cron_for_profile_routes_storage_without_mutating_globals(isolated_profiles):
     from cron import jobs as cron_jobs
     from hermes_cli import web_server

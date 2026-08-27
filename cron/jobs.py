@@ -174,6 +174,11 @@ ONESHOT_GRACE_SECONDS = 120
 # grow jobs.json without limit; oldest entries are dropped first.
 PAUSED_HISTORY_LIMIT = 10
 
+# A cleared resume barrier is archived rather than deleted, same rule and same
+# cap as ``paused_history``: the WHO/WHY of a lifted authorization barrier is
+# the record an audit actually needs, and it must outlive the lift.
+RESUME_BARRIER_HISTORY_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -498,7 +503,13 @@ def _jobs_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# ``resume_barrier`` is immutable THROUGH ``update_job`` on purpose. It is the
+# only field whose whole job is to refuse a state change, so a writer that can
+# set or clear it as an ordinary field update is not a barrier at all — it is a
+# suggestion. Both directions go through ``set_resume_barrier`` /
+# ``clear_resume_barrier``, which demand an explicit caller and archive what
+# they retire. See ``_resume_barrier``.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "resume_barrier"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1344,6 +1355,31 @@ def restore_jobs_cas(
     target_by_name = {row["name"]: row for row in target}
     for name, row in target_by_name.items():
         paused = expected_by_name.get(name)
+        # A bulk restore is the third door onto the same decision, and it has
+        # two distinct failure shapes. Refused here, before any write: the CAS
+        # is all-or-nothing, so validation is the only place the whole restore
+        # can be refused cleanly rather than half-applied mid-dependency-order.
+        #
+        #   1. A target that would hand back a RUNNABLE row for a job that
+        #      currently carries a barrier. Refused explicitly below.
+        #   2. A target restored from a jobs.json backup taken BEFORE the
+        #      barrier existed, so its rows have no ``resume_barrier`` key at
+        #      all. This is the likelier shape during an incident rollback,
+        #      and it is already refused: ``resume_barrier`` is outside the
+        #      allowed containment-field set, so present-here/absent-there
+        #      lands in ``changed - allowed`` and raises. Case 1 is checked
+        #      first only so the operator gets the barrier's actual text
+        #      instead of "differs outside containment fields".
+        #
+        # NEITHER guard defends against a plain file-level restore (cp of an
+        # old jobs.json over the live one). Nothing in this process can: that
+        # writer never calls in here. The admission gates are the backstop for
+        # everything of that shape, and they too go quiet once the field is
+        # gone -- a barrier is durable state, not a proof, and restoring a
+        # pre-barrier snapshot genuinely retires it. Re-assert after any
+        # file-level rollback.
+        if paused is not None and _resume_barrier(paused) is not None and not _is_paused(row):
+            _require_no_resume_barrier(paused, "restore")
         if paused is None or str(paused.get("id")) != str(row.get("id")):
             raise ValueError("restore target IDs/names do not match expected paused rows")
         allowed = {"enabled", "state", "paused", "paused_at", "paused_reason"}
@@ -1797,6 +1833,30 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+class ResumeBarrierError(PermissionError):
+    """Raised when a job under an authorization barrier is asked to run.
+
+    A ``PermissionError`` rather than a ``ValueError`` because that is what it
+    is: the transition is well-formed and would succeed, and it is refused
+    because the caller has not shown it is allowed to make it. Every surface
+    that already maps exceptions to exit codes / HTTP status treats the two
+    differently, and this must not read as "bad input, fix your arguments".
+    """
+
+    def __init__(self, job_id: str, job_name: str, barrier: Dict[str, Any], action: str):
+        self.job_id = job_id
+        self.job_name = job_name
+        self.barrier = barrier
+        self.action = action
+        super().__init__(
+            f"Refusing to {action} '{job_name}' ({job_id}): it carries a resume "
+            f"barrier set by {barrier.get('set_by') or 'unknown'} at "
+            f"{barrier.get('set_at') or 'unknown'} — {barrier.get('reason') or 'no reason recorded'}. "
+            "Clear it deliberately with clear_resume_barrier(job_id, caller=..., "
+            "reason=...) once the condition it names is actually met."
+        )
+
+
 class AmbiguousJobReference(LookupError):
     """Raised when a job name matches more than one job."""
 
@@ -1807,6 +1867,30 @@ class AmbiguousJobReference(LookupError):
         super().__init__(
             f"Job name '{ref}' is ambiguous — matches {len(matches)} jobs: {ids}. "
             f"Use the job ID instead."
+        )
+
+
+class JobPaused(RuntimeError):
+    """Raised when a run-now caller targets a job held out of the schedule.
+
+    Distinct from the ``None`` that means "no such job" so an HTTP surface can
+    answer 409 rather than 404 — and so the WHY travels with the refusal: a
+    caller that only learns "refused" has to go read ``jobs.json`` to find out
+    whether it hit a routine pause or a containment barrier.
+    """
+
+    def __init__(self, job: Dict[str, Any]):
+        self.job_id = job.get("id")
+        self.job_name = job.get("name") or self.job_id
+        self.paused_at = job.get("paused_at")
+        self.paused_reason = job.get("paused_reason")
+        detail = f' — "{self.paused_reason}"' if self.paused_reason else (
+            " (no reason recorded)"
+        )
+        since = f" since {self.paused_at}" if self.paused_at else ""
+        super().__init__(
+            f"Job '{self.job_name}' ({self.job_id}) is paused{since}{detail}. "
+            f"Resume it explicitly before running it."
         )
 
 
@@ -1976,11 +2060,22 @@ def _unpause_updates(job: Dict[str, Any]) -> Dict[str, Any]:
     write. It is only touched when the key is already present, so records that
     never carried it stay byte-identical.
 
-    Shared by ``resume_job`` and ``trigger_job``, the two paths that revive a
-    paused job, so the field can never be coherent on one and lossy on the
-    other. Both also emit CRON_RESUMED carrying the archived values, for the
-    same reason and with the same symmetry requirement — see
-    ``emit_cron_lifecycle_safe``.
+    ``resume_job`` is the ONLY caller. Un-pausing is an act an operator has to
+    ask for by name: ``trigger_job`` shared this helper until 2026-08-26,
+    which made "run this once" silently clear a containment hold, and it
+    refuses a paused job outright instead (see ``JobPaused``). That is why the
+    "shared by the two paths that revive a paused job" symmetry this docstring
+    used to assert — including the matching CRON_RESUMED emit — is gone: there
+    is only one such path now.
+
+    ``resume_barrier`` is deliberately NOT in here and must never be added.
+    Clearing ``paused_reason`` is what turned an authorization condition into
+    something a resume destroys on its way past; the barrier exists to be the
+    one field that survives every un-pause, and the scheduler re-reads it at
+    admission. Un-pausing a barriered job is now refused outright upstream of
+    this helper, so in practice it is never reached with one — the rule is
+    stated here anyway because this is where the next person will look for it.
+    See ``_resume_barrier``.
     """
     updates: Dict[str, Any] = {"paused_at": None, "paused_reason": None}
 
@@ -2002,6 +2097,321 @@ def _unpause_updates(job: Dict[str, Any]) -> Dict[str, Any]:
         updates["paused_history"] = history[-PAUSED_HISTORY_LIMIT:]
 
     return updates
+
+
+def _resume_barrier(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return this job's authorization barrier, or None when it carries none.
+
+    A barrier is a durable ``{reason, set_at, set_by}`` record on the job that
+    says "this must not run until a named condition is met". It is deliberately
+    NOT the same field as ``paused_reason``, and the difference is the whole
+    point of this module's 2026-08-26 fix:
+
+    ``paused_reason`` is prose attached to a pause, and ``_unpause_updates``
+    CLEARS it — it has to, a running job must not advertise why it was once
+    paused. So an authorization condition written into ``paused_reason`` is
+    destroyed by the very act it exists to gate, and nothing downstream can
+    re-check it: the admission scan reads ``enabled``/``state``, both of which
+    an un-pause resets. A ``paused_reason`` barrier is therefore unenforceable
+    by construction, however carefully it is worded.
+
+    The 2026-08-26 incident that produced this field is worth stating
+    accurately, because the FIRST reading of it was wrong and cost two
+    sessions real time. At 2026-08-26T05:17:33-35Z — event_bus timestamps are
+    UTC, so 01:17 EDT — the three Gate-2 barrier jobs (``jobflow-matcher``,
+    ``jaum-inbox-sweeper``, ``jaum-daytime-relay``) were resumed inside three
+    seconds, and ``caller`` is null on all three CRON_RESUMED rows in
+    ``events/event_bus.db``. That null was NOT an unsanctioned actor: it was
+    ``bin/gate2_resume_barrier_set.py``, the sanctioned executor, which at that
+    moment simply omitted its ``caller=`` argument. Its mtime is
+    2026-08-26T01:27:44 EDT, about ten minutes AFTER the lift, so the
+    ``caller=CALLER`` line now at its line 105 did not exist when those events
+    were emitted.
+
+    A second artifact corroborated it AND HAS SINCE BEEN DESTROYED, which is
+    itself worth recording. That script backs up jobs.json at its line 92 to a
+    FIXED name, ``profiles/main/cron/jobs.json.pre-gate2-resume`` — not a
+    timestamped one — so every run clobbers the last. It read 01:17:20,
+    thirteen seconds before the resume, when checked on 2026-08-26 morning; a
+    second run at 12:18 overwrote it and the 01:17 pre-image is gone for good.
+    Cite that as a reading taken at the time, never as a file to go re-check.
+
+    Three lessons are baked into this module because of all that. First, an
+    EMPTY attribution is not neutral — it actively misleads, and two
+    independent sessions read caller=None as "ran outside the tooling", one of
+    them re-pausing all three jobs on that reading. Hence ``resume_job`` now
+    REFUSES a blank caller on a reasoned pause instead of warning, and
+    ``set_resume_barrier`` / ``clear_resume_barrier`` refuse one outright.
+    Second: never date an event against the CURRENT source of an untracked
+    script; check its mtime first. Third, and the reason this field exists at
+    all: ``resume_job`` had no way to tell whether the gate had been consulted.
+    The sanctioned script does run ``gate2_landed_check.py`` and does refuse on
+    NOT LANDED — but it also ships a ``--skip-gate-check`` flag, self-labelled
+    "ARM-TEST ONLY ... Never use for a real resume", which skips that subprocess
+    outright. An arm-test bypass shipping on the production script is a
+    documented override, not a closed gate, and once the pause was lifted
+    nothing outside that script could re-assert the condition. A caller string
+    proves WHO acted; it can never prove they were ALLOWED to.
+
+    That is precisely the gap this field closes. A barrier re-read at ADMISSION
+    holds even when the executor's own precondition is bypassed, because the
+    scheduler refuses the fire independently of HOW the un-pause happened.
+
+    A barrier survives every un-pause path, so lifting the pause is no longer
+    enough to make the job run: the scheduler re-reads the barrier at ADMISSION
+    (``_get_due_jobs_locked``, ``claim_job_for_fire``), and ``resume_job`` /
+    ``trigger_job`` / ``restore_jobs_cas`` all refuse outright. That is the
+    difference between a flag someone forgot to re-check and a fence.
+
+    Tolerant on read: a malformed value (hand-edited jobs.json, a truncated
+    write) is still treated as a barrier - normalized to unknowns rather than
+    dropped. Failing open on a corrupt fence would make corrupting it the
+    cheapest way past it.
+    """
+    raw = job.get("resume_barrier")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return {"reason": str(raw), "set_at": None, "set_by": None}
+    if not (raw.get("reason") or raw.get("set_at") or raw.get("set_by")):
+        # An empty dict is not a barrier - it is a record of not having one.
+        return None
+    return {
+        "reason": raw.get("reason"),
+        "set_at": raw.get("set_at"),
+        "set_by": raw.get("set_by"),
+    }
+
+
+def emit_cron_barrier_safe(
+    *,
+    action: str,
+    job_id: str,
+    job_name: str,
+    caller: str,
+    reason: Optional[str],
+    barrier_reason: Optional[str],
+    barrier_set_at: Optional[str],
+    barrier_set_by: Optional[str],
+) -> None:
+    """Best-effort CRON_BARRIER_SET/CRON_BARRIER_CLEARED emit.
+
+    Defensive on the same terms as ``emit_cron_lifecycle_safe``: the barrier
+    write is already durable by the time this runs, so a bus outage costs an
+    audit record and never a barrier that half-happened.
+
+    The job RECORD is the authority here, not the event — ``resume_barrier``
+    and ``resume_barrier_history`` carry set_by/cleared_by durably, which is
+    strictly stronger than a best-effort emit. The event exists because that
+    is where people actually audit: the 2026-08-26 confusion was diagnosed
+    (wrongly, then rightly) from ``events/event_bus.db``, not from jobs.json,
+    which the scheduler rewrites about once a minute.
+    """
+    try:
+        from events.producers.cron_lifecycle_emitter import emit_cron_barrier
+        emit_cron_barrier(
+            _get_event_bus(),
+            action=action,
+            job_id=job_id,
+            job_name=job_name,
+            caller=caller,
+            reason=reason,
+            barrier_reason=barrier_reason,
+            barrier_set_at=barrier_set_at,
+            barrier_set_by=barrier_set_by,
+        )
+    except Exception:
+        logger.exception(
+            "cron_%s emit failed for job_id=%s", action, job_id
+        )
+
+
+def _require_no_resume_barrier(job: Dict[str, Any], action: str) -> None:
+    """Refuse *action* on a barriered job. Fail-closed; raises or returns None."""
+    barrier = _resume_barrier(job)
+    if barrier is None:
+        return
+    job_id = str(job.get("id") or "unknown")
+    job_name = str(job.get("name") or job_id)
+    logger.error(
+        "REFUSED %s of job_id=%s name=%s: resume barrier set by %s at %s (%s)",
+        action, job_id, job_name,
+        barrier.get("set_by"), barrier.get("set_at"), barrier.get("reason"),
+    )
+    raise ResumeBarrierError(job_id, job_name, barrier, action)
+
+
+def _require_caller(caller: Optional[str], fn: str) -> str:
+    """Normalize a required caller string, refusing an absent or blank one."""
+    text = caller.strip() if isinstance(caller, str) else ""
+    if not text:
+        raise ValueError(
+            f"{fn} requires a non-empty caller string identifying who is making "
+            "this change (e.g. 'hermes_cli:cron_resume'). An unattributable "
+            "lifecycle change on a job that carries an explicit reason is the "
+            "2026-08-26 bypass this argument exists to prevent."
+        )
+    return text
+
+
+def set_resume_barrier(
+    job_id: str,
+    *,
+    reason: str,
+    caller: str,
+) -> Optional[Dict[str, Any]]:
+    """Attach an authorization barrier to a job. Both arguments are required.
+
+    Does NOT pause the job - pausing and barriering are separate acts, and a
+    barrier on a running job is meaningful (it takes effect at the next
+    admission check). Pair it with ``pause_job`` when the intent is "stop now
+    AND stay stopped until someone says otherwise".
+
+    Re-setting an existing barrier is allowed and replaces it, archiving the
+    old one - sharpening the wording of a live barrier must not require
+    clearing it first, since the window between clear and re-set is exactly
+    when the job would slip through.
+
+    Writes directly under the jobs lock rather than through ``update_job``:
+    ``resume_barrier`` is in ``_IMMUTABLE_JOB_FIELDS`` precisely so that no
+    ordinary field update can reach it.
+    """
+    caller = _require_caller(caller, "set_resume_barrier")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            "set_resume_barrier requires a non-empty reason naming the "
+            "condition that must be met before this job may run again."
+        )
+    reason = reason.strip()
+
+    job = resolve_job_ref(job_id)
+    if not job:
+        return None
+
+    barrier = {
+        "reason": reason,
+        "set_at": _hermes_now().isoformat(),
+        "set_by": caller,
+    }
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, row in enumerate(jobs):
+            if row["id"] != job["id"]:
+                continue
+            previous = _resume_barrier(row)
+            if previous is not None:
+                history = [
+                    entry for entry in (row.get("resume_barrier_history") or [])
+                    if isinstance(entry, dict)
+                ]
+                history.append({
+                    **previous,
+                    "cleared_at": barrier["set_at"],
+                    "cleared_by": caller,
+                    "cleared_reason": "replaced by a re-stated barrier",
+                })
+                row["resume_barrier_history"] = history[-RESUME_BARRIER_HISTORY_LIMIT:]
+            row["resume_barrier"] = barrier
+            jobs[i] = row
+            save_jobs(jobs)
+            logger.warning(
+                "Resume barrier SET on job_id=%s name=%s by %s: %s",
+                row["id"], row.get("name"), caller, reason,
+            )
+            updated = _normalize_job_record(jobs[i])
+            emit_cron_barrier_safe(
+                action="barrier_set",
+                job_id=row["id"],
+                job_name=row.get("name") or row["id"],
+                caller=caller,
+                reason=reason,
+                barrier_reason=reason,
+                barrier_set_at=barrier["set_at"],
+                barrier_set_by=caller,
+            )
+            return updated
+    return None
+
+
+def clear_resume_barrier(
+    job_id: str,
+    *,
+    caller: str,
+    reason: str,
+) -> Optional[Dict[str, Any]]:
+    """Lift a job's authorization barrier. Both arguments are required.
+
+    ``reason`` here is the JUSTIFICATION for lifting - the evidence that the
+    condition the barrier named is now actually met - not a restatement of the
+    barrier. It is archived to ``resume_barrier_history`` alongside the barrier
+    it retires, because the lift is the moment worth attributing: the barrier
+    itself was never the thing in doubt.
+
+    Clearing does not resume the job. That stays a separate, separately
+    attributed call, so "I am allowed to lift this" and "I am putting it back
+    on the schedule now" are never the same keystroke.
+
+    Returns None if the job does not exist; returns the job unchanged (and
+    logs) if it carried no barrier - lifting nothing is not an error, and
+    raising here would make an idempotent teardown script fail on its second
+    run.
+    """
+    caller = _require_caller(caller, "clear_resume_barrier")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            "clear_resume_barrier requires a non-empty reason recording why "
+            "the barrier's condition is now considered met."
+        )
+    reason = reason.strip()
+
+    job = resolve_job_ref(job_id)
+    if not job:
+        return None
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, row in enumerate(jobs):
+            if row["id"] != job["id"]:
+                continue
+            previous = _resume_barrier(row)
+            if previous is None:
+                logger.info(
+                    "clear_resume_barrier: job_id=%s name=%s carries no barrier "
+                    "(no-op, requested by %s)", row["id"], row.get("name"), caller,
+                )
+                return _normalize_job_record(row)
+            history = [
+                entry for entry in (row.get("resume_barrier_history") or [])
+                if isinstance(entry, dict)
+            ]
+            history.append({
+                **previous,
+                "cleared_at": _hermes_now().isoformat(),
+                "cleared_by": caller,
+                "cleared_reason": reason,
+            })
+            row["resume_barrier_history"] = history[-RESUME_BARRIER_HISTORY_LIMIT:]
+            row["resume_barrier"] = None
+            jobs[i] = row
+            save_jobs(jobs)
+            logger.warning(
+                "Resume barrier CLEARED on job_id=%s name=%s by %s: %s "
+                "(barrier was: %s)",
+                row["id"], row.get("name"), caller, reason, previous.get("reason"),
+            )
+            updated = _normalize_job_record(jobs[i])
+            emit_cron_barrier_safe(
+                action="barrier_cleared",
+                job_id=row["id"],
+                job_name=row.get("name") or row["id"],
+                caller=caller,
+                reason=reason,
+                barrier_reason=previous.get("reason"),
+                barrier_set_at=previous.get("set_at"),
+                barrier_set_by=previous.get("set_by"),
+            )
+            return updated
+    return None
 
 
 def pause_job(
@@ -2082,7 +2492,24 @@ def resume_job(
     if not job:
         return None
 
-    if caller is None:
+    # Fence first: a barriered job is not resumable by ANY caller, named or
+    # not, so this is checked before the identity rule below. Lifting the
+    # barrier is a separate, separately attributed act
+    # (``clear_resume_barrier``) precisely so that it cannot be an accident of
+    # typing "resume".
+    _require_no_resume_barrier(job, "resume")
+
+    # Identity: anonymous is tolerated only for a pause that says nothing. A
+    # pause carrying an explicit ``paused_reason`` is somebody's stated
+    # condition, and lifting one unattributably is the 2026-08-26 defect - all
+    # five in-tree call sites (hermes_cli, hermes_console, both HTTP APIs, the
+    # LLM tool) already pass a caller, so this refuses ad-hoc in-process
+    # callers and nothing else. See ``_resume_barrier`` for why the barrier
+    # field exists on top of this: a caller string proves WHO, never that they
+    # were allowed.
+    if (job.get("paused_reason") or "").strip():
+        caller = _require_caller(caller, "resume_job (job carries a paused_reason)")
+    elif caller is None:
         logger.warning(
             "resume_job called anonymously (caller=None) for job_id=%s "
             "name=%s — postmortem attribution will be impossible. Pass an "
@@ -2232,37 +2659,37 @@ def emit_cron_lifecycle_safe(
 
     The pause/resume counterpart to ``emit_cron_triggered_safe``, and "every
     path" is load-bearing here for the same reason. A job leaves or re-enters
-    the schedule on exactly five paths, and all five emit here:
+    the schedule on exactly four paths, and all four emit here:
 
     ==================  ==========================  ======================
     transition          call site                   action=
     ==================  ==========================  ======================
     operator pause      ``pause_job``               ``"paused"``
     operator resume     ``resume_job``              ``"resumed"``
-    implicit un-pause   ``trigger_job``             ``"resumed"``
     bulk containment    ``pause_jobs_cas``          ``"paused"``
     bulk restore        ``restore_jobs_cas``        ``"resumed"``
     ==================  ==========================  ======================
 
     ``update_job`` itself deliberately stays out of the table. It is the
-    shared writer under all five, and every caller that moves a lifecycle
+    shared writer under all four, and every caller that moves a lifecycle
     field already knows which transition it is making; emitting from there
     instead would mean inferring the transition from a field diff and would
     fire on writes that change no state at all.
 
     The bottom two are the scheduler's bulk containment CAS, which has no
     production caller yet — they emit AFTER their jobs lock is released; see
-    ``pause_jobs_cas``. The third is the one that is easy to forget and
-    expensive to miss:
-    ``trigger_job`` sets ``enabled: True`` and clears the pause fields, so
-    "run this now" silently ends a pause. Without an event there, a reader
-    joining CRON_PAUSED to CRON_RESUMED would see an unterminated pause on a
-    job that has been running all along — worse than no trail, because it
-    reads as a job still contained. It is emitted only when the job actually
-    WAS paused (see ``_is_paused``), and it is emitted BEFORE the
-    CRON_TRIGGERED for the same call so the two read in cause order.
+    ``pause_jobs_cas``.
 
-    Until 2026-08-25 none of the five emitted anything at all. That is what
+    ``trigger_job`` was a fifth row here until 2026-08-26, emitting an
+    implicit ``"resumed"`` because "run this now" used to clear the pause
+    fields on its way past. It no longer revives anything — it raises
+    ``JobPaused`` instead — so there is no transition left for it to report.
+    That is the stronger fix for the same hazard this row was patching: an
+    un-pause nobody asked for is now impossible rather than merely audited.
+    A trigger of an already-running job emits CRON_TRIGGERED only, exactly as
+    it always did.
+
+    Until 2026-08-25 none of these emitted anything at all. That is what
     made the 2026-08-24/25 pause churn on eight jobflow/jaum/tracker rows
     unattributable: two sessions searched ``audit.jsonl`` and the agent
     transcripts for a record that was never written. If a path is added, add
@@ -2312,10 +2739,20 @@ def _trigger_job_admitted(
     """Schedule a job to run on the next scheduler tick.
 
     Sets ``next_run_at = NOW`` and emits a ``cron_triggered`` event capturing
-    the caller (e.g. ``"hermes_cli:cron_run"``, ``"llm:cronjob_tool"``,
-    ``"http_api:web_server"``) and an optional reason string. ``caller=None``
-    is allowed for backward compatibility but logs a WARNING — every internal
-    caller should pass an explicit caller string.
+    the caller (e.g. ``"http_api:api_server"``, ``"http_api:web_server"``) and
+    an optional reason string. ``caller=None`` is allowed for backward
+    compatibility but logs a WARNING — every internal caller should pass an
+    explicit caller string.
+
+    REFUSES a paused/disabled job by raising ``JobPaused`` rather than reviving
+    it. Until 2026-08-26 this path shared ``_unpause_updates`` with
+    ``resume_job``, so an operator asking a held job to "run now" from the
+    dashboard or the HTTP API cleared the hold as an unannounced side effect.
+    The intent behind a manual trigger is a single fire, not a lifecycle
+    change, and once the pause is gone the two are no longer separable. The
+    CLI (``hermes cron run`` → ``cronjob_tools._execute_job_now`` →
+    ``claim_job_for_fire``) has always refused; this makes the remaining
+    surfaces agree with it instead of being the silent exception.
     """
     # v0.15.1 catch-up: resolve by ID or name (upstream resolve_job_ref) so
     # `cron run <name>` works; raises AmbiguousJobReference for an ambiguous
@@ -2325,6 +2762,26 @@ def _trigger_job_admitted(
     if not job:
         return None
 
+    # The barrier check comes FIRST, before the paused check below, because the
+    # two answer different questions and the barrier is the durable one: a job
+    # can carry a barrier without being paused, and the scheduler re-reads it
+    # at admission either way.
+    #
+    # This guard arrived describing ``trigger_job`` as "the IMPLICIT un-pause"
+    # that runs ``_unpause_updates``, reached by "hermes cron run" as the
+    # shorter command. Both halves were wrong and are corrected here rather
+    # than left to mislead: ``hermes cron run`` routes through
+    # ``cronjob_tools._execute_job_now`` -> ``claim_job_for_fire`` and has
+    # never touched this function, and this function no longer un-pauses
+    # anything at all (see ``JobPaused`` below and ``_unpause_updates``).
+    # The guard is still exactly right, for a better reason: ``trigger_job``
+    # IS a second door onto the same authorization decision, opened by the two
+    # HTTP run-now controls -- POST /api/jobs/{id}/run and
+    # POST /api/cron/jobs/{id}/trigger, the dashboard's button. A button is a
+    # lower-attention surface than a short command, so covering it matters
+    # more than the original rationale claimed, not less.
+    _require_no_resume_barrier(job, "trigger")
+
     if caller is None:
         logger.warning(
             "trigger_job called anonymously (caller=None) for job_id=%s "
@@ -2333,36 +2790,34 @@ def _trigger_job_admitted(
             job_id, job.get("name"),
         )
 
-    previous_next_run_at = job.get("next_run_at")
-    previous_state = job.get("state")
-    was_paused = _is_paused(job)
-    previous_paused_at = job.get("paused_at")
-    previous_paused_reason = job.get("paused_reason")
+    if _is_paused(job):
+        # Refuse BEFORE any write, so a rejected trigger leaves nothing in
+        # jobs.json to reconcile afterwards. WARNING rather than INFO because
+        # the case worth seeing is a UI or automated caller bouncing off a
+        # barrier nobody is reading.
+        logger.warning(
+            "trigger_job refused job_id=%s name=%s: held out of the schedule "
+            "(state=%s enabled=%s paused_reason=%s) caller=%s reason=%s",
+            job["id"], job.get("name"), job.get("state"),
+            job.get("enabled"), job.get("paused_reason"), caller, reason,
+        )
+        raise JobPaused(job)
 
+    previous_next_run_at = job.get("next_run_at")
+
+    # ``enabled: True`` is a no-op past the guard above — ``_is_paused`` is
+    # true for anything not enabled — and is kept only so a legacy record
+    # carrying no ``enabled`` key materializes one. ``state`` can legitimately
+    # be something other than "scheduled" here ("running", "error"), so it is
+    # still reset.
     updated = update_job(
         job["id"],
         {
             "enabled": True,
             "state": "scheduled",
             "next_run_at": _hermes_now().isoformat(),
-            **_unpause_updates(job),
         },
     )
-
-    if updated is not None and was_paused:
-        # Emitted before the CRON_TRIGGERED below so the pair reads in cause
-        # order: the job came out of its pause, and then it was scheduled.
-        emit_cron_lifecycle_safe(
-            action="resumed",
-            job_id=job["id"],
-            job_name=updated.get("name") or job.get("name") or job["id"],
-            caller=caller,
-            reason=previous_paused_reason,
-            paused_at=previous_paused_at,
-            previous_state=previous_state,
-            new_state=updated.get("state"),
-            next_run_at=updated.get("next_run_at"),
-        )
 
     if updated is not None:
         emit_cron_triggered_safe(
@@ -2881,6 +3336,21 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                 continue
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
+            # Admission-time barrier re-check (2026-08-26). Everything above
+            # reads state that an un-pause CLEARS, so it can only answer "is
+            # this job paused right now" — it cannot answer "was it allowed to
+            # stop being paused". The barrier is the one field an un-pause does
+            # not touch, so re-reading it HERE, on the fire path, is what makes
+            # it a fence rather than a flag: a job whose pause was lifted by
+            # any means, sanctioned or not, still does not run.
+            if _resume_barrier(job) is not None:
+                logger.error(
+                    "REFUSED fire of job_id=%s name=%s: resume barrier is set "
+                    "(%s). The job was un-paused without the barrier being "
+                    "cleared — see clear_resume_barrier.",
+                    job_id, job.get("name"), _resume_barrier(job).get("reason"),
+                )
+                return False
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
@@ -3136,6 +3606,22 @@ def _get_due_jobs_locked() -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+
+            # Second half of the admission barrier re-check; see ``claim_fire``
+            # for why it is re-read on the fire path rather than trusted from
+            # the pause flags. Both gates are needed: this one keeps a
+            # barriered job out of the due list at all (so it never reaches
+            # dispatch, and no CRON_TRIGGERED is emitted for a job that will
+            # only be refused later), while ``claim_fire`` covers the manual
+            # and recovery paths that reach a fire without going through here.
+            if _resume_barrier(job) is not None:
+                logger.warning(
+                    "Skipping due job_id=%s name=%s: resume barrier is set "
+                    "(%s).",
+                    job.get("id"), job.get("name"),
+                    (_resume_barrier(job) or {}).get("reason"),
+                )
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler

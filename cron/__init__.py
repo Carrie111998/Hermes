@@ -23,8 +23,12 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    set_resume_barrier,
+    clear_resume_barrier,
+    ResumeBarrierError,
     trigger_job,
     request_run,
+    JobPaused,
     JOBS_FILE,
 )
 from cron.scheduler import tick
@@ -37,8 +41,12 @@ __all__ = [
     "update_job",
     "pause_job",
     "resume_job",
+    "set_resume_barrier",
+    "clear_resume_barrier",
+    "ResumeBarrierError",
     "trigger_job",
     "request_run",
+    "JobPaused",
     "tick",
     "JOBS_FILE",
 ]

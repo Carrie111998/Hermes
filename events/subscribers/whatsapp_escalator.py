@@ -17,8 +17,13 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 from events.bus import EventBus
 from events.failure_eligibility import failure_cluster_eligible
-from events.noise_guards import RepeatGuard, is_sustained_resource_repeat
+from events.noise_guards import (
+    RepeatGuard,
+    is_off_ladder_consecutive_failure,
+    is_sustained_resource_repeat,
+)
 from events.routing_policy import (
+    Attention,
     WA_IMMEDIATE,
     WA_IMPORTANT,
     WA_URGENT,
@@ -294,6 +299,15 @@ class WhatsAppEscalator(BaseSubscriber):
         if is_sustained_resource_repeat(event):
             return
 
+        # Same ladder as the chat lane (events.noise_guards): only rungs
+        # 3, 6, 12, 24 ... page. Applied HERE rather than inherited from
+        # TelegramNotifier because the two subscribers are independent
+        # consumers of the bus — that independence is exactly what v3's
+        # single-source-of-truth policy is for, and skipping it here would
+        # leave the PHONE lane on the pre-ladder behaviour.
+        if is_off_ladder_consecutive_failure(event):
+            return
+
         # Reset daily counter at midnight
         today = datetime.now().strftime("%Y-%m-%d")
         if self._daily_reset_date != today:
@@ -306,8 +320,18 @@ class WhatsAppEscalator(BaseSubscriber):
         # (normalized — digits ignored) within 30 min is one page, not N.
         # IMMEDIATE tier is exempt (interview/offer/secret/credential).
         tier = _TIER_BY_LABEL.get(route.wa_tier)
+        # Mirrors the chat lane: a ladder rung has already been rate-limited
+        # by the ladder itself and must not be collapsed again (the rungs
+        # normalize to one fingerprint); every other WARN+CRITICAL page
+        # dedups on a NON-SLIDING window so a sustained fault re-pages once
+        # per window instead of once per outage.
+        sustained_critical = (route.attention is Attention.WARN
+                              and route.priority is Priority.CRITICAL)
+        ladder_rung = event.event_type == EventType.CRON_FAILED_CONSECUTIVE
         if (tier != EscalationTier.IMMEDIATE
-                and self._wa_repeat_guard.is_repeat("wa", message)):
+                and not ladder_rung
+                and self._wa_repeat_guard.is_repeat(
+                    "wa", message, sliding=not sustained_critical)):
             return
 
         if self._is_quiet_hours() and tier != EscalationTier.IMMEDIATE:

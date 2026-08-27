@@ -4061,12 +4061,29 @@ class SessionBridgeStore:
                 # session_id-wide delete destroys on every rebuild. One session
                 # alone holds 6,235 of them against a single keyed row.
                 #
-                # Consequence, deliberate: the other 5,695 keyless rows ARE
-                # double-ingest residue with keyed twins, and this delete leaves
-                # them in place where the wide form cleared them. Retaining 5,695
-                # stale rows is the correct trade against destroying 13,062 live
-                # ones, but it is a trade, not an oversight -- anyone counting
-                # duplicates later should know it was chosen.
+                # Consequence, deliberate and STILL LIVE: a keyless row that
+                # IS double-ingest residue -- one carrying a keyed twin --
+                # survives here where the wide form cleared it. That is a
+                # standing property of this predicate, not a one-off. Leaving
+                # stale duplicates behind is the correct price for not
+                # destroying unique rows, so anyone counting duplicates later
+                # should know it was chosen, not overlooked.
+                #
+                # The residue this had ACCUMULATED by 2026-08-25 is gone: the
+                # other 5,695 of the 18,757 were exactly that, and on
+                # 2026-08-26 all 5,695 were deleted from the live root state.db
+                # out-of-band, Diego-authorized -- each one verified
+                # byte-identical to a surviving keyed twin across all 22
+                # columns first. So they were NOT retained indefinitely, and
+                # the 18,757/66 figures above are a dated 2026-08-25
+                # measurement rather than current state: live now is 13,062
+                # keyless rows over 60 sessions, every one of them twinless.
+                # Re-measure before quoting either.
+                #
+                # Size any recurrence off the residue's own footprint, not that
+                # 60: the 5,695 lived in 15 sessions, 4 of which held 5,144 of
+                # them. 60 is the TWINLESS session count and scopes a very
+                # different job.
                 conn.execute(
                     "DELETE FROM messages "
                     "WHERE session_id = ? AND native_event_key IS NOT NULL",

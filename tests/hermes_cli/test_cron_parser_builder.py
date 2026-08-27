@@ -25,9 +25,9 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
+    for action in ("list", "show", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
         ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick")
-                               else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
+                               else ["cron", action, "jobid"] if action in ("show", "pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
         assert ns.cron_command == action
@@ -42,6 +42,10 @@ def test_cron_aliases():
     for alias in ("rm", "delete"):
         ns = parser.parse_args(["cron", alias, "jid"])
         assert ns.cron_command == alias
+    # show has alias "detail"
+    ns = parser.parse_args(["cron", "detail", "jid"])
+    assert ns.cron_command == "detail"
+    assert ns.job_id == "jid"
     ns = parser.parse_args(["cron", "history", "jid", "--limit", "7"])
     assert ns.cron_command == "history"
     assert ns.job_id == "jid"
@@ -111,3 +115,47 @@ def test_cron_run_accepts_an_optional_reason():
     assert ns2.reason == "r"
     assert ns2.accept_hooks is True
 
+
+
+def test_cron_edit_accepts_a_model_and_provider_pin():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "edit", "jid", "--model", "claude-opus-5", "--provider", "anthropic",
+    ])
+    assert ns.cron_command == "edit"
+    assert ns.job_id == "jid"
+    assert ns.model == "claude-opus-5"
+    assert ns.provider == "anthropic"
+    # Both optional: a bare `cron edit <id>` must not invent a pin, and None is
+    # what `cronjob(action="update")` reads as "not supplied".
+    bare = parser.parse_args(["cron", "edit", "jid"])
+    assert bare.model is None
+    assert bare.provider is None
+    # Empty string is the documented clear (same as --script / --workdir), and
+    # must survive parsing as "" rather than collapsing to the None default.
+    cleared = parser.parse_args(["cron", "edit", "jid", "--model", "", "--provider", ""])
+    assert cleared.model == ""
+    assert cleared.provider == ""
+    # Composes with the other edit flags.
+    both = parser.parse_args([
+        "cron", "edit", "jid", "--model", "m", "--name", "n", "--agent",
+    ])
+    assert (both.model, both.name, both.no_agent) == ("m", "n", False)
+
+
+def test_cron_create_accepts_a_model_and_provider_pin():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "create", "every 1h", "do the thing",
+        "--model", "claude-opus-5", "--provider", "anthropic",
+    ])
+    assert ns.cron_command == "create"
+    assert ns.model == "claude-opus-5"
+    assert ns.provider == "anthropic"
+    # Both optional: a plain create must not invent a pin.
+    bare = parser.parse_args(["cron", "create", "every 1h"])
+    assert bare.model is None
+    assert bare.provider is None
+    # Available on the `add` alias too — it is the same subparser.
+    aliased = parser.parse_args(["cron", "add", "every 1h", "--model", "m"])
+    assert aliased.model == "m"

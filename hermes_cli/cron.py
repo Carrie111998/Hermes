@@ -1,7 +1,7 @@
 """
 Cron subcommand for hermes CLI.
 
-Handles standalone cron management commands like list, create, edit,
+Handles standalone cron management commands like list, show, create, edit,
 pause/resume/run/remove, status, and tick.
 """
 
@@ -96,6 +96,26 @@ def _warn_if_gateway_not_running() -> None:
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
+# A containment reason is written to be READ — the 2026-08-25 Gate-2 incident
+# happened because nobody saw one. So the listing shows as much of it as fits on
+# a line and, when it clips, names the command that prints the rest verbatim.
+# Never clip silently: a truncated barrier text that looks complete is worse
+# than no text at all.
+_PAUSE_REASON_LIST_LIMIT = 160
+
+
+def _clip_pause_reason(reason: str, limit: int = _PAUSE_REASON_LIST_LIMIT):
+    """Return ``(shown, was_clipped)`` for a one-line rendering of ``reason``.
+
+    Newlines collapse to spaces so a multi-line reason cannot break the
+    listing's alignment.
+    """
+    flat = " ".join(str(reason).split())
+    if len(flat) <= limit:
+        return flat, False
+    return flat[: limit - 1].rstrip() + "…", True
+
+
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
@@ -150,14 +170,43 @@ def cron_list(show_all: bool = False):
         print(f"  {color(job_id, Colors.YELLOW)} {status}")
         print(f"    Name:      {name}")
         if state == "paused":
-            paused_reason = job.get("paused_reason") or "(no reason recorded)"
+            raw_reason = job.get("paused_reason")
             paused_at = job.get("paused_at")
             suffix = f" (since {paused_at})" if paused_at else ""
-            print(f"    Paused:    {paused_reason}{suffix}")
+            if raw_reason:
+                shown, clipped = _clip_pause_reason(raw_reason)
+                print(f"    Paused:    {shown}{suffix}")
+                if clipped:
+                    print(color(
+                        f"               full reason: hermes cron show {job_id}",
+                        Colors.DIM,
+                    ))
+            else:
+                print(f"    Paused:    (no reason recorded){suffix}")
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+
+        # The per-job inference pin. This is the highest-precedence and most
+        # durable model override on the box — it beats HERMES_MODEL and
+        # config.yaml, is re-read from storage every tick, and lives in the
+        # untracked cron store, so no git checkout can revert it. Rendering it
+        # here is the only way an operator can SEE which jobs are pinned; a
+        # job silently running on a stale pin is otherwise indistinguishable
+        # from one following the global default. base_url is shown alongside
+        # because provider+base_url is a single security-relevant pair (F8),
+        # not two independent fields.
+        model = job.get("model")
+        provider = job.get("provider")
+        base_url = job.get("base_url")
+        if model:
+            print(f"    Model:     {model}")
+        if provider:
+            print(f"    Provider:  {provider}")
+        if base_url:
+            print(f"    Base URL:  {base_url}")
+
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
@@ -193,6 +242,49 @@ def cron_list(show_all: bool = False):
         print()
 
     _warn_if_gateway_not_running()
+
+
+def cron_show(job_id: str) -> int:
+    """Print one job in full — including the UNTRUNCATED pause reason.
+
+    ``cron list`` clips a long ``paused_reason`` to keep the listing readable;
+    this is where the whole text lives, so clipping never loses it.
+    """
+    from cron.jobs import get_job
+
+    job = get_job(job_id)
+    if job is None:
+        print(color(f"No such job: {job_id}", Colors.RED))
+        return 1
+
+    state = job.get("state", "scheduled" if job.get("enabled", True) else "paused")
+    print()
+    print(f"{color(job.get('id', job_id), Colors.YELLOW)}  {job.get('name', '(unnamed)')}")
+    print(f"  State:     {state}")
+    print(f"  Enabled:   {job.get('enabled', True)}")
+    print(f"  Schedule:  {job.get('schedule_display', job.get('schedule', {}).get('value', '?'))}")
+    print(f"  Next run:  {job.get('next_run_at', '?')}")
+
+    paused_at = job.get("paused_at")
+    if paused_at:
+        print(f"  Paused at: {paused_at}")
+    reason = job.get("paused_reason")
+    if reason:
+        print("  Paused because:")
+        for line in str(reason).splitlines() or [""]:
+            print(f"    {line}")
+    elif state == "paused" or not job.get("enabled", True):
+        print(color("  Paused because: (no reason recorded)", Colors.DIM))
+
+    history = job.get("paused_history") or []
+    if history:
+        print(f"  Earlier pauses ({len(history)}):")
+        for entry in history:
+            past_reason = entry.get("paused_reason") or "(no reason recorded)"
+            resumed = entry.get("resumed_at") or "?"
+            print(f"    {entry.get('paused_at', '?')} → {resumed}: {past_reason}")
+    print()
+    return 0
 
 
 def cron_tick():
@@ -340,6 +432,12 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        # Pin at creation. Beyond setting the override, a pinned axis carries no
+        # provider_snapshot/model_snapshot (cron.jobs._compute_provider_model_snapshots),
+        # so the job is exempt from the unpinned-drift guard that otherwise
+        # refuses to fire once global inference config moves.
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -350,6 +448,12 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     job_data = result.get("job", {})
+    if job_data.get("model"):
+        print(f"  Model: {job_data['model']}")
+    if job_data.get("provider"):
+        print(f"  Provider: {job_data['provider']}")
+    if job_data.get("base_url"):
+        print(f"  Base URL: {job_data['base_url']}")
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
     if job_data.get("no_agent"):
@@ -403,6 +507,15 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        # The per-job model/provider pin. `cronjob` treats None as "not
+        # supplied" and an empty string as "clear", so the argparse default
+        # leaves an existing pin untouched. Routing through the tool (rather
+        # than update_job directly) is deliberate: `action="update"` re-runs
+        # _validate_cron_base_url on the EFFECTIVE provider/base_url pair, so a
+        # provider change on a job that already carries a base_url cannot
+        # quietly create a credential-exfil pair (F8).
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -416,6 +529,16 @@ def cron_edit(args):
         print(f"  Skills: {', '.join(updated['skills'])}")
     else:
         print("  Skills: none")
+    # Echo the inference pin whenever THIS edit touched it, even when the new
+    # value is empty. A clear that printed nothing would be indistinguishable
+    # from a no-op, and this is the pin that survives a git checkout — the
+    # operator needs to read back what the store now holds, not what was typed.
+    if getattr(args, "model", None) is not None or updated.get("model"):
+        print(f"  Model: {updated.get('model') or '(inherited from env/config)'}")
+    if getattr(args, "provider", None) is not None or updated.get("provider"):
+        print(f"  Provider: {updated.get('provider') or '(inherited from env/config)'}")
+    if updated.get("base_url"):
+        print(f"  Base URL: {updated['base_url']}")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
     if updated.get("no_agent"):
@@ -469,6 +592,74 @@ def _job_action(
     return 0
 
 
+def cron_barrier(args) -> int:
+    """Show / set / clear a job's resume authorization barrier.
+
+    The operator surface for the fence added 2026-08-26. Without it the only
+    way to set a barrier is an in-process call, which is precisely the shape
+    of access that produced the bypass in the first place - the sanctioned
+    path has to be the convenient one or nobody uses it.
+
+    ``--caller`` is required for both mutating modes and is NOT defaulted to a
+    fixed "hermes_cli:..." string the way pause/resume are. Those record which
+    SURFACE acted, which is enough for a routine pause; a barrier lift needs to
+    record which PERSON or script decided the condition was met, and a constant
+    cannot carry that.
+    """
+    job_id = args.job_id
+    setting = getattr(args, "barrier_set", False)
+    clearing = getattr(args, "barrier_clear", False)
+    reason = _clean_reason(getattr(args, "reason", None))
+    caller = (getattr(args, "caller", None) or "").strip()
+
+    if not setting and not clearing:
+        result = _cron_api(action="list", include_disabled=True)
+        jobs = result.get("jobs") or []
+        match = next(
+            (j for j in jobs if job_id in {j.get("job_id"), j.get("name")}), None
+        )
+        if match is None:
+            print(color(f"No job matching '{job_id}'.", Colors.RED))
+            return 1
+        barrier = match.get("resume_barrier")
+        label = f"{match.get('name')} ({match.get('job_id')})"
+        if not barrier:
+            print(f"{label}: no resume barrier.")
+            return 0
+        print(color(f"{label}: RESUME BARRIER SET", Colors.YELLOW))
+        print(f"  Reason:  {barrier.get('reason')}")
+        print(f"  Set by:  {barrier.get('set_by')}")
+        print(f"  Set at:  {barrier.get('set_at')}")
+        print(color("  This job will not resume, trigger, or be admitted by the", Colors.DIM))
+        print(color("  scheduler until it is cleared.", Colors.DIM))
+        return 0
+
+    if not reason:
+        verb = "set" if setting else "clear"
+        print(color(f"--reason is required to {verb} a barrier.", Colors.RED))
+        return 1
+    if not caller:
+        print(color("--caller is required to set or clear a barrier.", Colors.RED))
+        return 1
+
+    action = "barrier_set" if setting else "barrier_clear"
+    result = _cron_api(action=action, job_id=job_id, reason=reason, caller=caller)
+    if not result.get("success"):
+        print(color(f"Failed: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    job = result.get("job") or {}
+    label = f"{job.get('name', job_id)} ({job.get('job_id', job_id)})"
+    if setting:
+        print(color(f"Resume barrier SET on {label}", Colors.YELLOW))
+        print(f"  Reason: {reason}")
+        print(color("  It will not run again until the barrier is cleared.", Colors.DIM))
+    else:
+        print(color(f"Resume barrier CLEARED on {label}", Colors.GREEN))
+        print(f"  Justification: {reason}")
+        print(color("  The job is NOT resumed - run 'hermes cron resume' separately.", Colors.DIM))
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -477,6 +668,9 @@ def cron_command(args):
         show_all = getattr(args, 'all', False)
         cron_list(show_all)
         return 0
+
+    if subcmd in {"show", "detail"}:
+        return cron_show(args.job_id)
 
     if subcmd == "status":
         cron_status()
@@ -513,6 +707,9 @@ def cron_command(args):
             caller="hermes_cli:cron_resume",
         )
 
+    if subcmd == "barrier":
+        return cron_barrier(args)
+
     if subcmd == "run":
         return _job_action(
             "run",
@@ -526,5 +723,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|show|create|edit|pause|resume|barrier|run|remove|status|runs|tick]")
     sys.exit(1)

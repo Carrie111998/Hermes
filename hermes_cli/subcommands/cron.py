@@ -70,6 +70,24 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--model",
+        help=(
+            "Pin the model this job runs on. Highest-precedence override — "
+            "beats HERMES_MODEL and config.yaml `model:` — and is re-read from "
+            "the cron store every tick. Pinning at creation also exempts the "
+            "job from the unpinned-drift skip, which otherwise refuses to run "
+            "a job whose global config changed since it was created."
+        ),
+    )
+    cron_create.add_argument(
+        "--provider",
+        help=(
+            "Pin the inference provider this job runs on (anthropic, openai, "
+            "a configured custom provider, ...). Same precedence and "
+            "drift-exemption as --model."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -134,6 +152,25 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--model",
+        help=(
+            "Pin the model this job runs on. Highest-precedence override — "
+            "beats HERMES_MODEL and config.yaml `model:` — and is re-read from "
+            "the cron store every tick, so it takes effect without a restart. "
+            "Pass empty string to clear (job falls back to env/config)."
+        ),
+    )
+    cron_edit.add_argument(
+        "--provider",
+        help=(
+            "Pin the inference provider this job runs on (anthropic, openai, "
+            "a configured custom provider, ...). Pass empty string to clear. "
+            "A job that already carries a base_url is re-validated against the "
+            "new provider and the edit is refused if the pair would send that "
+            "provider's stored credential off-host."
+        ),
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
@@ -149,6 +186,45 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
+
+    cron_barrier = cron_subparsers.add_parser(
+        "barrier",
+        help="Show, set, or clear a job's resume authorization barrier",
+    )
+    cron_barrier.add_argument("job_id", help="Job ID or name")
+    cron_barrier_mode = cron_barrier.add_mutually_exclusive_group()
+    cron_barrier_mode.add_argument(
+        "--set",
+        dest="barrier_set",
+        action="store_true",
+        help=(
+            "Attach a barrier. The job then refuses to resume, to be triggered, "
+            "and to be admitted by the scheduler until the barrier is cleared - "
+            "un-pausing it by any route is no longer enough."
+        ),
+    )
+    cron_barrier_mode.add_argument(
+        "--clear",
+        dest="barrier_clear",
+        action="store_true",
+        help="Lift the barrier. Does NOT resume the job; resume it separately.",
+    )
+    cron_barrier.add_argument(
+        "--reason",
+        help=(
+            "Required with --set (the condition that must be met before this "
+            "job may run) and with --clear (the evidence that it now is). Both "
+            "are archived to the job's resume_barrier_history."
+        ),
+    )
+    cron_barrier.add_argument(
+        "--caller",
+        help=(
+            "Who is making this change, e.g. 'diego:gate2-landed'. Required: an "
+            "unattributable barrier lift is the 2026-08-26 bypass this whole "
+            "mechanism exists to prevent."
+        ),
+    )
 
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"
@@ -170,6 +246,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_remove.add_argument("job_id", help="Job ID to remove")
 
     # cron status
+    # cron show — the untruncated view `cron list` points at for a long
+    # paused_reason.
+    cron_show = cron_subparsers.add_parser(
+        "show", aliases=["detail"], help="Show one job in full (untruncated pause reason)"
+    )
+    cron_show.add_argument("job_id", help="Job ID")
+
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
     cron_runs = cron_subparsers.add_parser(

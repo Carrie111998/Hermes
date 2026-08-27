@@ -6,9 +6,16 @@ been lost kept its existing copy while the rebuild's insert appended a second
 one -- 287,351 duplicate rows across 1,551 sessions in the live root state.db,
 each stored transcript held exactly twice.
 
-Two independent guards are pinned here: the rebuild now deletes by
-``session_id`` (cause), and ``idx_messages_native_event_key`` refuses a second
-row for an event a session already stores (constraint).
+Two independent guards are pinned here: the rebuild no longer deletes by the
+map join (cause), and ``idx_messages_native_event_key`` refuses a second row
+for an event a session already stores (constraint).
+
+The replacement predicate is ``session_id AND native_event_key IS NOT NULL``,
+NOT a bare ``session_id``.  It was narrowed to that in 3961fa7d82 because a
+session_id-wide delete destroys the keyless rows the bridge does not own --
+13,062 of them on the live root db as of 2026-08-25.  See the comment above
+the delete in ``session_bridge/store.py`` for why neither the wide form nor
+the map join is correct.
 """
 
 from __future__ import annotations

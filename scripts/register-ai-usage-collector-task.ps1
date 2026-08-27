@@ -1,4 +1,4 @@
-# Registers AIUsageCollector: runs the collector every 5 minutes at user logon.
+# Registers AIUsageCollector: runs the collector every 15 minutes at user logon.
 #
 # Provenance: the live AIUsageCollector task on the primary host was registered
 # by this script but the script itself was never committed, so the task's
@@ -24,10 +24,13 @@ if (-not (Test-Path $Runner)) {
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Runner`""
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5)
-# ExecutionTimeLimit is 6 minutes -- deliberately just above the 5-minute
-# repetition interval, with -MultipleInstances IgnoreNew, so a collector run
-# that wedges is killed before the next one is due and runs never stack.
+    -RepetitionInterval (New-TimeSpan -Minutes 15)
+# ExecutionTimeLimit stays at 6 minutes. It is NOT derived from the repetition
+# interval: -MultipleInstances IgnoreNew is what guarantees runs never stack, so
+# the interval and the limit move independently. The interval went 5 -> 15 min on
+# 2026-08-26 to cut cold interpreter starts 288 -> 96/day; terminations (event 329)
+# were dose-responsive to host memory pressure, not to the limit, and a run that
+# overruns 6 minutes is still a wedged run worth killing.
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
     -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Minutes 6) `
     -MultipleInstances IgnoreNew
