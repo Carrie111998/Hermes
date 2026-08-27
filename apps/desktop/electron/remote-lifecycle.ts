@@ -1084,6 +1084,18 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const tokenPath = tokenFilePath ? expandRemotePath(tokenFilePath) : ''
   const ownerPath = `${reservation}/owner`
   const metadata = JSON.stringify({ schemaVersion: LOCKFILE_SCHEMA_VERSION, ...opts.lockMetadata, pid: '__PID__' })
+
+  // The payload runs under `sh` — dash on Debian/Ubuntu — so the PID is spliced
+  // in by concatenation. `${var//pat/repl}` is a bashism; dash aborts the whole
+  // spawn with "Bad substitution". Splitting on the QUOTED placeholder also
+  // keeps `pid` a JSON number: readLockfile() rejects a string pid as
+  // malformed-pid skew.
+  const metadataParts = metadata.split('"__PID__"')
+
+  if (metadataParts.length !== 2) {
+    throw new Error('Lock metadata must contain exactly one PID placeholder.')
+  }
+
   const reservationNonce = validateSpawnNonce(opts.reservationNonce || crypto.randomBytes(8).toString('hex'))
 
   return withRemoteUpdateMutex(
@@ -1103,7 +1115,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
       `${markerClear}; marker_clear || exit 75; mkdir -p "$(dirname ${logPath})" && ` +
       `${detachedSpawn}; ` +
       `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; ` +
-      `lock_json=${shq(metadata)}; lock_json=\${lock_json//__PID__/$child}; ` +
+      `lock_json=${shq(metadataParts[0])}"$child"${shq(metadataParts[1])}; ` +
       `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
       `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
       `echo "$child"`,
