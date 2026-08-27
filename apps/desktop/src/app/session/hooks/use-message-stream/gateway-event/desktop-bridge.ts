@@ -1,10 +1,11 @@
-import { hasLivePreviewForSession, readActivePreview } from '@/app/chat/right-rail/preview-reader'
+import { getLivePreviewTabIdForSession, readActivePreview } from '@/app/chat/right-rail/preview-reader'
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
 import type { PreviewActAction } from '@/lib/preview-act/act-in-page'
 import type { TourAction, TourStep } from '@/lib/tour'
 import { $gateway } from '@/store/gateway'
+import { $rightRailActiveTabId } from '@/store/layout'
 import { applyDesktopLayoutPreset, revealDesktopPane } from '@/store/pane-focus'
 import { recordAgentReaction } from '@/store/reactions-local'
 import { setMessages } from '@/store/session'
@@ -100,14 +101,15 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
         })
 
       // Allow preview actions when the session is active OR when that
-      // session owns a live preview reader. After a restart,
-      // activeSessionIdRef points at whichever session the user has open
-      // — not the bot's session — so isActiveEvent alone rejects valid
-      // preview interactions. Session-scoped reader check prevents a
-      // background session from driving the interactive session's preview
-      // (#95459 review: a live reader proves availability, not authority).
+      // session owns a live preview reader AND the owned tab IS the
+      // globally active preview. Binding admission and effect to the same
+      // exact preview identity means a background session can never pass
+      // the ownership check and then act on a different session's
+      // globally-active tab (#95459).
+      const ownedTabId = getLivePreviewTabIdForSession(ctx.sessionId ?? '')
+
       const previewAllowed =
-        isActiveEvent || hasLivePreviewForSession(ctx.sessionId ?? '')
+        isActiveEvent || (ownedTabId !== null && ownedTabId === $rightRailActiveTabId.get())
 
       if (previewAllowed) {
         void loadPreviewEngine()

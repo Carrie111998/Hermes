@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { $previewTabs } from '@/store/preview'
 
-import { hasLivePreviewForSession, registerPreviewPageReader } from './preview-reader'
+import { getLivePreviewTabIdForSession, hasLivePreviewForSession, registerPreviewPageReader } from './preview-reader'
 
 describe('session-scoped preview reader gate (#95459)', () => {
   const setupTabs = () => {
@@ -49,5 +49,26 @@ describe('session-scoped preview reader gate (#95459)', () => {
     expect(hasLivePreviewForSession('')).toBe(false)
 
     unregister()
+  })
+
+  it('returns the owned tab ID so admission and effect bind to one identity', () => {
+    setupTabs()
+    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
+
+    // Owning session resolves the exact tab it owns...
+    expect(getLivePreviewTabIdForSession('session-A')).toBe('url:tab-a')
+
+    // ...while a non-owning session resolves nothing.
+    expect(getLivePreviewTabIdForSession('session-B')).toBeNull()
+
+    unregister()
+  })
+
+  it('owned tab ID is null after unregister', () => {
+    setupTabs()
+    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
+
+    unregister()
+    expect(getLivePreviewTabIdForSession('session-A')).toBeNull()
   })
 })
