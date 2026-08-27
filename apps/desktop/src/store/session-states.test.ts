@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
-import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $connection, $selectedStoredSessionId, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
   $sessionStates,
   $sessionTiles,
+  $workspaceContextStoredSessionId,
   blankDraftTile,
   clearAllSessionStates,
   closeAllOpenSessionTiles,
@@ -27,6 +28,7 @@ import {
   requestForOwnedSession,
   resetTileRuntimeBindings,
   selectionHomesToWorkspace,
+  sessionFilesystemSharesAmbientConnection,
   type SessionTileDelegate,
   sessionTileOwnerRoute,
   setSessionTileDelegate,
@@ -434,6 +436,43 @@ describe('selectionHomesToWorkspace', () => {
   })
 })
 
+describe('$workspaceContextStoredSessionId', () => {
+  afterEach(() => {
+    noteActiveTreeGroup(null)
+    $layoutTree.set(null)
+    $selectedStoredSessionId.set(null)
+  })
+
+  it('keeps workspace tools attached to the active top tab while a tool zone is focused', () => {
+    $selectedStoredSessionId.set('alpha')
+    $layoutTree.set(
+      split('row', [
+        group(['workspace', tilePane('beta')], { active: tilePane('beta'), id: 'main' }),
+        group(['files'], { active: 'files', id: 'files-zone' })
+      ])
+    )
+
+    noteActiveTreeGroup('main')
+    expect($workspaceContextStoredSessionId.get()).toBe('beta')
+
+    noteActiveTreeGroup('files-zone')
+    expect($workspaceContextStoredSessionId.get()).toBe('beta')
+  })
+
+  it('returns to the primary selection when the workspace tab is active', () => {
+    $selectedStoredSessionId.set('alpha')
+    $layoutTree.set(
+      split('row', [
+        group(['workspace', tilePane('beta')], { active: 'workspace', id: 'main' }),
+        group(['files'], { active: 'files', id: 'files-zone' })
+      ])
+    )
+
+    noteActiveTreeGroup('files-zone')
+    expect($workspaceContextStoredSessionId.get()).toBe('alpha')
+  })
+})
+
 describe('nextSessionTileForWorkspace (⌘W promotion source)', () => {
   afterEach(() => {
     $layoutTree.set(null)
@@ -784,5 +823,41 @@ describe('isSessionRemote (#94640)', () => {
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(isSessionRemote('stored-2')).toBe(true)
+  })
+})
+
+describe('sessionFilesystemSharesAmbientConnection', () => {
+  afterEach(() => {
+    $sessionTiles.set([])
+    setSessions([])
+    $connection.set(null)
+  })
+
+  it('allows an ordinary session with no exact owner route to use the ambient Files bridge', () => {
+    expect(sessionFilesystemSharesAmbientConnection('ordinary-session')).toBe(true)
+  })
+
+  it('fails closed when a focused tile belongs to another remote connection', () => {
+    $connection.set({ connectionId: 'office', mode: 'remote', profile: 'default' } as never)
+    $sessionTiles.set([
+      {
+        ownerRoute: { connectionId: 'homelab', mode: 'remote', profile: 'default' },
+        storedSessionId: 'remote-tile'
+      }
+    ])
+
+    expect(sessionFilesystemSharesAmbientConnection('remote-tile')).toBe(false)
+  })
+
+  it('allows the exact active remote connection and profile', () => {
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default' } as never)
+    $sessionTiles.set([
+      {
+        ownerRoute: { connectionId: 'homelab', mode: 'remote', profile: 'default' },
+        storedSessionId: 'remote-tile'
+      }
+    ])
+
+    expect(sessionFilesystemSharesAmbientConnection('remote-tile')).toBe(true)
   })
 })

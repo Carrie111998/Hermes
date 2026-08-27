@@ -30,6 +30,7 @@ import {
   revealTreePane
 } from '@/components/pane-shell/tree/store'
 import type { WorkspaceMode } from '@/contrib/types'
+import type { HermesConnection } from '@/global'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
 import type { SessionInfo } from '@/types/hermes'
@@ -1003,6 +1004,41 @@ export function isSessionRemote(sessionId: null | string | undefined): boolean {
 }
 
 /**
+ * Whether the global Files bridge can safely browse `sessionId` on the ambient
+ * connection. Local profile pools share Electron's filesystem. Remote reads,
+ * however, route through the active connection + profile, so an exact owner on
+ * another remote route must fail closed instead of browsing the wrong machine.
+ */
+export function sessionFilesystemSharesAmbientConnection(
+  sessionId: null | string | undefined,
+  ambient: HermesConnection | null = $connection.get()
+): boolean {
+  const owner = knownOwnerForSession(sessionId)
+  const ambientMode = ambient?.mode ?? 'local'
+
+  if (!owner) {
+    return true
+  }
+
+  if (typeof owner === 'string') {
+    return ambientMode === 'local' || normalizeProfileKey(owner) === normalizeProfileKey(ambient?.profile)
+  }
+
+  const ownerConnectionId = owner.connectionId.trim()
+  const ownerIsLocal = owner.mode === 'local' || !ownerConnectionId || ownerConnectionId === LOCAL_CONNECTION_ID
+
+  if (ownerIsLocal) {
+    return ambientMode !== 'remote'
+  }
+
+  if (ambientMode !== 'remote' || ownerConnectionId !== ambient?.connectionId?.trim()) {
+    return false
+  }
+
+  return normalizeProfileKey(owner.targetProfile ?? owner.profile) === normalizeProfileKey(ambient.profile)
+}
+
+/**
  * Dispatch a session-scoped RPC through the OWNER of `sessionId` (tile route →
  * hint → connection-tagged row / known profile). This is the client half of
  * #91684: approval.respond (and siblings) sent on the ambient socket land on
@@ -1595,6 +1631,32 @@ export const $focusedStoredSessionId = computed(
     const active = groupId && tree ? findGroup(tree, groupId)?.active : undefined
 
     return active?.startsWith(TILE_PANE_PREFIX) ? active.slice(TILE_PANE_PREFIX.length) : selected
+  }
+)
+
+/**
+ * Session that owns workspace-attached tools such as Files. A click inside a
+ * side/tool zone must not retarget those tools back to the primary chat: when
+ * the interacted zone is not a chat strip, follow the active tab stacked with
+ * `workspace`. This is deliberately separate from `$focusedStoredSessionId`,
+ * whose keyboard/status semantics still fall back to the primary on tool focus.
+ */
+export const $workspaceContextStoredSessionId = computed(
+  [$activeTreeGroup, $layoutTree, $selectedStoredSessionId],
+  (groupId, tree, selected) => {
+    const interacted = groupId && tree ? findGroup(tree, groupId)?.active : undefined
+
+    if (interacted?.startsWith(TILE_PANE_PREFIX)) {
+      return interacted.slice(TILE_PANE_PREFIX.length)
+    }
+
+    if (interacted === 'workspace') {
+      return selected
+    }
+
+    const workspaceActive = tree ? findGroupOfPane(tree, 'workspace')?.active : undefined
+
+    return workspaceActive?.startsWith(TILE_PANE_PREFIX) ? workspaceActive.slice(TILE_PANE_PREFIX.length) : selected
   }
 )
 
