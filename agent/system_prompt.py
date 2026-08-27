@@ -262,6 +262,70 @@ def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
     return [block] if block else []
 
 
+def _session_start_like(agent: Any, now: Any) -> Any:
+    """Best-known conversation start time, or ``now`` as a fallback.
+
+    ``Conversation started:`` must reference when the conversation actually
+    began, not when the system prompt was last (re)built — the prompt is
+    rebuilt on compression, fresh-agent gateway turns, and resume paths, and
+    stamping build time made the date drift forward across midnight (a chat
+    that started on Wednesday read as \"Conversation started: Thursday\" after
+    a Thursday-morning resume).  Prefer, in order:
+
+    1. the timestamp embedded in ``session_id`` (``YYYYMMDD_HHMMSS_...``) —
+       immutable for the life of the session, so the line is byte-stable
+       across every rebuild boundary (preserving prefix-cache KV); timezone
+       is applied the same way ``hermes_time.now()`` does, so the display
+       date honours the user's configured IANA zone;
+    2. ``agent.session_start`` (session-creation stamp);
+    3. ``now`` (initial/legacy build without either).
+    """
+    import re
+    from datetime import datetime
+
+    # Session ids and agent.session_start are stamped with MACHINE-local
+    # time at creation (naive datetime.now()), while ``now`` is rendered in
+    # the user's configured IANA zone.  Attach machine-local first, then
+    # convert so the displayed date honours the configured zone even when
+    # the box's TZ differs (e.g. a remote gateway run in UTC).
+    try:
+        machine_local_tz = datetime.now().astimezone().tzinfo
+    except (ValueError, OSError):
+        machine_local_tz = None
+
+    def _in_display_tz(dt: Any) -> Any:
+        if machine_local_tz is not None and dt.tzinfo is None:
+            try:
+                dt = dt.replace(tzinfo=machine_local_tz)
+            except ValueError:
+                pass
+        if getattr(now, "tzinfo", None) is not None and dt.tzinfo is not None:
+            try:
+                dt = dt.astimezone(now.tzinfo)
+            except (ValueError, OSError):
+                pass
+        return dt
+
+    # 1. Session id embeds the true start as YYYYMMDD_HHMMSS.
+    session_id = getattr(agent, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        m = re.match(r"^(\d{8})_(\d{6})", session_id)
+        if m:
+            try:
+                embedded = datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S")
+                return _in_display_tz(embedded)
+            except ValueError:
+                pass
+
+    # 2. Session-creation stamp set by the runner.
+    session_start = getattr(agent, "session_start", None)
+    if hasattr(session_start, "astimezone"):
+        return _in_display_tz(session_start)
+
+    # 3. Fallback: build time.
+    return now
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -662,13 +726,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()
-    # Date-only (not minute-precision) so the system prompt is byte-stable
-    # for the full day.  Minute-precision changes invalidate prefix-cache KV
-    # on every rebuild path (compression boundary, fresh-agent gateway turns,
-    # session resume without a stored prompt).  The model can still query the
-    # exact wall-clock time via tools when it actually needs it.
-    # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    # The line must anchor the conversation's REAL start, not the build
+    # clock.  The system prompt is rebuilt on compression / fresh-agent
+    # turns / resume-without-stored-prompt; stamping build time silently
+    # advanced the date to "the day the prompt was last rebuilt" whenever a
+    # session crossed midnight or was resumed next morning (the recurring
+    # "you keep saying last night" confusion).  Priority:
+    #   1. timestamp embedded in session_id (YYYYMMDD_HHMMSS_...) — stable
+    #      across resume, compression, any rebuild, and never moves forward;
+    #   2. agent.session_start (session-creation stamp);
+    #   3. now() as a last resort for the initial build.
+    # Date-only output stays byte-stable per session (the embedded start
+    # never changes), preserving prefix-cache KV across rebuild boundaries.
+    # Credit: @iamfoz (PR #20451) for the original date-only design.
+    timestamp_line = f"Conversation started: {_session_start_like(agent, now).strftime('%A, %B %d, %Y')}"
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:
