@@ -4187,7 +4187,15 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         mcp_snapshot = get_mcp_tool_catalog_snapshot()
         aliases = registry.get_registered_toolset_aliases()
-        enabled_canonical = {aliases.get(name, name) for name in enabled}
+
+        def _canonical_toolset(name: str) -> str:
+            if name in aliases:
+                return aliases[name]
+            if name in mcp_snapshot:
+                return f"mcp-{name}"
+            return name
+
+        enabled_canonical = {_canonical_toolset(name) for name in enabled}
         known_names = {
             (definition.get("function") or {}).get("name")
             for definition in definitions
@@ -4214,11 +4222,11 @@ class APIServerAdapter(BasePlatformAdapter):
         configured = (config.get("platform_toolsets") or {}).get(platform)
         explicit_config_present = isinstance(configured, list)
         explicit_names = {str(name) for name in configured} if explicit_config_present else set()
-        explicit_canonical = {aliases.get(name, name) for name in explicit_names}
+        explicit_canonical = {_canonical_toolset(name) for name in explicit_names}
 
         requested_by_canonical: Dict[str, List[str]] = {}
         for name in sorted(enabled):
-            requested_by_canonical.setdefault(aliases.get(name, name), []).append(name)
+            requested_by_canonical.setdefault(_canonical_toolset(name), []).append(name)
 
         if explicit_names:
             from toolsets import TOOLSETS, resolve_toolset

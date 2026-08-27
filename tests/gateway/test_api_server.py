@@ -1073,7 +1073,7 @@ class TestToolsEndpoint:
             },
         ), patch(
             "tools.registry.registry.get_registered_toolset_aliases",
-            return_value={"aurora": "mcp-aurora"},
+            return_value={},
         ), patch(
             "tools.registry.registry.get_entry",
             return_value=None,
