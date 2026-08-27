@@ -28,6 +28,7 @@ import copy
 import os
 import shutil
 import sys
+import typing
 import json
 import re
 import concurrent.futures
@@ -21052,6 +21053,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _exit_needs_tty() -> "typing.NoReturn":
+    """Report the missing TTY and exit 1."""
+    print(
+        "Error: interactive chat requires a terminal (stdin is not a TTY).\n"
+        "Run 'hermes chat' directly in a terminal, or pass a one-shot query:\n"
+        '  hermes chat -q "your prompt"',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def will_enter_interactive_repl(
     *,
     query: str | None = None,
@@ -21179,14 +21191,7 @@ def main(
         list_tools=list_tools,
         list_toolsets=list_toolsets,
     ) and not sys.stdin.isatty():
-        print(
-            "Error: interactive chat requires a terminal (stdin is not a TTY).\n"
-            "Run 'hermes chat' directly in a terminal, or pass a one-shot "
-            "query:\n"
-            '  hermes chat -q "your prompt"',
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        _exit_needs_tty()
 
     # Skip worktree for list commands (they exit immediately)
     if not list_tools and not list_toolsets:
@@ -21717,6 +21722,21 @@ def main(
             _finalize_single_query(cli)
         return
     
+    # Backstop: the early guard above is the one that fires in practice (it
+    # runs before worktree setup and agent init, so the user does not pay for
+    # either), but it necessarily predicts which branch main() will take. This
+    # check sits on the actual REPL entry, where no prediction is involved, so a
+    # future flag that carves out a new non-interactive path — or reorders the
+    # dispatch below — cannot silently bypass the TTY requirement and reintroduce
+    # the raw `OSError: [Errno 22]` from prompt_toolkit.
+    #
+    # Only stdin is checked, deliberately. prompt_toolkit tolerates a non-TTY
+    # stdout: with a pty stdin and a piped stdout, Application.run() completes
+    # normally (verified against the vendored prompt_toolkit), so gating on
+    # stdout too would break `hermes chat | tee session.log`, which works today.
+    if not sys.stdin.isatty():
+        _exit_needs_tty()
+
     # Run interactive mode
     cli.run()
 

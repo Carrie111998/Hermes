@@ -77,3 +77,30 @@ class TestInteractiveTTYGuard:
         with pytest.raises(SystemExit) as exc:
             cli_mod.main()
         assert exc.value.code == 1
+
+
+class TestBackstopGuard:
+    """The REPL entry itself is guarded, not only the predicted branch.
+
+    The early guard predicts which branch main() will take; this one sits on the
+    actual REPL entry. A future flag that carves out a new non-interactive path,
+    or a reordering of main()'s dispatch, must not be able to reach
+    prompt_toolkit with a non-TTY stdin.
+    """
+
+    def test_repl_entry_is_guarded_even_if_the_early_check_is_bypassed(
+        self, monkeypatch, capsys
+    ):
+        # Simulate exactly that regression: force the predicate to claim this
+        # invocation is non-interactive, so the early guard does not fire.
+        monkeypatch.setattr(cli_mod, "will_enter_interactive_repl", lambda **_kw: False)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+
+        def _boom(*_a, **_k):
+            raise AssertionError("reached cli.run() with a non-TTY stdin")
+
+        monkeypatch.setattr(cli_mod.HermesCLI, "run", _boom, raising=False)
+        with pytest.raises(SystemExit) as exc:
+            cli_mod.main()
+        assert exc.value.code == 1
+        assert "requires a terminal" in capsys.readouterr().err
