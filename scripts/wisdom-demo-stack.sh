@@ -28,9 +28,10 @@ declare -a CHILD_PIDS=()
 
 usage() {
   cat <<'EOF'
-Usage: scripts/wisdom-demo-stack.sh [up|status]
+Usage: scripts/wisdom-demo-stack.sh [up|login|status]
 
   up      Start the complete local demo in this terminal (default).
+  login   Refresh the foreground Portal browser's local demo session.
   status  Show the expected listener state without changing anything.
 
 Useful overrides:
@@ -217,13 +218,26 @@ authenticate_demo() {
     return 1
   fi
 
+  open_portal_login "${auth_record}"
+}
+
+open_portal_login() {
+  local auth_record="$1"
+  local handoff_pid
+
   AUTH_FILE="${auth_record}" \
     PORTAL_REDIRECT="${PORTAL_URL}/orgs/${TEAM_ORG_SLUG}/wisdom" \
     node -e '
       const http = require("node:http");
       const fs = require("node:fs");
       const record = JSON.parse(fs.readFileSync(process.env.AUTH_FILE, "utf8"));
+      const timeout = setTimeout(() => {
+        server.close(() => {
+          process.exitCode = 1;
+        });
+      }, 30000);
       const server = http.createServer((_request, response) => {
+        clearTimeout(timeout);
         response.statusCode = 302;
         for (const cookie of record.cookies) {
           response.appendHeader(
@@ -237,9 +251,41 @@ authenticate_demo() {
       });
       server.listen(3120, "127.0.0.1");
     ' >"${STATE_DIR}/browser-login.log" 2>&1 &
-  CHILD_PIDS+=("$!")
+  handoff_pid="$!"
+  CHILD_PIDS+=("${handoff_pid}")
   wait_for_port 3120 "browser login handoff"
   open "http://127.0.0.1:3120/login"
+  wait "${handoff_pid}"
+}
+
+login() {
+  local auth_record="${STATE_DIR}/portal-login.json"
+  local -a relogin_args=(
+    --privy-did "${PRIVY_DID}"
+    --org-id "${TEAM_ORG_ID}"
+  )
+
+  require_directory "${PORTAL_APP}"
+  mkdir -p "${STATE_DIR}"
+  require_free_port 3120 "browser-login"
+  [[ -n "$(port_pid 3111 || true)" ]] || {
+    echo "error: Portal is not running on ${PORTAL_URL}" >&2
+    echo "hint: start the demo with scripts/wisdom-demo-stack.sh up" >&2
+    exit 1
+  }
+
+  (
+    cd "${PORTAL_APP}"
+    set -a
+    # shellcheck disable=SC1091
+    source e2e/browser/env.source
+    set +a
+    pnpm exec tsx scripts/relogin-account.ts "${relogin_args[@]}"
+  ) >"${auth_record}"
+  chmod 600 "${auth_record}"
+
+  open_portal_login "${auth_record}"
+  echo "Portal demo login refreshed for ${TEAM_ORG_SLUG}"
 }
 
 up() {
@@ -332,6 +378,7 @@ up() {
 
 case "${1:-up}" in
   up) up ;;
+  login) login ;;
   status) status ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
