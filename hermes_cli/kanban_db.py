@@ -11628,6 +11628,23 @@ def _kanban_local_first_enabled() -> bool:
     return bool(isinstance(kanban, Mapping) and kanban.get("local_first"))
 
 
+def _resolve_explicit_local_task_route(
+    task: Task,
+) -> Optional[tuple[str, str]]:
+    """Return an explicitly pinned local task route, if one was supplied.
+
+    ``kanban.local_first`` is a policy for avoiding doomed remote attempts;
+    it must not erase a deliberate per-card local model selection.  The
+    provider is required here so a model name cannot be guessed to be local
+    from its spelling alone.
+    """
+    provider = str(task.provider_override or "").strip().lower()
+    model = str(task.model_override or "").strip()
+    if provider in _LOCAL_KANBAN_PROVIDERS and model:
+        return provider, model
+    return None
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -11879,22 +11896,26 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
+    explicit_local_route = _resolve_explicit_local_task_route(task)
     local_first_route = (
         _resolve_local_first_route(parsed_profile)
         if _kanban_local_first_enabled()
         else None
     )
-    if local_first_route is not None:
-        # A task-level remote override is still subject to the operator's
-        # local-first policy. This avoids a guaranteed egress rejection for
-        # protected task context while preserving the configured profile route
-        # and fail-closed firewall for any later fallback attempt.
-        local_provider, local_model = local_first_route
+    selected_local_route = explicit_local_route or local_first_route
+    if selected_local_route is not None:
+        # An explicit local task pin has precedence over the profile's local
+        # fallback. A remote task override remains subject to local-first
+        # policy, avoiding a guaranteed egress rejection for protected task
+        # context while preserving the configured profile route and
+        # fail-closed firewall for any later fallback attempt.
+        local_provider, local_model = selected_local_route
         _log.info(
-            "kanban worker %s: local-first route %s/%s selected before spawn",
+            "kanban worker %s: local route %s/%s selected before spawn (%s)",
             task.id,
             local_provider,
             local_model,
+            "explicit task pin" if explicit_local_route else "profile local-first",
         )
         cmd.extend(["-m", local_model, "--provider", local_provider])
     elif task.model_override:
