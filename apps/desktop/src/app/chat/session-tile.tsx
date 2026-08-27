@@ -44,6 +44,7 @@ import { sessionAwaitingInput } from '@/store/prompts'
 import {
   $connection,
   $gatewayState,
+  $primarySessionOwnerIntent,
   $selectedStoredSessionId,
   $sessions,
   sessionMatchesStoredId,
@@ -633,6 +634,23 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
   })
 }
 
+/** Capture the exact owner represented by a tab before dispatching Delete.
+ * Tile tabs carry their persisted route; the workspace tab carries the
+ * primary selection intent. A bare stored id is insufficient when two
+ * connections expose the same profile/id. */
+export function sessionTabDeleteOwnerRoute(
+  storedSessionId: string,
+  tabPaneId: string
+): SessionOwnerRoute | undefined {
+  if (tabPaneId !== 'workspace') {
+    return sessionTileOwnerRoute(storedSessionId)
+  }
+
+  const intent = $primarySessionOwnerIntent.get()
+
+  return intent?.storedSessionId === storedSessionId ? intent.ownerRoute : undefined
+}
+
 /** A session TAB's context menu: the full session verb set (pin, copy id, new
  *  window, branch, rename, archive, delete) — the SAME menu a sidebar row
  *  gets, targeted through the tile delegate (whose verbs are generic over
@@ -664,7 +682,12 @@ export function SessionTabMenu({
         onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
         onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
         onClose={onClose}
-        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
+        onDelete={() =>
+          void sessionTileDelegate()?.deleteSession(
+            storedSessionId,
+            sessionTabDeleteOwnerRoute(storedSessionId, tabPaneId)
+          )
+        }
         onHideTabBar={onHideTabBar}
         onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
         pinned={pinned}

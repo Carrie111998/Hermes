@@ -74,7 +74,7 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
-import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
+import { $sessionStates, $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 import {
   $transcriptTailBySessionId,
@@ -3759,6 +3759,7 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     $sessionSeenCounts.set({})
     $unreadFinishedMarkers.set({})
     $sessionTiles.set([])
+    $sessionStates.set({})
     $transcriptTailBySessionId.set({})
     setPrimarySessionOwnerIntent(null)
     _resetSessionOwnerHintsForTests({ storage: true })
@@ -3781,10 +3782,12 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     $sessionSeenCounts.set({})
     $unreadFinishedMarkers.set({})
     $sessionTiles.set([])
+    $sessionStates.set({})
     $transcriptTailBySessionId.set({})
     setPrimarySessionOwnerIntent(null)
     _resetSessionOwnerHintsForTests({ storage: true })
     window.localStorage.clear()
+    vi.mocked(requestGatewayForAgent).mockClear()
   })
 
   async function readyActions() {
@@ -3941,6 +3944,98 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
 
     expect(vi.mocked(requestGatewayForAgent).mock.calls.filter(call => call[2] === 'session.close')).toEqual([])
     expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('evicts the selected primary exact stored-runtime binding and warm state after deletion', async () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
+
+    const runtimeBindings: MutableRefObject<Map<string, string>> = {
+      current: new Map([['selected-cleanup', 'runtime-a']])
+    }
+
+    const runtimeStates: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['runtime-a', createClientSessionState('selected-cleanup')]])
+    }
+
+    setSessions([
+      storedSession({ connection_id: sourceA.connectionId, id: 'selected-cleanup', profile: sourceA.profile })
+    ])
+    setPrimarySessionOwnerIntent({ ownerRoute: sourceA, storedSessionId: 'selected-cleanup' })
+    $sessionStates.set({ 'runtime-a': createClientSessionState('selected-cleanup') })
+    mockDeleteSession.mockResolvedValue({ ok: true })
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-a"
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        runtimeIdByStoredSessionIdRef={runtimeBindings}
+        selectedStoredSessionId="selected-cleanup"
+        sessionStateByRuntimeIdRef={runtimeStates}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('selected-cleanup', sourceA)
+    })
+
+    expect(runtimeBindings.current.has('selected-cleanup')).toBe(false)
+    expect(runtimeStates.current.has('runtime-a')).toBe(false)
+    expect($sessionStates.get()['runtime-a']).toBeUndefined()
+  })
+
+  it('keeps another owner binding while evicting the deleted selected primary runtime', async () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
+    const sourceB = { connectionId: 'source-b', profile: 'worker' }
+
+    const runtimeBindings: MutableRefObject<Map<string, string>> = {
+      current: new Map([['shared-primary-cleanup', 'runtime-b']])
+    }
+
+    const runtimeStates: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([
+        ['runtime-a', createClientSessionState('shared-primary-cleanup')],
+        ['runtime-b', createClientSessionState('shared-primary-cleanup')]
+      ])
+    }
+
+    setSessions([
+      storedSession({ connection_id: sourceA.connectionId, id: 'shared-primary-cleanup', profile: sourceA.profile }),
+      storedSession({ connection_id: sourceB.connectionId, id: 'shared-primary-cleanup', profile: sourceB.profile })
+    ])
+    setPrimarySessionOwnerIntent({ ownerRoute: sourceA, storedSessionId: 'shared-primary-cleanup' })
+    $sessionStates.set({
+      'runtime-a': createClientSessionState('shared-primary-cleanup'),
+      'runtime-b': createClientSessionState('shared-primary-cleanup')
+    })
+    mockDeleteSession.mockResolvedValue({ ok: true })
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-a"
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        runtimeIdByStoredSessionIdRef={runtimeBindings}
+        selectedStoredSessionId="shared-primary-cleanup"
+        sessionStateByRuntimeIdRef={runtimeStates}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('shared-primary-cleanup', sourceA)
+    })
+
+    expect(runtimeBindings.current.get('shared-primary-cleanup')).toBe('runtime-b')
+    expect(runtimeStates.current.has('runtime-a')).toBe(false)
+    expect(runtimeStates.current.has('runtime-b')).toBe(true)
+    expect($sessionStates.get()['runtime-a']).toBeUndefined()
+    expect($sessionStates.get()['runtime-b']).toBeDefined()
   })
 
   it('keeps a same-id tile owned by another connection', async () => {

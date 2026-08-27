@@ -3,14 +3,20 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { clearSessionDraft, stashSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
-import { $connection, $sessions } from '@/store/session'
+import { $connection, $sessions, setPrimarySessionOwnerIntent } from '@/store/session'
 import {
   $sessionTiles,
   sessionTileOwnerGeneration,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
 
-import { commitSessionTileResume, sessionTileDraftScope, sessionTileResumeFailure, tileDragPayload } from './session-tile'
+import {
+  commitSessionTileResume,
+  sessionTabDeleteOwnerRoute,
+  sessionTileDraftScope,
+  sessionTileResumeFailure,
+  tileDragPayload
+} from './session-tile'
 
 afterEach(() => {
   $activeGatewayProfile.set('default')
@@ -18,6 +24,23 @@ afterEach(() => {
   $projectTree.set([])
   $sessions.set([])
   $sessionTiles.set([])
+  setPrimarySessionOwnerIntent(null)
+})
+
+describe('tab delete owner routing', () => {
+  it('captures the exact persisted owner of a tile tab', () => {
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    $sessionTiles.set([{ ownerRoute, storedSessionId: 'duplicate-id' }])
+
+    expect(sessionTabDeleteOwnerRoute('duplicate-id', 'session-tile:duplicate-id')).toEqual(ownerRoute)
+  })
+
+  it('captures the exact primary owner intent for the workspace tab', () => {
+    const ownerRoute = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    setPrimarySessionOwnerIntent({ ownerRoute, storedSessionId: 'duplicate-id' })
+
+    expect(sessionTabDeleteOwnerRoute('duplicate-id', 'workspace')).toEqual(ownerRoute)
+  })
 })
 
 describe('sessionTileResumeFailure', () => {

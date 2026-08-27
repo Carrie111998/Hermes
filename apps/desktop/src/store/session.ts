@@ -149,10 +149,56 @@ export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: n
     return undefined
   }
 
-  const session = sessions.find(candidate => sessionMatchesStoredId(candidate, sessionId))
-  const profile = session?.profile?.trim()
-  const connectionId = session?.connection_id?.trim()
+  const candidates = sessions.filter(candidate => sessionMatchesStoredId(candidate, sessionId))
   const hint = getSessionOwnerHint(sessionId)
+
+  if (candidates.length === 0) {
+    return hint
+  }
+
+  if (candidates.length > 1) {
+    if (hint) {
+      const hintConnectionId = hint.connectionId.trim()
+      const hintProfiles = new Set([hint.profile.trim() || 'default', hint.targetProfile?.trim() || 'default'])
+
+      const taggedHintMatch = candidates.some(
+        candidate =>
+          candidate.connection_id?.trim() === hintConnectionId &&
+          hintProfiles.has(candidate.profile?.trim() || 'default')
+      )
+
+      const allUntaggedProfilesMatch = candidates.every(
+        candidate => !candidate.connection_id?.trim() && hintProfiles.has(candidate.profile?.trim() || 'default')
+      )
+
+      if (taggedHintMatch || allUntaggedProfilesMatch) {
+        return hint
+      }
+    }
+
+    const owners = new Map<string, SessionOwnerScope>()
+
+    for (const candidate of candidates) {
+      const profile = candidate.profile?.trim()
+      const connectionId = candidate.connection_id?.trim()
+
+      const owner: SessionOwnerScope = connectionId
+        ? { connectionId, profile: profile || 'default' }
+        : profile || undefined
+
+      const key = connectionId
+        ? JSON.stringify(['route', connectionId, profile || 'default'])
+        : JSON.stringify(['profile', profile || ''])
+
+      owners.set(key, owner)
+    }
+
+    return owners.size === 1 ? owners.values().next().value : undefined
+  }
+
+  const session = candidates[0]
+  const profile = session.profile?.trim()
+  const connectionId = session.connection_id?.trim()
 
   if (connectionId) {
     return { connectionId, profile: profile || 'default' }
@@ -551,10 +597,16 @@ export function mergeSessionPage(
   const prevByLineage = new Map(previous.map(session => [lineageIdentity(session), session]))
 
   const merged = incoming.map(session => {
-    const prev =
-      prevById.get(identity(session)) ??
-      prevByLineage.get(lineageIdentity(session)) ??
-      uniqueUntaggedPrevious(previous, session)
+    // An untagged row normalizes to the local owner identity. That normalization
+    // is not proof that the row came from the local candidate: the aggregate can
+    // contain both local and remote copies of the same profile/id (or lineage).
+    // Establish uniqueness before any normalized exact lookup so local metadata
+    // cannot win merely because `undefined` connection_id normalizes to `local`.
+    const prev = session.connection_id?.trim()
+      ? prevById.get(identity(session)) ??
+        prevByLineage.get(lineageIdentity(session)) ??
+        uniqueUntaggedPrevious(previous, session)
+      : uniqueUntaggedPrevious(previous, session)
 
     // User-send stamps last_active before the DB flushes the user row
     // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.

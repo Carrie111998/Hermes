@@ -248,6 +248,28 @@ describe('knownSessionOwner', () => {
 
     expect(knownSessionOwner([], 'hidden')).toEqual(route)
   })
+
+  it('fails closed when duplicate rows name different exact owners', () => {
+    const rows = [
+      session({ connection_id: 'source-a', id: 'shared-owner', profile: 'worker' }),
+      session({ connection_id: 'source-b', id: 'shared-owner', profile: 'worker' })
+    ]
+
+    expect(knownSessionOwner(rows, 'shared-owner')).toBeUndefined()
+  })
+
+  it('honors a unique exact hint when duplicate rows share a stored id', () => {
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    const rows = [
+      session({ connection_id: 'source-a', id: 'hinted-owner', profile: 'worker' }),
+      session({ connection_id: 'source-b', id: 'hinted-owner', profile: 'worker' })
+    ]
+
+    setSessionOwnerHint('hinted-owner', ownerB)
+
+    expect(knownSessionOwner(rows, 'hinted-owner')).toEqual(ownerB)
+  })
 })
 
 describe('computed $attentionSessionIds', () => {
@@ -396,6 +418,60 @@ describe('mergeSessionPage', () => {
     const incoming = [session({ id: 'shared-remote', profile: 'worker', title: null })]
 
     expect(mergeSessionPage(previous, incoming, [])[0]).toMatchObject({ profile: 'worker', title: null })
+    expect(mergeSessionPage(previous, incoming, [])[0]?.connection_id).toBeUndefined()
+  })
+
+  it('does not inherit local metadata when an untagged id also exists remotely', () => {
+    const previous = [
+      session({ connection_id: 'local', id: 'local-remote-twin', last_active: 50, profile: 'worker', title: 'Local title' }),
+      session({
+        connection_id: 'homelab',
+        id: 'local-remote-twin',
+        last_active: 40,
+        profile: 'worker',
+        title: 'Remote title'
+      })
+    ]
+
+    const incoming = [session({ id: 'local-remote-twin', last_active: 5, profile: 'worker', title: null })]
+
+    expect(mergeSessionPage(previous, incoming, [])[0]).toMatchObject({
+      last_active: 5,
+      profile: 'worker',
+      title: null
+    })
+    expect(mergeSessionPage(previous, incoming, [])[0]?.connection_id).toBeUndefined()
+  })
+
+  it('does not inherit local metadata when an untagged lineage also exists remotely', () => {
+    const previous = [
+      session({
+        _lineage_root_id: 'shared-lineage',
+        connection_id: 'local',
+        id: 'local-tip',
+        last_active: 50,
+        profile: 'worker',
+        title: 'Local lineage title'
+      }),
+      session({
+        _lineage_root_id: 'shared-lineage',
+        connection_id: 'homelab',
+        id: 'remote-tip',
+        last_active: 40,
+        profile: 'worker',
+        title: 'Remote lineage title'
+      })
+    ]
+
+    const incoming = [
+      session({ _lineage_root_id: 'shared-lineage', id: 'fresh-tip', last_active: 5, profile: 'worker', title: null })
+    ]
+
+    expect(mergeSessionPage(previous, incoming, [])[0]).toMatchObject({
+      last_active: 5,
+      profile: 'worker',
+      title: null
+    })
     expect(mergeSessionPage(previous, incoming, [])[0]?.connection_id).toBeUndefined()
   })
 

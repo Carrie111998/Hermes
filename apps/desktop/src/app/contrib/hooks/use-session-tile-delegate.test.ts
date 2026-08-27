@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { setSessionOwnerHint, setSessions } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import {
   $sessionTiles,
   sessionTileDelegate,
@@ -47,6 +48,7 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
 function renderTile(
   requestGateway: ReturnType<typeof vi.fn>,
   refs?: {
+    removeSession?: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
     runtimeIdByStoredSessionIdRef?: { current: Map<string, string> }
     sessionStateByRuntimeIdRef?: { current: Map<string, unknown> }
     updateSessionState?: ReturnType<typeof vi.fn>
@@ -57,7 +59,7 @@ function renderTile(
       archiveSession: vi.fn(async () => undefined),
       branchStoredSession: vi.fn(async () => undefined),
       executeSlashCommand: vi.fn(async () => undefined) as never,
-      removeSession: vi.fn(async () => undefined),
+      removeSession: refs?.removeSession ?? vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
       runtimeIdByStoredSessionIdRef: (refs?.runtimeIdByStoredSessionIdRef ?? { current: new Map() }) as never,
       sessionStateByRuntimeIdRef: (refs?.sessionStateByRuntimeIdRef ?? { current: new Map() }) as never,
@@ -65,6 +67,18 @@ function renderTile(
     })
   )
 }
+
+describe('useSessionTileDelegate deleteSession', () => {
+  it('threads the tab captured owner route through to removeSession', async () => {
+    const removeSession = vi.fn(async () => undefined)
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    renderTile(vi.fn(), { removeSession })
+    await sessionTileDelegate()!.deleteSession('duplicate-id', ownerRoute)
+
+    expect(removeSession).toHaveBeenCalledWith('duplicate-id', ownerRoute)
+  })
+})
 
 describe('useSessionTileDelegate resumeTile', () => {
   beforeEach(() => {

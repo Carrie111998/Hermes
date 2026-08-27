@@ -2401,13 +2401,24 @@ export function useSessionActions({
           closeSessionTile(storedSessionId)
         }
 
-        if (tiledRuntimeId) {
-          if (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) === tiledRuntimeId) {
-            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+        // Retire every exact runtime owned by the deleted surface. The selected
+        // primary is not necessarily tiled, and a same-id owner may already have
+        // replaced the stored→runtime entry; delete mappings by matching runtime
+        // value so owner B's binding cannot be evicted while owner A's warm cache,
+        // reverse state, and reactive mirror are removed.
+        const deletedRuntimeIds = new Set(
+          [closingRuntimeId, tiledRuntimeId].filter((id): id is string => Boolean(id))
+        )
+
+        for (const deletedRuntimeId of deletedRuntimeIds) {
+          for (const [boundStoredId, boundRuntimeId] of runtimeIdByStoredSessionIdRef.current) {
+            if (boundRuntimeId === deletedRuntimeId) {
+              runtimeIdByStoredSessionIdRef.current.delete(boundStoredId)
+            }
           }
 
-          sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
-          dropSessionState(tiledRuntimeId)
+          sessionStateByRuntimeIdRef.current.delete(deletedRuntimeId)
+          dropSessionState(deletedRuntimeId)
         }
       } catch (err) {
         if (listed?.session) {

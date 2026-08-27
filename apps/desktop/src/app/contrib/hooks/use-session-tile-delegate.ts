@@ -17,7 +17,11 @@ import {
 } from '@/store/read-only-transcript'
 import { knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
-import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
+import {
+  requestForSessionProfile,
+  type SessionOwnerRoute,
+  type SessionOwnerScope
+} from '@/store/session-request-router'
 import {
   publishSessionState,
   sessionTileOwnerGeneration,
@@ -58,7 +62,7 @@ interface SessionTileDelegateParams {
   archiveSession: (storedSessionId: string) => Promise<unknown>
   branchStoredSession: (storedSessionId: string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
-  removeSession: (storedSessionId: string) => Promise<unknown>
+  removeSession: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
   requestGateway: GatewayRequester
   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef']
   sessionStateByRuntimeIdRef: SessionStateCache['sessionStateByRuntimeIdRef']
@@ -144,8 +148,8 @@ export function useSessionTileDelegate({
       branchSession: async storedSessionId => {
         await branchStoredSession(storedSessionId)
       },
-      deleteSession: async storedSessionId => {
-        await removeSession(storedSessionId)
+      deleteSession: async (storedSessionId, ownerRoute) => {
+        await removeSession(storedSessionId, ownerRoute)
       },
       executeSlash: async (rawCommand, sessionId) => {
         await executeSlashCommand(rawCommand, { sessionId })
