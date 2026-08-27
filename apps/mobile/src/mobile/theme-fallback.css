@@ -40,7 +40,7 @@ body {
   padding-top: env(safe-area-inset-top);
   /* Bottom = nav-bar inset. When the keyboard opens the WebView shrinks above
      it natively (Chromium edge-to-edge), so no manual lift is needed here. */
-  padding-bottom: env(safe-area-inset-bottom);
+  padding-bottom: var(--mobile-system-bottom-inset);
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
   /* The safe-area strips (status bar on top, nav bar on bottom) show this
@@ -54,6 +54,13 @@ body {
   height: 100% !important;
   max-height: 100%;
   min-height: 0;
+}
+
+/* Desktop chat docks the composer at `bottom:0` inside a 100vh shell. Lift
+   only the docked phone composer into the same opaque system lane as #root;
+   keyboard resize still owns the open-keyboard position. */
+:root[data-hermes-mobile] [data-slot='composer-dock']:not([data-popped-out]) {
+  bottom: var(--mobile-system-bottom-inset) !important;
 }
 
 /*
@@ -86,6 +93,21 @@ body {
   --composer-control-gap: 0.375rem;
   /* A phone must never inherit the desktop chat's rigid minimum pane width. */
   --chat-min-width: 0px;
+  /* Fold gesture/nav bars can report zero through older WebView safe-area
+     bridges. Keep a deliberate opaque 20px minimum clear lane so the composer
+     never rests under Android Home/Back/Recents controls. */
+  --mobile-system-bottom-inset: max(env(safe-area-inset-bottom), 1.25rem);
+  --mobile-conversation-text-scale: 1;
+}
+
+/* Text comfort is deliberately separate from density. It adjusts reading text
+   and line metrics, not the phone's fixed 44px controls or safe-area math. */
+:root[data-hermes-mobile] {
+  --conversation-text-font-size: calc(0.8125rem * var(--mobile-conversation-text-scale));
+  --conversation-caption-font-size: calc(0.75rem * var(--mobile-conversation-text-scale));
+  --conversation-tool-font-size: calc(0.6875rem * var(--mobile-conversation-text-scale));
+  --conversation-line-height: calc(1.125rem * var(--mobile-conversation-text-scale));
+  --conversation-caption-line-height: calc(1rem * var(--mobile-conversation-text-scale));
 }
 [data-titlebar-tool='layout'],
 [data-titlebar-tool='hud'],
@@ -643,11 +665,53 @@ html:has([data-overlay-surface]) .mobile-top-toolbar {
   padding-inline: 0.75rem;
 }
 .mobile-preview-webpage {
-  width: 100%;
+  width: min(100%, calc(100% / var(--mobile-preview-zoom)));
   min-height: 0;
-  flex: 1;
+  max-height: 100%;
+  aspect-ratio: var(--mobile-preview-aspect);
   border: 0;
   background: white;
+  transform: scale(var(--mobile-preview-zoom));
+  transform-origin: center;
+}
+.mobile-preview-controls {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: center;
+  gap: 0.25rem;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.25));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  padding: 0.25rem 0.5rem;
+}
+.mobile-preview-controls button {
+  min-width: 2.75rem;
+  min-height: 2.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--ui-text-tertiary, currentColor);
+  font-size: 0.75rem;
+}
+.mobile-preview-controls button[aria-pressed='true'] {
+  border-color: var(--ui-stroke-secondary, rgb(148 163 184 / 0.45));
+  background: var(--chrome-action-hover, rgb(148 163 184 / 0.14));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-controls span {
+  min-width: 2.5rem;
+  color: var(--ui-text-tertiary, currentColor);
+  font-size: 0.75rem;
+  text-align: center;
+}
+.mobile-preview-viewport {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  background: color-mix(in srgb, var(--dt-background, #0d2f86) 88%, black);
 }
 .mobile-preview-unavailable {
   display: grid;

@@ -149,7 +149,7 @@ public class ActiveSessionService extends Service {
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
         return builder
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_hermes)
                 .setContentTitle("Hermes active session")
                 .setContentText("Keeping your remote session ready")
                 .setContentIntent(PendingIntent.getActivity(this, 4101, open, flags))

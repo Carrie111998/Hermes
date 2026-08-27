@@ -35,6 +35,7 @@ import {
   togglePanesFlipped,
 } from '@/store/layout'
 
+import { $mobileDisplayScale, adjustMobileDisplayScale, MOBILE_DISPLAY_SCALE_STEP, resetMobileDisplayScale } from './mobile-display-scale'
 import { mobileWorkspacePanes } from './mobile-workspace-menu'
 import { MobilePreviewOverlay } from './mobile-preview-overlay'
 import { shouldOpenMobilePreview } from './mobile-preview-policy'
@@ -103,6 +104,7 @@ export function MobileBehaviors() {
     [hiddenPanes, panes, tree],
   )
   const hapticsMuted = useStore($hapticsMuted)
+  const mobileDisplayScale = useStore($mobileDisplayScale)
   const nativeNotifyPrefs = useStore($nativeNotifyPrefs)
   const notificationsSilenced = nativeNotifyPrefs.silencedUntil > Date.now()
   const leftTitlebarTools = useTitlebarToolContributions('left')
@@ -138,6 +140,36 @@ export function MobileBehaviors() {
           else silenceNativeNotificationsFor(60 * 60 * 1000)
         },
       },
+      {
+        group: 'system',
+        id: 'ui-scale-down',
+        label: `UI smaller · ${Math.round(mobileDisplayScale.overall * 100)}%`,
+        onSelect: () => adjustMobileDisplayScale('overall', -MOBILE_DISPLAY_SCALE_STEP),
+      },
+      {
+        group: 'system',
+        id: 'ui-scale-up',
+        label: `UI larger · ${Math.round(mobileDisplayScale.overall * 100)}%`,
+        onSelect: () => adjustMobileDisplayScale('overall', MOBILE_DISPLAY_SCALE_STEP),
+      },
+      {
+        group: 'system',
+        id: 'text-scale-down',
+        label: `Text smaller · ${Math.round(mobileDisplayScale.text * 100)}%`,
+        onSelect: () => adjustMobileDisplayScale('text', -MOBILE_DISPLAY_SCALE_STEP),
+      },
+      {
+        group: 'system',
+        id: 'text-scale-up',
+        label: `Text larger · ${Math.round(mobileDisplayScale.text * 100)}%`,
+        onSelect: () => adjustMobileDisplayScale('text', MOBILE_DISPLAY_SCALE_STEP),
+      },
+      {
+        group: 'system',
+        id: 'display-scale-reset',
+        label: 'Reset display size',
+        onSelect: resetMobileDisplayScale,
+      },
       { group: 'view', id: 'flip-panes', label: t.titlebar.swapSidebarSides, onSelect: togglePanesFlipped },
       {
         group: 'system',
@@ -147,7 +179,7 @@ export function MobileBehaviors() {
       },
       { group: 'system', id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
     ],
-    [hapticsMuted, navigate, notificationsSilenced, previewTabs.length, t],
+    [hapticsMuted, mobileDisplayScale.overall, mobileDisplayScale.text, navigate, notificationsSilenced, previewTabs.length, t],
   )
   const runContributedToolbarTool = useCallback(
     (tool: MobileToolbarContextAction) => {

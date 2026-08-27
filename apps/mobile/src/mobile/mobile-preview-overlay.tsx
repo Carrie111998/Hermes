@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 
 import { PreviewPane } from '@/app/chat/right-rail/preview-pane'
 import { Codicon } from '@/components/ui/codicon'
@@ -24,14 +25,28 @@ function tabLabel(tab: PreviewTab): string {
   return tab.target.label || (tab.target.kind === 'url' ? 'Browser' : 'Preview')
 }
 
+const PREVIEW_ASPECTS = [
+  { id: 'portrait', label: '9:16', ratio: '9 / 16' },
+  { id: 'square', label: '1:1', ratio: '1 / 1' },
+  { id: 'landscape', label: '16:9', ratio: '16 / 9' }
+] as const
+
+type PreviewAspect = typeof PREVIEW_ASPECTS[number]['id']
+
+const clampZoom = (value: number) => Math.max(0.7, Math.min(1.5, Math.round(value * 100) / 100))
+
 function MobileUrlPreview({
+  aspectRatio,
   onNavigate,
   onOpenExternal,
   target,
+  zoom,
 }: {
+  aspectRatio: string
   onNavigate: (url: string) => void
   onOpenExternal: (url: string) => void
   target: PreviewTab['target']
+  zoom: number
 }) {
   const [draft, setDraft] = useState(target.url)
   const [reloadKey, setReloadKey] = useState(0)
@@ -83,14 +98,16 @@ function MobileUrlPreview({
         )}
       </div>
       {inlineUrl ? (
-        <iframe
-          className="mobile-preview-webpage"
-          key={`${inlineUrl}:${reloadKey}`}
-          referrerPolicy="no-referrer"
-          sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
-          src={inlineUrl}
-          title={target.label || 'Browser'}
-        />
+        <div className="mobile-preview-viewport" style={{ '--mobile-preview-aspect': aspectRatio, '--mobile-preview-zoom': zoom } as CSSProperties}>
+          <iframe
+            className="mobile-preview-webpage"
+            key={`${inlineUrl}:${reloadKey}`}
+            referrerPolicy="no-referrer"
+            sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+            src={inlineUrl}
+            title={target.label || 'Browser'}
+          />
+        </div>
       ) : (
         <div className="mobile-preview-unavailable">
           <Codicon name="globe" size="2rem" />
@@ -119,6 +136,9 @@ export function MobilePreviewOverlay({
   tabs,
 }: MobilePreviewOverlayProps) {
   const closePreviewRef = useRef<HTMLButtonElement>(null)
+  const [aspect, setAspect] = useState<PreviewAspect>('landscape')
+  const [zoom, setZoom] = useState(1)
+  const selectedAspect = PREVIEW_ASPECTS.find(item => item.id === aspect) ?? PREVIEW_ASPECTS[2]
   const activeTab = useMemo(
     () => tabs.find(tab => tab.id === activeTabId) ?? tabs[0] ?? null,
     [activeTabId, tabs],
@@ -174,9 +194,26 @@ export function MobilePreviewOverlay({
           <Codicon name="close" size="1.2rem" />
         </button>
       </header>
+      <div aria-label="Preview framing" className="mobile-preview-controls" role="toolbar">
+        {PREVIEW_ASPECTS.map(item => (
+          <button aria-pressed={item.id === aspect} key={item.id} onClick={() => setAspect(item.id)} type="button">
+            {item.label}
+          </button>
+        ))}
+        <span aria-live="polite">{Math.round(zoom * 100)}%</span>
+        <button aria-label="Zoom preview out" onClick={() => setZoom(current => clampZoom(current - 0.1))} type="button">−</button>
+        <button aria-label="Reset preview zoom" onClick={() => setZoom(1)} type="button">1:1</button>
+        <button aria-label="Zoom preview in" onClick={() => setZoom(current => clampZoom(current + 0.1))} type="button">+</button>
+      </div>
       <div className="mobile-preview-content" role="tabpanel">
         {activeTab.target.kind === 'url' ? (
-          <MobileUrlPreview onNavigate={onNavigate} onOpenExternal={onOpenExternal} target={activeTab.target} />
+          <MobileUrlPreview
+            aspectRatio={selectedAspect.ratio}
+            onNavigate={onNavigate}
+            onOpenExternal={onOpenExternal}
+            target={activeTab.target}
+            zoom={zoom}
+          />
         ) : (
           <PreviewPane embedded tabId={activeTab.id} target={activeTab.target} />
         )}
