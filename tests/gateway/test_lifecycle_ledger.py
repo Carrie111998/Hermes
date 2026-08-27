@@ -76,6 +76,140 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-platform sample_memory (issue #94936)
+# ---------------------------------------------------------------------------
+
+_EXPECTED_KEYS = {"rss_kib", "mem_total_kib", "mem_available_kib", "swap_used_kib"}
+
+
+def test_sample_memory_returns_same_key_shape_on_current_platform() -> None:
+    """Whatever platform the test runs on, ``sample_memory()`` returns a
+    dict with the documented key shape (issue #94936).  Pre-fix this
+    returned ``{}`` on Windows / macOS and the OOM heuristic in
+    ``detect_unclean_exit`` was a structural constant ``False``.
+    """
+    sample = sample_memory()
+    assert isinstance(sample, dict)
+    # All documented keys must be present — the consumer heuristic in
+    # detect_unclean_exit reads mem_total_kib / mem_available_kib.
+    assert _EXPECTED_KEYS.issubset(sample.keys()), (
+        f"missing keys: {_EXPECTED_KEYS - set(sample.keys())}"
+    )
+    for key in _EXPECTED_KEYS:
+        assert isinstance(sample[key], int), f"{key} must be int (KiB)"
+        assert sample[key] >= 0
+
+
+def test_sample_memory_uses_psutil_when_platform_is_not_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force the non-Linux fallback path on any CI host (issue #94936).
+
+    The dispatcher is ``sys.platform.startswith('linux')``; we patch
+    ``sys.platform`` to ``win32`` to verify the psutil branch is reached
+    even when the test runner is Linux, then assert the same key shape
+    comes back.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    sample = sample_memory()
+    assert _EXPECTED_KEYS.issubset(sample.keys()), (
+        f"psutil fallback missing keys: {_EXPECTED_KEYS - set(sample.keys())}"
+    )
+    assert isinstance(sample.get("rss_kib"), int)
+    assert sample["rss_kib"] > 0
+
+
+def test_sample_memory_uses_proc_when_platform_is_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the Linux /proc fast-path is still reached on Linux hosts
+    (regression guard for the dispatcher swap).
+
+    Runs on any host by patching ``sys.platform`` AND stubbing
+    ``_sample_memory_proc`` to return a known sample — that proves the
+    dispatcher routes Linux to the proc backend without depending on the
+    host actually having ``/proc``.
+    """
+    import gateway.lifecycle_ledger as ledger_mod
+
+    captured = {"called": False}
+    sentinel_sample = {
+        "rss_kib": 12345,
+        "mem_total_kib": 1024 * 1024,
+        "mem_available_kib": 512 * 1024,
+        "swap_used_kib": 1024,
+    }
+
+    def _fake_proc() -> Dict[str, Any]:
+        captured["called"] = True
+        return sentinel_sample
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(ledger_mod, "_sample_memory_proc", _fake_proc)
+
+    sample = sample_memory()
+    assert captured["called"] is True, "Linux dispatcher did not call _sample_memory_proc"
+    assert sample == sentinel_sample
+    assert _EXPECTED_KEYS.issubset(sample.keys())
+
+
+def test_sample_memory_falls_back_gracefully_when_psutil_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the non-Linux fallback cannot import ``psutil`` it must still
+    return a dict — never raise — per the module's stated contract that
+    a forensics failure must not affect the lifecycle it is observing.
+
+    On Windows CI psutil is normally available; we simulate "missing" by
+    patching ``sys.platform`` away from ``linux`` AND poisoning the
+    ``psutil`` import inside the fallback to raise ``ImportError``.
+    """
+    import builtins
+
+    monkeypatch.setattr(sys, "platform", "darwin")  # force psutil branch
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name, *args, **kwargs):
+        if name == "psutil":
+            raise ImportError("simulated psutil unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+    # Must not raise — that's the entire contract.
+    sample = sample_memory()
+    assert isinstance(sample, dict)
+    # Empty dict is acceptable; partial dict is acceptable; what is NOT
+    # acceptable is an exception or a non-dict return.
+    for key, value in sample.items():
+        assert isinstance(key, str)
+        assert isinstance(value, int)
+
+
+def test_sample_memory_oom_heuristic_sees_measurement_on_non_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: on a non-Linux host, the OOM heuristic in
+    ``detect_unclean_exit`` must receive a real ``mem_available_kib``
+    value, not ``None``.  Pre-fix the value was always ``None`` and
+    ``suspected_oom`` was a structural constant ``False``.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    # Capture the heartbeat dict the way write_loop_heartbeat writes it.
+    sample = sample_memory()
+    assert "mem_available_kib" in sample
+    # Hand it to the heuristic exactly as detect_unclean_exit does.
+    total = sample.get("mem_total_kib")
+    avail = sample.get("mem_available_kib")
+    # The heuristic's safe default: missing or zero values simply do not
+    # fire — but here we have real values and want to prove the plumbing
+    # is no longer hard-disabled.
+    assert avail is not None and avail > 0
+    assert total is not None and total > 0
+
+
+# ---------------------------------------------------------------------------
 # First boot / clean lifecycle
 # ---------------------------------------------------------------------------
 
