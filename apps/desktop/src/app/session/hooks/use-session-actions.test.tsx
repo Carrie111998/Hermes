@@ -75,7 +75,13 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
-import { $sessionTiles, closeSessionTile, reopenLastClosedTile, sessionTileOwnerRoute } from '@/store/session-states'
+import {
+  $sessionTiles,
+  closeSessionTile,
+  openSessionTileForProfile,
+  reopenLastClosedTile,
+  sessionTileOwnerRoute
+} from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
@@ -1768,7 +1774,7 @@ describe('branchStoredSession desktop source tagging', () => {
     })
   })
 
-  it('branches an open live chat via session.branch with a trimmed message count (bug #1/#3 fix)', async () => {
+  it('branches an open live chat via session.branch with a trimmed message count and preserves its backend target', async () => {
     let branchParams: Record<string, unknown> | undefined
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -1785,6 +1791,17 @@ describe('branchStoredSession desktop source tagging', () => {
         } as never
       }
 
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          resumed: 'branch-stored',
+          session_id: 'branch-runtime',
+          session_key: 'branch-stored'
+        } as never
+      }
+
       return {} as never
     })
 
@@ -1794,22 +1811,40 @@ describe('branchStoredSession desktop source tagging', () => {
       { id: 'q2', role: 'user', parts: [{ type: 'text', text: 'question two' }] },
       { id: 'a2', role: 'assistant', parts: [{ type: 'text', text: 'answer two' }] }
     ])
+    setSessions([storedSession({ id: 'stored-parent', profile: 'backend-default' })])
+    setSelectedStoredSessionId('stored-parent')
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'question one', role: 'user', timestamp: 1 },
+        { content: 'answer one', role: 'assistant', timestamp: 2 },
+        { content: 'question two', role: 'user', timestamp: 3 },
+        { content: 'answer two', role: 'assistant', timestamp: 4 }
+      ],
+      session_id: 'stored-parent'
+    } as never)
 
     let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
-    const sourceOwnerRoute: SessionProfileRoute = { connectionId: 'source-a', profile: 'default' }
+    const leasedOwnerRoute: SessionProfileRoute = { connectionId: 'source-a', profile: 'default' }
+
+    const completeOwnerRoute: SessionProfileRoute = {
+      connectionId: 'source-a',
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
 
     render(
       <BranchHarness
         activeSessionId="live-parent"
-        bindGatewayRequest={gateway => ({ ...directGatewayLease(gateway), ownerRoute: sourceOwnerRoute })}
+        bindGatewayRequest={gateway => ({ ...directGatewayLease(gateway), ownerRoute: leasedOwnerRoute })}
         onCurrentReady={branch => (branchCurrentSession = branch)}
         onReady={() => undefined}
         requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
       />
     )
     await waitFor(() => expect(branchCurrentSession).not.toBeNull())
 
-    // Branch from the FIRST assistant reply ("a1"), not the last message �
+    // Branch from the FIRST assistant reply ("a1"), not the last message —
     // this is exactly the scenario that used to drop the question (bug #1):
     // only the clicked message survived instead of everything up to it.
     await expect(branchCurrentSession!('a1')).resolves.toBe(true)
@@ -1821,10 +1856,41 @@ describe('branchStoredSession desktop source tagging', () => {
     expect(branchParams).toEqual({ session_id: 'live-parent', count: 2 })
     expect($sessions.get().find(session => session.id === 'branch-stored')).toMatchObject({
       connection_id: 'source-a',
-      profile: 'default'
+      profile: 'backend-default'
     })
-    expect(getSessionOwnerHint('branch-stored')).toEqual(sourceOwnerRoute)
-    expect(sessionTileOwnerRoute('branch-stored')).toEqual(sourceOwnerRoute)
+    expect(getSessionOwnerHint('branch-stored')).toEqual(completeOwnerRoute)
+
+    // Persisting/reopening the child tile must retain the complete display-to-
+    // backend route, and every later session read must use the physical display
+    // profile while rewriting an explicit backend profile parameter.
+    setSelectedStoredSessionId(null)
+    openSessionTileForProfile('branch-stored', 'default', 'center', undefined, undefined, completeOwnerRoute)
+    closeSessionTile('branch-stored')
+    reopenLastClosedTile()
+    expect(sessionTileOwnerRoute('branch-stored')).toEqual(completeOwnerRoute)
+
+    vi.mocked(requestGatewayForAgent).mockClear()
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    for (const method of ['session.get', 'session.messages', 'session.read']) {
+      await requestForSessionProfile(knownSessionOwner($sessions.get(), 'branch-stored'), requestGateway, method, {
+        profile: 'default',
+        session_id: 'branch-stored'
+      })
+    }
+
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(1, 'source-a', 'default', 'session.get', {
+      profile: 'backend-default',
+      session_id: 'branch-stored'
+    })
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(2, 'source-a', 'default', 'session.messages', {
+      profile: 'backend-default',
+      session_id: 'branch-stored'
+    })
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(3, 'source-a', 'default', 'session.read', {
+      profile: 'backend-default',
+      session_id: 'branch-stored'
+    })
   })
 
   it('keeps a branch-from-branched tile on the exact owner when connections share a profile', async () => {

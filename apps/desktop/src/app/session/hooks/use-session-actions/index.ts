@@ -2137,6 +2137,15 @@ export function useSessionActions({
           sourceOwnerRoute = sourceLease.ownerRoute
           const resolvedProfile = await resolveSessionProfile(parentStoredId)
           profile = normalizeProfileKey(resolvedProfile ?? uiIntent.profile)
+
+          // The lease names the Desktop-facing registry route that owns the
+          // physical socket. The stored parent row names the backend profile
+          // served by that route, which can differ for remote overrides. Keep
+          // binding the existing socket/profile pair, but persist the complete
+          // route on the child so REST reads can address the backend profile.
+          if (sourceOwnerRoute && profile !== normalizeProfileKey(sourceOwnerRoute.profile)) {
+            sourceOwnerRoute = { ...sourceOwnerRoute, targetProfile: profile }
+          }
         } else {
           // Runtime ids are socket-local. A tile must carry the exact registry
           // route that resumed it; a profile string alone is ambiguous when two
