@@ -8205,6 +8205,44 @@ def _refuse_if_gated(
     return True
 
 
+def plan_gate_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Resolve the plan a gated task is waiting on, straight from the database.
+
+    Read-only. Exists so a human-facing surface can DISPLAY the authoritative
+    plan text before asking for confirmation, without the caller supplying — or
+    being able to influence — which artifact is shown. ``release_plan_gate``
+    re-reads all of this independently, so a stale display cannot approve
+    different words than the ones on screen.
+    """
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'plan_awaiting_approval' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if ev is None or not ev["payload"]:
+        return None
+    try:
+        payload = json.loads(ev["payload"])
+        project_id = str(payload["project_id"])
+        revision = int(payload["revision"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    plan = conn.execute(
+        "SELECT body, proposed_by, root_task_id FROM pm_plans "
+        "WHERE project_id = ? AND revision = ?",
+        (project_id, revision),
+    ).fetchone()
+    if plan is None:
+        return None
+    return {
+        "project_id": project_id,
+        "revision": revision,
+        "body": plan["body"],
+        "proposed_by": plan["proposed_by"],
+        "root_task_id": plan["root_task_id"],
+    }
+
+
 def park_for_plan_approval(
     conn: sqlite3.Connection,
     task_id: str,

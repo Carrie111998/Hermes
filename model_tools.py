@@ -1192,6 +1192,33 @@ def _emit_post_tool_call_hook(
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
+    *args,
+    **kwargs,
+) -> str:
+    """Mark the context as executing a model tool, then dispatch.
+
+    Every tool execution path in the codebase funnels through this function —
+    the agent loop, ``execute_code``'s programmatic tool calls, the tool
+    executor, the MCP bridge, and this module's own re-dispatch — so marking
+    here covers all of them without a call-site change that a future caller
+    could forget.
+
+    The mark is what stops a model tool from reaching a human approval gate:
+    ``approval_broker.deny_agent_provenance()`` consults it. The context manager
+    restores the previous value in ``finally``, so an exception, a cancellation,
+    or a nested re-dispatch cannot leave the flag set for the next turn.
+    """
+    from agent.delegation_context import tool_handler_context
+
+    with tool_handler_context():
+        return _handle_function_call_inner(
+            function_name, function_args, *args, **kwargs
+        )
+
+
+def _handle_function_call_inner(
+    function_name: str,
+    function_args: Dict[str, Any],
     task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
     session_id: Optional[str] = None,

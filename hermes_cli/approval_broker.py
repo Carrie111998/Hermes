@@ -1,57 +1,63 @@
 """Attestation broker for human approval gates.
 
-WHAT THIS IS
-------------
-An ``Attestation`` is the object ``kanban_db.release_plan_gate`` requires before
-it will release a gate. It can only be produced by a constructor in this module,
-and every constructor establishes human presence from a source the caller cannot
-supply as an argument.
+STATUS: NO LOCAL APPROVAL AUTHORITY
+-----------------------------------
+There is deliberately **no local surface that can approve a plan.** Every call to
+:func:`for_plan_decision` fails closed until a separately authenticated approval
+adapter is configured, and none ships in this slice.
 
-WHAT THIS IS NOT — read before describing it
---------------------------------------------
-Hermes approval gates are an **integrity control, not a security boundary
-against arbitrary code execution as your own user account.**
+WHY THE LOCAL CLI WAS REMOVED AS AN AUTHORITY
+---------------------------------------------
+An earlier revision confirmed human presence by reading a fixed phrase from
+``/dev/tty``, backed by tool-origin provenance (a ContextVar, an environment
+marker, and a PID registry checked through process ancestry). Two independent
+reviews and a reproduction retired that design:
 
-Hermes workers run as the same OS user as you, with terminal and filesystem
-access. Any process running as that user can read the credentials on disk. These
-gates provide strong, tested protection against:
+1. A model tool can allocate a real PTY (``process_registry.spawn_local(...,
+   use_pty=True)``) and drive the prompt, so the TTY alone proves nothing.
+2. The provenance marks lived in same-user-writable locations. The reproduction
+   that settled it:
 
-  * a worker or agent approving its own plan (accidental self-approval),
-  * approval reached through ordinary tool invocation, on any surface,
-  * prompt injection that emits an approval command,
-  * approval of a stale plan whose text has since changed,
-  * replay of a previous approval,
-  * confused-deputy approval of a different project or board.
+       rm -rf <registry roots>; unset HERMES_TOOL_ORIGIN;
+       env -u HERMES_TOOL_ORIGIN hermes project approve-plan <task>
 
-They do **not** provide a cryptographic boundary against a deliberately
-adversarial process running as your user. A genuine adversarial boundary
-requires an independent security domain: separate OS identities, an external
-approval service the agent cannot reach, or hardware-backed confirmation. None
-of those is in this slice.
+   run inside a real tool call on a real PTY: prompt displayed, phrase accepted,
+   task released, approval row written.
 
-WHY THE TTY, SPECIFICALLY
--------------------------
-Dispatcher-spawned workers are launched with ``stdin=subprocess.DEVNULL`` and
-``start_new_session=True``. ``setsid()`` detaches the controlling terminal, so
-``open("/dev/tty")`` raises ENXIO inside any worker, cron job, delegated child,
-or background process. Reading the confirmation phrase from ``/dev/tty`` — never
-stdin, never argv, never an environment variable — means the phrase is never
-present in any model's context.
+Hardening that design further does not work, and the reason is structural rather
+than a missing check:
 
-That defeats an LLM emitting the command, prompt injection whose payload is a
-shell command, cron, and every detached execution path. It does **not** defeat
-an adversary that allocates a pty and drives the prompt. That is the stated
-limit above, not an oversight.
+* Any marker a local process can read, a same-user process can erase.
+* Ancestry cannot substitute. A process can ``fork`` twice to orphan itself,
+  shedding the ancestry that would betray it, and then allocate its **own** PTY.
+  The result has no Hermes ancestor, no Hermes terminal, and no marker — it is
+  kernel-indistinguishable from a human's shell. There is no kernel-verifiable
+  property of "is a human at a terminal" to test for.
+* Blocking the CLI is not a boundary either: the same process can call this
+  module directly, or write ``kanban.db`` with sqlite3, since both are
+  same-user writable.
+
+**Software running under the same macOS user cannot establish trustworthy human
+provenance by process inspection alone.** That is the finding, and it is why the
+authority moved out rather than being reinforced.
+
+WHAT REMAINS, AND WHY
+---------------------
+Everything the database layer needs to *consume* an approval is intact and
+tested: the subject, the binding hash over the exact plan bytes, the decision
+binding, the single-use nonce, the TTL, and the atomic transaction in
+``kanban_db.release_plan_gate``. A future adapter mints an
+:class:`Attestation` through :func:`issue_attestation_for_adapter` and that
+machinery accepts it unchanged. None of it had to be rebuilt, because none of it
+was what failed — the *surface* was.
 
 NOTE ON THE LOOPBACK DESKTOP SURFACE
 ------------------------------------
-An earlier design had a "medium strength" tier for the Desktop WebSocket. It was
-removed as fictional: on a loopback connection ``WSTransport.auth_identity`` is
-``None``, the ``?token=`` path stamps no identity, and the loopback token is
-served unauthenticated in ``GET /`` HTML — so any local process can read it. It
-attested that *a process on this machine* made a call, which is exactly what a
-worker is. Deployment approval is therefore reserved for a separately
-authenticated surface, and is not implemented here.
+The loopback token is **not** independent authentication and must never be
+treated as such. On a loopback connection ``WSTransport.auth_identity`` is
+``None``, the ``?token=`` path stamps no identity, and the token is served
+unauthenticated in ``GET /`` HTML, so any local process can read it. It attests
+that *a process on this machine* made a call, which is exactly what a worker is.
 """
 
 from __future__ import annotations
@@ -68,17 +74,19 @@ from typing import Optional
 # confirming it is seconds, and a long-lived object is a replay target.
 DEFAULT_TTL_SECONDS = 300
 
-# The exact phrase the operator must type. Deliberately not "y" or "yes": it
-# must be unambiguous in a scrollback and impossible to hit by accident.
+# Phrase vocabulary a future confirmation surface may use. Deliberately not
+# "y"/"yes": unambiguous in a scrollback and impossible to hit by accident.
 CONFIRM_PHRASES = {"approved": "approve", "rejected": "reject"}
 
 # Back-compat alias for callers/tests that referenced the single-phrase name.
 CONFIRM_PHRASE = CONFIRM_PHRASES["approved"]
 
-# Only this module may construct an Attestation. This is a speed bump against
-# accidental construction, NOT a security boundary — Python has no private
-# constructors, and anything running in-process can read this value. It is here
-# so that a *mistake* fails loudly, not so that an adversary is stopped.
+VALID_DECISIONS = frozenset(CONFIRM_PHRASES)
+
+# Only this module may construct an Attestation. A speed bump against accidental
+# construction, NOT a security boundary — Python has no private constructors,
+# and anything running in-process can read this value. It is here so that a
+# *mistake* fails loudly, not so that an adversary is stopped.
 _CONSTRUCTOR_TOKEN = object()
 
 
@@ -87,7 +95,29 @@ class ApprovalProvenanceError(PermissionError):
 
 
 class ApprovalSurfaceError(PermissionError):
-    """Raised when the surface cannot establish human presence (e.g. no TTY)."""
+    """Raised when the surface cannot establish human presence."""
+
+
+class NoApprovalSurfaceError(ApprovalSurfaceError):
+    """Raised because no separately authenticated approval surface is configured.
+
+    This is the normal state in this release. It is a subclass of
+    ``ApprovalSurfaceError`` so existing callers that already handle a refusal
+    keep working, and a distinct type so a caller can tell "you are not allowed"
+    from "there is nowhere to ask".
+    """
+
+
+NO_SURFACE_MESSAGE = (
+    "Approval refused: no separately authenticated approval surface is "
+    "configured, so this plan gate cannot be released from this machine.\n"
+    "\n"
+    "This is deliberate, not a misconfiguration. Local approval was removed as "
+    "an authority: a process running as your own user can allocate a terminal, "
+    "erase any local marker, and orphan itself, so nothing a local check can "
+    "observe distinguishes a human from an agent. Releasing a gate requires an "
+    "approval surface the agent holds no credential for; none ships yet."
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +127,9 @@ class Attestation:
     ``subject`` names what was approved (``plan:<project_id>:<revision>``) and
     ``binding_hash`` pins the exact bytes, so an attestation cannot be replayed
     against a different revision or a plan whose text has since changed.
+
+    Consumed by ``kanban_db.release_plan_gate``, which re-derives both from the
+    authoritative row inside its own transaction and refuses on any mismatch.
     """
 
     subject: str
@@ -141,7 +174,7 @@ class Attestation:
 
 
 # ---------------------------------------------------------------------------
-# Binding
+# Binding — unchanged, and deliberately so
 # ---------------------------------------------------------------------------
 
 
@@ -164,17 +197,21 @@ def plan_binding_hash(project_id: str, revision: int, plan_body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — negative provenance (defence in depth, NOT the boundary)
+# Advisory provenance — defence in depth for a future adapter, NOT a boundary
 # ---------------------------------------------------------------------------
 
 
 def _agent_provenance_reason() -> Optional[str]:
     """Name the agent context we are running inside, or None.
 
-    These signals are advisory: a worker can ``env -u HERMES_KANBAN_TASK``. They
-    are here because they make the accidental case — by far the most likely one —
-    fail immediately and legibly. The boundary is the positive requirement in
-    the constructors below.
+    **Advisory only.** Every signal here is erasable by the process it describes
+    (``env -u``, ``env -i``, or simply not being in this interpreter). It is kept
+    because it makes the *accidental* case — by far the most likely one — fail
+    immediately and legibly, and because a future authenticated adapter should
+    still decline to prompt when it can see it is inside an agent turn.
+
+    It is not consulted before the surface check in :func:`for_plan_decision`,
+    and nothing relies on it to refuse.
     """
     try:
         from agent.delegation_context import (
@@ -214,13 +251,7 @@ def _agent_provenance_reason() -> Optional[str]:
 
 
 def _in_tool_handler() -> bool:
-    """True while a model tool call is executing.
-
-    The ContextVar is set by ``model_tools.handle_function_call`` in the NEXT
-    commit of this series. Until then this returns False and the other signals
-    carry the load; the import is written defensively so landing that commit
-    needs no change here.
-    """
+    """True while a model tool call is executing in this interpreter."""
     try:
         from agent.delegation_context import in_tool_handler
 
@@ -230,18 +261,117 @@ def _in_tool_handler() -> bool:
 
 
 def deny_agent_provenance() -> None:
-    """Raise when called from any agent-driven context."""
+    """Raise when called from a recognisable agent-driven context.
+
+    Advisory. See :func:`_agent_provenance_reason`. Callers must not treat a
+    silent return as evidence of human presence.
+    """
     reason = _agent_provenance_reason()
     if reason is not None:
         raise ApprovalProvenanceError(
             f"Approval refused: running inside {reason}. Human approval gates "
-            f"cannot be crossed by an agent. Approve from an interactive "
-            f"terminal instead."
+            f"cannot be crossed by an agent."
         )
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — positive capability (the actual boundary)
+# The adapter seam — where a real boundary will attach
+# ---------------------------------------------------------------------------
+
+
+def resolve_plan_approval_adapter():
+    """Return the configured approval adapter, or None.
+
+    **Always None in this release.** No adapter ships, and there is deliberately
+    no way to name one from configuration yet: a config key alone would invite a
+    local shim that re-creates the surface this design removed. When an adapter
+    lands it must satisfy one property — the agent must hold no credential that
+    can drive it — and that is a property of the adapter's trust domain, not of
+    anything this module can check.
+
+    See ``planning/APPROVAL-SURFACE-DESIGN-NOTE.md`` for the intended first
+    implementation (a macOS-native helper requiring fresh Touch ID).
+    """
+    return None
+
+
+def issue_attestation_for_adapter(
+    *,
+    project_id: str,
+    revision: int,
+    plan_body: str,
+    decision: str,
+    surface: str,
+    operator_display: str,
+    tty_path: Optional[str] = None,
+) -> Attestation:
+    """Mint an Attestation on behalf of an authenticated approval adapter.
+
+    The **only** constructor. The broker owns the subject, the binding hash, the
+    nonce and the timestamp so that an adapter cannot show an operator one thing
+    and record another; the adapter contributes only who authenticated and where.
+
+    This does not authenticate anything. Calling it asserts that the caller has
+    *already* established human presence in a trust domain the agent cannot
+    reach. It is reachable in-process, which is not a defect to fix here: a
+    process that can call it can also write ``kanban.db`` directly. That is the
+    same limit that moved the authority out of this machine.
+    """
+    if decision not in VALID_DECISIONS:
+        raise ValueError(f"decision must be one of {sorted(VALID_DECISIONS)}")
+    return Attestation(
+        subject=plan_subject(project_id, revision),
+        binding_hash=plan_binding_hash(project_id, revision, plan_body),
+        decision=decision,
+        surface=surface,
+        operator_display=operator_display,
+        os_user=_os_user(),
+        os_uid=getattr(os, "getuid", lambda: None)(),
+        host_id=_host_id(),
+        tty_path=tty_path,
+        issued_at=int(time.time()),
+        nonce=secrets.token_hex(16),
+        _token=_CONSTRUCTOR_TOKEN,
+    )
+
+
+def for_plan_decision(
+    *,
+    project_id: str,
+    revision: int,
+    plan_body: str,
+    decision: str,
+    display_context: Optional[dict] = None,
+) -> Attestation:
+    """Obtain an attestation for ONE decision about ONE plan revision.
+
+    Fails closed with :class:`NoApprovalSurfaceError` whenever no separately
+    authenticated adapter is configured — which is every call in this release.
+
+    The refusal is unconditional and happens **first**. It does not depend on
+    detecting the caller: there is no terminal, PTY, stdin, flag, environment
+    variable, cron job, gateway route, loopback session, delegated child, MCP
+    tool, code-execution child, orphaned process or same-user subprocess that
+    can reach an approval, because there is no local approval endpoint to reach.
+    """
+    if decision not in VALID_DECISIONS:
+        raise ValueError(f"decision must be one of {sorted(VALID_DECISIONS)}")
+
+    adapter = resolve_plan_approval_adapter()
+    if adapter is None:
+        raise NoApprovalSurfaceError(NO_SURFACE_MESSAGE)
+
+    return adapter.confirm_plan_decision(          # pragma: no cover - none ships
+        project_id=project_id,
+        revision=revision,
+        plan_body=plan_body,
+        decision=decision,
+        display_context=display_context,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Identity helpers (recorded in the audit row, not used to authenticate)
 # ---------------------------------------------------------------------------
 
 
@@ -271,90 +401,3 @@ def _host_id() -> str:
         return socket.gethostname() or "unknown"
     except Exception:
         return "unknown"
-
-
-def for_plan_decision(
-    *,
-    project_id: str,
-    revision: int,
-    plan_body: str,
-    decision: str,
-    _tty_opener=None,
-) -> Attestation:
-    """Confirm ONE decision about ONE plan revision at the controlling terminal.
-
-    The caller supplies only *what is being decided*. The broker owns the
-    subject, the binding hash, the prompt text, and the confirmation phrase, so
-    a caller cannot show the operator one thing and record another. The earlier
-    signature took ``subject``, ``binding_hash`` and ``prompt`` from the caller
-    and took ``decision`` separately at release time — which allowed a prompt
-    describing a rejection to be redeemed as an approval.
-
-    ``plan_body`` is used only to compute the hash the operator is confirming.
-    It is not trusted: ``release_plan_gate`` recomputes the same hash from the
-    authoritative ``pm_plans`` row inside its transaction and refuses on any
-    mismatch. Passing a wrong body therefore fails closed rather than approving
-    the wrong text.
-
-    Opens ``/dev/tty`` directly — not stdin. A process with no controlling
-    terminal (every dispatcher-spawned worker, cron job, delegated child and
-    background process) fails at the open with ENXIO and never sees the prompt.
-    """
-    if decision not in CONFIRM_PHRASES:
-        raise ValueError(f"decision must be one of {sorted(CONFIRM_PHRASES)}")
-    deny_agent_provenance()
-
-    subject = plan_subject(project_id, revision)
-    binding_hash = plan_binding_hash(project_id, revision, plan_body)
-    phrase = CONFIRM_PHRASES[decision]
-    verb = "APPROVE" if decision == "approved" else "REJECT"
-    prompt = (
-        f"\n{verb} plan revision {int(revision)} of project {project_id}?\n"
-        f"  plan fingerprint: {binding_hash[:16]}\n"
-        f"Type {phrase!r} to confirm, anything else to abort: "
-    )
-
-    opener = _tty_opener or _open_controlling_tty
-    try:
-        tty = opener()
-    except OSError as exc:
-        raise ApprovalSurfaceError(
-            "Approval refused: no controlling terminal. This command must be "
-            "run from an interactive shell; it cannot be confirmed from a "
-            "worker, a cron job, or a background process."
-        ) from exc
-
-    try:
-        tty.write(prompt)
-        tty.flush()
-        typed = tty.readline()
-    finally:
-        try:
-            tty.close()
-        except Exception:
-            pass
-
-    if (typed or "").strip() != phrase:
-        raise ApprovalSurfaceError(
-            f"Refused: confirmation phrase not matched (expected {phrase!r})."
-        )
-
-    return Attestation(
-        subject=subject,
-        binding_hash=binding_hash,
-        decision=decision,
-        surface="cli-tty",
-        operator_display=_operator_display(),
-        os_user=_os_user(),
-        os_uid=getattr(os, "getuid", lambda: None)(),
-        host_id=_host_id(),
-        tty_path=getattr(tty, "name", "/dev/tty"),
-        issued_at=int(time.time()),
-        nonce=secrets.token_hex(16),
-        _token=_CONSTRUCTOR_TOKEN,
-    )
-
-
-def _open_controlling_tty():
-    """Open ``/dev/tty`` read-write. Raises OSError when there is none."""
-    return open("/dev/tty", "r+", buffering=1)

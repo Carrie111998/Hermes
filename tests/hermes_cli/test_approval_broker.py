@@ -6,10 +6,13 @@ after the plan text changed, or redeemed for a decision the human did not
 confirm — and that a valid decision updates the approval ledger, the plan row,
 the task gate and the event atomically, or not at all.
 
-WHAT IT DOES NOT PROVE: that a deliberately adversarial process running as the
-same OS user cannot approve. Hermes agents run as the user with terminal access;
-a process that allocates a pty and drives the prompt defeats the TTY
-constructor. That is a stated limit of the design.
+THE SURFACE IS GONE, THE MACHINERY IS NOT. There is no local approval surface
+any more: ``for_plan_decision`` fails closed because no separately authenticated
+adapter is configured. Everything below the surface — binding, decision, nonce,
+expiry, replay, atomicity — is unchanged and still proved here, because a future
+authenticated adapter consumes exactly this machinery. Attestations are minted
+directly through ``issue_attestation_for_adapter``, which is what such an adapter
+will call; these tests exercise the consumer, not the (absent) surface.
 
 NOTE: the earlier version of this file tested plan_binding_hash() in isolation
 and called that "binding". It was not: nothing verified that release_plan_gate
@@ -25,47 +28,19 @@ from hermes_cli import approval_broker as ab
 from hermes_cli import kanban_db as kb
 
 
-class FakeTTY:
-    name = "/dev/tty"
-
-    def __init__(self, typed):
-        self._typed = typed
-        self.written = []
-        self.closed = False
-
-    def write(self, s):
-        self.written.append(s)
-
-    def flush(self):
-        pass
-
-    def readline(self):
-        return self._typed + "\n"
-
-    def close(self):
-        self.closed = True
-
-
-def _tty(typed):
-    return lambda: FakeTTY(typed)
-
-
-def _no_tty():
-    def opener():
-        raise OSError(6, "Device not configured")
-    return opener
-
-
 REAL_BODY = "REAL PLAN: do the thing"
 
 
-def _attest(project_id="p1", revision=1, body=REAL_BODY, decision="approved",
-            typed=None):
-    return ab.for_plan_decision(
+def _attest(project_id="p1", revision=1, body=REAL_BODY, decision="approved"):
+    """Mint an attestation the way a future authenticated adapter will.
+
+    Not a bypass of the surface — there is no surface. These tests are about
+    what ``release_plan_gate`` does with an attestation, which is the part that
+    survives the move to an external approval domain.
+    """
+    return ab.issue_attestation_for_adapter(
         project_id=project_id, revision=revision, plan_body=body,
-        decision=decision,
-        _tty_opener=_tty(typed if typed is not None
-                         else ab.CONFIRM_PHRASES.get(decision, "?")),
+        decision=decision, surface="test-adapter", operator_display="tester",
     )
 
 
@@ -121,97 +96,110 @@ def _refusal_reasons(conn, tid):
     ]
 
 
-# =========================== broker construction ===========================
+# ================== no local approval authority ============================
 
 def test_direct_construction_is_refused():
+    """The dataclass still refuses to be built outside this module."""
     with pytest.raises(ab.ApprovalProvenanceError):
         ab.Attestation(
-            subject="plan:p1:1", binding_hash="h", decision="approved",
-            surface="cli-tty", operator_display="r", os_user="r", os_uid=1,
-            host_id="h", tty_path=None, issued_at=int(time.time()), nonce="n",
+            subject="plan:p1:1", binding_hash="x", decision="approved",
+            surface="cli-tty", operator_display="me", os_user="me", os_uid=1,
+            host_id="h", tty_path="/dev/tty", issued_at=int(time.time()),
+            nonce="n",
         )
 
 
-@pytest.mark.parametrize("var,val", [
-    ("HERMES_KANBAN_TASK", "t_abc"),
-    ("HERMES_KANBAN_RUN_ID", "7"),
-    ("HERMES_CRON_SESSION", "1"),
-    ("HERMES_DELEGATED_CHILD_CONTEXT", "1"),
-    ("HERMES_SESSION_SOURCE", "kanban"),
-    ("HERMES_SESSION_PLATFORM", "telegram"),
-])
-def test_agent_contexts_are_denied(monkeypatch, var, val):
-    monkeypatch.setenv(var, val)
-    with pytest.raises(ab.ApprovalProvenanceError):
-        _attest()
+def test_no_adapter_is_configured():
+    """The default, and the reason every approval below fails."""
+    assert ab.resolve_plan_approval_adapter() is None
 
 
-def test_delegated_child_contextvar_is_denied():
-    from agent.delegation_context import delegated_child_context
-    with delegated_child_context():
-        with pytest.raises(ab.ApprovalProvenanceError):
-            _attest()
-
-
-def test_provenance_is_checked_before_the_tty_is_touched(monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
-    tty = FakeTTY("approve")
-    with pytest.raises(ab.ApprovalProvenanceError):
+def test_for_plan_decision_fails_closed():
+    with pytest.raises(ab.NoApprovalSurfaceError):
         ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
-                             decision="approved", _tty_opener=lambda: tty)
-    assert tty.written == []
+                             decision="approved")
 
 
-def test_no_controlling_terminal_is_refused():
-    with pytest.raises(ab.ApprovalSurfaceError):
+def test_the_refusal_explains_that_this_is_deliberate():
+    """An operator hitting this must not think it is a misconfiguration."""
+    with pytest.raises(ab.NoApprovalSurfaceError) as exc:
         ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
-                             decision="approved", _tty_opener=_no_tty())
+                             decision="approved")
+    message = str(exc.value)
+    assert "no separately authenticated approval surface" in message
+    assert "deliberate" in message
 
 
-def test_wrong_phrase_is_refused():
-    with pytest.raises(ab.ApprovalSurfaceError):
-        _attest(typed="yes")
-
-
-def test_approve_phrase_cannot_confirm_a_rejection():
-    """Each decision has its own phrase; they are not interchangeable."""
-    with pytest.raises(ab.ApprovalSurfaceError):
-        _attest(decision="rejected", typed="approve")
-
-
-def test_the_prompt_names_the_decision_project_and_revision():
-    tty = FakeTTY("approve")
-    ab.for_plan_decision(project_id="p1", revision=7, plan_body="b",
-                         decision="approved", _tty_opener=lambda: tty)
-    text = "".join(tty.written)
-    assert "APPROVE" in text and "p1" in text and "7" in text
-
-
-def test_the_rejection_prompt_says_reject():
-    tty = FakeTTY("reject")
-    ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
-                         decision="rejected", _tty_opener=lambda: tty)
-    assert "REJECT" in "".join(tty.written)
-
-
-def test_prompt_is_written_to_the_tty_not_stdout(capsys):
-    tty = FakeTTY("approve")
-    ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
-                         decision="approved", _tty_opener=lambda: tty)
-    assert "APPROVE" not in capsys.readouterr().out
-
-
-def test_tty_is_closed_even_on_refusal():
-    tty = FakeTTY("no")
-    with pytest.raises(ab.ApprovalSurfaceError):
+def test_rejection_also_fails_closed():
+    """Reject is a gate release too, and gets no local authority either."""
+    with pytest.raises(ab.NoApprovalSurfaceError):
         ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
-                             decision="approved", _tty_opener=lambda: tty)
-    assert tty.closed
+                             decision="rejected")
+
+
+def test_no_surface_error_is_still_an_approval_surface_error():
+    """Callers that already handle a refusal keep working."""
+    assert issubclass(ab.NoApprovalSurfaceError, ab.ApprovalSurfaceError)
+    assert issubclass(ab.ApprovalSurfaceError, PermissionError)
+
+
+def test_the_broker_exposes_no_tty_surface_at_all():
+    """The forgeable surface is removed, not merely disabled.
+
+    A disabled code path can be re-enabled by configuration or by a caller that
+    passes the right argument. Absence cannot.
+    """
+    for gone in ("_open_controlling_tty", "_ControllingTTY", "_plan_banner",
+                 "_controlling_tty_origin_reason"):
+        assert not hasattr(ab, gone), f"{gone} still exists"
+    import inspect
+    assert "_tty_opener" not in inspect.signature(ab.for_plan_decision).parameters
 
 
 def test_unknown_decision_is_rejected():
     with pytest.raises(ValueError):
-        _attest(decision="maybe")
+        ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
+                             decision="maybe")
+    with pytest.raises(ValueError):
+        ab.issue_attestation_for_adapter(
+            project_id="p1", revision=1, plan_body="b", decision="maybe",
+            surface="s", operator_display="o")
+
+
+# ============== advisory provenance (explicitly NOT the boundary) ===========
+
+@pytest.mark.parametrize("var,val", [
+    ("HERMES_KANBAN_TASK", "t1"),
+    ("HERMES_KANBAN_RUN_ID", "r1"),
+    ("HERMES_CRON_SESSION", "1"),
+    ("HERMES_DELEGATED_CHILD_CONTEXT", "1"),
+    ("HERMES_SESSION_SOURCE", "kanban"),
+])
+def test_agent_contexts_are_denied_by_the_advisory_check(monkeypatch, var, val):
+    monkeypatch.setenv(var, val)
+    with pytest.raises(ab.ApprovalProvenanceError):
+        ab.deny_agent_provenance()
+
+
+def test_delegated_child_contextvar_is_denied():
+    from agent.delegation_context import delegated_child_context
+
+    with delegated_child_context():
+        with pytest.raises(ab.ApprovalProvenanceError):
+            ab.deny_agent_provenance()
+
+
+def test_the_advisory_check_is_not_what_refuses_an_approval():
+    """The refusal must not depend on recognising the caller.
+
+    In a clean context the advisory check passes — and the approval is still
+    refused. That is the property the whole redesign rests on: nothing is being
+    detected, there is simply nowhere to approve.
+    """
+    ab.deny_agent_provenance()          # clean context: does not raise
+    with pytest.raises(ab.NoApprovalSurfaceError):
+        ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
+                             decision="approved")
 
 
 # ===================== binding, enforced at the gate =======================
@@ -432,11 +420,25 @@ def test_events_never_carry_the_attestation_nonce(conn):
     assert a.nonce not in blob
 
 
-def test_a_worker_cannot_mint_the_attestation_it_would_need(conn, monkeypatch):
+def test_a_worker_cannot_obtain_an_approval(conn, monkeypatch):
+    """A worker gets no approval — and not because it was recognised.
+
+    The previous version of this test set HERMES_KANBAN_TASK and asserted the
+    mint refused, i.e. it proved a heuristic fired. That heuristic was erasable
+    (``env -u HERMES_KANBAN_TASK``), so the test proved less than it looked.
+    Now the worker is refused because no approval surface exists, which no
+    environment change can alter — asserted below both with and without the
+    marker set.
+    """
     tid = _seed(conn)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-    with pytest.raises(ab.ApprovalProvenanceError):
-        _attest()
+    for marker_set in (True, False):
+        if marker_set:
+            monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        with pytest.raises(ab.NoApprovalSurfaceError):
+            ab.for_plan_decision(project_id="p1", revision=1,
+                                 plan_body=REAL_BODY, decision="approved")
     assert kb.gate_state_of(conn, tid) == "plan"
 
 

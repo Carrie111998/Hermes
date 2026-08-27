@@ -19,16 +19,12 @@ def _attest(project_id="p1", revision=1, body="the plan", decision="approved"):
     """A real broker-produced attestation via a stub TTY (fresh nonce each call)."""
     from hermes_cli import approval_broker as ab
 
-    class _TTY:
-        name = "/dev/tty"
-        def write(self, s): pass
-        def flush(self): pass
-        def readline(self): return ab.CONFIRM_PHRASES[decision] + chr(10)
-        def close(self): pass
-
-    return ab.for_plan_decision(
+    # Minted the way a future authenticated adapter will. There is no local
+    # approval surface any more; these tests are about what release_plan_gate
+    # does with an attestation, which is unchanged.
+    return ab.issue_attestation_for_adapter(
         project_id=project_id, revision=revision, plan_body=body,
-        decision=decision, _tty_opener=lambda: _TTY(),
+        decision=decision, surface="test-adapter", operator_display="tester",
     )
 
 

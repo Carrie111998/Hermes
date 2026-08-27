@@ -101,6 +101,21 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_ap = sub.add_parser(
+        "approve-plan",
+        help="Approve a plan at the human gate (interactive terminal only)",
+    )
+    p_ap.add_argument("task_id", help="The gated task id (t_…)")
+
+    p_rp = sub.add_parser(
+        "reject-plan",
+        help="Reject a plan at the human gate (interactive terminal only)",
+    )
+    p_rp.add_argument("task_id", help="The gated task id (t_…)")
+    p_rp.add_argument(
+        "--reason", default=None, help="Why the plan is being rejected"
+    )
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -133,12 +148,139 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "approve-plan": _cmd_approve_plan,
+        "reject-plan": _cmd_reject_plan,
     }
     handler = handlers.get(action)
     if handler is None:
         print(f"Unknown project action: {action}", file=sys.stderr)
         return 1
     return handler(args)
+
+
+# ---------------------------------------------------------------------------
+# Human approval gate
+# ---------------------------------------------------------------------------
+#
+# These two commands are the ONLY surface that can cross a plan gate. They are
+# deliberately not reachable from a tool, the gateway, the dashboard, cron, or
+# `bot_relay`: the broker refuses every one of those contexts, and confirmation
+# is read from /dev/tty rather than stdin, so a piped or redirected answer
+# cannot satisfy them either.
+#
+# Nothing about WHAT is being approved comes from the command line. The task id
+# is a lookup key; the project, revision, root task and plan body are all read
+# from the database, and the release path re-reads them independently.
+
+
+def _print_plan(task_id: str, task, ctx: dict) -> None:
+    """Show the authoritative plan text for a gated task.
+
+    Read from the database, never from the caller, so what is displayed is what
+    a future authenticated adapter would bind an approval to.
+    """
+    print()
+    print(f"  Task     : {task_id}  {task.title}")
+    print(f"  Project  : {ctx['project_id']}")
+    print(f"  Revision : {ctx['revision']}")
+    print(f"  Proposed : {ctx['proposed_by'] or '(unknown)'}")
+    print()
+    print("  ---------------- plan ----------------")
+    for line in (ctx["body"] or "(empty plan)").splitlines() or ["(empty plan)"]:
+        print(f"  {line}")
+    print("  --------------------------------------")
+
+
+def _gate_decision(args, decision: str) -> int:
+    """Shared body for approve-plan / reject-plan."""
+    from hermes_cli import approval_broker as ab
+    from hermes_cli import kanban_db as kb
+
+    task_id = str(getattr(args, "task_id", "") or "").strip()
+    if not task_id:
+        print("project: a task id is required", file=sys.stderr)
+        return 2
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            print(f"project: no such task: {task_id}", file=sys.stderr)
+            return 1
+        if kb.gate_state_of(conn, task_id) != "plan":
+            print(
+                f"project: task {task_id} is not awaiting plan approval",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Resolve the artifact from the DATABASE, never from the caller.
+        ctx = kb.plan_gate_context(conn, task_id)
+        if ctx is None:
+            print(
+                f"project: task {task_id} has no resolvable plan for its gate",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Display the authoritative plan. This is the whole of what the local
+        # CLI can still do: it reads the artifact from the database so an
+        # operator can see exactly what is pending, and it decides nothing.
+        # Printing to stdout is safe precisely BECAUSE nothing is confirmed
+        # here — there is no prompt a redirect could hide.
+        _print_plan(task_id, task, ctx)
+
+        try:
+            attestation = ab.for_plan_decision(
+                project_id=ctx["project_id"],
+                revision=ctx["revision"],
+                plan_body=ctx["body"] or "",
+                decision=decision,
+                display_context={
+                    "task_id": task_id,
+                    "title": task.title,
+                    "proposed_by": ctx["proposed_by"] or "(unknown)",
+                },
+            )
+        except ab.NoApprovalSurfaceError as exc:
+            # The normal outcome in this release. Not a misconfiguration:
+            # local approval was removed as an authority because a same-user
+            # process can forge every local signal of human presence.
+            print(f"\nproject: {exc}", file=sys.stderr)
+            return 3
+        except ab.ApprovalProvenanceError as exc:
+            print(f"\nproject: {exc}", file=sys.stderr)
+            return 3
+        except ab.ApprovalSurfaceError as exc:
+            print(f"\nproject: {exc}", file=sys.stderr)
+            return 3
+
+        # The plan may have changed between display and confirmation. The
+        # release path recomputes the binding hash from the live row, so a
+        # stale display fails here rather than approving different words.
+        ok, why = kb.release_plan_gate(
+            conn, task_id,
+            attestation=attestation,
+            reason=getattr(args, "reason", None),
+        )
+        if not ok:
+            print(f"project: {why}", file=sys.stderr)
+            return 1
+
+        verb = "approved" if decision == "approved" else "rejected"
+        print(f"\nPlan {verb}. Task {task_id} is now "
+              f"{kb.get_task(conn, task_id).status}.")
+        return 0
+    finally:
+        conn.close()
+
+
+def _cmd_approve_plan(args: argparse.Namespace) -> int:
+    return _gate_decision(args, "approved")
+
+
+def _cmd_reject_plan(args: argparse.Namespace) -> int:
+    return _gate_decision(args, "rejected")
 
 
 def _resolve(conn, ident: str):

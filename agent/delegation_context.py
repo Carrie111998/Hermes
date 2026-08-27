@@ -159,3 +159,52 @@ def delegated_child_subprocess_env(
 
         env = os.environ
     return scrub_kanban_env(env)
+
+
+# Set for the duration of ONE model tool execution. Approval gates consult it so
+# that no tool call — on any surface, including a tool that shells out — can
+# reach the attestation broker.
+#
+# A ContextVar rather than a module global or an env var: the gateway runs turns
+# concurrently in executor threads and asyncio tasks, so a process-wide flag
+# would leak one turn's state into another's. ContextVars are per-thread and
+# per-task by construction, which is exactly the isolation this needs.
+_IN_TOOL_HANDLER: ContextVar[bool] = ContextVar(
+    "hermes_in_tool_handler",
+    default=False,
+)
+
+
+@contextmanager
+def tool_handler_context() -> Iterator[None]:
+    """Mark the current context as executing a model tool call.
+
+    Re-entrant: ``handle_function_call`` re-dispatches to itself for some tools,
+    and ``execute_code`` calls it from inside a running tool. The token restores
+    the PREVIOUS value rather than clearing the flag, so an inner call finishing
+    never unmarks an outer one.
+
+    ``finally`` is what makes this safe under an exception, a cancellation, or a
+    tool that raises past its own cleanup: the flag cannot survive the call that
+    set it.
+
+    ADVISORY, NOT A BOUNDARY. This does not cross ``fork``/``exec``, so a tool
+    that shells out produces an unmarked child. An earlier revision tried to
+    close that with a PID registry checked through process ancestry; it was
+    removed after a reproduction showed a same-user process can erase the marks,
+    orphan itself, and allocate its own PTY. Plan approval no longer depends on
+    detecting an agent context at all — ``approval_broker.for_plan_decision``
+    fails closed because no authenticated approval surface exists. This flag
+    remains only so an agent turn can be recognised for logging and for a future
+    adapter's own courtesy checks.
+    """
+    token = _IN_TOOL_HANDLER.set(True)
+    try:
+        yield
+    finally:
+        _IN_TOOL_HANDLER.reset(token)
+
+
+def in_tool_handler() -> bool:
+    """True while a model tool call is executing in this context."""
+    return bool(_IN_TOOL_HANDLER.get())
