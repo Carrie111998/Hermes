@@ -142,12 +142,14 @@ NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 # cache, cron, hooks, ...) that Hermes itself may drop next to them (#95953).
 # Every ``create_profile`` path writes at least one of these (``.env`` is
 # unconditional on creation; SOUL.md is seeded; config.yaml arrives with
-# config clones; the marker with ``--no-skills``).
+# config clones; the marker with ``--no-skills``); ``state.db`` covers
+# restored/partial profiles that carry only their session database.
 _PROFILE_MARKER_FILES = (
     ".env",
     "config.yaml",
     "SOUL.md",
     NO_BUNDLED_SKILLS_MARKER,
+    "state.db",
 )
 
 
