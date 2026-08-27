@@ -1132,12 +1132,11 @@ import sys
 # Tool description for LLM
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands. The host OS, shell, and terminal backend are stated in your environment section — write commands for THAT platform. Filesystem, current working directory, and exported environment variables persist between calls.
 
-Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell.
-NEVER pipe a build/test command through tail/head/cat (e.g. `cargo build | tail -20`): output is auto-truncated with the full text saved to a file anyway, and the pipe makes exit_code report tail's 0 instead of the build's failure. Same for `cmd || echo failed`. Run the command bare.
+Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); pair with notify_on_complete=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
 PTY: set pty=true for interactive CLIs (they hang without it); local backend only.
 """
@@ -4122,16 +4121,16 @@ TERMINAL_SCHEMA = {
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Local backend only. Default: false.",
                 "default": False
             },
-            "notify_on_complete": {
-                "type": "boolean",
-                "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
-                "default": False
-            },
-            "watch_patterns": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s, capped at a small number of matches over the process's lifetime; over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
+            "notify": {
+                "description": "With background=true: notify=true fires exactly one notification when the process exits (the right choice for nearly every bounded task — builds, tests, deploys). notify=['pattern', ...] instead notifies when a line matches a pattern — ONLY for one-shot readiness signals on processes that never exit (e.g. ['Application startup complete']); rate-limited and auto-disabled if it over-fires. Omit for silent daemons.",
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"type": "array", "items": {"type": "string"}}
+                ]
             }
+            # Legacy aliases (unadvertised, still accepted): notify_on_complete
+            # (bool) and watch_patterns (list). notify=true|[...] maps onto
+            # them in the dispatch wrapper; explicit notify wins on conflict.
         },
         "required": ["command"]
     }
@@ -4150,6 +4149,24 @@ def _handle_terminal(args, **kw):
             "command in 'command'. Use execute_code(code=...) for Python; "
             "for shell, retry as terminal(command=...)."
         )
+    # `notify` is the advertised interface: true → notify_on_complete,
+    # ['pat', ...] → watch_patterns. The legacy args remain accepted
+    # (old transcripts, internal callers); explicit `notify` wins.
+    notify = args.get("notify")
+    notify_on_complete = args.get("notify_on_complete", False)
+    watch_patterns = args.get("watch_patterns")
+    if notify is not None:
+        if isinstance(notify, bool):
+            notify_on_complete = notify
+            watch_patterns = None
+        elif isinstance(notify, list):
+            watch_patterns = notify
+            notify_on_complete = False
+        else:
+            return tool_error(
+                "notify must be true/false (notify on exit) or a list of "
+                "strings (notify on output pattern match)."
+            )
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -4158,8 +4175,8 @@ def _handle_terminal(args, **kw):
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
-        watch_patterns=args.get("watch_patterns"),
+        notify_on_complete=notify_on_complete,
+        watch_patterns=watch_patterns,
     )
 
 

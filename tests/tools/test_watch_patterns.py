@@ -273,12 +273,14 @@ class TestCheckpointPersistence:
 # =========================================================================
 
 class TestTerminalToolSchema:
-    def test_schema_includes_watch_patterns(self):
+    def test_schema_unified_notify_covers_patterns(self):
+        """Pattern-watching is advertised through `notify` (list form); the
+        legacy watch_patterns arg stays handler-accepted but unadvertised."""
         from tools.terminal_tool import TERMINAL_SCHEMA
         props = TERMINAL_SCHEMA["parameters"]["properties"]
-        assert "watch_patterns" in props
-        assert props["watch_patterns"]["type"] == "array"
-        assert props["watch_patterns"]["items"] == {"type": "string"}
+        assert "watch_patterns" not in props
+        array_alts = [alt for alt in props["notify"]["anyOf"] if alt["type"] == "array"]
+        assert array_alts and array_alts[0]["items"] == {"type": "string"}
 
     def test_handler_passes_watch_patterns(self):
         """_handle_terminal passes watch_patterns to terminal_tool."""
