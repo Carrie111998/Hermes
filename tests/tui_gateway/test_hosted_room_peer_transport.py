@@ -66,13 +66,14 @@ class FakePeerClient:
 
 
 class FailingPeerClient(FakePeerClient):
-    def __init__(self, *, method, retryable=True):
+    def __init__(self, *, method, retryable=True, not_admitted=False):
         super().__init__()
         self.method = method
         self.error = PeerRunsHTTPError(
             f"{method} failed",
             retryable=retryable,
-            ambiguous=method == "dispatch",
+            ambiguous=method == "dispatch" and not not_admitted,
+            not_admitted=not_admitted,
         )
 
     def prepare(self, **kwargs):
@@ -229,8 +230,29 @@ def test_roomlink_falls_back_to_relay_on_retryable_prepare_failure():
     assert client.active_link.name == "relay"
 
 
-def test_roomlink_reuses_identical_dispatch_after_ambiguous_direct_failure():
+def test_roomlink_never_falls_back_after_ambiguous_direct_failure():
     direct = FailingPeerClient(method="dispatch")
+    relay = FakePeerClient()
+    client = FailoverHostedRoomPeerClient([
+        RoomLinkCandidate("direct", "direct", "install-peer", direct),
+        RoomLinkCandidate("relay", "relay", "install-peer", relay),
+    ])
+    dispatch = {"task_id": "task-1", "execution_generation": 1}
+
+    try:
+        client.dispatch(dispatch=dispatch, grant="grant")
+    except PeerRunsHTTPError as exc:
+        assert exc.ambiguous is True
+    else:
+        raise AssertionError("ambiguous dispatch was automatically replayed")
+
+    assert direct.calls[0][1]["dispatch"] is dispatch
+    assert relay.calls == []
+    assert client.active_link.name == "direct"
+
+
+def test_roomlink_falls_back_after_proven_not_admitted_direct_failure():
+    direct = FailingPeerClient(method="dispatch", not_admitted=True)
     relay = FakePeerClient()
     client = FailoverHostedRoomPeerClient([
         RoomLinkCandidate("direct", "direct", "install-peer", direct),

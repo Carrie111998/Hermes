@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import json
+import errno
 import io
+import json
+import socket
 import threading
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -251,6 +253,129 @@ def test_ambiguous_admission_replays_the_identical_idempotency_key(tmp_path):
     assert restarted.recover_dispatch(
         dispatch=_dispatch(), grant="signed.room.grant"
     )["run_id"] == "run-recovered"
+
+
+def test_ambiguous_admission_recovery_is_bounded_and_backed_off(tmp_path):
+    now = [0.0]
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+        receipt_db_path=tmp_path / "state.db",
+        poll_min_seconds=0.1,
+        poll_max_seconds=0.4,
+        clock=lambda: now[0],
+    )
+    requests = []
+
+    def response_lost(path, **kwargs):
+        requests.append((path, kwargs))
+        raise PeerRunsHTTPError(
+            "peer response was lost",
+            retryable=True,
+            ambiguous=True,
+        )
+
+    client._request = response_lost
+    with pytest.raises(PeerRunsHTTPError, match="response was lost"):
+        client.recover_dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+    assert len(requests) == 2
+    assert requests[0][1]["headers"] == requests[1][1]["headers"]
+    assert requests[0][1]["body"] == requests[1][1]["body"]
+
+    with pytest.raises(PeerRunsHTTPError, match="backing off"):
+        client.recover_dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+    assert len(requests) == 2
+
+    now[0] = 0.1
+    client._request = lambda *_args, **_kwargs: {
+        "run_id": "run-recovered",
+        "status": "running",
+        "replayed": True,
+    }
+    recovered = client.recover_dispatch(
+        dispatch=_dispatch(), grant="signed.room.grant"
+    )
+    assert recovered["run_id"] == "run-recovered"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+        socket.gaierror(socket.EAI_NONAME, "name not known"),
+        OSError(errno.ENETUNREACH, "no route"),
+    ],
+)
+def test_post_connect_failures_proven_before_admission_are_safe_to_queue(
+    monkeypatch, reason
+):
+    calls = []
+
+    def unreachable(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise urllib.error.URLError(reason)
+
+    monkeypatch.setattr("hermes_cli.urllib_security.open_credentialed_url", unreachable)
+    client = PeerRunsHTTPClient(base_url="https://peer.example.test", api_key="")
+
+    with pytest.raises(PeerRunsHTTPError) as caught:
+        client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+
+    assert caught.value.retryable is True
+    assert caught.value.not_admitted is True
+    assert caught.value.ambiguous is False
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timed out"),
+        ConnectionResetError(errno.ECONNRESET, "connection reset"),
+    ],
+)
+def test_post_connection_failures_that_may_follow_send_remain_ambiguous(
+    monkeypatch, failure
+):
+    calls = []
+
+    def uncertain(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise failure
+
+    monkeypatch.setattr("hermes_cli.urllib_security.open_credentialed_url", uncertain)
+    client = PeerRunsHTTPClient(base_url="https://peer.example.test", api_key="")
+
+    with pytest.raises(PeerRunsHTTPError) as caught:
+        client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+
+    assert caught.value.not_admitted is False
+    assert caught.value.ambiguous is True
+    assert len(calls) == 2
+
+
+def test_post_http_5xx_remains_ambiguous(monkeypatch):
+    calls = []
+
+    def rejected(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise urllib.error.HTTPError(
+            "https://peer.example.test/v1/runs",
+            503,
+            "Unavailable",
+            {},
+            io.BytesIO(b'{"error":"unavailable"}'),
+        )
+
+    monkeypatch.setattr("hermes_cli.urllib_security.open_credentialed_url", rejected)
+    client = PeerRunsHTTPClient(base_url="https://peer.example.test", api_key="")
+
+    with pytest.raises(PeerRunsHTTPError) as caught:
+        client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+
+    assert caught.value.not_admitted is False
+    assert caught.value.ambiguous is True
+    assert len(calls) == 2
 
 
 def test_peer_approval_sends_the_exact_request_id(peer_server, tmp_path):

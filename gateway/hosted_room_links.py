@@ -36,7 +36,7 @@ _LEGACY_FIELDS = {
     "trace_id",
     "updated_at",
 }
-_STATUSES = {"ready", "needs_reauthorization"}
+_STATUSES = {"ready", "unavailable", "needs_reauthorization"}
 
 
 @dataclass(frozen=True)

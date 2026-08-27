@@ -136,6 +136,8 @@ class FailoverHostedRoomPeerClient:
             try:
                 result = getattr(candidate.client, method)(**kwargs)
             except Exception as exc:
+                if bool(getattr(exc, "ambiguous", False)):
+                    raise
                 if not bool(getattr(exc, "retryable", False)):
                     raise
                 last_error = exc

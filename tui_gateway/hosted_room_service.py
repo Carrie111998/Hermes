@@ -247,6 +247,9 @@ class HostedRoomService:
             on_reauthorization=lambda: self._set_route_status(
                 binding.room_id, member_id, "needs_reauthorization"
             ),
+            on_unavailable=lambda: self._set_route_status(
+                binding.room_id, member_id, "unavailable"
+            ),
             on_refreshed=lambda grant: self._rotate_route_grant(
                 binding.room_id, member_id, grant
             ),
@@ -749,11 +752,13 @@ class _RouteStatusPeerClient:
         *,
         on_ready,
         on_reauthorization,
+        on_unavailable,
         on_refreshed,
     ) -> None:
         self._client = client
         self._on_ready = on_ready
         self._on_reauthorization = on_reauthorization
+        self._on_unavailable = on_unavailable
         self._on_refreshed = on_refreshed
 
     def __getattr__(self, name):
@@ -792,8 +797,11 @@ class _RouteStatusPeerClient:
             except Exception as exc:
                 if bool(getattr(exc, "needs_reauthorization", False)):
                     self._on_reauthorization()
+                elif bool(getattr(exc, "not_admitted", False)):
+                    self._on_unavailable()
                 raise
-            self._on_ready()
+            if name != "prepare":
+                self._on_ready()
             return result
 
         return tracked

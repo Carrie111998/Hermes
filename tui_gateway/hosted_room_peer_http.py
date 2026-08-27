@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import json
+import errno
 import hashlib
+import json
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -13,6 +15,29 @@ from pathlib import Path
 from typing import Any
 
 from gateway.hosted_room_peer import HostedMemberDispatch, validate_room_link_url
+
+
+_NOT_ADMITTED_ERRNOS = frozenset(
+    value
+    for name in (
+        "ECONNREFUSED",
+        "ENETDOWN",
+        "ENETUNREACH",
+        "EHOSTDOWN",
+        "EHOSTUNREACH",
+    )
+    if (value := getattr(errno, name, None)) is not None
+)
+
+
+def _is_proven_pre_admission_failure(exc: BaseException) -> bool:
+    """Return whether no HTTP connection could have carried the request."""
+    reason: Any = exc
+    while isinstance(reason, urllib.error.URLError):
+        reason = reason.reason
+    if isinstance(reason, socket.gaierror):
+        return True
+    return isinstance(reason, OSError) and reason.errno in _NOT_ADMITTED_ERRNOS
 
 
 def _response_error_code(detail: str) -> str | None:
@@ -44,12 +69,14 @@ class PeerRunsHTTPError(RuntimeError):
         *,
         retryable: bool = False,
         ambiguous: bool = False,
+        not_admitted: bool = False,
         status_code: int | None = None,
         error_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.ambiguous = ambiguous
+        self.not_admitted = not_admitted
         self.status_code = status_code
         self.error_code = error_code
         self.needs_reauthorization = bool(
@@ -163,10 +190,14 @@ class PeerRunsHTTPClient:
                 error_code=error_code,
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            not_admitted = method == "POST" and _is_proven_pre_admission_failure(
+                exc
+            )
             raise PeerRunsHTTPError(
                 f"peer is unreachable: {exc}",
                 retryable=True,
-                ambiguous=method == "POST",
+                ambiguous=method == "POST" and not not_admitted,
+                not_admitted=not_admitted,
             ) from exc
         try:
             payload = json.loads(raw)

@@ -136,12 +136,19 @@ class HostedRoomRuntime:
         clock: Callable[[], float] = time.time,
         lease_ttl_seconds: float = 30.0,
         poll_interval_seconds: float = 0.1,
+        unavailable_retry_min_seconds: float = 1.0,
+        unavailable_retry_max_seconds: float = 30.0,
         process_generation: str | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
+        if not (
+            unavailable_retry_min_seconds > 0
+            and unavailable_retry_max_seconds >= unavailable_retry_min_seconds
+        ):
+            raise ValueError("unavailable retry bounds are invalid")
         if rpc is None and transport_resolver is None:
             raise ValueError("rpc or transport_resolver is required")
 
@@ -155,6 +162,8 @@ class HostedRoomRuntime:
         self.clock = clock
         self.lease_ttl_seconds = float(lease_ttl_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
+        self.unavailable_retry_min_seconds = float(unavailable_retry_min_seconds)
+        self.unavailable_retry_max_seconds = float(unavailable_retry_max_seconds)
         self.process_generation = process_generation or uuid.uuid4().hex
         self._rooms_provider: Callable[[], Iterable[HostedRoomBinding]]
         if callable(rooms):
@@ -171,6 +180,9 @@ class HostedRoomRuntime:
         self._leases: dict[str, state.DriverLease] = {}
         self._recovered_leases: set[tuple[str, int]] = set()
         self._ambiguous_rooms: dict[str, float] = {}
+        self._unavailable_route_retries: dict[
+            tuple[str, str], dict[str, float]
+        ] = {}
         self._blocked_rooms: set[str] = set()
         self._status_lock = threading.Lock()
         self._current_task: state.TaskIdentity | None = None
@@ -558,6 +570,8 @@ class HostedRoomRuntime:
         for task in queued:
             if self._stop.is_set():
                 return
+            if self._route_retry_is_deferred(task):
+                return
             lease = self._renew_lease_if_needed(binding, lease)
             attempt = state.start_task(
                 self.db_path,
@@ -567,6 +581,44 @@ class HostedRoomRuntime:
                 clock=self.clock,
             )
             self._execute_attempt(binding, task, attempt)
+            current = state.get_task(self.db_path, task["identity"])
+            if current["status"] not in state.TERMINAL_STATUSES:
+                return
+
+    @staticmethod
+    def _route_retry_key(task: Mapping[str, Any]) -> tuple[str, str]:
+        payload = task.get("payload") or {}
+        member_id = str(
+            payload.get("target_member_id") or payload.get("target_profile") or ""
+        )
+        return task["identity"].room_id, member_id
+
+    def _route_retry_is_deferred(self, task: Mapping[str, Any]) -> bool:
+        retry = self._unavailable_route_retries.get(self._route_retry_key(task))
+        return retry is not None and self.clock() < retry["next_attempt_at"]
+
+    def _defer_unavailable_route(self, task: Mapping[str, Any]) -> float:
+        key = self._route_retry_key(task)
+        previous = self._unavailable_route_retries.get(key)
+        delay = (
+            self.unavailable_retry_min_seconds
+            if previous is None
+            else min(
+                self.unavailable_retry_max_seconds,
+                max(
+                    self.unavailable_retry_min_seconds,
+                    previous["delay"] * 2,
+                ),
+            )
+        )
+        self._unavailable_route_retries[key] = {
+            "delay": delay,
+            "next_attempt_at": self.clock() + delay,
+        }
+        return delay
+
+    def _clear_unavailable_route_retry(self, task: Mapping[str, Any]) -> None:
+        self._unavailable_route_retries.pop(self._route_retry_key(task), None)
 
     def _ensure_lease(self, binding: HostedRoomBinding) -> state.DriverLease:
         with self._status_lock:
@@ -713,6 +765,7 @@ class HostedRoomRuntime:
                     execution_generation=attempt.execution_generation,
                     on_terminal=on_terminal,
                 )
+                self._clear_unavailable_route_retry(task)
                 receipt = self._wait_for_terminal(
                     binding,
                     task=task,
@@ -735,7 +788,27 @@ class HostedRoomRuntime:
             self._drop_lease(binding.room_id)
             self._record_error(f"task {attempt.identity.task_id} fenced: {exc}")
         except Exception as exc:
-            if submit_attempted:
+            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
+                try:
+                    state.requeue_not_admitted_task(
+                        self.db_path,
+                        attempt,
+                        clock=self.clock,
+                    )
+                except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
+                    self._drop_lease(binding.room_id)
+                    self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
+                    self._record_error(
+                        f"task {attempt.identity.task_id} not-admitted proof lost "
+                        f"its fence: {fence_exc}"
+                    )
+                else:
+                    delay = self._defer_unavailable_route(task)
+                    self._record_error(
+                        f"task {attempt.identity.task_id} was not admitted; "
+                        f"queued for retry in {delay:g}s"
+                    )
+            elif submit_attempted:
                 self._drop_lease(binding.room_id)
                 self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
                 self._record_error(

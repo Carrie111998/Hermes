@@ -1289,6 +1289,64 @@ def requeue_indeterminate_task(
         return _task_from_row(_load_task(conn, identity))
 
 
+def requeue_not_admitted_task(
+    db_path: Path | str,
+    attempt: TaskAttempt,
+    *,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Return a running task to its durable queue after proven non-admission."""
+    now = _timestamp(clock)
+    lease = attempt.lease
+    identity = attempt.identity
+    if lease.room_id != identity.room_id:
+        raise DriverValidationError("lease and task belong to different rooms")
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, lease, now=now)
+        row = _load_task(conn, identity)
+        if (
+            row["status"] == "queued"
+            and int(row["execution_generation"]) == attempt.execution_generation
+            and int(row["cancel_generation"]) == attempt.cancel_generation
+            and row["run_gateway_id"] is None
+            and row["run_process_generation"] is None
+            and row["run_lease_generation"] is None
+        ):
+            return _task_from_row(row, idempotent=True)
+        if (
+            row["status"] != "running"
+            or int(row["execution_generation"]) != attempt.execution_generation
+            or int(row["cancel_generation"]) != attempt.cancel_generation
+            or row["run_gateway_id"] != lease.gateway_id
+            or row["run_process_generation"] != lease.process_generation
+            or int(row["run_lease_generation"] or 0) != lease.lease_generation
+        ):
+            raise StaleTaskError("not-admitted task attempt lost its fence")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='queued', run_gateway_id=NULL,
+                   run_process_generation=NULL, run_lease_generation=NULL,
+                   started_at=NULL, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='running'
+                 AND execution_generation=? AND cancel_generation=?
+                 AND run_gateway_id=? AND run_process_generation=?
+                 AND run_lease_generation=?""",
+            (
+                now,
+                identity.room_id,
+                identity.task_id,
+                attempt.execution_generation,
+                attempt.cancel_generation,
+                lease.gateway_id,
+                lease.process_generation,
+                lease.lease_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("not-admitted task changed during requeue")
+        return _task_from_row(_load_task(conn, identity))
+
+
 def cancel_task(
     db_path: Path | str,
     identity: TaskIdentity,

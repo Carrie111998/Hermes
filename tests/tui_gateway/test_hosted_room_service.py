@@ -115,6 +115,21 @@ class _UnavailablePeerClient(_FakePeerClient):
         raise RuntimeError("peer is offline before admission")
 
 
+class _NotAdmittedPeerClient(_FakePeerClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.offline = True
+
+    def dispatch(self, **kwargs):
+        if self.offline:
+            raise PeerRunsHTTPError(
+                "peer refused the connection",
+                retryable=True,
+                not_admitted=True,
+            )
+        return super().dispatch(**kwargs)
+
+
 class _ExpiredGrantPeerClient(_FakePeerClient):
     def prepare(self, **kwargs):
         raise PeerRunsHTTPError(
@@ -814,6 +829,100 @@ def test_expired_grant_surfaces_needs_reauthorization_without_secret(
     assert after_rotation.peer_routes[("room-1", "member-peer")].grant == (
         "rotated.room.grant"
     )
+
+
+def test_not_admitted_dispatch_persists_unavailable_route_until_success(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(installation_id="install-peer", persistent_process=True)
+    )
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest=catalog.catalog_digest,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed.room.grant",
+    )
+    peer = _NotAdmittedPeerClient()
+    service = HostedRoomService(_server(), db_path=db)
+    service.register_peer_route(
+        room_id="room-1",
+        member_id="member-peer",
+        route=route,
+        client=peer,
+        target_url="https://peer.example.test",
+        catalog=catalog,
+    )
+    service.create_room(
+        room_id="room-1",
+        name="Peer room",
+        members=[
+            {"member_id": "local", "profile": "default", "handle": "local"},
+            {
+                "member_id": "member-peer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": catalog.catalog_digest,
+                },
+            },
+        ],
+    )
+    binding = service.bindings()[0]
+    task = {
+        "identity": driver.TaskIdentity(
+            "room-1", "task-peer", "thread-1", "turn-1"
+        ),
+        "execution_generation": 1,
+        "payload": {
+            "target_member_id": "member-peer",
+            "target_profile": "reviewer",
+            "source_event_seq": 3,
+        },
+    }
+    transport = service._resolve_member_transport(binding, task)
+    session = transport.create(
+        profile="reviewer",
+        title="Group: room-1",
+        source="bot_room",
+    )
+
+    with pytest.raises(PeerRunsHTTPError) as caught:
+        transport.submit(
+            profile="reviewer",
+            session_id=session["session_id"],
+            prompt="Review the queued task.",
+            source="bot_room",
+            task=task["identity"],
+            execution_generation=1,
+            on_terminal=lambda _receipt: None,
+        )
+
+    assert caught.value.not_admitted is True
+    assert service.status("room-1")["peer_routes"][0]["status"] == "unavailable"
+    restarted = HostedRoomService(_server(), db_path=db)
+    assert restarted.status("room-1")["peer_routes"][0]["status"] == "unavailable"
+
+    peer.offline = False
+    transport.submit(
+        profile="reviewer",
+        session_id=session["session_id"],
+        prompt="Review the queued task.",
+        source="bot_room",
+        task=task["identity"],
+        execution_generation=2,
+        on_terminal=lambda _receipt: None,
+    )
+    assert service.status("room-1")["peer_routes"][0]["status"] == "ready"
 
 
 def test_dispatch_refresh_persists_before_remote_admission(tmp_path: Path):

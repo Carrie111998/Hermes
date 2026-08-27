@@ -18,6 +18,7 @@ from tui_gateway.hosted_room_driver import (
     HostedRoomRuntime,
     room_session_title,
 )
+from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
 
 
 ROOM_ID = "room-1"
@@ -255,6 +256,25 @@ class FakeSessionRPC:
         return {"interrupted": True}
 
 
+class NotAdmittedThenSuccessRPC(FakeSessionRPC):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempted_generations: list[int] = []
+
+    def submit(self, **kwargs):
+        self.attempted_generations.append(kwargs["execution_generation"])
+        if self.failures > 0:
+            self.failures -= 1
+            self.calls.append(("submit", dict(kwargs)))
+            raise PeerRunsHTTPError(
+                "peer refused the connection",
+                retryable=True,
+                not_admitted=True,
+            )
+        return super().submit(**kwargs)
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Path:
     path = tmp_path / "state.db"
@@ -422,6 +442,85 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
     assert all(binding == BINDING for binding, _, _ in resolutions)
     assert all(task_identity == identity for _, task_identity, _ in resolutions)
     assert any(method == "submit" for method, _ in selected.calls)
+
+
+def test_not_admitted_peer_task_stays_queued_with_exponential_capped_retry(
+    db: Path,
+):
+    now = [100.0]
+    identity = _identity()
+    _admit(db, identity, prompt="Keep this exact prompt queued.")
+    rpc = NotAdmittedThenSuccessRPC(failures=3)
+    runtime = _runtime(
+        db,
+        rpc,
+        clock=lambda: now[0],
+        lease_ttl_seconds=30,
+        unavailable_retry_min_seconds=2,
+        unavailable_retry_max_seconds=4,
+    )
+
+    runtime._run_cycle()
+    assert state.get_task(db, identity)["status"] == "queued"
+    assert rpc.attempted_generations == [1]
+
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1]
+    now[0] += 2
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1, 2]
+
+    now[0] += 3.9
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1, 2]
+    now[0] += 0.1
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1, 2, 3]
+
+    now[0] += 4
+    runtime._run_cycle()
+    task = state.get_task(db, identity)
+    assert task["status"] == "settled"
+    assert task["execution_generation"] == 4
+    assert task["payload"]["prompt"] == "Keep this exact prompt queued."
+    assert rpc.attempted_generations == [1, 2, 3, 4]
+
+
+def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path):
+    db = tmp_path / "state.db"
+    for room_id in ("room-1", "room-2"):
+        hosted_rooms.create_room(
+            db,
+            room_id=room_id,
+            name=room_id,
+            members=[{"profile": PROFILE, "handle": PROFILE}],
+            authority_gateway_id=BINDING.gateway_id,
+            now=90,
+        )
+    offline_identity = _identity("offline-task")
+    healthy_identity = state.TaskIdentity(
+        "room-2", "healthy-task", "thread-2", "turn-healthy"
+    )
+    _admit(db, offline_identity)
+    _admit(db, healthy_identity)
+    offline = NotAdmittedThenSuccessRPC(failures=10)
+    healthy = FakeSessionRPC()
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING, HostedRoomBinding("room-2", "gateway-a", 1)],
+        transport_resolver=lambda binding, _task: (
+            offline if binding.room_id == ROOM_ID else healthy
+        ),
+        turn_lock=RecordingTurnLocks(),
+        clock=lambda: 100.0,
+        lease_ttl_seconds=30,
+        poll_interval_seconds=0.01,
+    )
+
+    runtime._run_cycle()
+
+    assert state.get_task(db, offline_identity)["status"] == "queued"
+    assert state.get_task(db, healthy_identity)["status"] == "settled"
 
 
 def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
