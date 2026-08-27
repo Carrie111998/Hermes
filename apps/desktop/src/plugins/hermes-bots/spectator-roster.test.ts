@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { isSpectatorMode, spectatorRoster } from './data'
+import { spectatorSessionOpenPlan } from './bot-row'
 
 describe('spectator roster', () => {
   afterEach(() => {
@@ -56,5 +57,20 @@ describe('spectator roster', () => {
   it('fails closed without a spectator credential', async () => {
     window.__HERMES_SPECTATOR__ = true
     await expect(spectatorRoster()).rejects.toThrow('spectator credential unavailable')
+  })
+
+  it('opens only an existing persisted conversation without a profile mutation target', () => {
+    expect(spectatorSessionOpenPlan(undefined)).toBeNull()
+    expect(
+      spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never)
+    ).toEqual({
+      sessionId: 'stored-1',
+      options: {
+        intent: 'main',
+        awaitHydration: true,
+        expectHistory: true,
+        keepAllProfilesScope: false
+      }
+    })
   })
 })

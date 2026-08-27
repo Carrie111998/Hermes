@@ -85,6 +85,25 @@ interface BotRowProps {
   spectator?: boolean
 }
 
+export function spectatorSessionOpenPlan(previewSession: RosterRow['last_session']) {
+  const sessionId = previewSession?.id
+
+  if (!sessionId) return null
+
+  const hasAuthoritativeCount =
+    typeof previewSession.message_count === 'number' && Number.isFinite(previewSession.message_count)
+
+  return {
+    sessionId,
+    options: {
+      intent: 'main' as const,
+      awaitHydration: true,
+      expectHistory: hasAuthoritativeCount ? previewSession.message_count > 0 : true,
+      keepAllProfilesScope: false
+    }
+  }
+}
+
 export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator = false }: BotRowProps) {
   const { t } = useI18n()
   const b = useBots()
@@ -211,20 +230,39 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
 
   // Rows and Active Now share the exact-owner open path; only that path may
   // activate a source and resolve the canonical Bot Chat.
-  const open = () => {
-    if (!spectator) void openRosterBot(bot)
+  const spectatorOpenPlan = spectatorSessionOpenPlan(previewSession)
+  const open = async () => {
+    if (spectator) {
+      if (!spectatorOpenPlan) {
+        host.notify?.({
+          kind: 'info',
+          title: displayName(bot, meta),
+          message: 'This bot has no conversation to observe yet.'
+        })
+        return
+      }
+
+      try {
+        await host.openSession(spectatorOpenPlan.sessionId, spectatorOpenPlan.options)
+      } catch (error) {
+        host.notifyError?.(error, `Could not open ${displayName(bot, meta)}'s conversation`)
+      }
+      return
+    }
+
+    await openRosterBot(bot)
   }
 
   const row = (
     <RowButton
       aria-label={rowTooltip}
-      aria-disabled={spectator || undefined}
+      aria-disabled={(spectator && !spectatorOpenPlan) || undefined}
       className={cn(
         'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
-        !spectator && 'hover:bg-(--chrome-action-hover)',
+        (!spectator || spectatorOpenPlan) && 'hover:bg-(--chrome-action-hover)',
         isActive && 'bg-(--ui-row-active-background)'
       )}
-      onClick={open}
+      onClick={spectator && !spectatorOpenPlan ? undefined : () => void open()}
       onPointerEnter={spectator ? undefined : warm}
     >
       <div className={cn('shrink-0', !sourceStatus.available && 'grayscale opacity-60')}>
