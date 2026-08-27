@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -44,6 +44,7 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+const execFile = promisify(execFileCallback)
 
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(
@@ -825,6 +826,70 @@ test('buildSpawnCommand atomically reserves the ownership slot through spawn and
   assert.match(cmd, /lock_json/)
   assert.match(cmd, /trap .*rm -rf/)
   assert.ok(cmd.indexOf('lock_json') > cmd.indexOf('serve --isolated'))
+})
+
+test('buildSpawnCommand preserves expanded paths when assigning shell variables', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-shell-path-home-'))
+  const harness = await mkdtemp(path.join(os.tmpdir(), 'hermes-shell-path-harness-'))
+  const fakePython = path.join(harness, 'python3')
+  const payloadReport = path.join(harness, 'payload')
+
+  await writeFile(fakePython, '#!/bin/sh\nprintf \'%s\' "$4" > "$HERMES_TEST_PAYLOAD"\n')
+  await chmod(fakePython, 0o755)
+
+  try {
+    const command = buildSpawnCommand('/x/hermes', '', {
+      hermesHome: '~/.hermes',
+      logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+      ownershipId: OWNERSHIP_ID,
+      reservationNonce: SPAWN_NONCE,
+      spawnNonce: SPAWN_NONCE,
+      tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
+      lockMetadata: {
+        ownershipId: OWNERSHIP_ID,
+        spawnNonce: SPAWN_NONCE,
+        port: 0,
+        profile: '',
+        hermesPath: '/x/hermes',
+        hermesHome: '~/.hermes',
+        logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+        tokenFingerprint: fingerprintToken('stored-token'),
+        protocolVersion: PROTOCOL_VERSION,
+        startedAt: '2026-07-14T00:00:00.000Z'
+      }
+    })
+
+    await exec(command, {
+      shell: '/bin/sh',
+      env: {
+        ...process.env,
+        HERMES_TEST_PAYLOAD: payloadReport,
+        PATH: `${harness}:${process.env.PATH || ''}`
+      }
+    })
+
+    const payload = await readFile(payloadReport, 'utf8')
+    const reservationStart = payload.indexOf('reservation=')
+    const reservationNonceStart = payload.indexOf('reservation_nonce=', reservationStart)
+    const assignments = payload.slice(reservationStart, reservationNonceStart)
+
+    const result = await execFile(
+      '/bin/sh',
+      ['-c', `${assignments}printf '%s\\n' "$reservation" "$lock" "$owner_file"`],
+      { env: { ...process.env, HOME: home } }
+    )
+
+    const expected = path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID)
+
+    assert.deepEqual(result.stdout.trim().split('\n'), [
+      path.join(expected, '.connect.lock'),
+      path.join(expected, 'backend.lock.json'),
+      path.join(expected, '.connect.lock', 'owner')
+    ])
+  } finally {
+    await rm(home, { recursive: true, force: true })
+    await rm(harness, { recursive: true, force: true })
+  }
 })
 
 test.skipIf(process.platform === 'win32')('detached backend does not inherit the update mutex descriptor', async () => {

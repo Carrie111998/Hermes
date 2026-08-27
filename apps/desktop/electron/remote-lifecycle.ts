@@ -1083,7 +1083,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
 
   return withRemoteUpdateMutex(
     `umask 077 && mkdir -p "$(dirname ${reservation})"; ` +
-      `reservation=${shq(reservation)}; lock=${shq(lockPath)}; owner_file=${shq(ownerPath)}; ` +
+      `reservation=${reservation}; lock=${lockPath}; owner_file=${ownerPath}; ` +
       `reservation_nonce=${shq(reservationNonce)}; ` +
       `i=0; while ! mkdir "$reservation" 2>/dev/null; do ` +
       `owner_data=$(cat "$owner_file" 2>/dev/null || true); owner_pid=${'${owner_data%%:*}'}; ` +
