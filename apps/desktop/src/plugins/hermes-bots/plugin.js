@@ -6701,7 +6701,7 @@ function knownGroups(metaByName) {
 // turn in its OWN persistent per-group Hermes session and is fed only the
 // room messages that are NEW since it last saw the room.
 
-const GROUP_CHAT_MAX_ROUNDS = 3
+const GROUP_CHAT_MAX_ROUNDS = 10
 
 // #94478 review: continuation rounds are bounded independently of the message cap so a pathological mention chain can't consume the room's whole budget on handoffs.
 const GROUP_CHAT_MAX_MESSAGES = 10
