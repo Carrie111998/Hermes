@@ -2,11 +2,24 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { ownerQualifiedSessionIdentity } from '@/lib/session-row-identity'
+import { $unreadFinishedSessionIds } from '@/store/session'
+
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 
-const { openSession } = vi.hoisted(() => ({ openSession: vi.fn() }))
+const { ackStoredSessionId, markSessionRead, openSession } = vi.hoisted(() => ({
+  ackStoredSessionId: vi.fn(),
+  markSessionRead: vi.fn(),
+  openSession: vi.fn()
+}))
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  $unreadFinishedSessionIds.set([])
+  ackStoredSessionId.mockClear()
+  markSessionRead.mockClear()
+  openSession.mockClear()
+})
 
 // Exercises the real SessionActionsMenu end-to-end (no DropdownMenu mock) so
 // a broken asChild composition on the kebab trigger fails here — the menu
@@ -58,6 +71,7 @@ vi.mock('@/i18n', () => ({
           export: 'Export',
           hideTabBar: 'Hide tab bar',
           markRead: 'Mark as read',
+          markUnread: 'Mark as unread',
           newWindow: 'Open in new window',
           openInNewTab: 'Open in new tab',
           pin: 'Pin',
@@ -94,7 +108,7 @@ vi.mock('@/store/session', () => ({
   $selectedStoredSessionId: atom<null | string>(null),
   $sessions: atom<unknown[]>([]),
   $unreadFinishedSessionIds: atom<string[]>([]),
-  markSessionRead: vi.fn(),
+  markSessionRead,
   sessionMatchesStoredId: vi.fn(() => false),
   sessionPinId: vi.fn((s: { id: string }) => s.id),
   setSessions: vi.fn()
@@ -108,6 +122,7 @@ vi.mock('@/store/session-states', () => ({
   closeAllOpenSessionTiles: vi.fn(),
   openSessionTile: vi.fn()
 }))
+vi.mock('@/store/session-unread', () => ({ ackStoredSessionId }))
 vi.mock('@/store/windows', () => ({
   canOpenSessionInTerminal: () => false,
   canOpenSessionWindow: () => true,
@@ -149,6 +164,37 @@ describe('SessionActionsMenu', () => {
       ownerRoute,
       workspaceMode: 'sessions'
     })
+  })
+
+  it('reads and clears only the exact-owner transient unread marker', async () => {
+    const onToggleUnread = vi.fn()
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    $unreadFinishedSessionIds.set([
+      ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, 'duplicate-id')
+    ])
+    render(
+      <SessionActionsMenu
+        onToggleUnread={onToggleUnread}
+        ownerRoute={ownerRoute}
+        sessionId="duplicate-id"
+        title="Owner B session"
+      >
+        <button aria-label="Session actions" type="button">
+          ⋮
+        </button>
+      </SessionActionsMenu>
+    )
+
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Mark as read' }))
+
+    expect(markSessionRead).toHaveBeenCalledWith('duplicate-id', ownerRoute)
+    expect(ackStoredSessionId).toHaveBeenCalledWith('duplicate-id', ownerRoute)
+    expect(onToggleUnread).not.toHaveBeenCalled()
   })
 
   it('opens the dropdown on click without a tooltip on the kebab', async () => {

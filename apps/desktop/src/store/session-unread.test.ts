@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import type { SessionInfo } from '@/types/hermes'
 
 import { makeSessionInfo } from '../test/session-info'
@@ -7,10 +8,13 @@ import { makeSessionInfo } from '../test/session-info'
 import { $activeGatewayProfile } from './profile'
 import {
   $cronSessions,
+  $lastReadAtBySessionId,
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
+  markSessionRead,
+  setPrimarySessionOwnerIntent,
   setSelectedStoredSessionId,
   setSessions
 } from './session'
@@ -18,6 +22,7 @@ import { clearAllSessionStates } from './session-states'
 import {
   $sessionSeenCounts,
   $unreadFinishedMarkers,
+  ackStoredSessionId,
   forgetSessionUnread,
   markSessionUnreadFinished
 } from './session-unread'
@@ -32,8 +37,10 @@ function resetAll() {
   $cronSessions.set([])
   $messagingSessions.set([])
   $selectedStoredSessionId.set(null)
+  setPrimarySessionOwnerIntent(null)
   $activeGatewayProfile.set('default')
   $sessionSeenCounts.set({})
+  $lastReadAtBySessionId.set({})
   $unreadFinishedMarkers.set({})
   $unreadFinishedSessionIds.set([])
 }
@@ -183,6 +190,82 @@ describe('persisted unread (session-unread)', () => {
 
     expect($sessionSeenCounts.get()).toEqual({ alpha: { s1: 3 }, beta: { s1: 6 } })
     expect($unreadFinishedMarkers.get()).toEqual({ alpha: ['s1'] })
+  })
+
+  it('marks only the exact owner when same-id twins share a profile', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerRouteB = { connectionId: 'source-b', profile: 'worker' }
+
+    setSessions([ownerA, ownerB])
+    markSessionUnreadFinished('shared', ownerRouteB)
+
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerB)])
+    expect($unreadFinishedMarkers.get()).toEqual({ worker: [sessionRowIdentity(ownerB)] })
+  })
+
+  it('rehydrates only the exact marked twin after transient state is lost', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', message_count: 5, profile: 'worker' })
+
+    setSessions([ownerA, ownerB])
+    markSessionUnreadFinished('shared', { connectionId: 'source-b', profile: 'worker' })
+    $unreadFinishedSessionIds.set([])
+
+    setSessions([{ ...ownerA }, { ...ownerB }])
+
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerB)])
+  })
+
+  it('acks only the exact owner when same-id twins share a profile', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerRouteA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerRouteB = { connectionId: 'source-b', profile: 'worker' }
+
+    setSessions([ownerA, ownerB])
+    markSessionUnreadFinished('shared', ownerRouteA)
+    markSessionUnreadFinished('shared', ownerRouteB)
+
+    ackStoredSessionId('shared', ownerRouteA)
+
+    // The durable ack is exact-owner; the transient paint is cleared by
+    // markSessionRead, which is exercised independently below.
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerA), sessionRowIdentity(ownerB)])
+    expect($unreadFinishedMarkers.get()).toEqual({ worker: [sessionRowIdentity(ownerB)] })
+  })
+
+  it('keeps the unread twin intact while refreshing the selected owner', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', message_count: 5, profile: 'worker' })
+    const identityA = sessionRowIdentity(ownerA)
+    const identityB = sessionRowIdentity(ownerB)
+    const ownerRouteB = { connectionId: 'source-b', profile: 'worker' }
+
+    setSessions([ownerA, ownerB])
+    $sessionSeenCounts.set({ worker: { [identityA]: 3, [identityB]: 5 } })
+    $unreadFinishedMarkers.set({ worker: [identityA] })
+    setPrimarySessionOwnerIntent({ ownerRoute: ownerRouteB, storedSessionId: 'shared' })
+    setSelectedStoredSessionId('shared')
+
+    setSessions([{ ...ownerA }, { ...ownerB, message_count: 6 }])
+
+    expect($sessionSeenCounts.get()).toEqual({ worker: { [identityA]: 3, [identityB]: 6 } })
+    expect($unreadFinishedMarkers.get()).toEqual({ worker: [identityA] })
+  })
+
+  it('marks read only for the exact owner when same-id twins coexist', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', message_count: 5, profile: 'worker' })
+    const ownerRouteA = { connectionId: 'source-a', profile: 'worker' }
+
+    setSessions([ownerA, ownerB])
+    $unreadFinishedSessionIds.set([sessionRowIdentity(ownerA), sessionRowIdentity(ownerB)])
+
+    markSessionRead('shared', ownerRouteA)
+
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerB)])
+    expect(Object.keys($lastReadAtBySessionId.get())).toEqual([sessionRowIdentity(ownerA)])
   })
 
   it('files a live-edge marker with no loaded row under the active gateway profile', () => {

@@ -10,11 +10,13 @@ import {
   setWorkspaceScope,
   workspaceScopeKey
 } from '@/components/pane-shell/workspace-scope'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $connection,
   $selectedStoredSessionId,
+  $unreadFinishedSessionIds,
   setPrimarySessionOwnerIntent,
   setSessions
 } from '@/store/session'
@@ -53,9 +55,14 @@ import {
   setSessionTileDelegate,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
+import { $unreadFinishedMarkers, markSessionUnreadFinished } from '@/store/session-unread'
+import type { SessionInfo } from '@/types/hermes'
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
+
+const session = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
+  ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
 
 describe('foregroundSessionScopes', () => {
   beforeEach(() => {
@@ -323,6 +330,9 @@ describe('SessionTile workspace scope', () => {
     $selectedStoredSessionId.set(null)
     setPrimarySessionOwnerIntent(null)
     $sessionTiles.set([])
+    setSessions([])
+    $unreadFinishedSessionIds.set([])
+    $unreadFinishedMarkers.set({})
   })
 
   it('stores an exact Bot owner and keeps it through placement patches', () => {
@@ -362,6 +372,25 @@ describe('SessionTile workspace scope', () => {
     ])
   })
 
+  it('marks and acks only the exact owner when a duplicate tile opens', () => {
+    const ownerRouteA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerRouteB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const ownerA = session('shared-unread', { connection_id: 'source-a', profile: 'worker' })
+    const ownerB = session('shared-unread', { connection_id: 'source-b', profile: 'worker' })
+
+    setSessions([ownerA, ownerB])
+    markSessionUnreadFinished('shared-unread', ownerRouteA)
+    markSessionUnreadFinished('shared-unread', ownerRouteB)
+
+    openSessionTile('shared-unread', 'right', undefined, undefined, {
+      ownerRoute: ownerRouteB,
+      workspaceMode: 'sessions'
+    })
+
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerA)])
+    expect($unreadFinishedMarkers.get()).toEqual({ worker: [sessionRowIdentity(ownerA)] })
+  })
+
   it('focuses the exact-owner pane when duplicate stored ids coexist', () => {
     const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
     const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
@@ -385,6 +414,34 @@ describe('SessionTile workspace scope', () => {
       })
     ).toBe('tile')
     expect(findGroupOfPane($layoutTree.get()!, paneB)?.active).toBe(paneB)
+  })
+
+  it('marks only the newly focused exact-owner twin read', () => {
+    const ownerRouteA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerRouteB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const ownerA = session('shared-focus-unread', { connection_id: 'source-a', profile: 'worker' })
+    const ownerB = session('shared-focus-unread', { connection_id: 'source-b', profile: 'worker' })
+    const paneA = sessionTilePaneId('shared-focus-unread', ownerRouteA)
+    const paneB = sessionTilePaneId('shared-focus-unread', ownerRouteB)
+
+    setSessions([ownerA, ownerB])
+    openSessionTile('shared-focus-unread', 'right', undefined, undefined, {
+      ownerRoute: ownerRouteA,
+      workspaceMode: 'sessions'
+    })
+    openSessionTile('shared-focus-unread', 'right', undefined, undefined, {
+      ownerRoute: ownerRouteB,
+      workspaceMode: 'sessions'
+    })
+    $layoutTree.set(group([paneA, paneB], { active: paneA, id: 'unread-owners' }))
+    focusOpenSession('shared-focus-unread', { ownerRoute: ownerRouteA, workspaceMode: 'sessions' })
+    markSessionUnreadFinished('shared-focus-unread', ownerRouteA)
+    markSessionUnreadFinished('shared-focus-unread', ownerRouteB)
+
+    focusOpenSession('shared-focus-unread', { ownerRoute: ownerRouteB, workspaceMode: 'sessions' })
+
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerA)])
+    expect($unreadFinishedMarkers.get()).toEqual({ worker: [sessionRowIdentity(ownerA)] })
   })
 
   it('closes only the requested exact-owner duplicate tile', () => {

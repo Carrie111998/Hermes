@@ -396,6 +396,13 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     return
   }
 
+  const ownerRoute = sessionOwnerRouteByRuntimeId.get(runtimeId)
+
+  const readIdentity = ownerRoute
+    ? (sessionRowIdentityForOwner(ownerLookupSessionRows(), storedId, ownerRoute) ??
+      ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedId))
+    : storedId
+
   const wasWorking = previous?.busy ?? false
 
   if (next.busy && !wasWorking) {
@@ -404,23 +411,25 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     // completion's re-asserts. Dropping it here means this turn's finish
     // re-lights even if it lands within the same millisecond as the last
     // read (same-tick submit → finish in tests and fast local models).
-    clearReadBaseline(storedId)
+    clearReadBaseline(storedId, ownerRoute)
   } else if (!next.busy && wasWorking) {
     markSettled(storedId)
 
     // FOCUSED, not selected: a session finishing in the tile the user is
     // watching is already seen, and a tile is never the primary selection.
-    if (storedId !== $focusedStoredSessionId.get()) {
+    const focusedReadIdentity = $focusedSessionRowIdentity.get() ?? $focusedStoredSessionId.get()
+
+    if (readIdentity !== focusedReadIdentity) {
       // Re-light only genuinely new completions: if the user already viewed
       // this session (or its family) at or after this settle moment, a
       // re-assert of the same completion must not re-arm the dot. `-1` for
       // "never read" (not `0`) so fake-timer tests pinned to t=0 still light.
-      const lastReadAt = $lastReadAtBySessionId.get()[storedId] ?? -1
+      const lastReadAt = $lastReadAtBySessionId.get()[readIdentity] ?? -1
 
       if (Date.now() > lastReadAt) {
         // Flags the transient atom AND persists a marker, so the green dot
         // survives an app restart (see session-unread.ts).
-        markSessionUnreadFinished(storedId)
+        markSessionUnreadFinished(storedId, ownerRoute)
       }
     }
   }
@@ -1555,8 +1564,8 @@ export function openSessionTile(
   // setSelectedStoredSessionId cleared unread, so tile-opened sessions kept
   // their green dot even while the user was reading them. Acks the persisted
   // watermark/marker too so a later list refresh doesn't repaint it.
-  markSessionRead(storedSessionId)
-  ackStoredSessionId(storedSessionId)
+  markSessionRead(storedSessionId, workspaceScope.ownerRoute)
+  ackStoredSessionId(storedSessionId, workspaceScope.ownerRoute)
 
   const requestedIdentity = sessionTileIdentity(storedSessionId, workspaceScope.ownerRoute)
 
@@ -2214,16 +2223,48 @@ export const selectionHomesToWorkspace = (selected: null | string, tiles: readon
   !(selected && tiles.some(t => t.storedSessionId === selected))
 
 // Bringing a finished session to the front clears its green dot. Keyed on the
-// FOCUSED session, not the selected one: a tile is never $selectedStoredSessionId,
-// and a tile tab click goes through activateTreePane rather than focusOpenSession,
-// so this is the one hook that catches every way a tile reaches the front.
+// FOCUSED exact row, not the selected raw id: a tile is never
+// $selectedStoredSessionId, and same-id twins on two owners must still emit a
+// focus edge when the active pane moves between them.
+function focusedSessionReadTarget(): null | { ownerRoute?: SessionOwnerRoute; storedSessionId: string } {
+  const groupId = $activeTreeGroup.get()
+  const tree = $layoutTree.get()
+  const active = groupId && tree ? findGroup(tree, groupId)?.active : undefined
+
+  const focusedTile = active?.startsWith(TILE_PANE_PREFIX)
+    ? tileForIdentity($sessionTiles.get(), active.slice(TILE_PANE_PREFIX.length))
+    : undefined
+
+  const storedSessionId = focusedTile?.storedSessionId ?? $selectedStoredSessionId.get()
+
+  if (!storedSessionId) {
+    return null
+  }
+
+  const primaryOwnerIntent = $primarySessionOwnerIntent.get()
+
+  const ownerRoute = focusedTile
+    ? focusedTile.ownerRoute
+    : primaryOwnerIntent?.storedSessionId === storedSessionId
+      ? primaryOwnerIntent.ownerRoute
+      : getSessionOwnerHint(storedSessionId)
+
+  return { ownerRoute, storedSessionId }
+}
+
 // Clears the whole conversation family (markSessionRead) AND acks the
 // persisted watermark/marker (ackStoredSessionId) so the next list refresh
 // doesn't repaint the dot the user just cleared by looking at it.
-$focusedStoredSessionId.listen(focused => {
-  if (focused) {
-    markSessionRead(focused)
-    ackStoredSessionId(focused)
+$focusedSessionRowIdentity.listen(focusedIdentity => {
+  if (!focusedIdentity) {
+    return
+  }
+
+  const target = focusedSessionReadTarget()
+
+  if (target) {
+    markSessionRead(target.storedSessionId, target.ownerRoute)
+    ackStoredSessionId(target.storedSessionId, target.ownerRoute)
   }
 })
 

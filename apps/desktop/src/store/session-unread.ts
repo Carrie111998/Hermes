@@ -1,15 +1,25 @@
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import {
+  ownerQualifiedSessionIdentity,
+  sessionRowForOwner,
+  sessionRowIdentity,
+  sessionRowIdentityForOwner
+} from '@/lib/session-row-identity'
 import { stableArray } from '@/lib/stable-array'
 import { readKey } from '@/lib/storage'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayProfile } from '@/store/profile'
+import { normalizeProfileKey } from '@/store/profile-key'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
   $cronSessions,
   $messagingSessions,
+  $primarySessionOwnerIntent,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
+  getSessionOwnerHint,
   sessionMatchesStoredId,
   sessionPinId
 } from './session'
@@ -150,21 +160,27 @@ const MARKERS_CAP = 200
 
 const rowsFor = (lists: readonly SessionInfo[][]): SessionInfo[] => lists.flat()
 
-const isSelected = (row: SessionInfo, selected: null | string): boolean =>
-  Boolean(selected && sessionMatchesStoredId(row, selected))
-
 /** The persistence bucket a row belongs to — its OWN profile, never the live
  *  gateway's (the lists are routinely cross-profile). */
 const profileKeyForRow = (row: SessionInfo): string => normalizeProfileKey(row.profile)
+
+/** The row's durable unread key. Connection-tagged rows are exact-owner
+ * identities; ownerless/local legacy rows keep their historical raw key. */
+const persistenceIdForRow = (row: SessionInfo): string =>
+  row.connection_id ? sessionRowIdentity(row) : sessionPinId(row)
 
 /** The row a bare stored id refers to. Ids are caller-supplied and each
  *  profile's backend is its own namespace, so two profiles can hold the same
  *  id; a tie breaks toward the live gateway, since both opening a session and
  *  running one swap the gateway onto that session's profile. */
-function resolveLoadedRow(storedSessionId: string): SessionInfo | undefined {
-  const matches = rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()]).filter(row =>
-    sessionMatchesStoredId(row, storedSessionId)
-  )
+function resolveLoadedRow(storedSessionId: string, ownerRoute?: SessionOwnerRoute): SessionInfo | undefined {
+  const rows = rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()])
+
+  if (ownerRoute) {
+    return sessionRowForOwner(rows, storedSessionId, ownerRoute)
+  }
+
+  const matches = rows.filter(row => sessionMatchesStoredId(row, storedSessionId))
 
   if (matches.length < 2) {
     return matches[0]
@@ -183,11 +199,30 @@ function resolveLoadedRow(storedSessionId: string): SessionInfo | undefined {
 const unlistedProfile = (hint?: null | string): string =>
   normalizeProfileKey((hint ?? '').trim() || $activeGatewayProfile.get())
 
-/** Bucket for a bare stored id: its row's profile, else the live gateway's. */
-const resolveProfile = (storedSessionId: string): string => {
-  const row = resolveLoadedRow(storedSessionId)
+function selectedSessionRowIdentity(rows: readonly SessionInfo[], selected: null | string): null | string {
+  if (!selected) {
+    return null
+  }
 
-  return row ? profileKeyForRow(row) : unlistedProfile()
+  const primaryIntent = $primarySessionOwnerIntent.get()
+
+  const ownerRoute =
+    primaryIntent?.storedSessionId === selected ? primaryIntent.ownerRoute : getSessionOwnerHint(selected)
+
+  if (ownerRoute) {
+    return sessionRowIdentityForOwner(rows, selected, ownerRoute)
+  }
+
+  const candidates = rows.filter(row => sessionMatchesStoredId(row, selected))
+
+  if (candidates.length === 1) {
+    return sessionRowIdentity(candidates[0])
+  }
+
+  const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+  const activeCandidates = candidates.filter(row => profileKeyForRow(row) === activeProfile)
+
+  return activeCandidates.length === 1 ? sessionRowIdentity(activeCandidates[0]) : null
 }
 
 /** Write a profile's marker bucket, dropping the key when it empties so we
@@ -208,19 +243,30 @@ function setMarkerBucket(profile: string, ids: readonly string[]): void {
 /** UNREAD WRITER — the live busy→idle edge (session-states.ts) and any surface
  *  that learns out-of-band that a session produced something the user hasn't
  *  seen. Flags the transient atom (immediate paint) AND persists the marker so
- *  the dot survives a restart. The marker lands in the row's own profile; with
- *  no loaded row it lands in `profileHint`'s, falling back to the active
- *  gateway's — the only place a live edge can come from. */
-export function markSessionUnreadFinished(storedSessionId: string, profileHint?: null | string): void {
+ *  the dot survives a restart. A full owner route keeps same-id twins exact; a
+ *  profile-only hint supports permanently hidden Bot Mode chats; otherwise the
+ *  active gateway profile is the safe live-edge fallback. */
+export function markSessionUnreadFinished(
+  storedSessionId: string,
+  ownerHint?: null | string | SessionOwnerRoute
+): void {
+  const ownerRoute = ownerHint && typeof ownerHint === 'object' ? ownerHint : undefined
+  const profileHint = typeof ownerHint === 'string' ? ownerHint : ownerRoute?.profile
+  const row = resolveLoadedRow(storedSessionId, ownerRoute)
+
+  const transientId = ownerRoute
+    ? row
+      ? sessionRowIdentity(row)
+      : ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedSessionId)
+    : storedSessionId
   const current = $unreadFinishedSessionIds.get()
 
-  if (!current.includes(storedSessionId)) {
-    $unreadFinishedSessionIds.set([...current, storedSessionId])
+  if (!current.includes(transientId)) {
+    $unreadFinishedSessionIds.set([...current, transientId])
   }
 
-  const row = resolveLoadedRow(storedSessionId)
   const profile = row ? profileKeyForRow(row) : unlistedProfile(profileHint)
-  const durableId = row ? sessionPinId(row) : storedSessionId
+  const durableId = ownerRoute ? transientId : row ? sessionPinId(row) : storedSessionId
   const bucket = $unreadFinishedMarkers.get()[profile] ?? []
 
   if (bucket.includes(durableId)) {
@@ -234,9 +280,9 @@ export function markSessionUnreadFinished(storedSessionId: string, profileHint?:
 
 /** ACK — the user opened (or is looking at) this session: watermark := its
  *  current message_count, and any explicit marker is retired. */
-function ackSessionRow(row: SessionInfo): void {
+function ackSessionRow(row: SessionInfo, exactOwner = false): void {
   const profile = profileKeyForRow(row)
-  const durableId = sessionPinId(row)
+  const durableId = exactOwner ? sessionRowIdentity(row) : persistenceIdForRow(row)
 
   if (Number.isFinite(row.message_count)) {
     const seen = $sessionSeenCounts.get()
@@ -261,22 +307,24 @@ function ackSessionRow(row: SessionInfo): void {
 }
 
 /** Clear persisted unread for a stored id even when its row isn't loaded —
- *  the marker alone can be retired; the watermark needs the row's count. With
- *  no row there is no profile to read, so we retire it from `profileHint`'s
- *  bucket, falling back to the active gateway's (the profile whose sessions
- *  you can actually be opening); other profiles' identically-named ids stay
- *  untouched. Pass the hint whenever the caller knows the owner — a hidden
- *  session can be opened without the gateway ever moving onto its profile,
- *  which would otherwise ack a bucket that never held the marker. */
-export function ackStoredSessionId(storedSessionId: null | string, profileHint?: null | string): void {
+ *  the marker alone can be retired; the watermark needs the row's count. A
+ *  full owner route identifies an exact same-id twin; a profile-only hint
+ *  supports hidden Bot Mode canonical chats; without either, use the active
+ *  gateway profile and never touch another profile's identically named id. */
+export function ackStoredSessionId(
+  storedSessionId: null | string,
+  ownerHint?: null | string | SessionOwnerRoute
+): void {
   if (!storedSessionId) {
     return
   }
 
-  const row = resolveLoadedRow(storedSessionId)
+  const ownerRoute = ownerHint && typeof ownerHint === 'object' ? ownerHint : undefined
+  const profileHint = typeof ownerHint === 'string' ? ownerHint : ownerRoute?.profile
+  const row = resolveLoadedRow(storedSessionId, ownerRoute)
 
   if (row) {
-    ackSessionRow(row)
+    ackSessionRow(row, Boolean(ownerRoute))
 
     return
   }
@@ -288,7 +336,11 @@ export function ackStoredSessionId(storedSessionId: null | string, profileHint?:
     return
   }
 
-  const next = markers.filter(id => id !== storedSessionId)
+  const markerId = ownerRoute
+    ? ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedSessionId)
+    : storedSessionId
+
+  const next = markers.filter(id => id !== markerId)
 
   if (next.length !== markers.length) {
     setMarkerBucket(profile, next)
@@ -364,9 +416,8 @@ export function forgetSessionUnread(
  *  between their watermark and live count IS the unread signal. */
 function ingestRows(rows: readonly SessionInfo[]): void {
   const selected = $selectedStoredSessionId.get()
-  // Only the OWNING profile's row counts as on-screen: a same-id row in
-  // another profile is a different session and keeps its unread gap.
-  const selectedProfile = selected ? resolveProfile(selected) : null
+  const loadedRows = rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()])
+  const selectedIdentity = selectedSessionRowIdentity(loadedRows, selected)
   const seen = $sessionSeenCounts.get()
   let next: null | SeenCounts = null
 
@@ -381,10 +432,12 @@ function ingestRows(rows: readonly SessionInfo[]): void {
     }
 
     const profile = profileKeyForRow(row)
-    const durableId = sessionPinId(row)
+    const durableId = persistenceIdForRow(row)
     const bucket = next?.[profile] ?? seen[profile]
 
-    if (profile === selectedProfile && isSelected(row, selected)) {
+    const rowSelected = Boolean(selectedIdentity && sessionRowIdentity(row) === selectedIdentity)
+
+    if (rowSelected) {
       if (bucket?.[durableId] !== row.message_count) {
         write(profile, durableId, row.message_count)
       }
@@ -431,7 +484,7 @@ function pruneSeenCounts(seen: SeenCounts, rows: readonly SessionInfo[]): SeenCo
   }
 
   for (const row of rows) {
-    keepFor(profileKeyForRow(row)).add(sessionPinId(row))
+    keepFor(profileKeyForRow(row)).add(persistenceIdForRow(row))
   }
 
   const next: SeenCounts = {}
@@ -459,45 +512,51 @@ function recomputeUnread(): void {
   const markers = $unreadFinishedMarkers.get()
   const seen = $sessionSeenCounts.get()
   const unread: string[] = []
+  const loadedRows = rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()])
+  const selectedIdentity = selectedSessionRowIdentity(loadedRows, selected)
+
+  const rowIsSelected = (row: SessionInfo): boolean =>
+    Boolean(selectedIdentity && sessionRowIdentity(row) === selectedIdentity)
 
   const isMarked = (row: SessionInfo, durableId: string): boolean => {
     const bucket = markers[profileKeyForRow(row)]
 
-    return Boolean(bucket?.includes(durableId) || bucket?.includes(row.id))
+    return Boolean(bucket?.includes(durableId) || (!row.connection_id && bucket?.includes(row.id)))
   }
 
-  // Watermark + marker unread for chat and cron rows. The selected skip stays
-  // profile-blind here (unlike the persisted writes): the paint layer is keyed
-  // by row id, so dotting a same-id row from another profile would just put a
-  // dot on the session you have open.
+  const paintIdentity = (row: SessionInfo): string =>
+    row.connection_id ? sessionRowIdentity(row) : row.id
+
+  // Watermark + marker unread for chat and cron rows. The exact selected row
+  // stays quiet; a same-id twin owned by another connection remains eligible.
   for (const row of rowsFor([$sessions.get(), $cronSessions.get()])) {
-    if (isSelected(row, selected)) {
+    if (rowIsSelected(row)) {
       continue
     }
 
-    const durableId = sessionPinId(row)
+    const durableId = persistenceIdForRow(row)
     const watermark = seen[profileKeyForRow(row)]?.[durableId]
 
     const exceedsWatermark =
       typeof watermark === 'number' && Number.isFinite(row.message_count) && row.message_count > watermark
 
     if (exceedsWatermark || isMarked(row, durableId)) {
-      unread.push(row.id)
+      unread.push(paintIdentity(row))
     }
   }
 
   // Messaging rows: explicit (live-edge) markers only — see header comment.
   for (const row of $messagingSessions.get()) {
-    if (!isSelected(row, selected) && isMarked(row, sessionPinId(row))) {
-      unread.push(row.id)
+    if (!rowIsSelected(row) && isMarked(row, persistenceIdForRow(row))) {
+      unread.push(paintIdentity(row))
     }
   }
 
   // Preserve live-edge ids whose row isn't loaded yet.
-  const loadedRows = rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()])
-
   for (const id of $unreadFinishedSessionIds.get()) {
-    if (id !== selected && !unread.includes(id) && !loadedRows.some(row => sessionMatchesStoredId(row, id))) {
+    const loaded = loadedRows.some(row => sessionRowIdentity(row) === id || sessionMatchesStoredId(row, id))
+
+    if (id !== selected && !unread.includes(id) && !loaded) {
       unread.push(id)
     }
   }
@@ -575,7 +634,16 @@ if (!isSecondaryWindow() && !isBrowserWindow()) {
 
   // Opening a session acks it durably (the transient atom is already cleared
   // synchronously by setSelectedStoredSessionId — this is the persisted half).
-  // Unary on purpose: nanostores hands a listener (value, oldValue), and the
-  // old selection would otherwise arrive as the profile hint.
-  $selectedStoredSessionId.listen(id => ackStoredSessionId(id))
+  $selectedStoredSessionId.listen(selected => {
+    if (!selected) {
+      return
+    }
+
+    const primaryIntent = $primarySessionOwnerIntent.get()
+
+    const ownerRoute =
+      primaryIntent?.storedSessionId === selected ? primaryIntent.ownerRoute : getSessionOwnerHint(selected)
+
+    ackStoredSessionId(selected, ownerRoute)
+  })
 }

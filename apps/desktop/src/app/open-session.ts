@@ -97,7 +97,7 @@ export function openSession(
   // Must run BEFORE the focus short-circuits below: clicking a session that is
   // already on screen (open tile, or the main session) would otherwise return
   // at focusOpenSession and never clear its unread dot.
-  markSessionRead(storedSessionId)
+  markSessionRead(storedSessionId, workspaceScope.ownerRoute)
 
   const hasWorkspaceMetadata = Boolean(
     workspaceScope.ownerRoute ||

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import type { SessionInfo } from '@/types/hermes'
 
 const patch = vi.fn<(id: string, unread: boolean, profile?: unknown) => Promise<{ ok: boolean }>>(() =>
@@ -120,5 +121,22 @@ describe('watchUnreadWriteGuard', () => {
     $sessions.set([row('a', { unread: false })])
 
     expect($unreadWriteGuard.get().has('a')).toBe(true)
+  })
+
+  it('keeps an exact-owner optimistic write fenced from a stale page', async () => {
+    watchUnreadWriteGuard()
+    const ownerA = row('shared', { connection_id: 'source-a', profile: 'worker', unread: false })
+    const ownerB = row('shared', { connection_id: 'source-b', profile: 'worker', unread: false })
+    const ownerRouteB = { connectionId: 'source-b', profile: 'worker' }
+
+    $sessions.set([ownerA, ownerB])
+    await markSessionUnread('shared', true, ownerRouteB)
+
+    // This page was issued before the PATCH and must not retire owner B's
+    // optimistic guard merely because the optimistic local row already echoed
+    // the value once.
+    $sessions.set([ownerA, ownerB])
+
+    expect($unreadWriteGuard.get().get(sessionRowIdentity(ownerB))?.value).toBe(true)
   })
 })

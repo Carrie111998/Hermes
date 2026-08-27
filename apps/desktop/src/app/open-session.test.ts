@@ -25,9 +25,22 @@ vi.mock('./routes', () => ({
   sessionRoute: (id: string) => `/c/${encodeURIComponent(id)}`
 }))
 
-import { $activeSessionId, $primarySessionOwnerIntent, $selectedStoredSessionId } from '@/store/session'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
+import {
+  $activeSessionId,
+  $primarySessionOwnerIntent,
+  $selectedStoredSessionId,
+  $sessions,
+  $unreadFinishedSessionIds,
+  setSessions
+} from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
+
+import { makeSessionInfo } from '../test/session-info'
 
 import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
+
+const session = (over: Partial<SessionInfo>): SessionInfo => makeSessionInfo({ id: 'live', ...over })
 
 /**
  * The question behind both the sidebar "+" and a palette open: is there a
@@ -92,6 +105,8 @@ describe('openSession', () => {
     $activeSessionId.set(null)
     $primarySessionOwnerIntent.set(null)
     $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    $unreadFinishedSessionIds.set([])
   })
 
   it('in-place focuses an existing tile and does not navigate', () => {
@@ -100,6 +115,20 @@ describe('openSession', () => {
     expect(focusOpenSession).toHaveBeenCalledWith('s1', { workspaceMode: 'sessions' })
     expect(navigate).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('marks only the exact owner read before an existing-tile focus short-circuit', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+    const ownerRouteB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    setSessions([ownerA, ownerB])
+    $unreadFinishedSessionIds.set([sessionRowIdentity(ownerA), sessionRowIdentity(ownerB)])
+    focusOpenSession.mockReturnValue('tile')
+
+    openSession('shared', navigate, 'in-place', { ownerRoute: ownerRouteB, workspaceMode: 'sessions' })
+
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerA)])
   })
 
   it('in-place focuses main when already selected and not on a page', () => {

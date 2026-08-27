@@ -143,9 +143,17 @@ export const $sessionDotStateById = computed(
     // our own writes is fenced out by the write guard: keep OUR value until a
     // page confirms it or the guard expires.
     const persistedUnreadRows = []
+    const rowCountById = new Map<string, number>()
 
     for (const session of sessions) {
-      const entry = unreadWriteGuard.get(session.id)
+      rowCountById.set(session.id, (rowCountById.get(session.id) ?? 0) + 1)
+    }
+
+    for (const session of sessions) {
+      const identity = sessionRowIdentity(session)
+
+      const entry = unreadWriteGuard.get(identity) ??
+        (rowCountById.get(session.id) === 1 ? unreadWriteGuard.get(session.id) : undefined)
 
       if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {
         if (entry.value) {

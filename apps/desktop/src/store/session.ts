@@ -6,7 +6,13 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
-import { sessionRowIdentity, sessionRowLiveIdentity } from '@/lib/session-row-identity'
+import {
+  normalizeSessionRowConnection,
+  normalizeSessionRowProfile,
+  ownerQualifiedSessionIdentity,
+  sessionRowIdentity,
+  sessionRowLiveIdentity
+} from '@/lib/session-row-identity'
 import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
@@ -1191,15 +1197,36 @@ export function markAllSessionsRead() {
 // already-viewed completion keeps re-lighting the row.
 export const $lastReadAtBySessionId = atom<Record<string, number>>({})
 
+function unreadFamilyIdentities(storedSessionId: string, ownerRoute?: SessionOwnerRoute): string[] {
+  const sessions = $sessions.get()
+
+  if (!ownerRoute) {
+    return lineageAliases(storedSessionId, sessions)
+  }
+
+  const connectionId = normalizeSessionRowConnection(ownerRoute.connectionId)
+  const profile = normalizeSessionRowProfile(ownerRoute.profile)
+
+  const ownerRows = sessions.filter(
+    row =>
+      normalizeSessionRowConnection(row.connection_id) === connectionId &&
+      normalizeSessionRowProfile(row.profile) === profile
+  )
+
+  return lineageAliases(storedSessionId, ownerRows).map(id =>
+    ownerQualifiedSessionIdentity(connectionId, profile, id)
+  )
+}
+
 /** A new turn started for this session: the read baseline only guarded the
  *  PREVIOUS completion's re-asserts, so drop it — the new turn's finish must
  *  re-light even when it lands in the same millisecond as the last read. */
-export const clearReadBaseline = (storedSessionId: string) => {
+export const clearReadBaseline = (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => {
   const map = $lastReadAtBySessionId.get()
+  const familyIds = unreadFamilyIdentities(storedSessionId, ownerRoute)
 
-  if (storedSessionId in map) {
-    const { [storedSessionId]: _dropped, ...rest } = map
-    $lastReadAtBySessionId.set(rest)
+  if (familyIds.some(id => id in map)) {
+    $lastReadAtBySessionId.set(Object.fromEntries(Object.entries(map).filter(([id]) => !familyIds.includes(id))))
   }
 }
 
@@ -1210,14 +1237,21 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   // root), not just the exact row: the sidebar lights the dot for every alias
   // of a lineage, so reading any row must clear all of them.
   const id = $selectedStoredSessionId.get()
+  const primaryIntent = id ? $primarySessionOwnerIntent.get() : null
+
+  const ownerRoute = id
+    ? primaryIntent?.storedSessionId === id
+      ? primaryIntent.ownerRoute
+      : getSessionOwnerHint(id)
+    : undefined
 
   if (id) {
-    markSessionRead(id)
+    markSessionRead(id, ownerRoute)
   }
 
   // ...and the persisted watermark flag, when the row carried one.
   if (id) {
-    void clearUnreadOnOpen(id)
+    void clearUnreadOnOpen(id, ownerRoute)
   }
 }
 
@@ -1226,13 +1260,15 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
  *  baseline so a later completion that settles BEFORE this view is not
  *  re-lit. Must be callable before any focus short-circuit (openSession top)
  *  so re-clicking an already-visible session still clears its dot. */
-export const markSessionRead = (storedSessionId: string | null | undefined) => {
+export const markSessionRead = (
+  storedSessionId: string | null | undefined,
+  ownerRoute?: SessionOwnerRoute
+) => {
   if (!storedSessionId) {
     return
   }
 
-  const sessions = $sessions.get()
-  const familyIds = new Set<string>(lineageAliases(storedSessionId, sessions))
+  const familyIds = new Set<string>(unreadFamilyIdentities(storedSessionId, ownerRoute))
 
   const lastReadAt = Date.now()
   const nextReadMap = { ...$lastReadAtBySessionId.get() }

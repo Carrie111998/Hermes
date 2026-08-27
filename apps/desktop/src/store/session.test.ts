@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import type { SessionInfo } from '@/types/hermes'
 
 const setUnreadRemote = vi.fn<(id: string, unread: boolean, profile?: null | string) => Promise<{ ok: boolean }>>(() =>
@@ -49,6 +50,7 @@ import {
   sessionPinId,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setPrimarySessionOwnerIntent,
   setRememberedRoute,
   setRememberedSessionId,
   setSelectedStoredSessionId,
@@ -62,7 +64,8 @@ import {
   $attentionSessionIds,
   clearAllSessionStates,
   getRecentlySettledSessionIds,
-  publishSessionState
+  publishSessionState,
+  recordSessionEventScope
 } from './session-states'
 
 const session = (over: Partial<SessionInfo>): SessionInfo => makeSessionInfo({ id: 'live', ...over })
@@ -995,6 +998,7 @@ describe('unread finished sessions', () => {
     clearAllSessionStates()
     $unreadFinishedSessionIds.set([])
     $selectedStoredSessionId.set(null)
+    setPrimarySessionOwnerIntent(null)
     $sessions.set([])
     setUnreadRemote.mockClear()
   })
@@ -1003,6 +1007,7 @@ describe('unread finished sessions', () => {
     clearAllSessionStates()
     $unreadFinishedSessionIds.set([])
     $selectedStoredSessionId.set(null)
+    setPrimarySessionOwnerIntent(null)
     $sessions.set([])
   })
 
@@ -1016,6 +1021,25 @@ describe('unread finished sessions', () => {
     publishSessionState('rt1', idle)
 
     expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+  })
+
+  it('marks same-id background finishes independently by event owner', () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+
+    setSessions([ownerA, ownerB])
+    recordSessionEventScope({ connectionId: 'source-a', profile: 'worker', session_id: 'runtime-a' })
+    recordSessionEventScope({ connectionId: 'source-b', profile: 'worker', session_id: 'runtime-b' })
+
+    for (const runtimeId of ['runtime-a', 'runtime-b']) {
+      const working = makeState({ busy: true, storedSessionId: 'shared' })
+      publishSessionState(runtimeId, working)
+      publishSessionState(runtimeId, { ...working, busy: false })
+    }
+
+    expect($unreadFinishedSessionIds.get().sort()).toEqual(
+      [sessionRowIdentity(ownerA), sessionRowIdentity(ownerB)].sort()
+    )
   })
 
   it('does NOT mark unread when the finishing session is the active one', () => {
@@ -1151,6 +1175,23 @@ describe('unread finished sessions', () => {
 
     await Promise.resolve()
     expect(setUnreadRemote).toHaveBeenCalledWith('s1', false, undefined)
+  })
+
+  it('clears only the selected exact-owner twin', async () => {
+    const ownerA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker', unread: true })
+    const ownerB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker', unread: true })
+    const ownerRouteB = { connectionId: 'source-b', profile: 'worker' }
+
+    setSessions([ownerA, ownerB])
+    $unreadFinishedSessionIds.set([sessionRowIdentity(ownerA), sessionRowIdentity(ownerB)])
+    setPrimarySessionOwnerIntent({ ownerRoute: ownerRouteB, storedSessionId: 'shared' })
+
+    setSelectedStoredSessionId('shared')
+
+    expect($sessions.get()).toEqual([ownerA, { ...ownerB, unread: false }])
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionRowIdentity(ownerA)])
+    await Promise.resolve()
+    expect(setUnreadRemote).toHaveBeenCalledWith('shared', false, ownerRouteB)
   })
 
   it('does not PATCH a read row when it is opened', async () => {

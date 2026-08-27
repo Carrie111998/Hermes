@@ -29,6 +29,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
+import { ownerQualifiedSessionIdentity, sessionRowIdentityForOwner } from '@/lib/session-row-identity'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $projectTree, moveSessionToProject, projectIdForCwd, projectRootCwd } from '@/store/projects'
@@ -217,8 +218,17 @@ function useSessionActions({
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const isRemote = useStore($connection)?.mode === 'remote'
   // The row's finished-unread dot is cleared by opening the session (main or
-  // tile) — this menu item is the explicit escape hatch for the rest.
-  const isUnread = useStore($unreadFinishedSessionIds).includes(sessionId)
+  // tile) — this menu item is the explicit escape hatch for the rest. Exact
+  // owners use the same qualified lineage identity as the dot-state map, so a
+  // same-id twin cannot make this menu offer the wrong action.
+  const transientUnreadIds = useStore($unreadFinishedSessionIds)
+
+  const transientIdentity = ownerRoute
+    ? (sessionRowIdentityForOwner($sessions.get(), sessionId, ownerRoute) ??
+      ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, sessionId))
+    : sessionId
+
+  const isUnread = transientUnreadIds.includes(transientIdentity)
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
@@ -333,8 +343,8 @@ function useSessionActions({
         if (unread || isUnread) {
           // Clear the transient family dot immediately (and ack the persisted
           // watermark/marker so a list refresh doesn't repaint it)…
-          markSessionRead(sessionId)
-          ackStoredSessionId(sessionId)
+          markSessionRead(sessionId, ownerRoute)
+          ackStoredSessionId(sessionId, ownerRoute)
 
           // …and retire the persisted watermark when the row carries one.
           if (unread) {

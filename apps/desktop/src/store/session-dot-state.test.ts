@@ -180,6 +180,24 @@ describe('persisted unread (backend watermark)', () => {
     expect($sessionDotStateById.get()['s1']).not.toBe('unread')
   })
 
+  it('fences only the exact optimistic twin from a stale list page', () => {
+    const ownerA = storedRow('shared', { connection_id: 'source-a', profile: 'worker', unread: false })
+    const ownerB = storedRow('shared', { connection_id: 'source-b', profile: 'worker', unread: false })
+    const guard = new Map($unreadWriteGuard.get())
+
+    guard.set(sessionRowIdentity(ownerB), {
+      at: Date.now(),
+      ownerRoute: { connectionId: 'source-b', profile: 'worker' },
+      storedId: 'shared',
+      value: true
+    })
+    $unreadWriteGuard.set(guard)
+    setSessions([ownerA, ownerB])
+
+    expect($sessionDotStateById.get()[sessionRowIdentity(ownerA)]).not.toBe('unread')
+    expect($sessionDotStateById.get()[sessionRowIdentity(ownerB)]).toBe('unread')
+  })
+
   it('leaves a row alone when the backend omits the flag (older runtime)', () => {
     setSessions([storedRow('s1')])
 

@@ -32,7 +32,10 @@ export const UNREAD_WRITE_GUARD_MS = 10_000
 
 /** id -> the value we wrote and when. Guarded rows outrank list pages. */
 export const $unreadWriteGuard = atom<
-  Map<string, { at: number; ownerRoute?: SessionOwnerRoute; storedId?: string; value: boolean }>
+  Map<
+    string,
+    { at: number; optimistic?: boolean; ownerRoute?: SessionOwnerRoute; storedId?: string; value: boolean }
+  >
 >(new Map())
 
 function matchesOwner(
@@ -74,7 +77,7 @@ export async function markSessionUnread(
     ? ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedId)
     : storedId
 
-  guard.set(guardKey, { at: Date.now(), ownerRoute, storedId, value: unread })
+  guard.set(guardKey, { at: Date.now(), optimistic: true, ownerRoute, storedId, value: unread })
   $unreadWriteGuard.set(guard)
 
   setSessions(rows => rows.map(r => (matchesOwner(r, storedId, ownerRoute) ? { ...r, unread } : r)))
@@ -99,15 +102,15 @@ export async function markSessionUnread(
 
 /** Opening a session clears its persisted unread flag (auto-mark-read).
  *  Best-effort: a failed PATCH is healed by the next honest refresh. */
-export async function clearUnreadOnOpen(storedId: string): Promise<void> {
-  const row = rowFor(storedId)
+export async function clearUnreadOnOpen(storedId: string, ownerRoute?: SessionOwnerRoute): Promise<void> {
+  const row = rowFor(storedId, ownerRoute)
 
   if (!row || row.unread !== true) {
     return
   }
 
   try {
-    await markSessionUnread(storedId, false)
+    await markSessionUnread(storedId, false, ownerRoute)
   } catch {
     // Ignore: the dot simply returns until a refresh reconciles.
   }
@@ -115,7 +118,14 @@ export async function clearUnreadOnOpen(storedId: string): Promise<void> {
 
 /** Release guard entries once a list page confirms the value we wrote. Call
  *  once at boot, next to watchSessionPins(). */
+let unreadWriteGuardWatching = false
+
 export function watchUnreadWriteGuard(): void {
+  if (unreadWriteGuardWatching) {
+    return
+  }
+
+  unreadWriteGuardWatching = true
   $sessions.listen(rows => {
     const guard = $unreadWriteGuard.get()
     let changed = false
@@ -124,7 +134,15 @@ export function watchUnreadWriteGuard(): void {
       const row = rows.find(r => matchesOwner(r, entry.storedId ?? id, entry.ownerRoute))
 
       if (row && row.unread === entry.value) {
-        guard.delete(id)
+        if (entry.optimistic) {
+          // The first matching publication is our own optimistic setSessions
+          // update, not backend confirmation. Keep the fence for the next list
+          // page, but remember that the local echo has been consumed.
+          guard.set(id, { ...entry, optimistic: false })
+        } else {
+          guard.delete(id)
+        }
+
         changed = true
       }
     }
