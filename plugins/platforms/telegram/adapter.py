@@ -17,11 +17,31 @@ import html as _html
 import re
 import threading
 import time
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+_NLO365_APPROVAL_CLI = "/home/ilan/nlo365-broker/.venv/bin/nlo365-approvals"
+_NLO365_APPROVAL_ID_RE = re.compile(
+    r"\bApproval ID:\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\b",
+    re.IGNORECASE,
+)
+
+
+def _nlo365_approval_id(content: str) -> Optional[str]:
+    """Extract a canonical approval UUID only from an explicit queued notice."""
+    if "queued for approval" not in content.lower():
+        return None
+    match = _NLO365_APPROVAL_ID_RE.search(content)
+    if not match:
+        return None
+    try:
+        return str(uuid.UUID(match.group(1)))
+    except ValueError:
+        return None
 
 from agent.deadline import run_bounded_async
 
@@ -5281,6 +5301,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        nlo365_approval_id = _nlo365_approval_id(content)
+        nlo365_reply_markup = (
+            self._nlo365_approval_keyboard(nlo365_approval_id)
+            if nlo365_approval_id
+            else None
+        )
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -5288,7 +5315,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if nlo365_reply_markup is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -5342,6 +5369,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
+                approval_markup = (
+                    nlo365_reply_markup if i == len(chunks) - 1 else None
+                )
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
@@ -5397,6 +5427,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **({"reply_markup": approval_markup} if approval_markup else {}),
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -5411,6 +5442,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **({"reply_markup": approval_markup} if approval_markup else {}),
                                 )
                             else:
                                 raise
@@ -7172,6 +7204,126 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    @staticmethod
+    def _nlo365_approval_keyboard(approval_id: str):
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve & Execute", callback_data=f"na:a:{approval_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject", callback_data=f"na:r:{approval_id}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "ℹ️ Status", callback_data=f"na:s:{approval_id}"
+                    )
+                ],
+            ]
+        )
+
+    async def _run_nlo365_approval_action(
+        self, choice: str, approval_id: str
+    ) -> Dict[str, Any]:
+        """Run the local operator CLI with fixed argv and parse its safe summary."""
+        try:
+            canonical_id = str(uuid.UUID(approval_id))
+        except ValueError as exc:
+            raise RuntimeError("invalid approval identifier") from exc
+        command = {
+            "a": "approve-execute-safe",
+            "r": "reject-safe",
+            "s": "status-safe",
+        }.get(choice)
+        if command is None:
+            raise RuntimeError("invalid approval action")
+        process = await asyncio.create_subprocess_exec(
+            _NLO365_APPROVAL_CLI,
+            command,
+            canonical_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise RuntimeError("Microsoft 365 approval action timed out") from exc
+        if process.returncode != 0:
+            raise RuntimeError("Microsoft 365 approval action failed safely")
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Microsoft 365 approval returned invalid status") from exc
+        if not isinstance(result, dict) or result.get("approval_id") != canonical_id:
+            raise RuntimeError("Microsoft 365 approval returned mismatched status")
+        return result
+
+    async def _handle_nlo365_approval_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"a", "r", "s"}:
+            await query.answer(text="Invalid Microsoft 365 approval data.")
+            return
+        choice, approval_id = parts[1], parts[2]
+        try:
+            approval_id = str(uuid.UUID(approval_id))
+        except ValueError:
+            await query.answer(text="Invalid Microsoft 365 approval data.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to approve Microsoft 365 changes.")
+            return
+
+        await query.answer(text="Processing…" if choice != "s" else "Checking status…")
+        try:
+            result = await self._run_nlo365_approval_action(choice, approval_id)
+        except Exception:
+            logger.exception("NLO365 Telegram approval callback failed")
+            await query.edit_message_text(
+                text=(
+                    "⚠️ Microsoft 365 approval action failed safely. "
+                    f"Approval ID: {approval_id}"
+                ),
+                reply_markup=self._nlo365_approval_keyboard(approval_id),
+            )
+            return
+
+        status = str(result.get("status") or "unknown")
+        action = str(result.get("action") or "Microsoft 365 change")
+        if status == "verified" and result.get("verification_matched") is True:
+            text = f"✅ Verified: {action}\nApproval ID: {approval_id}"
+            reply_markup = None
+        elif status == "rejected":
+            text = f"❌ Rejected: {action}\nApproval ID: {approval_id}"
+            reply_markup = None
+        elif status in {"pending", "approved"}:
+            text = f"⏳ {action}: {status}\nApproval ID: {approval_id}"
+            reply_markup = self._nlo365_approval_keyboard(approval_id)
+        else:
+            text = f"⚠️ {action}: {status}\nApproval ID: {approval_id}"
+            reply_markup = None
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7186,6 +7338,18 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- NLO365 human approval callbacks (na:choice:uuid) ---
+        if data.startswith("na:"):
+            await self._handle_nlo365_approval_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

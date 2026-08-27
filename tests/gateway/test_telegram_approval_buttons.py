@@ -330,3 +330,98 @@ class TestTelegramApprovalCallback:
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
 
+
+class TestNlo365ApprovalButtons:
+    APPROVAL_ID = "11111111-1111-4111-8111-111111111111"
+
+    @pytest.mark.asyncio
+    async def test_queued_approval_message_gets_inline_buttons(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._should_attempt_rich = MagicMock(return_value=False)
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=77)
+        )
+        captured_rows = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: {"text": text, "callback_data": callback_data},
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+            lambda rows: captured_rows.extend(rows) or rows,
+        )
+
+        result = await adapter.send(
+            "12345",
+            f"Your contact has been queued for approval.\n\nApproval ID: {self.APPROVAL_ID}",
+            metadata={"notify": True},
+        )
+
+        assert result.success is True
+        assert captured_rows == [
+            [
+                {"text": "✅ Approve & Execute", "callback_data": f"na:a:{self.APPROVAL_ID}"},
+                {"text": "❌ Reject", "callback_data": f"na:r:{self.APPROVAL_ID}"},
+            ],
+            [{"text": "ℹ️ Status", "callback_data": f"na:s:{self.APPROVAL_ID}"}],
+        ]
+        assert adapter._bot.send_message.call_args.kwargs["reply_markup"] == captured_rows
+
+    @pytest.mark.asyncio
+    async def test_nonapproval_message_has_no_nlo365_keyboard(self):
+        adapter = _make_adapter()
+        adapter._should_attempt_rich = MagicMock(return_value=False)
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=78)
+        )
+
+        await adapter.send("12345", "Ordinary response", metadata={"notify": True})
+
+        assert "reply_markup" not in adapter._bot.send_message.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_callback_never_runs_broker(self):
+        adapter = _make_adapter()
+        adapter._run_nlo365_approval_action = AsyncMock()
+        query = AsyncMock()
+        query.data = f"na:a:{self.APPROVAL_ID}"
+        query.message = MagicMock(chat_id=12345)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=222, first_name="Mallory")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._run_nlo365_approval_action.assert_not_awaited()
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_authorized_approve_executes_and_removes_buttons(self):
+        adapter = _make_adapter()
+        adapter._run_nlo365_approval_action = AsyncMock(
+            return_value={
+                "approval_id": self.APPROVAL_ID,
+                "action": "contacts.write",
+                "status": "verified",
+                "provider_id_present": True,
+                "verification_matched": True,
+                "verification_stage": "provider_read_back",
+            }
+        )
+        query = AsyncMock()
+        query.data = f"na:a:{self.APPROVAL_ID}"
+        query.message = MagicMock(chat_id=12345)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=111, first_name="Ilan")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._run_nlo365_approval_action.assert_awaited_once_with(
+            "a", self.APPROVAL_ID
+        )
+        edit = query.edit_message_text.call_args.kwargs
+        assert "Verified" in edit["text"]
+        assert edit["reply_markup"] is None
