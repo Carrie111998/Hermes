@@ -34,9 +34,11 @@ async function type(cdp, sel, text) {
 
   if (!focused) throw new Error(`element not found: ${sel}`)
 
-  for (const ch of text) {
-    await cdp.send('Input.dispatchKeyEvent', { type: 'char', text: ch, unmodifiedText: ch })
-  }
+  // Use Input.insertText (not dispatchKeyEvent type:'char'): the rich-text
+  // composer (rich-editor.ts / contentEditable) ignores synthetic char events,
+  // so dispatchKeyEvent silently drops the text. insertText fires the real
+  // beforeinput/input pipeline the editor listens to.
+  await cdp.send('Input.insertText', { text })
   return { typed: text.length }
 }
 

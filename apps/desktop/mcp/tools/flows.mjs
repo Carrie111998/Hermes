@@ -115,9 +115,10 @@ async function editFlow(cdp, { newText } = {}) {
   })()`)
 
   const text = newText || `debug-edit-${Date.now()}`
-  for (const ch of text) {
-    await cdp.send('Input.dispatchKeyEvent', { type: 'char', text: ch, unmodifiedText: ch })
-  }
+  // Input.insertText — dispatchKeyEvent type:'char' is ignored by the
+  // contentEditable composer (rich-editor.ts), so use the real insertText
+  // pipeline that fires beforeinput/input.
+  await cdp.send('Input.insertText', { text })
   await sleep(100)
 
   const draftAfterTyping = await cdp.eval(`(() => {
