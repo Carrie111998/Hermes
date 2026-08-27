@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest'
 
 import { $previewTabs } from '@/store/preview'
 
-import { getLivePreviewTabIdForSession, hasLivePreviewForSession, registerPreviewPageReader } from './preview-reader'
+import {
+  getLivePreviewTabIdForSession,
+  hasLivePreviewForSession,
+  isLivePreviewTabOwnedBySession,
+  registerPreviewPageReader
+} from './preview-reader'
 
 describe('session-scoped preview reader gate (#95459)', () => {
   const setupTabs = () => {
@@ -70,5 +75,31 @@ describe('session-scoped preview reader gate (#95459)', () => {
 
     unregister()
     expect(getLivePreviewTabIdForSession('session-A')).toBeNull()
+  })
+
+  it('resolves ownership from the exact active tab, not the first owned tab (#95459 review)', () => {
+    // Deterministic witness from the review: session S owns live previews A
+    // and B (registered in that order), and B is the active one. Authorization
+    // must ask about B specifically — getLivePreviewTabIdForSession(S) would
+    // return A (the first owned tab), which is the wrong identity to compare
+    // against the active preview.
+    $previewTabs.set([
+      { id: 'url:tab-a', target: { kind: 'url', label: 'Browser', source: 'https://x', url: 'https://x' } },
+      { id: 'url:tab-b', target: { kind: 'url', label: 'Browser', source: 'https://y', url: 'https://y' } }
+    ])
+
+    const unregisterA = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-S')
+    const unregisterB = registerPreviewPageReader('url:tab-b', async () => ({ text: '', title: '', url: '' }), 'session-S')
+
+    // The active tab B IS owned by S -> allowed.
+    expect(isLivePreviewTabOwnedBySession('url:tab-b', 'session-S')).toBe(true)
+    // A non-active tab owned by S also answers true for itself (the mutation
+    // targets that tab), but the admission layer gates on the ACTIVE tab.
+    expect(isLivePreviewTabOwnedBySession('url:tab-a', 'session-S')).toBe(true)
+    // A different session does not own either.
+    expect(isLivePreviewTabOwnedBySession('url:tab-b', 'session-other')).toBe(false)
+
+    unregisterA()
+    unregisterB()
   })
 })

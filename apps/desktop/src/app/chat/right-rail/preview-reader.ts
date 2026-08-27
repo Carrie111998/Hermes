@@ -78,6 +78,21 @@ export function getLivePreviewTabIdForSession(sessionId: string): RightRailTabId
   return null
 }
 
+/** True when the given preview tab is a LIVE reader owned by `sessionId` and
+ *  still open in `$previewTabs`. This asks about ONE specific tab — the one
+ *  the mutation targets — rather than selecting an arbitrary tab owned by the
+ *  session and comparing afterwards, so authorization depends on the identity
+ *  of the preview being acted on, never on Map insertion order (#95459). */
+export function isLivePreviewTabOwnedBySession(tabId: RightRailTabId, sessionId: string): boolean {
+  if (!sessionId || !tabId) {
+    return false
+  }
+
+  const openIds = new Set($previewTabs.get().map(t => t.id))
+
+  return openIds.has(tabId) && readers.has(tabId) && readerSessions.get(tabId) === sessionId
+}
+
 /** Boolean convenience wrapper for the session-scoped ownership check. */
 export function hasLivePreviewForSession(sessionId: string): boolean {
   return getLivePreviewTabIdForSession(sessionId) !== null

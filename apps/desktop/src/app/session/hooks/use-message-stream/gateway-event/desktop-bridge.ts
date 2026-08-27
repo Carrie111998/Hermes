@@ -1,4 +1,4 @@
-import { getLivePreviewTabIdForSession, readActivePreview } from '@/app/chat/right-rail/preview-reader'
+import { isLivePreviewTabOwnedBySession, readActivePreview } from '@/app/chat/right-rail/preview-reader'
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
@@ -101,15 +101,19 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
         })
 
       // Allow preview actions when the session is active OR when that
-      // session owns a live preview reader AND the owned tab IS the
-      // globally active preview. Binding admission and effect to the same
-      // exact preview identity means a background session can never pass
-      // the ownership check and then act on a different session's
-      // globally-active tab (#95459).
-      const ownedTabId = getLivePreviewTabIdForSession(ctx.sessionId ?? '')
+      // session owns the preview the user is actually LOOKING AT. Resolve
+      // the active preview tab FIRST, then ask whether that exact tab is
+      // owned by this session — never select an arbitrary owned tab and
+      // compare afterwards (that made admission depend on Map insertion
+      // order and dropped a valid owner whose owned tab wasn't the first
+      // one registered). Binding admission and effect to the same exact
+      // preview identity means a background session can only act on a
+      // preview it owns AND that is on screen (#95459).
+      const activePreviewId = $rightRailActiveTabId.get()
 
       const previewAllowed =
-        isActiveEvent || (ownedTabId !== null && ownedTabId === $rightRailActiveTabId.get())
+        isActiveEvent ||
+        (activePreviewId !== null && isLivePreviewTabOwnedBySession(activePreviewId, ctx.sessionId ?? ''))
 
       if (previewAllowed) {
         void loadPreviewEngine()
