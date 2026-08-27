@@ -14082,7 +14082,7 @@ def test_session_delete_refuses_active_session(monkeypatch):
     called: list[str] = []
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             called.append(sid)
             return True
 
@@ -14133,7 +14133,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             return False
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14148,7 +14148,7 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             raise RuntimeError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14169,7 +14169,7 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
@@ -14323,7 +14323,7 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
         def __init__(self, db_path=None):
             captured["db_path"] = db_path
 
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
@@ -17721,6 +17721,45 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
         server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
         assert seen == [("a", "ws_disconnect")]  # only the flagged one closed
         assert server._sessions["b"]["transport"] is server._detached_ws_transport  # re-pointed
+    finally:
+        server._sessions.clear()
+
+
+def test_close_sessions_for_transport_parks_without_reap_on_service_restart(
+    monkeypatch,
+):
+    """WS 1012 / service restart must park Desktop sessions, not orphan-reap.
+
+    The reporter's ``reaped_sessions=0 detached_sessions=7`` line is this
+    path: close_on_disconnect is off, so sessions are detached. Arming the
+    20s orphan reap raced atexit ``_shutdown_sessions`` on a dying backend
+    and ended durable chats the next process should resume (#95868).
+    """
+    reaps = []
+    closed = []
+    monkeypatch.setattr(
+        server, "_schedule_ws_orphan_reap", lambda sid: reaps.append(sid)
+    )
+    monkeypatch.setattr(
+        server,
+        "_close_session_by_id",
+        lambda sid, *, end_reason: closed.append((sid, end_reason)) or True,
+    )
+    transport = object()
+    server._sessions.clear()
+    server._sessions["chat"] = {
+        "transport": transport,
+        "close_on_disconnect": False,
+    }
+    try:
+        reaped, detached = server._close_sessions_for_transport(
+            transport, end_reason="ws_service_restart"
+        )
+        assert reaped == 0
+        assert detached == 1
+        assert closed == []
+        assert reaps == []
+        assert server._sessions["chat"]["transport"] is server._detached_ws_transport
     finally:
         server._sessions.clear()
 

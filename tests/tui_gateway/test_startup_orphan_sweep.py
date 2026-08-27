@@ -87,6 +87,8 @@ class TestSweepOrphanedSessionRows:
 
         # The distinct reason is a recoverable accident, not a boundary.
         assert "startup_orphan_reap" in SessionDB.RECOVERABLE_END_REASONS
+        # Process-exit teardown is the same accident class (#95868).
+        assert "tui_shutdown" in SessionDB.RECOVERABLE_END_REASONS
 
         # Peer-keyed recovery still surfaces the swept row...
         recovered = db.find_latest_gateway_session_for_peer(

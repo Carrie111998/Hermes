@@ -148,6 +148,32 @@ class TestFinalizeSessionPersist:
         mock_db.end_session.assert_called_once_with("sess_123", "test")
 
 
+    @patch("tui_gateway.server._get_db")
+    def test_tui_shutdown_does_not_end_or_delete_session(self, mock_get_db):
+        """Process exit (#95868) must not close or hard-delete a durable row.
+
+        atexit ``_shutdown_sessions`` finalizes every live Desktop chat with
+        ``tui_shutdown`` when the backend bounces. Ending that row made the
+        chat vanish from the sidebar after reload; deleting it would match
+        the reporter's empty ``SELECT id FROM sessions``. Persist still
+        runs; the row stays open for the next process to resume.
+        """
+        from tui_gateway.server import _finalize_session
+
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "sess_123", "source": "desktop"}
+        mock_get_db.return_value = mock_db
+
+        agent = _make_agent(session_id="sess_123")
+        session = _make_session(agent=agent, history=[{"role": "user", "content": "x"}])
+
+        _finalize_session(session, end_reason="tui_shutdown")
+
+        mock_db.end_session.assert_not_called()
+        mock_db.delete_session.assert_not_called()
+        mock_db.delete_session_if_empty.assert_not_called()
+
+
 class TestFinalizeSessionPersistE2E:
     """End-to-end: _finalize_session must actually land unflushed turns in
     state.db on disconnect/restart.
@@ -245,6 +271,49 @@ class TestFinalizeSessionPersistE2E:
 
         after = db.get_messages_as_conversation(session_id)
         assert len(after) == 2, after
+
+
+    def test_tui_shutdown_keeps_populated_desktop_row_open(self, tmp_path, monkeypatch):
+        """A populated Desktop chat must survive process teardown (#95868).
+
+        Profile switch / gateway reload closes the WS with 1012, then atexit
+        ``_shutdown_sessions`` finalizes in-memory sessions with
+        ``tui_shutdown``. The row must remain in ``sessions`` with
+        ``ended_at IS NULL`` and its messages intact so the next process
+        can list and resume it.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from hermes_state import SessionDB
+        import tui_gateway.server as srv
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "20260826_132708_a12a19"
+        db.create_session(session_id=session_id, source="desktop")
+        db.append_message(session_id, role="user", content="hour-long working session")
+        db.append_message(
+            session_id, role="assistant", content="continuing the work…"
+        )
+        monkeypatch.setattr(srv, "_get_db", lambda: db)
+
+        agent = self._real_agent(db, session_id, [])
+        session = _make_session(agent=agent, history=[], session_key=session_id)
+        session["source"] = "desktop"
+
+        srv._finalize_session(session, end_reason="tui_shutdown")
+
+        ids = [
+            r["id"]
+            for r in db._conn.execute("SELECT id FROM sessions").fetchall()
+        ]
+        assert session_id in ids
+        row = db.get_session(session_id)
+        assert row is not None
+        assert row["ended_at"] is None
+        assert row["end_reason"] is None
+        contents = [
+            m.get("content") for m in db.get_messages_as_conversation(session_id)
+        ]
+        assert any("hour-long" in (c or "") for c in contents), contents
 
 
 class TestOnSessionEndHook:

@@ -4,6 +4,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from hermes_cli import mcp_startup
 from tui_gateway import server
 from tui_gateway import ws as ws_mod
@@ -270,5 +272,21 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (1012, "ws_service_restart"),
+        (1001, "ws_service_restart"),
+        (1000, "ws_disconnect"),
+        (1006, "ws_disconnect"),
+        (None, "ws_disconnect"),
+        ("", "ws_disconnect"),
+    ],
+)
+def test_teardown_end_reason_for_ws_close(code, expected):
+    """Service-restart close codes park sessions; other codes still reap."""
+    assert ws_mod.teardown_end_reason_for_ws_close(code) == expected
 
 

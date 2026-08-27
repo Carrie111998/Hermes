@@ -79,6 +79,34 @@ class TestDeleteSessionIfEmpty:
         assert (sessions_dir / "busy.json").exists()
 
 
+    def test_delete_session_logs_reason_and_message_count(self, db, caplog):
+        """Hard-deletes must be greppable after the fact (#95868)."""
+        db.create_session(session_id="logged", source="desktop", model="test")
+        db.append_message("logged", role="user", content="keep me")
+        db.set_session_title("logged", "Working chat")
+
+        with caplog.at_level("INFO", logger="hermes_state"):
+            assert db.delete_session("logged", reason="session.delete") is True
+
+        joined = "\n".join(caplog.messages)
+        assert "delete_session id=logged" in joined
+        assert "reason=session.delete" in joined
+        assert "messages=1" in joined
+        assert "title=set" in joined
+        assert db.get_session("logged") is None
+
+
+    def test_delete_session_if_empty_logs_reason(self, db, caplog):
+        db.create_session(session_id="draft", source="cli", model="test")
+
+        with caplog.at_level("INFO", logger="hermes_state"):
+            assert db.delete_session_if_empty("draft", reason="cli_exit") is True
+
+        joined = "\n".join(caplog.messages)
+        assert "delete_session_if_empty id=draft" in joined
+        assert "reason=cli_exit" in joined
+
+
 
 class TestCLIDiscardSessionIfEmpty:
     """Wiring tests for HermesCLI._discard_session_if_empty."""

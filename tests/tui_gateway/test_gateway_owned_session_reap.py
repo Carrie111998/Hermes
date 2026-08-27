@@ -72,3 +72,14 @@ class TestFinalizeSkipsGatewaySessions:
         _finalize_session(_make_session(), end_reason="tui_close")
 
         db.end_session.assert_called_once_with("sess_1", "tui_close")
+
+    @patch("tui_gateway.server._get_db")
+    def test_missing_row_still_ended_on_tui_shutdown(self, mock_get_db):
+        """Keep-open (#95868) skips end_session only when a durable row exists."""
+        db = MagicMock()
+        db.get_session.return_value = None
+        mock_get_db.return_value = db
+
+        _finalize_session(_make_session(), end_reason="tui_shutdown")
+
+        db.end_session.assert_called_once_with("sess_1", "tui_shutdown")
