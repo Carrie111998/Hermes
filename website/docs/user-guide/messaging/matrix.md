@@ -88,6 +88,7 @@ matrix:
     - "@alice:matrix.org"
   allowed_rooms:                  # Matrix rooms allowed to trigger agent turns
     - "!abc123:matrix.org"
+  allowed_rooms_apply_to_dms: false    # Also enforce allowed_rooms for DMs and invites
   free_response_rooms:            # Rooms exempt from mention requirement
     - "!abc123:matrix.org"
   ignore_user_patterns:           # Bridge/appservice ghost users to ignore
@@ -99,6 +100,16 @@ matrix:
   dm_mention_threads: false       # Create thread when @mentioned in DM (default: false)
   max_message_length: 16000       # Outbound chunk size in chars (default: 16000, max: 65535)
 ```
+
+By default, DMs remain exempt from `allowed_rooms` for backward compatibility.
+Set `allowed_rooms_apply_to_dms: true` with a non-empty `allowed_rooms` list to
+require every inbound event, outbound room operation, and room invite to use
+one of those IDs.
+An empty `allowed_rooms` list keeps the existing unrestricted-room behavior.
+This option is available only in `config.yaml`; it does not have an
+environment-variable equivalent. Enabling it does not automatically leave
+rooms the account had already joined, so audit existing memberships before
+using the setting as a confinement boundary.
 
 Or via environment variables:
 

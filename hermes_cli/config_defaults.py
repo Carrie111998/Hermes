@@ -2412,6 +2412,7 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in rooms
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
+        "allowed_rooms_apply_to_dms": False, # With allowed_rooms, enforce it for DMs and room invites
     },
 
     # Approval mode for dangerous commands:
