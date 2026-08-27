@@ -159,6 +159,206 @@ class TestDeliverOnlyStatusCodes:
 
 
 # ===================================================================
+# Direct-delivery idempotency
+# ===================================================================
+
+class TestDeliverOnlyIdempotency:
+
+    @staticmethod
+    def _route():
+        return {
+            "secret": _INSECURE_NO_AUTH,
+            "deliver": "telegram",
+            "deliver_only": True,
+            "deliver_extra": {"chat_id": "c-1"},
+            "prompt": "hello {attempt}",
+            "script": "unused-test-script",
+        }
+
+    @staticmethod
+    async def _post(cli, delivery_id, attempt=1):
+        return await cli.post(
+            "/webhooks/r",
+            json={"attempt": attempt},
+            headers={"X-GitHub-Delivery": delivery_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_commits_id_before_later_duplicate(self):
+        adapter = _make_adapter({"r": self._route()})
+        mock_target = _wire_mock_target(adapter)
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=lambda _script, payload: (True, payload)
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            first = await self._post(cli, "stable-success")
+            duplicate = await self._post(cli, "stable-success")
+
+            assert first.status == 200
+            assert (await first.json())["status"] == "delivered"
+            assert duplicate.status == 200
+            assert (await duplicate.json())["status"] == "duplicate"
+
+        mock_target.send.assert_awaited_once()
+        assert adapter._route_processor.run_route_script.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["result", "exception"])
+    async def test_failure_releases_id_for_successful_retry(self, failure):
+        adapter = _make_adapter({"r": self._route()})
+        mock_target = _wire_mock_target(adapter)
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=lambda _script, payload: (True, payload)
+        )
+        failed = (
+            SendResult(success=False, error="private target detail")
+            if failure == "result"
+            else RuntimeError("private target detail")
+        )
+        mock_target.send = AsyncMock(
+            side_effect=[failed, SendResult(success=True)]
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            first = await self._post(cli, "stable-retry", attempt=1)
+            retry = await self._post(cli, "stable-retry", attempt=2)
+            duplicate = await self._post(cli, "stable-retry", attempt=3)
+
+            assert first.status == 502
+            assert (await first.json())["error"] == "Delivery failed"
+            assert retry.status == 200
+            assert (await retry.json())["status"] == "delivered"
+            assert duplicate.status == 200
+            assert (await duplicate.json())["status"] == "duplicate"
+
+        assert mock_target.send.await_count == 2
+        assert adapter._route_processor.run_route_script.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_id_is_retryable_without_processing(self):
+        adapter = _make_adapter({"r": self._route()})
+        mock_target = _wire_mock_target(adapter)
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=lambda _script, payload: (True, payload)
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocking_send(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return SendResult(success=True)
+
+        mock_target.send = AsyncMock(side_effect=_blocking_send)
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            first_task = asyncio.create_task(
+                self._post(cli, "stable-in-flight")
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            concurrent = await self._post(cli, "stable-in-flight")
+            assert concurrent.status == 503
+            assert await concurrent.json() == {
+                "status": "error",
+                "error": "Delivery in progress",
+            }
+            assert mock_target.send.await_count == 1
+            assert adapter._route_processor.run_route_script.call_count == 1
+
+            release.set()
+            first = await first_task
+            assert first.status == 200
+            duplicate = await self._post(cli, "stable-in-flight")
+            assert duplicate.status == 200
+            assert (await duplicate.json())["status"] == "duplicate"
+
+        assert mock_target.send.await_count == 1
+        assert adapter._route_processor.run_route_script.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_in_flight_request_allows_later_retry(self):
+        adapter = _make_adapter({"r": self._route()})
+        mock_target = _wire_mock_target(adapter)
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=lambda _script, payload: (True, payload)
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _first_fails(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return SendResult(success=False, error="private")
+
+        send_count = 0
+
+        async def _fail_then_succeed(*args, **kwargs):
+            nonlocal send_count
+            send_count += 1
+            if send_count == 1:
+                return await _first_fails(*args, **kwargs)
+            return SendResult(success=True)
+
+        mock_target.send = AsyncMock(side_effect=_fail_then_succeed)
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            first_task = asyncio.create_task(
+                self._post(cli, "stable-in-flight-failure")
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            concurrent = await self._post(cli, "stable-in-flight-failure")
+            assert concurrent.status == 503
+            release.set()
+            assert (await first_task).status == 502
+            retry = await self._post(cli, "stable-in-flight-failure")
+            assert retry.status == 200
+            assert (await retry.json())["status"] == "delivered"
+
+        assert mock_target.send.await_count == 2
+        assert adapter._route_processor.run_route_script.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_script_exception_releases_reservation_before_target(self):
+        adapter = _make_adapter({"r": self._route()})
+        mock_target = _wire_mock_target(adapter)
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[RuntimeError("script failed"), (True, {"attempt": 2})]
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            failed = await self._post(cli, "stable-script-error", attempt=1)
+            retry = await self._post(cli, "stable-script-error", attempt=2)
+
+            assert failed.status == 500
+            assert retry.status == 200
+            assert (await retry.json())["status"] == "delivered"
+
+        mock_target.send.assert_awaited_once()
+        assert adapter._route_processor.run_route_script.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_script_ignore_commits_id_and_suppresses_duplicate(self):
+        adapter = _make_adapter({"r": self._route()})
+        mock_target = _wire_mock_target(adapter)
+        adapter._route_processor.run_route_script = MagicMock(
+            return_value=(False, None)
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            ignored = await self._post(cli, "stable-ignore")
+            duplicate = await self._post(cli, "stable-ignore")
+
+            assert ignored.status == 200
+            assert (await ignored.json())["status"] == "ignored"
+            assert duplicate.status == 200
+            assert (await duplicate.json())["status"] == "duplicate"
+
+        mock_target.send.assert_not_awaited()
+        assert adapter._route_processor.run_route_script.call_count == 1
+
+
+# ===================================================================
 # Startup validation
 # ===================================================================
 
