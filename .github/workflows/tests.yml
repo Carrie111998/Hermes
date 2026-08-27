@@ -23,8 +23,9 @@ jobs:
     # adds a second setup.
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
     # Standard fork runners need more wall-clock time for the same isolated
-    # per-file suite; the upstream 96-core runner still completes far sooner.
-    timeout-minutes: 45
+    # per-file suite; an observed fork run exceeded 45 minutes without a test
+    # failure. The upstream 96-core runner still completes far sooner.
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
