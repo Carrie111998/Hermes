@@ -2468,6 +2468,14 @@ function pushLocalAvatars(roster) {
       continue
     }
 
+    // The server explicitly reports NO avatar (has_avatar === false) yet we
+    // have seen one before (recorded fingerprint): it was cleared
+    // server-side. Backfilling would resurrect deleted art — let the roster
+    // forget it instead (#95613).
+    if (bot.has_avatar === false && $botMeta.get()[key]?.imageStamp) {
+      continue
+    }
+
     const image = $botMeta.get()[key]?.image
 
     if (image && typeof image === 'string' && image.startsWith('data:')) {
@@ -2555,40 +2563,119 @@ function isBackfilledFacePng(dataUrl) {
   }
 }
 
-function pullServerAvatars(roster) {
+/** The server-side avatar fingerprint a roster row reports, or null on
+ *  gateways that predate it. Comparing this against the fingerprint
+ *  recorded next to a cached image is what lets a roster refresh notice a
+ *  server-side avatar replacement (or removal) without probing the asset
+ *  store on every paint (#95613). */
+function rosterAvatarStamp(bot) {
+  if (bot && typeof bot.avatar_mtime === 'number' && typeof bot.avatar_size === 'number') {
+    return `${bot.avatar_mtime}:${bot.avatar_size}`
+  }
+  return null
+}
+
+/** Fetch (and cache) the server-side avatar for one roster row. When the
+ *  local cache already holds an image and `expectedStamp` differs, the
+ *  fetched copy wins on mismatch — the server is the source of truth for
+ *  art once pushed (CLI set_asset, edits on another machine). Identical
+ *  bytes just refresh the recorded fingerprint so the next cycle is a
+ *  no-op. */
+function fetchServerAvatar(bot, key, expectedStamp) {
+  avatarFetchInflight.add(key)
+  const assetRequest = bot.sourceScoped
+    ? requestForBot(bot, 'profiles.get_asset', { name: bot.name, asset: 'avatar' })
+    : host.request('profiles.get_asset', { name: bot.name, asset: 'avatar' })
+  Promise.resolve(assetRequest)
+    .then(res => {
+      if (res?.found && res.data) {
+        const current = $botMeta.get()
+        const mine = current[key] || {}
+        // A 160px raster of the vector face is only for inter-agent
+        // notices. Do not park it on the roster or the live face dies.
+        if (isBackfilledFacePng(res.data) && mine.imageKind !== 'photo' && !mine.pet) {
+          return
+        }
+        $botMeta.set({
+          ...current,
+          [key]: { ...mine, image: res.data, imageStamp: expectedStamp || null }
+        })
+        persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
+      } else if (!res?.found && expectedStamp) {
+        // The asset vanished between the roster snapshot and the fetch
+        // (cleared elsewhere): drop the cached copy rather than render
+        // deleted art.
+        const current = $botMeta.get()
+        const mine = current[key] || {}
+        if (mine.image) {
+          const { image, imageStamp, ...rest } = mine
+          $botMeta.set({ ...current, [key]: rest })
+          persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
+        }
+      }
+    })
+    .catch(() => undefined)
+    .finally(() => avatarFetchInflight.delete(key))
+}
+
+/** Fetch server-side avatars for roster rows flagged has_avatar and keep
+ *  the local cache honest. Fetch-when-missing is the baseline (older
+ *  gateways, no fingerprint); gateways that report an avatar fingerprint
+ *  also REVALIDATE cached images: a changed fingerprint means the server
+ *  asset was replaced since we last saw it, and a cache with no recorded
+ *  fingerprint predates this feature — validate it once, then record. A
+ *  server that explicitly lost its avatar (has_avatar === false) drops a
+ *  previously-fetched cached image instead of rendering deleted art. All
+ *  overwrites are fenced by `fetchedAt` against roster snapshots that
+ *  predate the user's own latest metadata write (a set_asset push may
+ *  still be in flight). */
+function pullServerAvatars(roster, fetchedAt = 0) {
   pushLocalAvatars(roster)
 
   for (const bot of roster) {
     const key = botMetaKey(bot)
 
-    if (!bot.has_avatar || avatarFetchInflight.has(key)) {
+    if (!bot.has_avatar) {
+      // Server-side avatar removed after we last saw one (recorded
+      // fingerprint): drop the stale cached image. The same fence as the
+      // revalidation path keeps a just-saved local image from being
+      // erased by a snapshot that predates its write.
+      const mine = $botMeta.get()[key] || {}
+      if (
+        mine.image &&
+        mine.imageStamp &&
+        (!fetchedAt || fetchedAt >= (botMetaWriteAt.get(key) || 0))
+      ) {
+        const { image, imageStamp, ...rest } = mine
+        $botMeta.set({ ...$botMeta.get(), [key]: rest })
+        persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
+      }
       continue
     }
 
-    if ($botMeta.get()[key]?.image) {
+    if (avatarFetchInflight.has(key)) {
       continue
     }
 
-    avatarFetchInflight.add(key)
-    const assetRequest = bot.sourceScoped
-      ? requestForBot(bot, 'profiles.get_asset', { name: bot.name, asset: 'avatar' })
-      : host.request('profiles.get_asset', { name: bot.name, asset: 'avatar' })
-    Promise.resolve(assetRequest)
-      .then(res => {
-        if (res?.found && res.data) {
-          const current = $botMeta.get()
-          const mine = current[key] || {}
-          // A 160px raster of the vector face is only for inter-agent
-          // notices. Do not park it on the roster or the live face dies.
-          if (isBackfilledFacePng(res.data) && mine.imageKind !== 'photo' && !mine.pet) {
-            return
-          }
-          $botMeta.set({ ...current, [key]: { ...mine, image: res.data } })
-          persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
-        }
-      })
-      .catch(() => undefined)
-      .finally(() => avatarFetchInflight.delete(key))
+    const stamp = rosterAvatarStamp(bot)
+    const mine = $botMeta.get()[key] || {}
+
+    if (!mine.image) {
+      fetchServerAvatar(bot, key, stamp)
+      continue
+    }
+
+    // A cached image exists. When the gateway reports a fingerprint,
+    // refetch on mismatch — the server replaced the asset, or the cache
+    // predates fingerprinting (validate once). Fenced as above: a
+    // snapshot fetched before the user's own write must not clobber a
+    // just-saved local image with older server bytes.
+    if (stamp && stamp !== mine.imageStamp) {
+      if (fetchedAt && fetchedAt < (botMetaWriteAt.get(key) || 0)) {
+        continue
+      }
+      fetchServerAvatar(bot, key, stamp)
+    }
   }
 }
 
@@ -5640,6 +5727,14 @@ function showsHandle(name, meta, bot) {
 // mint two canonical chats.
 const canonicalCreations = new Map()
 
+// The one-time self-introduction prompt submitted when a new bot's canonical
+// chat is born (createCanonicalChat kickoff). It is a user-attributed
+// onboarding artifact, not real conversation: roster previews must not keep
+// showing it once the profile has a description (#95613, #88798). Defined
+// inside the canonical-chat section so the section-sliced harness
+// (canonical-chat-creation.test.mjs) picks it up too.
+const BOT_INTRO_PROMPT = 'Hey, tell me about yourself!'
+
 /** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
  *  adoption, stored-session lookups). */
 const PROFILE_SESSION_LIST_LIMIT = 200
@@ -5922,7 +6017,7 @@ function createCanonicalChat(owner, { kickoff = false, openingStillCurrent = nul
         await new Promise(resolve => window.setTimeout(resolve, 400))
 
         try {
-          await requestForBot(bot, 'prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
+          await requestForBot(bot, 'prompt.submit', { session_id: runtime, text: BOT_INTRO_PROMPT })
 
           if (!opened && sid && typeof host.openSession === 'function' && canNavigate()) {
             await host.openSession(sid, {
@@ -8601,6 +8696,22 @@ function botRowOwnsWorkspace(
   return isActiveRosterBot(bot, focusedOwner)
 }
 
+/** Whether a roster row's preview session still holds only the onboarding
+ *  self-introduction — the "Hey, tell me about yourself!" kickoff stamped at
+ *  bot birth. That prompt is a user-attributed onboarding artifact, not real
+ *  conversation, so once the profile has a description the row must show the
+ *  description instead of the stale hardcoded English text (#95613, #88798).
+ *  A chat counts as intro-only when the newest user/assistant message IS the
+ *  intro prompt and nothing real followed it (at most the intro plus the
+ *  bot's own, possibly empty, reply). */
+function introOnlyPreview(session) {
+  return Boolean(
+    session &&
+    (session.message_count || 0) <= 2 &&
+    String(session.preview || '').trim() === BOT_INTRO_PROMPT
+  )
+}
+
 // ── bot row ──────────────────────────────────────────────────────────────────
 
 function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
@@ -8681,11 +8792,18 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   // profile's most recent (but unrelated) activity. Liveness checks above
   // keep last_session semantics: any recent activity means the bot is alive.
   const { fromBot } = previewKind(previewSession?.preview)
+  // The onboarding kickoff is not real conversation: once the profile has a
+  // description, the row shows THAT instead of the stale "Hey, tell me about
+  // yourself!" intro text (#95613).
+  const introOnly = introOnlyPreview(previewSession)
+  const botDescription = String(bot.description || '').trim()
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = stripPreviewMarkdown(
-    fromBot
-      ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
-      : previewSession?.preview || ''
+    introOnly && botDescription
+      ? botDescription
+      : fromBot
+        ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
+        : previewSession?.preview || ''
   )
   const handle = botHandle(bot.name, bot)
   const gatewayLabel = bot.connectionLabel || (bot.connectionId === 'local' ? 'This device' : '')
@@ -8872,6 +8990,26 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onEdit(bot)).catch(error => host.notifyError?.(error, 'Could not load bot')),
             children: 'Edit Profile'
+          }),
+          jsx(ContextMenuItem, {
+            onSelect: () => {
+              // Safe per-bot avatar cache reset: drop the locally cached
+              // image + fingerprint for THIS bot only, then refetch from the
+              // profile asset store. Never touches the rest of local
+              // storage, so it cannot disturb any other plugin or setting
+              // (#95613).
+              const key = botMetaKey(bot)
+              const current = $botMeta.get()
+              const mine = current[key] || {}
+              if (mine.image || mine.imageStamp) {
+                const { image, imageStamp, ...rest } = mine
+                $botMeta.set({ ...current, [key]: rest })
+                persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
+              }
+              pullServerAvatars([bot])
+              host.notify({ kind: 'info', message: `Refreshing ${displayName(bot, meta)}'s avatar…` })
+            },
+            children: 'Refresh avatar'
           }),
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onGroup(bot)).catch(error => host.notifyError?.(error, 'Could not load bot groups')),
@@ -14673,7 +14811,7 @@ function BotsPane() {
       $lastSources.set(data.sources)
     }
     mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
-    pullServerAvatars(activeSourceRoster)
+    pullServerAvatars(activeSourceRoster, data?.fetchedAt || 0)
     trackInboundActivity(roster)
     backfillMessagingProtocol(activeSourceRoster)
     // React Query owns the stable server snapshot; derived arrays intentionally
