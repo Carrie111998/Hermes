@@ -2992,11 +2992,20 @@ class MCPServerTask:
             # os.kill probe below only runs when psutil is unavailable.
             import psutil
 
-            if not psutil.pid_exists(pid):
-                continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
-        return True
+            # INVERTED BEFORE THIS FIX, AND IT MEANT STDIO MCP NEVER WORKED.
+            #
+            # The loop returned True -- from a method named _stdio_children_dead --
+            # the moment it found a pid that EXISTS, so a healthy subprocess was
+            # reported as dead and every tools/call fast-failed with
+            # "subprocess has exited". The unreachable `return False` directly
+            # beneath it is the tell: the two branches were transposed.
+            #
+            # Observed as delegate-wave being undelegatable: discovery listed the
+            # server's tools, then every call to them failed instantly while the
+            # server was running and answering the same calls fine by hand.
+            if psutil.pid_exists(pid):
+                return False  # at least one child is alive, so not dead
+        return True  # none of the children we spawned still exist
 
     async def _watch_stdio_children(self) -> None:
         """Poll child liveness while a stdio RPC is in flight (#81995).
