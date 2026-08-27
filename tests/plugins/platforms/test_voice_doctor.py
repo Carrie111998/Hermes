@@ -27,8 +27,15 @@ from plugins.platforms.discord.voice_doctor import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_pynacl_installed():
-    """When nacl imports, the check returns ✅."""
+def test_pynacl_installed(monkeypatch):
+    """When nacl imports, the check returns ✅.
+
+    Stubbed via ``sys.modules`` so the test does not depend on PyNaCl being
+    installed in the ambient environment (CI does not ship it — it arrives
+    only as a discord.py transitive dependency).
+    """
+    monkeypatch.setitem(sys.modules, "nacl", MagicMock())
+
     icon, detail = _check_pynacl()
     assert icon == "✅"
     assert "installed" in detail
