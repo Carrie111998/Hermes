@@ -118,12 +118,17 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
-    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
-    which is a stale-session signal (same as errcode=-14) rather than
-    a genuine rate limit."""
+    """Distinguish iLink stale-session responses from genuine rate limits."""
+    if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
+        return True
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    return (errmsg or "").lower() == "unknown error"
+    message = " ".join((errmsg or "").lower().replace("_", " ").split())
+    return (
+        message == "unknown error"
+        or "session" in message
+        or "context token" in message
+    )
 
 
 MEDIA_IMAGE = 1
@@ -1841,10 +1846,8 @@ class WeixinAdapter(BasePlatformAdapter):
                     ret = resp.get("ret")
                     errcode = resp.get("errcode")
                     if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
-                        is_session_expired = (
-                            ret == SESSION_EXPIRED_ERRCODE
-                            or errcode == SESSION_EXPIRED_ERRCODE
-                            or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
+                        is_session_expired = _is_stale_session_ret(
+                            ret, errcode, resp.get("errmsg") or resp.get("msg")
                         )
                         # Session expired — strip token and retry once
                         if is_session_expired and not retried_without_token and context_token:
@@ -1858,6 +1861,15 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self.name, _safe_id(chat_id),
                             )
                             continue
+                        if is_session_expired:
+                            errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+                            last_error = RuntimeError(
+                                "iLink session expired: "
+                                f"ret={ret} errcode={errcode} errmsg={errmsg}; "
+                                "ask the user to message the bot in WeChat to refresh the session, "
+                                "then retry (or re-run iLink login)"
+                            )
+                            break
                         # Rate limit (-2) — backoff and retry
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE

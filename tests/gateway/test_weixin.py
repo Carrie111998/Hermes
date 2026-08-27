@@ -270,6 +270,36 @@ class TestWeixinChunkDelivery:
         assert send_message_mock.await_count == 2
         assert sleep_mock.await_count == 1
 
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"errcode": -14, "errmsg": "session timeout"},
+            {"ret": -2, "errmsg": "session expired"},
+        ],
+    )
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_stale_session_is_actionable_and_does_not_open_rate_limit_circuit(
+        self, send_message_mock, sleep_mock, response,
+    ):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 1
+        adapter._send_chunk_retry_delay_seconds = 0
+        send_message_mock.return_value = response
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert "session expired" in (result.error or "").lower()
+        assert "message the bot" in (result.error or "").lower()
+        assert "rate limit" not in (result.error or "").lower()
+        assert adapter._rate_limit_events == []
+        assert adapter._rate_limit_cooldown_remaining() == 0
+        assert send_message_mock.await_count == 2
+        assert send_message_mock.await_args_list[0].kwargs["context_token"] == "ctx-token"
+        assert send_message_mock.await_args_list[1].kwargs["context_token"] is None
+        sleep_mock.assert_not_awaited()
+
 
 class TestWeixinOutboundMedia:
 
@@ -505,10 +535,13 @@ class TestIsStaleSessionRet:
         assert weixin._is_stale_session_ret(-2, None, "freq limit") is False
 
 
-    def test_errcode_minus_14_is_not_matched_here(self):
-        # -14 is handled by the separate SESSION_EXPIRED_ERRCODE path; the
-        # helper only disambiguates -2 from a genuine rate limit.
-        assert weixin._is_stale_session_ret(-14, None, "session expired") is False
+    @pytest.mark.parametrize("ret, errcode", [(-14, None), (None, -14)])
+    def test_minus_14_is_stale_regardless_of_message(self, ret, errcode):
+        assert weixin._is_stale_session_ret(ret, errcode, "session timeout") is True
+
+    @pytest.mark.parametrize("errmsg", ["session timeout", "session expired", "context_token expired"])
+    def test_minus_2_with_session_semantics_is_stale(self, errmsg):
+        assert weixin._is_stale_session_ret(-2, None, errmsg) is True
 
 
 class TestWeixinContentDedup:
