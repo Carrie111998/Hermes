@@ -25,6 +25,7 @@ import path from 'node:path'
 import { actTools, handleAct } from './tools/act.mjs'
 import { flowTools, handleFlow } from './tools/flows.mjs'
 import { assertTargetAttested, canon } from './guard.mjs'
+import { dispatchTool, wrapResult } from './dispatch.mjs'
 
 // ---------------------------------------------------------------------------
 // Output bounds — never dump the whole DOM into an agent's context.
@@ -245,74 +246,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   }))
 }))
 
-/** Shared lazy CDP handle for tool modules (act/flow). Uses the friendly connect(). */
-async function getCdp() {
-  return connect()
-}
-
-const toolCtx = {
-  evalBounded,
-  resolveSelector,
-  get cdp() {
-    return cdp
-  },
-  ensureCdp: getCdp
-}
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
   const { name, arguments: a = {} } = req.params
 
   try {
-    let out
-    if (readTools.some(t => t.name === name)) {
-      out = name === 'status' ? undefined : undefined
-      // dispatch read tools — these disclose live UI/chat state, so they are
-      // also gated by target attestation (the connected target must prove it
-      // is the isolated sandbox, not the operator's real dev Desktop).
-      const live = await connect()
-      await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })
-      if (name === 'desktop_ui_status') out = await status()
-      else if (name === 'ui_inspect') out = await inspect(a)
-      else if (name === 'ui_query') out = await query(a)
-      else if (name === 'ui_console') out = await consoleLog(a)
-      else if (name === 'ui_screenshot') out = await screenshot(a)
-    } else if (actTools.some(t => t.name === name)) {
-      if (!CFG.allowAct) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                error: 'mutating tools are disabled',
-                hint: "set DESKTOP_DEBUG_MCP_ALLOW_ACT=1 in this MCP server's env to enable ui_click/ui_type/ui_press/ui_eval"
-              })
-            }
-          ]
-        }
-      }
-      const live = await connect()
-      await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })
-      out = await handleAct(name, a, { ...toolCtx, cdp: live })
-    } else if (flowTools.some(t => t.name === name)) {
-      if (!CFG.allowAct) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ error: 'flows mutate the UI — disabled without DESKTOP_DEBUG_MCP_ALLOW_ACT=1' }) }]
-        }
-      }
-      const live = await connect()
-      await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })
-      out = await handleFlow(name, a, { ...toolCtx, cdp: live })
-    } else {
-      throw new Error(`unknown tool: ${name}`)
-    }
-
-    const text = typeof out === 'string' ? out : JSON.stringify(out, null, 1)
-    return { content: [{ type: 'text', text }] }
+    const out = await dispatchTool(name, a, {
+      EXPECTED_HOME,
+      DEFAULT_HOME,
+      connect,
+      assertTargetAttested,
+      handleAct,
+      handleFlow,
+      status,
+      inspect,
+      query,
+      consoleLog,
+      screenshot,
+      readTools,
+      actTools,
+      flowTools,
+      CFG,
+      evalBounded,
+      resolveSelector
+    })
+    return wrapResult(out)
   } catch (err) {
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ error: String(err.message || err) }) }],
-      isError: true
-    }
+    return wrapResult({ error: String(err.message || err) }, true)
   }
 })
 
