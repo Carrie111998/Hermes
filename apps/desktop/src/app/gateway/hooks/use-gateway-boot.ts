@@ -59,6 +59,7 @@ import {
   $sessions,
   ensureDefaultWorkspaceCwd,
   forgetSessionOwnerHintsForConnection,
+  seedRemoteWorkspaceFromPreview,
   setConnection,
   setCurrentBranch,
   setCurrentCwd,
@@ -555,6 +556,12 @@ export function useGatewayBoot({
       if (!shouldPublish()) {
         return
       }
+
+      // Covers boot and Settings-apply (this function's two callers). The
+      // footer connection picker (store/connections.ts selectConnection)
+      // needs the SAME seeding and calls the same shared helper directly —
+      // see its own call site for why this couldn't just live here alone.
+      await seedRemoteWorkspaceFromPreview(shouldPublish)
 
       const remoteDefault = await desktopDefaultCwd().catch(() => null)
 

@@ -8,6 +8,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
 import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
+import { activeGateway } from '@/store/gateway'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 import type { SessionOwnerRoute, SessionOwnerScope } from './session-request-router'
@@ -293,6 +294,38 @@ export async function ensureDefaultWorkspaceCwd(shouldPublish: () => boolean = (
   if (remembered) {
     const { cwd } = await sanitize(remembered)
     seedLiveCwd(cwd)
+  }
+}
+
+/** Resolve and PERSIST the remote workspace cwd via the backend's
+ *  `workspace.preview` RPC, when nothing is remembered for this connection
+ *  yet — read-only on the backend (no session/agent built there), so cheap
+ *  enough to call from every place a remote connection can become active.
+ *
+ *  Desktop's cwd-seeding machinery historically only ran at boot and on a
+ *  Settings → Gateway apply (`ensureDefaultWorkspaceCwd`, called from
+ *  `use-gateway-boot.ts`) — the footer connection picker's `selectConnection`
+ *  (`store/connections.ts`) never called it, so switching to a remote gateway
+ *  that way (Architecture B's actual path) left the project tree empty with
+ *  no seeding attempt at all, not even the stale-cache bug this function's
+ *  first version had. Call this from every connection-establishment path
+ *  instead of re-deriving the same logic per call site.
+ *
+ *  Persists via `setCurrentCwd` (not the transient variant) into the same
+ *  per-connection remembered cache `workspaceCwdForNewSession` reads on every
+ *  "New chat" click, so one successful resolution covers every later draft
+ *  on this connection, not just the view active when it ran. */
+export async function seedRemoteWorkspaceFromPreview(shouldPublish: () => boolean = () => true): Promise<void> {
+  if ($connection.get()?.mode !== 'remote' || $activeSessionId.get() || getRememberedWorkspaceCwd()) {
+    return
+  }
+
+  const preview = await activeGateway()
+    ?.request<{ cwd?: string }>('workspace.preview', {})
+    .catch(() => null)
+
+  if (shouldPublish() && preview?.cwd && !$activeSessionId.get() && !getRememberedWorkspaceCwd()) {
+    setCurrentCwd(preview.cwd)
   }
 }
 

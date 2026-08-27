@@ -21,7 +21,7 @@ import {
   refreshActiveProfile,
   requestFreshSession
 } from '@/store/profile'
-import { $connection } from '@/store/session'
+import { $connection, seedRemoteWorkspaceFromPreview } from '@/store/session'
 
 const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
 
@@ -321,6 +321,10 @@ export async function selectConnection(connectionId: string, options: SelectConn
     captureNewChatSource()
     requestFreshSession()
     await rememberConnection(connectionId)
+    // No-op most of the time (this connection was already active, so it was
+    // seeded already) — cheap safety net for the same reason as the main
+    // switch branch below; see that call site's comment.
+    void seedRemoteWorkspaceFromPreview()
 
     return
   }
@@ -436,6 +440,15 @@ export async function selectConnection(connectionId: string, options: SelectConn
       captureNewChatSource()
       requestFreshSession()
       await refreshActiveProfile()
+      // The footer connection picker is a real switch path Desktop's
+      // cwd-seeding machinery historically never covered (only boot and a
+      // Settings → Gateway apply called ensureDefaultWorkspaceCwd) — so
+      // switching to a remote gateway this way left the project tree empty
+      // with no seeding attempt at all. Read-only on the backend, so safe
+      // here; fire-and-forget (never blocks the switch on it) since a fresh
+      // draft's own workspaceCwdForNewSession read happens later, by which
+      // point this will very likely have already landed.
+      void seedRemoteWorkspaceFromPreview()
     }
   } catch (error) {
     if (revision === switchRevision) {
