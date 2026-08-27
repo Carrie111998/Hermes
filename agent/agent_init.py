@@ -1674,12 +1674,35 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
-    # Coding-agent usage export: count this session. No-op unless
-    # monitoring.usage_export.enabled. terminal.type mirrors the dimension the
-    # dashboards group sessions by; TERM_PROGRAM is unset for non-interactive
-    # runs (cron, gateway, CI), which is itself the useful distinction.
+    # Coding-agent usage export: start the exporter, then count this session.
+    # No-op unless monitoring.usage_export.enabled.
+    #
+    # ⚠ start() MUST happen here, not only at gateway boot. Hermes runs as a
+    # bare CLI process as often as it runs under the gateway, and a
+    # gateway-only start meant every CLI session silently exported nothing:
+    # record_api_call() returns immediately while the provider state is unset.
+    # start() is idempotent, so repeated sessions in one process are free.
+    #
+    # terminal.type mirrors the dimension the dashboards group sessions by;
+    # TERM_PROGRAM is unset for non-interactive runs (cron, gateway, CI), which
+    # is itself the useful distinction.
     try:
         from agent.monitoring import usage_export
+        try:
+            from hermes_cli.config import load_config_readonly as _load_usage_cfg
+            _usage_cfg = _load_usage_cfg()
+        except Exception:
+            _usage_cfg = None
+        if _usage_cfg and usage_export.start(_usage_cfg):
+            # Drain on interpreter exit. A CLI process has no gateway shutdown
+            # hook, so without this the final export interval's tokens are lost
+            # on every run — DELTA counters hold unexported increments in
+            # memory. atexit is registered once per process; shutdown() is
+            # idempotent.
+            if not getattr(usage_export, "_atexit_registered", False):
+                import atexit
+                atexit.register(usage_export.shutdown)
+                usage_export._atexit_registered = True
         usage_export.record_session_start(
             terminal_type=os.environ.get("TERM_PROGRAM") or "non-interactive",
         )

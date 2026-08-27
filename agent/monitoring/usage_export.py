@@ -38,6 +38,10 @@ _M_ACTIVE = "hermes.active_time.total"
 _lock = threading.Lock()
 _state: Optional["_UsageExportState"] = None
 
+# Set by whichever entrypoint registers the atexit drain, so a process that
+# creates many agents/sessions registers it exactly once.
+_atexit_registered = False
+
 
 class _UsageExportState:
     __slots__ = ("provider", "tokens", "cost", "sessions", "active", "attrs_base")

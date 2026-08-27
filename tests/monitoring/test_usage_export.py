@@ -19,8 +19,10 @@ from agent.monitoring import usage_export
 @pytest.fixture(autouse=True)
 def _reset_state():
     usage_export._state = None
+    usage_export._atexit_registered = False
     yield
     usage_export._state = None
+    usage_export._atexit_registered = False
 
 
 def _config(**overrides):
