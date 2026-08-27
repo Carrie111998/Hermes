@@ -267,6 +267,39 @@ describe('useSessionStateCache — per-session turn timer', () => {
   })
 })
 
+describe('useSessionStateCache — parked renderer recovery', () => {
+  afterEach(() => {
+    cleanup()
+    $messages.set([])
+    $sessionStates.set({})
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('publishes a running transcript when requestAnimationFrame never fires', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => 1)
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined)
+
+    let cache!: Cache
+    render(<ViewHarness activeSessionId="parked-thread" onReady={c => (cache = c)} />)
+
+    const messages = [userMessage('parked-user', 'keep working'), assistantText('parked-assistant', 'answer arrived')]
+
+    act(() => {
+      cache.updateSessionState('parked-thread', state => ({ ...state, busy: true, messages }), 'parked-stored')
+    })
+
+    expect($messages.get()).toEqual([])
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250)
+    })
+
+    expect($messages.get().map(message => message.id)).toEqual(['parked-user', 'parked-assistant'])
+  })
+})
+
 interface LayoutProbeHarnessProps {
   activeSessionId: string | null
   onLayoutSnapshot: (snapshot: { active: string | null; selected: string | null }) => void
