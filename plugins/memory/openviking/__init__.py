@@ -2281,16 +2281,17 @@ def _run_quick_local_setup(
     provider_config["server_config_path"] = str(result.paths.server_config)
     provider_config["server_command_path"] = str(result.paths.server_command)
     if result.server_restart_required:
-        print("\n  Quick Local settings were updated")
+        print("\n  Quick Local restart required")
         print(
-            "  The running OpenViking server is still using the previous Hermes "
-            "LLM settings."
+            "  The running OpenViking server must restart to use the updated "
+            "runtime or Hermes LLM settings."
         )
         print(
             f"  Stop the Quick Local server at {result.endpoint}, then start Hermes again."
         )
         print(
-            "  Hermes will restart it with the updated settings when memory is first used."
+            "  Hermes will restart it with the updated runtime and settings "
+            "when memory is first used."
         )
         print(f"  Config file: {result.paths.ovcli_config}\n")
     else:
