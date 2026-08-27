@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_governance
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +636,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
+        ),
+    )
+    p_block.add_argument(
+        "--blocker-class", default=None, choices=sorted(kanban_governance.BLOCKER_CLASSES),
+        help=(
+            "Governance blocker classification. Required for blocks mentioning "
+            "Christopher. Valid values: infra_default, lane_work, review_fix, "
+            "dependency_wait, human_decision. Use human_decision for holds on "
+            "Christopher with a --decision-class."
+        ),
+    )
+    p_block.add_argument(
+        "--decision-class", default=None,
+        help=(
+            "Decision classification (only valid with --blocker-class human_decision). "
+            "Valid values: scope_authorization, irreversible_risk_acceptance, "
+            "policy_override, principal_intent_ambiguity."
         ),
     )
 
@@ -2371,6 +2389,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    blocker_class = getattr(args, "blocker_class", None)
+    decision_class = getattr(args, "decision_class", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2383,6 +2403,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                blocker_class=blocker_class,
+                decision_class=decision_class,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

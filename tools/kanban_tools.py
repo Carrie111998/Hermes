@@ -832,6 +832,8 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    blocker_class = args.get("blocker_class")
+    decision_class = args.get("decision_class")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -869,6 +871,8 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                blocker_class=blocker_class,
+                decision_class=decision_class,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1892,6 +1896,24 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "blocker_class": {
+                "type": "string",
+                "enum": ["infra_default", "lane_work", "review_fix", "dependency_wait", "human_decision"],
+                "description": (
+                    "Governance blocker classification. Required for blocks "
+                    "mentioning Christopher as an operational owner. Use "
+                    "human_decision with a decision_class for holds on Christopher."
+                ),
+            },
+            "decision_class": {
+                "type": "string",
+                "enum": ["scope_authorization", "irreversible_risk_acceptance", "policy_override", "principal_intent_ambiguity"],
+                "description": (
+                    "Decision classification (only valid with "
+                    "blocker_class=human_decision). Specifies the type of "
+                    "human decision being made."
                 ),
             },
             "board": _board_schema_prop(),
