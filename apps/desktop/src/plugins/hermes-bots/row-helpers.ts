@@ -57,6 +57,15 @@ export const ACTIVE_WINDOW_S = 90
 const RECENT_ACTIVITY_WINDOW_S = 7 * 24 * 60 * 60
 export const BOT_ROSTER_SEARCH_THRESHOLD = 8
 
+/** Rows the Group Chat picker can seat from the complete gateway roster. */
+export function selectableGroupChatBots(roster: null | RosterRow[] | undefined): RosterRow[] {
+  return (roster || []).filter(bot => !bot?.ghost)
+}
+
+export function canCreateGroupChat(roster: null | RosterRow[] | undefined): boolean {
+  return selectableGroupChatBots(roster).length >= 2
+}
+
 /** The stored session id this bot's canonical Bot Chat answers to — the
  *  compression-lineage tip the live-state atoms are keyed by, falling back to
  *  the durable registry id. THE id for anything core-keyed: the row's status

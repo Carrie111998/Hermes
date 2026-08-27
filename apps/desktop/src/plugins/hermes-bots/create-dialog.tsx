@@ -82,6 +82,7 @@ import type {
 import { CheckList, SkillsView, skillsViewRoutesConnections } from './profile-config'
 import { deleteBot } from './profile-ops'
 import { botRosterMeta } from './routing'
+import { selectableGroupChatBots } from './row-helpers'
 import { HubSkillsSection } from './skills-hub'
 import { composeSoul } from './soul'
 import type { BotMeta, ConnectionRow, RosterRow } from './types'
@@ -1185,7 +1186,7 @@ export function CreateGroupChatDialog({ open, roster, onClose, onCreated }: Crea
 
   // An outage placeholder preserves one selected owner's identity in the
   // sidebar, but it is not a routable room member. Never offer it here.
-  const selectableRoster = roster.filter(bot => !bot?.ghost)
+  const selectableRoster = selectableGroupChatBots(roster)
   const selected = selectableRoster.filter(bot => checked[botRosterKey(bot)])
   const visible: RosterRow[] = filterBots(selectableRoster, allMeta, query)
   const atCap = selected.length >= GROUP_CHAT_MAX_MEMBERS
