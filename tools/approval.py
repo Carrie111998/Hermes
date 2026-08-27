@@ -2459,9 +2459,18 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = os.path.normpath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    canonical_operand = operand == os.path.join(temp_dir, basename)
+    # macOS exposes /tmp as the OS-owned alias for /private/tmp. Permit only
+    # this standard alias; arbitrary symlinked temp directories remain gated.
+    macos_tmp_alias = (
+        raw_temp_dir == "/tmp"
+        and temp_dir == "/private/tmp"
+        and operand == os.path.join("/tmp", basename)
+    )
+    if not (canonical_operand or macos_tmp_alias):
         return False
 
     target = os.path.realpath(operand)
@@ -2872,6 +2881,17 @@ def list_gateway_approvals(session_key: str) -> list[dict]:
     """Return replay-safe snapshots of unresolved approvals for one session."""
     with _lock:
         return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
+
+
+def find_gateway_approval_session(request_id: str) -> Optional[str]:
+    """Return the session key holding the exact unresolved approval request."""
+    if not request_id:
+        return None
+    with _lock:
+        for session_key, entries in _gateway_queues.items():
+            if any(entry.data.get("request_id") == request_id for entry in entries):
+                return session_key
+    return None
 
 
 def ack_gateway_approval(session_key: str, request_id: str) -> bool:
