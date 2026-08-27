@@ -2,16 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
-import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
+import { $workspaceMode, setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $connection, $selectedStoredSessionId, setSessions } from '@/store/session'
+import { $activeSessionId, $connection, $selectedStoredSessionId, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
+  $focusedStoredSessionId,
   $sessionStates,
   $sessionTiles,
   blankDraftTile,
+  clearAllSessionStates,
+  closeAllOpenSessionTiles,
   focusedSessionNeedsRoute,
   focusOpenSession,
+  foregroundSessionScopes,
   isSessionRemote,
   knownOwnerForSession,
   markSelectionRestore,
@@ -19,6 +24,7 @@ import {
   openSessionTile,
   orderTilesByTree,
   patchSessionTile,
+  recordSessionEventScope,
   releaseSessionTranscript,
   requestForOwnedSession,
   resetTileRuntimeBindings,
@@ -31,6 +37,62 @@ import {
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
+
+describe('foregroundSessionScopes', () => {
+  beforeEach(() => {
+    clearAllSessionStates()
+    $activeSessionId.set(null)
+    $sessionTiles.set([])
+  })
+
+  afterEach(() => {
+    clearAllSessionStates()
+    $activeSessionId.set(null)
+    $sessionTiles.set([])
+  })
+
+  it('keeps the exact registry owner of an idle foreground runtime', () => {
+    recordSessionEventScope({ connectionId: 'cloud', profile: 'default', session_id: 'runtime-1' })
+    $activeSessionId.set('runtime-1')
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['conn:cloud::default']))
+  })
+
+  it('fails closed when the foreground runtime has no registered source', () => {
+    $activeSessionId.set('legacy-runtime')
+
+    expect(foregroundSessionScopes()).toEqual(new Set())
+  })
+
+  it('keeps every open pane owner, not only the focused runtime', () => {
+    recordSessionEventScope({ connectionId: 'cloud-a', profile: 'default', session_id: 'runtime-a' })
+    recordSessionEventScope({ connectionId: 'cloud-b', profile: 'default', session_id: 'runtime-b' })
+    $sessionTiles.set([
+      { runtimeId: 'runtime-a', storedSessionId: 'stored-a' },
+      {
+        ownerRoute: { connectionId: 'cloud-b', profile: 'default' },
+        storedSessionId: 'stored-b'
+      }
+    ])
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['conn:cloud-a::default', 'conn:cloud-b::default']))
+  })
+
+  it('releases an idle pane owner when the pane closes', () => {
+    $sessionTiles.set([
+      {
+        ownerRoute: { connectionId: 'cloud', profile: 'default' },
+        storedSessionId: 'stored-cloud'
+      }
+    ])
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['conn:cloud::default']))
+
+    $sessionTiles.set([])
+
+    expect(foregroundSessionScopes()).toEqual(new Set())
+  })
+})
 
 describe('resetTileRuntimeBindings', () => {
   afterEach(() => {
@@ -269,6 +331,52 @@ describe('SessionTile workspace scope', () => {
   })
 })
 
+describe('closeAllOpenSessionTiles persists Bot Mode Close All (#94137)', () => {
+  afterEach(() => {
+    $activeGatewayProfile.set('default')
+    $layoutTree.set(null)
+    $sessionTiles.set([])
+  })
+
+  it('drops persisted bot tiles so a roster/profile rehydrate cannot restore them', () => {
+    openSessionTile('chat-a', 'center', 'workspace', undefined, {
+      workspaceMode: 'bots',
+      workspaceOwnerKey: 'bot:a'
+    })
+    openSessionTile('chat-b', 'center', 'workspace', undefined, {
+      workspaceMode: 'bots',
+      workspaceOwnerKey: 'bot:b'
+    })
+    $layoutTree.set(group(['workspace', tilePane('chat-a'), tilePane('chat-b')], { active: 'workspace', id: 'main' }))
+
+    closeAllOpenSessionTiles('workspace')
+
+    expect($sessionTiles.get()).toEqual([])
+
+    // Profile swap re-reads the shared Bot bucket. Close All must have
+    // emptied it, not only dismissed the tree panes.
+    $activeGatewayProfile.set('other-profile')
+    expect($sessionTiles.get()).toEqual([])
+    $activeGatewayProfile.set('default')
+    expect($sessionTiles.get()).toEqual([])
+  })
+
+  it('leaves session tiles stacked in a different zone open', () => {
+    openSessionTile('keep', 'right', 'workspace')
+    openSessionTile('close-me', 'center', 'workspace')
+    $layoutTree.set(
+      split('row', [
+        group(['workspace', tilePane('close-me')], { active: 'workspace', id: 'main' }),
+        group([tilePane('keep')], { active: tilePane('keep'), id: 'right' })
+      ])
+    )
+
+    closeAllOpenSessionTiles('workspace')
+
+    expect($sessionTiles.get().map(tile => tile.storedSessionId)).toEqual(['keep'])
+  })
+})
+
 describe('releaseSessionTranscript', () => {
   afterEach(() => {
     $sessionStates.set({})
@@ -396,6 +504,76 @@ describe('boot-restore selection homing (⌘R tab persistence)', () => {
     // One-shot consumed: the next selection change is a real navigation.
     $selectedStoredSessionId.set('nav-2')
     expect(activePane()).toBe('workspace')
+  })
+})
+
+describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
+  afterEach(() => {
+    $layoutTree.set(null)
+    $selectedStoredSessionId.set(null)
+    setWorkspaceScope('sessions')
+  })
+
+  it('a Bots-pane click keeps the main-zone bot tile focused instead of collapsing to a null selection edge', () => {
+    // Bot chats open as TILES and never set $selectedStoredSessionId. Clicking
+    // a roster row moves the interaction tracker to the sidebar group, whose
+    // active pane is chrome ('hermes-bots:pane'), not a session tile. The old
+    // derivation then fell back to the null primary selection and published a
+    // NULL "focused session" edge — which the Bots plugin read as "the chat
+    // lost the center", releasing its open claim and re-asserting the Bots
+    // home over the still-visible chat (the reported "jumps to the list").
+    setWorkspaceScope('bots', 'bot:b')
+    $selectedStoredSessionId.set(null)
+    $layoutTree.set(
+      split('row', [
+        group(['sessions', 'hermes-bots:pane'], { active: 'hermes-bots:pane', id: 'grp-sessions' }),
+        group(['workspace', tilePane('chat-b')], { active: tilePane('chat-b'), id: 'grp-main' })
+      ])
+    )
+    noteActiveTreeGroup('grp-sessions')
+
+    expect($focusedStoredSessionId.get()).toBe('chat-b')
+  })
+
+  it('the main-zone tile also answers while the tracker sits on the workspace tab itself', () => {
+    setWorkspaceScope('bots', 'bot:b')
+    $selectedStoredSessionId.set(null)
+    $layoutTree.set(group(['workspace', tilePane('chat-b')], { active: tilePane('chat-b'), id: 'grp-main' }))
+    noteActiveTreeGroup('grp-main')
+
+    expect($focusedStoredSessionId.get()).toBe('chat-b')
+  })
+
+  it('a closed bot chat (no tile in main) still falls back to the selection', () => {
+    setWorkspaceScope('bots', 'bot:b')
+    $selectedStoredSessionId.set(null)
+    $layoutTree.set(
+      split('row', [
+        group(['sessions', 'hermes-bots:pane'], { active: 'hermes-bots:pane', id: 'grp-sessions' }),
+        group(['workspace'], { active: 'workspace', id: 'grp-main' })
+      ])
+    )
+    noteActiveTreeGroup('grp-sessions')
+
+    // No tile owns the main zone — the chat was closed — so the null edge is
+    // genuine and must still surface (that is what lets the Bots home return).
+    expect($focusedStoredSessionId.get()).toBeNull()
+  })
+
+  it('sessions mode keeps collapsing to the primary selection (derivation gated to Bot Mode)', () => {
+    $selectedStoredSessionId.set('primary-1')
+    $layoutTree.set(
+      split('row', [
+        group(['sessions'], { active: 'sessions', id: 'grp-sessions' }),
+        group(['workspace', tilePane('stacked')], { active: tilePane('stacked'), id: 'grp-main' })
+      ])
+    )
+    noteActiveTreeGroup('grp-sessions')
+
+    // The main-zone tile must NOT answer here: in sessions mode the sidebar
+    // highlight follows the primary selection exactly as it always has.
+    expect($workspaceMode.get()).toBe('sessions')
+    expect($focusedStoredSessionId.get()).toBe('primary-1')
   })
 })
 
@@ -608,6 +786,12 @@ describe('knownOwnerForSession / requestForOwnedSession (#91684 client half)', (
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(knownOwnerForSession('stored-2')).toBe('loki')
+  })
+
+  it('keeps a session row connection owner when profiles share the same name', () => {
+    setSessions([{ connection_id: 'source-b', id: 'stored-shared', profile: 'default' } as never])
+
+    expect(knownOwnerForSession('stored-shared')).toEqual({ connectionId: 'source-b', profile: 'default' })
   })
 
   it('returns undefined (ambient) when no owner is known, and for null ids', () => {

@@ -193,6 +193,7 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
 # same constants the emission sites use) through the gateway noise filter.
 ROUTINE_COMPRESSION_STATUS_SAMPLES = (
     COMPACTION_STATUS,
+    COMPACTION_DONE_STATUS,
     PRE_API_COMPRESSION_STATUS_TEMPLATE.format(tokens=123456),
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(tokens=120000, threshold=100000),
     IDLE_COMPACTION_STATUS_TEMPLATE.format(idle_seconds=3600, tokens=120000),
@@ -289,6 +290,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_compress_aborted",
     "_last_summary_auth_failure",
     "_last_summary_network_failure",
+    "_last_summary_empty_content_failure",
     "_last_aux_model_failure_error",
     "_last_aux_model_failure_model",
     "_summary_model_fallen_back",
@@ -841,6 +843,174 @@ def resolve_context_compression_timeouts(
     return idle, ceiling
 
 
+def resolve_compression_fallback_route() -> Optional[dict]:
+    """Return the first usable ``auxiliary.compression.fallback_chain`` entry.
+
+    The chain is the user's declared answer to "the configured compression
+    route is unhealthy". The auxiliary client applies it from its exception
+    handler, so a route that *stalls* — connection open, no tokens, aborted by
+    the host's progress-aware timeout — never reaches it (#78981). This
+    resolves the same config into explicit ``call_llm`` route arguments the
+    stall path can pin onto one retry.
+
+    Only the first structurally complete entry is returned: one extra bounded
+    attempt is the budget for a stall, and if that entry cannot build a client
+    (or errors) the auxiliary client's own exception path still walks the rest
+    of the chain from there. Returns ``None`` when no entry is usable, which
+    keeps the historical continue-without-compression behaviour.
+    """
+    try:
+        from agent.auxiliary_client import (
+            _fallback_entry_api_key,
+            _get_auxiliary_task_config,
+        )
+
+        chain = _get_auxiliary_task_config("compression").get("fallback_chain")
+    except Exception:
+        logger.debug("compression fallback_chain lookup failed", exc_info=True)
+        return None
+    if not isinstance(chain, list):
+        return None
+
+    for index, entry in enumerate(chain):
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        # Both are required to name a route. _resolve_fallback_entry applies
+        # the same rule when the aux client walks this chain itself.
+        if not provider or not model:
+            continue
+        try:
+            api_key = _fallback_entry_api_key(entry)
+        except Exception:
+            logger.debug(
+                "compression fallback_chain[%d] api key resolution failed",
+                index,
+                exc_info=True,
+            )
+            api_key = None
+        from agent.auxiliary_client import _coerce_positive_timeout
+
+        timeout = _coerce_positive_timeout(entry.get("timeout"))
+        return {
+            "label": f"fallback_chain[{index}]({provider})",
+            "provider": provider,
+            "model": model,
+            "base_url": str(entry.get("base_url") or "").strip() or None,
+            "api_key": api_key or None,
+            "api_mode": str(
+                entry.get("api_mode") or entry.get("transport") or ""
+            ).strip() or None,
+            "timeout": timeout,
+        }
+    return None
+
+
+def _retry_compression_on_fallback_chain(
+    *,
+    worker: Callable[[CompressionCommitFence], Tuple[list, str]],
+    messages: list,
+    system_prompt_fallback: Any,
+    idle_timeout_seconds: float,
+    total_ceiling_seconds: float,
+    on_commit_overrun: Optional[Callable[[float, float], None]] = None,
+    telemetry_agent: Any = None,
+    new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
+) -> Optional[Tuple[list, str]]:
+    """Re-run an aborted compression once with the summary route pinned.
+
+    Returns the fallback attempt's ``(messages, system_prompt)`` when it
+    actually compressed, or ``None`` when there was nothing to fall back to,
+    the attempt raised, or it produced no compression either — the caller then
+    degrades exactly as it did before.
+
+    The retry is bounded the same way the primary was: silence for one idle
+    window ends it, while a fallback that is streaming keeps its ceiling. The
+    entry's own ``timeout`` (when declared) sets that idle window, so a
+    fallback tuned for a slower-but-healthy backend is not held to a deadline
+    the stalled primary defined (#62452 semantics, applied to the stall path).
+    """
+    # An explicit stop is not a stalled route. The retry worker would abort on
+    # the same event anyway, but starting one at all makes /stop look ignored.
+    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
+    if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
+        return None
+
+    route = resolve_compression_fallback_route()
+    if route is None:
+        return None
+
+    # The aborted fence refuses every future commit, so the retry needs a
+    # fresh one. Mint it through the host's factory when it has one: hosts
+    # publish the active fence for hard-interrupt admission, and a /stop
+    # during the retry must serialize against THIS attempt's commit boundary.
+    retry_fence = None
+    if new_fence is not None:
+        try:
+            retry_fence = new_fence()
+        except Exception:
+            logger.warning(
+                "compression stall-fallback fence factory failed; the retry "
+                "will run on an unpublished fence (a /stop mid-retry cannot "
+                "serialize against its commit boundary)",
+                exc_info=True,
+            )
+    if not isinstance(retry_fence, CompressionCommitFence):
+        logger.warning(
+            "compression stall-fallback retry running on an unpublished fence; "
+            "hard-interrupt admission will read the aborted attempt's fence "
+            "rather than the retry's commit boundary",
+        )
+        retry_fence = CompressionCommitFence()
+    idle = float(route.get("timeout") or idle_timeout_seconds)
+    ceiling = max(float(total_ceiling_seconds), idle)
+    logger.warning(
+        "Context compression stalled on the configured summary route — "
+        "retrying once on %s (%s) before continuing without compression",
+        route["label"],
+        route["model"],
+    )
+    try:
+        from agent.context_compressor import pin_summary_route
+
+        with pin_summary_route(route):
+            result_msgs, result_prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=messages,
+                system_prompt_fallback=system_prompt_fallback,
+                idle_timeout_seconds=idle,
+                total_ceiling_seconds=ceiling,
+                on_commit_overrun=on_commit_overrun,
+                fence=retry_fence,
+                telemetry_agent=telemetry_agent,
+                stall_fallback=False,
+            )
+    except Exception:
+        # The primary already failed; a failing fallback must degrade, never
+        # turn "continue without compression" into a raised turn.
+        logger.warning(
+            "Context compression fallback attempt on %s failed",
+            route["label"],
+            exc_info=True,
+        )
+        return None
+    if result_msgs is messages:
+        # Aborted or no-op: the worker hands back the caller's own list.
+        logger.warning(
+            "Context compression fallback attempt on %s produced no "
+            "compression; continuing without compression",
+            route["label"],
+        )
+        return None
+    logger.info(
+        "Context compression recovered on %s after the primary summary route "
+        "stalled",
+        route["label"],
+    )
+    return result_msgs, result_prompt
+
+
 def run_compress_context_with_progress_timeout(
     *,
     worker: Callable[[CompressionCommitFence], Tuple[list, str]],
@@ -852,6 +1022,8 @@ def run_compress_context_with_progress_timeout(
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
     fence: Optional[CompressionCommitFence] = None,
     telemetry_agent: Any = None,
+    stall_fallback: bool = True,
+    new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
 ) -> Tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware timeout.
 
@@ -882,6 +1054,19 @@ def run_compress_context_with_progress_timeout(
     ``system_prompt_fallback`` may be a string or a zero-arg callable resolved
     only on the timeout path, so successful compression never pays for (or
     fails on) an eager prompt rebuild.
+
+    ``stall_fallback`` (default on) makes an aborted stall attempt the
+    configured ``auxiliary.compression.fallback_chain`` once — pinned onto a
+    fresh fence — before degrading to "continue without compression". Nothing
+    raises out of a silent stall, so the auxiliary client's own fallback
+    handling (exception-path only) never sees it (#78981). ``on_timeout``
+    therefore fires only after that attempt has also failed, which keeps its
+    cooldown bookkeeping from suppressing the retry it precedes.
+
+    ``new_fence`` mints that retry's fence. Hosts that publish the active
+    fence for hard-interrupt admission pass a factory that publishes the new
+    one too, so a ``/stop`` during the retry serializes against the retry's
+    commit boundary rather than the aborted attempt's.
     """
     if idle_timeout_seconds <= 0:
         raise ValueError(
@@ -1084,6 +1269,23 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        # The durable lease is free again (above), so a fallback attempt can
+        # acquire it immediately. Run it BEFORE on_timeout: that callback
+        # records the summary-failure cooldown, which would make the retry's
+        # own summary call a no-op.
+        if stall_fallback:
+            recovered = _retry_compression_on_fallback_chain(
+                worker=worker,
+                messages=messages,
+                system_prompt_fallback=system_prompt_fallback,
+                idle_timeout_seconds=idle,
+                total_ceiling_seconds=ceiling,
+                on_commit_overrun=on_commit_overrun,
+                telemetry_agent=telemetry_agent,
+                new_fence=new_fence,
+            )
+            if recovered is not None:
+                return recovered
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -2492,8 +2694,13 @@ def compress_context(
     if _compaction_status:
         agent._emit_status(_compaction_status)
     _compaction_done_emitted = False
+    # Commit outcome of this attempt; rebound to "committed" on the success
+    # path just before returning the compressed history. The lifecycle
+    # closure reads it at call time, so any abort/exception path that skips
+    # that rebind keeps the terminal edge suppressed.
+    _commit_status = "aborted"
 
-    def _complete_compaction_lifecycle() -> None:
+    def _complete_compaction_lifecycle(*, force_terminal: bool = False) -> None:
         nonlocal _compaction_done_emitted
         if _compaction_done_emitted:
             return
@@ -2501,7 +2708,13 @@ def compress_context(
         # A suppressed start (quiet context engine) opened no visible
         # compaction phase — emit no terminal edge either. Failure warnings
         # go through agent._emit_warning and are never suppressed here.
-        if _compaction_status_emitted:
+        # Aborts that never compacted (lock contender, cancelled commit
+        # fence) opt in via force_terminal: they still need the structured
+        # terminal edge so clients can retire their compaction phase. Chat
+        # surfaces filter this routine notice independently.
+        if _compaction_status_emitted and (
+            _commit_status == "committed" or force_terminal
+        ):
             _emit_compaction_done(agent)
 
     # ── Compression lock ────────────────────────────────────────────────
@@ -2630,7 +2843,7 @@ def compress_context(
                         split_status="aborted",
                         failure_class="commit_fence_cancelled",
                     )
-                    _complete_compaction_lifecycle()
+                    _complete_compaction_lifecycle(force_terminal=True)
                     return messages, _existing_sp
             try:
                 _lock_acquired = _try_acquire_lock(
@@ -2722,7 +2935,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="lock_contended",
             )
-            _complete_compaction_lifecycle()
+            _complete_compaction_lifecycle(force_terminal=True)
             return messages, _existing_sp
     _lock_released = False
     _lock_release_guard = threading.Lock()
@@ -4183,15 +4396,6 @@ def _compress_context_via_codex_app_server(
     except Exception:
         pass
 
-    _compaction_done_emitted = False
-
-    def _complete_compaction_lifecycle() -> None:
-        nonlocal _compaction_done_emitted
-        if _compaction_done_emitted:
-            return
-        _compaction_done_emitted = True
-        _emit_compaction_done(agent)
-
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
@@ -4199,7 +4403,6 @@ def _compress_context_via_codex_app_server(
     except BaseException:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
-        _complete_compaction_lifecycle()
         raise
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
@@ -4224,7 +4427,6 @@ def _compress_context_via_codex_app_server(
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
-        _complete_compaction_lifecycle()
         return messages, existing_prompt
 
     try:
@@ -4264,7 +4466,9 @@ def _compress_context_via_codex_app_server(
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
-    _complete_compaction_lifecycle()
+    # Terminal edge only on success — failure/interrupt paths above return
+    # without it, matching the main compress_context() gating.
+    _emit_compaction_done(agent)
     return messages, existing_prompt
 
 
