@@ -92,10 +92,7 @@ test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
 
 test('SSH reuse proof remains compatible when runtime state is absent', () => {
   assert.equal(
-    classifySshReuseProof(
-      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION },
-      SPAWN_NONCE
-    ),
+    classifySshReuseProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION }, SPAWN_NONCE),
     'authenticated-ok'
   )
 })

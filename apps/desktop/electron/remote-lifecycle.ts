@@ -69,7 +69,11 @@ function ownershipProofKey(token) {
 }
 
 function verifyOwnershipChallengeProof(proof, token, challenge, spawnNonce, pid) {
-  if (proof?.ok !== true || proof.protocolVersion !== PROTOCOL_VERSION || !/^[0-9a-f]{64}$/.test(String(proof.proof || ''))) {
+  if (
+    proof?.ok !== true ||
+    proof.protocolVersion !== PROTOCOL_VERSION ||
+    !/^[0-9a-f]{64}$/.test(String(proof.proof || ''))
+  ) {
     return false
   }
 
@@ -1583,13 +1587,7 @@ async function connect(deps) {
           assertBootstrapNotSuperseded(signal)
           await cancelForwardSafe(deps, localPort, lock.port)
           await assertRemoteInstallUpdateClear(ssh, hermesHome)
-          await cleanupStale(
-            ssh,
-            ownershipId,
-            lock,
-            pidAlive,
-            authenticatedOwnership ? async () => true : undefined
-          )
+          await cleanupStale(ssh, ownershipId, lock, pidAlive, authenticatedOwnership ? async () => true : undefined)
         } else if (reuseClassification === 'authenticated-ok') {
           const token = await adoptOwnedServedToken(
             adoptServedToken,
