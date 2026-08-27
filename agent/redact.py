@@ -155,11 +155,23 @@ _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDE
 _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
+# Quoted assignments need their own grammar: ``\S+`` stops at the first space
+# and also leaves an escaped quote's suffix exposed.  The escaped-character
+# branch consumes ``\\\"``/``\\'`` as one value character.
+_ENV_ASSIGN_QUOTED_RE = re.compile(
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*"
+    r"(['\"])((?:\\.|(?!\2)[^\r\n])*)\2",
+)
 # Lowercase env names: only underscore-boundary forms (``openai_key=…``,
 # ``FAL_KEY=…``, ``db_pw=…``) — NOT bare ``password=``/``token=``/``secret=``,
 # which appear in prose, URLs, and form bodies (issue #77484).
 _ENV_ASSIGN_LOWER_RE = re.compile(
     rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    re.IGNORECASE,
+)
+_ENV_ASSIGN_LOWER_QUOTED_RE = re.compile(
+    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*"
+    r"(['\"])((?:\\.|(?!\2)[^\r\n])*)\2",
     re.IGNORECASE,
 )
 
@@ -225,6 +237,11 @@ _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
 # leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
 _YAML_ASSIGN_RE = re.compile(
     rf"(^[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_YAML_QUOTED_ASSIGN_RE = re.compile(
+    rf"(^[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)"
+    r"(['\"])((?:\\.|(?!\3)[^\r\n])*)\3",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -318,7 +335,7 @@ def _key_has_secret_keyword(key: str) -> bool:
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
-    rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
+    rf'("{_JSON_KEY_NAMES}")\s*:\s*"((?:\\.|[^"\\\r\n])+)"',
     re.IGNORECASE,
 )
 
@@ -470,7 +487,9 @@ _FORM_BODY_RE = re.compile(
 # smuggled as ``sk-abc\x1bdef…`` or ``ghp_abc\n123…`` escapes the contiguous
 # prefix regexes (issue #77484). Used by _mask_control_split_tokens.
 _CONTROL_CHARS_RE = re.compile(
-    r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060\ufeff]"
+    r"[\x00-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b-\u200f"
+    r"\u2028-\u202f\u2060-\u206f\ufeff\ufff9-\ufffb"
+    r"\U000e0001\U000e0020-\U000e007f]"
 )
 
 # Union of every _PREFIX_PATTERNS body class — a control-stripped match may
@@ -509,22 +528,17 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         body = m.group(1)
         start_orig = orig_idx[m.start(1)]
         end_orig = orig_idx[m.end(1) - 1] + 1
-        # If a fragment inside the span already matches _PREFIX_RE on its
-        # own AND the span crosses a LINE boundary (\n / \r), do NOT join.
-        # A complete token at end-of-line followed by a word line
-        # (``ghp_<token>\nbutton [ref=e3]``) joins into one stripped-copy
-        # match and the mask eats ``button``. Line structure is legitimate;
-        # the self-matching fragment is handled by the ordinary prefix pass
-        # (any remainder past the newline is left unmasked — accepted
-        # residual to preserve line structure).
-        # For NON-newline controls (ESC, ZWSP, ...) the join proceeds even
-        # when a fragment self-matches: those bytes never legitimately sit
-        # between a token and adjacent prose, and skipping there let the
-        # non-matching remainder of a split token leak
-        # (``sk-<head>\x1b<tail>`` masked only the head).
         span = text[start_orig:end_orig]
+        # A complete token followed by a new line of ordinary text must not
+        # be swallowed as one credential.  A split token, however, can have a
+        # self-matching prefix fragment before LF/CR; only join that case when
+        # the post-boundary fragment is long enough to be a token body.  This
+        # preserves UI/source lines such as ``token\nbutton [ref=e3]`` while
+        # closing the suffix-leak path for long split credentials.
         if ("\n" in span or "\r" in span) and _PREFIX_RE.search(span):
-            continue
+            after_boundary = re.split(r"[\n\r]", span, maxsplit=1)[1]
+            if len(after_boundary) < 10:
+                continue
         # Reject matches whose original span crosses a non-token char
         # (e.g. ``sk_abc…\nTAVILY_API_KEY=…`` — the ``=`` is not part of a
         # token body, so the regex matched across unrelated lines). Also
@@ -771,6 +785,41 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+_SOURCE_SAFE_VALUE_RE = re.compile(
+    r"^(?:true|false|null|none|undefined|[+-]?\d+(?:\.\d+)?)$",
+    re.IGNORECASE,
+)
+_SOURCE_PLACEHOLDER_RE = re.compile(
+    r"(?:placeholder|example|dummy|fixture|test)",
+    re.IGNORECASE,
+)
+
+
+def _should_redact_code_structured_value(key: str, value: str) -> bool:
+    """Keep low-confidence source literals while masking real credentials.
+
+    ``code_file`` is a narrow false-positive control, not a secret-safety
+    bypass.  Numeric/boolean constants and explicit fixture placeholders are
+    ordinary source content; credential-shaped keys or opaque values remain
+    redacted even when the caller identifies the surrounding text as source.
+    """
+    normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+    normalized_value = value.strip()
+    if _SOURCE_SAFE_VALUE_RE.fullmatch(normalized_value):
+        return False
+    if _SOURCE_PLACEHOLDER_RE.search(normalized_value) and len(value) < 80:
+        return False
+    strong_key = any(
+        marker in normalized_key
+        for marker in (
+            "apikey", "secret", "password", "passwd", "credential",
+            "privatekey", "accesstoken", "refreshtoken", "authtoken",
+            "bearer", "jwt", "clientsecret",
+        )
+    )
+    return strong_key or len(value) >= 12
+
+
 def redact_sensitive_text(
     text: str,
     *,
@@ -822,7 +871,9 @@ def redact_sensitive_text(
         text = str(text)
     if not text:
         return text
-    if not (force or _REDACT_ENABLED):
+    # File content is an agent-visible safety boundary.  It is always
+    # redacted, even when ordinary logging redaction was disabled globally.
+    if not (force or file_read or _REDACT_ENABLED):
         return text
 
     # File content must also run the structured assignment/JSON/YAML passes;
@@ -842,11 +893,16 @@ def redact_sensitive_text(
 
     # ENV assignments: OPENAI_API_KEY=*** (skip only for non-file source code)
     # File content must also run the structured assignment/JSON/YAML passes.
-    if file_read or not code_file:
-        def _mask_structured_value(value):
+    # Structured values are always inspected.  ``code_file`` only narrows the
+    # low-confidence values through _should_redact_code_structured_value; it
+    # never disables credential-shaped assignments or fields.
+    if text:
+        def _mask_structured_value(value, key=""):
             # The prefix pass already produced a safe file-content sentinel;
             # keep it intact instead of replacing it with a reusable mask.
-            if file_read and value.startswith("«redacted:") and value.endswith("»"):
+            if value.startswith("«redacted:") and value.endswith("»"):
+                return value
+            if code_file and not file_read and not _should_redact_code_structured_value(key, value):
                 return value
             return _mask_token_nonreusable(value) if file_read else _mask_token(value)
 
@@ -865,7 +921,13 @@ def redact_sensitive_text(
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
-                return f"{name}={quote}{_mask_structured_value(value)}{quote}"
+                return f"{name}={quote}{_mask_structured_value(value, name)}{quote}"
+            def _redact_env_quoted(m):
+                name, quote, value = m.group(1), m.group(2), m.group(3)
+                if _ENV_LOOKUP_VALUE_RE.match(value) or not _key_has_secret_keyword(name):
+                    return m.group(0)
+                return f"{name}={quote}{_mask_structured_value(value, name)}{quote}"
+            text = _ENV_ASSIGN_QUOTED_RE.sub(_redact_env_quoted, text)
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
@@ -874,6 +936,7 @@ def redact_sensitive_text(
             # case). The uppercase regex above is all-caps-only, so it never
             # matches URL params; the lowercase one would (issue #77484).
             if "://" not in text:
+                text = _ENV_ASSIGN_LOWER_QUOTED_RE.sub(_redact_env_quoted, text)
                 text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -900,7 +963,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_structured_value(value)}"'
+                return f'{key}: "{_mask_structured_value(value, key)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -919,7 +982,13 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{_mask_structured_value(value)}"
+                return f"{key}{sep}{_mask_structured_value(value, key)}"
+            def _redact_yaml_quoted(m):
+                key, sep, quote, value = m.groups()
+                if _ENV_LOOKUP_VALUE_RE.match(value) or not _key_has_secret_keyword(key):
+                    return m.group(0)
+                return f"{key}{sep}{quote}{_mask_structured_value(value, key)}{quote}"
+            text = _YAML_QUOTED_ASSIGN_RE.sub(_redact_yaml_quoted, text)
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
