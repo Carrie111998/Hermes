@@ -224,6 +224,39 @@ def test_render_large_db_with_pending_rebuild_suggests_optimize():
     assert "optimize-storage" in blob
 
 
+def test_render_large_db_with_auto_prune_enabled_is_informational():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big),
+        holders=None,
+        auto_prune_enabled=True,
+    )
+
+    matching = [line for line in lines if "state.db is large" in line[1]]
+    assert len(matching) == 1
+    assert matching[0][0] == "info"
+    assert matching[0][2] == "(sessions.auto_prune is enabled)"
+
+
+def test_render_large_db_pending_rebuild_with_auto_prune_only_suggests_optimize():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big, fts_rebuild_pending=True),
+        holders=None,
+        auto_prune_enabled=True,
+    )
+
+    matching = [line for line in lines if "state.db is large" in line[1]]
+    assert len(matching) == 1
+    assert matching[0][0] == "warn"
+    assert "optimize-storage" in matching[0][2]
+    assert "consider enabling" not in matching[0][2]
+
+
 def test_render_large_db_legacy_trigram_suggests_optimize():
     from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
 
