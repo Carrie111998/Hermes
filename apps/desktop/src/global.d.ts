@@ -87,7 +87,15 @@ declare global {
         setIgnoreMouse: (ignore: boolean) => void
         setFocusable: (focusable: boolean) => void
         pushState: (payload: PetOverlayStatePayload) => void
-        roamEnvironment: () => Promise<{
+        roamEnvironment: (probe?: {
+          maxCacheAgeMs?: number
+          petHeight?: number
+          petWidth: number
+          reuseCapture?: boolean
+          scanMode?: 'destination' | 'landing' | 'support'
+        }) => Promise<{
+          sceneRevision?: string
+          visualLedges?: Array<{ left: number; right: number; y: number }>
           windows: Array<{ height: number; width: number; x: number; y: number }>
           workArea: { height: number; width: number; x: number; y: number }
         } | null>

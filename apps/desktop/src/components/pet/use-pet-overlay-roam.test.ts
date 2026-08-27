@@ -2,13 +2,27 @@ import { renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  advanceOverlayVisualCandidate,
   clampOverlayRoamBounds,
+  nearestOverlayHopDestination,
+  overlayDropAllowed,
   overlayGroundY,
-  overlayHopArcHeight,
-  overlayHopMaxTravel,
-  overlayHopRange,
+  overlayHasSupport,
+  overlayHopApexY,
+  overlayHopDestinations,
+  overlayHopEndpointLanding,
+  overlayHopMaxVerticalTravel,
+  overlayHopYAtProgress,
+  overlayIdleAction,
+  overlayLandingAlongPath,
+  overlayMotionLandingLedges,
+  overlayMotionProbeIsCurrent,
+  overlayPlannedAction,
   overlayRoamLedges,
-  pickOverlayHopTarget,
+  overlaySupportAt,
+  overlaySupportMissOutcome,
+  overlayVerticalCorrection,
+  revalidateOverlayPlannedHop,
   usePetOverlayRoam
 } from './use-pet-overlay-roam'
 
@@ -41,6 +55,126 @@ describe('overlay roam geometry', () => {
     expect(overlayGroundY({ height: 1040, width: 1920, x: 0, y: 24 }, 300)).toBe(792)
   })
 
+  it('accepts a nearby ledge as support but not a clearly lower one', () => {
+    const bounds = { height: 300, width: 240, x: 200, y: 124 }
+
+    expect(overlayHasSupport([{ left: 100, right: 400, y: 400 }], bounds)).toBe(true)
+    expect(overlayHasSupport([{ left: 100, right: 400, y: 412 }], bounds)).toBe(false)
+    expect(overlaySupportAt([{ left: 100, right: 400, y: 420 }], bounds, 24)).not.toBeNull()
+  })
+
+  it('uses a 35% hop, 15% drop, and 50% walk distribution on elevated supports', () => {
+    expect(overlayIdleAction(true, () => 0.34)).toBe('hop')
+    expect(overlayIdleAction(true, () => 0.35)).toBe('drop')
+    expect(overlayIdleAction(true, () => 0.49)).toBe('drop')
+    expect(overlayIdleAction(true, () => 0.5)).toBe('walk')
+    expect(overlayIdleAction(true, () => 0.9)).toBe('walk')
+  })
+
+  it('moves the drop band to hops on the desktop floor', () => {
+    expect(overlayIdleAction(false, () => 0.49)).toBe('hop')
+    expect(overlayIdleAction(false, () => 0.5)).toBe('walk')
+    expect(overlayIdleAction(false, () => 0.9)).toBe('walk')
+  })
+
+  it('targets only an upper support directly above, or hops in place', () => {
+    const floor = { left: 0, right: 1000, y: 800 }
+    const elevated = { left: 100, right: 500, y: 600 }
+    const side = { left: 700, right: 900, y: 650 }
+
+    expect(overlayHopDestinations([floor], floor, 400, 70)).toEqual([{ ledge: floor }])
+    expect(overlayHopDestinations([floor, elevated], elevated, 300, 70)).toEqual([{ ledge: elevated }])
+    expect(overlayHopDestinations([floor, side], floor, 300, 70)).toEqual([{ ledge: floor }])
+    expect(overlayHopDestinations([floor, elevated, side], floor, 300, 70)).toEqual([{ ledge: elevated }])
+  })
+
+  it('forbids intentional drops when no hop destination exists', () => {
+    expect(overlayDropAllowed(true, true)).toBe(true)
+    expect(overlayDropAllowed(true, false)).toBe(false)
+    expect(overlayDropAllowed(false, true)).toBe(false)
+  })
+
+  it('forces a grounded action after a drag or vertical motion to walk', () => {
+    expect(overlayPlannedAction(true, 0, true, () => 0.1)).toBe('walk')
+    expect(overlayPlannedAction(true, 0, true, () => 0.5)).toBe('walk')
+    expect(overlayPlannedAction(true, 0, false, () => 0.1)).toBe('hop')
+  })
+
+  it('drops after three consecutive missed support probes', () => {
+    const first = overlaySupportMissOutcome(0)
+    const second = overlaySupportMissOutcome(first.failures)
+    const third = overlaySupportMissOutcome(second.failures)
+
+    expect(first).toEqual({ failures: 1, shouldDrop: false })
+    expect(second).toEqual({ failures: 2, shouldDrop: false })
+    expect(third).toEqual({ failures: 3, shouldDrop: true })
+  })
+
+  it('snaps small vertical edge jitter instead of starting a zero-distance motion', () => {
+    expect(overlayVerticalCorrection(192, 200)).toBe('snap')
+    expect(overlayVerticalCorrection(208, 200)).toBe('snap')
+    expect(overlayVerticalCorrection(191, 200)).toBe('fall')
+    expect(overlayVerticalCorrection(209, 200)).toBe('hop')
+  })
+
+  it('lands on the first valid surface crossed during descent', () => {
+    const ledges = [
+      { left: 0, right: 1000, y: 800 },
+      { left: 150, right: 300, y: 400 },
+      { left: 150, right: 300, y: 500 }
+    ]
+
+    expect(overlayLandingAlongPath(ledges, { x: 140, y: 60 }, { x: 220, y: 250 }, 300)).toEqual(ledges[1])
+    expect(overlayLandingAlongPath(ledges, { x: 220, y: 250 }, { x: 100, y: 60 }, 300)).toBeNull()
+    expect(overlayLandingAlongPath(ledges, { x: 0, y: 60 }, { x: 80, y: 250 }, 300)).toBeNull()
+  })
+
+  it('requires two consecutive visual samples before an airborne landing', () => {
+    const ledge = { left: 100, right: 400, y: 400 }
+    const first = advanceOverlayVisualCandidate(null, ledge)
+    const second = advanceOverlayVisualCandidate(first, { ...ledge, y: 408 })
+
+    expect(first).toEqual({ hits: 1, ledge })
+    expect(second).toEqual({ hits: 2, ledge: { ...ledge, y: 408 } })
+    expect(advanceOverlayVisualCandidate(second, null)).toBeNull()
+  })
+
+  it('keeps a planned visual destination eligible until the hop lands', () => {
+    const floor = { left: 0, right: 1000, y: 800 }
+    const destination = { left: 150, right: 300, y: 400 }
+    const landingLedges = overlayMotionLandingLedges([floor], null, destination)
+
+    expect(landingLedges).toEqual([floor, destination])
+    expect(overlayLandingAlongPath(landingLedges, { x: 140, y: 60 }, { x: 220, y: 130 }, 300)).toEqual(destination)
+    expect(overlayMotionLandingLedges([floor], destination, destination)).toEqual([floor, destination])
+  })
+
+  it('settles on the planned endpoint even when a frame skips the descending crossing', () => {
+    const destination = { left: 150, right: 300, y: 400 }
+
+    expect(overlayHopEndpointLanding(destination, 799, 800)).toBeNull()
+    expect(overlayHopEndpointLanding(destination, 800, 800)).toBe(destination)
+  })
+
+  it('drops a planned hop destination after two refreshed scenes no longer contain it', () => {
+    const destination = { left: 150, right: 300, y: 400 }
+    const firstMiss = revalidateOverlayPlannedHop(destination, [], 0)
+    const secondMiss = revalidateOverlayPlannedHop(firstMiss.ledge, [], firstMiss.failures)
+
+    expect(firstMiss).toEqual({ failures: 1, ledge: destination })
+    expect(secondMiss).toEqual({ failures: 2, ledge: null })
+    expect(revalidateOverlayPlannedHop(destination, [{ ...destination, y: 406 }], 1)).toEqual({
+      failures: 0,
+      ledge: { ...destination, y: 406 }
+    })
+  })
+
+  it('rejects surface probe results from a previous movement phase', () => {
+    expect(overlayMotionProbeIsCurrent(4, 4, 'hop', 'hop')).toBe(true)
+    expect(overlayMotionProbeIsCurrent(4, 5, 'hop', 'hop')).toBe(false)
+    expect(overlayMotionProbeIsCurrent(4, 4, 'hop', 'walk')).toBe(false)
+  })
+
   it('turns visible app-window top edges into ledges and removes covered spans', () => {
     const ledges = overlayRoamLedges(
       {
@@ -62,6 +196,28 @@ describe('overlay roam geometry', () => {
     ])
   })
 
+  it('adds a visually detected horizontal surface without duplicating a native edge', () => {
+    const ledges = overlayRoamLedges(
+      {
+        visualLedges: [
+          { left: 100, right: 500, y: 310 },
+          { left: 100, right: 500, y: 408 }
+        ],
+        windows: [{ height: 300, width: 500, x: 50, y: 400 }],
+        workArea: { height: 800, width: 1200, x: 0, y: 0 }
+      },
+      240,
+      64,
+      70
+    )
+
+    expect(ledges).toEqual([
+      { left: -88, right: 1048, y: 800 },
+      { left: -38, right: 398, y: 400 },
+      { left: 12, right: 348, y: 310 }
+    ])
+  })
+
   it('falls back to the display floor when a maximized front window covers everything', () => {
     const ledges = overlayRoamLedges(
       {
@@ -79,21 +235,25 @@ describe('overlay roam geometry', () => {
     expect(ledges).toEqual([{ left: -88, right: 1048, y: 800 }])
   })
 
-  it('limits sideways hops and uses a taller arc', () => {
-    const ledge = { left: 0, right: 1200, y: 700 }
-    const range = overlayHopRange(ledge, ledge, 500, 64)
-
-    expect(overlayHopMaxTravel(64)).toBe(96)
-    expect(range).toEqual({ left: 404, right: 596, y: 700 })
-    expect(pickOverlayHopTarget(range!, 500, () => 1)).toBe(596)
-    expect(overlayHopArcHeight(70, 0)).toBe(105)
-    expect(overlayHopArcHeight(70, 100)).toBe(160)
+  it('limits upper support search to three rendered pet heights', () => {
+    expect(overlayHopMaxVerticalTravel(70)).toBe(210)
   })
 
-  it('rejects a destination ledge that is too far away for one hop', () => {
-    expect(
-      overlayHopRange({ left: 0, right: 800, y: 700 }, { left: 300, right: 700, y: 500 }, 100, 64)
-    ).toBeNull()
+  it('passes through a destination-aware apex and lands at the target height', () => {
+    const apex = overlayHopApexY(70, 420)
+
+    expect(apex).toBe(385)
+    expect(overlayHopYAtProgress(600, apex, 420, 0)).toBe(600)
+    expect(overlayHopYAtProgress(600, apex, 420, 0.5)).toBe(385)
+    expect(overlayHopYAtProgress(600, apex, 420, 1)).toBe(420)
+  })
+
+  it('chooses the nearest valid support as the hop destination', () => {
+    const nearby = { ledge: { left: 150, right: 260, y: 500 } }
+    const farther = { ledge: { left: 20, right: 180, y: 300 } }
+
+    expect(nearestOverlayHopDestination([farther, nearby], 600)).toBe(nearby)
+    expect(nearestOverlayHopDestination([], 600)).toBeNull()
   })
 
   it('replans immediately when the drag completion key changes', async () => {
