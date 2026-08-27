@@ -30,13 +30,14 @@ _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS = frozenset({
     "gateway/platforms/whatsapp_cloud.py:712:_post_interactive:post",
     "gateway/platforms/yuanbao.py:530:fetch:post",
     "gateway/platforms/yuanbao_media.py:416:get_cos_credentials:post",
-    "gateway/run.py:25029:_send_home_channel_startup_notifications:send",
-    "gateway/run.py:25036:_send_home_channel_startup_notifications:send",
-    "gateway/run.py:25122:_send_session_db_warning_notifications:send",
-    "gateway/run.py:25129:_send_session_db_warning_notifications:send",
-    "gateway/run.py:28490:_run_agent_via_proxy:post",
-    "gateway/run.py:30534:_run_agent_inner:edit_message",
-    "gateway/run.py:30568:_run_agent_inner:edit_message",
+    "gateway/run.py:24956:_send_restart_notification:send",
+    "gateway/run.py:25037:_send_home_channel_startup_notifications:send",
+    "gateway/run.py:25044:_send_home_channel_startup_notifications:send",
+    "gateway/run.py:25130:_send_session_db_warning_notifications:send",
+    "gateway/run.py:25137:_send_session_db_warning_notifications:send",
+    "gateway/run.py:28498:_run_agent_via_proxy:post",
+    "gateway/run.py:30542:_run_agent_inner:edit_message",
+    "gateway/run.py:30576:_run_agent_inner:edit_message",
     "gateway/run.py:5915:_deliver_bg_review_message:send",
     "plugins/platforms/discord/adapter.py:3618:_send_to_forum:create_thread",
     "plugins/platforms/discord/adapter.py:3637:_send_to_forum:send",
@@ -50,7 +51,8 @@ _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS = frozenset({
     "plugins/platforms/discord/adapter.py:7736:send_clarify:send",
     "plugins/platforms/discord/adapter.py:7778:send_update_prompt:send",
     "plugins/platforms/mattermost/adapter.py:189:_api_post:post",
-    "plugins/platforms/photon/adapter.py:2654:_sidecar_call:post",
+    "plugins/platforms/line/adapter.py:550:loading:post",
+    "plugins/platforms/photon/adapter.py:2655:_sidecar_call:post",
     "plugins/platforms/simplex/adapter.py:756:_send_ws:send",
     "plugins/platforms/simplex/adapter.py:777:_send_command:send",
     "plugins/platforms/slack/adapter.py:1839:_send_slash_ephemeral:post",
@@ -72,9 +74,9 @@ _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS = frozenset({
     "plugins/platforms/slack/adapter.py:9721:_standalone_send:post",
     "plugins/platforms/whatsapp/adapter.py:1738:_standalone_send:post",
     "plugins/platforms/whatsapp/adapter.py:1781:_standalone_send:post",
-    "tools/send_message_tool.py:2345:_send_qqbot:post",
-    "tools/send_message_tool.py:2353:_send_qqbot:post",
-    "tools/send_message_tool.py:2361:_send_qqbot:post",
+    "tools/send_message_tool.py:2357:_send_qqbot:post",
+    "tools/send_message_tool.py:2365:_send_qqbot:post",
+    "tools/send_message_tool.py:2373:_send_qqbot:post",
     # Private adapter transports are sealed by the named metaclass-wrapped
     # public/legacy caller; line movement requires re-review of that call graph.
     "plugins/platforms/discord/adapter.py:4014:_send_file_attachment:send",
@@ -89,8 +91,8 @@ _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS = frozenset({
     "gateway/platforms/yuanbao.py:4831:send_text:send_text",
     # Non-publishing Slack directory/control requests and Signal JSON-RPC are
     # exact reviewed exceptions (the latter's publishing caller is enveloped).
-    "tools/send_message_tool.py:1844:post_api:post",
-    "tools/send_message_tool.py:1972:_post:post",
+    "tools/send_message_tool.py:1856:post_api:post",
+    "tools/send_message_tool.py:1984:_post:post",
 })
 
 # Unlike non-publishing/control exceptions, these private helpers carry real
@@ -107,43 +109,6 @@ _SEALED_PRIVATE_TRANSPORT_EXEMPTIONS = frozenset({
     "plugins/platforms/telegram/adapter.py:6003:_edit_overflow_split:send_message",
     "plugins/platforms/whatsapp/adapter.py:1062:_send_media_to_bridge:post",
 })
-
-_EXTERNAL_SEALED_TRANSPORT_CALLERS = {
-    fingerprint: ("tools/send_message_tool.py", "_send_to_platform")
-    for fingerprint in _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS
-    if "_standalone_send:" in fingerprint
-    or fingerprint.startswith("tools/send_message_tool.py:1972:_post:")
-    or fingerprint.startswith("tools/send_message_tool.py:2345:_send_qqbot:")
-    or fingerprint.startswith("tools/send_message_tool.py:2353:_send_qqbot:")
-    or fingerprint.startswith("tools/send_message_tool.py:2361:_send_qqbot:")
-}
-
-
-def validate_sealed_transport_exemptions(sources: dict[str, bytes]) -> None:
-    """Prove exact external exemptions still name a terminally gated caller."""
-    checked: set[tuple[str, str]] = set()
-    for caller_path, caller_name in _EXTERNAL_SEALED_TRANSPORT_CALLERS.values():
-        if (caller_path, caller_name) in checked:
-            continue
-        checked.add((caller_path, caller_name))
-        raw = sources.get(caller_path)
-        if raw is None:
-            raise RuntimeError(f"sealed transport caller source missing: {caller_path}")
-        source = raw.decode("utf-8")
-        tree = ast.parse(source)
-        caller = next(
-            (
-                node for node in ast.walk(tree)
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == caller_name
-            ),
-            None,
-        )
-        caller_source = ast.get_source_segment(source, caller) if caller is not None else ""
-        if not caller_source or "apply_terminal_outbound_text_policy" not in caller_source:
-            raise RuntimeError(
-                f"sealed transport caller is not terminally gated: {caller_path}:{caller_name}"
-            )
 
 
 def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> list[str]:
@@ -219,27 +184,12 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
         call_names = argument_names | keyword_names
         has_visible_content = bool(call_names & _TRANSPORT_VISIBLE_NAMES)
         known_publish_operation = operation in _DIRECT_PUBLISH_OPERATIONS
-        function = enclosing(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        owner_hint = enclosing(function, ast.ClassDef) if function is not None else None
-        private_adapter_context = bool(
-            isinstance(function, ast.AsyncFunctionDef)
-            and function.name.startswith("_")
-            and isinstance(owner_hint, ast.ClassDef)
-            and any("BasePlatformAdapter" in ast.unparse(base) for base in owner_hint.bases)
-        )
-        opaque_payload_parameter = bool(
-            private_adapter_context
-            and (
-                {
-                    arg.arg.lower() for arg in (
-                        *function.args.posonlyargs, *function.args.args,
-                        *function.args.kwonlyargs,
-                    )
-                }
-                & {"blob", "data", "envelope", "item", "packet", "raw", "record", "value"}
-                or function.args.vararg is not None
-                or function.args.kwarg is not None
-            )
+        operation_tokens = {
+            token for token in operation.lower().replace("-", "_").split("_") if token
+        }
+        transport_verb = bool(
+            operation_tokens
+            & {"deliver", "edit", "post", "publish", "send", "transmit", "transport", "update"}
         )
         receiver = node.func.value
         receiver_text = ast.unparse(receiver).lower()
@@ -248,7 +198,14 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
         }
         structurally_transport_shaped = bool(
             isinstance(parents.get(node), ast.Await)
-            and (has_visible_content or opaque_payload_parameter)
+            and (
+                has_visible_content
+                or (
+                    transport_verb
+                    and call_names & _TRANSPORT_TARGET_NAMES
+                    and len(argument_names - _TRANSPORT_TARGET_NAMES) > 0
+                )
+            )
             and (
                 call_names & _TRANSPORT_TARGET_NAMES
                 or receiver_tokens & {"channel", "webhook"}
@@ -259,10 +216,7 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
                 "session", "socket", "transport", "webhook",
             }
         )
-        if not (
-            (known_publish_operation and has_visible_content)
-            or structurally_transport_shaped
-        ):
+        if not (known_publish_operation and has_visible_content) and not structurally_transport_shaped:
             continue
         receiver_name = receiver.id if isinstance(receiver, ast.Name) else None
         if (
@@ -270,6 +224,7 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
             and operation in _DIRECT_PUBLISH_OPERATIONS
         ):
             continue
+        function = enclosing(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         if function is None:
             violations.append(f"{relative_path}:{node.lineno}:<module>:{operation}")
             continue

@@ -703,6 +703,15 @@ def test_instance_sync_publisher_assignment_is_forbidden():
         adapter.publish_native = publish_native
 
 
+def test_instance_private_async_publisher_with_opaque_payload_is_forbidden():
+    async def _publish_raw(chat_id, data):
+        return chat_id, data
+
+    adapter = GateAdapter()
+    with pytest.raises(TypeError, match="private async adapter assignment"):
+        adapter._publish_raw = _publish_raw
+
+
 @pytest.mark.asyncio
 async def test_instance_non_content_helper_and_mutable_state_remain_ordinary():
     async def _lookup_state(key):

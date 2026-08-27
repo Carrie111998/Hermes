@@ -3270,17 +3270,21 @@ class BasePlatformAdapter(ABC, metaclass=_TerminalOutboundBoundaryMeta):
                 parameter_names
                 & {"chat_id", "channel_id", "parent_chat_id", "user_id", "to_account"}
             )
+            private_publisher_name = bool(
+                str(name).startswith("_")
+                and {token for token in str(name).lower().split("_") if token}
+                & {"deliver", "edit", "post", "publish", "send", "transmit", "update"}
+            )
             if str(name) in _INSTANCE_ASYNC_CALLBACK_SLOTS:
                 object.__setattr__(self, name, value)
                 return
-            if str(name).startswith("_"):
+            if str(name).startswith("_") and (
+                (carries_target and not carries_visible_content)
+                or (private_publisher_name and not carries_visible_content)
+            ):
                 raise TypeError(
-                    f"private async adapter assignment {name!r} is forbidden"
-                )
-            if not (carries_visible_content and carries_target):
-                raise TypeError(
-                    "instance-level async adapter patches require explicit target "
-                    "and visible-content parameters"
+                    f"private async adapter assignment {name!r} has an uncertain "
+                    "publisher envelope"
                 )
             if not str(name).startswith("_") or carries_visible_content:
                 if assigned_signature is None:

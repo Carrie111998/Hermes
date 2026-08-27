@@ -1471,6 +1471,18 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
     """
+    from gateway.platforms.base import apply_terminal_outbound_payload_policy
+
+    gated_envelope, changed = apply_terminal_outbound_payload_policy(
+        platform="telegram",
+        chat_id=str(chat_id),
+        payload={"content": message, "media": media_files or []},
+        metadata={"thread_id": thread_id} if thread_id else None,
+        operation="telegram_standalone_sender",
+    )
+    if changed:
+        message = gated_envelope
+        media_files = []
     try:
         from telegram import Bot
         from telegram.constants import ParseMode

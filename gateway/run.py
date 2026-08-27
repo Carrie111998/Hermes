@@ -22700,7 +22700,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel = adapter._client.get_channel(text_ch_id)
             if channel:
                 safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+                from gateway.platforms.base import apply_terminal_outbound_text_policy
+
+                voice_notice = apply_terminal_outbound_text_policy(
+                    platform="discord",
+                    chat_id=str(text_ch_id),
+                    content=f"**[Voice]** <@{user_id}>: {safe_text}",
+                    operation="voice_channel_transcript",
+                )
+                await channel.send(voice_notice)
         except Exception:
             pass
 
