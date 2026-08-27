@@ -5346,6 +5346,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # shared chokepoint in hermes_constants (Closes #21256).
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        # Set when an explicit --reasoning was applied. Model switches re-run
+        # the chokepoint for the new model (#96012) and must not clobber a
+        # level the user pinned on the command line.
+        self._reasoning_cli_flag_applied = False
         # An explicit --reasoning wins over config for this run only (never
         # persisted). Kanban's dispatcher uses it to pin a task's thinking
         # depth without touching the worker profile's config.yaml. An
@@ -5360,6 +5364,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             else:
                 self.reasoning_config = _cli_reasoning
+                self._reasoning_cli_flag_applied = True
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -11213,10 +11218,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "reasoning_config": getattr(self, "reasoning_config", None),
         }
         self.model = result.new_model
         self.provider = result.target_provider
         self.requested_provider = result.target_provider
+        # Re-resolve the per-model reasoning override for the NEW model.
+        # self.reasoning_config was resolved against the model that was live
+        # at startup; leaving it stale means the next agent
+        # re-initialization injects the old model's effort over the per-model
+        # override the in-place switch just applied — providers that accept a
+        # narrower level set then 400 (#96012). An explicit --reasoning stays
+        # authoritative for the whole run.
+        if not getattr(self, "_reasoning_cli_flag_applied", False):
+            try:
+                from hermes_constants import resolve_reasoning_config
+                self.reasoning_config = resolve_reasoning_config(
+                    CLI_CONFIG, result.new_model
+                )
+            except Exception:
+                logger.debug(
+                    "reasoning re-resolution for %s failed; keeping prior level",
+                    result.new_model, exc_info=True,
+                )
         # Always overwrite explicit overrides so stale credentials from the
         # previous provider (e.g. Ollama api_key/base_url) don't leak into
         # the new provider's credential resolution on the next turn.
