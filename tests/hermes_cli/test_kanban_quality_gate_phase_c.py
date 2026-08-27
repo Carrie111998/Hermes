@@ -46,7 +46,7 @@ def test_workers_cannot_self_certify_quality_pass(routed_conn):
     task_id, _implementation_run_id, review_run_id = _review_run(routed_conn)
 
     assert not kb.complete_task(routed_conn, task_id, expected_run_id=review_run_id)
-    assert kb.get_task(routed_conn, task_id).status == "running"
+    assert kb.get_task(routed_conn, task_id).status == "escalation_required"
     assert not kb.record_quality_gate(
         routed_conn,
         task_id=task_id,
@@ -74,7 +74,6 @@ def test_operator_configured_gate_executes_in_task_workspace_and_records_same_ru
         },
     )
 
-    assert kb.execute_quality_gates(routed_conn, task_id=task_id, run_id=review_run_id)
     assert kb.complete_task(routed_conn, task_id, expected_run_id=review_run_id)
 
     run = kb.get_run(routed_conn, review_run_id)

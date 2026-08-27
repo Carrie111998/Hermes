@@ -5719,6 +5719,28 @@ def complete_task(
     else:
         verified_cards = []
 
+    # The domain completion boundary owns quality execution.  Run the persisted
+    # command before entering the completion write transaction; holding SQLite's
+    # write lock across a subprocess would block every board writer.  A pass is
+    # then re-checked by the CAS-protected event query below.
+    quality_row = conn.execute(
+        "SELECT current_run_id, quality_policy_json FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if quality_row is not None and _quality_policy_required(quality_row):
+        gate_run_id = expected_run_id if expected_run_id is not None else quality_row["current_run_id"]
+        already_passed = (
+            conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='quality_passed' LIMIT 1",
+                (task_id, int(gate_run_id)),
+            ).fetchone()
+            if gate_run_id is not None else None
+        )
+        if already_passed is None:
+            if gate_run_id is None or not execute_quality_gates(
+                conn, task_id=task_id, run_id=int(gate_run_id),
+            ):
+                return False
+
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
