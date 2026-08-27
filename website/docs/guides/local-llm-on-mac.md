@@ -17,6 +17,52 @@ We cover two backends:
 
 Both expose an OpenAI-compatible `/v1/chat/completions` endpoint. Hermes works with either one — just point it at `http://localhost:8080` or `http://localhost:8000`.
 
+## Mac model server with Hermes in a Proxmox LXC
+
+The model server and Hermes do not need to run on the same machine. A common homelab layout is:
+
+```text
+Mac (Apple Silicon)                 Proxmox LXC
+llama-server / omlx / Ollama  <───  Hermes Agent + hermes serve
+                                  └─ tools, files, sessions, credentials
+```
+
+In this layout, configure the **Mac's reachable LAN or Tailscale address** in Hermes — never `localhost`. From inside the LXC, verify the endpoint first:
+
+```bash
+# Replace 192.168.1.50 and the port with your Mac and model server.
+curl -s http://192.168.1.50:8080/v1/models | jq .
+```
+
+The Mac model server must listen on an address reachable from the LXC. For `llama-server`, use `--host 0.0.0.0`; for Ollama, set `OLLAMA_HOST=0.0.0.0`; for omlx or LM Studio, enable network serving in the application. Prefer a firewall rule that allows only the LXC or Tailscale network rather than exposing the port to the whole internet.
+
+### Define selectable Mac backends
+
+If you run more than one server or want to keep a local fallback, define each endpoint as a named provider in the LXC's `~/.hermes/config.yaml`:
+
+```yaml
+providers:
+  mac-llama:
+    name: Mac llama.cpp
+    api: http://192.168.1.50:8080/v1
+    default_model: Qwen3.5-9B-Q4_K_M.gguf
+    discover_models: true
+
+  mac-ollama:
+    name: Mac Ollama
+    api: http://192.168.1.50:11434/v1
+    default_model: qwen3.5:9b
+    discover_models: true
+```
+
+Run `hermes model` in the LXC to choose **Mac llama.cpp** or **Mac Ollama**. The selected provider and model are used by the Hermes process in the LXC; terminal commands, file operations, sessions, and persistent state remain in the LXC. You can switch again later with `hermes model`, or use `/model` in an active chat when you want an explicit session-scoped change.
+
+If you use Hermes Desktop on the Mac with **Settings → Gateways** pointed at the LXC, open the model picker while that remote gateway/profile is active. The picker reads the remote profile's provider inventory, so the Mac endpoints must be configured in the LXC — not in the Mac Desktop client's local config. A model selected there changes the remote Hermes profile only.
+
+:::warning Network and authentication
+A model server reachable over your LAN or Tailscale is still a network service. Bind it only to the interface you need, restrict its firewall access, and use an API key or `key_env` when the server supports authentication. Do not put model-server credentials in a checked-in `config.yaml`; use `key_env` with a secret in the LXC's `~/.hermes/.env`.
+:::
+
 :::info Apple Silicon only
 This guide targets Macs with Apple Silicon (M1 and later). Intel Macs will work with llama.cpp but without GPU acceleration — expect significantly slower performance.
 :::
