@@ -431,12 +431,6 @@ function migrateLegacyStore(store: Storage): void {
     return
   }
 
-  // Claim the migration before touching legacy state. If storage is failing,
-  // skip recovery rather than retrying expensive parsing on every read.
-  if (!writeRaw(store, LEGACY_MIGRATION_KEY, '1')) {
-    return
-  }
-
   const candidates: Array<[string, InFlightTurnSnapshot]> = []
   const legacySessionKeys: string[] = []
   const legacyProfileSessionKeys: string[] = []
@@ -457,7 +451,6 @@ function migrateLegacyStore(store: Storage): void {
 
   for (const key of legacySessionKeys) {
     const raw = readRaw(store, key)
-    removeRaw(store, key)
 
     if (!raw || raw === DISCARDED_SNAPSHOT_RAW) {
       continue
@@ -479,7 +472,6 @@ function migrateLegacyStore(store: Storage): void {
 
   for (const key of legacyProfileSessionKeys) {
     const raw = readRaw(store, key)
-    removeRaw(store, key)
 
     if (!raw || raw === DISCARDED_SNAPSHOT_RAW) {
       continue
@@ -502,7 +494,6 @@ function migrateLegacyStore(store: Storage): void {
   }
 
   const aggregateRaw = readRaw(store, LEGACY_STORAGE_KEY)
-  removeRaw(store, LEGACY_STORAGE_KEY)
 
   if (aggregateRaw && aggregateRaw.length <= MAX_LEGACY_STORE_CHARS) {
     try {
@@ -546,17 +537,32 @@ function migrateLegacyStore(store: Storage): void {
     return
   }
 
-  for (const [storedSessionId, snapshot] of candidates
-    .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
-    .slice(0, Math.max(0, MAX_ENTRIES - existingKeys.size))) {
+  for (const [storedSessionId, snapshot] of candidates.sort((left, right) => right[1].updatedAt - left[1].updatedAt)) {
     const owner = journalOwner(storedSessionId, snapshot.profile, snapshot.connectionId)
     const messages = boundedMessages(snapshot.messages)
     const value = messages ? serializeSnapshot({ ...snapshot, messages }) : null
 
-    if (owner && value && readRaw(store, owner.key) === null && writeRaw(store, owner.key, value)) {
+    if (owner && value && readRaw(store, owner.key) === null) {
+      if (!writeRaw(store, owner.key, value)) {
+        return
+      }
+
       existingKeys.add(owner.key)
     }
   }
+
+  // Commit the migration only after every replacement record is durable. A
+  // quota/setItem failure leaves all legacy records and the marker untouched,
+  // so the next read can retry without data loss.
+  if (!writeRaw(store, LEGACY_MIGRATION_KEY, '1')) {
+    return
+  }
+
+  for (const key of [...legacySessionKeys, ...legacyProfileSessionKeys]) {
+    removeRaw(store, key)
+  }
+
+  removeRaw(store, LEGACY_STORAGE_KEY)
 }
 
 function discardSnapshot(store: Storage, key: string): void {

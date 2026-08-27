@@ -635,6 +635,40 @@ describe('legacy journal migration', () => {
     expect(window.localStorage.getItem(STORAGE_KEY)).not.toBeNull()
   })
 
+  it('keeps legacy records retryable when a replacement write fails', () => {
+    const legacy = {
+      messages: [user('u1', 'one'), assistant('a1', 'partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
+      streamId: 'a1',
+      turnStartedAt: 1,
+      updatedAt: Date.now()
+    }
+    const legacyKey = legacyProfileSessionStorageKey('stored-1')
+    const replacementKey = sessionStorageKey('stored-1')
+    window.localStorage.setItem(legacyKey, JSON.stringify(legacy))
+
+    const originalSetItem = Storage.prototype.setItem
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key, value) {
+      if (key === replacementKey) {
+        throw new DOMException('quota exceeded', 'QuotaExceededError')
+      }
+      return originalSetItem.call(this, key, value)
+    })
+
+    expect(readInFlightTurnJournal('stored-1')).toBeNull()
+    expect(window.localStorage.getItem(legacyKey)).not.toBeNull()
+    expect(window.localStorage.getItem(replacementKey)).toBeNull()
+    expect(window.localStorage.getItem(MIGRATION_KEY)).toBeNull()
+
+    setItem.mockRestore()
+
+    expect(readInFlightTurnJournal('stored-1')).toEqual(legacy)
+    expect(window.localStorage.getItem(legacyKey)).toBeNull()
+    expect(window.localStorage.getItem(replacementKey)).not.toBeNull()
+    expect(window.localStorage.getItem(MIGRATION_KEY)).toBe('1')
+  })
+
   it('drops an oversized legacy aggregate without parsing it', () => {
     window.localStorage.setItem(STORAGE_KEY, 'x'.repeat(2 * 1024 * 1024 + 1))
 
