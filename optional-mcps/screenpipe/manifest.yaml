@@ -52,9 +52,10 @@ post_install: |
   audio while recording is enabled. Review its retention and delete-range
   controls at https://docs.screenpipe.com/api-recipes before enabling capture.
 
-  Install and run the screenpipe desktop app before using these tools. The MCP
-  server connects only to screenpipe's local API at http://localhost:3030 and
-  discovers its local API key from the desktop installation.
+  Install and run the screenpipe desktop app, or start the CLI with
+  `npx screenpipe record`, before using these tools. The MCP server connects
+  only to screenpipe's local API at http://localhost:3030 and discovers its
+  local API key from the screenpipe installation.
 
   The default tool selection is read-only. Review the install-time checklist
   before enabling tools that update memories, meetings, recordings, or pipes.
