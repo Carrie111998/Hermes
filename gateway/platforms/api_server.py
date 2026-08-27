@@ -909,6 +909,24 @@ except ImportError:
         already short-circuited the request by then."""
 
 
+def _cron_job_paused_exc() -> type:
+    """Resolve ``cron.jobs.JobPaused`` at CALL time, not import time.
+
+    ``importlib.reload(cron.jobs)`` builds a NEW class object, and an
+    ``except`` clause holding the pre-reload one silently stops matching:
+    the run handler falls through to its generic handler and answers 500
+    where the contract says 409. That is the worst possible reply here —
+    a held job's whole point is to explain itself, and a 500 says nothing
+    at all. Re-importing costs a ``sys.modules`` lookup and cannot drift.
+    """
+    try:
+        from cron.jobs import JobPaused
+
+        return JobPaused
+    except ImportError:  # pragma: no cover — cron absent, see the stand-in
+        return _CronJobPaused
+
+
 def _notify_cron_provider_jobs_changed() -> None:
     """Tell the active cron scheduler provider the job set changed after a REST
     mutation (no-op for the built-in). Best-effort — never breaks the handler."""
@@ -4716,7 +4734,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
-        except _CronJobPaused as paused:
+        except _cron_job_paused_exc() as paused:
             return web.json_response(
                 {
                     "error": str(paused),

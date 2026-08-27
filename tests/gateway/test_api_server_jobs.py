@@ -597,6 +597,50 @@ class TestRunJob:
         assert "Gate-2 containment barrier" in data["error"]
 
     @pytest.mark.asyncio
+    async def test_run_job_still_409s_after_cron_jobs_is_reloaded(self, adapter):
+        """The 409 must not depend on class IDENTITY surviving a reload.
+
+        api_server bound ``JobPaused`` at import time. ``tests/cron/
+        test_activity_telemetry.py`` calls ``importlib.reload(cron.jobs)``,
+        which builds a NEW class object — so the ``except`` clause stopped
+        matching and this route answered 500 instead of 409, but ONLY when
+        that suite ran first. It passed alone and failed in the full run.
+        A held job answering 500 tells the operator nothing, which is the
+        one thing this route exists not to do.
+        """
+        import importlib
+
+        import cron.jobs
+
+        importlib.reload(cron.jobs)
+        try:
+            app = _create_app(adapter)
+            paused = {
+                **SAMPLE_JOB,
+                "state": "paused",
+                "enabled": False,
+                "paused_at": "2026-08-25T15:38:09-04:00",
+                "paused_reason": "Gate-2 containment barrier",
+            }
+            # Deliberately the RELOADED class, i.e. the one api_server's
+            # import-time binding no longer is.
+            mock_trigger = MagicMock(side_effect=cron.jobs.JobPaused(paused))
+            async with TestClient(TestServer(app)) as cli:
+                with patch(
+                    f"{_MOD}._CRON_AVAILABLE", True
+                ), patch(
+                    f"{_MOD}._cron_trigger", mock_trigger
+                ):
+                    resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                    assert resp.status == 409
+                    data = await resp.json()
+
+            assert data["paused_reason"] == "Gate-2 containment barrier"
+        finally:
+            # Leave the module as we found it for whatever runs next.
+            importlib.reload(cron.jobs)
+
+    @pytest.mark.asyncio
     async def test_run_job_refuses_during_gateway_drain(self, adapter):
         app = _create_app(adapter)
         runner = SimpleNamespace(_draining=False, _external_drain_active=True)
