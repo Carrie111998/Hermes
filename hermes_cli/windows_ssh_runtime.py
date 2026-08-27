@@ -450,6 +450,18 @@ def inspect_hermes(hermes_path: str) -> dict[str, Any]:
     }
 
 
+def list_profiles() -> dict[str, Any]:
+    """Inventory Hermes profiles on this host without spawning any backend.
+
+    Delegates to the canonical profile registry so the roster Desktop sees is
+    exactly what this installation serves: canonical ``default`` plus every
+    valid named profile directory under the Hermes root.
+    """
+    from hermes_cli.profiles import list_profile_names
+
+    return {"profiles": list_profile_names()}
+
+
 def dispatch(argv: list[str]) -> Any:
     if not argv:
         raise ValueError("missing operation")
@@ -457,6 +469,8 @@ def dispatch(argv: list[str]) -> Any:
     if operation == "probe":
         import platform
         return {"os": "Windows", "arch": platform.machine(), "hermesHome": str(get_default_hermes_root()), "python": sys.executable}
+    if operation == "list-profiles" and len(argv) == 1:
+        return list_profiles()
     if operation == "upload-token" and len(argv) == 3:
         return upload_token(argv[1], argv[2], sys.stdin.buffer.read(65))
     if operation == "read-lock" and len(argv) == 2:
