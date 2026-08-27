@@ -4960,11 +4960,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False
+            # A dropped SSE connection is only a dead transport, not a stop
+            # signal: the session endpoint always persists to state.db, so
+            # leave the agent running server-side and drain the now-unread
+            # queue (ref issue #15026 — for persisted turns, SSE is only a
+            # transport and disconnect must not cancel execution). The Stop
+            # button interrupts explicitly via POST /v1/runs/{run_id}/stop.
+            await self._detach_session_stream_task_on_disconnect(run_id, queue)
+            logger.info(
+                "Session SSE client disconnected; detached live run %s "
+                "(stop via /v1/runs/%s/stop)",
+                run_id,
+                run_id,
             )
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
         except asyncio.CancelledError:
+            # Task cancellation (server shutdown) still interrupts: the gateway
+            # is going away, so letting the turn finish is pointless.
             await self._drain_session_stream_task_on_disconnect(
                 run_id, task, interrupt_message="SSE task cancelled", shield_wait=True
             )
@@ -4995,6 +5006,37 @@ class APIServerAdapter(BasePlatformAdapter):
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
+
+    async def _detach_session_stream_task_on_disconnect(
+        self,
+        run_id: str,
+        queue: "asyncio.Queue",
+    ) -> None:
+        """Detach a client-disconnected session stream without interrupting it.
+
+        The session endpoint always persists to state.db, so a dropped SSE
+        connection is only a dead transport, not a stop signal (ref issue
+        #15026). The agent turn runs in ``_run_and_signal`` — already a
+        ``_background_tasks`` member independent of this handler — and keeps
+        producing events into *queue*. Drain those events until the end
+        sentinel so they don't accumulate in memory for the remainder of the
+        turn. The Stop button halts a detached run via
+        ``POST /v1/runs/{run_id}/stop``.
+        """
+
+        async def _drain() -> None:
+            with suppress(Exception):
+                while True:
+                    if await queue.get() is None:
+                        break
+
+        drain_task = asyncio.create_task(_drain())
+        try:
+            self._background_tasks.add(drain_task)
+        except TypeError:
+            pass
+        if hasattr(drain_task, "add_done_callback"):
+            drain_task.add_done_callback(self._background_tasks.discard)
 
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
