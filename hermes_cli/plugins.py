@@ -233,6 +233,12 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway outbound policy hook. Fired at the platform-adapter boundary for
+    # both sends and edits, immediately before user-visible I/O. Callbacks may
+    # allow, rewrite, or block the message. This hook is fail-closed on timeout
+    # and callback error because it is an enforcement boundary, not telemetry.
+    # Kwargs: platform, chat_id, content, metadata, operation.
+    "pre_gateway_send",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -440,7 +446,10 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
 # Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
+    "pre_tool_call",
+    "pre_gateway_send",
+}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
@@ -3713,11 +3722,17 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     )
 
 
-def _pre_tool_call_timeout_block() -> Dict[str, str]:
-    """Fail-closed directive when a policy callback times out or is still running."""
+def _policy_hook_block(hook_name: str, *, error: bool = False) -> Dict[str, str]:
+    """Fail-closed directive when a policy callback does not produce a decision."""
+    if hook_name == "pre_tool_call":
+        return {
+            "action": "block",
+            "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        }
+    failure = "raised an error" if error else "timed out or is still running"
     return {
         "action": "block",
-        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        "reason": f"{hook_name} policy callback {failure}",
     }
 
 
@@ -5619,7 +5634,7 @@ class PluginManager:
                                 callback_name,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(_policy_hook_block(hook_name))
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -5670,7 +5685,7 @@ class PluginManager:
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(_policy_hook_block(hook_name))
                         continue
                     if "exc" in failure:
                         raise failure["exc"]
@@ -5686,6 +5701,8 @@ class PluginManager:
                     callback_name,
                     exc,
                 )
+                if fail_closed:
+                    results.append(_policy_hook_block(hook_name, error=True))
         return results
 
     def _subscribe_event(
