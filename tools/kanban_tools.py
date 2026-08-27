@@ -799,9 +799,11 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                subscribed=subscribed,
             )
         finally:
             conn.close()
@@ -810,6 +812,36 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+    """Subscribe only a Telegram-originated graph root, best-effort.
+
+    Graph edges are committed by ``create_task`` before this function runs;
+    checking them here prevents child fan-out from inheriting the root chat.
+    """
+    from gateway.session_context import get_session_env
+    from hermes_cli import kanban_db as kb
+
+    if kb.parent_ids(conn, task_id):
+        return False
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if platform != "telegram" or not chat_id:
+        return False
+    try:
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        profile = get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE") or "default"
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id=chat_id,
+            thread_id=thread_id, user_id=user_id,
+            notifier_profile=profile,
+        )
+        return True
+    except Exception:
+        logger.warning("kanban Telegram root auto-subscribe failed", exc_info=True)
+        return False
 
 
 def _handle_unblock(args: dict, **kw) -> str:

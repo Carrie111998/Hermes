@@ -1735,3 +1735,18 @@ def test_board_param_in_all_schemas():
         assert "board" not in schema["parameters"].get("required", []), (
             f"{schema['name']} marks board as required; must be optional"
         )
+
+
+@pytest.mark.parametrize("platform", ["discord", "slack", "matrix"])
+def test_auto_subscribe_rejects_non_telegram_roots(monkeypatch, worker_env, platform):
+    """Only Telegram roots can opt into automatic terminal notifications."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", platform)
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-42")
+
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title=f"{platform} root", assignee="peer")
+        assert kt._maybe_auto_subscribe(conn, root) is False
+        assert kb.list_notify_subs(conn, root) == []

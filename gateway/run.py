@@ -5060,6 +5060,14 @@ class GatewayRunner:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "is_root": not any(
+                                        event.kind == "created" and event.payload
+                                        and (
+                                            event.payload.get("parents")
+                                            or event.payload.get("from_decompose_of")
+                                        )
+                                        for event in _kb.list_events(conn, sub["task_id"])
+                                    ),
                                     "board": slug,
                                 })
                         finally:
@@ -5175,7 +5183,7 @@ class GatewayRunner:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and d["is_root"]:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
@@ -9933,11 +9941,13 @@ class GatewayRunner:
                     chat_id = str(getattr(source, "chat_id", "") or "")
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
-                    if platform_str and chat_id:
+                    if platform_str == "telegram" and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
                             try:
+                                if _kb.parent_ids(conn, task_id):
+                                    return False
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
@@ -9945,14 +9955,16 @@ class GatewayRunner:
                                     user_id=user_id,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
+                                return True
                             finally:
                                 conn.close()
-                        await asyncio.to_thread(_sub)
-                        output = (
-                            output.rstrip()
-                            + "\n"
-                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
-                        )
+                        subscribed = await asyncio.to_thread(_sub)
+                        if subscribed:
+                            output = (
+                                output.rstrip()
+                                + "\n"
+                                + t("gateway.kanban.subscribed_suffix", task_id=task_id)
+                            )
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
 

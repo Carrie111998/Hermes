@@ -233,3 +233,25 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+def test_root_subscription_does_not_fan_out_to_child_events(tmp_path, monkeypatch):
+    """Temp SQLite + captured adapter: a root subscription never reaches its child."""
+    db_path = tmp_path / "root-only-notifications.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[root])
+        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, root, summary="root complete")
+        kb.complete_task(conn, child, summary="child complete")
+        assert kb.list_notify_subs(conn, child) == []
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert root in adapter.sent[0]["text"]
+    assert child not in adapter.sent[0]["text"]
