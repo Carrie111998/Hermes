@@ -7423,6 +7423,11 @@ def run_conversation(
                 # was recovered — refresh that budget too so it guards each
                 # stall independently rather than capping the whole run.
                 agent._dropped_toolcall_retries = 0
+                # A real tool call this turn means any later completed-turn
+                # text in the SAME turn (e.g. a summary of this result) must
+                # never be mistaken for a fabricated-tool-use claim — see
+                # the fabricated-tool-use check below.
+                agent._landed_real_tool_call_this_turn = True
 
                 previous_msg = messages[-1] if messages else None
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
@@ -8264,10 +8269,56 @@ def run_conversation(
                     final_response = None
                     continue
 
-                # Reached finalization without the dropped-tool-call mismatch —
-                # a genuine turn end. Clear the consecutive-stall budget so the
-                # next turn starts fresh.
+                # ── Fabricated tool-use recovery (any provider, any tool) ──
+                # A completed turn (any finish_reason, including "stop") whose
+                # text either leaks a raw tool-call JSON fragment or
+                # affirmatively claims a completed tool action with a result,
+                # while tool_calls came back empty. Unlike the dropped-toolcall
+                # guard above, this does NOT gate on finish_reason=="tool_calls"
+                # — that guard's own comment notes "finish_reason='stop' text
+                # finishes never enter this guard," which is exactly the gap
+                # this closes. Guarded by _landed_real_tool_call_this_turn so a
+                # genuine post-tool-call summary (whose text may legitimately
+                # say things like "the search returned...") is never mistaken
+                # for a fabrication. See
+                # docs/rfcs/2026-08-fabricated-tool-use-detection.md.
+                elif (
+                    not assistant_message.tool_calls
+                    and not getattr(agent, "_landed_real_tool_call_this_turn", False)
+                    and _looks_like_fabricated_tool_use(final_response)
+                    and getattr(agent, "_fabricated_tool_use_retries", 0) < 3
+                ):
+                    agent._fabricated_tool_use_retries = getattr(agent, "_fabricated_tool_use_retries", 0) + 1
+                    logger.warning(
+                        "completed turn's text claims tool use with no real "
+                        "tool_calls (fabricated-tool-use pattern) — "
+                        "re-prompting (retry %d/3, model=%s provider=%s)",
+                        agent._fabricated_tool_use_retries, agent.model, agent.provider,
+                    )
+                    agent._emit_status(
+                        "↻ Reply looked like a fabricated tool result with no "
+                        f"real tool call — re-prompting ({agent._fabricated_tool_use_retries}/3)"
+                    )
+                    final_msg["_fabricated_tool_use_nudge"] = True
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _FABRICATED_TOOL_USE_NUDGE_CONTENT,
+                        "_fabricated_tool_use_nudge": True,
+                    })
+                    agent._session_messages = messages
+                    final_response = None
+                    continue
+
+                # Reached finalization without either mismatch — a genuine
+                # turn end. Clear both consecutive-stall budgets, and the
+                # landed-real-tool-call flag, so the NEXT turn starts fresh.
+                # Without resetting the flag here, a single real tool call
+                # anywhere in the session would permanently disable the
+                # fabricated-tool-use check for every later turn.
                 agent._dropped_toolcall_retries = 0
+                agent._fabricated_tool_use_retries = 0
+                agent._landed_real_tool_call_this_turn = False
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
@@ -8282,6 +8333,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_fabricated_tool_use_nudge")
                     )
                 ):
                     messages.pop()
