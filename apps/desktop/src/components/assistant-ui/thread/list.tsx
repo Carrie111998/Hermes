@@ -433,7 +433,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     setBudgetSessionKey(sessionKey)
     setHadGroups(hasGroups)
     setRenderBudget(FIRST_PAINT_BUDGET)
-  } else if (renderBudget > paneBudget) {
+  } else if (paneLifecycle === 'hot-hidden' && renderBudget > paneBudget) {
     // Apply the hidden budget during render so React never first commits the
     // stale full transcript after this pane moves to the background.
     setRenderBudget(paneBudget)
