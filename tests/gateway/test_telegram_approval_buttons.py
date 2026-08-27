@@ -187,35 +187,47 @@ class TestTelegramApprovalCallback:
         update = MagicMock(callback_query=query)
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            with (
+                patch.object(
+                    adapter, "_is_callback_user_authorized"
+                ) as mock_authorize,
+                patch("tools.approval.resolve_gateway_approval") as mock_resolve,
+            ):
                 await adapter._handle_callback_query(update, MagicMock())
 
         query.answer.assert_awaited_once_with(
             text="⛔ Telegram approvals are disabled."
         )
+        mock_authorize.assert_not_called()
         mock_resolve.assert_not_called()
         assert adapter._approval_state[5] == "agent:main:telegram:group:12345:99"
         query.edit_message_text.assert_not_called()
 
     def test_gateway_config_bridges_profile_scoped_callback_gate(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         from gateway.config import load_gateway_config
+        from gateway.run import _profile_runtime_scope
 
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "security:\n"
-            "  approval:\n"
-            "    telegram_callbacks_enabled: false\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback_values = []
+        for profile_name, enabled in (("locked", False), ("open", True)):
+            profile_home = tmp_path / profile_name
+            profile_home.mkdir()
+            (profile_home / "config.yaml").write_text(
+                "security:\n"
+                "  approval:\n"
+                f"    telegram_callbacks_enabled: {str(enabled).lower()}\n",
+                encoding="utf-8",
+            )
 
-        config = load_gateway_config()
+            with _profile_runtime_scope(profile_home):
+                config = load_gateway_config()
+                telegram = config.platforms[Platform.TELEGRAM]
+                callback_values.append(
+                    telegram.extra["approval_callbacks_enabled"]
+                )
 
-        telegram = config.platforms[Platform.TELEGRAM]
-        assert telegram.extra["approval_callbacks_enabled"] is False
+        assert callback_values == [False, True]
 
 
     @pytest.mark.asyncio
