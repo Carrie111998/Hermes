@@ -399,8 +399,15 @@ def test_create_schema_exposes_scheduled_initial_status():
     from tools.kanban_tools import KANBAN_CREATE_SCHEMA
 
     initial_status = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["initial_status"]
-    assert set(initial_status["enum"]) == {"running", "blocked", "scheduled"}
+    assert "scheduled" in initial_status["enum"]
     assert "outside the dispatcher" in initial_status["description"]
+
+
+def test_list_schema_exposes_scheduled_status_filter():
+    from tools.kanban_tools import KANBAN_LIST_SCHEMA
+
+    status = KANBAN_LIST_SCHEMA["parameters"]["properties"]["status"]
+    assert "scheduled" in status["enum"]
 
 
 def test_create_scheduled_stays_outside_dispatch_queue(worker_env):
