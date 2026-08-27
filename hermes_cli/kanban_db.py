@@ -11441,6 +11441,17 @@ def _confinement_preflight_or_refuse(
     try:
         intended = _dc.plan_workspace_path(task, board=board)
         _dc.preflight_workspace(task_id, intended)
+        # The board's confinement policy. In `open` mode this is only the
+        # protected-path denials; in `sandbox` mode it is the full contract
+        # assertion set (authorized root, origin-less fixture, no alternates,
+        # no secrets, no untracked source, confined HERMES_HOME with no live
+        # key material, single_query_mode=deny, required deny globs, and the
+        # prohibited-command matrix) — re-run on EVERY dispatch, not once at
+        # setup, so a config edit between two dispatches cannot silently widen
+        # what a worker may do.
+        from hermes_cli import workspace_policy as _wp
+
+        _wp.enforce(task_id, intended, board=board)
     except _dc.PreflightRefusal as exc:
         _record_confinement_event(
             conn, task_id, "confinement_refused",
