@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import suppress
@@ -16,6 +17,77 @@ except ImportError:
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
+
+
+def _uses_room_run_auth(self, request: "web.Request") -> bool:
+    return request.path.endswith("/v1/runs") and bool(
+        self._room_grant_token(request)
+    )
+
+
+def _initialize_run_state(self, *, store_factory) -> None:
+    """Initialize adapter-owned durable and live ``/v1/runs`` state."""
+    self._run_idempotency_store = store_factory()
+    self._run_idempotency_ids: set[str] = set()
+    self._run_owners: Dict[str, str] = {}
+    self._run_owner_pid = os.getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        self._run_owner_started = int(
+            get_process_start_time(self._run_owner_pid) or 0
+        )
+    except Exception:
+        self._run_owner_started = 0
+    # Active run streams: run_id -> asyncio.Queue of SSE event dicts
+    self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+    # Creation timestamps for orphaned-run TTL sweep
+    self._run_streams_created: Dict[str, float] = {}
+    # Runs with a connected SSE consumer; their queue is actively draining.
+    self._run_stream_subscribers: set[str] = set()
+    # Active run agent/task references for stop support
+    self._active_run_agents: Dict[str, Any] = {}
+    self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+    # Stop is cooperative: the executor thread may outlive the HTTP request.
+    self._stopping_run_ids: set[str] = set()
+    # Pollable run status for dashboards and external control-plane UIs.
+    self._run_statuses: Dict[str, Dict[str, Any]] = {}
+    # Active approval session key for each run_id. The approval core resolves
+    # requests by session key, while API clients address them by run_id.
+    self._run_approval_sessions: Dict[str, str] = {}
+
+
+def _http_routes(self) -> list[tuple[str, str, Any]]:
+    return [
+        ("POST", "/v1/runs", self._handle_runs),
+        ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+        ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+        ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+        ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+    ]
+
+
+def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
+    return {
+        "supported": True,
+        "durable": self._run_idempotency_store.durable,
+        "retention_seconds": store_type.RETENTION_SECONDS,
+    }
+
+
+def _close_run_state(self) -> None:
+    store = getattr(self, "_run_idempotency_store", None)
+    if store is None:
+        return
+    try:
+        store.close()
+    except Exception:
+        logger.debug(
+            "Failed to close run idempotency store for %s",
+            self.name,
+            exc_info=True,
+        )
 
 
 def _set_run_status(

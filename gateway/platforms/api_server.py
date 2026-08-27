@@ -1250,10 +1250,7 @@ def _admit_api_agent_request(handler):
     """
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
-        room_run = request.path.endswith("/v1/runs") and bool(
-            self._room_grant_token(request)
-        )
-        if not room_run:
+        if not _api_runs._uses_room_run_auth(self, request):
             auth_err = self._check_auth(request)
             if auth_err:
                 return auth_err
@@ -1556,35 +1553,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        self._run_idempotency_store = RunIdempotencyStore()
-        self._run_idempotency_ids: set[str] = set()
-        self._run_owners: Dict[str, str] = {}
-        self._run_owner_pid = os.getpid()
-        try:
-            from gateway.status import get_process_start_time
-
-            self._run_owner_started = int(
-                get_process_start_time(self._run_owner_pid) or 0
-            )
-        except Exception:
-            self._run_owner_started = 0
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
-        # Creation timestamps for orphaned-run TTL sweep
-        self._run_streams_created: Dict[str, float] = {}
-        # Runs with a connected SSE consumer; their queue is actively draining.
-        self._run_stream_subscribers: set[str] = set()
-        # Active run agent/task references for stop support
-        self._active_run_agents: Dict[str, Any] = {}
-        self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
-        # Stop is cooperative: the executor thread may outlive the HTTP request.
-        self._stopping_run_ids: set[str] = set()
-        # Pollable run status for dashboards and external control-plane UIs.
-        self._run_statuses: Dict[str, Dict[str, Any]] = {}
-        # Active approval session key for each run_id.  The approval core
-        # resolves requests by session key, while API clients address the
-        # in-flight run by run_id.
-        self._run_approval_sessions: Dict[str, str] = {}
+        _api_runs._initialize_run_state(
+            self,
+            store_factory=RunIdempotencyStore,
+        )
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -2285,33 +2257,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
-            (
-                "POST",
-                "/v1/room-members/invitations",
-                self._handle_room_member_invitation,
-            ),
-            (
-                "GET",
-                "/v1/room-members/capabilities",
-                self._handle_room_member_capabilities,
-            ),
-            (
-                "POST",
-                "/v1/room-members/grants/refresh",
-                self._handle_room_member_grant_refresh,
-            ),
-            (
-                "POST",
-                "/v1/room-members/grants/revoke",
-                self._handle_room_member_grant_revoke,
-            ),
-            ("POST", "/v1/runs", self._handle_runs),
-            ("GET", "/v1/runs/{run_id}", self._handle_get_run),
-            ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
-            ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
-            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
-            ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
+        routes.extend(_room_grants._http_routes(self))
+        routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
@@ -3386,11 +3334,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
-                "runs_idempotency": {
-                    "supported": True,
-                    "durable": self._run_idempotency_store.durable,
-                    "retention_seconds": RunIdempotencyStore.RETENTION_SECONDS,
-                },
+                "runs_idempotency": _api_runs._idempotency_capabilities(
+                    self,
+                    store_type=RunIdempotencyStore,
+                ),
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -7923,14 +7870,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
                 )
-        run_idempotency_store = getattr(self, "_run_idempotency_store", None)
-        if run_idempotency_store is not None:
-            try:
-                run_idempotency_store.close()
-            except Exception:
-                logger.debug(
-                    "Failed to close run idempotency store for %s", self.name, exc_info=True,
-                )
+        _api_runs._close_run_state(self)
         try:
             if self._site:
                 await self._site.stop()

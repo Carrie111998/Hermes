@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.platforms import api_server
+from gateway.platforms import api_server_room_grants
 from gateway.platforms import api_server_runs
 
 
@@ -111,3 +112,69 @@ def test_room_scoped_run_policy_delegates_with_legacy_api_bindings(monkeypatch):
         permission="stop",
         _api_server=sys.modules[api_server.__name__],
     )
+
+
+def test_run_state_initialization_and_teardown_are_shard_owned():
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    store = MagicMock()
+    store_factory = MagicMock(return_value=store)
+
+    api_server_runs._initialize_run_state(
+        adapter,
+        store_factory=store_factory,
+    )
+
+    store_factory.assert_called_once_with()
+    assert adapter._run_idempotency_store is store
+    assert adapter._run_idempotency_ids == set()
+    assert adapter._run_owners == {}
+    assert adapter._run_streams == {}
+    assert adapter._run_streams_created == {}
+    assert adapter._run_stream_subscribers == set()
+    assert adapter._active_run_agents == {}
+    assert adapter._active_run_tasks == {}
+    assert adapter._stopping_run_ids == set()
+    assert adapter._run_statuses == {}
+    assert adapter._run_approval_sessions == {}
+
+    api_server_runs._close_run_state(adapter)
+    store.close.assert_called_once_with()
+
+
+def test_run_capability_metadata_is_shard_owned():
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._run_idempotency_store = SimpleNamespace(durable=True)
+    store_type = SimpleNamespace(RETENTION_SECONDS=123)
+
+    assert api_server_runs._idempotency_capabilities(
+        adapter,
+        store_type=store_type,
+    ) == {
+        "supported": True,
+        "durable": True,
+        "retention_seconds": 123,
+    }
+
+
+def test_roomlink_and_run_route_tuples_are_shard_owned():
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+
+    room_routes = api_server_room_grants._http_routes(adapter)
+    run_routes = api_server_runs._http_routes(adapter)
+
+    assert [(method, path) for method, path, _ in room_routes] == [
+        ("POST", "/v1/room-members/invitations"),
+        ("GET", "/v1/room-members/capabilities"),
+        ("POST", "/v1/room-members/grants/refresh"),
+        ("POST", "/v1/room-members/grants/revoke"),
+    ]
+    assert [(method, path) for method, path, _ in run_routes] == [
+        ("POST", "/v1/runs"),
+        ("GET", "/v1/runs/{run_id}"),
+        ("GET", "/v1/runs/{run_id}/events"),
+        ("POST", "/v1/runs/{run_id}/approval"),
+        ("POST", "/v1/runs/{run_id}/steer"),
+        ("POST", "/v1/runs/{run_id}/stop"),
+    ]
+    assert all(handler.__self__ is adapter for _, _, handler in room_routes)
+    assert all(handler.__self__ is adapter for _, _, handler in run_routes)

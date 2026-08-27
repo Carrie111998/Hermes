@@ -10,6 +10,31 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 
+def _http_routes(self) -> list[tuple[str, str, Any]]:
+    return [
+        (
+            "POST",
+            "/v1/room-members/invitations",
+            self._handle_room_member_invitation,
+        ),
+        (
+            "GET",
+            "/v1/room-members/capabilities",
+            self._handle_room_member_capabilities,
+        ),
+        (
+            "POST",
+            "/v1/room-members/grants/refresh",
+            self._handle_room_member_grant_refresh,
+        ),
+        (
+            "POST",
+            "/v1/room-members/grants/revoke",
+            self._handle_room_member_grant_revoke,
+        ),
+    ]
+
+
 def _room_grant_token(request: "web.Request") -> str:
     authorization = str(request.headers.get("Authorization") or "")
     scheme, separator, token = authorization.partition(" ")
