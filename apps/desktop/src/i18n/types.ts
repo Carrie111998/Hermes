@@ -2074,6 +2074,7 @@ export interface Translations {
     templateAddFolder: string
     templateEdit: string
     templateDelete: string
+    templateReorder: string
     templateMoveUp: string
     templateMoveDown: string
     templateIndent: string
