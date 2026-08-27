@@ -249,6 +249,78 @@ def test_s6_test_isolation_binds_safe_scandir_before_unregister(
     assert manager.scandir == safe.resolve()
 
 
+def test_s6_test_isolation_binds_open_directory_when_resolved_referent_is_retargeted(
+    monkeypatch, tmp_path, fake_subprocess_run
+):
+    canonical = tmp_path / "canonical-service"
+    canonical.mkdir()
+    sentinel = canonical / "sentinel"
+    sentinel.write_text("untouched")
+    safe = tmp_path / "safe-scandir"
+    safe.mkdir()
+    moved = tmp_path / "safe-scandir-moved"
+    alias = tmp_path / "mutable-alias"
+    alias.symlink_to(safe, target_is_directory=True)
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test")
+    monkeypatch.setattr(service_manager_module, "S6_DYNAMIC_SCANDIR", canonical)
+    manager = S6ServiceManager(scandir=alias)
+    original_service_dir = manager._service_dir
+    retargeted = False
+
+    def retarget_referent_then_resolve(profile):
+        nonlocal retargeted
+        if not retargeted:
+            safe.rename(moved)
+            safe.symlink_to(canonical, target_is_directory=True)
+            retargeted = True
+        return original_service_dir(profile)
+
+    monkeypatch.setattr(manager, "_service_dir", retarget_referent_then_resolve)
+
+    manager.register_profile_gateway("coder", start_now=False)
+
+    assert sentinel.read_text() == "untouched"
+    assert not (canonical / "gateway-coder").exists()
+    assert (moved / "gateway-coder").is_dir()
+
+
+def test_s6_test_isolation_unregister_uses_open_directory_when_referent_is_retargeted(
+    monkeypatch, tmp_path, fake_subprocess_run
+):
+    canonical = tmp_path / "canonical-service"
+    canonical_service = canonical / "gateway-coder"
+    canonical_service.mkdir(parents=True)
+    sentinel = canonical_service / "sentinel"
+    sentinel.write_text("untouched")
+    safe = tmp_path / "safe-scandir"
+    safe_service = safe / "gateway-coder"
+    safe_service.mkdir(parents=True)
+    moved = tmp_path / "safe-scandir-moved"
+    alias = tmp_path / "mutable-alias"
+    alias.symlink_to(safe, target_is_directory=True)
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test")
+    monkeypatch.setattr(service_manager_module, "S6_DYNAMIC_SCANDIR", canonical)
+    manager = S6ServiceManager(scandir=alias)
+    original_service_dir = manager._service_dir
+    retargeted = False
+
+    def retarget_referent_then_resolve(profile):
+        nonlocal retargeted
+        if not retargeted:
+            safe.rename(moved)
+            safe.symlink_to(canonical, target_is_directory=True)
+            retargeted = True
+        return original_service_dir(profile)
+
+    monkeypatch.setattr(manager, "_service_dir", retarget_referent_then_resolve)
+
+    manager.unregister_profile_gateway("coder")
+
+    assert sentinel.read_text() == "untouched"
+    assert canonical_service.is_dir()
+    assert not (moved / "gateway-coder").exists()
+
+
 def test_s6_test_isolation_denies_resolved_alias_of_canonical_scandir(
     monkeypatch, tmp_path, fake_subprocess_run
 ):
@@ -330,7 +402,9 @@ def test_s6_test_isolation_guard_allows_noncanonical_tmp_scandir(
     manager.register_profile_gateway("coder", start_now=False)
 
     assert (s6_scandir / "gateway-coder").is_dir()
-    assert fake_subprocess_run == [["s6-svscanctl", "-a", str(s6_scandir)]]
+    assert len(fake_subprocess_run) == 1
+    assert fake_subprocess_run[0][:2] == ["s6-svscanctl", "-a"]
+    assert "/fd/" in fake_subprocess_run[0][2]
 
 
 def test_s6_live_guard_is_inactive_outside_test_context(

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+from functools import wraps
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
@@ -603,35 +604,81 @@ class S6CommandError(S6Error):
         super().__init__(message, service=service)
 
 
-def _refuse_live_s6_mutation_under_test(
-    scandir: Path, *, operation: str, profile: str
-) -> Optional[Path]:
-    """Deny live test mutations; return a stable safe scandir when active."""
-    if not os.environ.get("HERMES_TEST_ISOLATION"):
-        return None
-    service = f"{S6_SERVICE_PREFIX}{profile}"
-    if scandir == S6_DYNAMIC_SCANDIR:
-        raise S6TestIsolationError(
-            f"refusing to {operation} {service!r} in the live s6 scandir "
-            "while Hermes test isolation is active",
-            service=service,
-        )
-    try:
-        resolved_scandir = scandir.resolve()
-        resolved_live = S6_DYNAMIC_SCANDIR.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise S6TestIsolationError(
-            "refusing s6 mutation under test isolation: could not prove "
-            "the target scandir is separate from the live canonical scandir",
-            service=service,
-        ) from exc
-    if resolved_scandir == resolved_live:
-        raise S6TestIsolationError(
-            f"refusing to {operation} {service!r} in the live s6 scandir "
-            "while Hermes test isolation is active",
-            service=service,
-        )
-    return resolved_scandir
+def _with_test_bound_scandir(operation: str):
+    """Bind test-only s6 mutations to an open non-live directory inode."""
+    def decorate(method):
+        @wraps(method)
+        def wrapped(self, profile, *args, **kwargs):
+            if not os.environ.get("HERMES_TEST_ISOLATION"):
+                return method(self, profile, *args, **kwargs)
+
+            service = f"{S6_SERVICE_PREFIX}{profile}"
+            scandir = self.scandir
+            if scandir == S6_DYNAMIC_SCANDIR:
+                raise S6TestIsolationError(
+                    f"refusing to {operation} {service!r} in the live s6 scandir "
+                    "while Hermes test isolation is active",
+                    service=service,
+                )
+            try:
+                resolved_scandir = scandir.resolve()
+                resolved_live = S6_DYNAMIC_SCANDIR.resolve()
+            except (OSError, RuntimeError) as exc:
+                raise S6TestIsolationError(
+                    "refusing s6 mutation under test isolation: could not prove "
+                    "the target scandir is separate from the live canonical scandir",
+                    service=service,
+                ) from exc
+            if resolved_scandir == resolved_live:
+                raise S6TestIsolationError(
+                    f"refusing to {operation} {service!r} in the live s6 scandir "
+                    "while Hermes test isolation is active",
+                    service=service,
+                )
+
+            flags = os.O_RDONLY
+            flags |= getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                directory_fd = os.open(resolved_scandir, flags)
+                opened = os.fstat(directory_fd)
+                try:
+                    live = os.stat(S6_DYNAMIC_SCANDIR)
+                except FileNotFoundError:
+                    live = None
+                if live is not None and os.path.samestat(opened, live):
+                    raise S6TestIsolationError(
+                        f"refusing to {operation} {service!r} in the live s6 scandir "
+                        "while Hermes test isolation is active",
+                        service=service,
+                    )
+                fd_root = Path(f"/proc/{os.getpid()}/fd/{directory_fd}")
+                if not fd_root.is_dir():
+                    fd_root = Path(f"/dev/fd/{directory_fd}")
+                if not fd_root.is_dir():
+                    raise OSError("no stable fd path is available for the s6 scandir")
+            except S6TestIsolationError:
+                if "directory_fd" in locals():
+                    os.close(directory_fd)
+                raise
+            except (OSError, RuntimeError) as exc:
+                if "directory_fd" in locals():
+                    os.close(directory_fd)
+                raise S6TestIsolationError(
+                    "refusing s6 mutation under test isolation: could not bind "
+                    "the target scandir to a stable non-live directory",
+                    service=service,
+                ) from exc
+
+            self.scandir = fd_root
+            try:
+                return method(self, profile, *args, **kwargs)
+            finally:
+                self.scandir = resolved_scandir
+                os.close(directory_fd)
+
+        return wrapped
+    return decorate
 
 
 class S6ServiceManager:
@@ -981,6 +1028,7 @@ class S6ServiceManager:
     def supports_runtime_registration(self) -> bool:
         return True
 
+    @_with_test_bound_scandir("register")
     def register_profile_gateway(
         self,
         profile: str,
@@ -1001,12 +1049,6 @@ class S6ServiceManager:
                 directory already exists.
             RuntimeError: if ``s6-svscanctl`` fails.
         """
-        safe_scandir = _refuse_live_s6_mutation_under_test(
-            self.scandir, operation="register", profile=profile
-        )
-        if safe_scandir is not None:
-            self.scandir = safe_scandir
-
         import shutil
         import subprocess
 
@@ -1091,6 +1133,7 @@ class S6ServiceManager:
                 f"s6-svscanctl failed: {result.stderr or result.stdout}"
             )
 
+    @_with_test_bound_scandir("unregister")
     def unregister_profile_gateway(self, profile: str) -> None:
         """Stop the profile gateway service and remove its directory.
 
@@ -1107,12 +1150,6 @@ class S6ServiceManager:
         rmtree races s6-supervise on a set of root-owned files inside
         the supervise dir and the dir is left half-removed.
         """
-        safe_scandir = _refuse_live_s6_mutation_under_test(
-            self.scandir, operation="unregister", profile=profile
-        )
-        if safe_scandir is not None:
-            self.scandir = safe_scandir
-
         import shutil
         import subprocess
         import time
