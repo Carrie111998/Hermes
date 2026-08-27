@@ -775,12 +775,14 @@ test('disconnect reaps a wrapper when the live backend proves authenticated owne
     [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE\n'],
     [/print\("OWNED"/, 'FOREIGN\n'],
-    [/value="linux:"/, `${lock.creationTime}\n`]
+    [/value="linux:"/, `${lock.creationTime}\n`],
+    [/pidfd_open/, 'TERMINATED\n']
   ])
 
   await disconnect(ssh, OWNERSHIP_ID, async candidate => candidate.spawnNonce === SPAWN_NONCE)
 
-  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /pidfd_open/.test(command)))
+  assert.ok(!ssh.calls.some(command => /\bkill (-9 )?333\b/.test(command)))
   assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
@@ -804,6 +806,26 @@ test('disconnect refuses to signal an authenticated wrapper whose live creation 
     !ssh.calls.some(command => /kill (-9 )?333\b/.test(command)),
     'must not signal a recycled pid on a stale authenticated proof'
   )
+})
+
+test('disconnect keeps an authenticated lock when signal-bound process identity changes', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/value="linux:"/, `${lock.creationTime}\n`],
+    [/pidfd_open/, 'REFUSED\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID, async candidate => candidate.spawnNonce === SPAWN_NONCE)
+
+  assert.ok(
+    ssh.calls.some(command => /pidfd_open/.test(command)),
+    'the signal must bind to the verified process'
+  )
+  assert.ok(!ssh.calls.some(command => /\bkill (-9 )?333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
 test('disconnect is a no-op when this desktop has no lockfile', async () => {
@@ -1214,7 +1236,7 @@ test('connect reaps an authenticated wrapper before replacing its stale runtime'
     [/kill -0 333/, 'ALIVE'],
     [/print\("OWNED"/, 'FOREIGN\n'],
     [/value="linux:"/, `${lock.creationTime}\n`],
-    [/kill 333/, ''],
+    [/pidfd_open/, 'TERMINATED\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [/python3 -c/, ''],
     [/setsid|nohup/, '444\n'],
@@ -1233,8 +1255,52 @@ test('connect reaps an authenticated wrapper before replacing its stale runtime'
   )
 
   assert.equal(result.reused, false)
-  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /pidfd_open/.test(command)))
+  assert.ok(!ssh.calls.some(command => /\bkill (-9 )?333\b/.test(command)))
   assert.ok(ssh.calls.some(command => /setsid|nohup/.test(command)))
+})
+
+test('connect preserves an authenticated stale lock when the live creation time no longer matches', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+  const challenge = 'f'.repeat(64)
+  const proof = crypto
+    .createHmac('sha256', ownershipProofKey(reuseToken))
+    .update(`${challenge}:${SPAWN_NONCE}:333:${PROTOCOL_VERSION}`)
+    .digest('hex')
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'FOREIGN\n'],
+    [/value="linux:"/, 'linux:999999\n'],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid|nohup/, '444\n'],
+    [/kill -0 444/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=50002\n']
+  ])
+
+  await assert.rejects(
+    () =>
+      connect(
+        connectDeps(ssh, {
+          reuseToken,
+          mintOwnershipChallenge: () => challenge,
+          probeOwnershipChallenge: async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, proof }),
+          probeReuseProof: async () => 'authenticated-stale'
+        })
+      ),
+    (error: any) => {
+      assert.equal(error.kind, 'foreign-backend')
+
+      return true
+    }
+  )
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+  assert.ok(!ssh.calls.some(command => /setsid|nohup/.test(command)))
 })
 
 test('connect refuses to replace an alive process whose ownership cannot be proved', async () => {

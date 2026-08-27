@@ -687,6 +687,51 @@ async function pidIsOurDashboard(
   }
 }
 
+// A successful HMAC challenge authenticates a snapshot of the backend, not a
+// numeric PID forever. Bind the signal to a Linux pidfd, then re-check the
+// lock's kernel creation identity after opening that descriptor. If the host
+// cannot provide a signal-bound identity, refuse and preserve the lock rather
+// than falling back to a racy `kill <pid>` for this authenticated-only path.
+function buildAuthenticatedStaleTerminationCommand(lock) {
+  const pid = Number(lock.pid)
+  const expectedCreation = JSON.stringify(String(lock.creationTime || ''))
+  const script = `
+import os,select,signal,sys
+pid=${pid}
+expected_creation=${expectedCreation}
+if not sys.platform.startswith("linux") or not hasattr(os,"pidfd_open") or not hasattr(signal,"pidfd_send_signal"):
+ print("UNAVAILABLE");sys.exit(0)
+try:
+ pidfd=os.pidfd_open(pid,0)
+except ProcessLookupError:
+ print("ALREADY_STOPPED");sys.exit(0)
+except (OSError,PermissionError):
+ print("UNAVAILABLE");sys.exit(0)
+try:
+ try:
+  raw=open(f"/proc/{pid}/stat","r",encoding="ascii").read()
+  live_creation="linux:"+raw[raw.rfind(")")+2:].split()[19]
+ except (OSError,IndexError,UnicodeError):
+  print("REFUSED");sys.exit(0)
+ if live_creation!=expected_creation:
+  print("REFUSED");sys.exit(0)
+ try:
+  signal.pidfd_send_signal(pidfd,signal.SIGTERM)
+ except ProcessLookupError:
+  print("ALREADY_STOPPED");sys.exit(0)
+ poller=select.poll();poller.register(pidfd,select.POLLIN)
+ if not poller.poll(5000):
+  try:signal.pidfd_send_signal(pidfd,signal.SIGKILL)
+  except ProcessLookupError:print("TERMINATED");sys.exit(0)
+  if not poller.poll(2000):print("TIMEOUT");sys.exit(0)
+ print("TERMINATED")
+finally:
+ os.close(pidfd)
+`.trim()
+
+  return `python3 -c ${shq(script)}`
+}
+
 // Kill the stale dashboard ONLY if provably ours, then drop the lockfile unless
 // the caller asks us to preserve an unverified live owner's recovery record.
 async function cleanupStale(
@@ -744,36 +789,52 @@ async function cleanupStale(
   }
 
   if (owned) {
-    try {
-      const result = (
-        await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
-        )
-      ).trim()
+    if (authenticatedIdentity) {
+      let result = ''
 
-      void result
-    } catch {
-      // A backend mid-turn (in-flight LLM call, live MCP children) can ride
-      // out SIGTERM past the 5s graceful wait — and before-quit races this
-      // whole teardown against 6s before closing SSH, so giving up here
-      // reparents the still-running serve to pid 1: the #91668 leak, now on
-      // the quit-during-active-turn path. Escalate to SIGKILL and require a
-      // confirmed exit before treating the record as reclaimed.
       try {
-        await ssh.exec(
-          `kill -9 ${Number(lock.pid)} 2>/dev/null; ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 20 ] && exit 1; sleep 0.1; done`
-        )
-      } catch (cause) {
-        // Even SIGKILL could not confirm death (D-state, permissions). Keep
-        // the lockfile so the next connect's reap pass retries.
-        const error: any = new Error('Could not terminate the stale SSH backend.')
-        error.kind = 'transient-transport-error'
-        error.cause = cause
-        throw error
+        result = String(await ssh.exec(buildAuthenticatedStaleTerminationCommand(lock))).trim()
+      } catch {
+        // A failed signal-bound probe cannot authorize record deletion. Keep
+        // the lock so connect/disconnect can retry without orphaning the serve.
+        return false
+      }
+
+      if (result !== 'TERMINATED' && result !== 'ALREADY_STOPPED') {
+        return false
+      }
+    } else {
+      try {
+        const result = (
+          await ssh.exec(
+            `kill ${Number(lock.pid)} && ` +
+              `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
+              `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+          )
+        ).trim()
+
+        void result
+      } catch {
+        // A backend mid-turn (in-flight LLM call, live MCP children) can ride
+        // out SIGTERM past the 5s graceful wait — and before-quit races this
+        // whole teardown against 6s before closing SSH, so giving up here
+        // reparents the still-running serve to pid 1: the #91668 leak, now on
+        // the quit-during-active-turn path. Escalate to SIGKILL and require a
+        // confirmed exit before treating the record as reclaimed.
+        try {
+          await ssh.exec(
+            `kill -9 ${Number(lock.pid)} 2>/dev/null; ` +
+              `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
+              `i=$((i+1)); [ "$i" -ge 20 ] && exit 1; sleep 0.1; done`
+          )
+        } catch (cause) {
+          // Even SIGKILL could not confirm death (D-state, permissions). Keep
+          // the lockfile so the next connect's reap pass retries.
+          const error: any = new Error('Could not terminate the stale SSH backend.')
+          error.kind = 'transient-transport-error'
+          error.cause = cause
+          throw error
+        }
       }
     }
   }
@@ -1598,7 +1659,24 @@ async function connect(deps) {
           assertBootstrapNotSuperseded(signal)
           await cancelForwardSafe(deps, localPort, lock.port)
           await assertRemoteInstallUpdateClear(ssh, hermesHome)
-          await cleanupStale(ssh, ownershipId, lock, pidAlive, authenticatedOwnership ? async () => true : undefined)
+          const cleaned = await cleanupStale(
+            ssh,
+            ownershipId,
+            lock,
+            pidAlive,
+            authenticatedOwnership ? async () => true : undefined,
+            true
+          )
+
+          if (!cleaned) {
+            const error: any = new Error(
+              'The existing SSH backend is alive but its ownership could not be verified. ' +
+                'Refusing to replace it without a safe teardown.'
+            )
+
+            error.kind = 'foreign-backend'
+            throw error
+          }
         } else if (reuseClassification === 'authenticated-ok') {
           const token = await adoptOwnedServedToken(
             adoptServedToken,
