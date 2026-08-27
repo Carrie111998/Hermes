@@ -2202,7 +2202,7 @@ def run_kanban_goal_loop(
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"review_requested_by_worker"``,
     ``"changes_requested_by_reviewer"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_judge_transport"``, ``"blocked_by_worker"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -2220,6 +2220,14 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # Judge API/transport errors in a row. Mirrors
+    # GoalManager.check_goal_progress: a judge that cannot reach its API
+    # returns ("continue", ..., transport_failed=True), and without this
+    # guard those error verdicts are indistinguishable from real "not done
+    # yet" verdicts — a permanently broken judge (bad key, DNS, 401) burns
+    # the worker's entire turn budget and the resulting blocked message
+    # blames the worker instead of the judge config.
+    consecutive_transport_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2253,10 +2261,41 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # Honour the judge's transport_failed flag the way the GoalManager
+        # path does (see check_goal_progress): N consecutive transport
+        # failures mean the judge config is broken, not the worker. Block
+        # the card with a message that names the judge — spending the
+        # remaining turn budget on an unreachable API produces nothing and
+        # the blocked_budget message would blame the worker.
+        if transport_failed:
+            consecutive_transport_failures += 1
+        else:
+            consecutive_transport_failures = 0
+        if consecutive_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+            _log(
+                f"kanban goal loop: task {task_id} judge API unreachable "
+                f"{consecutive_transport_failures} turns in a row; blocking"
+            )
+            try:
+                block_fn(
+                    f"Goal-mode judge could not reach its API "
+                    f"{consecutive_transport_failures} turns in a row "
+                    f"(check auxiliary.goal_judge provider/key in config.yaml). "
+                    f"The worker was not at fault; {turns_used}/{max_turns} "
+                    f"turns were used before pausing."
+                )
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_judge_transport",
+                "turns_used": turns_used,
+                "reason": "judge API unreachable",
+            }
 
         if verdict == "done":
             if nudged_to_finalize:
