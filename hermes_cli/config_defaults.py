@@ -3689,6 +3689,33 @@ DEFAULT_CONFIG = {
         # Leave false to keep existing-profile attachment failing closed;
         # isolated driver-owned profiles work either way.
         "grant_existing_profile": False,
+        # Windows Session-0 transport policy (issue #94756).
+        #
+        # cua-driver refuses to spawn ``mcp`` in Windows Session 0
+        # ("requires an interactive Windows user session"). A long-lived
+        # Hermes gateway installed as a Scheduled Task or Windows service
+        # inherits Session 0, so its child cua-driver MCP spawn dies
+        # before MCP initialization — even though the canonical
+        # interactive CUA daemon is healthy and reachable through
+        # ``cua-driver call``.
+        #
+        #   auto (default) → Session 0 routes via the brokered CLI
+        #     transport (``cua-driver call <tool> <json>``), bypassing
+        #     the stdio MCP handshake entirely. Interactive sessions
+        #     (and non-Windows hosts) keep using MCP. The host topology
+        #     decides; you only set this when the default doesn't fit.
+        #   cli            → always brokered CLI transport; never spawn
+        #     ``cua-driver mcp``. Use this on an always-on Session 0
+        #     gateway that owns a separate interactive daemon.
+        #   mcp            → force MCP (will fail closed in Session 0
+        #     with the actionable ComputerUseSession0UnavailableError).
+        #   off            → refuse ``computer_use`` in Session 0 with
+        #     that error so the rest of the gateway keeps working.
+        #
+        # Override at runtime with HERMES_CUA_SESSION0_TRANSPORT (env
+        # always wins — same precedence model as HERMES_CUA_DRIVER_CMD
+        # and HERMES_CUA_TELEMETRY).
+        "session0_transport": "auto",
     },
 
     # =========================================================================
