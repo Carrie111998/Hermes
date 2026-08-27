@@ -125,23 +125,38 @@ function ConfigSettingsInner({
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (loadedConfig && !configSeeded.current) {
+    // `config === null` re-seeds even when the record reference is unchanged:
+    // after a profile switch (or a frozen-page thaw) the draft is dropped, and
+    // React Query's structural sharing keeps the cached record reference stable,
+    // so this effect would otherwise never re-run on its own — the settings
+    // page would sit on its loading skeleton forever with healthy queries.
+    if (loadedConfig && (!configSeeded.current || config === null)) {
       configSeeded.current = true
       savedDiscoverySignatureRef.current = repoDiscoveryPolicySignature(repoDiscoveryPolicyFromConfig(loadedConfig))
       setConfig(loadedConfig)
     }
-  }, [loadedConfig])
+  }, [loadedConfig, config])
 
   // A profile switch invalidates (but doesn't clear) the shared config query, so
   // the local draft would otherwise keep profile A's data and autosave it into
-  // B. Drop the seed + draft (re-seeds from B's refetch) and zero saveVersion so
-  // the pending debounced autosave is cancelled by its effect cleanup.
+  // B. Zero saveVersion so the pending debounced autosave is cancelled by its
+  // effect cleanup, then swap in the new profile's record as soon as it lands.
   useOnProfileSwitch(() => {
-    configSeeded.current = false
     savedDiscoverySignatureRef.current = undefined
-    setConfig(null)
     saveVersionRef.current = 0
     setSaveVersion(0)
+    configSeeded.current = false
+    // Seed from the refetch result directly instead of relying on the seed
+    // effect: the cached record reference can stay identical across a switch
+    // (React Query structural sharing), which would leave the effect above with
+    // nothing to observe — the page would keep profile A's data or, worse, sit
+    // on its loading skeleton forever.
+    void refetchConfig({ cancelRefetch: false }).then(result => {
+      if (result.data) {
+        configSeeded.current = true
+        setConfig(result.data)
+      }
+    })
   })
 
   useEffect(() => {
