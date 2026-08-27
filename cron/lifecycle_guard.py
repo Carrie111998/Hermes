@@ -815,7 +815,15 @@ def _references_at(
     if executable.strip("/"):
         if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
             resolved = _resolve_terminal_script_path(executable, cwd)
-            if resolved is not None:
+            # Only real files can be shell-script references: directories,
+            # missing entries, and other non-regular paths (path-shaped
+            # strings in heredocs/comments, directory assignments like
+            # `SRC=/tmp/tabjoy-e2e`) used to be yielded here and then
+            # hard-blocked by _read_referenced_script as unsafe. Skip them
+            # at the source; the cloud-placeholder branch upstream of
+            # _read_referenced_script still fails closed on any yielded
+            # path that turns out to be a FileProvider placeholder.
+            if resolved is not None and resolved.is_file():
                 yield resolved
 
 
