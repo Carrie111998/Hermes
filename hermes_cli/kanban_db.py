@@ -1481,7 +1481,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Absolute directory the worker was actually launched in. Recorded at
+    -- spawn so confinement is auditable after the fact, not only asserted at
+    -- launch. NULL for runs that predate the column and for synthetic runs
+    -- (no process was started).
+    observed_cwd        TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2789,6 +2794,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # task_runs gained observed_cwd: the directory the worker was actually
+    # launched in. Historical runs get NULL — the value was never captured and
+    # must not be guessed, because the whole point of the column is that the
+    # launch directory is recorded rather than assumed.
+    # Guarded on the table's existence: a legacy DB predating task_runs
+    # entirely would otherwise take an ALTER on a table that is not there.
+    # PRAGMA table_info returns no rows for a missing table, so the column
+    # check alone cannot tell "absent table" from "absent column".
+    has_runs = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone()
+    if has_runs:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "observed_cwd" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "observed_cwd", "observed_cwd TEXT"
+            )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -10843,6 +10868,12 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            # Fail closed before a worker exists. Raising here lands in the
+            # `except` below, which records a spawn failure — the task is
+            # released and counted rather than started in an arbitrary
+            # directory. `_default_spawn` re-runs this check at the spawn site
+            # so a caller that skips it still cannot inherit a directory.
+            launch_cwd = dispatch_preflight(claimed, str(workspace))
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
@@ -10850,13 +10881,16 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    pid = _spawn(claimed, launch_cwd, board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    pid = _spawn(claimed, launch_cwd)
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+                pid = _spawn(claimed, launch_cwd)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
+            # Where the worker actually started, recorded after the spawn
+            # returned so the row describes a process that existed.
+            record_observed_cwd(conn, claimed.current_run_id, launch_cwd)
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -11298,6 +11332,96 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+class DispatchPreflightError(RuntimeError):
+    """Raised when a dispatch fails its pre-spawn checks. Fail-closed."""
+
+
+def dispatch_preflight(task: "Task", workspace: str) -> str:
+    """Resolve the directory a worker must be launched in, or refuse.
+
+    WHAT THIS IS
+    ------------
+    A workflow-safety guard, not a security boundary. It runs in the
+    dispatcher, before any worker process is created, and it either returns an
+    absolute directory to launch in or raises. There is no warn tier and no
+    override flag: a gate that can be waived is not a gate.
+
+    WHAT IT IS NOT — read before describing it
+    ------------------------------------------
+    This does **not** constrain a worker once it is running, and it is **not**
+    protection against arbitrary same-user execution. A worker runs as the same
+    OS user with filesystem access; it can change directory, read outside its
+    workspace, and ignore every convention this establishes. What this fixes is
+    the *launch* defect: a worker starting somewhere nobody chose.
+
+    THE FAILURE IT EXISTS FOR
+    -------------------------
+    ``_default_spawn`` passed ``cwd=workspace if os.path.isdir(workspace) else
+    None`` to ``Popen``. ``cwd=None`` means "inherit the parent's directory", so
+    a task whose workspace was missing, relative, or empty launched its worker
+    in **the dispatcher's** directory — silently, with no error and nothing
+    recorded.
+
+    That is not hypothetical. During M2a a worker launched from the wrong
+    directory did not find its test command, searched the filesystem, located a
+    live production checkout whose default branch auto-deploys, and ran a
+    command there. Read-only, no damage, verified — and luck. Path denials were
+    added and the issue declared closed; a later run still *started* in the
+    wrong directory, because denials bound the blast radius without fixing the
+    launch.
+
+    So the rule here is: **never fall back to inheriting a directory.** A
+    workspace that cannot be resolved refuses the dispatch instead of guessing,
+    and the caller records a spawn failure rather than starting a worker
+    somewhere arbitrary.
+    """
+    raw = "" if workspace is None else str(workspace).strip()
+    if not raw:
+        raise DispatchPreflightError(
+            f"task {task.id} has no workspace; refusing to launch a worker in "
+            f"the dispatcher's own directory"
+        )
+    if not os.path.isabs(raw):
+        raise DispatchPreflightError(
+            f"task {task.id} workspace is not absolute ({raw!r}); a relative "
+            f"path resolves against whatever directory the dispatcher happens "
+            f"to be in"
+        )
+    if not os.path.isdir(raw):
+        raise DispatchPreflightError(
+            f"task {task.id} workspace does not exist or is not a directory "
+            f"({raw!r}); refusing to launch a worker in the dispatcher's own "
+            f"directory"
+        )
+    # realpath so the recorded value is the directory the child actually gets,
+    # not a symlink alias of it — an audit trail that needs interpreting is not
+    # much of an audit trail.
+    return os.path.realpath(raw)
+
+
+def record_observed_cwd(
+    conn: sqlite3.Connection, run_id: Optional[int], cwd: Optional[str]
+) -> None:
+    """Record the directory a run was launched in.
+
+    Best-effort and non-fatal: a missing audit value must never take down a
+    dispatch that has already succeeded. Callers that need the value to exist
+    should read it back.
+    """
+    if not run_id or not cwd:
+        return
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET observed_cwd = ? WHERE id = ?",
+                (str(cwd), int(run_id)),
+            )
+    except Exception:
+        _log.debug("could not record observed_cwd for run %s", run_id,
+                   exc_info=True)
+
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11319,6 +11443,11 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Fail closed BEFORE any worker process exists. Raises rather than
+    # returning a fallback: see dispatch_preflight for why there is no
+    # inherit-the-dispatcher's-directory path any more.
+    launch_cwd = dispatch_preflight(task, workspace)
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -11491,7 +11620,9 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            # Never None: dispatch_preflight refused above if the workspace
+            # could not be resolved, so there is no inherit-the-parent case.
+            cwd=launch_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
@@ -11510,6 +11641,10 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+
+    # The audit row is written by the dispatcher, on the connection it already
+    # holds. Opening a second write connection here would contend with it for
+    # SQLite's writer lock for the sake of one column.
     return proc.pid
 
 

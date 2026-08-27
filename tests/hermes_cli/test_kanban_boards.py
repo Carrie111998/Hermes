@@ -275,6 +275,9 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
+        # The workspace must exist: dispatch_preflight refuses rather than
+        # letting the worker inherit the dispatcher's directory.
+        (fresh_home / "ws").mkdir(parents=True, exist_ok=True)
         kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
