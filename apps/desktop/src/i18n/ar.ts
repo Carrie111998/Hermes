@@ -2243,6 +2243,34 @@ export const ar = defineLocale({
       messagingPlatforms: 'منصات المراسلة'
     },
     statusbar: {
+      accountUsagePanel: {
+        empty: 'لا توجد اشتراكات مربوطة',
+        loading: 'جارٍ فحص الخطط…',
+        refresh: 'تحديث',
+        resetsAt: when => `يتصفّر ${when}`,
+        states: {
+          network_error: 'تعذّر الوصول إلى المزوّد',
+          no_usage_endpoint: 'لا توجد بيانات خطة لهذا المزوّد',
+          not_authenticated: 'غير مسجّل الدخول',
+          ok: '',
+          parse_error: 'استجابة غير متوقّعة من المزوّد',
+          rate_limited: 'تجاوزت حد المعدّل — أعد المحاولة بعد قليل',
+          unauthorized: 'انتهت صلاحية تسجيل الدخول'
+        },
+        title: 'استهلاك الخطط',
+        windows: {
+          '5h': 'نافذة 5 ساعات',
+          '24h': 'النافذة اليومية',
+          '7d': 'النافذة الأسبوعية',
+          chat: 'المحادثة',
+          completions: 'الإكمالات',
+          credits: 'الرصيد',
+          period: 'دورة الفوترة',
+          premium_interactions: 'الطلبات المميّزة'
+        }
+      },
+      accountUsage: 'الخطط',
+      toggleAccountUsage: 'إظهار استهلاك الخطط',
       contextUsagePanel: {
         categories: {
           conversation: 'المحادثة',

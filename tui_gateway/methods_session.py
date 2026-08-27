@@ -2459,6 +2459,26 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"ok": True, "available": False})
 
 
+@method("account.usage")
+def _(rid, params: dict) -> dict:
+    """Subscription usage across every authenticated provider.
+
+    Fans out over the providers this machine holds credentials for — Claude,
+    Codex, Kimi, OpenRouter, Copilot, and anything a plugin adds — rather than
+    the one provider this session happens to use. Cached per provider with a
+    stale-while-revalidate read, so opening the panel repeatedly costs nothing;
+    ``refresh: true`` is the manual button and skips the cache.
+
+    Fail-open like its billing siblings, and no scope required (read-only).
+    """
+    try:
+        from agent.provider_usage import usage_payload
+
+        return _ok(rid, usage_payload(refresh=bool(params.get("refresh"))))
+    except Exception:
+        return _ok(rid, {"ok": True, "available": False, "providers": []})
+
+
 @method("subscription.state")
 def _(rid, params: dict) -> dict:
     """GET /api/billing/subscription → serialized SubscriptionState.

@@ -2462,6 +2462,17 @@ export interface Translations {
       openStarmap: string
       turnRunning: string
       contextUsage: string
+      accountUsagePanel: {
+        empty: string
+        loading: string
+        refresh: string
+        resetsAt: (when: string) => string
+        states: Record<string, string>
+        title: string
+        windows: Record<string, string>
+      }
+      accountUsage: string
+      toggleAccountUsage: string
       contextUsagePanel: {
         categories: {
           conversation: string

@@ -231,6 +231,31 @@ class OpenRouterProfile(ProviderProfile):
         return extra_body, top_level
 
 
+    def fetch_usage(
+        self,
+        *,
+        credential=None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ):
+        """OpenRouter credit balance and key limits — dollars, not percent.
+
+        Wraps the fetcher that already backs ``/usage``, handing it the
+        aggregator's resolved key so the plugin never touches the pool.
+        """
+        from agent.account_usage import _fetch_openrouter_account_usage
+        from agent.provider_usage_types import from_account_snapshot
+
+        return from_account_snapshot(
+            _fetch_openrouter_account_usage(
+                base_url or getattr(credential, "base_url", None),
+                getattr(credential, "access_token", None),
+            ),
+            provider="openrouter",
+            display_name="OpenRouter",
+        )
+
+
 openrouter = OpenRouterProfile(
     name="openrouter",
     aliases=("or",),
@@ -247,6 +272,8 @@ openrouter = OpenRouterProfile(
         "google/gemini-3.7-flash",
         "qwen/qwen3-plus",
     ),
+    # A credit balance moves with every request, so cache it briefly.
+    usage_ttl=60,
 )
 
 register_provider(openrouter)

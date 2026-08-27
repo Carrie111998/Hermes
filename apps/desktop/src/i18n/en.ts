@@ -2897,6 +2897,34 @@ export const en: Translations = {
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
       contextUsage: 'Context usage',
+      accountUsagePanel: {
+        empty: 'No connected subscriptions',
+        loading: 'Checking plans…',
+        refresh: 'Refresh',
+        resetsAt: when => `resets ${when}`,
+        states: {
+          network_error: 'Could not reach the provider',
+          no_usage_endpoint: 'No plan data for this provider',
+          not_authenticated: 'Not signed in',
+          ok: '',
+          parse_error: 'Unexpected response from the provider',
+          rate_limited: 'Rate limited — try again shortly',
+          unauthorized: 'Sign-in expired'
+        },
+        title: 'Plan Usage',
+        windows: {
+          '5h': '5-hour window',
+          '24h': 'Daily window',
+          '7d': 'Weekly window',
+          chat: 'Chat',
+          completions: 'Completions',
+          credits: 'Credits',
+          period: 'Billing period',
+          premium_interactions: 'Premium requests'
+        }
+      },
+      accountUsage: 'Plans',
+      toggleAccountUsage: 'Show plan usage',
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
