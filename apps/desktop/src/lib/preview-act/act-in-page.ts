@@ -529,6 +529,51 @@ export function actInPageCore(
     return fail(describe(el) + ' is disabled.')
   }
 
+  if (action.kind === 'upload') {
+    if (el.tagName !== 'INPUT' || (el as HTMLInputElement).type !== 'file') {
+      return fail(describe(el) + ' is not a file input. Use a selector for input[type="file"].')
+    }
+
+    const uploads = action.files || []
+
+    if (!uploads.length) {
+      return fail('Upload needs at least one local file.')
+    }
+
+    try {
+      const transfer = new DataTransfer()
+
+      for (const upload of uploads) {
+        const comma = upload.dataUrl.indexOf(',')
+
+        if (comma < 0 || !upload.dataUrl.startsWith('data:')) {
+          return fail('Upload data is not a valid data URL for ' + upload.name + '.')
+        }
+
+        const header = upload.dataUrl.slice(5, comma)
+        const body = upload.dataUrl.slice(comma + 1)
+        const mime = header.split(';')[0] || 'application/octet-stream'
+        const binary = /;base64/i.test(header) ? atob(body) : decodeURIComponent(body)
+        const bytes = new Uint8Array(binary.length)
+
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i)
+        }
+
+        transfer.items.add(new File([bytes], upload.name || 'upload', { type: mime }))
+      }
+
+      const input = el as HTMLInputElement
+      input.files = transfer.files
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+
+      return answer({ acted: 'uploaded ' + uploads.length + ' file' + (uploads.length === 1 ? '' : 's'), success: true })
+    } catch (error) {
+      return fail('Could not inject files into ' + describe(el) + ': ' + String(error))
+    }
+  }
+
   if (action.kind === 'click') {
     const init = { bubbles: true, cancelable: true, ...pointAt(el) }
 

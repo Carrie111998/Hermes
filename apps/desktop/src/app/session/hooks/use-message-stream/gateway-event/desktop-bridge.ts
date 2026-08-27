@@ -111,6 +111,7 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
               selector: payload?.selector,
               submit: payload?.submit,
               text: payload?.text,
+              filePaths: Array.isArray(payload?.files) ? payload.files : undefined,
               to: payload?.to as PreviewActAction['to']
             })
           )

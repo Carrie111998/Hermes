@@ -3381,6 +3381,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ref=next_args.get("ref"),
                     selector=next_args.get("selector"),
                     text=next_args.get("text"),
+                    files=next_args.get("files"),
                     key=next_args.get("key"),
                     submit=next_args.get("submit"),
                     amount=next_args.get("amount"),

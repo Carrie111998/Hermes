@@ -675,6 +675,37 @@ describe('press', () => {
   })
 })
 
+describe('upload', () => {
+  it('injects local files into a hidden file input and fires change', () => {
+    const holder = page('<input id="upload" aria-label="Upload product" type="file" style="display: none" />')
+    const input = document.getElementById('upload') as HTMLInputElement
+    const changed = vi.fn()
+
+    Object.defineProperty(input, 'files', { configurable: true, value: null, writable: true })
+
+    class FakeDataTransfer {
+      files: File[] = []
+      items = {
+        add: (file: File) => this.files.push(file)
+      }
+    }
+
+    vi.stubGlobal('DataTransfer', FakeDataTransfer)
+    input.addEventListener('change', changed)
+
+    const result = actInPage(document, holder, {
+      files: [{ dataUrl: 'data:text/plain;base64,SGk=', name: 'hello.txt' }],
+      kind: 'upload',
+      selector: '#upload'
+    })
+
+    expect(result.success).toBe(true)
+    expect(changed).toHaveBeenCalledOnce()
+    expect((input.files as unknown as File[])[0]).toMatchObject({ name: 'hello.txt', type: 'text/plain' })
+    vi.unstubAllGlobals()
+  })
+})
+
 describe('scroll', () => {
   it('scrolls the page by about a screen when given no distance', () => {
     const holder = page('<p>long page</p>')

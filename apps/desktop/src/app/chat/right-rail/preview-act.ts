@@ -27,6 +27,7 @@
  * out of the boot path.
  */
 
+import { readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
 import { actEngineSource, type PreviewActAction, type PreviewActResult } from '@/lib/preview-act/act-in-page'
 import { watchInPage } from '@/lib/preview-act/watch-in-page'
 
@@ -481,9 +482,50 @@ async function driveScroll(
   return { ...after.result, acted: 'scrolled the page', success: true }
 }
 
+/** Read local files through the desktop bridge, then inject browser-native File
+ * objects through the same page script channel used by the other preview acts. */
+async function driveUpload(run: PreviewScriptRunner, action: PreviewActAction): Promise<PreviewActResult> {
+  const paths = action.filePaths || []
+
+  if (!paths.length) {
+    return { error: 'Upload needs one or more local file paths.', success: false }
+  }
+
+  try {
+    const files = []
+
+    for (const path of paths) {
+      const dataUrl = await readDesktopFileDataUrlLocalFirst(path)
+      const name = path.split(/[\\/]/).pop() || 'upload'
+
+      if (!dataUrl.startsWith('data:')) {
+        return { error: 'Could not read ' + name + ' as a data URL.', success: false }
+      }
+
+      files.push({ dataUrl, name })
+    }
+
+    const pageAction: PreviewActAction = {
+      ...action,
+      filePaths: undefined,
+      files
+    }
+
+    const scripted = await runJson(run, buildScriptedScript(pageAction, SETTLE_MS))
+
+    if (scripted.kind === 'failed') {
+      return { error: scripted.error, success: false }
+    }
+
+    return scripted.kind === 'answered' ? scripted.result : { acted: 'uploaded files', note: NAVIGATED, success: true }
+  } catch (error) {
+    return { error: 'Could not read local upload: ' + String(error), success: false }
+  }
+}
+
 /** Run one action against the ACTIVE preview tab's page. `kind` is a bare
- *  string: the verb arrives off the wire, and the history ones never reach
- *  the in-page engine. */
+ * string: the verb arrives off the wire, and the history ones never reach
+ * the in-page engine. */
 export async function actOnActivePreview(
   action: Omit<PreviewActAction, 'kind'> & { kind: string }
 ): Promise<PreviewActResult> {
@@ -510,6 +552,24 @@ export async function actOnActivePreview(
   }
 
   const typed = action as PreviewActAction
+
+  // Backward-compatible bridge for sessions whose tool schema predates the
+  // dedicated `upload` verb. The normal `type` action remains unchanged unless
+  // its text carries this private file marker.
+  const legacyUploadPrefix = '__HERMES_PREVIEW_UPLOAD__:'
+
+  if (typed.kind === 'type' && typed.text?.startsWith(legacyUploadPrefix)) {
+    return driveUpload(run, {
+      ...typed,
+      filePaths: [typed.text.slice(legacyUploadPrefix.length)],
+      kind: 'upload',
+      text: undefined
+    })
+  }
+
+  if (typed.kind === 'upload') {
+    return driveUpload(run, typed)
+  }
 
   // Annotation, not interaction: nothing is clicked, nothing settles, and the
   // page is not re-read, so these skip the whole act-then-inventory path.

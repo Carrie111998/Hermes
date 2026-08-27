@@ -136,6 +136,7 @@ export type GatewayEventPayload = {
   ref?: string
   submit?: boolean
   key?: string
+  files?: string[]
   amount?: number
   to?: string
   max?: number

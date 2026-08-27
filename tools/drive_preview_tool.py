@@ -37,6 +37,7 @@ ACTIONS = (
     "click",
     "hover",
     "type",
+    "upload",
     "scroll",
     "press",
     "strobe",
@@ -48,7 +49,7 @@ SCROLL_TO = ("top", "bottom")
 
 # Verbs that need something to act on — a ref from the last inventory, or a
 # raw CSS selector. `scroll` is deliberately absent: bare, it scrolls the page.
-NEEDS_TARGET = ("click", "hover", "type", "press")
+NEEDS_TARGET = ("click", "hover", "type", "upload", "press")
 
 
 def drive_preview_tool(
@@ -56,6 +57,7 @@ def drive_preview_tool(
     ref: Optional[str] = None,
     selector: Optional[str] = None,
     text: Optional[str] = None,
+    files: Optional[list[str]] = None,
     key: Optional[str] = None,
     submit: Optional[bool] = None,
     amount: Optional[int] = None,
@@ -80,6 +82,14 @@ def drive_preview_tool(
     if verb == "type" and text is None:
         return tool_error("type needs the text to enter.")
 
+    if verb == "upload":
+        if not files:
+            return tool_error("upload needs one or more local file paths in files.")
+        if any(not isinstance(path, str) or not path.strip() for path in files):
+            return tool_error("files must contain non-empty local file paths.")
+        if len(files) > 12:
+            return tool_error("upload accepts at most 12 files at once.")
+
     if verb == "press" and not key:
         return tool_error("press needs a key, e.g. 'Enter' or 'Escape'.")
 
@@ -94,6 +104,7 @@ def drive_preview_tool(
                 ("ref", ref),
                 ("selector", selector),
                 ("text", text),
+                ("files", files),
                 ("key", key),
                 ("submit", submit),
                 ("full", full),
@@ -152,7 +163,9 @@ ACT_PREVIEW_SCHEMA = {
         "Actions: 'elements' (inventory), 'click', 'hover' (move the pointer "
         "onto something and leave it there — use it to open a dropdown or "
         "reveal a tooltip before clicking inside it), 'type' (set a field's "
-        "text; submit=true also presses Enter and submits the form), 'scroll' "
+        "text; submit=true also presses Enter and submits the form), "
+        "'upload' (inject local files into a page file input without opening "
+        "the native picker), 'scroll' "
         "(the page, or a ref'd scrollable), 'press' (a named key), 'strobe' "
         "(touch nothing — just rattle the highlight through the page again; "
         "'elements' already does this once, so reach for it only when asked to "
@@ -182,6 +195,11 @@ ACT_PREVIEW_SCHEMA = {
                 "description": "CSS selector, as a fallback when no ref fits. Prefer ref.",
             },
             "text": {"type": "string", "description": "For 'type': the text to enter."},
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "For 'upload': local file paths to inject into the targeted file input without opening File Explorer.",
+            },
             "submit": {
                 "type": "boolean",
                 "description": "For 'type': press Enter and submit the owning form afterwards.",
@@ -222,6 +240,7 @@ registry.register(
         ref=args.get("ref"),
         selector=args.get("selector"),
         text=args.get("text"),
+        files=args.get("files"),
         key=args.get("key"),
         submit=args.get("submit"),
         amount=args.get("amount"),
