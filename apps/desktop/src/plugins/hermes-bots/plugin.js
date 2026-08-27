@@ -14865,7 +14865,7 @@ function BotsPane() {
                         children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Bot']
                       }),
                       jsxs(DropdownMenuItem, {
-                        disabled: activeSourceRoster.length < 2,
+                        disabled: roster.filter(bot => !bot?.ghost).length < 2,
                         onSelect: () => setGroupCreateOpen(true),
                         children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
                       })
