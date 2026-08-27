@@ -1,4 +1,4 @@
-﻿"""Test that start_server configures ws-ping keepalive.
+"""Test that start_server configures ws-ping keepalive.
 
 The server now uses uvicorn.Server directly (not uvicorn.run) so we stub
 Config + Server + asyncio.run to capture kwargs without starting an event loop.
@@ -6,10 +6,12 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 
 import asyncio
 import contextlib
+import os
 import sys
 
 import pytest
 import uvicorn
+import yaml
 
 from hermes_cli import web_server
 
@@ -96,8 +98,8 @@ def test_start_server_disables_ws_ping_on_loopback(monkeypatch):
     minutes, so the loop can't process the pong and uvicorn kills an
     otherwise-healthy local connection (#53773 "event loop stalled 226.3s",
     #48445/#50005). On loopback there is no network/proxy path where a
-    half-open connection can occur â€” a dead local client tears the socket down
-    with a real FIN/RST that surfaces as WebSocketDisconnect regardless â€” so
+    half-open connection can occur — a dead local client tears the socket down
+    with a real FIN/RST that surfaces as WebSocketDisconnect regardless — so
     the ping provides no liveness value and only harms. Assert it is disabled.
     """
     captured = _stub_uvicorn(monkeypatch)
@@ -129,7 +131,7 @@ def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     WebSocketDisconnect into the reaping path (#32377).
 
     The invariant asserted here is that ping stays enabled (non-None, positive)
-    and the timeout is never shorter than the interval â€” not a frozen literal,
+    and the timeout is never shorter than the interval — not a frozen literal,
     which churns every time the window is retuned. Loopback disables the ping
     (see test_start_server_disables_ws_ping_on_loopback); this covers the
     public-bind half-open case, so the auth gate is active here.
@@ -156,10 +158,10 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     On Windows ``asyncio.run`` defaults to a ProactorEventLoop, but uvicorn's
     socket-serving stack forces a SelectorEventLoop on win32
     (``uvicorn/loops/asyncio.py``). Serving on the proactor loop binds a socket
-    that never accepts â€” the backend prints "Skipping web UI build" and hangs
+    that never accepts — the backend prints "Skipping web UI build" and hangs
     forever with the port LISTENING but no TCP handshake (#50641). We fix that
     by routing the serve call through ``uvicorn._compat.asyncio_run`` with
-    ``config.get_loop_factory()`` â€” exactly what ``uvicorn.Server.run`` does.
+    ``config.get_loop_factory()`` — exactly what ``uvicorn.Server.run`` does.
 
     This asserts the behavioral contract: on Windows the loop factory the runner
     receives is the one uvicorn's own Config produced, and bare ``asyncio.run``
@@ -212,7 +214,7 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     never the Windows loop-factory branch.
 
     The #50641 fix is intentionally win32-scoped to keep the loop selection
-    unchanged â€” Python's default loop on POSIX is already a SelectorEventLoop
+    unchanged — Python's default loop on POSIX is already a SelectorEventLoop
     (or uvloop), which is what uvicorn serves on.
 
     No platform patching: the Linux CI host is already POSIX, so this asserts
@@ -314,7 +316,7 @@ def test_start_server_treats_windows_fallback_keyboardinterrupt_as_clean_shutdow
 
     When ``uvicorn._compat.asyncio_run`` is unavailable (uvicorn predates the
     loop-factory API), the Windows branch falls back to bare ``asyncio.run``
-    under a hand-installed selector policy â€” still inside the same
+    under a hand-installed selector policy — still inside the same
     ``capture_signals()`` re-raise, so its ``KeyboardInterrupt`` must be
     swallowed identically. Forcing the ``_compat`` import to fail (None in
     ``sys.modules`` halts the import) is what actually selects the fallback:
@@ -345,42 +347,67 @@ def test_start_server_treats_windows_fallback_keyboardinterrupt_as_clean_shutdow
 
 
 
+@pytest.fixture()
+def _isolated_config_home():
+    """Per-test HERMES_HOME as a Path, with the raw-config cache cleared
+    around the test (the autouse ``_hermetic_environment`` conftest fixture
+    already redirected HERMES_HOME to a per-test tempdir)."""
+    from pathlib import Path
+
+    import hermes_cli.config as config_mod
+
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config_mod._RAW_CONFIG_CACHE.clear()
+    yield home
+    config_mod._RAW_CONFIG_CACHE.clear()
+
+
 @pytest.mark.asyncio
-async def test_get_put_config_preserves_env_var_placeholders(monkeypatch):
+async def test_put_config_preserves_env_var_placeholder_on_disk(
+    _isolated_config_home, monkeypatch
+):
     """
     Regression test for #94918:
-    Ensure get_config normalizes config for web without leaking runtime secrets.
+
+    Disk config.yaml holds an unexpanded ``${ENV_VAR}`` reference for
+    ``model.api_key``. A PUT that only touches an unrelated field must
+    leave that reference untouched on disk -- not materialize the
+    resolved secret.
+
+    This drives the real ``update_config()`` against a real config.yaml
+    on disk (no mocking of ``read_raw_config``/``save_config``/
+    ``load_config``), so a regression where ``update_config`` goes back
+    to resolving with ``load_config()`` before saving would fail this
+    test, unlike a test that only inspects the GET response.
     """
-    import json
-    from unittest.mock import patch
-    from hermes_cli.web_server import get_config
+    from hermes_cli.web_server import ConfigUpdate, update_config
 
     monkeypatch.setenv("TEST_OPENAI_SECRET", "super-secret-runtime-token-123")
 
-    raw_yaml_content = {
-        "model": {
-            "provider": "openai",
-            "api_key": "${TEST_OPENAI_SECRET}"
-        }
-    }
-    resolved_yaml_content = {
-        "model": {
-            "provider": "openai",
-            "api_key": "super-secret-runtime-token-123"
-        }
-    }
+    cfg_path = _isolated_config_home / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "provider": "openai",
+                    "default": "gpt-4",
+                    "api_key": "${TEST_OPENAI_SECRET}",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    with patch("hermes_cli.web_server.read_raw_config", return_value=raw_yaml_content), \
-         patch("hermes_cli.web_server.load_config", return_value=resolved_yaml_content):
+    # An unrelated change: touches a different top-level key and never
+    # mentions "model" at all -- the shape a real dashboard autosave of
+    # e.g. a display setting would send.
+    body = ConfigUpdate(config={"display": {"ephemeral_system_ttl": 5}})
+    result = await update_config(body)
+    assert result == {"ok": True}
 
-        response = await get_config()
+    on_disk_text = cfg_path.read_text(encoding="utf-8")
+    on_disk = yaml.safe_load(on_disk_text)
 
-        if hasattr(response, "body"):
-            raw_data = response.body.decode("utf-8")
-        else:
-            raw_data = response
-
-        config_dict = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-
-        # Web normalizer masks sensitive api_keys; runtime secret must never leak.
-        assert "super-secret-runtime-token-123" not in str(config_dict)
+    assert on_disk["model"]["api_key"] == "${TEST_OPENAI_SECRET}"
+    assert "super-secret-runtime-token-123" not in on_disk_text

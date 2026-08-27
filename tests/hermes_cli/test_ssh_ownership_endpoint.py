@@ -1,7 +1,3 @@
-﻿import pytest
-import warnings
-
-pytestmark = pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
@@ -40,4 +36,3 @@ def test_ssh_ownership_endpoint_is_absent_without_owner_nonce(monkeypatch):
         headers={"X-Hermes-Session-Token": token},
     )
     assert response.status_code == 404
-

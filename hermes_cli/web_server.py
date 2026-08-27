@@ -19627,7 +19627,7 @@ def start_server(
     # dashboard.ws_ping_timeout, #79635); the 20/20 defaults keep the
     # Cloudflare-Tunnel-friendly behaviour when unset or invalid.
     try:
-        _dash_cfg = read_raw_config().get("dashboard") or {}
+        _dash_cfg = load_config().get("dashboard") or {}
     except Exception:
         _dash_cfg = {}
 
@@ -19824,6 +19824,7 @@ def start_server(
     # normally instead of being swallowed and double-run.
     try:
         from uvicorn._compat import asyncio_run as _runner
+
         _loop_factory = config.get_loop_factory()
     except Exception:
         _runner = None
@@ -19835,6 +19836,12 @@ def start_server(
         except Exception:
             pass
 
+    # Same clean Ctrl+C contract as the POSIX branch above: ``capture_signals()``
+    # re-raises the captured signal after the graceful shutdown has already
+    # completed. For console Ctrl+C the re-raised SIGINT lands as
+    # ``KeyboardInterrupt`` — a clean user-requested exit here too. (Re-raised
+    # SIGTERM/SIGBREAK keep their default terminate disposition and never reach
+    # this except.)
     try:
         if _runner is not None:
             _runner(_serve(), loop_factory=_loop_factory)
@@ -19843,8 +19850,8 @@ def start_server(
     except KeyboardInterrupt:
         return
     except SystemExit as exc:
+        # Same probe-to-bind race translation as the POSIX branch (#93608).
         if exc.code == 1 and _port_bind_conflict(host, port):
             _report_port_in_use(host, port)
             raise SystemExit(PORT_IN_USE_EXIT_CODE) from None
         raise
-
