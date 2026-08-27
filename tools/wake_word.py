@@ -695,11 +695,22 @@ class _SherpaKwsEngine(_Engine):
 
         phrases = list(phrase_map)
         # Runtime tokenization of the arbitrary phrases — the open-vocab core.
+        # Check if bpe.model exists to determine tokens_type
+        bpe_model_path = d / "bpe.model"
+        if bpe_model_path.exists():
+            tokens_type = "bpe"
+            bpe_model = str(bpe_model_path)
+        else:
+            # For models like wenetspeech that use pinyin tokens
+            # Check if tokens.txt contains pinyin (partial pinyin format)
+            # by looking for entries like "ǐ", "ǎo" etc.
+            tokens_type = "ppinyin"
+            bpe_model = None
         tokens = text2token(
             [p.upper() for p in phrases],
             tokens=str(d / "tokens.txt"),
-            tokens_type="bpe",
-            bpe_model=str(d / "bpe.model"),
+            tokens_type=tokens_type,
+            bpe_model=bpe_model,
         )
         import tempfile
 
