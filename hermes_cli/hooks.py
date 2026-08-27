@@ -151,11 +151,15 @@ _DEFAULT_PAYLOADS = {
         "is_first_turn": True,
         "model": "gpt-4",
         "platform": "cli",
+        "sender_id": "",
+        "chat_id": "",
     },
     "post_llm_call": {
         "session_id": "test-session",
         "model": "gpt-4",
         "platform": "cli",
+        "sender_id": "",
+        "chat_id": "",
     },
     "pre_verify": {
         "session_id": "test-session",
