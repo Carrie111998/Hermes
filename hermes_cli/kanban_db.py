@@ -8424,6 +8424,10 @@ class DispatchResult:
     Surfaces the auto-assignment to telemetry / CLI / dashboard so the
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
+    auto_reassigned_invalid: list[str] = field(default_factory=list)
+    """Task ids created by an automated router whose assignee profile no
+    longer exists and was repaired to ``kanban.default_assignee`` before
+    spawning. Human/control-plane lanes are never rewritten."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -10820,7 +10824,8 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, provider_override, model_override FROM tasks "
+        "SELECT id, assignee, created_by, provider_override, model_override "
+        "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10989,7 +10994,13 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
+        # Repair stale generated assignments, but preserve explicit human /
+        # control-plane lanes. Decomposition already validates the roster at
+        # creation time; this covers the remaining lifecycle hole where a
+        # profile is removed after a generated card was persisted. Rewriting
+        # only known automated producers prevents a missing profile from
+        # stranding generated work while keeping terminal-pulled work
+        # intentionally non-spawnable.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
         # control-plane lane (e.g. an interactive Claude Code terminal
@@ -11004,14 +11015,52 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+            generated_by = (row["created_by"] or "").strip().lower()
+            generated_task = generated_by in {
+                "auto-decomposer",
+                "decomposer",
+                "specialist-routing",
+            }
+            if (
+                generated_task
+                and _default_assignee
+                and _default_assignee_resolved
+                and profile_exists(_default_assignee)
+            ):
+                if not dry_run:
+                    try:
+                        with write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET assignee = ?, "
+                                "consecutive_failures = 0, last_failure_error = NULL "
+                                "WHERE id = ? AND assignee = ?",
+                                (_default_assignee, row["id"], row_assignee),
+                            )
+                            _append_event(
+                                conn, row["id"], "assigned",
+                                {
+                                    "assignee": _default_assignee,
+                                    "source": "kanban.invalid_assignee_fallback",
+                                    "previous_assignee": row_assignee,
+                                },
+                            )
+                    except Exception:
+                        _log.warning(
+                            "kanban dispatch: failed to repair invalid generated "
+                            "assignee=%r on task %s",
+                            row_assignee,
+                            row["id"],
+                            exc_info=True,
+                        )
+                        result.skipped_nonspawnable.append(row["id"])
+                        continue
+                row_assignee = _default_assignee
+                result.auto_reassigned_invalid.append(row["id"])
+            else:
+                # Control-plane and explicitly human-assigned lanes remain
+                # visible as non-spawnable and are never silently reassigned.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
