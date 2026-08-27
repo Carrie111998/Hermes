@@ -16,7 +16,6 @@ transport:
   args:
     - "-y"
     - "screenpipe-mcp@0.19.1"
-  version: "0.19.1"
   env:
     SCREENPIPE_DISABLE_TELEMETRY: "1"
 
@@ -49,6 +48,10 @@ suggest:
     - screenpi.pe
 
 post_install: |
+  The screenpipe desktop app continuously records your screen and microphone
+  audio while recording is enabled. Review its retention and delete-range
+  controls at https://docs.screenpipe.com/api-recipes before enabling capture.
+
   Install and run the screenpipe desktop app before using these tools. The MCP
   server connects only to screenpipe's local API at http://localhost:3030 and
   discovers its local API key from the desktop installation.
