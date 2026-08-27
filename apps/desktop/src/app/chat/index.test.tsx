@@ -6,10 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $awaitingResponse,
   $busy,
+  $connection,
   $contextSuggestions,
   $currentCwd,
   $currentModel,
@@ -157,12 +159,14 @@ describe('ChatView render isolation', () => {
   beforeEach(() => {
     threadRenderCount.current = 0
     $activeSessionId.set('runtime-1')
+    $activeGatewayProfile.set('profile-a')
     $awaitingResponse.set(false)
     $busy.set(false)
     $contextSuggestions.set([])
     $currentCwd.set('/work')
     $currentModel.set('test-model')
     $currentProvider.set('test-provider')
+    $connection.set({ connectionId: 'local', mode: 'local' } as never)
     $freshDraftReady.set(false)
     $gatewayState.set('closed')
     const initialMessages = [assistantMessage('assistant-1', 'Stable historical answer')]
@@ -182,12 +186,14 @@ describe('ChatView render isolation', () => {
     cleanup()
     vi.restoreAllMocks()
     $activeSessionId.set(null)
+    $activeGatewayProfile.set('default')
     $awaitingResponse.set(false)
     $busy.set(false)
     $contextSuggestions.set([])
     $currentCwd.set('')
     $currentModel.set('')
     $currentProvider.set('')
+    $connection.set(null)
     $freshDraftReady.set(false)
     $gatewayState.set('idle')
     $messages.set([])
@@ -396,6 +402,39 @@ describe('ChatView render isolation', () => {
       $activeSessionId.set(null)
       $sessionStates.set({})
       $messages.set([])
+    })
+
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
+  })
+
+  it('fences same stored ids across profiles until the new runtime publishes', () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <ChatView {...chatViewProps()} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
+
+    act(() => $activeGatewayProfile.set('profile-b'))
+
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('true')
+
+    act(() => {
+      $sessionStates.set({
+        ...$sessionStates.get(),
+        'runtime-2': {
+          ...createClientSessionState('stored-1'),
+          messages: [assistantMessage('assistant-b', 'Profile B is ready')]
+        }
+      })
+      $activeSessionId.set('runtime-2')
     })
 
     expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')

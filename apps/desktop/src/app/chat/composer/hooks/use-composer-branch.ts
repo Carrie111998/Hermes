@@ -19,7 +19,13 @@ interface UseComposerBranchOptions {
  * instead of getting stashed under this one. Backend coupling (cwd + the
  * projects store) is the only dependency; nothing about ChatBar's render.
  */
-export function useComposerBranch({ actionsDisabled, clearDraft, cwd, draftRef, sessionKey }: UseComposerBranchOptions) {
+export function useComposerBranch({
+  actionsDisabled,
+  clearDraft,
+  cwd,
+  draftRef,
+  sessionKey
+}: UseComposerBranchOptions) {
   const scope = useComposerScope()
   const actionEpochRef = useRef({ key: sessionKey, value: 0 })
 

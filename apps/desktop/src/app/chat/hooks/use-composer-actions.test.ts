@@ -379,6 +379,69 @@ describe('useComposerActions native image drops', () => {
     expect(attached).toBe(false)
     expect(add).not.toHaveBeenCalled()
   })
+
+  it('patches a delayed A PR comment occurrence after the route changes to B', async () => {
+    let resolveComment: ((comment: Record<string, unknown>) => void) | undefined
+
+    const commentPending = new Promise<Record<string, unknown>>(resolve => {
+      resolveComment = resolve
+    })
+
+    const fetchPrComment = vi.fn(() => commentPending)
+    const add = vi.fn<(attachment: ComposerAttachment) => void>()
+    const updateIfCurrent = vi.fn(() => true)
+
+    const scope = {
+      add,
+      remove: vi.fn(() => null),
+      target: 'test-composer',
+      update: vi.fn(() => true),
+      updateIfCurrent
+    }
+
+    $connection.set(null)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { git: { review: { fetchPrComment } } }
+    })
+
+    const hook = renderHook(
+      ({ composerScopeKey }: { composerScopeKey: string }) =>
+        useComposerActions({
+          activeSessionId: 'runtime-a',
+          composerScopeKey,
+          currentCwd: '/repo',
+          requestGateway: vi.fn(),
+          scope
+        }),
+      { initialProps: { composerScopeKey: 'stored-a' } }
+    )
+
+    const url = 'https://github.com/NousResearch/hermes-agent/pull/1#discussion_r1'
+
+    act(() => expect(hook.result.current.attachPrCommentUrl(url)).toBe(true))
+
+    const optimistic = add.mock.calls[0]?.[0]
+
+    expect(optimistic?.occurrenceId).toBeTruthy()
+    hook.rerender({ composerScopeKey: 'stored-b' })
+
+    await act(async () => {
+      resolveComment?.({ author: 'reviewer', body: 'comment', line: 42, path: 'src/file.ts', prNumber: 1 })
+      await commentPending
+    })
+
+    await waitFor(() =>
+      expect(updateIfCurrent).toHaveBeenCalledWith(
+        optimistic,
+        expect.objectContaining({
+          kind: 'review',
+          label: 'file.ts:42 — @reviewer',
+          uploadState: undefined
+        })
+      )
+    )
+  })
 })
 
 describe('attachImagePath thumbnail separation', () => {

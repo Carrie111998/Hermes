@@ -192,7 +192,7 @@ function TileChat({
   // pointed at this tile's chips + session.
   const composer = useComposerActions({
     activeSessionId: runtimeId,
-    composerScopeKey: storedSessionId,
+    composerScopeKey: `${ownerRoute?.connectionId ?? ''}\0${ownerRoute?.profile ?? activeGatewayProfile}\0${storedSessionId}`,
     currentCwd: cwd,
     requestGateway: requestTileGateway,
     scope: {

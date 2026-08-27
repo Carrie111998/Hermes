@@ -6,6 +6,7 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { profileScopeKey } from '@/api/client'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
@@ -428,6 +429,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const connection = useStore($connection)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -471,6 +473,24 @@ const ChatViewContent = memo(function ChatViewContent({
 
     return resolveComposerSessionKey(effectiveSelectedSessionId, sessions)
   }, [isPrimary, location.pathname, selectedSessionId, sessions])
+
+  const activeOwnerScopeKey = profileScopeKey({
+    connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
+    profile: activeGatewayProfile
+  })
+
+  const tileOwner = !isPrimary && storedId ? getSessionOwnerHint(storedId) : undefined
+
+  const composerOwnerScopeKey = tileOwner
+    ? profileScopeKey({ connectionId: tileOwner.connectionId, profile: tileOwner.profile })
+    : activeOwnerScopeKey
+
+  const composerIdentityScopeKey = `${composerOwnerScopeKey}\0${queueSessionKey ?? '__new__'}`
+  const runtimeOwnerScopeByIdRef = useRef(new Map<string, string>())
+
+  if (isPrimary && activeSessionId && !runtimeOwnerScopeByIdRef.current.has(activeSessionId)) {
+    runtimeOwnerScopeByIdRef.current.set(activeSessionId, composerOwnerScopeKey)
+  }
 
   // When the tip row arrives after compression, migrate any tip-keyed stash onto
   // the durable lineage key before the composer remounts onto that key.
@@ -516,10 +536,18 @@ const ChatViewContent = memo(function ChatViewContent({
         isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
       : false
 
+  const activeRuntimeOwnerScope = activeSessionId ? runtimeOwnerScopeByIdRef.current.get(activeSessionId) : undefined
+
+  const activeRuntimeOwnerMismatch =
+    isPrimary &&
+    isRoutedSessionView &&
+    Boolean(activeRuntimeOwnerScope && activeRuntimeOwnerScope !== composerOwnerScopeKey)
+
   const newChatRouteHasStaleSession =
     isPrimary && isNewChatRoute(location.pathname) && Boolean(selectedSessionId || activeSessionId)
 
-  const sessionTransitioning = routeSessionMismatch || activeRuntimeRouteMismatch || newChatRouteHasStaleSession
+  const sessionTransitioning =
+    routeSessionMismatch || activeRuntimeRouteMismatch || activeRuntimeOwnerMismatch || newChatRouteHasStaleSession
 
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state. The Appearance toggle
@@ -764,6 +792,7 @@ const ChatViewContent = memo(function ChatViewContent({
               disabled={!gatewayOpen}
               focusKey={activeSessionId}
               gateway={gateway}
+              identityScopeKey={composerIdentityScopeKey}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
               onAddContextRef={onAddContextRef}
               onAddUrl={onAddUrl}

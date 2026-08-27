@@ -98,7 +98,10 @@ export function useComposerSubmit({
   ) => {
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
-    const submittedRevision = clearSubmittedDraft ? clearSessionDraft(submittedScope) : sessionDraftRevision(submittedScope)
+
+    const submittedRevision = clearSubmittedDraft
+      ? clearSessionDraft(submittedScope)
+      : sessionDraftRevision(submittedScope)
 
     const restore = () => {
       if (!clearSubmittedDraft) {
@@ -108,8 +111,7 @@ export function useComposerSubmit({
       const visibleScopeIsSubmitted = activeQueueSessionKeyRef.current === submittedScope
 
       const visibleDraftChanged =
-        visibleScopeIsSubmitted &&
-        (draftRef.current.length > 0 || scope.attachments.$attachments.get().length > 0)
+        visibleScopeIsSubmitted && (draftRef.current.length > 0 || scope.attachments.$attachments.get().length > 0)
 
       if (visibleDraftChanged || sessionDraftRevision(submittedScope) !== submittedRevision) {
         return

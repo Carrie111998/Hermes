@@ -327,28 +327,34 @@ export function useComposerActions({
     [actionIsCurrent, scope]
   )
 
-  const addTextToDraft = useCallback((text: string) => {
-    if (actionIsCurrent()) {
-      requestComposerInsert(text, { mode: 'block' })
-    }
-  }, [actionIsCurrent])
+  const addTextToDraft = useCallback(
+    (text: string) => {
+      if (actionIsCurrent()) {
+        requestComposerInsert(text, { mode: 'block' })
+      }
+    },
+    [actionIsCurrent]
+  )
 
-  const addTerminalSelectionAttachment = useCallback((text: string, label = 'selection') => {
-    if (!actionIsCurrent()) {
-      return
-    }
+  const addTerminalSelectionAttachment = useCallback(
+    (text: string, label = 'selection') => {
+      if (!actionIsCurrent()) {
+        return
+      }
 
-    const trimmed = text.trim()
-    const normalizedLabel = label.trim() || 'selection'
-    const refText = `@terminal:${formatRefValue(normalizedLabel)}`
+      const trimmed = text.trim()
+      const normalizedLabel = label.trim() || 'selection'
+      const refText = `@terminal:${formatRefValue(normalizedLabel)}`
 
-    if (!trimmed) {
-      return
-    }
+      if (!trimmed) {
+        return
+      }
 
-    setComposerTerminalSelection(normalizedLabel, trimmed)
-    requestComposerInsert(refText, { mode: 'inline' })
-  }, [actionIsCurrent])
+      setComposerTerminalSelection(normalizedLabel, trimmed)
+      requestComposerInsert(refText, { mode: 'inline' })
+    },
+    [actionIsCurrent]
+  )
 
   const addContextRefAttachment = useCallback(
     (refText: string, label?: string, detail?: string) => {
@@ -383,13 +389,16 @@ export function useComposerActions({
       const id = attachmentId('review', url)
       const refText = `@url:${formatRefValue(url)}`
 
-      attachToMain({
+      const baseAttachment: ComposerAttachment = {
         id,
+        occurrenceId: createComposerAttachmentOccurrenceId(),
         kind: 'review',
         label: url.replace(/^https:\/\/github\.com\//, '').replace(/#.*$/, ''),
         refText,
         uploadState: 'uploading'
-      })
+      }
+
+      attachToMain(baseAttachment)
 
       void (async () => {
         const comment = currentCwd
@@ -398,22 +407,23 @@ export function useComposerActions({
               .catch(() => null) ?? null)
           : null
 
-        if (!actionIsCurrent()) {
-          return
-        }
-
         if (comment) {
-          scope.update({
-            id,
+          scope.updateIfCurrent(baseAttachment, {
             kind: 'review',
             label: comment.path
               ? `${pathLabel(comment.path)}${comment.line ? `:${comment.line}` : ''} — @${comment.author}`
               : `PR #${comment.prNumber} — @${comment.author}`,
             detail: JSON.stringify(comment),
-            refText
+            refText,
+            uploadState: undefined
           })
         } else {
-          scope.update({ id, kind: 'url', label: pathLabel(url), refText })
+          scope.updateIfCurrent(baseAttachment, {
+            kind: 'url',
+            label: pathLabel(url),
+            refText,
+            uploadState: undefined
+          })
         }
       })()
 
@@ -512,7 +522,7 @@ export function useComposerActions({
       try {
         const { previewUrl, thumbnailUrl } = await queuedAttachmentPreview(filePath)
 
-        if (actionIsCurrent() && previewUrl) {
+        if (previewUrl) {
           // Keep only the bounded thumbnail in composer state. The full source
           // is read on demand for lightbox/download and separately at submit
           // for the model, so retaining 72 multi-MB data URLs serves no purpose.
@@ -523,11 +533,13 @@ export function useComposerActions({
           scope.updateIfCurrent(baseAttachment, thumbnailUrl ? { thumbnailUrl } : { previewUrl })
         }
 
-        return actionIsCurrent()
+        return true
       } catch (err) {
-        notifyError(err, copy.imagePreviewFailed)
+        if (actionIsCurrent()) {
+          notifyError(err, copy.imagePreviewFailed)
+        }
 
-        return actionIsCurrent()
+        return true
       }
     },
     [actionIsCurrent, attachToMain, copy.imagePreviewFailed, scope]

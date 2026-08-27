@@ -113,12 +113,21 @@ export function useComposerVoice({
     }
   }
 
-  const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
+  const {
+    cancel: cancelDictation,
+    dictate,
+    voiceActivityState,
+    voiceStatus
+  } = useVoiceRecorder({
     focusInput: focusAfterVoice,
     maxRecordingSeconds,
     onTranscript: insertVoiceTranscript,
     onTranscribeAudio
   })
+
+  const cancelDictationRef = useRef(cancelDictation)
+
+  cancelDictationRef.current = cancelDictation
 
   /** Auto-speak selector: the latest unspoken reply only — a backlog collapses to the newest. */
   const pendingResponse = () => {
@@ -231,6 +240,7 @@ export function useComposerVoice({
     }
 
     mountedVoiceScopeKeyRef.current = submissionKey
+    cancelDictationRef.current()
     setVoiceConversationActive(false)
     void conversation.end()
   }, [conversation, submissionKey])

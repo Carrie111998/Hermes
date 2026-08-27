@@ -93,6 +93,7 @@ export function ChatBar({
   disabled,
   focusKey,
   gateway,
+  identityScopeKey,
   maxRecordingSeconds = 120,
   queueSessionKey,
   sessionId,
@@ -125,11 +126,12 @@ export function ChatBar({
   // end control. Populated after useComposerVoice below (the submit wrapper
   // is created first); render-time assignment keeps the ref current.
   const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
-  const submitScopeKey = queueSessionKey || sessionId || null
-  const submitScopeEpochRef = useRef({ key: submitScopeKey, value: 0 })
+  const submitScopeKey = queueSessionKey === undefined ? (sessionId ?? null) : queueSessionKey
+  const actionScopeKey = identityScopeKey ?? submitScopeKey
+  const submitScopeEpochRef = useRef({ key: actionScopeKey, value: 0 })
 
-  if (submitScopeEpochRef.current.key !== submitScopeKey) {
-    submitScopeEpochRef.current = { key: submitScopeKey, value: submitScopeEpochRef.current.value + 1 }
+  if (submitScopeEpochRef.current.key !== actionScopeKey) {
+    submitScopeEpochRef.current = { key: actionScopeKey, value: submitScopeEpochRef.current.value + 1 }
   }
 
   const renderSubmitScopeEpoch = submitScopeEpochRef.current.value
@@ -267,7 +269,6 @@ export function ChatBar({
     isSteerableText,
     loadIntoComposer,
     requestMainFocus,
-    sessionIdRef,
     setComposerText,
     stashAt,
     syncDraftFromEditor
@@ -311,11 +312,11 @@ export function ChatBar({
   // "Add URL" dialog — open/value state, autofocus, and submit (host onAddUrl or
   // an @url: directive into the draft).
   const { openUrlDialog, setUrlOpen, setUrlValue, submitUrl, urlInputRef, urlOpen, urlValue } = useComposerUrlDialog({
-   disabled: actionsDisabled,
-   insertText,
-   onAddUrl,
-   scopeKey: activeQueueSessionKey
- })
+    disabled: actionsDisabled,
+    insertText,
+    onAddUrl,
+    scopeKey: actionScopeKey
+  })
 
   // The queue engine — queued turns, in-place editing, the shared drain lock,
   // and bounded auto-drain. Consumes the draft API and writes `queueEditRef`.
@@ -455,7 +456,7 @@ export function ChatBar({
     emoji,
     recordUndoPoint,
     requestMainFocus,
-    scopeKey: activeQueueSessionKey,
+    scopeKey: actionScopeKey,
     setComposerText,
     slash
   })
@@ -543,7 +544,7 @@ export function ChatBar({
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     const imageBlobs = extractClipboardImageBlobs(event.clipboardData)
 
-    if (imageBlobs.length > 0 && onAttachImageBlob) {
+    if (!actionsDisabled && imageBlobs.length > 0 && onAttachImageBlob) {
       triggerHaptic('selection')
 
       for (const blob of imageBlobs) {
@@ -569,7 +570,7 @@ export function ChatBar({
       // arrives as an empty paste (no blobs, no text). Fall back to the main
       // process, which pulls the image straight off the Windows clipboard.
       // Silent so a genuinely-empty paste doesn't pop a "no image" warning.
-      if (onPasteClipboardImage) {
+      if (!actionsDisabled && onPasteClipboardImage) {
         triggerHaptic('selection')
         void onPasteClipboardImage({ silent: true })
       }
@@ -588,7 +589,7 @@ export function ChatBar({
     // `@url:` chip. Optimistic card first, resolve via gh in the background —
     // if gh can't answer (offline, unauthenticated, foreign repo) the card
     // swaps back to the plain URL ref so nothing is lost.
-    if (PR_COMMENT_URL_RE.test(pastedText) && onAttachPrCommentUrl?.(pastedText)) {
+    if (!actionsDisabled && PR_COMMENT_URL_RE.test(pastedText) && onAttachPrCommentUrl?.(pastedText)) {
       event.preventDefault()
 
       return
@@ -1007,7 +1008,7 @@ export function ChatBar({
   // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +
   // branch-off/convert/list/switch actions; draft travels into the new session.
   const { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree } =
-    useComposerBranch({ actionsDisabled, clearDraft, cwd, draftRef, sessionKey: activeQueueSessionKey })
+    useComposerBranch({ actionsDisabled, clearDraft, cwd, draftRef, sessionKey: actionScopeKey })
 
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
   // Same explicit-halt semantics as the Stop button: park the queue.
@@ -1034,7 +1035,7 @@ export function ChatBar({
     onSubmit,
     onTranscribeAudio,
     sessionId,
-    submissionKey: activeQueueSessionKey,
+    submissionKey: actionScopeKey,
     target: scope.target
   })
 

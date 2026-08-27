@@ -599,7 +599,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const composer = useComposerActions({
     activeSessionId,
-    composerScopeKey: routedSessionId ?? routeToken,
+    composerScopeKey: `${gatewayScope}\0${routedSessionId ?? routeToken}`,
     currentCwd,
     requestGateway
   })

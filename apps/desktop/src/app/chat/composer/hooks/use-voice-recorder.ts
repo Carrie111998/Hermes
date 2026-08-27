@@ -28,6 +28,7 @@ export function useVoiceRecorder({
   const startedAtRef = useRef(0)
   const intervalRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
+  const recordingEpochRef = useRef(0)
 
   const clearTimers = () => {
     if (intervalRef.current) {
@@ -44,8 +45,14 @@ export function useVoiceRecorder({
   useEffect(() => () => clearTimers(), [])
 
   const stop = async () => {
+    const recordingEpoch = recordingEpochRef.current
+
     clearTimers()
     const result = await handle.stop()
+
+    if (recordingEpochRef.current !== recordingEpoch) {
+      return
+    }
 
     if (!result) {
       setVoiceStatus('idle')
@@ -64,16 +71,24 @@ export function useVoiceRecorder({
     try {
       const transcript = (await onTranscribeAudio(result.audio)).trim()
 
+      if (recordingEpochRef.current !== recordingEpoch) {
+        return
+      }
+
       if (!transcript) {
         notify({ kind: 'warning', title: voiceCopy.noSpeechDetected, message: voiceCopy.tryRecordingAgain })
       } else {
         onTranscript(transcript)
       }
     } catch (error) {
-      notifyError(error, voiceCopy.transcriptionFailed)
+      if (recordingEpochRef.current === recordingEpoch) {
+        notifyError(error, voiceCopy.transcriptionFailed)
+      }
     } finally {
-      setVoiceStatus('idle')
-      focusInput()
+      if (recordingEpochRef.current === recordingEpoch) {
+        setVoiceStatus('idle')
+        focusInput()
+      }
     }
   }
 
@@ -84,8 +99,19 @@ export function useVoiceRecorder({
       return
     }
 
+    const recordingEpoch = recordingEpochRef.current + 1
+
+    recordingEpochRef.current = recordingEpoch
+
     try {
       await handle.start({ onError: error => notifyError(error, voiceCopy.recordingFailed) })
+
+      if (recordingEpochRef.current !== recordingEpoch) {
+        handle.cancel()
+
+        return
+      }
+
       startedAtRef.current = Date.now()
       setElapsedSeconds(0)
       setVoiceStatus('recording')
@@ -93,9 +119,19 @@ export function useVoiceRecorder({
       const cap = Math.max(1, Math.min(Math.trunc(maxRecordingSeconds), 600))
       timeoutRef.current = window.setTimeout(() => void stop(), cap * 1000)
     } catch (error) {
-      setVoiceStatus('idle')
-      notifyError(error, voiceCopy.recordingFailed)
+      if (recordingEpochRef.current === recordingEpoch) {
+        setVoiceStatus('idle')
+        notifyError(error, voiceCopy.recordingFailed)
+      }
     }
+  }
+
+  const cancel = () => {
+    recordingEpochRef.current += 1
+    clearTimers()
+    handle.cancel()
+    setElapsedSeconds(0)
+    setVoiceStatus('idle')
   }
 
   const dictate = () => {
@@ -112,5 +148,5 @@ export function useVoiceRecorder({
     status: voiceStatus
   }
 
-  return { dictate, voiceActivityState, voiceStatus }
+  return { cancel, dictate, voiceActivityState, voiceStatus }
 }

@@ -97,8 +97,9 @@ export function useComposerQueue({
   const editingQueuedPrompt = queueEdit ? (queuedPrompts.find(entry => entry.id === queueEdit.entryId) ?? null) : null
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
-  const drainingQueueSessionsRef = useRef(new Set<string>())
+  const drainingQueueEntriesRef = useRef(new Map<string, { sessionKey: string }>())
   const drainFailuresRef = useRef(new Map<string, number>())
+  const [autoDrainRetryEpoch, setAutoDrainRetryEpoch] = useState(0)
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (actionsDisabled || !activeQueueSessionKey || queueEdit) {
@@ -202,7 +203,7 @@ export function useComposerQueue({
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
-      if (actionsDisabled || !activeQueueSessionKey || drainingQueueSessionsRef.current.has(activeQueueSessionKey)) {
+      if (actionsDisabled || !activeQueueSessionKey) {
         return false
       }
 
@@ -214,7 +215,15 @@ export function useComposerQueue({
         return false
       }
 
-      drainingQueueSessionsRef.current.add(drainQueueSessionKey)
+      const alreadyDraining = [...drainingQueueEntriesRef.current].some(
+        ([entryId, drain]) => entryId === entry.id || drain.sessionKey === drainQueueSessionKey
+      )
+
+      if (alreadyDraining) {
+        return false
+      }
+
+      drainingQueueEntriesRef.current.set(entry.id, { sessionKey: drainQueueSessionKey })
 
       try {
         const accepted = await Promise.resolve(
@@ -231,18 +240,20 @@ export function useComposerQueue({
           return false
         }
 
+        const settledQueueSessionKey = drainingQueueEntriesRef.current.get(entry.id)?.sessionKey ?? drainQueueSessionKey
+
         drainFailuresRef.current.delete(entry.id)
-        removeQueuedPrompt(drainQueueSessionKey, entry.id)
+        removeQueuedPrompt(settledQueueSessionKey, entry.id)
         resetBrowseState(drainRuntimeSessionId)
         // A successful drain means the queue is flowing again — lift any park
         // so the remaining entries follow. Manual drains (Enter on an empty
         // composer, the per-row send arrow) are exactly the resume gestures a
         // parked queue waits for; the auto path only reaches here unparked.
-        unparkQueuedPrompts(drainQueueSessionKey)
+        unparkQueuedPrompts(settledQueueSessionKey)
 
         return true
       } finally {
-        drainingQueueSessionsRef.current.delete(drainQueueSessionKey)
+        drainingQueueEntriesRef.current.delete(entry.id)
       }
     },
     [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId]
@@ -338,7 +349,7 @@ export function useComposerQueue({
       busy ||
       queueParked ||
       !activeQueueSessionKey ||
-      drainingQueueSessionsRef.current.has(activeQueueSessionKey)
+      [...drainingQueueEntriesRef.current.values()].some(drain => drain.sessionKey === activeQueueSessionKey)
     ) {
       return
     }
@@ -367,9 +378,13 @@ export function useComposerQueue({
       .then(sent => {
         if (!sent) {
           onFail()
+          setAutoDrainRetryEpoch(epoch => epoch + 1)
         }
       })
-      .catch(onFail)
+      .catch(() => {
+        onFail()
+        setAutoDrainRetryEpoch(epoch => epoch + 1)
+      })
   }, [actionsDisabled, activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
@@ -385,6 +400,12 @@ export function useComposerQueue({
       return
     }
 
+    for (const [entryId, drain] of drainingQueueEntriesRef.current) {
+      if (drain.sessionKey === prev) {
+        drainingQueueEntriesRef.current.set(entryId, { sessionKey: activeQueueSessionKey })
+      }
+    }
+
     migrateQueuedPrompts(prev, activeQueueSessionKey)
   }, [activeQueueSessionKey, queueSessionKey])
 
@@ -396,7 +417,7 @@ export function useComposerQueue({
     if (shouldAutoDrain({ isBusy: busy, parked: queueParked, queueLength: queuedPrompts.length })) {
       autoDrainNext()
     }
-  }, [autoDrainNext, busy, queueParked, queuedPrompts.length])
+  }, [autoDrainNext, autoDrainRetryEpoch, busy, queueParked, queuedPrompts.length])
 
   // Queue-edit cleanup: on session swap the scope effect already stashed the
   // edit snapshot; only restore into the composer when still on the same scope.

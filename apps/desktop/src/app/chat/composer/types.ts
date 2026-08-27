@@ -36,6 +36,9 @@ export interface ChatBarProps {
   busy: boolean
   disabled: boolean
   focusKey?: string | null
+  /** Profile-qualified identity used only to invalidate session-bound callbacks.
+   * Backend stored/runtime ids remain separate and are never parsed from it. */
+  identityScopeKey?: string | null
   maxRecordingSeconds?: number
   state: ChatBarState
   gateway?: HermesGateway | null

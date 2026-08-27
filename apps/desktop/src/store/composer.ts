@@ -231,7 +231,11 @@ function draftEqual(a: SessionDraft | undefined, b: SessionDraft | undefined): b
     return a === b
   }
 
-  return a.text === b.text && a.attachments.length === b.attachments.length && a.attachments.every((item, i) => attachmentEqual(item, b.attachments[i]!))
+  return (
+    a.text === b.text &&
+    a.attachments.length === b.attachments.length &&
+    a.attachments.every((item, i) => attachmentEqual(item, b.attachments[i]!))
+  )
 }
 
 function bumpDraftRevision(key: string): number {

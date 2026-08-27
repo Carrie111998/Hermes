@@ -2,7 +2,14 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { clearSessionDraft, type ComposerAttachment, mainComposerScope, stashSessionDraft } from '@/store/composer'
+import {
+  clearSessionDraft,
+  type ComposerAttachment,
+  mainComposerScope,
+  stashSessionDraft,
+  takeSessionDraft
+} from '@/store/composer'
+import { browseBackward, isBrowsingHistory, resetBrowseState } from '@/store/composer-input-history'
 import { $connection } from '@/store/session'
 
 import { useComposerActions } from '../../hooks/use-composer-actions'
@@ -26,12 +33,19 @@ vi.mock('@assistant-ui/react', () => ({
 interface ProbeHarnessProps {
   actionsDisabled?: boolean
   activeQueueSessionKey: string | null
+  onHook?: (hook: ReturnType<typeof useComposerDraft>) => void
   onLayoutSnapshot: (attachments: ComposerAttachment[]) => void
   sessionId: string
 }
 
-function ProbeHarness({ actionsDisabled = false, activeQueueSessionKey, onLayoutSnapshot, sessionId }: ProbeHarnessProps) {
-  useComposerDraft({
+function ProbeHarness({
+  actionsDisabled = false,
+  activeQueueSessionKey,
+  onHook,
+  onLayoutSnapshot,
+  sessionId
+}: ProbeHarnessProps) {
+  const draftHook = useComposerDraft({
     actionsDisabled,
     activeQueueSessionKey,
     focusKey: null,
@@ -46,6 +60,7 @@ function ProbeHarness({ actionsDisabled = false, activeQueueSessionKey, onLayout
   // synchronous read here — the same read ChatBar's `attachments` prop
   // performs at render time — observes the OUTGOING session's attachments.
   useLayoutEffect(() => {
+    onHook?.(draftHook)
     onLayoutSnapshot(mainComposerScope.$attachments.get())
   })
 
@@ -58,6 +73,8 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
     mainComposerScope.clear()
     clearSessionDraft('session-A')
     clearSessionDraft('session-B')
+    resetBrowseState('runtime-A')
+    resetBrowseState('runtime-B')
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
     vi.unstubAllGlobals()
     vi.useRealTimers()
@@ -129,6 +146,54 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
     vi.useRealTimers()
   })
 
+  it('does not let stale A history browsing suppress B draft persistence', () => {
+    expect(browseBackward('runtime-A', '', ['sent from A'])).toBe('sent from A')
+
+    let draftHook!: ReturnType<typeof useComposerDraft>
+
+    const view = render(
+      <ProbeHarness
+        activeQueueSessionKey="session-A"
+        onHook={hook => {
+          draftHook = hook
+        }}
+        onLayoutSnapshot={() => undefined}
+        sessionId="runtime-A"
+      />
+    )
+
+    view.rerender(
+      <ProbeHarness
+        actionsDisabled
+        activeQueueSessionKey="session-B"
+        onHook={hook => {
+          draftHook = hook
+        }}
+        onLayoutSnapshot={() => undefined}
+        sessionId="runtime-A"
+      />
+    )
+
+    expect(takeSessionDraft('session-B').text).toBe('')
+    draftHook.draftRef.current = 'fast draft in B'
+    expect(isBrowsingHistory('runtime-A')).toBe(true)
+    expect(takeSessionDraft('session-B').text).toBe('')
+
+    view.rerender(
+      <ProbeHarness
+        actionsDisabled
+        activeQueueSessionKey="session-C"
+        onHook={hook => {
+          draftHook = hook
+        }}
+        onLayoutSnapshot={() => undefined}
+        sessionId="runtime-A"
+      />
+    )
+
+    expect(takeSessionDraft('session-B').text).toBe('fast draft in B')
+  })
+
   it('applies a delayed image preview when it resolves while its attachment draft is inactive', async () => {
     const fullResolution =
       'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+GkZcAAAAASUVORK5CYII='
@@ -175,7 +240,12 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
         queueEditRef: { current: null as QueueEditState | null },
         sessionId: activeQueueSessionKey
       })
-      actions = useComposerActions({ activeSessionId: null, currentCwd: '', requestGateway: vi.fn() })
+      actions = useComposerActions({
+        activeSessionId: null,
+        composerScopeKey: activeQueueSessionKey,
+        currentCwd: '',
+        requestGateway: vi.fn()
+      })
 
       return null
     }

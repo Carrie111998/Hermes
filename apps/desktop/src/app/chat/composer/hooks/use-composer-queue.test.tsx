@@ -30,6 +30,7 @@ function renderQueueHook(
     onCancel?: () => void
     onSteer?: ChatBarProps['onSteer']
     onSubmit?: ChatBarProps['onSubmit']
+    queueSessionKey?: string | null
     sessionKey?: string
   } = {}
 ) {
@@ -40,15 +41,32 @@ function renderQueueHook(
   const draftRef = { current: '' }
   const loadIntoComposer = vi.fn()
 
-  const initialProps: { actionsDisabled?: boolean; busy: boolean; sessionKey?: string } = {
+  const initialProps: {
+    actionsDisabled?: boolean
+    busy: boolean
+    queueSessionKey?: string | null
+    sessionKey?: string
+  } = {
     actionsDisabled: overrides.actionsDisabled,
     busy: overrides.busy ?? false,
+    queueSessionKey: overrides.queueSessionKey,
     sessionKey: overrides.sessionKey
   }
 
   const hook = renderHook(
-    ({ actionsDisabled, busy, sessionKey }: { actionsDisabled?: boolean; busy: boolean; sessionKey?: string }) => {
+    ({
+      actionsDisabled,
+      busy,
+      queueSessionKey,
+      sessionKey
+    }: {
+      actionsDisabled?: boolean
+      busy: boolean
+      queueSessionKey?: string | null
+      sessionKey?: string
+    }) => {
       const activeSessionKey = sessionKey ?? overrides.sessionKey ?? SESSION_KEY
+      const durableQueueSessionKey = queueSessionKey === undefined ? activeSessionKey : queueSessionKey
 
       return useComposerQueue({
         actionsDisabled: actionsDisabled ?? overrides.actionsDisabled ?? false,
@@ -63,7 +81,7 @@ function renderQueueHook(
         onSteer,
         onSubmit,
         queueEditRef,
-        queueSessionKey: activeSessionKey,
+        queueSessionKey: durableQueueSessionKey,
         sessionId: `rt-${activeSessionKey}`
       })
     },
@@ -167,6 +185,59 @@ describe('useComposerQueue park integration', () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('queued in B', expect.anything()))
     expect(getQueuedPrompts(sessionB)).toHaveLength(0)
+  })
+
+  it('does not submit an in-flight entry twice when its runtime-derived queue key migrates', async () => {
+    const sessionA = 'runtime-a'
+    const sessionB = 'runtime-b'
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(() => pending)
+
+    enqueueQueuedPrompt(sessionA, { attachments: [], text: 'migrating entry' })
+    const { hook } = renderQueueHook({ onSubmit, queueSessionKey: null, sessionKey: sessionA })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    hook.rerender({ busy: false, queueSessionKey: null, sessionKey: sessionB })
+
+    await waitFor(() => expect(getQueuedPrompts(sessionB)).toHaveLength(1))
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    await act(async () => settle?.(true))
+
+    await waitFor(() => expect(getQueuedPrompts(sessionB)).toHaveLength(0))
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries A automatically after a stale A drain rejects across A to B to A', async () => {
+    const sessionA = 'session-a'
+    const sessionB = 'session-b'
+    let rejectFirst: ((accepted: boolean) => void) | undefined
+
+    const firstPending = new Promise<boolean>(resolve => {
+      rejectFirst = resolve
+    })
+
+    const onSubmit = vi
+      .fn<ChatBarProps['onSubmit']>()
+      .mockImplementationOnce(() => firstPending)
+      .mockResolvedValue(true)
+
+    enqueueQueuedPrompt(sessionA, { attachments: [], text: 'retry after stale rejection' })
+    const { hook } = renderQueueHook({ onSubmit, sessionKey: sessionA })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    hook.rerender({ busy: false, queueSessionKey: sessionB, sessionKey: sessionB })
+    hook.rerender({ busy: false, queueSessionKey: sessionA, sessionKey: sessionA })
+
+    await act(async () => rejectFirst?.(false))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2))
+    expect(getQueuedPrompts(sessionA)).toHaveLength(0)
   })
 
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {

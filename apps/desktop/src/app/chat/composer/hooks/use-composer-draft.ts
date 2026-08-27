@@ -121,8 +121,12 @@ export function useComposerDraft({
   // session switch mid-flight files one session's draft under another's key
   // (#54527).
   const draftScopeRef = useRef(activeQueueSessionKey)
-  const sessionIdRef = useRef(sessionId)
-  sessionIdRef.current = sessionId
+  const historySessionByScopeRef = useRef(new Map<string | null, string | null>())
+
+  if (!actionsDisabled) {
+    historySessionByScopeRef.current.set(activeQueueSessionKey, sessionId ?? null)
+  }
+
   const queueEditStateRef = useRef<QueueEditState | null>(queueEditRef.current)
   queueEditStateRef.current = queueEditRef.current
 
@@ -309,9 +313,10 @@ export function useComposerDraft({
     const sync = () => {
       const text = composerRuntime.getState().text
       draftRef.current = text
+      const historySessionId = historySessionByScopeRef.current.get(draftScopeRef.current) ?? null
       // Composer suggestion pills for THIS session's draft (debounced +
       // change-gated in the bus — this is just a timer reset).
-      sampleComposerDraft(sessionIdRef.current ?? null, text)
+      sampleComposerDraft(historySessionId, text)
 
       const editor = editorRef.current
 
@@ -319,7 +324,7 @@ export function useComposerDraft({
         renderComposerContents(editor, text, { trailingCommitted: true })
       }
 
-      if (isBrowsingHistory(sessionIdRef.current) || queueEditRef.current) {
+      if (isBrowsingHistory(historySessionId) || queueEditRef.current) {
         return
       }
 
@@ -406,6 +411,8 @@ export function useComposerDraft({
   // window by running before paint.
 
   useLayoutEffect(() => {
+    const historySessionByScope = historySessionByScopeRef.current
+
     // A pending debounce timer from the outgoing session is now stale — its
     // scope was correct when scheduled, but the authoritative stash below
     // (and the cleanup on the way out) already covers that text. Letting it
@@ -420,10 +427,11 @@ export function useComposerDraft({
     return () => {
       const latestText = syncDraftFromEditor()
       const editing = queueEditStateRef.current
+      const historySessionId = historySessionByScope.get(activeQueueSessionKey) ?? null
 
       if (editing?.sessionKey === activeQueueSessionKey) {
         stashAt(activeQueueSessionKey, editing.draft, editing.attachments)
-      } else if (!isBrowsingHistory(sessionId)) {
+      } else if (!isBrowsingHistory(historySessionId)) {
         stashAt(activeQueueSessionKey, latestText)
       }
 
@@ -431,7 +439,7 @@ export function useComposerDraft({
       // sample timer). The incoming session re-earns its own from the draft
       // restore above — without this a leaving session's "Add GitHub" pill
       // lingers in the map and re-appears stale on the way back.
-      clearDraftSuggestions(sessionIdRef.current)
+      clearDraftSuggestions(historySessionId)
     }
   }, [activeQueueSessionKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -474,8 +482,9 @@ export function useComposerDraft({
     const flushPendingDraftPersist = () => {
       const scope = draftScopeRef.current
       const editing = queueEditStateRef.current
+      const historySessionId = historySessionByScopeRef.current.get(scope) ?? null
 
-      if (editing?.sessionKey === scope || isBrowsingHistory(sessionIdRef.current)) {
+      if (editing?.sessionKey === scope || isBrowsingHistory(historySessionId)) {
         return
       }
 
@@ -505,7 +514,6 @@ export function useComposerDraft({
     isSteerableText,
     loadIntoComposer,
     requestMainFocus,
-    sessionIdRef,
     setComposerText,
     stashAt,
     syncDraftFromEditor
