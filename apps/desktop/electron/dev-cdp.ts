@@ -28,7 +28,6 @@
  */
 
 import path from 'node:path'
-import os from 'node:os'
 import crypto from 'node:crypto'
 
 /** Why the port is closed, for a one-line log the developer can act on. */
@@ -40,6 +39,14 @@ type DevCdpInput = {
   env: Record<string, string | undefined>
   isPackaged: boolean
   devServer: string | undefined
+  /**
+   * The REALIZED Hermes home, resolved once by the single home authority
+   * (hermes-home.ts) in the same main process. The descriptor attests exactly
+   * this value — it must never re-derive a home from env here, or a
+   * USER_DATA_DIR-only sandbox launch would attest the wrong root (P1, PR
+   * #95781 review round 3).
+   */
+  resolvedHermesHome: string
 }
 
 /** What every script under scripts/ already reaches for. */
@@ -122,14 +129,14 @@ function describeDevCdpDecision(decision: DevCdpDecision): string | null {
  */
 type DevCdpInstance = { nonce: string; dataRoot: string }
 
-function resolveDevCdpInstance({ env, isPackaged, devServer }: DevCdpInput): DevCdpInstance | null {
+function resolveDevCdpInstance({ env, isPackaged, devServer, resolvedHermesHome }: DevCdpInput): DevCdpInstance | null {
   const decision = resolveDevCdpPort({ env, isPackaged, devServer })
   if (decision.port === null) return null
 
-  const declared = env.HERMES_HOME
-  const dataRoot = path.resolve(declared && declared.length > 0
-    ? declared
-    : path.join(os.homedir(), '.hermes'))
+  // dataRoot IS the realized home from the single authority — canonical,
+  // lexical (path.resolve), matching what main.ts actually uses. No env
+  // reading here: the descriptor describes, it does not guess.
+  const dataRoot = path.resolve(resolvedHermesHome)
 
   // Per-run opaque nonce. The server checks it is present (a descriptor exists)
   // and compares the canonical dataRoot against its declared sandbox home.

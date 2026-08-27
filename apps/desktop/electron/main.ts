@@ -505,11 +505,27 @@ if (REMOTE_DISPLAY_REASON) {
 // Chromium binds it at launch.
 const DEV_CDP = resolveDevCdpPort({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
 
+// HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
+// HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
+// touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
+// Resolution ladder lives in hermes-home.ts — the single home authority shared
+// with the dev-CDP debug descriptor (resolveDevCdpInstance), so the app and
+// the descriptor can never disagree about which home is realized.
+const HERMES_HOME = resolveHermesHomeFromInputs({
+  env: process.env,
+  isWindows: IS_WINDOWS,
+  appHome: app.getPath('home'),
+  userDataOverride: USER_DATA_OVERRIDE,
+  readWindowsUserEnvVar,
+  directoryExists
+})
+
+
 // Per-instance debug descriptor the renderer exposes to an attached MCP server,
 // so the server can attest which Hermes home this target actually runs against
 // (target-derived authority, not a caller-supplied coordinate). Null when the
 // CDP port is closed, so nothing is exposed outside dev mode.
-const DEV_CDP_INSTANCE = resolveDevCdpInstance({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
+const DEV_CDP_INSTANCE = resolveDevCdpInstance({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER, resolvedHermesHome: HERMES_HOME })
 
 if (DEV_CDP.port) {
   app.commandLine.appendSwitch('remote-debugging-port', String(DEV_CDP.port))
@@ -762,21 +778,6 @@ if (INSTALL_STAMP) {
 // %LOCALAPPDATA%\hermes yet, prefer the legacy path so we don't orphan their
 // existing config / sessions / .env. New installs go to %LOCALAPPDATA%.
 //
-// HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
-// HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
-// touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
-// Resolution ladder lives in hermes-home.ts — the single home authority shared
-// with the dev-CDP debug descriptor (resolveDevCdpInstance), so the app and
-// the descriptor can never disagree about which home is realized.
-const HERMES_HOME = resolveHermesHomeFromInputs({
-  env: process.env,
-  isWindows: IS_WINDOWS,
-  appHome: app.getPath('home'),
-  userDataOverride: USER_DATA_OVERRIDE,
-  readWindowsUserEnvVar,
-  directoryExists
-})
-
 function pathWithHermesManagedNode(...entries) {
   const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
 
