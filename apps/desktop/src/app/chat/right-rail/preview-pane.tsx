@@ -11,21 +11,32 @@ import { PanelEmpty } from '@/app/overlays/panel'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { ESCAPE_PRIORITY, isTopEscapeLayer, pushEscapeLayer } from '@/lib/escape-layers'
 import { guardGuestPointers } from '@/lib/guest-pointer-guard'
 import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
 import { isRemoteGateway } from '@/lib/media'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
+import {
+  $browserAgentActingTabId,
+  $browserControlModes,
+  BROWSER_CONTROL_DEFAULT,
+  toggleBrowserControlMode
+} from '@/store/browser-control'
 import { notify, notifyError } from '@/store/notifications'
 import {
+  $browserFullscreenTabId,
   $browserPages,
   $previewServerRestart,
   commitBrowserTabLocation,
+  exitBrowserFullscreen,
   failPreviewServerRestart,
+  newBrowserTab,
   noteBrowserPage,
   popOutBrowserTab,
-  type PreviewTarget
+  type PreviewTarget,
+  toggleBrowserFullscreen
 } from '@/store/preview'
 import { canOpenBrowserWindow, isBrowserWindow } from '@/store/windows'
 
@@ -233,6 +244,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const previewContentRef = useRef<HTMLDivElement | null>(null)
   const webviewRef = useRef<PreviewWebview | null>(null)
   const previewServerRestart = useStore($previewServerRestart)
+  // Subscribed rather than read: the chip has to repaint the moment either the
+  // user flips the mode or an agent action starts/ends on this tab.
+  const controlModes = useStore($browserControlModes)
+  const agentActingTabId = useStore($browserAgentActingTabId)
+  const fullscreenTabId = useStore($browserFullscreenTabId)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
   const [currentUrl, setCurrentUrl] = useState(target.url)
@@ -252,6 +268,42 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
   const isRemoteHtmlTarget =
     target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
+
+  // Only a real Browser tab has an agent channel to hand over. A file peek or
+  // an artifact has nothing to take control OF, so it gets no chip.
+  const isBrowserTab = target.kind === 'url' && Boolean(tabId)
+  // Read off the subscribed record rather than the store getter, so the chip
+  // re-renders when the mode changes instead of showing a snapshot.
+  const controlMode = isBrowserTab ? (controlModes[tabId ?? ''] ?? BROWSER_CONTROL_DEFAULT) : undefined
+  const agentDriving = isBrowserTab && agentActingTabId === tabId
+  const fullscreen = isBrowserTab && fullscreenTabId === tabId
+
+  // Escape leaves fullscreen — the gesture every full-window surface answers
+  // to. Registered only while fullscreen, and only when this layer is the top
+  // one, so it never steals Escape from a dialog opened over it.
+  useEffect(() => {
+    if (!fullscreen) {
+      return
+    }
+
+    const release = pushEscapeLayer(ESCAPE_PRIORITY.overlay)
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || !isTopEscapeLayer(ESCAPE_PRIORITY.overlay)) {
+        return
+      }
+
+      event.preventDefault()
+      exitBrowserFullscreen()
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      release()
+    }
+  }, [fullscreen])
 
   // Hand the live address to storage when this guest is about to go away
   // (pop-out, dock-back, tab close). The other renderer builds from
@@ -977,7 +1029,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
   return (
     <aside
-      className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground"
+      className={cn(
+        'relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground',
+        // Fullscreen is a POSITIONING change on the pane that is already
+        // mounted, never a re-parent: moving this subtree would remount the
+        // <webview> and take the page's history, scroll and login with it.
+        fullscreen && 'fixed inset-0 z-50 h-screen w-screen bg-background'
+      )}
       // Buttons 3/4 are a mouse's back/forward. Chromium delivers them to the
       // renderer as a normal mouse event inside the app's own chrome (the
       // guest page gets its own via `app-command` in main), and unhandled they
@@ -1026,11 +1084,15 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             canGoBack={history.back}
             canGoForward={history.forward}
             consoleOpen={consoleOpen}
+            controlMode={controlMode}
             devToolsOpen={devtoolsOpen}
+            driving={agentDriving}
+            fullscreen={fullscreen}
             loading={loading}
             onBack={goBack}
             onForward={goForward}
             onNavigate={navigateTo}
+            onNewTab={isBrowserTab && !isBrowserWindow() ? () => newBrowserTab() : undefined}
             onOpenExternal={
               !isBrowserWindow() && !canOpenBrowserWindow()
                 ? () => void window.hermesDesktop?.openExternal(currentUrl)
@@ -1042,7 +1104,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             }
             onReload={reloadPreview}
             onToggleConsole={() => consoleState.setOpen(open => !open)}
+            onToggleControlMode={tabId && isBrowserTab ? () => toggleBrowserControlMode(tabId) : undefined}
             onToggleDevTools={toggleDevTools}
+            // A popped-out Browser already owns its whole window; a second
+            // "fill the window" there would be a no-op button.
+            onToggleFullscreen={
+              tabId && isBrowserTab && !isBrowserWindow() ? () => toggleBrowserFullscreen(tabId) : undefined
+            }
             url={currentUrl}
           />
         )}

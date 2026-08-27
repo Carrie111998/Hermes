@@ -246,7 +246,8 @@ export const zh: Translations = {
     exitHud: '退出 HUD 模式',
     resetHudLayout: '重置 HUD 大小和位置',
     layoutEditor: '布局编辑器',
-    layoutEditorTitle: mod => `布局编辑器 — ${mod} 点击重置布局`
+    layoutEditorTitle: mod => `布局编辑器 — ${mod} 点击重置布局`,
+    openBrowser: '浏览器'
   },
 
   keybinds: {
@@ -3250,7 +3251,15 @@ export const zh: Translations = {
       loadFailedConsole: (code, message) => `加载失败${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: '无法访问预览页面。',
       openTarget: url => `打开 ${url}`,
-      fallbackTitle: '预览'
+      fallbackTitle: '预览',
+      agentDriving: 'Hermes 正在操作',
+      agentIdle: 'Hermes 可操作',
+      takeManualControl: '切换到手动操作',
+      returnControlToHermes: '把操作交还给 Hermes',
+      manualControl: '手动操作中',
+      enterFullscreen: '全窗口显示',
+      exitFullscreen: '退出全窗口',
+      newBrowserTab: '新建浏览器标签页'
     }
   },
 

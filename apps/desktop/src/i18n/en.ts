@@ -253,7 +253,8 @@ export const en: Translations = {
     exitHud: 'Exit HUD mode',
     resetHudLayout: 'Reset HUD size and position',
     layoutEditor: 'Layout editor',
-    layoutEditorTitle: mod => `Layout editor — ${mod}-click resets the layout`
+    layoutEditorTitle: mod => `Layout editor — ${mod}-click resets the layout`,
+    openBrowser: 'Browser'
   },
 
   keybinds: {
@@ -3088,7 +3089,15 @@ export const en: Translations = {
       loadFailedConsole: (code, message) => `Load failed${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: 'The preview page could not be reached.',
       openTarget: url => `Open ${url}`,
-      fallbackTitle: 'Preview'
+      fallbackTitle: 'Preview',
+      agentDriving: 'Hermes is driving',
+      agentIdle: 'Hermes can drive',
+      takeManualControl: 'Take manual control',
+      returnControlToHermes: 'Return control to Hermes',
+      manualControl: 'Manual control',
+      enterFullscreen: 'Fill the window',
+      exitFullscreen: 'Exit full window',
+      newBrowserTab: 'New browser tab'
     }
   },
 

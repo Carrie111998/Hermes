@@ -250,7 +250,8 @@ export const ja = defineLocale({
     unmuteHaptics: '触覚フィードバックをオン',
     openSettings: '設定を開く',
     openStarmap: 'メモリグラフを開く',
-    resetHudLayout: 'HUD のサイズと位置をリセット'
+    resetHudLayout: 'HUD のサイズと位置をリセット',
+    openBrowser: 'ブラウザ'
   },
 
   language: {
@@ -2717,7 +2718,15 @@ export const ja = defineLocale({
       loadFailedConsole: (code, message) => `読み込みに失敗しました${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: 'プレビューページに到達できませんでした。',
       openTarget: url => `${url} を開く`,
-      fallbackTitle: 'プレビュー'
+      fallbackTitle: 'プレビュー',
+      agentDriving: 'AI操作中',
+      agentIdle: 'Hermes が操作できます',
+      takeManualControl: '手動操作に切替',
+      returnControlToHermes: 'Hermes に操作を戻す',
+      manualControl: '手動操作中',
+      enterFullscreen: 'ブラウザを全画面',
+      exitFullscreen: '全画面を解除',
+      newBrowserTab: '新規ブラウザタブ'
     }
   },
 

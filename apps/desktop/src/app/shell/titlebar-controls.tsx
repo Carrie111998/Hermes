@@ -23,6 +23,7 @@ import {
   togglePanesFlipped,
   toggleSidebarOpen
 } from '@/store/layout'
+import { openBrowserTab } from '@/store/preview'
 import { $unreadSessionCount } from '@/store/session-dot-state'
 
 import { appViewForPath, isOverlayView } from '../routes'
@@ -200,6 +201,20 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   // Static system tools — always pinned to the screen's right edge.
   const systemTools: TitlebarTool[] = [
+    {
+      // Browsing is a first-class surface, not a preview side effect, so it
+      // gets a permanent door. `openBrowserTab` re-fronts the Browser you
+      // already had rather than stacking another one — the same function the
+      // ⌘⇧L keybind and the command palette call, so all three agree.
+      actionId: 'view.showBrowser',
+      icon: <TitlebarIcon name="globe" />,
+      id: 'browser',
+      label: t.titlebar.openBrowser,
+      onSelect: () => {
+        triggerHaptic('open')
+        openBrowserTab()
+      }
+    },
     {
       className: 'group/tool',
       // Hover + held ⌘/Ctrl morphs the glyph into its reset form (see

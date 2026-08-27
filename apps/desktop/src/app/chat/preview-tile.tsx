@@ -19,6 +19,7 @@ import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
 import { translateNow } from '@/i18n'
 import { openExternalLink } from '@/lib/external-link'
+import { forgetBrowserControl } from '@/store/browser-control'
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '@/store/layout'
 import {
   $browserPages,
@@ -27,6 +28,7 @@ import {
   adoptPersistedBrowserTab,
   type BrowserPage,
   closeRightRailTab,
+  exitBrowserFullscreen,
   forgetBrowserPage,
   markBrowserTabPopped,
   newBrowserTab,
@@ -269,6 +271,8 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   render: tabId => <PreviewTilePane tabId={tabId} />,
   close: tabId => {
     forgetBrowserPage(tabId)
+    forgetBrowserControl(tabId)
+    exitBrowserFullscreen(tabId)
     forgetPreviewConsole(tabId)
     closeRightRailTab(tabId)
   }
