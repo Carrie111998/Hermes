@@ -714,10 +714,21 @@ async function cleanupStale(
     }
   }
 
+  // An authenticated HTTP proof only speaks for the process that answered the
+  // challenge. That backend can exit before we signal and the kernel can hand
+  // its pid to an unrelated process, so the authenticated path must re-confirm
+  // the lock's recorded process-start identity against the live pid immediately
+  // before signaling. Fail closed: a legacy record without creationTime, or an
+  // unreadable one, is not a match — such a lock still needs argv identity.
+  const authenticatedIdentity =
+    authenticatedOwnership &&
+    Boolean(lock.creationTime) &&
+    (await remoteProcessCreationTime(ssh, lock.pid)) === lock.creationTime
+
   const owned =
     pidAlive &&
     lock &&
-    (authenticatedOwnership ||
+    (authenticatedIdentity ||
       (await pidIsOurDashboard(
         ssh,
         lock.pid,

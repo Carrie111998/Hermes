@@ -774,13 +774,36 @@ test('disconnect reaps a wrapper when the live backend proves authenticated owne
   const ssh = fakeSsh([
     [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE\n'],
-    [/print\("OWNED"/, 'FOREIGN\n']
+    [/print\("OWNED"/, 'FOREIGN\n'],
+    [/value="linux:"/, `${lock.creationTime}\n`]
   ])
 
   await disconnect(ssh, OWNERSHIP_ID, async candidate => candidate.spawnNonce === SPAWN_NONCE)
 
   assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
   assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+// An authenticated proof is only evidence about the process that answered the
+// HTTP challenge. Between that answer and the signal the backend can exit and
+// the kernel can hand its pid to an unrelated process, so the lock's recorded
+// creationTime must still match the live pid at the moment we signal.
+test('disconnect refuses to signal an authenticated wrapper whose live creation time no longer matches the lock', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/print\("OWNED"/, 'FOREIGN\n'],
+    [/value="linux:"/, 'linux:999999\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID, async candidate => candidate.spawnNonce === SPAWN_NONCE)
+
+  assert.ok(
+    !ssh.calls.some(command => /kill (-9 )?333\b/.test(command)),
+    'must not signal a recycled pid on a stale authenticated proof'
+  )
 })
 
 test('disconnect is a no-op when this desktop has no lockfile', async () => {
@@ -1190,6 +1213,7 @@ test('connect reaps an authenticated wrapper before replacing its stale runtime'
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE'],
     [/print\("OWNED"/, 'FOREIGN\n'],
+    [/value="linux:"/, `${lock.creationTime}\n`],
     [/kill 333/, ''],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [/python3 -c/, ''],
