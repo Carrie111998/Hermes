@@ -516,10 +516,32 @@ def test_clarify_batch_state_cleared_after_resolution(server):
         assert rid not in server._pending
 
 
-def test_clarify_block_helper_builds_batch_payload(capture):
-    """_clarify_block forwards only wire fields (qid/question/choices/
-    multi_select) — the tool-side normalized entries carry extra keys the
-    renderer must not see."""
+def _start_one_question_clarify(server, normalized):
+    box = {}
+
+    def run():
+        box["answer"] = server._clarify_block("s1", "", None, questions=normalized)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    rid = None
+    while time.monotonic() < deadline and rid is None:
+        with server._prompt_lock:
+            rid = next(iter(server._pending), None)
+        time.sleep(0.01)
+    assert rid
+    return thread, box, rid
+
+
+def test_clarify_block_helper_uses_single_wire_shape_for_one_question(capture):
+    """A one-item tool batch must use the reliable legacy card wire shape.
+
+    A single card needs only its request id; sending a one-item ``questions``
+    payload also makes released clients depend on qids from that request event
+    and can strand a rebound renderer on the batch spinner.  The callback still
+    returns batch-shaped answers to ``clarify_tool``.
+    """
     server, buf = capture
     normalized = [
         {
@@ -528,7 +550,112 @@ def test_clarify_block_helper_builds_batch_payload(capture):
             "multi_select": False,
         },
     ]
+    thread, box, rid = _start_one_question_clarify(server, normalized)
 
+    server.handle_request({
+        "id": "a", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": "a"},
+    })
+    thread.join(timeout=5)
+
+    messages = [json.loads(line) for line in buf.getvalue().splitlines()]
+    request = messages[0]["params"]
+    assert request["type"] == "clarify.request"
+    assert request["payload"]["question"] == "Which?"
+    assert request["payload"]["choices"] == ["a (Recommended)", "b"]
+    assert "questions" not in request["payload"]
+    assert json.loads(box["answer"]) == {"answers": {"q0": "a"}}
+
+
+def test_one_question_wire_does_not_mistake_json_user_text_for_batch_envelope(capture):
+    server, _ = capture
+    normalized = [{
+        "qid": "q0", "id": "", "question": "Payload?", "choices": None,
+        "choices_offered": None, "multi_select": False,
+    }]
+    thread, box, rid = _start_one_question_clarify(server, normalized)
+
+    literal = '{"answers": "this is my literal answer"}'
+    server.handle_request({
+        "id": "a", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": literal},
+    })
+    thread.join(timeout=5)
+
+    assert json.loads(box["answer"]) == {"answers": {"q0": literal}}
+
+
+def test_one_question_wire_accepts_extraneous_question_id(capture):
+    """Single-card replies remain answerable even if a client echoes an id."""
+    server, _ = capture
+    normalized = [{
+        "qid": "q0", "id": "", "question": "Which?", "choices": ["a", "b"],
+        "choices_offered": ["a", "b"], "multi_select": False,
+    }]
+    thread, box, rid = _start_one_question_clarify(server, normalized)
+
+    response = server.handle_request({
+        "id": "a", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "client-generated", "answer": "a"},
+    })
+    thread.join(timeout=5)
+
+    assert response["result"] == {"status": "ok"}
+    assert json.loads(box["answer"]) == {"answers": {"q0": "a"}}
+
+
+def test_one_question_wire_preserves_multi_select_json(capture):
+    server, _ = capture
+    normalized = [{
+        "qid": "q0", "id": "", "question": "Which?", "choices": ["a", "b"],
+        "choices_offered": ["a", "b"], "multi_select": True,
+    }]
+    thread, box, rid = _start_one_question_clarify(server, normalized)
+
+    raw = '["a", "b"]'
+    server.handle_request({
+        "id": "a", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": raw},
+    })
+    thread.join(timeout=5)
+
+    assert json.loads(box["answer"]) == {"answers": {"q0": raw}}
+
+
+def test_one_question_wire_distinguishes_skip_from_timeout(capture, monkeypatch):
+    server, buf = capture
+    normalized = [{
+        "qid": "q0", "id": "", "question": "Which?", "choices": ["a", "b"],
+        "choices_offered": ["a", "b"], "multi_select": False,
+    }]
+    thread, box, rid = _start_one_question_clarify(server, normalized)
+
+    server.handle_request({
+        "id": "skip", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": ""},
+    })
+    thread.join(timeout=5)
+    assert json.loads(box["answer"]) == {"answers": {}}
+
+    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 0)
+    timed_out = json.loads(server._clarify_block("s1", "", None, questions=normalized))
+    assert timed_out == {"answers": {}, "timed_out": True}
+
+    messages = [json.loads(line) for line in buf.getvalue().splitlines()]
+    assert any(message["params"]["type"] == "clarify.expire" for message in messages)
+
+
+def test_clarify_block_helper_builds_multi_question_batch_payload(capture):
+    """Real multi-question batches keep only their validated wire fields."""
+    server, buf = capture
+    normalized = [
+        {
+            "qid": qid, "id": qid, "question": text,
+            "choices": ["a", "b"], "choices_offered": ["a", "b"],
+            "multi_select": False,
+        }
+        for qid, text in (("q0", "First?"), ("q1", "Second?"))
+    ]
     box = {}
 
     def run():
@@ -544,18 +671,18 @@ def test_clarify_block_helper_builds_batch_payload(capture):
         time.sleep(0.01)
     assert rid
 
-    server.handle_request({
-        "id": "a", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "a"},
-    })
+    for qid in ("q0", "q1"):
+        server.handle_request({
+            "id": qid, "method": "clarify.respond",
+            "params": {"request_id": rid, "question_id": qid, "answer": "a"},
+        })
     thread.join(timeout=5)
 
     messages = [json.loads(line) for line in buf.getvalue().splitlines()]
-    request = messages[0]["params"]
-    assert request["type"] == "clarify.request"
-    sent = request["payload"]["questions"][0]
-    assert set(sent) == {"qid", "question", "choices", "multi_select"}
-    assert "id" not in sent and "choices_offered" not in sent
+    sent = messages[0]["params"]["payload"]["questions"]
+    assert len(sent) == 2
+    assert all(set(row) == {"qid", "question", "choices", "multi_select"} for row in sent)
+    assert all("id" not in row and "choices_offered" not in row for row in sent)
 
 
 def test_approval_pending_replays_unresolved_requests(server, monkeypatch):
