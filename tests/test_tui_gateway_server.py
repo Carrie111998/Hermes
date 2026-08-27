@@ -18018,41 +18018,6 @@ def test_close_sessions_for_transport_skips_session_rebound_before_claim(
     monkeypatch.setattr(server, "_sessions_lock", _SnapshotInterlock())
     server._sessions.clear()
     server._sessions["rebound"] = session
-    monkeypatch.setattr(
-        server,
-        "_teardown_popped_session",
-        lambda *_args, **_kwargs: True,
-    )
-    original_sessions_lock = server._sessions_lock
-    rebound = threading.Event()
-
-    class _SnapshotInterlock:
-        """Run the resume rebind after snapshot and before the ownership claim."""
-
-        def __init__(self):
-            self._fired = False
-
-        def __enter__(self):
-            original_sessions_lock.acquire()
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            original_sessions_lock.release()
-            if not self._fired:
-                self._fired = True
-
-                def _resume_rebind():
-                    with server._session_resume_lock:
-                        session["transport"] = new_transport
-                    rebound.set()
-
-                thread = threading.Thread(target=_resume_rebind)
-                thread.start()
-                assert rebound.wait(timeout=1)
-                thread.join(timeout=1)
-            return False
-
-    monkeypatch.setattr(server, "_sessions_lock", _SnapshotInterlock())
     try:
         reaped, detached = server._close_sessions_for_transport(old_transport)
         assert reaped == 0
