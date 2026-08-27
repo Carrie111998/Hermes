@@ -4,7 +4,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'vitest'
 
-import beforePack, { cleanStaleAppOutDir, preserveRollbackBackup } from '../scripts/before-pack.mjs'
+import beforePack, {
+  cleanStaleAppOutDir,
+  macRollbackOutputDir,
+  preserveRollbackBackup
+} from '../scripts/before-pack.mjs'
 
 test('cleanStaleAppOutDir removes a populated unpacked directory', () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-before-pack-'))
@@ -67,10 +71,7 @@ test('preserveRollbackBackup moves a working build to .bak', () => {
     // Original slot vacated so electron-builder stages into a clean tree...
     assert.equal(fs.existsSync(appOutDir), false)
     // ...and the previous working build is intact under .bak for rollback.
-    assert.equal(
-      fs.readFileSync(path.join(`${appOutDir}.bak`, 'Hermes.exe'), 'utf8'),
-      'MZ-old-build'
-    )
+    assert.equal(fs.readFileSync(path.join(`${appOutDir}.bak`, 'Hermes.exe'), 'utf8'), 'MZ-old-build')
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true })
   }
@@ -129,10 +130,37 @@ test('beforePack on win32 preserves the previous build instead of wiping it', as
     await beforePack({ appOutDir, electronPlatformName: 'win32' })
 
     assert.equal(fs.existsSync(appOutDir), false)
+    assert.equal(fs.readFileSync(path.join(`${appOutDir}.bak`, 'Hermes.exe'), 'utf8'), 'MZ-working')
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('beforePack on darwin preserves the previous app bundle instead of wiping it', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-before-pack-'))
+  try {
+    const appOutDir = path.join(tempRoot, 'mac-arm64')
+    const executable = path.join(appOutDir, 'Hermes.app', 'Contents', 'MacOS', 'Hermes')
+    fs.mkdirSync(path.dirname(executable), { recursive: true })
+    fs.writeFileSync(executable, 'working-mac-build', 'utf8')
+
+    // node-pty staging is skipped because arch is not a number here.
+    await beforePack({
+      appOutDir,
+      electronPlatformName: 'darwin',
+      packager: { appInfo: { productFilename: 'Hermes' } }
+    })
+
+    const backupDir = macRollbackOutputDir(appOutDir)
+
+    assert.equal(fs.existsSync(appOutDir), false)
     assert.equal(
-      fs.readFileSync(path.join(`${appOutDir}.bak`, 'Hermes.exe'), 'utf8'),
-      'MZ-working'
+      fs.readFileSync(path.join(backupDir, 'Hermes.app', 'Contents', 'MacOS', 'Hermes'), 'utf8'),
+      'working-mac-build'
     )
+    assert.equal(path.basename(path.dirname(backupDir)), '.hermes-update-backup')
+    assert.equal(path.basename(backupDir), 'mac-arm64')
+    assert.equal(fs.existsSync(`${appOutDir}.bak`), false)
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true })
   }
