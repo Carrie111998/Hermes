@@ -698,6 +698,18 @@ export const $sessionProfilesUsage = atom<Record<string, ProfileUsage>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
+
+export interface PrimarySessionOwnerIntent {
+  ownerRoute: SessionOwnerRoute
+  storedSessionId: string
+}
+
+export const $primarySessionOwnerIntent = atom<PrimarySessionOwnerIntent | null>(null)
+
+export function setPrimarySessionOwnerIntent(intent: PrimarySessionOwnerIntent | null): void {
+  $primarySessionOwnerIntent.set(intent)
+}
+
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
   previousStoredSessionId: string

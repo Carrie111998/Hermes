@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   $composerAttachments,
+  $composerNewChatGeneration,
   $voiceConversationStartRequest,
   addComposerAttachment,
+  advanceComposerNewChatGeneration,
   claimSessionDraft,
   clearSessionDraft,
   clearSessionDraftIfRevision,
@@ -21,6 +23,26 @@ import {
   takeVoiceConversationStart,
   updateComposerAttachment
 } from './composer'
+import {
+  _resetComposerStorageScopeAliasesForTests,
+  encodeComposerStorageScopeKey,
+  registerComposerStorageScopeAlias
+} from './composer-storage-scope'
+
+describe('New Chat storage identities', () => {
+  afterEach(() => $composerNewChatGeneration.set(0))
+
+  it('allocates distinct identities from the same stale cross-window snapshot', () => {
+    $composerNewChatGeneration.set(12)
+    const first = advanceComposerNewChatGeneration()
+
+    // A second renderer initialized before the first write still sees 12.
+    $composerNewChatGeneration.set(12)
+    const second = advanceComposerNewChatGeneration()
+
+    expect(first).not.toBe(second)
+  })
+})
 
 describe('voice conversation start requests', () => {
   it('latches each request until the main composer consumes it once', () => {
@@ -217,6 +239,7 @@ describe('session drafts', () => {
     }
 
     window.localStorage.clear()
+    _resetComposerStorageScopeAliasesForTests()
   })
 
   it('keeps drafts isolated per session scope', () => {
@@ -269,6 +292,21 @@ describe('session drafts', () => {
 
     expect(takeSessionDraft('session-a').attachments.map(item => item.id)).toEqual(['image:a'])
     expect(takeSessionDraft('session-b').text).toBe('other window text')
+  })
+
+  it('reloads a stale persisted source key through its active handoff alias', () => {
+    const owner = { connectionId: 'local', profile: 'default' }
+    const source = encodeComposerStorageScopeKey(owner, null, 4)
+    const destination = encodeComposerStorageScopeKey(owner, 'created-session')
+
+    stashSessionDraft(destination, 'before stale write', [])
+    registerComposerStorageScopeAlias(source, destination)
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ [source]: 'stale window draft' }))
+
+    reloadPersistedDrafts()
+
+    expect(takeSessionDraft(source).text).toBe('stale window draft')
+    expect(takeSessionDraft(destination).text).toBe('stale window draft')
   })
 
   it('evicts empty drafts instead of leaving stale entries behind', () => {

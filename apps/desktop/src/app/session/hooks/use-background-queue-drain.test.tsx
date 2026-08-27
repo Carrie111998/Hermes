@@ -125,6 +125,32 @@ describe('useBackgroundQueueDrain', () => {
     expect(getQueuedPrompts(foreignKey)).toHaveLength(1)
   })
 
+  it('never resolves a claimed local entry by a duplicate foreign entry id', async () => {
+    const foreignOwner = { connectionId: 'source-b', profile: 'default' }
+    const localKey = storageKey('stored-shared')
+    const foreignKey = encodeComposerStorageScopeKey(foreignOwner, 'stored-shared')
+    const runtimeMap = { current: new Map([['stored-shared', 'rt-local-shared']]) }
+    const submitText = vi.fn(async () => true)
+    const localEntry = enqueueQueuedPrompt(localKey, { text: 'local turn', attachments: [] })!
+    const foreignEntry = enqueueQueuedPrompt(foreignKey, { text: 'FOREIGN SECRET', attachments: [] })!
+
+    $queuedPromptsBySession.set({
+      [foreignKey]: [{ ...foreignEntry, id: 'duplicate-entry' }],
+      [localKey]: [{ ...localEntry, id: 'duplicate-entry' }]
+    })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(submitText).toHaveBeenCalledOnce())
+    expect(submitText).toHaveBeenCalledWith('local turn', {
+      attachments: [],
+      fromQueue: true,
+      sessionId: 'rt-local-shared',
+      storedSessionId: 'stored-shared'
+    })
+    expect(getQueuedPrompts(foreignKey)).toHaveLength(1)
+  })
+
   it('leaves the selected session queue to the mounted ChatBar drainer', async () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)

@@ -15,7 +15,12 @@
  *     the bridge has no session-window support.
  */
 import type { WorkspaceMode } from '@/contrib/types'
-import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/store/session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  markSessionRead,
+  setPrimarySessionOwnerIntent
+} from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
   focusedSessionNeedsRoute,
@@ -95,7 +100,18 @@ export function openSession(
   // at focusOpenSession and never clear its unread dot.
   markSessionRead(storedSessionId)
   setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
-  const botWorkspaceScope = workspaceScope.workspaceMode === 'bots' ? workspaceScope : undefined
+
+  const hasWorkspaceMetadata = Boolean(
+    workspaceScope.ownerRoute ||
+    workspaceScope.workspaceMode === 'bots' ||
+    workspaceScope.workspaceOwnerKey ||
+    workspaceScope.workspaceTabTitle
+  )
+
+  const publishPrimaryOwner = () =>
+    setPrimarySessionOwnerIntent(
+      workspaceScope.ownerRoute ? { ownerRoute: workspaceScope.ownerRoute, storedSessionId } : null
+    )
 
   let resolved: OpenSessionIntent = intent
 
@@ -114,6 +130,7 @@ export function openSession(
     // Canonical relationship chats explicitly own the main workspace. Route
     // even when the session is already open as a tile; resumeSession removes
     // that redundant tile when the main surface binds.
+    publishPrimaryOwner()
     navigate(sessionRoute(storedSessionId))
 
     return
@@ -145,15 +162,15 @@ export function openSession(
     // stacking a second blank one beside it.
     if (
       spendBlankDraft &&
-      (botWorkspaceScope
-        ? reuseBlankDraftTile(storedSessionId, botWorkspaceScope)
+      (hasWorkspaceMetadata
+        ? reuseBlankDraftTile(storedSessionId, workspaceScope)
         : reuseBlankDraftTile(storedSessionId))
     ) {
       return
     }
 
-    if (botWorkspaceScope) {
-      openSessionTile(storedSessionId, 'center', undefined, undefined, botWorkspaceScope)
+    if (hasWorkspaceMetadata) {
+      openSessionTile(storedSessionId, 'center', undefined, undefined, workspaceScope)
     } else {
       openSessionTile(storedSessionId, 'center')
     }
@@ -165,7 +182,14 @@ export function openSession(
   // otherwise load it into main. From a full page (artifacts, skills, …) a
   // `'main'` hit still has to route back: fronting the workspace tab alone
   // leaves the page showing.
-  if (focusedSessionNeedsRoute(focusOpenSession(storedSessionId, workspaceScope), $workspaceIsPage.get())) {
+  const focused = focusOpenSession(storedSessionId, workspaceScope)
+
+  if (focused === 'main') {
+    publishPrimaryOwner()
+  }
+
+  if (focusedSessionNeedsRoute(focused, $workspaceIsPage.get())) {
+    publishPrimaryOwner()
     navigate(sessionRoute(storedSessionId))
   }
 }

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from './composer'
+import { clearSessionDraft, sessionDraftRevision, stashSessionDraft, takeSessionDraft } from './composer'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
@@ -14,12 +14,12 @@ import {
   beginComposerQueueDrain,
   finishComposerQueueDrain
 } from './composer-queue-drain'
-import { encodeComposerStorageScopeKey } from './composer-storage-scope'
 import {
   _resetComposerStorageMigrationsForTests,
   migrateComposerStorageScope,
   resolveComposerStorageScopeKey
 } from './composer-storage-migration'
+import { encodeComposerStorageScopeKey } from './composer-storage-scope'
 
 const OWNER_A = { connectionId: 'connection-a', profile: 'profile-a' }
 const OWNER_B = { connectionId: 'connection-b', profile: 'profile-b' }
@@ -76,6 +76,18 @@ describe('composer storage migration', () => {
     expect(takeSessionDraft(to).text).toBe('')
     expect(getQueuedPrompts(from).map(item => item.text)).toEqual(['profile A queue'])
     expect(getQueuedPrompts(to)).toHaveLength(0)
+  })
+
+  it('hands off the cleared submitted revision so a late rejection can restore directly', () => {
+    const from = key(OWNER_A, null, 7)
+    const to = key(OWNER_A, 'stored-created')
+
+    stashSessionDraft(from, 'submitted prompt', [])
+    const submittedRevision = clearSessionDraft(from)
+
+    expect(migrateComposerStorageScope(from, to)).toBe(true)
+    expect(sessionDraftRevision(from)).toBe(submittedRevision)
+    expect(sessionDraftRevision(to)).toBe(submittedRevision)
   })
 
   it('keeps the next New Chat generation independent from the previous handoff', () => {

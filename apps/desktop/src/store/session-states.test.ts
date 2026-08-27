@@ -268,6 +268,19 @@ describe('SessionTile workspace scope', () => {
     ])
   })
 
+  it('re-homes a duplicate stored id to the new exact owner without reusing its runtime', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    openSessionTile('shared-id', 'right', undefined, undefined, { ownerRoute: ownerA, workspaceMode: 'sessions' })
+    patchSessionTile('shared-id', { runtimeId: 'runtime-owner-a' })
+    openSessionTile('shared-id', 'right', undefined, undefined, { ownerRoute: ownerB, workspaceMode: 'sessions' })
+
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({ ownerRoute: ownerB, runtimeId: undefined, storedSessionId: 'shared-id' })
+    ])
+  })
+
   it('allows a Bot-scoped tab when the same stored session is hidden in Sessions main', () => {
     const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
 

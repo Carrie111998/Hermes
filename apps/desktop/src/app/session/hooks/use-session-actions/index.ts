@@ -88,6 +88,7 @@ import {
   setIntroSeed,
   setMessages,
   setNewChatWorkspaceTarget,
+  setPrimarySessionOwnerIntent,
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
@@ -132,6 +133,7 @@ import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE }
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
+import type { CreatedBackendSessionForSend } from '../use-prompt-actions/utils'
 
 import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
 import {
@@ -408,6 +410,7 @@ export function useSessionActions({
         : undefined
 
       advanceComposerNewChatGeneration()
+      setPrimarySessionOwnerIntent(null)
       resetViewSync()
       busyRef.current = false
       setBusy(false)
@@ -482,7 +485,10 @@ export function useSessionActions({
   )
 
   const createBackendSessionForSend = useCallback(
-    async (preview: string | null = null): Promise<string | null> => {
+    async (
+      preview: string | null = null,
+      onCreated?: (created: CreatedBackendSessionForSend) => void
+    ): Promise<string | null> => {
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
 
@@ -599,6 +605,9 @@ export function useSessionActions({
         resetViewSync()
         activeSessionIdRef.current = created.session_id
         selectedStoredSessionIdRef.current = stored
+        setPrimarySessionOwnerIntent(
+          stored && capturedRoute ? { ownerRoute: capturedRoute, storedSessionId: stored } : null
+        )
         ensureSessionState(created.session_id, stored)
 
         if (stored) {
@@ -621,6 +630,13 @@ export function useSessionActions({
         setActiveSessionId(created.session_id)
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())
+
+        onCreated?.({
+          owner: capturedRoute ? { connectionId: capturedRoute.connectionId, profile: capturedRoute.profile } : null,
+          runtimeSessionId: created.session_id,
+          storedSessionId: stored
+        })
+
         const yoloArmed = $yoloActive.get()
         const runtimeInfo = applyRuntimeInfo(created.info)
 

@@ -72,6 +72,8 @@ import { useSlashCommand } from './slash'
 import { useSubmitPrompt } from './submit'
 import {
   blobToDataUrl,
+  type ComposerSessionCreatedForSend,
+  type CreatedBackendSessionForSend,
   delay,
   friendlyRemoteAttachError,
   type GatewayRequest,
@@ -232,13 +234,16 @@ interface PromptActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
-  createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  createBackendSessionForSend: (
+    preview?: string | null,
+    onCreated?: (created: CreatedBackendSessionForSend) => void
+  ) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
   handleSkinCommand: (arg: string) => string
   openMemoryGraph: () => void
-  onSessionCreatedForSend?: (storedSessionId: string) => void
+  onSessionCreatedForSend?: (created: ComposerSessionCreatedForSend) => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void

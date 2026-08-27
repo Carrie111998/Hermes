@@ -33,6 +33,34 @@ describe('sessionTileResumeFailure', () => {
 })
 
 describe('qualified tile draft titles', () => {
+  it('selects title metadata from the tile exact owner when duplicate rows exist', () => {
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    $sessionTiles.set([{ ownerRoute, storedSessionId: 'duplicate-id' }])
+    $sessions.set([
+      {
+        connection_id: 'source-a',
+        id: 'duplicate-id',
+        profile: 'worker',
+        preview: 'owner A preview',
+        title: 'Owner A title'
+      },
+      {
+        connection_id: 'source-b',
+        id: 'duplicate-id',
+        profile: 'worker',
+        preview: 'owner B preview',
+        title: 'Owner B title'
+      }
+    ] as never)
+
+    expect(tileDragPayload('duplicate-id')).toEqual({
+      id: 'duplicate-id',
+      profile: 'worker',
+      title: 'Owner B title'
+    })
+  })
+
   it('uses the exact tile route when duplicate stored ids exist across owners', () => {
     const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'default' }
     const scope = sessionTileDraftScope('duplicate-id', ownerRoute)

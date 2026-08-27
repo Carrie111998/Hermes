@@ -15,13 +15,15 @@ export interface NormalizedComposerStorageOwner {
   profile: string
 }
 
+export type ComposerNewChatGeneration = number | string
+
 export interface ComposerStorageScope {
   format: 'canonical' | 'legacy'
   owner: NormalizedComposerStorageOwner
   /** Raw durable/lineage-root id. Null is the New Chat identity. */
   storedSessionId: string | null
   /** Distinguishes successive New Chat drafts for the same owner. */
-  newChatGeneration: number
+  newChatGeneration: ComposerNewChatGeneration
 }
 
 interface DecodeComposerStorageScopeOptions {
@@ -45,6 +47,15 @@ function validStoredSessionId(storedSessionId: unknown): storedSessionId is stri
   return storedSessionId === null || (typeof storedSessionId === 'string' && storedSessionId.trim().length > 0)
 }
 
+const UUID_GENERATION_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function validNewChatGeneration(value: unknown): value is ComposerNewChatGeneration {
+  return (
+    (Number.isSafeInteger(value) && (value as number) >= 0) ||
+    (typeof value === 'string' && UUID_GENERATION_RE.test(value))
+  )
+}
+
 /**
  * Reversible renderer-storage identity. The versioned JSON payload avoids
  * delimiter parsing and keeps exact connection/profile ownership alongside the
@@ -53,7 +64,7 @@ function validStoredSessionId(storedSessionId: unknown): storedSessionId is stri
 export function encodeComposerStorageScopeKey(
   owner: ComposerStorageOwner,
   storedSessionId: string | null,
-  newChatGeneration = 0
+  newChatGeneration: ComposerNewChatGeneration = 0
 ): string {
   if (!validStoredSessionId(storedSessionId)) {
     throw new Error('Composer storage scope requires a stored session id or null')
@@ -62,8 +73,8 @@ export function encodeComposerStorageScopeKey(
   const normalizedOwner = normalizeComposerStorageOwner(owner)
   const normalizedGeneration = storedSessionId === null ? newChatGeneration : 0
 
-  if (!Number.isSafeInteger(normalizedGeneration) || normalizedGeneration < 0) {
-    throw new Error('Composer New Chat generation must be a non-negative integer')
+  if (!validNewChatGeneration(normalizedGeneration)) {
+    throw new Error('Composer New Chat generation must be a non-negative legacy integer or UUID')
   }
 
   return `${CANONICAL_PREFIX}${JSON.stringify([
@@ -104,15 +115,14 @@ function decodeCanonical(key: string): ComposerStorageScope | null {
       typeof payload[0] !== 'string' ||
       typeof payload[1] !== 'string' ||
       !validStoredSessionId(payload[2]) ||
-      !Number.isSafeInteger(payload[3]) ||
-      (payload[3] as number) < 0
+      !validNewChatGeneration(payload[3])
     ) {
       return null
     }
 
     const owner = normalizeComposerStorageOwner({ connectionId: payload[0], profile: payload[1] })
     const storedSessionId = payload[2]
-    const newChatGeneration = storedSessionId === null ? (payload[3] as number) : 0
+    const newChatGeneration = storedSessionId === null ? payload[3] : 0
 
     // Reject alternate spellings instead of silently normalizing an untrusted
     // key into a backend target. Only encodeComposerStorageScopeKey output is a

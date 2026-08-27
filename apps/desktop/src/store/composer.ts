@@ -4,7 +4,11 @@ import { deriveDraftTitle } from '@/lib/draft-title'
 import { triggerHaptic } from '@/lib/haptics'
 import { persistentAtom } from '@/lib/persisted'
 
-import { resolveComposerStorageScopeKey } from './composer-storage-scope'
+import {
+  type ComposerNewChatGeneration,
+  encodeComposerStorageScopeKey,
+  resolveComposerStorageScopeKey
+} from './composer-storage-scope'
 
 export interface ComposerAttachment {
   id: string
@@ -34,17 +38,33 @@ export type ComposerAttachmentPatch = Partial<Omit<ComposerAttachment, 'id' | 'o
 export const $composerDraft = atom('')
 export const $composerAttachments = atom<ComposerAttachment[]>([])
 export const $composerTerminalSelections = atom<Record<string, string>>({})
-export const $composerNewChatGeneration = persistentAtom('hermes.desktop.composerNewChatGeneration', 0, {
-  decode: raw => {
-    const value = Number(raw)
+const createComposerNewChatGeneration = (): ComposerNewChatGeneration => crypto.randomUUID()
 
-    return Number.isSafeInteger(value) && value >= 0 ? value : 0
-  },
-  encode: value => String(value)
-})
+export const $composerNewChatGeneration = persistentAtom<ComposerNewChatGeneration>(
+  'hermes.desktop.composerNewChatGeneration',
+  createComposerNewChatGeneration(),
+  {
+    decode: raw => {
+      const value = Number(raw)
 
-export const advanceComposerNewChatGeneration = (): number => {
-  const next = $composerNewChatGeneration.get() + 1
+      if (Number.isSafeInteger(value) && value >= 0) {
+        return value
+      }
+
+      try {
+        encodeComposerStorageScopeKey({ connectionId: 'local', profile: 'default' }, null, raw)
+
+        return raw
+      } catch {
+        return createComposerNewChatGeneration()
+      }
+    },
+    encode: value => String(value)
+  }
+)
+
+export const advanceComposerNewChatGeneration = (): ComposerNewChatGeneration => {
+  const next = createComposerNewChatGeneration()
 
   $composerNewChatGeneration.set(next)
 
@@ -358,18 +378,28 @@ function publishDraftTitle(key: string, title: string): void {
  * that the incoming text-only snapshot can't know about.
  */
 export function reloadPersistedDrafts(): void {
-  const incoming = new Map(loadPersistedDraftTexts())
+  const incoming = new Map<string, SessionDraft>()
 
-  for (const [key, draft] of incoming) {
+  for (const [persistedKey, persistedDraft] of loadPersistedDraftTexts()) {
+    const canonicalKey = draftKey(persistedKey)
+
+    // An explicit destination snapshot is authoritative over a stale writer's
+    // retired source key, regardless of object insertion order.
+    if (!incoming.has(canonicalKey) || persistedKey === canonicalKey) {
+      incoming.set(canonicalKey, persistedDraft)
+    }
+  }
+
+  for (const [key, incomingDraft] of incoming) {
     const local = draftsBySession.get(key)
-    const next = local?.attachments.length ? { ...local, text: draft.text } : draft
+    const next = local?.attachments.length ? { ...local, text: incomingDraft.text } : incomingDraft
 
     if (!draftEqual(local, next)) {
       bumpDraftRevision(key)
     }
 
     draftsBySession.set(key, next)
-    publishDraftTitle(key, deriveDraftTitle(draft.text))
+    publishDraftTitle(key, deriveDraftTitle(incomingDraft.text))
   }
 
   // Only keys that previously had persisted text can be external clears.
@@ -582,6 +612,37 @@ export function claimSessionDraft(fromKey: string | null | undefined, toKey: str
   clearSessionDraft(fromKey)
 
   return true
+}
+
+/** Carry a cleared in-flight submission's revision across a storage handoff.
+ * Content migration already bumps a destination revision; only an untouched
+ * destination inherits the retired source counter. */
+export function handoffEmptySessionDraftRevision(
+  fromKey: string | null | undefined,
+  toKey: string | null | undefined
+): boolean {
+  const from = draftKey(fromKey)
+  const to = draftKey(toKey)
+
+  if (fromKey === undefined || !toKey || from === to) {
+    return false
+  }
+
+  const sourceRevision = draftRevisionsBySession.get(from) ?? 0
+  const destinationRevision = draftRevisionsBySession.get(to) ?? 0
+  const destinationDraft = draftsBySession.get(to)
+
+  const destinationUntouched =
+    destinationRevision === 0 &&
+    (!destinationDraft || (!destinationDraft.text.trim() && destinationDraft.attachments.length === 0))
+
+  if (sourceRevision > 0 && destinationUntouched) {
+    draftRevisionsBySession.set(to, sourceRevision)
+  }
+
+  draftRevisionsBySession.delete(from)
+
+  return sourceRevision > 0 && destinationUntouched
 }
 
 export function setComposerDraft(value: string) {

@@ -38,7 +38,7 @@ import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { sessionAwaitingInput } from '@/store/prompts'
 import {
@@ -436,16 +436,39 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
  *  the paginated recents page, so it has no `$sessions` row at all until new
  *  activity lands it there — resolving through the tree keeps its tab titled
  *  and tinted instead of a grey "Session" placeholder. */
-export function tileStoredRow(storedSessionId: string): SessionInfo | undefined {
+export function tileStoredRow(
+  storedSessionId: string,
+  ownerRoute: SessionOwnerRoute | undefined = sessionTileOwnerRoute(storedSessionId)
+): SessionInfo | undefined {
   const match = (s: SessionInfo) => sessionMatchesStoredId(s, storedSessionId)
 
-  return (
-    $sessions.get().find(match) ??
-    $projectTree
+  const candidates = [
+    ...$sessions.get().filter(match),
+    ...$projectTree
       .get()
       .flatMap(p => [...p.repos.flatMap(r => r.groups.flatMap(g => g.sessions)), ...(p.previewSessions ?? [])])
-      .find(match)
+      .filter(match)
+  ]
+
+  if (!ownerRoute) {
+    return candidates[0]
+  }
+
+  const exactTagged = candidates.find(
+    row =>
+      row.connection_id?.trim() === ownerRoute.connectionId &&
+      normalizeProfileKey(row.profile) === normalizeProfileKey(ownerRoute.profile)
   )
+
+  if (exactTagged) {
+    return exactTagged
+  }
+
+  const profileOnly = candidates.filter(
+    row => !row.connection_id?.trim() && normalizeProfileKey(row.profile) === normalizeProfileKey(ownerRoute.profile)
+  )
+
+  return profileOnly.length === 1 ? profileOnly[0] : undefined
 }
 
 /** The tab's REGISTERED name. Deliberately the bare placeholder for a draft
@@ -454,8 +477,9 @@ export function tileStoredRow(storedSessionId: string): SessionInfo | undefined 
  *  would let the registered name already match the row that lands on send —
  *  skipping the re-register that hands the tab back to this string. */
 function tileTitle(storedSessionId: string): string {
-  const stored = tileStoredRow(storedSessionId)
-  const explicit = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.workspaceTabTitle
+  const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+  const stored = tileStoredRow(storedSessionId, tile?.ownerRoute)
+  const explicit = tile?.workspaceTabTitle
 
   return stored ? sessionTitle(stored) : explicit || NEW_SESSION_TITLE
 }
@@ -479,8 +503,8 @@ export function sessionTileDraftScope(
 /** The `@session` link payload for a tile tab drag — id + owning profile + title.
  *  Resolved at drag time, so an unsent tab drags under its draft name. */
 export function tileDragPayload(storedSessionId: string): SessionDragPayload {
-  const stored = tileStoredRow(storedSessionId)
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+  const stored = tileStoredRow(storedSessionId, tile?.ownerRoute)
   const explicit = tile?.workspaceTabTitle
 
   const title = stored

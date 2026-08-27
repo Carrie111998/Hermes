@@ -28,12 +28,22 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $composerNewChatGeneration } from '@/store/composer'
 import { parkQueuedPrompts } from '@/store/composer-queue'
+import { resolveComposerStorageOwner } from '@/store/composer-storage-owner'
 import { encodeComposerStorageScopeKey, legacyComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
-import { $activeGatewayProfile, $gatewaySwapTarget, $hydrationSyncProfile, $profiles } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $gatewaySwapTarget,
+  $hydrationSyncProfile,
+  $newChatConnectionId,
+  $newChatProfile,
+  $newChatRoute,
+  $profiles,
+  resolveNewChatOwnerRoute
+} from '@/store/profile'
 import {
   $connection,
   $contextSuggestions,
@@ -41,6 +51,7 @@ import {
   $gatewayState,
   $introPersonality,
   $introSeed,
+  $primarySessionOwnerIntent,
   $resumeExhaustedSessionId,
   $sessions,
   getSessionOwnerHint,
@@ -50,7 +61,12 @@ import {
   shouldMigrateComposerScope
 } from '@/store/session'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
-import { $focusedStoredSessionId, $sessionStates, sessionTileDelegate } from '@/store/session-states'
+import {
+  $focusedStoredSessionId,
+  $sessionStates,
+  knownOwnerForSession,
+  sessionTileDelegate
+} from '@/store/session-states'
 import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -438,6 +454,10 @@ const ChatViewContent = memo(function ChatViewContent({
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const connection = useStore($connection)
+  const primarySessionOwnerIntent = useStore($primarySessionOwnerIntent)
+  const newChatConnectionId = useStore($newChatConnectionId)
+  const newChatProfile = useStore($newChatProfile)
+  const newChatRoute = useStore($newChatRoute)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -475,25 +495,54 @@ const ChatViewContent = memo(function ChatViewContent({
   // latter can be momentarily null/stale mid-switch, which used to leak into
   // the composer's scope key (#59305). A tile has no route, so it always uses
   // its own selection directly.
-  const queueSessionKey = useMemo(() => {
-    const effectiveSelectedSessionId = isPrimary
-      ? primaryRouteSelectedSessionId(location.pathname, selectedSessionId)
-      : selectedSessionId
+  const effectiveSelectedSessionId = isPrimary
+    ? primaryRouteSelectedSessionId(location.pathname, selectedSessionId)
+    : selectedSessionId
 
-    return resolveComposerSessionKey(effectiveSelectedSessionId, sessions)
-  }, [isPrimary, location.pathname, selectedSessionId, sessions])
+  const queueSessionKey = useMemo(
+    () => resolveComposerSessionKey(effectiveSelectedSessionId, sessions),
+    [effectiveSelectedSessionId, sessions]
+  )
 
   const activeComposerOwnerConnectionId = connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')
   const activeComposerOwnerProfile = activeGatewayProfile
 
   const tileOwner = !isPrimary ? sessionOwnerRoute : undefined
 
+  const newChatOwnerRevision = JSON.stringify([
+    activeGatewayProfile,
+    connection?.connectionId,
+    connection?.mode,
+    newChatConnectionId,
+    newChatProfile,
+    newChatRoute
+  ])
+
+  const newChatOwner = useMemo(() => (newChatOwnerRevision ? resolveNewChatOwnerRoute() : null), [newChatOwnerRevision])
+
+  const inferredSessionOwner = effectiveSelectedSessionId ? knownOwnerForSession(effectiveSelectedSessionId) : undefined
+
   const composerOwner = useMemo(
     () =>
+      resolveComposerStorageOwner({
+        ambientOwner: { connectionId: activeComposerOwnerConnectionId, profile: activeComposerOwnerProfile },
+        isPrimary,
+        knownOwner: inferredSessionOwner,
+        newChatOwner,
+        primaryIntent: primarySessionOwnerIntent,
+        selectedSessionId: effectiveSelectedSessionId,
+        tileOwner
+      }),
+    [
+      activeComposerOwnerConnectionId,
+      activeComposerOwnerProfile,
+      effectiveSelectedSessionId,
+      inferredSessionOwner,
+      isPrimary,
+      newChatOwner,
+      primarySessionOwnerIntent,
       tileOwner
-        ? { connectionId: tileOwner.connectionId, profile: tileOwner.profile }
-        : { connectionId: activeComposerOwnerConnectionId, profile: activeComposerOwnerProfile },
-    [activeComposerOwnerConnectionId, activeComposerOwnerProfile, tileOwner]
+    ]
   )
 
   const composerOwnerScopeKey = encodeComposerStorageScopeKey(composerOwner, null)

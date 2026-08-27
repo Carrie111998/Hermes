@@ -48,6 +48,7 @@ import { TRANSCRIPT_DIRECTIVE_AREA, type TranscriptDirectiveContribution } from 
 import { setYoloEnabled } from '@/lib/yolo-session'
 import { $composerNewChatGeneration, draftTitleFor } from '@/store/composer'
 import { pruneComposerPopoutZones } from '@/store/composer-popout'
+import { resolveComposerStorageOwner } from '@/store/composer-storage-owner'
 import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import {
   $fileBrowserOpen,
@@ -61,7 +62,7 @@ import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH
 } from '@/store/layout'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, normalizeProfileKey, resolveNewChatOwnerRoute } from '@/store/profile'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import {
   $reviewOpen,
@@ -74,12 +75,14 @@ import {
 import {
   $connection,
   $currentCwd,
+  $primarySessionOwnerIntent,
   $selectedStoredSessionId,
   $sessions,
   $yoloActive,
   sessionMatchesStoredId
 } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
+import { knownOwnerForSession } from '@/store/session-states'
 import { watchUnreadWriteGuard } from '@/store/session-unread-remote'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
 import { isBrowserWindow, isHudWindow } from '@/store/windows'
@@ -136,11 +139,20 @@ const wrapWorkspaceTab = (tab: ReactElement) => <WorkspaceTabMenu>{tab}</Workspa
 export const workspaceDraftScope = (storedSessionId: null | string): string => {
   const connection = $connection.get()
 
-  return encodeComposerStorageScopeKey(
-    {
+  const owner = resolveComposerStorageOwner({
+    ambientOwner: {
       connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
       profile: $activeGatewayProfile.get()
     },
+    isPrimary: true,
+    knownOwner: storedSessionId ? knownOwnerForSession(storedSessionId) : undefined,
+    newChatOwner: storedSessionId === null ? resolveNewChatOwnerRoute() : undefined,
+    primaryIntent: $primarySessionOwnerIntent.get(),
+    selectedSessionId: storedSessionId
+  })
+
+  return encodeComposerStorageScopeKey(
+    owner,
     storedSessionId,
     storedSessionId === null ? $composerNewChatGeneration.get() : 0
   )
@@ -155,11 +167,36 @@ const workspaceDragPayload = (): SessionDragPayload | null => {
     return null
   }
 
-  const stored = $sessions.get().find(s => sessionMatchesStoredId(s, selected))
+  const ownerIntent = $primarySessionOwnerIntent.get()
+  const candidates = $sessions.get().filter(session => sessionMatchesStoredId(session, selected))
+
+  const stored =
+    ownerIntent?.storedSessionId === selected
+      ? (candidates.find(
+          session =>
+            session.connection_id?.trim() === ownerIntent.ownerRoute.connectionId &&
+            normalizeProfileKey(session.profile) === normalizeProfileKey(ownerIntent.ownerRoute.profile)
+        ) ?? (candidates.length === 1 && !candidates[0]?.connection_id?.trim() ? candidates[0] : undefined))
+      : candidates.length === 1
+        ? candidates[0]
+        : undefined
+
+  const connection = $connection.get()
+
+  const owner = resolveComposerStorageOwner({
+    ambientOwner: {
+      connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
+      profile: $activeGatewayProfile.get()
+    },
+    isPrimary: true,
+    knownOwner: knownOwnerForSession(selected),
+    primaryIntent: ownerIntent,
+    selectedSessionId: selected
+  })
 
   return {
     id: selected,
-    profile: stored?.profile ?? $activeGatewayProfile.get(),
+    profile: stored?.profile ?? owner.profile,
     title: stored ? storedSessionTitle(stored) : draftTitleFor(workspaceDraftScope(selected)) || NEW_SESSION_TITLE
   }
 }

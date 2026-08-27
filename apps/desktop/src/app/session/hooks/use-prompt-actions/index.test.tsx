@@ -1,7 +1,7 @@
 import { JsonRpcGatewayError } from '@hermes/shared'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getSession } from '@/hermes'
@@ -9,6 +9,7 @@ import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
@@ -31,7 +32,7 @@ import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
 import { clearSingleFlightSessionResumeState } from './single-flight-resume'
-import type { SubmitTextOptions } from './utils'
+import type { ComposerSessionCreatedForSend, CreatedBackendSessionForSend, SubmitTextOptions } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
 
@@ -141,7 +142,7 @@ function Harness({
   ) => void
   onReady: (handle: HarnessHandle) => void
   onSeedState?: (state: Record<string, unknown>) => void
-  onSessionCreatedForSend?: (storedSessionId: string) => void
+  onSessionCreatedForSend?: (created: ComposerSessionCreatedForSend) => void
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
@@ -153,7 +154,10 @@ function Harness({
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
   storedSessionId?: null | string
   activeSessionId?: null | string
-  createBackendSessionForSend?: (preview?: null | string) => Promise<null | string>
+  createBackendSessionForSend?: (
+    preview?: null | string,
+    onCreated?: (created: CreatedBackendSessionForSend) => void
+  ) => Promise<null | string>
 }) {
   const localActiveSessionIdRef = useRef<string | null>(
     activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId
@@ -161,9 +165,11 @@ function Harness({
 
   const activeSessionIdRef = activeSessionIdRefProp ?? localActiveSessionIdRef
 
-  const selectedStoredSessionIdRef: MutableRefObject<string | null> = selectedStoredSessionIdRefProp ?? {
-    current: storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
-  }
+  const localSelectedStoredSessionIdRef = useRef<string | null>(
+    storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
+  )
+
+  const selectedStoredSessionIdRef = selectedStoredSessionIdRefProp ?? localSelectedStoredSessionIdRef
 
   const defaultStoredSessionId = storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
   const defaultRuntimeSessionId = activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId
@@ -187,12 +193,40 @@ function Harness({
     interimBoundaryPending: false
   } as never)
 
+  const createSessionForSend = useCallback(
+    async (preview?: null | string, onCreated?: (created: CreatedBackendSessionForSend) => void) => {
+      let metadataEmitted = false
+
+      const capture = (created: CreatedBackendSessionForSend) => {
+        metadataEmitted = true
+        onCreated?.(created)
+      }
+
+      const runtimeSessionId = createBackendSessionForSend
+        ? await createBackendSessionForSend(preview, capture)
+        : RUNTIME_SESSION_ID
+
+      // Legacy test doubles predate the immutable metadata callback. Production
+      // useSessionActions always emits it before returning.
+      if (runtimeSessionId && !metadataEmitted) {
+        onCreated?.({
+          owner: null,
+          runtimeSessionId,
+          storedSessionId: activeSessionIdRef.current === runtimeSessionId ? selectedStoredSessionIdRef.current : null
+        })
+      }
+
+      return runtimeSessionId
+    },
+    [activeSessionIdRef, createBackendSessionForSend, selectedStoredSessionIdRef]
+  )
+
   const actions = usePromptActions({
     activeSessionId: activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId,
     activeSessionIdRef,
     branchCurrentSession: async () => true,
     busyRef: localBusyRef,
-    createBackendSessionForSend: createBackendSessionForSend ?? (async () => RUNTIME_SESSION_ID),
+    createBackendSessionForSend: createSessionForSend,
     getRoutedStoredSessionId: getRoutedStoredSessionId ?? (() => null),
     getRuntimeIdForStoredSession: getRuntimeIdForStoredSession ?? (() => null),
     getRouteToken: getRouteToken ?? (() => 'token'),
@@ -217,49 +251,53 @@ function Harness({
     }
   })
 
+  const { cancelRun, editMessage, redirectPrompt, reloadFromMessage, restoreToMessage, steerPrompt, submitText } =
+    actions
+
   useEffect(() => {
     onReady({
       activeSessionIdRef,
-      cancelRun: (...args: Parameters<typeof actions.cancelRun>) =>
-        act(async () => actions.cancelRun(...args)) as Promise<void>,
-      editMessage: (...args: Parameters<typeof actions.editMessage>) =>
-        act(async () => actions.editMessage(...args)) as Promise<void>,
-      reloadFromMessage: (...args: Parameters<typeof actions.reloadFromMessage>) =>
-        act(async () => actions.reloadFromMessage(...args)) as Promise<void>,
-      restoreToMessage: (...args: Parameters<typeof actions.restoreToMessage>) =>
-        act(async () => actions.restoreToMessage(...args)) as Promise<void>,
-      redirectPrompt: (...args: Parameters<typeof actions.redirectPrompt>) =>
-        act(async () => actions.redirectPrompt(...args)) as Promise<boolean>,
-      steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
-        act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
-      submitTextRaw: actions.submitText,
-      submitText: (...args: Parameters<typeof actions.submitText>) =>
-        act(async () => actions.submitText(...args)) as Promise<boolean>
+      cancelRun: (...args: Parameters<typeof cancelRun>) => act(async () => cancelRun(...args)) as Promise<void>,
+      editMessage: (...args: Parameters<typeof editMessage>) => act(async () => editMessage(...args)) as Promise<void>,
+      reloadFromMessage: (...args: Parameters<typeof reloadFromMessage>) =>
+        act(async () => reloadFromMessage(...args)) as Promise<void>,
+      restoreToMessage: (...args: Parameters<typeof restoreToMessage>) =>
+        act(async () => restoreToMessage(...args)) as Promise<void>,
+      redirectPrompt: (...args: Parameters<typeof redirectPrompt>) =>
+        act(async () => redirectPrompt(...args)) as Promise<boolean>,
+      steerPrompt: (...args: Parameters<typeof steerPrompt>) =>
+        act(async () => steerPrompt(...args)) as Promise<boolean>,
+      submitTextRaw: (...args: Parameters<typeof submitText>) => submitText(...args),
+      submitText: (...args: Parameters<typeof submitText>) => act(async () => submitText(...args)) as Promise<boolean>
     })
   }, [
-    actions.cancelRun,
-    actions.editMessage,
-    actions.reloadFromMessage,
-    actions.restoreToMessage,
-    actions.redirectPrompt,
-    actions.steerPrompt,
-    actions.submitText,
     activeSessionIdRef,
-    onReady
+    cancelRun,
+    editMessage,
+    onReady,
+    redirectPrompt,
+    reloadFromMessage,
+    restoreToMessage,
+    steerPrompt,
+    submitText
   ])
 
   return null
 }
 
 describe('usePromptActions fresh-session composer handoff', () => {
-  it('emits the stored id only after the first send actually creates and binds a session', async () => {
+  it('emits immutable source and destination scopes after the first send creates a session', async () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
     const onSessionCreatedForSend = vi.fn()
+    const owner = { connectionId: 'remote-owner', profile: 'profile-b' }
+    const sourceScope = encodeComposerStorageScopeKey(owner, null, '11111111-1111-4111-8111-111111111111')
+    const destinationScope = encodeComposerStorageScopeKey(owner, 'stored-created')
 
-    const createBackendSessionForSend = vi.fn(async () => {
+    const createBackendSessionForSend = vi.fn(async (_preview, onCreated) => {
       activeSessionIdRef.current = 'runtime-created'
       selectedStoredSessionIdRef.current = 'stored-created'
+      onCreated?.({ owner, runtimeSessionId: 'runtime-created', storedSessionId: 'stored-created' })
 
       return 'runtime-created'
     })
@@ -281,11 +319,57 @@ describe('usePromptActions fresh-session composer handoff', () => {
       />
     )
 
-    await expect(handle!.submitText('first prompt')).resolves.toBe(true)
+    await expect(handle!.submitText('first prompt', { composerStorageScope: sourceScope })).resolves.toBe(true)
 
     expect(createBackendSessionForSend).toHaveBeenCalledOnce()
     expect(onSessionCreatedForSend).toHaveBeenCalledOnce()
-    expect(onSessionCreatedForSend).toHaveBeenCalledWith('stored-created')
+    expect(onSessionCreatedForSend).toHaveBeenCalledWith({
+      fromScopeKey: sourceScope,
+      runtimeSessionId: 'runtime-created',
+      storedSessionId: 'stored-created',
+      toScopeKey: destinationScope
+    })
+  })
+
+  it('does not adopt an existing chat that reuses the created runtime id after create', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const onSessionCreatedForSend = vi.fn()
+    const owner = { connectionId: 'remote-owner', profile: 'profile-b' }
+    const sourceScope = encodeComposerStorageScopeKey(owner, null, '22222222-2222-4222-8222-222222222222')
+
+    const createBackendSessionForSend = vi.fn(async (_preview, onCreated) => {
+      activeSessionIdRef.current = 'runtime-reused'
+      selectedStoredSessionIdRef.current = 'stored-created'
+      onCreated?.({ owner, runtimeSessionId: 'runtime-reused', storedSessionId: 'stored-created' })
+      // User opens an existing chat whose backend reuses the same runtime text.
+      selectedStoredSessionIdRef.current = 'stored-existing'
+
+      return 'runtime-reused'
+    })
+
+    const requestGateway = vi.fn(async () => ({ accepted: true }) as never)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRoutedStoredSessionId={() => 'stored-existing'}
+        onReady={next => (handle = next)}
+        onSessionCreatedForSend={onSessionCreatedForSend}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+
+    await expect(handle!.submitText('first prompt', { composerStorageScope: sourceScope })).resolves.toBe(false)
+
+    expect(onSessionCreatedForSend).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
   })
 })
 

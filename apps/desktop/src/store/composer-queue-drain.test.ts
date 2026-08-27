@@ -37,14 +37,17 @@ describe('composer queue drain coordinator', () => {
     expect(finishComposerQueueDrain(drain)).toBe(scopeB)
   })
 
-  it('rejects non-canonical scopes and a handoff into another active drain', () => {
+  it('merges source and destination claims so exclusion lasts until both settle', () => {
     expect(beginComposerQueueDrain('default\0stored-a', 'entry-a')).toBeNull()
 
     const first = beginComposerQueueDrain(scopeA, 'entry-a')!
     const second = beginComposerQueueDrain(scopeB, 'entry-b')!
 
-    expect(handoffComposerQueueDrains(scopeA, scopeB)).toBe(0)
-    expect(finishComposerQueueDrain(first)).toBe(scopeA)
+    expect(handoffComposerQueueDrains(scopeA, scopeB)).toBe(1)
+    expect(beginComposerQueueDrain(scopeB, 'entry-c')).toBeNull()
     expect(finishComposerQueueDrain(second)).toBe(scopeB)
+    expect(beginComposerQueueDrain(scopeB, 'entry-c')).toBeNull()
+    expect(finishComposerQueueDrain(first)).toBe(scopeB)
+    expect(beginComposerQueueDrain(scopeB, 'entry-c')).not.toBeNull()
   })
 })

@@ -15,7 +15,8 @@ import { beginComposerQueueDrain, finishComposerQueueDrain } from '@/store/compo
 import {
   type ComposerStorageOwner,
   decodeComposerStorageScopeKey,
-  normalizeComposerStorageOwner
+  normalizeComposerStorageOwner,
+  resolveComposerStorageScopeKey
 } from '@/store/composer-storage-scope'
 import { notify } from '@/store/notifications'
 import { $sessions, idsShareLineage } from '@/store/session'
@@ -113,7 +114,6 @@ export function useBackgroundQueueDrain({
 
         scheduleRetry()
       }
-
       void (async () => {
         let acceptedEntry: QueuedPromptEntry | null = null
         let failed = false
@@ -121,11 +121,10 @@ export function useBackgroundQueueDrain({
 
         try {
           // A migration can hand the lock to another qualified key before this
-          // microtask runs. Entry ids are unique, so resolve the live entry
-          // across the store and let finish() tell us its settled key.
-          const liveEntry = Object.values($queuedPromptsBySession.get())
-            .flat()
-            .find(candidate => candidate.id === entry.id)
+          // microtask runs. Resolve that scope, then match the entry only inside
+          // its exact owner namespace: entry ids are not an ownership boundary.
+          const liveScopeKey = resolveComposerStorageScopeKey(sessionKey)
+          const liveEntry = $queuedPromptsBySession.get()[liveScopeKey]?.find(candidate => candidate.id === entry.id)
 
           if (!liveEntry) {
             return
@@ -146,6 +145,7 @@ export function useBackgroundQueueDrain({
 
           if (accepted === false) {
             failed = true
+
             return
           }
 
@@ -192,6 +192,7 @@ export function useBackgroundQueueDrain({
       }
 
       const storedSessionId = target.storedSessionId
+
       const isSelected =
         storedSessionId === null
           ? selectedStoredSessionId === null

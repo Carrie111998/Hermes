@@ -612,7 +612,10 @@ describe('profile-aware plugin session opens', () => {
     expect(setShowAllProfiles).toHaveBeenCalledWith(true)
     expect($activeGatewayProfile.get()).toBe('remote-worker')
     expect(setSessionOwnerHint).toHaveBeenCalledWith('remote-chat', route)
-    expect(openSessionCore).toHaveBeenCalledWith('remote-chat', expect.any(Function), 'in-place')
+    expect(openSessionCore).toHaveBeenCalledWith('remote-chat', expect.any(Function), 'in-place', {
+      ownerRoute: route,
+      workspaceMode: 'sessions'
+    })
   })
 
   it('threads an exact Bot workspace owner into the core session open', async () => {

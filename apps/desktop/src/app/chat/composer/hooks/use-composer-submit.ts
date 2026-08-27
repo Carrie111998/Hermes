@@ -14,6 +14,7 @@ import {
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { resolveComposerStorageScopeKey } from '@/store/composer-storage-migration'
+import { decodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
@@ -147,10 +148,24 @@ export function useComposerSubmit({
       stashAt(restoreScope, text, submittedAttachments)
     }
 
+    const composerStorageScope =
+      typeof submittedScope === 'string' && decodeComposerStorageScopeKey(submittedScope)?.format === 'canonical'
+        ? submittedScope
+        : undefined
+
     void Promise.resolve(
       attachments
-        ? onSubmit(text, { attachments, composerScope: submitScopeKey, ...(displayKind ? { displayKind } : {}) })
-        : onSubmit(text, { composerScope: submitScopeKey, ...(displayKind ? { displayKind } : {}) })
+        ? onSubmit(text, {
+            attachments,
+            composerScope: submitScopeKey,
+            ...(composerStorageScope ? { composerStorageScope } : {}),
+            ...(displayKind ? { displayKind } : {})
+          })
+        : onSubmit(text, {
+            composerScope: submitScopeKey,
+            ...(composerStorageScope ? { composerStorageScope } : {}),
+            ...(displayKind ? { displayKind } : {})
+          })
     )
       .then(accepted => {
         if (accepted === false) {

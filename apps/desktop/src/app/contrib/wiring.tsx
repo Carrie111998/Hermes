@@ -42,9 +42,8 @@ import { activateWakeIndicator } from '@/lib/wake-indicator'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
-import { $composerNewChatGeneration, requestVoiceConversationStart } from '@/store/composer'
+import { requestVoiceConversationStart } from '@/store/composer'
 import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
-import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
@@ -75,9 +74,7 @@ import {
   $sessionResumeRequest,
   $sessions,
   forgetSessionOwnerHintsForSession,
-  getSessionOwnerHint,
   requestSessionResume,
-  resolveComposerSessionKey,
   sessionMatchesStoredId,
   sessionOwnerRouteFromRow,
   sessionPinId,
@@ -126,6 +123,7 @@ import { useMessageStream } from '../session/hooks/use-message-stream'
 import { useModelControls } from '../session/hooks/use-model-controls'
 import { usePreviewRouting } from '../session/hooks/use-preview-routing'
 import { usePromptActions } from '../session/hooks/use-prompt-actions'
+import type { ComposerSessionCreatedForSend } from '../session/hooks/use-prompt-actions/utils'
 import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
@@ -629,20 +627,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const handleSkinCommand = useSkinCommand()
 
-  const handleSessionCreatedForSend = useCallback((storedSessionId: string) => {
-    const owner = getSessionOwnerHint(storedSessionId)
-
-    if (!owner) {
-      return
-    }
-
-    const durableSessionId = resolveComposerSessionKey(storedSessionId, $sessions.get()) ?? storedSessionId
-    const storageOwner = { connectionId: owner.connectionId, profile: owner.profile }
-
-    migrateComposerStorageScope(
-      encodeComposerStorageScopeKey(storageOwner, null, $composerNewChatGeneration.get()),
-      encodeComposerStorageScopeKey(storageOwner, durableSessionId)
-    )
+  const handleSessionCreatedForSend = useCallback(({ fromScopeKey, toScopeKey }: ComposerSessionCreatedForSend) => {
+    migrateComposerStorageScope(fromScopeKey, toScopeKey)
   }, [])
 
   const {

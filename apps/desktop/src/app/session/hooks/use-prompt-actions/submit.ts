@@ -18,6 +18,11 @@ import {
   mainComposerScope,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import {
+  decodeComposerStorageScopeKey,
+  encodeComposerStorageScopeKey,
+  normalizeComposerStorageOwner
+} from '@/store/composer-storage-scope'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
@@ -41,6 +46,8 @@ import { finalizeInterruptedMessages } from './rewind'
 import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
 import {
   acquireSubmitInFlight,
+  type ComposerSessionCreatedForSend,
+  type CreatedBackendSessionForSend,
   type GatewayRequest,
   inlineErrorMessage,
   isProviderSetupError,
@@ -57,12 +64,15 @@ interface SubmitPromptDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   copy: Translations['desktop']
-  createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  createBackendSessionForSend: (
+    preview?: string | null,
+    onCreated?: (created: CreatedBackendSessionForSend) => void
+  ) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
   onRuntimeRecovered?: (runtimeId: string) => void
-  onSessionCreatedForSend?: (storedSessionId: string) => void
+  onSessionCreatedForSend?: (created: ComposerSessionCreatedForSend) => void
   requestGateway: GatewayRequest
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
@@ -279,6 +289,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const startingActiveSessionId = activeSessionIdRef.current
       const selectedStoredSessionId = selectedStoredSessionIdRef.current
       const routedStoredSessionId = getRoutedStoredSessionId()
+
+      const submittedStorageScopeKey = options?.composerStorageScope
+
+      const submittedStorageScope = submittedStorageScopeKey
+        ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
+        : null
 
       const routedRuntimeId = routedStoredSessionId ? getRuntimeIdForStoredSession(routedStoredSessionId) : null
 
@@ -661,8 +677,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       if (!sessionId) {
+        const createdSessionRef: { current: CreatedBackendSessionForSend | null } = { current: null }
+
         try {
-          sessionId = await createBackendSessionForSend(bubbleText)
+          sessionId = await createBackendSessionForSend(bubbleText, created => {
+            createdSessionRef.current = created
+          })
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()
@@ -696,22 +716,23 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return false
         }
 
-        // A successful create re-homes selection + route to the chat it just
-        // minted, so the pre-create baseline can't tell our own re-home from
-        // a user switch (judging it drift aborted EVERY first send of a new
-        // chat: no prompt.submit, no DB row, a stranded route that 404s
-        // "Session not found"). The drift signal for this window is the
-        // active ref instead: every switch path re-nulls or retargets it
-        // synchronously, so it only still equals the id create returned when
-        // nobody re-homed since.
-        if (activeSessionIdRef.current !== sessionId) {
+        const createdSession = createdSessionRef.current
+
+        if (!createdSession || createdSession.runtimeSessionId !== sessionId) {
+          return abortForSessionSwitch(sessionId)
+        }
+
+        // Selection is the durable identity and cannot be spoofed by a reused
+        // runtime string. Background runtime events may retarget activeSessionId
+        // without a user switch, so validate the created stored id directly.
+        if (selectedStoredSessionIdRef.current !== createdSession.storedSessionId) {
           return abortForSessionSwitch(sessionId)
         }
 
         // Re-pin the baseline to the created chat for the rest of the
         // pipeline; the closures (seedOptimistic et al) see the new value.
-        startingStoredSessionId = selectedStoredSessionIdRef.current
-        startingSelectedStoredSessionId = selectedStoredSessionIdRef.current
+        startingStoredSessionId = createdSession.storedSessionId
+        startingSelectedStoredSessionId = createdSession.storedSessionId
         startingRouteToken = getRouteToken()
         // The target too: it was captured BEFORE the create (null for a fresh
         // draft) and seedOptimistic hands it to updateSessionState as the
@@ -721,10 +742,26 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // translate the runtime id to the stored id, never saw the session's
         // tile route / owner hint / row, probed REST by a runtime id, and fell
         // to the ambient socket — the fresh-chat owner loss behind #94071.
-        targetStoredSessionId = selectedStoredSessionIdRef.current
+        targetStoredSessionId = createdSession.storedSessionId
 
-        if (startedAsNewChat && targetStoredSessionId) {
-          onSessionCreatedForSend?.(targetStoredSessionId)
+        if (startedAsNewChat && targetStoredSessionId && submittedStorageScopeKey && submittedStorageScope) {
+          const createdOwner = normalizeComposerStorageOwner(createdSession.owner ?? submittedStorageScope.owner)
+
+          if (
+            submittedStorageScope.format !== 'canonical' ||
+            submittedStorageScope.storedSessionId !== null ||
+            createdOwner.connectionId !== submittedStorageScope.owner.connectionId ||
+            createdOwner.profile !== submittedStorageScope.owner.profile
+          ) {
+            return abortForSessionSwitch(sessionId)
+          }
+
+          onSessionCreatedForSend?.({
+            fromScopeKey: submittedStorageScopeKey,
+            runtimeSessionId: createdSession.runtimeSessionId,
+            storedSessionId: targetStoredSessionId,
+            toScopeKey: encodeComposerStorageScopeKey(createdOwner, targetStoredSessionId)
+          })
         }
 
         seedOptimistic(sessionId)

@@ -27,7 +27,7 @@ vi.mock('./routes', () => ({
   sessionRoute: (id: string) => `/c/${encodeURIComponent(id)}`
 }))
 
-import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import { $activeSessionId, $primarySessionOwnerIntent, $selectedStoredSessionId } from '@/store/session'
 
 import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
 
@@ -93,6 +93,7 @@ describe('openSession', () => {
     reuseBlankDraftTile.mockReset()
     setSessionTileWorkspaceScope.mockReset()
     $activeSessionId.set(null)
+    $primarySessionOwnerIntent.set(null)
     $selectedStoredSessionId.set(null)
   })
 
@@ -121,6 +122,15 @@ describe('openSession', () => {
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate)
     expect(navigate).toHaveBeenCalledWith('/c/s1')
+  })
+
+  it('publishes the exact owner when an in-place open routes into main', () => {
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'profile-b' }
+
+    focusOpenSession.mockReturnValue(null)
+    openSession('shared-id', navigate, 'in-place', { ownerRoute, workspaceMode: 'sessions' })
+
+    expect($primarySessionOwnerIntent.get()).toEqual({ ownerRoute, storedSessionId: 'shared-id' })
   })
 
   it('main routes to the workspace even when the session is already open as a tile', () => {

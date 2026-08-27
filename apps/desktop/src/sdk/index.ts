@@ -976,7 +976,14 @@ export const host = {
               ...(options.tabTitle ? { workspaceTabTitle: options.tabTitle } : {})
             })
           } else {
-            openSession(storedSessionId, navigate, intent)
+            if (ownerRoute) {
+              openSession(storedSessionId, navigate, intent, {
+                ownerRoute,
+                workspaceMode: 'sessions'
+              })
+            } else {
+              openSession(storedSessionId, navigate, intent)
+            }
           }
 
           // Judge the main surface AFTER the open: on a cold start the persisted

@@ -12,7 +12,9 @@ interface ActiveDrain {
 let nextDrainId = 1
 const activeByHandle = new Map<number, ActiveDrain>()
 const handleByEntry = new Map<string, number>()
-const handleByScope = new Map<string, number>()
+const handlesByScope = new Map<string, Set<number>>()
+
+const scopeIsClaimed = (scopeKey: string): boolean => Boolean(handlesByScope.get(scopeKey)?.size)
 
 const canonicalScope = (scopeKey: string): string | null => {
   const resolved = resolveComposerStorageScopeKey(scopeKey)
@@ -24,14 +26,14 @@ const canonicalScope = (scopeKey: string): string | null => {
 export function beginComposerQueueDrain(scopeKey: string, entryId: string): ComposerQueueDrainHandle | null {
   const canonicalKey = canonicalScope(scopeKey)
 
-  if (!canonicalKey || !entryId.trim() || handleByScope.has(canonicalKey) || handleByEntry.has(entryId)) {
+  if (!canonicalKey || !entryId.trim() || scopeIsClaimed(canonicalKey) || handleByEntry.has(entryId)) {
     return null
   }
 
   const handle = { id: nextDrainId++ }
 
   activeByHandle.set(handle.id, { entryId, scopeKey: canonicalKey })
-  handleByScope.set(canonicalKey, handle.id)
+  handlesByScope.set(canonicalKey, new Set([handle.id]))
   handleByEntry.set(entryId, handle.id)
 
   return handle
@@ -41,7 +43,7 @@ export function beginComposerQueueDrain(scopeKey: string, entryId: string): Comp
 export function isComposerQueueDrainExcluded(scopeKey: string, entryId: string): boolean {
   const canonicalKey = canonicalScope(scopeKey)
 
-  return !canonicalKey || handleByScope.has(canonicalKey) || handleByEntry.has(entryId)
+  return !canonicalKey || scopeIsClaimed(canonicalKey) || handleByEntry.has(entryId)
 }
 
 /**
@@ -57,35 +59,40 @@ export function handoffComposerQueueDrains(fromScopeKey: string, toScopeKey: str
     return 0
   }
 
-  const handleId = handleByScope.get(from)
+  const sourceHandles = handlesByScope.get(from)
 
-  if (handleId === undefined) {
+  if (!sourceHandles?.size) {
     return 0
   }
 
   if (from === to) {
-    return 1
+    return sourceHandles.size
   }
 
-  const targetHolder = handleByScope.get(to)
-
-  if (targetHolder !== undefined && targetHolder !== handleId) {
-    return 0
-  }
-
-  const active = activeByHandle.get(handleId)
-
-  if (!active) {
-    return 0
-  }
+  const targetHandles = handlesByScope.get(to) ?? new Set<number>()
+  let moved = 0
 
   // Claim the target before releasing the source: no visible/background
-  // contender can enter between the two qualified identities.
-  handleByScope.set(to, handleId)
-  handleByScope.delete(from)
-  active.scopeKey = to
+  // contender can enter between the two qualified identities. An existing
+  // destination claim is merged, not overwritten; both must settle before the
+  // migrated scope becomes drainable again.
+  handlesByScope.set(to, targetHandles)
 
-  return 1
+  for (const handleId of sourceHandles) {
+    const active = activeByHandle.get(handleId)
+
+    if (!active) {
+      continue
+    }
+
+    targetHandles.add(handleId)
+    active.scopeKey = to
+    moved += 1
+  }
+
+  handlesByScope.delete(from)
+
+  return moved
 }
 
 /** Release a claim and return the qualified key on which it finally settled. */
@@ -98,8 +105,14 @@ export function finishComposerQueueDrain(handle: ComposerQueueDrainHandle): stri
 
   activeByHandle.delete(handle.id)
 
-  if (handleByScope.get(active.scopeKey) === handle.id) {
-    handleByScope.delete(active.scopeKey)
+  const scopeHandles = handlesByScope.get(active.scopeKey)
+
+  if (scopeHandles) {
+    scopeHandles.delete(handle.id)
+
+    if (!scopeHandles.size) {
+      handlesByScope.delete(active.scopeKey)
+    }
   }
 
   if (handleByEntry.get(active.entryId) === handle.id) {
@@ -113,6 +126,6 @@ export function finishComposerQueueDrain(handle: ComposerQueueDrainHandle): stri
 export function _resetComposerQueueDrainsForTests(): void {
   activeByHandle.clear()
   handleByEntry.clear()
-  handleByScope.clear()
+  handlesByScope.clear()
   nextDrainId = 1
 }

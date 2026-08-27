@@ -1122,8 +1122,13 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
 
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : undefined
-  const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
+  const ownerRoute = scope.ownerRoute
+  const workspaceTabTitle = scope.workspaceTabTitle
+
+  const ownerChanged =
+    tile?.ownerRoute?.connectionId !== ownerRoute?.connectionId ||
+    tile?.ownerRoute?.profile !== ownerRoute?.profile ||
+    tile?.ownerRoute?.targetProfile !== ownerRoute?.targetProfile
 
   if (
     !tile ||
@@ -1138,6 +1143,7 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
   }
 
   patchSessionTile(storedSessionId, {
+    ...(ownerChanged ? { error: undefined, runtimeId: undefined } : {}),
     ownerRoute,
     workspaceMode: scope.workspaceMode,
     workspaceOwnerKey,
@@ -1386,11 +1392,11 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,
-        workspaceTabTitle: workspaceScope.workspaceMode === 'bots' ? workspaceScope.workspaceTabTitle : undefined
+        workspaceTabTitle: workspaceScope.workspaceTabTitle
       }
     ])
     // Adoption is async via the registry — order sync runs after the move path

@@ -529,7 +529,7 @@ describe('startFreshSessionDraft', () => {
 
     act(() => handle!.startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null }))
 
-    expect($composerNewChatGeneration.get()).toBe(before + 1)
+    expect($composerNewChatGeneration.get()).not.toBe(before)
   })
 
   it('can reset machine-bound session state without closing the current overlay route', async () => {

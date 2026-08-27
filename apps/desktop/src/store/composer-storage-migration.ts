@@ -1,4 +1,4 @@
-import { claimSessionDraft } from './composer'
+import { claimSessionDraft, handoffEmptySessionDraftRevision } from './composer'
 import { migrateQueuedPrompts } from './composer-queue'
 import { handoffComposerQueueDrains } from './composer-queue-drain'
 import {
@@ -34,6 +34,7 @@ export function migrateComposerStorageScope(fromScopeKey: string, toScopeKey: st
 
   handoffComposerQueueDrains(from, to)
   claimSessionDraft(from, to)
+  handoffEmptySessionDraftRevision(from, to)
   migrateQueuedPrompts(from, to)
   registerComposerStorageScopeAlias(from, to)
 

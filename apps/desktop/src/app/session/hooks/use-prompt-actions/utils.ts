@@ -5,10 +5,24 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
+import type { ComposerStorageOwner } from '@/store/composer-storage-scope'
 
 import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
 
 export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+
+export interface CreatedBackendSessionForSend {
+  owner: ComposerStorageOwner | null
+  runtimeSessionId: string
+  storedSessionId: string | null
+}
+
+export interface ComposerSessionCreatedForSend {
+  fromScopeKey: string
+  runtimeSessionId: string
+  storedSessionId: string
+  toScopeKey: string
+}
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -690,6 +704,9 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
 
 export interface SubmitTextOptions {
   attachments?: ComposerAttachment[]
+  /** Exact renderer-local storage identity captured by the composer at dispatch.
+   * Never pass this value to a backend RPC. */
+  composerStorageScope?: string
   /** The composer scope key that was actually loaded when this text was
    *  submitted (see use-composer-draft's activeQueueSessionKeyRef). Compared
    *  against the resolved submit target in sessionContextDrift — a mismatch
