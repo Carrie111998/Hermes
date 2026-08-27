@@ -129,6 +129,31 @@ class TestMemoryBlockProjectScope:
         assert "other note" not in volatile, \
             "[project:other] entry must be filtered out with scope='proj'"
 
+    def test_empty_scope_shows_all_entries(self, store_and_agent, monkeypatch):
+        """project_scoping=True + resolve_project_scope()=\"\" → all entries unfiltered."""
+        store, agent = store_and_agent
+
+        # resolve_project_scope returns "" (e.g. cwd in $HOME or temp root)
+        monkeypatch.setattr(
+            "agent.runtime_cwd.resolve_project_scope", lambda: ""
+        )
+
+        # Enable project scoping in config
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"memory": {"project_scoping": True}},
+        )
+
+        parts = _build(agent)
+        volatile = parts.get("volatile", "")
+
+        assert "global note" in volatile, \
+            "global (un-tagged) entry must appear when scope is empty"
+        assert "other note" in volatile, \
+            "[project:other] entry must be included when scope is empty (unfiltered)"
+        assert "proj note" in volatile, \
+            "[project:proj] entry must be included when scope is empty (unfiltered)"
+
     def test_scoping_disabled_shows_all(self, store_and_agent, monkeypatch):
         """project_scoping=False (default) → all entries unfiltered (backward compat)."""
         store, agent = store_and_agent

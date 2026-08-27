@@ -1,17 +1,10 @@
 """Tests for runtime_cwd.resolve_project_scope() — project-scoped memory (issue #33638)."""
 
-import os
 from pathlib import Path
 
 import pytest
 
 import agent.runtime_cwd as rt
-
-
-@pytest.fixture
-def markers_dir(tmp_path: Path) -> Path:
-    """A tmp dir with common project markers — used as a project root."""
-    return tmp_path / "my-project"
 
 
 class TestResolveProjectScope:
