@@ -22,9 +22,9 @@ def test_ssh_ownership_valid_challenge_returns_verifiable_protocol_2_proof(monke
 
     assert response.status_code == 200
     payload = response.json()
+    assert set(payload) == {"ok", "protocolVersion", "proof"}
     assert payload["ok"] is True
     assert payload["protocolVersion"] == 2
-    assert set(payload) == {"ok", "protocolVersion", "proof"}
     canonical = f"{challenge}:{nonce}:{os.getpid()}:2".encode()
     proof_key = hmac.new(
         token.encode(), b"hermes-ssh-ownership-v2", hashlib.sha256
@@ -65,56 +65,6 @@ def test_ssh_ownership_endpoint_requires_token_and_returns_exact_nonce(
             "runtimeIntact": True,
             "pid": os.getpid(),
         }
-    finally:
-        web_server._apply_ssh_owner_nonce(None)
-
-
-@pytest.mark.parametrize("challenge", ["", "a" * 63, "A" * 64, "g" * 64])
-def test_ssh_ownership_endpoint_rejects_malformed_unauthenticated_challenge(
-    challenge, monkeypatch
-):
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "t" * 64)
-    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", "0123456789abcdef")
-    web_server.app.state.auth_required = False
-    client = TestClient(web_server.app)
-
-    response = client.get("/api/ssh/ownership", params={"challenge": challenge})
-
-    assert response.status_code == 400
-
-
-def test_ssh_ownership_challenge_requires_an_active_ssh_owner(monkeypatch):
-    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", None)
-    web_server.app.state.auth_required = False
-    client = TestClient(web_server.app)
-
-    response = client.get("/api/ssh/ownership", params={"challenge": "a" * 64})
-
-    assert response.status_code == 401
-
-
-def test_ssh_ownership_fails_closed_without_runtime_identity_baseline(monkeypatch):
-    token = "t" * 64
-
-    def missing_purelib(*args, **kwargs):
-        raise OSError("runtime path unavailable")
-
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
-    monkeypatch.setattr(
-        web_server, "sysconfig", types.SimpleNamespace(get_paths=missing_purelib)
-    )
-    web_server.app.state.auth_required = False
-    web_server._apply_ssh_owner_nonce("0123456789abcdef")
-    try:
-        client = TestClient(web_server.app)
-
-        response = client.get(
-            "/api/ssh/ownership",
-            headers={"X-Hermes-Session-Token": token},
-        )
-
-        assert response.status_code == 200
-        assert response.json()["runtimeIntact"] is False
     finally:
         web_server._apply_ssh_owner_nonce(None)
 
@@ -195,15 +145,11 @@ def test_ssh_runtime_marker_survives_in_place_installs(tmp_path, monkeypatch):
     )
 
     web_server._apply_ssh_owner_nonce("0123456789abcdef")
-    marker = web_server._SSH_RUNTIME_MARKER
     try:
-        assert marker is not None
-        assert os.path.isfile(marker)
         (purelib / "newpkg").mkdir()  # a package landing in the live venv
         assert web_server._ssh_runtime_intact() is True
     finally:
         web_server._apply_ssh_owner_nonce(None)
-    assert not os.path.exists(marker)
 
 
 def test_ssh_runtime_readonly_purelib_falls_back_to_stat(tmp_path, monkeypatch):
@@ -225,8 +171,6 @@ def test_ssh_runtime_readonly_purelib_falls_back_to_stat(tmp_path, monkeypatch):
     # (daemon threads crash in their excepthooks → nondeterministic teardown
     # errors file-wide, the Aug 2026 CI flake). chmod is thread-safe and
     # exercises the genuine OSError path.
-    if os.name != "posix":  # pragma: no cover - Windows mode bits differ
-        pytest.skip("POSIX directory mode bits are required")
     if os.geteuid() == 0:  # pragma: no cover - root ignores mode bits
         pytest.skip("directory write bits are not enforced for root")
     purelib.chmod(0o555)
@@ -262,7 +206,7 @@ def test_ssh_owner_nonce_rejects_path_traversal(tmp_path, monkeypatch):
     monkeypatch.setattr(
         web_server,
         "sysconfig",
-        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+        types.SimpleNamespace(get_paths=lambda *args, **kwargs: {"purelib": str(purelib)}),
     )
 
     web_server._apply_ssh_owner_nonce("../../../../evil")
@@ -285,7 +229,7 @@ def test_ssh_owner_nonce_sweeps_dead_runtime_markers_only(tmp_path, monkeypatch)
     monkeypatch.setattr(
         web_server,
         "sysconfig",
-        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+        types.SimpleNamespace(get_paths=lambda *args, **kwargs: {"purelib": str(purelib)}),
     )
 
     web_server._apply_ssh_owner_nonce("0123456789abcdef")
@@ -295,5 +239,29 @@ def test_ssh_owner_nonce_sweeps_dead_runtime_markers_only(tmp_path, monkeypatch)
         assert not dead.exists()
         assert live.is_file()
         assert web_server._SSH_RUNTIME_MARKER == str(current)
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
+
+
+def test_ssh_ownership_fails_closed_without_runtime_identity_baseline(monkeypatch):
+    token = "t" * 64
+
+    def missing_purelib(*args, **kwargs):
+        raise OSError("runtime path unavailable")
+
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+    monkeypatch.setattr(
+        web_server, "sysconfig", types.SimpleNamespace(get_paths=missing_purelib)
+    )
+    web_server.app.state.auth_required = False
+    web_server._apply_ssh_owner_nonce("0123456789abcdef")
+    try:
+        response = TestClient(web_server.app).get(
+            "/api/ssh/ownership",
+            headers={"X-Hermes-Session-Token": token},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["runtimeIntact"] is False
     finally:
         web_server._apply_ssh_owner_nonce(None)

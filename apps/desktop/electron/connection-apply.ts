@@ -54,6 +54,13 @@ async function resolveTerminalConnection(getTarget, ensureBackend) {
   return target
 }
 
+async function resolveTerminalConnectionForSender(webContentsId, getTarget, ensureBackend) {
+  return resolveTerminalConnection(
+    () => getTarget(webContentsId),
+    () => ensureBackend(webContentsId)
+  )
+}
+
 async function teardownSshState(state, { cleanupRemote }) {
   // Remote process first, while the SSH channel can still exec kill.
   // Then drop the local forward and close the transport. Each step is
@@ -79,4 +86,10 @@ async function teardownSshState(state, { cleanupRemote }) {
   }
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection, teardownSshState }
+export {
+  applyConnectionChange,
+  commitConnectionFailure,
+  resolveTerminalConnection,
+  resolveTerminalConnectionForSender,
+  teardownSshState
+}
