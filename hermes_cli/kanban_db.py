@@ -7831,26 +7831,79 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
             _lock_task_worktree(repo_root, target, branch_name)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
-        cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
-    else:
-        cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
-        ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=60,
-        check=False,
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+
+    # Serialize Hermes lifecycle transitions and ask Git to publish the new
+    # worktree already locked.  Locking in a second command leaves an
+    # add-return/lock-start window where an independent pruner can remove the
+    # checkout; ``worktree add --lock`` closes that window at Git's boundary.
+    from .active_sessions import _FileLock
+    common = _git_common_dir(repo_root)
+    if common is None:
+        raise RuntimeError(f"cannot resolve git common dir for {repo_root}")
+    lock_reason = f"active Hermes Kanban task {branch_name}"
+    with _FileLock(common / "hermes-worktree-lifecycle.lock"):
+        if _git_branch_exists(repo_root, branch_name):
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add",
+                "--lock", "--reason", lock_reason, str(target), branch_name,
+            ]
+        else:
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add",
+                "--lock", "--reason", lock_reason, "-b", branch_name,
+                str(target), "HEAD",
+            ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
         )
-    _lock_task_worktree(repo_root, target, branch_name)
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+            )
+
+
+def _adopt_nonterminal_task_worktrees(conn: sqlite3.Connection) -> None:
+    """Restore lifecycle locks for task worktrees created before lock leasing.
+
+    Dispatch is the restart/recovery boundary that sees every nonterminal
+    task.  Re-locking an existing checkout here closes the upgrade gap for
+    worktrees materialized by an older process, while branch verification
+    prevents a stale task row from claiming another task's checkout.
+    """
+    rows = conn.execute(
+        "SELECT id, workspace_path, branch_name FROM tasks "
+        "WHERE workspace_kind='worktree' AND workspace_path IS NOT NULL "
+        "AND status NOT IN ('done', 'archived', 'failed', 'cancelled')"
+    ).fetchall()
+    for row in rows:
+        target = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        branch = (row["branch_name"] or "").strip() or f"wt/{row['id']}"
+        try:
+            if not target.is_dir() or not _is_linked_worktree_checkout(target):
+                continue
+            if _git_current_branch(target) != branch:
+                _log.warning(
+                    "Refusing to adopt worktree for task %s: branch mismatch at %s",
+                    row["id"], target,
+                )
+                continue
+            common = _git_common_dir(target)
+            if common is None:
+                continue
+            _lock_task_worktree(common.parent, target, branch)
+        except Exception as exc:
+            # Recovery is fail-safe and best-effort: an unverifiable checkout
+            # is preserved by cleanup policy, and one bad row must not stall
+            # dispatch for unrelated projects.
+            _log.warning(
+                "Unable to adopt worktree lease for task %s at %s: %s",
+                row["id"], target, exc,
+            )
 
 
 def _resolve_worktree_workspace(
@@ -10090,6 +10143,8 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    if not dry_run:
+        _adopt_nonterminal_task_worktrees(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
