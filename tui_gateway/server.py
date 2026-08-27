@@ -14,7 +14,6 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -40,6 +39,20 @@ from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway.session_ownership import (
+    bind_live_session_transport,
+    commit_agent_build,
+    commit_resume_failure_state,
+    commit_resume_hydration,
+    deferred_build_effect_session,
+    forget_retired_session_id,
+    remember_retired_session_id,
+    run_live_build_effect,
+    session_is_live_for_commit,
+    session_lifecycle_lock,
+    session_record_is_authoritative,
+    was_retired_session_id,
+)
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -161,36 +174,6 @@ _cfg_lock = threading.Lock()
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
-_RETIRED_SESSION_ID_LIMIT = 4096
-_retired_session_ids: OrderedDict[str, None] = OrderedDict()
-_retired_session_ids_lock = threading.Lock()
-
-
-def _remember_retired_session_id(sid: str) -> None:
-    sid = str(sid or "")
-    if not sid:
-        return
-    with _retired_session_ids_lock:
-        _retired_session_ids.pop(sid, None)
-        _retired_session_ids[sid] = None
-        while len(_retired_session_ids) > _RETIRED_SESSION_ID_LIMIT:
-            _retired_session_ids.popitem(last=False)
-
-
-def _forget_retired_session_id(sid: str) -> None:
-    sid = str(sid or "")
-    if not sid:
-        return
-    with _retired_session_ids_lock:
-        _retired_session_ids.pop(sid, None)
-
-
-def _was_retired_session_id(sid: str) -> bool:
-    sid = str(sid or "")
-    if not sid:
-        return False
-    with _retired_session_ids_lock:
-        return sid in _retired_session_ids
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -420,9 +403,6 @@ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 # Unlike a public session id, this object identity cannot be supplied by RPC.
 _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
     contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
-)
-_deferred_build_effect_session: contextvars.ContextVar[dict | None] = (
-    contextvars.ContextVar("hermes_gateway_deferred_build_effect_session", default=None)
 )
 
 # JSON-RPC method being dispatched on this thread/task. Purely diagnostic: the
@@ -1014,9 +994,6 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
-def _session_lifecycle_lock(session: dict) -> threading.RLock:
-    """Return the per-runtime lock shared by builders and teardown."""
-    return session.setdefault("_lifecycle_lock", threading.RLock())
 
 
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
@@ -1121,94 +1098,6 @@ def _teardown_popped_session(
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
     _teardown_session(session, end_reason=end_reason)
-    return True
-
-
-def _session_is_live_for_commit(sid: str, session: dict) -> bool:
-    """Return whether ``session`` still owns ``sid`` and may be mutated."""
-    with _session_resume_lock:
-        with _sessions_lock:
-            return (
-                _sessions.get(sid) is session
-                and not session.get("_closing")
-                and not session.get("_finalized")
-            )
-
-
-def _run_live_build_effect(
-    sid: str, session: dict, effect: Callable[[], object]
-) -> bool:
-    """Run a deferred-build side effect before teardown can finalize."""
-    with _session_lifecycle_lock(session):
-        if not _session_is_live_for_commit(sid, session):
-            return False
-        token = _deferred_build_effect_session.set(session)
-        try:
-            result = effect()
-        finally:
-            _deferred_build_effect_session.reset(token)
-    return True if result is None else bool(result)
-
-
-def _commit_agent_build(
-    sid: str, session: dict, agent, config_model_seen
-) -> bool:
-    """Publish a built agent only while its runtime still owns the registry id."""
-    with _session_lifecycle_lock(session):
-        with _session_resume_lock:
-            with _sessions_lock:
-                if (
-                    _sessions.get(sid) is not session
-                    or session.get("_closing")
-                    or session.get("_finalized")
-                ):
-                    return False
-                session["agent"] = agent
-                session["config_model_seen"] = config_model_seen
-                return True
-
-
-def _commit_resume_hydration(
-    sid: str,
-    session: dict,
-    history: list,
-    display_history_prefix: list,
-    message_count: int,
-) -> bool:
-    """Publish deferred resume history only for the current live runtime."""
-    with _session_lifecycle_lock(session):
-        with _session_resume_lock:
-            with _sessions_lock:
-                if (
-                    _sessions.get(sid) is not session
-                    or session.get("_closing")
-                    or session.get("_finalized")
-                ):
-                    return False
-                with session["history_lock"]:
-                    session["history"] = history
-                    session["display_history_prefix"] = display_history_prefix
-                    session["resume_hydrating"] = False
-                    session["resume_message_count"] = message_count
-        return True
-
-
-def _commit_resume_failure_state(sid: str, session: dict, message: str) -> bool:
-    """Publish deferred-resume failure state before the runtime is retired."""
-    with _session_lifecycle_lock(session):
-        with _session_resume_lock:
-            with _sessions_lock:
-                if (
-                    _sessions.get(sid) is not session
-                    or session.get("_closing")
-                    or session.get("_finalized")
-                ):
-                    return False
-                session["resume_hydrating"] = False
-                session["resume_history_error"] = message
-                session["agent_error"] = message
-                session["resume_history_ready"].set()
-                session["agent_ready"].set()
     return True
 
 
@@ -1637,38 +1526,22 @@ def _transport_is_dead(transport) -> bool:
     return getattr(transport, "_closed", None) is True
 
 
-def _bind_live_session_transport(
-    sid: str, session: dict, transport: Transport | None
-) -> bool:
-    """Bind ``session`` to a live client transport as one ownership claim.
-
-    Disconnect teardown snapshots session ids before it can act on them, so a
-    later transport assignment must use the same resume lock and confirm that
-    the exact session record is still registered.  The liveness check also
-    handles a slow ``session.resume`` whose WebSocket closed while it was
-    building history or an agent: such a worker must not publish a dead
-    transport after the disconnect cleanup has already completed.
-
-    The caller may continue with its normal response path when this returns
-    ``False``.  A closed request cannot receive that response, and leaving the
-    previous transport unchanged is safer than replacing it with a dead one.
-    """
-    if transport is None or _transport_is_dead(transport):
-        return False
-    with _session_resume_lock:
-        with _sessions_lock:
-            if _sessions.get(sid) is not session:
-                return False
-            # The transport can close while this worker waits for the locks.
-            if _transport_is_dead(transport):
-                return False
-            session["transport"] = transport
-            session.setdefault("viewers", {})[transport] = time.time()
-            # Keep timer cancellation in the same critical section as the
-            # rebind.  Otherwise a disconnect could park and schedule a reap
-            # between the bind and a later cancellation.
-            _cancel_ws_orphan_reap(sid)
-    return True
+# Session ownership and deferred-build fencing live in
+# tui_gateway/session_ownership.py.  These aliases keep the handler modules'
+# rebound-globals seam intact (method_ctx.py) and preserve the existing
+# monkeypatch targets in the tests.
+_bind_live_session_transport = bind_live_session_transport
+_session_record_is_authoritative = session_record_is_authoritative
+_session_is_live_for_commit = session_is_live_for_commit
+_session_lifecycle_lock = session_lifecycle_lock
+_run_live_build_effect = run_live_build_effect
+_commit_agent_build = commit_agent_build
+_commit_resume_hydration = commit_resume_hydration
+_commit_resume_failure_state = commit_resume_failure_state
+_remember_retired_session_id = remember_retired_session_id
+_forget_retired_session_id = forget_retired_session_id
+_was_retired_session_id = was_retired_session_id
+_deferred_build_effect_session = deferred_build_effect_session
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
@@ -9234,6 +9107,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
     queued_transport = None
+    # Ownership BEFORE the claim: the queue pop and the ``running`` latch below
+    # are mutations, and a record that a concurrent disconnect already popped
+    # has no authority to accept new work.  Checking after the claim (the old
+    # order) meant a stale record could keep a drained prompt and a stuck
+    # ``running`` flag that nothing would ever clear.
+    if not _session_record_is_authoritative(sid, session):
+        return False
     with session["history_lock"]:
         if session.get("_closing"):
             return False
@@ -9248,7 +9128,27 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         queued_transport = queued.get("transport")
     if queued_transport is not None:
-        _bind_live_session_transport(sid, session, queued_transport)
+        outcome = _bind_live_session_transport(sid, session, queued_transport)
+        if outcome.is_stale_record:
+            # A teardown claimed the record between the authority check and
+            # here.  Give the envelope back and drop the ``running`` latch so
+            # the popped record is left exactly as teardown expects it.  A
+            # merely dead queued transport is NOT terminal: the turn itself is
+            # still legitimate and its events go to whatever the session is
+            # bound to now.
+            with session["history_lock"]:
+                rest = [queued]
+                advanced = session.get("queued_prompt")
+                if advanced:
+                    rest.append(advanced)
+                rest.extend(session.get("queued_prompts") or [])
+                session["queued_prompt"] = rest[0]
+                if rest[1:]:
+                    session["queued_prompts"] = rest[1:]
+                else:
+                    session.pop("queued_prompts", None)
+                session["running"] = False
+            return False
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:

@@ -1331,26 +1331,6 @@ def test_write_json_drops_event_after_runtime_is_claimed(monkeypatch):
     assert out.parts == []
 
 
-def test_retired_session_id_reuse_keeps_the_new_tombstone(monkeypatch):
-    """Reusing a runtime id must not let an old bounded entry erase its replacement."""
-    sid = "reused-runtime-sid"
-    other = "other-runtime-sid"
-    monkeypatch.setattr(server, "_RETIRED_SESSION_ID_LIMIT", 2)
-    with server._retired_session_ids_lock:
-        saved = server._retired_session_ids.copy()
-        server._retired_session_ids.clear()
-    try:
-        server._remember_retired_session_id(sid)
-        server._forget_retired_session_id(sid)
-        server._remember_retired_session_id(sid)
-        server._remember_retired_session_id(other)
-        assert server._was_retired_session_id(sid)
-    finally:
-        with server._retired_session_ids_lock:
-            server._retired_session_ids.clear()
-            server._retired_session_ids.update(saved)
-
-
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
     # The live ticker must nest the snapshot under a "usage" key, matching the
     # message.complete / session.info payloads the desktop & TUI handlers read

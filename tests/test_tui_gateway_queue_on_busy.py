@@ -13,12 +13,21 @@ import threading
 import time
 import types
 
+import pytest
+
 import tools.async_delegation as ad
 from tui_gateway import server
 
 
-def _session(agent=None, **extra):
-    return {
+@pytest.fixture(autouse=True)
+def _isolate_session_registry():
+    server._sessions.clear()
+    yield
+    server._sessions.clear()
+
+
+def _session(agent=None, sid="sid", **extra):
+    session = {
         "agent": agent if agent is not None else types.SimpleNamespace(),
         "session_key": "session-key",
         "history": [],
@@ -29,6 +38,11 @@ def _session(agent=None, **extra):
         "attached_images": [],
         **extra,
     }
+    # `_drain_queued_prompt` proves registry authority before it claims the
+    # queue, so a drain test's record has to be registered the way a real one
+    # is. The autouse fixture above keeps that registration per-test.
+    server._sessions[sid] = session
+    return session
 
 
 # ── _enqueue_prompt ────────────────────────────────────────────────────────

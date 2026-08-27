@@ -360,8 +360,20 @@ def _(rid, params: dict) -> dict:
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        _bind_live_session_transport(sid, session, t)
+    #
+    # `_sess_nowait()` above is an UNLOCKED registry read, so a disconnect
+    # teardown can pop this exact record between that read and here. The bind
+    # is the first point that proves registry authority, and a stale-record
+    # refusal is terminal: everything below mutates history, the prompt queue,
+    # and the `running` latch, none of which a popped record may accept. A
+    # merely dead request transport is NOT terminal — the turn is legitimate
+    # and its events reach whatever the session is bound to now.
+    t = current_transport()
+    if t is not None:
+        if _bind_live_session_transport(sid, session, t).is_stale_record:
+            return _err(rid, 4001, "session not found")
+    elif not _session_record_is_authoritative(sid, session):
+        return _err(rid, 4001, "session not found")
     while True:
         busy_transport = None
         with session["history_lock"]:
