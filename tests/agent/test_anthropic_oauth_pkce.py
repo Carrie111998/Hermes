@@ -16,8 +16,12 @@ History:
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from typing import Any, Dict
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
+
+import pytest
 
 
 def _patch_oauth_flow(
@@ -25,6 +29,7 @@ def _patch_oauth_flow(
     *,
     callback_code: str,
     token_response: Dict[str, Any] | None = None,
+    token_error_status: int | None = None,
     capture_token_request: Dict[str, Any] | None = None,
     capture_auth_url: Dict[str, str] | None = None,
 ) -> None:
@@ -77,8 +82,18 @@ def _patch_oauth_flow(
     def fake_urlopen(req, *_a, **_kw):
         if capture_token_request is not None:
             capture_token_request["url"] = req.full_url
+            capture_token_request["method"] = req.get_method()
             capture_token_request["data"] = json.loads(req.data.decode())
             capture_token_request["headers"] = dict(req.headers)
+            capture_token_request.setdefault("requests", []).append(req.full_url)
+        if token_error_status is not None:
+            raise HTTPError(
+                req.full_url,
+                token_error_status,
+                "Bad Request" if token_error_status == 400 else "Method Not Allowed",
+                hdrs=None,
+                fp=BytesIO(b'{"type":"error"}'),
+            )
         return _FakeResponse(json.dumps(token_response).encode())
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -185,6 +200,79 @@ def test_login_token_exchange_uses_platform_claude_host(monkeypatch, tmp_path):
         "login token exchange must target platform.claude.com first, not the "
         "dead console.anthropic.com host (regression of #45250 / #49821)"
     )
+
+
+def test_login_exchange_matches_current_claude_code_manual_flow(monkeypatch, tmp_path):
+    """The authorization and exchange redirects must use Claude Code's live URI."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    captured_token: Dict[str, Any] = {}
+    captured_url: Dict[str, str] = {}
+    _patch_oauth_flow(
+        monkeypatch,
+        callback_code="placeholder",
+        capture_token_request=captured_token,
+        capture_auth_url=captured_url,
+    )
+
+    def fake_input(*_a, **_kw):
+        qs = parse_qs(urlparse(captured_url["url"]).query)
+        return f"auth-code#{qs['state'][0]}"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    from agent.anthropic_adapter import run_hermes_oauth_login_pure
+
+    assert run_hermes_oauth_login_pure() is not None
+
+    auth_url = urlparse(captured_url["url"])
+    auth_query = parse_qs(auth_url.query)
+    assert (auth_url.scheme, auth_url.netloc, auth_url.path) == (
+        "https",
+        "claude.com",
+        "/cai/oauth/authorize",
+    )
+    assert auth_query["redirect_uri"] == [
+        "https://platform.claude.com/oauth/code/callback"
+    ]
+    assert captured_token["url"] == "https://platform.claude.com/v1/oauth/token"
+    assert captured_token["method"] == "POST"
+    assert captured_token["headers"]["Content-type"] == "application/json"
+    assert captured_token["data"]["redirect_uri"] == auth_query["redirect_uri"][0]
+    assert captured_token["data"]["state"] == auth_query["state"][0]
+    assert captured_token["data"]["code_verifier"]
+
+
+@pytest.mark.parametrize("status", [400, 405])
+def test_login_exchange_does_not_retry_rejected_request(
+    monkeypatch, tmp_path, capsys, status
+):
+    """A rejected authorization-code request must not be replayed to stale hosts."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    captured_token: Dict[str, Any] = {}
+    captured_url: Dict[str, str] = {}
+    _patch_oauth_flow(
+        monkeypatch,
+        callback_code="placeholder",
+        token_error_status=status,
+        capture_token_request=captured_token,
+        capture_auth_url=captured_url,
+    )
+
+    def fake_input(*_a, **_kw):
+        qs = parse_qs(urlparse(captured_url["url"]).query)
+        return f"auth-code#{qs['state'][0]}"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    from agent.anthropic_adapter import run_hermes_oauth_login_pure
+
+    assert run_hermes_oauth_login_pure() is None
+    assert captured_token["requests"] == [
+        "https://platform.claude.com/v1/oauth/token"
+    ]
+    assert f"HTTP Error {status}" in capsys.readouterr().out
 
 
 

@@ -1188,12 +1188,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         }).encode()
         content_type = "application/x-www-form-urlencoded"
 
-    token_endpoints = [
-        "https://platform.claude.com/v1/oauth/token",
-        "https://console.anthropic.com/v1/oauth/token",
-    ]
     last_error = None
-    for endpoint in token_endpoints:
+    for endpoint in _OAUTH_TOKEN_URLS:
         req = urllib.request.Request(
             endpoint,
             data=data,
@@ -1531,13 +1527,12 @@ def run_oauth_setup_token() -> Optional[str]:
 # Stores credentials in ~/.hermes/.anthropic_oauth.json (our own file).
 
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-# Anthropic migrated the OAuth token endpoint to platform.claude.com;
-# console.anthropic.com now 404s. Callers should iterate _OAUTH_TOKEN_URLS
-# (new host first, console fallback). _OAUTH_TOKEN_URL is kept as the primary
-# for backward compatibility with existing imports and now points at the live host.
+# Keep these URLs aligned with Claude Code's manual OAuth flow. Authorization
+# codes are single-use, so a rejected exchange must not be replayed to retired
+# hosts. _OAUTH_TOKEN_URL is retained for existing imports.
+_OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 _OAUTH_TOKEN_URLS = [
     "https://platform.claude.com/v1/oauth/token",
-    "https://console.anthropic.com/v1/oauth/token",
 ]
 _OAUTH_TOKEN_URL = _OAUTH_TOKEN_URLS[0]
 # User-Agent sent on the OAuth *token endpoint* (login exchange + refresh).
@@ -1550,7 +1545,7 @@ _OAUTH_TOKEN_URL = _OAUTH_TOKEN_URLS[0]
 # (build_anthropic_kwargs) still uses the ``claude-code/`` UA + ``x-app: cli`` —
 # that fingerprint is required there and is NOT throttled on the messages API.
 _OAUTH_TOKEN_USER_AGENT = "axios/1.7.9"
-_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 _OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 def _get_hermes_oauth_file() -> Path:
     return get_hermes_home() / ".anthropic_oauth.json"
@@ -1590,7 +1585,7 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
     }
     from urllib.parse import urlencode
 
-    auth_url = f"https://claude.ai/oauth/authorize?{urlencode(params)}"
+    auth_url = f"{_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
     print()
     print("Authorize Hermes with your Claude Pro/Max subscription.")
@@ -1648,9 +1643,8 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
             "code_verifier": verifier,
         }).encode()
 
-        # Anthropic migrated the OAuth token endpoint to platform.claude.com;
-        # console.anthropic.com now 404s. Try the new host first, then fall
-        # back to console for older deployments (mirrors the refresh path).
+        # Use only Claude Code's live token endpoint. Authorization codes are
+        # single-use and must not be replayed to retired fallback hosts.
         # UA is _OAUTH_TOKEN_USER_AGENT (a non-claude-code UA) — see the
         # constant's definition for why the token endpoint must not send
         # claude-code/ (429 UA-prefix block).
