@@ -1614,3 +1614,227 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Iteration-budget self-release race (#95212)
+#
+# The turn finalizer runs INSIDE the still-live worker. It used to record the
+# budget-exhaustion failure with ``release_claim=True`` — the spawn-failure
+# mode, only correct when NO process exists — nulling claim_lock /
+# claim_expires / worker_pid and flipping the task back to ``ready`` while its
+# own process kept running, so the dispatcher could spawn a duplicate worker
+# beside it. Now the worker SELF-HOLDS: the failure is accounted immediately
+# (#87096 taxonomy preserved), but status stays ``running`` with the claim
+# intact until the pid is actually gone; ``detect_crashed_workers`` then
+# releases the held claim WITHOUT re-counting the failure.
+# ---------------------------------------------------------------------------
+
+
+def _hold_failure_kwargs():
+    """Kwargs the turn finalizer passes for a budget-exhausted worker."""
+    return dict(
+        error=(
+            "Iteration budget exhausted (8/8) — task could not complete "
+            "within the allowed iterations"
+        ),
+        outcome="timed_out",
+        release_claim=False,
+        hold_claim=True,
+        end_run=True,
+    )
+
+
+def test_budget_self_hold_keeps_running_claim_intact(kanban_home):
+    """Hold mode accounts the failure but must NOT touch the claim: the task
+    stays running / undispatchable while the worker process is still alive."""
+    import json
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="budget-hold", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, os.getpid())  # any live pid
+
+        blocked = kb._record_task_failure(conn, tid, **_hold_failure_kwargs())
+
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, "
+            "consecutive_failures, last_failure_error "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        # Claim preserved — nothing for the dispatcher to spawn onto.
+        assert row["status"] == "running", (
+            f"pre-fix this was 'ready' (self-released): {row['status']}"
+        )
+        assert row["claim_lock"] == f"{host}:worker"
+        assert row["claim_expires"] is not None
+        assert row["worker_pid"] == os.getpid()
+        # Failure accounted exactly once; run closed as timed_out.
+        assert row["consecutive_failures"] == 1
+        assert "Iteration budget exhausted" in (row["last_failure_error"] or "")
+        assert blocked is False
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "timed_out"
+        assert json.loads(run["metadata"]).get("claim_hold") is True
+        # And a dispatcher tick cannot claim a running task.
+        assert kb.claim_task(conn, tid) is None
+
+
+def test_budget_self_hold_trips_breaker_to_blocked(kanban_home):
+    """When the unified counter reaches the limit, hold mode trips straight to
+    ``blocked`` — parked, undispatchable, no duplicate-worker window."""
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="budget-trip", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, os.getpid())
+
+        blocked = kb._record_task_failure(
+            conn, tid, **_hold_failure_kwargs(), failure_limit=1,
+        )
+
+        assert blocked is True
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+
+
+def test_budget_self_hold_is_idempotent_across_exit_paths(kanban_home):
+    """Several exit paths can invoke the finalizer fallback while the worker
+    winds down; only the FIRST one may tick the failure counter."""
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="budget-idempotent", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, os.getpid())
+
+        for _ in range(2):
+            kb._record_task_failure(conn, tid, **_hold_failure_kwargs())
+
+        row = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row["consecutive_failures"] == 1
+        timed_out_events = conn.execute(
+            "SELECT kind FROM task_events "
+            "WHERE task_id = ? AND kind = 'timed_out'",
+            (tid,),
+        ).fetchall()
+        assert len(timed_out_events) == 1
+
+
+def test_hold_claim_and_release_claim_are_mutually_exclusive(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="mutex", assignee="a")
+        with pytest.raises(ValueError):
+            kb._record_task_failure(
+                conn, tid, error="x", outcome="crashed",
+                release_claim=True, hold_claim=True,
+            )
+
+
+def test_detect_crashed_workers_releases_held_claim_without_recounting(
+    kanban_home, monkeypatch,
+):
+    """Once the held worker's pid is actually gone, the reclaim chain restores
+    the source phase WITHOUT ticking ``consecutive_failures`` again (the
+    worker already accounted the failure) and without misclassifying the exit
+    as a crashed run or a clean-exit protocol violation."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    alive = {"value": True}
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: alive["value"])
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="budget-reclaim", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 424242)
+
+        kb._record_task_failure(conn, tid, **_hold_failure_kwargs())
+        held = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert held["status"] == "running"
+
+        # The worker finishes teardown and exits.
+        alive["value"] = False
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == []
+        assert getattr(kb.detect_crashed_workers, "_last_rate_limited", []) == []
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, "
+            "consecutive_failures FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+        assert row["worker_pid"] is None
+        assert row["consecutive_failures"] == 1, (
+            "releasing a self-held claim must NOT double-count the failure"
+        )
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
+            ).fetchall()
+        ]
+        assert "budget_hold_reclaimed" in kinds
+        assert "crashed" not in kinds
+        assert "protocol_violation" not in kinds
+
+
+def test_detect_crashed_workers_leaves_held_claim_while_pid_alive(
+    kanban_home, monkeypatch,
+):
+    """Direct counterpart to the release test: while the held worker's pid is
+    still ALIVE, ``detect_crashed_workers`` must not act on the held claim at
+    all — status/claim/pid stay exactly as the worker left them and no reclaim
+    event of any kind is appended."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="budget-hold-alive", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 424242)
+
+        kb._record_task_failure(conn, tid, **_hold_failure_kwargs())
+        held = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert held["status"] == "running"
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == []
+        assert getattr(kb.detect_crashed_workers, "_last_rate_limited", []) == []
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] == f"{host}:worker"
+        assert row["claim_expires"] is not None
+        assert row["worker_pid"] == 424242
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
+            ).fetchall()
+        ]
+        assert "budget_hold_reclaimed" not in kinds
+        assert "crashed" not in kinds
+        assert "protocol_violation" not in kinds

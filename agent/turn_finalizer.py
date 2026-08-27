@@ -67,9 +67,16 @@ def _record_kanban_budget_exhausted(
     exhausted its iteration budget.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
-    (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
-    already closed the run this is a no-op — so it is safe to call from
-    multiple exit paths.
+    (``WHERE ended_at IS NULL``) plus the self-hold open-run guard guarantee
+    idempotence — if another path already recorded the failure this is a
+    no-op — so it is safe to call from multiple exit paths.
+
+    Since #95212 this runs INSIDE the still-live worker, so it records the
+    failure with ``hold_claim=True``: the unified counter ticks and the run
+    closes ``timed_out``, but the claim is deliberately kept — the task
+    stays ``running`` (undispatchable) until this process actually exits,
+    after which the dispatcher's reclaim chain releases it without spawning
+    a duplicate worker or re-counting the failure.
     """
     try:
         from hermes_cli import kanban_db as _kb
@@ -85,7 +92,8 @@ def _record_kanban_budget_exhausted(
                     "iterations"
                 ),
                 outcome="timed_out",
-                release_claim=True,
+                release_claim=False,
+                hold_claim=True,
                 end_run=True,
                 event_payload_extra={
                     "budget_used": api_call_count,
