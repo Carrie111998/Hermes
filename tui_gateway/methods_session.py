@@ -160,6 +160,34 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("workspace.preview")
+def _(rid, params: dict) -> dict:
+    """Resolve the workspace a fresh draft WOULD use, without creating a
+    session or building an agent.
+
+    ``session.create`` already resolves this cwd synchronously (see above),
+    but Desktop only calls it once a draft is actually sent
+    (``createBackendSessionForSend``), so a fresh new-chat tile has nothing to
+    show a file tree against until then. This mirrors session.create's own
+    cwd/branch/project resolution — same helpers, same params (an explicit
+    ``cwd`` wins, otherwise the profile's configured ``terminal.cwd``) — but
+    skips agent construction, MCP/tool discovery, and session-row creation
+    entirely, so it's safe to call on every new-chat tile open, not just on
+    send.
+    """
+    cwd = _completion_cwd(params)
+    profile = (params.get("profile") or "").strip() or None
+    return _ok(
+        rid,
+        {
+            "cwd": cwd,
+            "branch": _git_branch_for_cwd(cwd),
+            "project": _project_info_for_cwd(cwd),
+            "profile_name": _response_profile_name(profile),
+        },
+    )
+
+
 @method("session.list")
 def _(rid, params: dict) -> dict:
     with _profile_db(params) as db:
