@@ -139,6 +139,67 @@ class TestClarifyDictChoices:
         assert "{" not in result["user_response"]
         assert all("{" not in c for c in result["choices_offered"])
 
+    def test_single_key_list_wrapper_unpacks_to_choices(self):
+        """A wrapper dict packing several options must unpack, not drop.
+
+        The #95904 shape: the model packed 4 options into one dict under a
+        non-whitelisted key (``{"item": ["a", "b", "c", "d"]}``). The old
+        flatten dropped the dict, ``choices`` emptied out, and the clarify
+        silently degraded to open-ended — no buttons on any platform.
+        """
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return choices[0]
+
+        result = json.loads(clarify_tool(
+            "Which environment?",
+            choices=[{"item": ["staging", "production", "local dev", "cancel"]}],
+            callback=cb,
+        ))  # type: ignore
+        assert seen == [
+            "staging (Recommended)",
+            "production",
+            "local dev",
+            "cancel",
+        ]
+        assert result["user_response"] == "staging"
+
+    def test_opaque_single_key_dict_without_list_still_drops(self):
+        """The unpack is structural: opaque single-key values stay dropped."""
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return "typed"
+
+        clarify_tool(
+            "Pick",
+            choices=[{"count": 3}, "a real choice"],
+            callback=cb,
+        )
+        # single surviving choice carries no (Recommended) label by design
+        assert seen == ["a real choice"]
+
+    def test_questions_batch_path_unpacks_wrapper_too(self):
+        """The questions[] batch normalizer uses the same expansion."""
+        seen = []
+
+        def cb(question, choices, multi_select=False):
+            seen.extend(choices or [])
+            return choices[0]
+
+        clarify_tool(
+            "batch",
+            questions=[{
+                "question": "Which environment?",
+                "choices": [{"item": ["staging", "production"]}],
+            }],
+            callback=cb,
+        )
+        assert seen == ["staging (Recommended)", "production"]
+
 
 class TestClarifySchema:
     """Tests for the OpenAI function-calling schema."""
