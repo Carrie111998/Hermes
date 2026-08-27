@@ -210,33 +210,43 @@ def _normalize_slack_parent_command(
 
 
 def _media_types_from_wire(raw: Dict[str, Any]) -> list[str]:
-    """Per-attachment MIME types, positionally aligned with ``media_urls``.
+    """Per-attachment MIME types, aligned to ``media_urls`` BY URL.
 
     ``media_urls`` (legacy, flat) and ``media`` (rich, Phase 2) are separate
-    wire fields. The connector builds both from one list, so they agree — but
-    the gateway must not ASSUME that: consumers index the two lists by the
-    same ``i`` (``_event_media_type_at``), so a length disagreement would
-    attach one attachment's MIME to another's URL and mis-route it. That is
-    strictly worse than having no MIME, where classification safely falls
-    back to the message-level type.
+    wire fields, and consumers index them by the same ``i``
+    (``_event_media_type_at``). Deriving the MIME list positionally is unsafe:
+    the two fields can disagree in order, and a length check alone accepts a
+    reordered pair — attaching one attachment's MIME to another's URL, which
+    silently MIS-ROUTES it (an image classified by a PDF's mime is not treated
+    as an image at all).
 
-    Fail safe: map only when the lengths agree; otherwise return ``[]``.
-    A missing per-entry ``mime`` keeps its slot as ``""``.
+    So resolve each URL's MIME by LOOKUP, never by position: build
+    ``url -> mime`` from ``media[]`` and map it over ``media_urls``. Any URL
+    with no matching entry keeps its slot as ``""`` and falls back to
+    message-level classification, which is the safe degradation.
     """
     media = raw.get("media")
+    urls = raw.get("media_urls")
     if not isinstance(media, list) or not media:
         return []
-    urls = raw.get("media_urls")
-    if isinstance(urls, list) and len(urls) != len(media):
-        # Disagreeing producer — refuse to guess the pairing.
-        logger.warning(
-            "relay inbound media/media_urls length mismatch (%d vs %d); "
-            "dropping per-attachment MIME types for this event",
-            len(media),
-            len(urls),
-        )
+    if not isinstance(urls, list) or not urls:
+        # No URL list to align to — the MIME list has no meaningful indices.
         return []
-    return [(m.get("mime") or "") if isinstance(m, dict) else "" for m in media]
+    mime_by_url: dict[str, str] = {}
+    for m in media:
+        if isinstance(m, dict):
+            url = m.get("url")
+            if isinstance(url, str) and url:
+                mime_by_url[url] = m.get("mime") or ""
+    types = [mime_by_url.get(u, "") if isinstance(u, str) else "" for u in urls]
+    missing = sum(1 for t in types if not t)
+    if missing:
+        logger.debug(
+            "relay inbound: %d/%d media_urls had no matching media[] mime",
+            missing,
+            len(types),
+        )
+    return types
 
 
 def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:

@@ -100,11 +100,11 @@ class TestMediaTypesMapping:
         ev = _event_from_wire(_wire_event("text"))
         assert ev.media_types == []
 
-    def test_length_mismatch_drops_mimes_rather_than_misaligning(self):
+    def test_length_mismatch_resolves_by_url_without_misaligning(self):
         """media_urls and media[] are independent wire fields; consumers index
-        BOTH by the same i. A disagreeing producer must not cause a MIME to be
-        attached to the wrong URL (mis-routing) — fail safe to no MIMEs, which
-        degrades to message-level classification."""
+        BOTH by the same i. Resolution is BY URL, so a length disagreement can
+        no longer misalign anything: each surviving URL keeps its own mime and
+        an unmatched URL degrades to "" (message-level classification)."""
         media = [
             {"url": "https://x/a.png", "kind": "image", "mime": "image/png"},
             {"url": "https://x/b.pdf", "kind": "document", "mime": "application/pdf"},
@@ -112,8 +112,8 @@ class TestMediaTypesMapping:
         ev = _event_from_wire(
             _wire_event("image", media=media, media_urls=["https://x/a.png"])
         )
-        assert ev.media_types == []
         assert ev.media_urls == ["https://x/a.png"]
+        assert ev.media_types == ["image/png"]
 
 
 class TestSttGate:
@@ -174,3 +174,85 @@ class TestSttGate:
             )
         )
         assert _event_media_is_stt_input(ev, 0) is False
+
+class TestUrlMimePairingThroughLocalization:
+    """The end-to-end invariant my unit tests originally missed.
+
+    media_urls and media_types are indexed BY POSITION by every downstream
+    classifier. _localize_inbound_media drops entries (a dead connector
+    re-host) as a NORMAL best-effort path — so if it filters URLs without
+    filtering MIMEs in lockstep, every surviving attachment inherits a
+    neighbour's type. Drive the REAL path: wire parse -> localization ->
+    run.py classifier."""
+
+    def _adapter(self):
+        from gateway.relay.adapter import RelayAdapter
+
+        return RelayAdapter.__new__(RelayAdapter)
+
+    def test_dropped_first_attachment_does_not_shift_the_second_mime(self):
+        import asyncio
+
+        from gateway.run import _event_media_is_image, _event_media_type_at
+
+        rehost = "https://conn.example/relay/media/dead"
+        kept = "https://cdn.discordapp.com/attachments/1/2/kept.png"
+        ev = _event_from_wire(
+            _wire_event(
+                "document",
+                media=[
+                    {"url": rehost, "kind": "document", "mime": "application/pdf"},
+                    {"url": kept, "kind": "image", "mime": "image/png"},
+                ],
+                media_urls=[rehost, kept],
+            )
+        )
+        assert ev.media_types == ["application/pdf", "image/png"]
+
+        adapter = self._adapter()
+        adapter._media_client = None
+        adapter._get_media_client = lambda: None  # type: ignore[method-assign]
+        asyncio.run(adapter._localize_inbound_media(ev))
+
+        # The dead re-host is dropped; the PNG must keep ITS OWN mime.
+        assert ev.media_urls == [kept]
+        assert ev.media_types == ["image/png"]
+        assert _event_media_type_at(ev, 0) == "image/png"
+        assert _event_media_is_image(ev, 0) is True
+
+    def test_reordered_media_vs_media_urls_resolves_by_url_not_position(self):
+        """Equal-length but differently-ordered wire fields must not pair up
+        positionally — resolve each URL's mime by lookup."""
+        png = "https://x/a.png"
+        pdf = "https://x/b.pdf"
+        ev = _event_from_wire(
+            _wire_event(
+                "image",
+                media=[
+                    {"url": pdf, "mime": "application/pdf"},
+                    {"url": png, "mime": "image/png"},
+                ],
+                media_urls=[png, pdf],
+            )
+        )
+        assert ev.media_types == ["image/png", "application/pdf"]
+
+    def test_url_with_no_matching_media_entry_gets_empty_mime(self):
+        known = "https://x/a.png"
+        orphan = "https://x/unknown.bin"
+        ev = _event_from_wire(
+            _wire_event(
+                "image",
+                media=[{"url": known, "mime": "image/png"}],
+                media_urls=[known, orphan],
+            )
+        )
+        assert ev.media_types == ["image/png", ""]
+
+    def test_media_without_media_urls_yields_no_types(self):
+        """No URL list to align to ⇒ the indices are meaningless."""
+        ev = _event_from_wire(
+            _wire_event("image", media=[{"url": "https://x/a.png", "mime": "image/png"}])
+        )
+        assert ev.media_urls == []
+        assert ev.media_types == []
