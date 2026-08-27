@@ -41,6 +41,7 @@ describe('completed-unread dot follows the focused session', () => {
 
     session.$unreadFinishedSessionIds.set([])
     session.$selectedStoredSessionId.set('primary')
+    states.$sessionTiles.set([{ storedSessionId: 'tiled' }])
 
     const finishTurn = (storedSessionId: string) => {
       const working = { ...createClientSessionState(null), busy: true, storedSessionId }

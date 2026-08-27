@@ -243,9 +243,16 @@ export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, s
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { recoveryKey?: string; updateComposerAttachments?: boolean } = {}
+      options: { recoveryKey?: string; remote?: boolean; updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
-      const remote = isSessionRemote(storedIdRef.current ?? sessionId)
+      const exactOwner = readOwner()
+
+      const remote =
+        options.remote ??
+        (exactOwner && typeof exactOwner === 'object'
+          ? exactOwner.connectionId !== 'local'
+          : isSessionRemote(storedIdRef.current ?? sessionId))
+
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
@@ -301,7 +308,7 @@ export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, s
 
       return { attachments: synced, sessionId: liveSessionId }
     },
-    [bindRecoveredRuntime, readState, recoveryKey, requestSessionGateway, scope.attachments]
+    [bindRecoveredRuntime, readOwner, readState, recoveryKey, requestSessionGateway, scope.attachments]
   )
 
   // The REAL submit pipeline with tile seams: session always exists, and the
@@ -350,9 +357,19 @@ export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, s
         return true
       }
 
-      return await submitPromptText(rawText, options)
+      const tileRecoveryKey = recoveryKey()
+      const canonicalScope = ownerRouteRef.current ? tileRecoveryKey : undefined
+
+      return await submitPromptText(rawText, {
+        ...options,
+        ...(options?.composerStorageScope || canonicalScope
+          ? { composerStorageScope: options?.composerStorageScope ?? canonicalScope }
+          : {}),
+        sessionId: options?.sessionId ?? runtimeIdRef.current,
+        storedSessionId: options?.storedSessionId ?? storedIdRef.current
+      })
     },
-    [listTileSession, scope.attachments.$attachments, submitPromptText]
+    [listTileSession, recoveryKey, scope.attachments.$attachments, submitPromptText]
   )
 
   const cancelRun = useCallback(async () => {
