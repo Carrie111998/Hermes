@@ -34,10 +34,23 @@ def _translate_acp_cwd(cwd: str) -> str:
     ``\\\\wsl.localhost\\`` UNC paths. Store and execute against the POSIX form so
     agents, tools, and persisted ACP sessions all agree on the usable workspace.
     Native Linux/macOS keeps the original cwd unchanged.
+
+    Also guards against ACP clients that send a cwd which does not exist on the
+    host actually running Hermes — e.g. the Rabbit R1 node sends a POSIX-style
+    ``/home/yt`` even when Hermes runs on Windows. Pinning a nonexistent cwd
+    makes the terminal tool spawn its probe shells in a bad directory (MSYS
+    bash wedges during init, so the probe never exits and every command hangs).
+    Fall back to a real directory instead.
     """
     from hermes_constants import translate_cwd_for_wsl_backend
 
-    return translate_cwd_for_wsl_backend(str(cwd))
+    translated = translate_cwd_for_wsl_backend(str(cwd))
+    if translated and os.path.isdir(translated):
+        return translated
+    home = os.path.expanduser("~")
+    if home and os.path.isdir(home):
+        return home
+    return os.getcwd()
 
 
 def _normalize_cwd_for_compare(cwd: str | None) -> str:
