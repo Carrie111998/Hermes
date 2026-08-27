@@ -521,6 +521,17 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # these, so production tests must not see them either.
     "HERMES_DASHBOARD_OAUTH_CLIENT_ID",
     "HERMES_DASHBOARD_PORTAL_URL",
+    # state.db trigram opt-out. Operators set this to reclaim the multi-GB
+    # `messages_fts_trigram` index (CJK/substring search only); on this box it
+    # is a *User-level* Windows env var, so every shell inherits it. Left set,
+    # SessionDB drops the trigram FTS at open and the suite silently measures a
+    # one-index schema: `optimize_fts()` returns 1 instead of 2 and the v9
+    # migration test's `messages_fts_trigram MATCH` raises "no such table".
+    # `scripts/run_tests.sh` never saw this because its `env -i` allowlist
+    # drops the var, so the gap only bit a direct `python -m pytest` run.
+    # Tests that want the index absent opt IN explicitly with
+    # `monkeypatch.setenv` (see tests/test_state_db_fts_external_content.py).
+    "HERMES_DISABLE_MESSAGE_TRIGRAM",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
     "TERMINAL_CONTAINER_CPU",
