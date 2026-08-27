@@ -440,7 +440,11 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
 # Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
+    "pre_tool_call",
+    "pre_kanban_task_complete",
+    "pre_kanban_task_claim",
+}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
