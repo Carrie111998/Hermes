@@ -235,6 +235,14 @@ def test_stop_room_snapshots_tasks_before_status_transitions(monkeypatch, tmp_pa
         return dict(task)
 
     monkeypatch.setattr(driver, "list_tasks", listed)
+    monkeypatch.setattr(
+        hosted_rooms,
+        "request_room_stop",
+        lambda _db, *, room_id, cancel_id: {
+            "room_id": room_id,
+            "cancel_id": cancel_id,
+        },
+    )
     service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
     service.runtime = SimpleNamespace(cancel=cancel, wakeup=lambda: None)
 
