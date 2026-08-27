@@ -151,6 +151,21 @@ retry, both scaffolding messages are stripped from final persisted history via t
 `_is_ephemeral_scaffolding` mechanism (`run_agent.py`), unchanged from how the dropped-toolcall
 pair already does this. No new retry infrastructure is introduced.
 
+### Third refinement, found in independent post-merge review: the two new counters/flag must also reset at turn START, not just turn end
+
+`agent._dropped_toolcall_retries`, `agent._fabricated_tool_use_retries`, and `agent._landed_real_tool_call_this_turn`
+were originally reset only at `run_conversation()`'s own "genuine turn end" fallthrough. That point is skipped by
+any of the function's ~35 early-return paths — concretely, a user interrupt during the empty-response retry
+backoff returns immediately without ever reaching it. A real tool call landing in one turn, followed by that
+same turn exiting early via such a path, left `_landed_real_tool_call_this_turn` stuck `True` and silently
+suppressed fabricated-tool-use detection for the *next*, unrelated turn on the same long-lived agent object —
+defeating the exact bug class this whole design exists to catch.
+
+Fix: also reset all three in `build_turn_context()` (`agent/turn_context.py`), the prologue every
+`run_conversation()` call unconditionally passes through at its very start, alongside the dozen other
+per-turn retry counters it already resets there. The turn-end reset stays in place too (harmless, idempotent) —
+this is a second, more reliable reset point, not a replacement for the first.
+
 ## Testing
 
 New file `tests/run_agent/test_fabricated_tool_use_recovery.py`, mirroring
