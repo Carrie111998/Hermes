@@ -59,7 +59,8 @@ function transcript(answer: string, sessionId = ACTIVE_STORED_ID) {
 
 function makeRefresh(
   resolveSession: ActiveTranscriptRefreshDeps['resolveSession'] = () => ({ profile: 'default' }),
-  selectedProfile = 'default'
+  selectedProfile = 'default',
+  connectionId: null | string = null
 ) {
   const activeSessionIdRef = { current: ACTIVE_RUNTIME_ID as string | null }
   const selectedStoredSessionIdRef = { current: ACTIVE_STORED_ID as string | null }
@@ -68,19 +69,26 @@ function makeRefresh(
   const requestSequenceRef = { current: 0 }
   const signatureRef = { current: new Map<string, string>() }
   const state = createClientSessionState(ACTIVE_STORED_ID)
+  state.connectionId = connectionId
   state.profile = selectedProfile
   const states = new Map([[ACTIVE_RUNTIME_ID, state]])
 
-  const sessionStateHasOwner = vi.fn((sessionId: string, owner: { profile: string; storedSessionId: string }) => {
-    const current = states.get(sessionId)
+  const sessionStateHasOwner = vi.fn(
+    (sessionId: string, owner: { connectionId?: null | string; profile: string; storedSessionId: string }) => {
+      const current = states.get(sessionId)
 
-    return current?.profile === owner.profile && current.storedSessionId === owner.storedSessionId
-  })
+      return (
+        current?.profile === owner.profile &&
+        current.storedSessionId === owner.storedSessionId &&
+        (!current.connectionId || !owner.connectionId || current.connectionId === owner.connectionId)
+      )
+    }
+  )
 
   const updateOwnedSessionState = vi.fn(
     (
       sessionId: string,
-      owner: { profile: string; storedSessionId: string },
+      owner: { connectionId?: null | string; profile: string; storedSessionId: string },
       updater: (value: typeof state) => typeof state
     ) => {
       const current = states.get(sessionId)
@@ -131,11 +139,13 @@ function useSyncHarness({
   activeStoredSessionId: string | null
   refreshActiveTranscript: () => Promise<void>
 }) {
-  const updateSessionState: Parameters<typeof useBackgroundSync>[0]['updateSessionState'] = vi.fn(
-    (sessionId, updater) => {
-      const current = {} as Parameters<typeof updater>[0]
+  const updateOwnedSessionState: Parameters<typeof useBackgroundSync>[0]['updateOwnedSessionState'] = vi.fn(
+    (_sessionId, _owner, updater) => {
+      const current = createClientSessionState(ACTIVE_STORED_ID)
 
-      return updater(current)
+      void updater(current)
+
+      return true
     }
   )
 
@@ -153,7 +163,8 @@ function useSyncHarness({
     refreshHermesConfig: vi.fn(),
     refreshMessagingSessions: vi.fn(),
     refreshSessions: vi.fn(),
-    updateSessionState,
+    sessionStateHasOwner: vi.fn(() => true),
+    updateOwnedSessionState,
     requestGateway: vi.fn(async () => ({ sessions: [] })) as never
   })
 }
@@ -250,16 +261,19 @@ describe('active transcript refresh', () => {
 
     let updaterCallCount = 0
 
-    const updateSessionState: Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState'] = vi.fn(
-      (sessionId, updater) => {
+    const updateOwnedSessionState: Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateOwnedSessionState'] =
+      vi.fn((sessionId, _owner, updater) => {
         updaterCallCount += 1
-        const current = {} as Parameters<typeof updater>[0]
+        const current = states.get(sessionId)
 
-        return updater(current)
-      }
-    )
+        if (!current) {
+          return false
+        }
 
-    void updateSessionState
+        states.set(sessionId, updater(current))
+
+        return true
+      })
 
     const signatureRef = { current: new Map<string, string>() }
     const requestSequenceRef = { current: 0 }
@@ -288,13 +302,67 @@ describe('active transcript refresh', () => {
         busyRef,
         requestSequenceRef,
         signatureRef,
-        updateSessionState
+        sessionStateHasOwner: vi.fn(() => true),
+        updateOwnedSessionState
       })
     })
 
     // Behavior assertions:
     expect(updaterCallCount).toBeGreaterThan(0)
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+    expect(states.get(TILE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'background delivery answer'
+    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, 'default')
+  })
+
+  it('does not publish a delayed tile transcript after the same root is reclaimed by another connection', async () => {
+    const tile = {
+      ownerRoute: { connectionId: 'connection-a', profile: 'default' },
+      runtimeId: 'runtime-tile-shared',
+      storedSessionId: 'stored-tile-shared'
+    }
+
+    const stateA = createClientSessionState(tile.storedSessionId)
+    stateA.connectionId = 'connection-a'
+    stateA.profile = 'default'
+    const states = new Map([[tile.runtimeId, stateA]])
+    let resolve: ((value: unknown) => void) | undefined
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const sessionStateHasOwner = vi.fn((runtimeId: string, owner: { connectionId?: null | string }) => {
+      const current = states.get(runtimeId)
+
+      return current?.connectionId === owner.connectionId
+    })
+
+    const updateOwnedSessionState = vi.fn(() => false)
+
+    const request = reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      sessionStateHasOwner,
+      signatureRef: { current: new Map() },
+      tiles: [tile],
+      updateOwnedSessionState
+    })
+
+    const stateB = createClientSessionState(tile.storedSessionId)
+    stateB.connectionId = 'connection-b'
+    stateB.profile = 'default'
+    states.set(tile.runtimeId, stateB)
+    resolve?.(transcript('stale tile', tile.storedSessionId))
+    await request
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(tile.storedSessionId, {
+      connectionId: 'connection-a',
+      profile: 'default'
+    })
+    expect(updateOwnedSessionState).not.toHaveBeenCalled()
+    expect(states.get(tile.runtimeId)).toBe(stateB)
   })
 
   it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {
@@ -319,9 +387,9 @@ describe('active transcript refresh', () => {
     // Compute the same signature the reconcile will compute, and pre-seed it.
     const preSignature = sessionMessagesSignature(pre.messages as never)
 
-    signatureRef.current.set(`tile:${TILE_STORED_ID}`, preSignature)
+    signatureRef.current.set(`tile:${JSON.stringify(['', 'default', TILE_STORED_ID])}`, preSignature)
 
-    const updateSessionState = vi.fn()
+    const updateOwnedSessionState = vi.fn()
     const busyRef = { current: false }
     const requestSequenceRef = { current: 0 }
 
@@ -331,11 +399,12 @@ describe('active transcript refresh', () => {
         busyRef,
         requestSequenceRef,
         signatureRef,
-        updateSessionState
+        sessionStateHasOwner: vi.fn(() => true),
+        updateOwnedSessionState
       })
     })
 
-    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(updateOwnedSessionState).not.toHaveBeenCalled()
   })
 
   it('refreshes a local/Desktop session when sessions.changed ticks', async () => {
@@ -542,8 +611,8 @@ describe('reconcileActiveTranscript', () => {
     })
     expect(fixture.updateSessionState).toHaveBeenCalledWith(
       ACTIVE_RUNTIME_ID,
-      { profile: 'bot-b', storedSessionId: ownerBStoredSessionId },
-      expect.any(Function),
+      { connectionId: ownerBRoute.connectionId, profile: 'bot-b', storedSessionId: ownerBStoredSessionId },
+      expect.any(Function)
     )
     expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({
       text: 'owner B answer'
@@ -640,6 +709,33 @@ describe('reconcileActiveTranscript', () => {
     resolve?.(transcript('stale default answer'))
     await request
 
+    expect(fixture.updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('drops a delayed same-root response when the runtime is reclaimed by another connection', async () => {
+    const ownerA = { connectionId: 'connection-a', profile: 'default' }
+    const fixture = makeRefresh(() => ({ ownerRoute: ownerA, profile: 'default' }), 'default', ownerA.connectionId)
+    let resolve: ((value: unknown) => void) | undefined
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const request = fixture.refresh()
+    const reclaimed = createClientSessionState(ACTIVE_STORED_ID)
+    reclaimed.connectionId = 'connection-b'
+    reclaimed.profile = 'default'
+    reclaimed.messages = [
+      { id: 'connection-b-existing', parts: [{ text: 'connection B', type: 'text' }], role: 'assistant' }
+    ]
+    fixture.states.set(ACTIVE_RUNTIME_ID, reclaimed)
+
+    resolve?.(transcript('stale connection A'))
+    await request
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(ACTIVE_STORED_ID, ownerA)
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)).toBe(reclaimed)
     expect(fixture.updateSessionState).not.toHaveBeenCalled()
   })
 
@@ -888,11 +984,17 @@ describe('typing-aware sessions.changed deferral', () => {
       // transcript path, so the updater just runs against a throwaway state —
       // but it must live in `stable` like every other prop, since a fresh
       // identity per render would re-run the connect-reseed effect.
-      updateSessionState: vi.fn(
+      sessionStateHasOwner: vi.fn(() => true),
+      updateOwnedSessionState: vi.fn(
         (
           _sessionId: string,
+          _owner: unknown,
           updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
-        ) => updater(createClientSessionState(ACTIVE_STORED_ID))
+        ) => {
+          void updater(createClientSessionState(ACTIVE_STORED_ID))
+
+          return true
+        }
       )
     }
 

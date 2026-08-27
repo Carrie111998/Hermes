@@ -133,6 +133,31 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
     expect($attentionSessionIds.get()).toEqual([])
   })
 
+  it('keeps same-profile live bookkeeping isolated across connections', () => {
+    rehydrateLiveSessionStatuses(
+      { sessions: [{ id: 'runtime-shared', session_key: 'stored-shared', status: 'working' }] },
+      Date.now(),
+      'default',
+      'connection-a'
+    )
+
+    const ownerB = {
+      ...createClientSessionState('stored-shared'),
+      awaitingResponse: true,
+      busy: true,
+      connectionId: 'connection-b',
+      profile: 'default'
+    }
+
+    publishSessionState('runtime-shared', ownerB)
+
+    rehydrateLiveSessionStatuses({ sessions: [] }, Date.now(), 'default', 'connection-a')
+
+    expect($sessionStates.get()['runtime-shared']).toBe(ownerB)
+    expect(ownerB.busy).toBe(true)
+    expect(ownerB.awaitingResponse).toBe(true)
+  })
+
   it('leaves runtimes this poll never seeded alone', () => {
     // A background PROFILE's sessions are served by a different gateway and
     // never appear in this profile's active_list. Reaping them would dark out

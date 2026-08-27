@@ -275,6 +275,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionIdRef,
     ensureSessionState,
     getRuntimeIdForStoredSession,
+    getSessionStateOwner,
     resetViewSync,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
@@ -376,6 +377,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // not whichever duplicate row happens to appear first in the all-profile list.
   const hydrateFromStoredSession = useStoredSessionHydration({
     activeSessionIdRef,
+    getSessionStateOwner,
     selectedStoredSessionIdRef,
     selectedStoredSessionProfileRef,
     sessionStateHasOwner,
@@ -799,7 +801,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshMessagingSessions,
     refreshSessions,
     requestGateway,
-    updateSessionState
+    sessionStateHasOwner,
+    updateOwnedSessionState
   })
 
   // Electron-main / OS / cross-window integrations: update polling, ⌘W close,

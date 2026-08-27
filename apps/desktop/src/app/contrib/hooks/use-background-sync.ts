@@ -1,3 +1,4 @@
+import { registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
@@ -20,7 +21,7 @@ import {
   sessionMatchesStoredId,
   setCurrentCwd
 } from '@/store/session'
-import type { SessionProfileRoute } from '@/store/session-request-router'
+import { sessionOwnerRouteFromRow, type SessionProfileRoute } from '@/store/session-request-router'
 import {
   $sessionStates,
   $sessionTiles,
@@ -49,18 +50,16 @@ export function resolveActiveTranscriptSession(
     $sessions
       .get()
       .find(
-        session =>
-          sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
+        session => sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
       ) ??
     $messagingSessions
       .get()
       .find(
-        session =>
-          sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
+        session => sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
       )
 
   if (visible) {
-    return { profile: visible.profile }
+    return { ownerRoute: sessionOwnerRouteFromRow(visible), profile: visible.profile }
   }
 
   const ownerRoute = getSessionOwnerHint(storedSessionId)
@@ -106,24 +105,42 @@ export async function reconcileTileTranscripts({
   requestSequenceRef,
   busyRef,
   signatureRef,
-  updateSessionState,
+  sessionStateHasOwner,
+  updateOwnedSessionState,
+  defaultScope,
   tiles: tilesOverride
 }: {
   busyRef: MutableRefObject<boolean>
   requestSequenceRef: MutableRefObject<number>
   signatureRef: MutableRefObject<Map<string, string>>
-  tiles?: Array<{ storedSessionId: string; runtimeId?: string }>
-  updateSessionState: (
+  defaultScope?: { connectionId?: null | string; profile: string }
+  sessionStateHasOwner: (sessionId: string, owner: SessionStateOwner) => boolean
+  tiles?: Array<{ ownerRoute?: SessionProfileRoute; storedSessionId: string; runtimeId?: string }>
+  updateOwnedSessionState: (
     sessionId: string,
-    updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
-  ) => ClientSessionState
+    owner: SessionStateOwner,
+    updater: (state: ClientSessionState) => ClientSessionState
+  ) => boolean
 }): Promise<void> {
   const tiles = tilesOverride ?? $sessionTiles.get()
 
   for (const tile of tiles) {
     const storedSessionId = tile.storedSessionId
     const runtimeSessionId = tile.runtimeId
+
+    const ownerProfile = normalizeProfileKey(
+      tile.ownerRoute?.targetProfile ?? tile.ownerRoute?.profile ?? defaultScope?.profile
+    )
+
+    const owner: SessionStateOwner = {
+      connectionId: tile.ownerRoute?.connectionId ?? defaultScope?.connectionId,
+      profile: ownerProfile,
+      storedSessionId
+    }
+
+    const profileScope: ProfileScope = owner.connectionId
+      ? { connectionId: owner.connectionId, profile: owner.profile }
+      : owner.profile
 
     if (!runtimeSessionId) {
       // Resume not yet bound — the tile's own stream owns the view.
@@ -143,14 +160,20 @@ export async function reconcileTileTranscripts({
 
     // With a tiles override (test path), the live $sessionTiles check can't
     // see the synthetic tile — treat override tiles as present.
-    const stillPresent = tilesOverride
-      ? tilesOverride.some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
-      : $sessionTiles.get().some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
+    const stillPresent = () =>
+      (tilesOverride ?? $sessionTiles.get()).some(
+        t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId
+      )
 
     try {
-      const latest = await getLatestSessionMessages(storedSessionId)
+      const latest = await getLatestSessionMessages(storedSessionId, profileScope)
 
-      if (requestId !== requestSequenceRef.current || busyRef.current || !stillPresent) {
+      if (
+        requestId !== requestSequenceRef.current ||
+        busyRef.current ||
+        !stillPresent() ||
+        !sessionStateHasOwner(runtimeSessionId, owner)
+      ) {
         // Tile closed or superseded mid-read — discard AND prune its
         // signature so the map doesn't grow one entry per ever-opened tile
         // for the app's lifetime (#94255 review point 3).
@@ -159,27 +182,28 @@ export async function reconcileTileTranscripts({
         continue
       }
 
-      const signatureKey = `tile:${storedSessionId}`
+      const signatureKey = `tile:${JSON.stringify([owner.connectionId ?? '', owner.profile, storedSessionId])}`
       const signature = sessionMessagesSignature(latest.messages)
 
       if (signatureRef.current.get(signatureKey) === signature) {
         continue
       }
 
-      signatureRef.current.set(signatureKey, signature)
       const messages = toChatMessages(latest.messages)
 
-      updateSessionState(
-        runtimeSessionId,
-        state => ({
+      if (
+        !updateOwnedSessionState(runtimeSessionId, owner, state => ({
           ...state,
           messages: preserveLocalAssistantErrors(
             graftRefreshedTailOntoBackfill(messages, state.messages),
             state.messages
           )
-        }),
-        storedSessionId
-      )
+        }))
+      ) {
+        continue
+      }
+
+      signatureRef.current.set(signatureKey, signature)
     } catch {
       // Non-fatal: the next change event retries.
     }
@@ -230,7 +254,12 @@ export async function reconcileActiveTranscript({
       busyRef.current ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
       selectedStoredSessionProfileRef.current !== storedSessionProfile ||
-      activeSessionIdRef.current !== runtimeSessionId
+      activeSessionIdRef.current !== runtimeSessionId ||
+      !sessionStateHasOwner(runtimeSessionId, {
+        connectionId: stored.ownerRoute?.connectionId,
+        profile: storedSessionProfile,
+        storedSessionId
+      })
     ) {
       return
     }
@@ -252,7 +281,12 @@ export async function reconcileActiveTranscript({
     }
 
     const messages = toChatMessages(latest.messages)
-    const owner = { profile: storedSessionProfile, storedSessionId }
+
+    const owner: SessionStateOwner = {
+      connectionId: stored.ownerRoute?.connectionId,
+      profile: storedSessionProfile,
+      storedSessionId
+    }
 
     if (
       !updateOwnedSessionState(runtimeSessionId, owner, state => ({
@@ -324,11 +358,11 @@ interface LiveSessionStatusResponse {
   sessions?: LiveSessionStatusItem[]
 }
 
-// Runtime → stored-session ownership this poll has seen live, per gateway
-// profile. Keeping both ids is load-bearing: a runtime id can be reused between
-// snapshots, including by another profile, and the old snapshot must not reap
+// Runtime → stored-session ownership this poll has seen live, per backend
+// connection/profile scope. Keeping both ids is load-bearing: a runtime id can be reused between
+// snapshots, including by another backend scope, and the old snapshot must not reap
 // or rewrite the replacement (ABA).
-const liveRuntimeOwnersByProfile = new Map<string, Map<string, string>>()
+const liveRuntimeOwnersByScope = new Map<string, Map<string, string>>()
 
 // Renderer-wide keyboard warmth, tracked at module scope like the live-runtime
 // bookkeeping above: any keydown anywhere in the window marks activity, and a
@@ -372,9 +406,12 @@ export function resetTypingActivityTracking(): void {
 export function rehydrateLiveSessionStatuses(
   response: LiveSessionStatusResponse,
   nowMs = Date.now(),
-  profileKey = 'default'
+  profileKey = 'default',
+  connectionId: null | string = null
 ): void {
   const ownerProfile = normalizeProfileKey(profileKey)
+  const ownerConnectionId = connectionId?.trim() || null
+  const ownerScope = registryBackendScopeKey(ownerConnectionId, ownerProfile)
   const occupiedRuntimeIds = new Set<string>()
   const seen = new Map<string, string>()
 
@@ -395,7 +432,7 @@ export function rehydrateLiveSessionStatuses(
     occupiedRuntimeIds.add(runtimeSessionId)
 
     const existing = $sessionStates.get()[runtimeSessionId]
-    const owner = { profile: ownerProfile, storedSessionId }
+    const owner = { connectionId: ownerConnectionId, profile: ownerProfile, storedSessionId }
 
     // Runtime ids are transport-local and can collide or be reused. Once a
     // slot exists, this snapshot may touch it only when BOTH durable owner
@@ -423,7 +460,11 @@ export function rehydrateLiveSessionStatuses(
       existing.busy !== busy ||
       existing.needsInput !== needsInput
     ) {
-      const ownedState = existing ?? { ...createClientSessionState(storedSessionId), profile: ownerProfile }
+      const ownedState = existing ?? {
+        ...createClientSessionState(storedSessionId),
+        connectionId: ownerConnectionId,
+        profile: ownerProfile
+      }
 
       publishSessionState(runtimeSessionId, {
         ...ownedState,
@@ -454,9 +495,9 @@ export function rehydrateLiveSessionStatuses(
   // has ended: the gateway reaps a session out of `_sessions` when its turn
   // completes and its transport goes away. Settle it through the normal publish
   // path so the busy→idle transition fires — that edge is what clears the
-  // spinner AND marks the row unread ("your turn"). Only ids this profile
-  // previously saw are eligible, so another profile's live rows are untouched.
-  const previouslyLive = liveRuntimeOwnersByProfile.get(ownerProfile)
+  // spinner AND marks the row unread ("your turn"). Only ids this backend
+  // scope previously saw are eligible, so another scope's live rows are untouched.
+  const previouslyLive = liveRuntimeOwnersByScope.get(ownerScope)
 
   if (previouslyLive) {
     for (const [runtimeSessionId, storedSessionId] of previouslyLive) {
@@ -465,7 +506,7 @@ export function rehydrateLiveSessionStatuses(
       }
 
       const existing = $sessionStates.get()[runtimeSessionId]
-      const owner = { profile: ownerProfile, storedSessionId }
+      const owner = { connectionId: ownerConnectionId, profile: ownerProfile, storedSessionId }
 
       if (
         sessionStateMatchesOwner(existing, owner) &&
@@ -489,14 +530,14 @@ export function rehydrateLiveSessionStatuses(
     }
   }
 
-  liveRuntimeOwnersByProfile.set(ownerProfile, seen)
+  liveRuntimeOwnersByScope.set(ownerScope, seen)
 }
 
-/** Forget every profile's live-runtime bookkeeping. A gateway wipe already
+/** Forget every backend scope's live-runtime bookkeeping. A gateway wipe already
  *  drops the session states these ids point at, so a carried-over set would
  *  only reap runtimes that no longer exist. */
 export function resetLiveRuntimeTracking(): void {
-  liveRuntimeOwnersByProfile.clear()
+  liveRuntimeOwnersByScope.clear()
 }
 
 interface BackgroundSyncParams {
@@ -514,11 +555,12 @@ interface BackgroundSyncParams {
   refreshMessagingSessions: () => Promise<unknown> | unknown
   refreshSessions: () => Promise<unknown> | unknown
   requestGateway: GatewayRequester
-  updateSessionState: (
+  sessionStateHasOwner: (sessionId: string, owner: SessionStateOwner) => boolean
+  updateOwnedSessionState: (
     sessionId: string,
-    updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
-  ) => ClientSessionState
+    owner: SessionStateOwner,
+    updater: (state: ClientSessionState) => ClientSessionState
+  ) => boolean
 }
 
 /** Poll a callback while the tab is visible, on `intervalMs`; re-checks on tab
@@ -587,7 +629,8 @@ export function useBackgroundSync({
   refreshMessagingSessions,
   refreshSessions,
   requestGateway,
-  updateSessionState
+  sessionStateHasOwner,
+  updateOwnedSessionState
 }: BackgroundSyncParams): void {
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
@@ -699,7 +742,7 @@ export function useBackgroundSync({
         const response = await requestGateway<LiveSessionStatusResponse>('session.active_list', {})
 
         if (!cancelled) {
-          rehydrateLiveSessionStatuses(response, Date.now(), activeGatewayProfile)
+          rehydrateLiveSessionStatuses(response, Date.now(), activeGatewayProfile, activeConnectionId)
         }
       } catch {
         // Older gateways may not expose session.active_list. Live stream events
@@ -722,7 +765,14 @@ export function useBackgroundSync({
     }
     // sessionsChangeTick: each sessions.changed broadcast re-seeds immediately
     // via the effect re-run (already coalesced to 2s server-side).
-  }, [activeGatewayProfile, changeEventsAvailable, gatewayState, requestGateway, sessionsChangeTick])
+  }, [
+    activeConnectionId,
+    activeGatewayProfile,
+    changeEventsAvailable,
+    gatewayState,
+    requestGateway,
+    sessionsChangeTick
+  ])
 
   // sessions.changed also means the *stored* list may have new rows (a cron
   // run's session, an inbound messaging turn creating a thread). The full list
@@ -755,7 +805,9 @@ export function useBackgroundSync({
         },
         requestSequenceRef: tileRequestSequenceRef,
         signatureRef: tileSignatureRef,
-        updateSessionState
+        defaultScope: { connectionId: activeConnectionId, profile: activeGatewayProfile },
+        sessionStateHasOwner,
+        updateOwnedSessionState
       })
     }
 
@@ -819,7 +871,10 @@ export function useBackgroundSync({
     refreshMessagingSessions,
     refreshSessions,
     requestActiveTranscriptRefresh,
-    updateSessionState
+    activeConnectionId,
+    activeGatewayProfile,
+    sessionStateHasOwner,
+    updateOwnedSessionState
   ])
 
   // Keyboard warmth for the deferral above: capture phase on window. Any

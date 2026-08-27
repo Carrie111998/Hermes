@@ -18,6 +18,7 @@ type UpdateOwnedSessionState = (
 
 interface StoredSessionHydrationOptions {
   activeSessionIdRef: MutableRefObject<string | null>
+  getSessionStateOwner: (sessionId: string) => SessionStateOwner | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   selectedStoredSessionProfileRef: MutableRefObject<string | null>
   sessionStateHasOwner: (sessionId: string, owner: SessionStateOwner) => boolean
@@ -31,9 +32,10 @@ export type StoredSessionHydrator = (
   storedSessionProfile?: string | null
 ) => Promise<void>
 
-/** Re-read persisted history for one profile-qualified runtime owner. */
+/** Re-read persisted history for one connection/profile-qualified runtime owner. */
 export function useStoredSessionHydration({
   activeSessionIdRef,
+  getSessionStateOwner,
   selectedStoredSessionIdRef,
   selectedStoredSessionProfileRef,
   sessionStateHasOwner,
@@ -54,7 +56,15 @@ export function useStoredSessionHydration({
       // are profile-local, so looking the owner up by bare id can read a same-id
       // transcript from another profile and graft it onto this runtime.
       const ownerProfile = normalizeProfileKey(storedSessionProfile)
-      const owner = { profile: ownerProfile, storedSessionId }
+      const owner = getSessionStateOwner(runtimeSessionId)
+
+      if (!owner || owner.profile !== ownerProfile || owner.storedSessionId !== storedSessionId) {
+        return
+      }
+
+      const profileScope = owner.connectionId
+        ? { connectionId: owner.connectionId, profile: owner.profile }
+        : owner.profile
 
       const isCurrentOwner = () =>
         selectedStoredSessionIdRef.current === storedSessionId &&
@@ -63,13 +73,13 @@ export function useStoredSessionHydration({
 
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
-          const latest = await getLatestSessionMessages(storedSessionId, ownerProfile)
+          const latest = await getLatestSessionMessages(storedSessionId, profileScope)
           const messages = toChatMessages(latest.messages)
 
           // The request belongs to the exact profile + durable id + runtime
           // captured before its first await. A same-id profile switch can reuse
           // either id, so all three axes must still match at publication time.
-          if (!isCurrentOwner()) {
+          if (!isCurrentOwner() || !sessionStateHasOwner(runtimeSessionId, owner)) {
             return
           }
 
@@ -114,6 +124,7 @@ export function useStoredSessionHydration({
     },
     [
       activeSessionIdRef,
+      getSessionStateOwner,
       selectedStoredSessionIdRef,
       selectedStoredSessionProfileRef,
       sessionStateHasOwner,

@@ -433,6 +433,21 @@ export function useSessionStateCache({
     [sessionStateCache]
   )
 
+  const getSessionStateOwner = useCallback(
+    (sessionId: string): SessionStateOwner | null => {
+      const state = sessionStateCache.get(sessionId)
+
+      return state?.profile && state.storedSessionId
+        ? {
+            connectionId: state.connectionId,
+            profile: normalizeProfileKey(state.profile),
+            storedSessionId: state.storedSessionId
+          }
+        : null
+    },
+    [sessionStateCache]
+  )
+
   const updateOwnedSessionState = useCallback(
     (
       sessionId: string,
@@ -488,6 +503,7 @@ export function useSessionStateCache({
   return {
     activeSessionIdRef,
     ensureSessionState,
+    getSessionStateOwner,
     getRuntimeIdForStoredSession,
     resetViewSync,
     runtimeIdByStoredSessionIdRef,

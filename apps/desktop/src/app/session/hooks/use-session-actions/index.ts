@@ -1656,6 +1656,7 @@ export function useSessionActions({
         const inFlightRecovery = recoverInFlightTurnJournal(
           storedSessionId,
           normalizeProfileKey(sessionProfile),
+          resolvedConnectionId || null,
           preferredWithRuntimeChanges,
           { keepPending: resumedRunning }
         )
@@ -1825,6 +1826,7 @@ export function useSessionActions({
           const fallbackRecovery = recoverInFlightTurnJournal(
             storedSessionId,
             normalizeProfileKey(sessionProfile),
+            resolvedConnectionId || null,
             reconcileAuthoritativeMessages(fallback.messages, previousMessages)
           )
 
