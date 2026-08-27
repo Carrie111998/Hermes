@@ -588,6 +588,10 @@ _MAX_BACKOFF_SECONDS = 60
 # can ever reach the circuit-breaker half-open probe or _signal_reconnect.
 _PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
+# Upper bound for one TTL-driven tools/list re-probe of a connected server
+# (SEP-2549 ``ttl_ms`` expiry). Generous: a re-list is a single paginated
+# request family, but a slow server should never stall the turn it rides on.
+_MCP_TTL_RELIST_TIMEOUT = 15.0
 # Jitter applied to reconnect backoff sleeps. Without it, every server that
 # lost the same backend retries in lockstep (thundering herd) and log lines
 # from N servers land in synchronized bursts.
@@ -2779,9 +2783,16 @@ class MCPServerTask:
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
+                self._list_cache_meta = {}
                 new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                    self.session.list_tools, "tools", self.name,
+                    cache_meta_out=self._list_cache_meta,
                 )
+            # The manifest was just re-fetched — advance the SEP-2549 TTL
+            # anchor (see ``_discover_tools``) so the TTL-driven re-list does
+            # not fire again immediately over an already-fresh list_changed
+            # refresh.
+            self._list_cache_meta["listed_at"] = time.time()
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
             # all names: live agent turns may already have tool-call IDs
@@ -3895,6 +3906,11 @@ class MCPServerTask:
                 self.session.list_tools, "tools", self.name,
                 cache_meta_out=self._list_cache_meta,
             )
+        # Anchor TTL expiry (SEP-2549 ``ttl_ms``): the timestamp of THIS list
+        # is what expiry is measured against. Without it a connected server's
+        # manifest could never be re-listed after its TTL passed — the hint
+        # would be captured and persisted but never read back.
+        self._list_cache_meta["listed_at"] = time.time()
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:
@@ -8112,6 +8128,100 @@ def get_registered_mcp_server_names() -> set:
         return set(_mcp_tool_server_names.values())
 
 
+# One re-list per server at a time: concurrent refresh threads hitting the
+# same expired TTL would otherwise double ``tools/list`` on the server.
+_ttl_refreshing: set = set()
+
+
+def _refresh_ttl_expired_server_tool_lists() -> None:
+    """Re-list connected servers whose SEP-2549 ``tools/list`` TTL expired.
+
+    ``ttl_ms`` (MCP 2026-07-28 / SEP-2549) tells the client how long a tool
+    manifest may be cached. The lazy on-disk schema cache honors it
+    (``mcp_schema_cache.get_cached_entry``), but connected servers never
+    re-listed: ``_list_cache_meta`` was captured at discovery and only ever
+    persisted to the schema cache, never read back. A tool added or removed
+    server-side mid-session stayed invisible to the registry, the agent
+    snapshot, and tool_search until process restart.
+
+    Runs synchronously on the caller's thread, hopping onto the MCP loop
+    only for servers whose TTL has actually elapsed; servers without a TTL
+    hint (pre-2026) keep the old never-expires behavior. Exceptions are
+    logged per-server and swallowed — this rides the per-turn refresh and
+    must never break the turn.
+    """
+    with _lock:
+        servers = list(_servers.items())
+    for name, server in servers:
+        try:
+            _relist_server_tools_if_ttl_expired(name, server)
+        except Exception as exc:
+            logger.warning(
+                "MCP server '%s': TTL tool-list refresh failed: %s", name, exc,
+            )
+
+
+def _relist_server_tools_if_ttl_expired(name: str, server: MCPServerTask) -> None:
+    """Re-list one connected server's tools when its ``ttl_ms`` has elapsed."""
+    if getattr(server, "session", None) is None:
+        return
+    if not getattr(server, "_ready", None) or not server._ready.is_set():
+        return
+    meta = getattr(server, "_list_cache_meta", None) or {}
+    ttl_ms = meta.get("ttl_ms")
+    listed_at = meta.get("listed_at")
+    if not isinstance(ttl_ms, (int, float)) or not isinstance(listed_at, (int, float)):
+        # No TTL hint (pre-2026 server) → keep the old never-expires behavior,
+        # matching ``mcp_schema_cache.get_cached_entry``'s semantics.
+        return
+    if (time.time() - listed_at) * 1000.0 < float(ttl_ms):
+        return
+    with _lock:
+        if name in _ttl_refreshing:
+            return
+        _ttl_refreshing.add(name)
+    try:
+        _run_on_mcp_loop(server._discover_tools, timeout=_MCP_TTL_RELIST_TIMEOUT)
+    finally:
+        with _lock:
+            _ttl_refreshing.discard(name)
+    _reconcile_server_tool_registrations(name, server)
+
+
+def _reconcile_server_tool_registrations(name: str, server: MCPServerTask) -> None:
+    """Register a re-listed server's tools; deregister no-longer-served names.
+
+    Mirrors the lazy-connect phantom reconciliation (tools the live server no
+    longer serves must leave the registry so the model stops seeing tools that
+    can never succeed).
+    """
+    from tools.registry import registry
+
+    config = getattr(server, "_config", None)
+    if not isinstance(config, dict):
+        return
+    old_names = set(getattr(server, "_registered_tool_names", []) or [])
+    live_names = _register_server_tools(name, server, config)
+    server._registered_tool_names = list(live_names)
+    phantom_names = old_names - set(live_names)
+    if phantom_names:
+        for tool_name in phantom_names:
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
+        logger.info(
+            "MCP server '%s': TTL refresh removed %d tool(s) no longer served: %s",
+            name, len(phantom_names), ", ".join(sorted(phantom_names)),
+        )
+    if not live_names:
+        # A server that re-listed to zero tools must not keep a stale manifest
+        # on disk: the next lazy startup would register phantoms from cache.
+        try:
+            from tools.mcp_schema_cache import clear_cache_entry
+            clear_cache_entry(name)
+        except Exception as exc:
+            logger.debug("MCP schema cache clear failed for '%s': %s", name, exc)
+
+
 
 def refresh_agent_mcp_tools(
     agent,
@@ -8156,6 +8266,17 @@ def refresh_agent_mcp_tools(
     """
     from model_tools import get_tool_definitions
     from tools.registry import registry
+
+    # SEP-2549 TTL re-list: a connected server whose ``tools/list`` cache hint
+    # (``ttl_ms``) has expired is re-probed BEFORE the snapshot rebuild, so
+    # server-side additions/removals land in the registry first and the rebuilt
+    # snapshot (and tool_search's catalog) reflect them. No-op for servers
+    # without a TTL hint or whose TTL still holds; failures are logged by the
+    # helper and never break the refresh.
+    try:
+        _refresh_ttl_expired_server_tool_lists()
+    except Exception:
+        logger.debug("TTL tool-list refresh skipped", exc_info=True)
 
     # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
     # the user just ENABLED in config is picked up; the agent's stored selection
