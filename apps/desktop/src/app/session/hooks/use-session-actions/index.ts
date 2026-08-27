@@ -2504,12 +2504,27 @@ export function useSessionActions({
           }
 
           setMessages(previousMessages)
-          navigate(sessionRoute(storedSessionId), { replace: true })
 
+          // session.close ran before DELETE. Once DELETE fails, the durable row
+          // is recoverable but that runtime is not: re-publishing its id would
+          // make the route look bound to a process we already closed. Retire only
+          // that exact runtime (same-id owners may have another warm runtime) and
+          // leave the restored owner intent + route unbound so normal route
+          // recovery resumes it against the captured owner.
           if (closingRuntimeId) {
-            setActiveSessionId(closingRuntimeId)
-            activeSessionIdRef.current = closingRuntimeId
+            for (const [boundStoredId, boundRuntimeId] of runtimeIdByStoredSessionIdRef.current) {
+              if (boundRuntimeId === closingRuntimeId) {
+                runtimeIdByStoredSessionIdRef.current.delete(boundStoredId)
+              }
+            }
+
+            sessionStateByRuntimeIdRef.current.delete(closingRuntimeId)
+            dropSessionState(closingRuntimeId)
           }
+
+          setActiveSessionId(null)
+          activeSessionIdRef.current = null
+          navigate(sessionRoute(storedSessionId), { replace: true })
         }
 
         notifyError(err, copy.deleteFailed)
@@ -2565,6 +2580,8 @@ export function useSessionActions({
             normalizeProfileKey(selectedOwnerIntent.ownerRoute.profile) === normalizeProfileKey(capturedOwner.profile)))
 
       const previousPinned = $pinnedSessionIds.get()
+      const previousMessages = wasSelected ? $messages.get() : []
+      const previousRuntimeId = wasSelected ? activeSessionId : null
 
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop only aliases no surviving exact-owner
@@ -2645,12 +2662,40 @@ export function useSessionActions({
 
         untombstoneSessions(aliases)
         $pinnedSessionIds.set(previousPinned)
+
+        if (wasSelected) {
+          setFreshDraftReady(false)
+          setSelectedStoredSessionId(storedSessionId)
+          selectedStoredSessionIdRef.current = storedSessionId
+          setPrimarySessionOwnerIntent(selectedOwnerIntent)
+          const stored = findListedSession(storedSessionId, capturedOwner)?.session
+
+          if (stored) {
+            applyStoredUsage(stored)
+          }
+
+          setMessages(previousMessages)
+          setActiveSessionId(previousRuntimeId)
+          activeSessionIdRef.current = previousRuntimeId
+          navigate(sessionRoute(storedSessionId), { replace: true })
+        }
+
         notifyError(err, copy.archiveFailed)
       } finally {
         endSessionMutation(aliases)
       }
     },
-    [copy, runtimeIdByStoredSessionIdRef, selectedStoredSessionId, sessionStateByRuntimeIdRef, startFreshSessionDraft]
+    [
+      activeSessionId,
+      activeSessionIdRef,
+      copy,
+      navigate,
+      runtimeIdByStoredSessionIdRef,
+      selectedStoredSessionId,
+      selectedStoredSessionIdRef,
+      sessionStateByRuntimeIdRef,
+      startFreshSessionDraft
+    ]
   )
 
   return {

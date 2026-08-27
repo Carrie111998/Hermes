@@ -3911,7 +3911,10 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     $sessionTiles.set([])
     $sessionStates.set({})
     $transcriptTailBySessionId.set({})
+    setActiveSessionId(null)
+    setMessages([])
     setPrimarySessionOwnerIntent(null)
+    setSelectedStoredSessionId(null)
     _resetSessionOwnerHintsForTests({ storage: true })
     window.localStorage.clear()
     mockDeleteSession.mockReset()
@@ -3934,7 +3937,10 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     $sessionTiles.set([])
     $sessionStates.set({})
     $transcriptTailBySessionId.set({})
+    setActiveSessionId(null)
+    setMessages([])
     setPrimarySessionOwnerIntent(null)
+    setSelectedStoredSessionId(null)
     _resetSessionOwnerHintsForTests({ storage: true })
     window.localStorage.clear()
     vi.mocked(requestGatewayForAgent).mockClear()
@@ -4031,6 +4037,88 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
       storedSessionId: 'shared-selected-rollback'
     })
     expect($currentUsage.get()).toMatchObject({ input: 11, output: 7, total: 18 })
+  })
+
+  it('restores duplicate-id delete failure as exact-owner unbound state without reviving the closed runtime', async () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    const sourceA = storedSession({
+      connection_id: ownerA.connectionId,
+      id: 'duplicate-delete-fail',
+      profile: 'worker'
+    })
+
+    const sourceB = storedSession({
+      connection_id: ownerB.connectionId,
+      id: 'duplicate-delete-fail',
+      profile: 'worker'
+    })
+
+    const previousMessages = [
+      { id: 'delete-kept-message', parts: [{ text: 'still here', type: 'text' }], role: 'assistant' }
+    ] as never
+
+    const navigate = vi.fn()
+
+    const runtimeBindings: MutableRefObject<Map<string, string>> = {
+      current: new Map([['duplicate-delete-fail', 'runtime-b']])
+    }
+
+    const runtimeStates: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([
+        ['runtime-a', createClientSessionState('duplicate-delete-fail')],
+        ['runtime-b', createClientSessionState('duplicate-delete-fail')]
+      ])
+    }
+
+    setSessions([sourceA, sourceB])
+    setActiveSessionId('runtime-b')
+    setSelectedStoredSessionId('duplicate-delete-fail')
+    setPrimarySessionOwnerIntent({ ownerRoute: ownerB, storedSessionId: 'duplicate-delete-fail' })
+    setMessages(previousMessages)
+    $sessionStates.set({
+      'runtime-a': createClientSessionState('duplicate-delete-fail'),
+      'runtime-b': createClientSessionState('duplicate-delete-fail')
+    })
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+    mockDeleteSession.mockRejectedValue(new Error('backend down'))
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-b"
+        navigate={navigate}
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        runtimeIdByStoredSessionIdRef={runtimeBindings}
+        selectedStoredSessionId="duplicate-delete-fail"
+        sessionStateByRuntimeIdRef={runtimeStates}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('duplicate-delete-fail', ownerB)
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-b', 'worker', 'session.close', {
+      session_id: 'runtime-b'
+    })
+    expect($sessions.get()).toEqual([sourceB, sourceA])
+    expect($selectedStoredSessionId.get()).toBe('duplicate-delete-fail')
+    expect($primarySessionOwnerIntent.get()).toEqual({
+      ownerRoute: ownerB,
+      storedSessionId: 'duplicate-delete-fail'
+    })
+    expect($messages.get()).toEqual(previousMessages)
+    expect(navigate).toHaveBeenLastCalledWith(sessionRoute('duplicate-delete-fail'), { replace: true })
+    expect($activeSessionId.get()).toBeNull()
+    expect(runtimeBindings.current.has('duplicate-delete-fail')).toBe(false)
+    expect(runtimeStates.current.has('runtime-b')).toBe(false)
+    expect(runtimeStates.current.has('runtime-a')).toBe(true)
+    expect($sessionStates.get()['runtime-b']).toBeUndefined()
+    expect($sessionStates.get()['runtime-a']).toBeDefined()
   })
 
   it('uses only owner-proven aliases for raw legacy cleanup', async () => {
@@ -4419,6 +4507,52 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
       profile: 'worker'
     })
     expect($sessions.get()).toEqual([ownerA])
+  })
+
+  it('restores a selected exact owner, transcript, route, and live runtime when duplicate-id archive fails', async () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const sourceA = storedSession({ connection_id: ownerA.connectionId, id: 'duplicate-arch-fail', profile: 'worker' })
+    const sourceB = storedSession({ connection_id: ownerB.connectionId, id: 'duplicate-arch-fail', profile: 'worker' })
+
+    const previousMessages = [
+      { id: 'kept-message', parts: [{ text: 'keep me', type: 'text' }], role: 'assistant' }
+    ] as never
+
+    const navigate = vi.fn()
+
+    setSessions([sourceA, sourceB])
+    setActiveSessionId('runtime-b')
+    setSelectedStoredSessionId('duplicate-arch-fail')
+    setPrimarySessionOwnerIntent({ ownerRoute: ownerB, storedSessionId: 'duplicate-arch-fail' })
+    setMessages(previousMessages)
+    mockSetSessionArchived.mockRejectedValue(new Error('backend down'))
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-b"
+        navigate={navigate}
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        selectedStoredSessionId="duplicate-arch-fail"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('duplicate-arch-fail', ownerB)
+    })
+
+    expect($sessions.get()).toEqual([sourceB, sourceA])
+    expect($selectedStoredSessionId.get()).toBe('duplicate-arch-fail')
+    expect($primarySessionOwnerIntent.get()).toEqual({
+      ownerRoute: ownerB,
+      storedSessionId: 'duplicate-arch-fail'
+    })
+    expect($messages.get()).toEqual(previousMessages)
+    expect(navigate).toHaveBeenLastCalledWith(sessionRoute('duplicate-arch-fail'), { replace: true })
+    expect($activeSessionId.get()).toBe('runtime-b')
   })
 
   it('archives a messaging row against its owning profile', async () => {
