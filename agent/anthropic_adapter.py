@@ -791,6 +791,28 @@ def _build_anthropic_client_with_bearer_hook(
         import re as _re
         normalized_base_url = _re.sub(r"/v1/?$", "", normalized_base_url.rstrip("/"))
 
+    # AnthropicFoundry is the SDK's native Entra ID path. It invokes the
+    # token provider for every request, matching the OpenAI SDK callable-key
+    # behavior used by the GPT deployments above.
+    foundry_client_cls = getattr(_anthropic_sdk, "AnthropicFoundry", None)
+    if _is_azure_anthropic_endpoint(normalized_base_url) and callable(foundry_client_cls):
+        foundry_kwargs = {
+            "azure_ad_token_provider": token_provider,
+            "timeout": timeout_obj,
+            "max_retries": 0,
+        }
+        if normalized_base_url:
+            foundry_kwargs["base_url"] = normalized_base_url
+        common_betas = _common_betas_for_base_url(
+            normalized_base_url,
+            drop_context_1m_beta=drop_context_1m_beta,
+        )
+        if common_betas:
+            foundry_kwargs["default_headers"] = {
+                "anthropic-beta": ",".join(common_betas)
+            }
+        return foundry_client_cls(**foundry_kwargs)
+
     http_client = build_bearer_http_client(token_provider, timeout=timeout_obj)
 
     kwargs = {

@@ -214,6 +214,7 @@ def build_models_payload(
         rows = list(rows) + _append_unconfigured_rows(
             rows, ctx, current_only=True
         )
+    _ensure_current_azure_foundry_models(rows, ctx)
 
     # --- Deduplicate: remove models from aggregators that overlap with
     # user-defined providers.  When a local proxy (e.g. litellm-proxy)
@@ -426,6 +427,78 @@ def _reasoning_catalog_reader(slug: str):
         warm_openrouter_reasoning_caps_async()
         return openrouter_model_reasoning_capabilities
     return None
+
+
+
+def _ensure_current_azure_foundry_models(rows: list[dict], ctx: ConfigContext) -> None:
+    """Expose configured Azure Foundry deployments in picker rows."""
+    provider = (ctx.current_provider or "").strip().lower()
+    models_to_add: list[str] = []
+
+    def add_model(value: object) -> None:
+        model = str(value or "").strip()
+        if model and model not in models_to_add:
+            models_to_add.append(model)
+
+    if provider == "azure-foundry":
+        add_model(ctx.current_model)
+
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        cfg = load_config()
+        disk_model = cfg.get("model") if isinstance(cfg, dict) else None
+        if isinstance(disk_model, dict):
+            disk_provider = str(disk_model.get("provider") or "").strip().lower()
+            disk_default = str(
+                disk_model.get("default") or disk_model.get("name") or ""
+            ).strip()
+            if disk_provider == "azure-foundry":
+                add_model(disk_default)
+
+        aliases = cfg.get("model_aliases") if isinstance(cfg, dict) else None
+        if isinstance(aliases, dict):
+            for alias_name, alias in aliases.items():
+                if not isinstance(alias, dict):
+                    continue
+                if str(alias.get("provider") or "").strip().lower() != "azure-foundry":
+                    continue
+                add_model(alias.get("model") or alias_name)
+
+        for entry in get_fallback_chain(cfg):
+            if str(entry.get("provider") or "").strip().lower() != "azure-foundry":
+                continue
+            add_model(entry.get("model"))
+    except Exception:
+        pass
+
+    if not models_to_add:
+        return
+
+    for row in rows:
+        if str(row.get("slug") or "").strip().lower() != "azure-foundry":
+            continue
+        models = list(row.get("models") or [])
+        for candidate in reversed(models_to_add):
+            if candidate and candidate not in models:
+                models.insert(0, candidate)
+        row["models"] = models
+        row["total_models"] = len(models)
+        return
+
+    rows.append(
+        {
+            "slug": "azure-foundry",
+            "name": "Azure Foundry",
+            "is_current": provider == "azure-foundry",
+            "is_user_defined": False,
+            "models": models_to_add,
+            "total_models": len(models_to_add),
+            "source": "config",
+            "authenticated": True,
+        }
+    )
 
 
 def _apply_capabilities(rows: list[dict]) -> None:

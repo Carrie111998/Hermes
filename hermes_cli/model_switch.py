@@ -2036,6 +2036,51 @@ def switch_model(
     elif not api_mode:
         api_mode = determine_api_mode(target_provider, base_url)
 
+    # Azure Foundry can host both OpenAI-style deployments (/openai/v1) and
+    # Anthropic-style Claude deployments (/anthropic) under the same provider.
+    # If the selected model matches a configured fallback entry, carry that
+    # entry's base_url/api_mode forward so picker selection does not send a
+    # Claude deployment to the primary /openai/v1 endpoint.
+    if target_provider == "azure-foundry":
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.fallback_config import get_fallback_chain
+
+            matched_fallback = False
+            for entry in get_fallback_chain(load_config()):
+                if str(entry.get("provider") or "").strip().lower() != "azure-foundry":
+                    continue
+                if str(entry.get("model") or "").strip().lower() != str(new_model or "").strip().lower():
+                    continue
+                entry_base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+                if not entry_base_url:
+                    continue
+                runtime = resolve_runtime_provider(
+                    requested="azure-foundry",
+                    explicit_base_url=entry_base_url,
+                    target_model=new_model,
+                )
+                api_key = runtime.get("api_key", api_key)
+                base_url = runtime.get("base_url", entry_base_url) or entry_base_url
+                api_mode = (
+                    str(entry.get("api_mode") or entry.get("transport") or "").strip()
+                    or runtime.get("api_mode", "")
+                    or api_mode
+                )
+                matched_fallback = True
+                break
+            if not matched_fallback and base_url:
+                runtime = resolve_runtime_provider(
+                    requested="azure-foundry",
+                    explicit_base_url=str(base_url).strip().rstrip("/"),
+                    target_model=new_model,
+                )
+                api_key = runtime.get("api_key", api_key)
+                base_url = runtime.get("base_url", base_url) or base_url
+                api_mode = runtime.get("api_mode", api_mode) or api_mode
+        except Exception:
+            pass
+
     # --- Normalize model name for target provider ---
     new_model = _resolve_named_custom_model_id(
         new_model, target_provider, custom_providers

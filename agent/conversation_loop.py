@@ -2371,6 +2371,33 @@ def run_conversation(
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
 
+        # Codex Responses stores encrypted reasoning replay blobs that only the
+        # Responses endpoint can consume. When a session switches to an
+        # Anthropic-style provider (for example Azure Foundry Claude), those
+        # blobs must not be replayed or the provider rejects the request with
+        # "Encrypted content is not supported with this model." Clean only the
+        # per-call API copy; keep stored history untouched so switching back to
+        # Codex still has its replay state.
+        if agent.api_mode != "codex_responses":
+            for api_msg in api_messages:
+                if not isinstance(api_msg, dict):
+                    continue
+                api_msg.pop("codex_reasoning_items", None)
+                details = api_msg.get("reasoning_details")
+                if isinstance(details, list):
+                    cleaned_details = [
+                        detail
+                        for detail in details
+                        if not (
+                            isinstance(detail, dict)
+                            and detail.get("encrypted_content")
+                        )
+                    ]
+                    if cleaned_details:
+                        api_msg["reasoning_details"] = cleaned_details
+                    else:
+                        api_msg.pop("reasoning_details", None)
+
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
         # External recall context is injected into the user message, not the system

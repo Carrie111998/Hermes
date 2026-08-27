@@ -1494,6 +1494,15 @@ def _resolve_azure_foundry_runtime(
             "the AZURE_FOUNDRY_BASE_URL environment variable."
         )
 
+    # Fallback entries and explicit model switches can point the same
+    # azure-foundry provider at an Anthropic-style Foundry endpoint while the
+    # persisted primary config still targets /openai/v1. In that case the URL
+    # must win over the persisted api_mode/default model, otherwise Claude
+    # deployments are incorrectly routed through OpenAI Responses.
+    detected_api_mode = _detect_api_mode_for_url(base_url)
+    if detected_api_mode == "anthropic_messages":
+        cfg_api_mode = detected_api_mode
+
     # Anthropic SDK appends /v1/messages itself, so strip any trailing /v1
     # we inherited from the configured base_url to avoid double-/v1 paths.
     if cfg_api_mode == "anthropic_messages":
