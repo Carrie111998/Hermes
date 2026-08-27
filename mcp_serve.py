@@ -493,10 +493,12 @@ class EventBridge:
             db_file = get_hermes_home() / "state.db"
         except ImportError:
             db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-        try:
-            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
-            self._state_db_mtime = 0.0
+        # Do not prime the mtime gate here. The per-session timestamp baseline
+        # suppresses historical replay; leaving the gate open lets the first
+        # poll observe messages/conversations that arrive immediately after
+        # startup, even on filesystems where a rapid utime/write can share the
+        # same visible mtime.
+        self._state_db_mtime = 0.0
         try:
             self._cached_sessions_index = _load_sessions_index()
         except Exception:

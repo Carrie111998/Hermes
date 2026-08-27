@@ -2038,24 +2038,25 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            if self._flush_messages_to_session_db(messages, conversation_history) is False:
+                return False
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return True
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -4420,11 +4421,20 @@ class AIAgent:
             last_activity_description=getattr(self, "_last_activity_desc", None) or "",
             last_activity_provenance=provenance,
             extra={
-            "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
-            "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
+                "current_tool": self._current_tool,
+                "api_call_count": self._api_call_count,
+                "max_iterations": self.max_iterations,
+                "budget_used": self.iteration_budget.used,
+                "budget_max": self.iteration_budget.max_total,
+                "awaiting_session_persistence": bool(
+                    getattr(self, "_awaiting_session_persistence", False)
+                ),
+                "awaiting_session_persistence_stage": (
+                    getattr(self, "_awaiting_session_persistence_stage", None)
+                ),
+                "session_persistence_wait_attempts": int(
+                    getattr(self, "_session_persistence_wait_attempts", 0) or 0
+                ),
             },
         )
 

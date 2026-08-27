@@ -247,68 +247,116 @@ def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     assert isinstance(result.get("error"), str) and result["error"].strip() != ""
 
 
-def test_locked_flush_exception_surfaces_locked_cause_in_result_contract():
-    """SQLite write-lock contention must surface as a 'locked' cause.
+def test_locked_flush_waits_and_resumes_without_replaying_tool_call_turn():
+    """SQLite write-lock contention waits at the durable boundary.
 
-    Gateway contract: result['failure_reason'] is exactly
-    'session_persistence_failed:locked' and result['error'] is a non-empty
-    string whose wording talks about busy storage, NOT disk space.
+    A transient lock after the model emits assistant(tool_calls) must retry the
+    exact same in-memory batch, then execute the tool once after the append is
+    durable. It must not return session_persistence_failed:locked or ask the
+    model to regenerate the tool call.
     """
     import sqlite3
 
     agent = _make_agent()
+    agent._session_persistence_lock_wait_initial_s = 0.0
+    agent._session_persistence_lock_wait_max_sleep_s = 0.0
+    agent._session_persistence_lock_progress_interval_s = 0.0
     tool_call = _mock_tool_call(call_id="must-not-run")
-    agent.client.chat.completions.create.return_value = _mock_response(
-        content="I'll inspect the repository now.",
-        finish_reason="tool_calls",
-        tool_calls=[tool_call],
-    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="I'll inspect the repository now.",
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content="done", finish_reason="stop"),
+    ]
+    flush_snapshots: list[list] = []
+
+    def _locked_twice_then_success(messages, conversation_history=None):
+        flush_snapshots.append(copy.deepcopy(messages))
+        if len(flush_snapshots) <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return True
+
     agent._flush_messages_to_session_db = MagicMock(
-        side_effect=sqlite3.OperationalError("database is locked")
+        side_effect=_locked_twice_then_success
     )
     agent.interim_assistant_callback = MagicMock()
-    agent._execute_tool_calls = MagicMock()
+    executed: list[str] = []
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        executed.append(assistant_message.tool_calls[0].id)
+        messages.append(make_tool_result_message("web_search", "search result", "must-not-run"))
 
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
     ):
         result = agent.run_conversation("inspect the repository")
 
-    agent.interim_assistant_callback.assert_not_called()
-    agent._execute_tool_calls.assert_not_called()
-    assert result["failed"] is True
-    assert result["turn_exit_reason"] == "session_persistence_failed"
-    assert result["failure_reason"] == "session_persistence_failed:locked"
-    assert isinstance(result.get("error"), str) and result["error"].strip() != ""
-    assert "busy" in result["error"].lower()
-    assert "disk" not in result["error"].lower()
+    assert executed == ["must-not-run"]
+    assert agent.client.chat.completions.create.call_count == 2
+    assistant_flushes = [
+        snapshot for snapshot in flush_snapshots
+        if (
+            snapshot
+            and snapshot[-1].get("role") == "assistant"
+            and snapshot[-1].get("tool_calls")
+        )
+    ]
+    assert len(assistant_flushes) == 3
+    assert all(
+        snapshot[-1]["tool_calls"][0]["id"] == "must-not-run"
+        for snapshot in assistant_flushes
+    )
+    assert result["failed"] is False
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "done"
+    assert "failure_reason" not in result
 
 
 def test_persistence_cause_resets_between_turns():
-    """A locked failure on turn 1 must not leak its cause into turn 2."""
+    """A recovered locked wait on turn 1 must not poison turn 2."""
     import sqlite3
 
     agent = _make_agent()
+    agent._session_persistence_lock_wait_initial_s = 0.0
+    agent._session_persistence_lock_wait_max_sleep_s = 0.0
     tool_call = _mock_tool_call(call_id="must-not-run")
-    agent.client.chat.completions.create.return_value = _mock_response(
-        content="I'll inspect the repository now.",
-        finish_reason="tool_calls",
-        tool_calls=[tool_call],
-    )
-    agent._flush_messages_to_session_db = MagicMock(
-        side_effect=sqlite3.OperationalError("database is locked")
-    )
-    agent._execute_tool_calls = MagicMock()
+
+    def _locked_once_then_success(messages, conversation_history=None):
+        if _locked_once_then_success.calls == 0:
+            _locked_once_then_success.calls += 1
+            raise sqlite3.OperationalError("database is locked")
+        return True
+
+    _locked_once_then_success.calls = 0
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        messages.append(make_tool_result_message("web_search", "search result", "must-not-run"))
 
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
     ):
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="I'll inspect the repository now.",
+                finish_reason="tool_calls",
+                tool_calls=[tool_call],
+            ),
+            _mock_response(content="done", finish_reason="stop"),
+        ]
+        agent._flush_messages_to_session_db = MagicMock(
+            side_effect=_locked_once_then_success
+        )
         first = agent.run_conversation("inspect the repository")
-        assert first["failure_reason"] == "session_persistence_failed:locked"
+        assert first["failed"] is False
+        assert "failure_reason" not in first
 
         # Storage recovered but the flush function now reports a bare False
         # (no exception): the stale 'locked' cause must not be reused.
@@ -323,6 +371,41 @@ def test_persistence_cause_resets_between_turns():
 
     assert second["turn_exit_reason"] == "session_persistence_failed"
     assert second["failure_reason"] == "session_persistence_failed:unknown"
+
+
+def test_stop_during_locked_assistant_wait_cancels_before_tool_execution():
+    """A /stop while awaiting persistence cancels the pending tool safely."""
+    import sqlite3
+
+    agent = _make_agent()
+    agent._session_persistence_lock_wait_initial_s = 0.0
+    agent._session_persistence_lock_wait_max_sleep_s = 0.0
+    tool_call = _mock_tool_call(call_id="cancel-before-tool")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+
+    def _locked_then_stop(messages, conversation_history=None):
+        agent.interrupt("stop requested")
+        raise sqlite3.OperationalError("database is locked")
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_locked_then_stop)
+    agent._execute_tool_calls = MagicMock()
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("inspect the repository")
+
+    agent._execute_tool_calls.assert_not_called()
+    assert result["interrupted"] is True
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "interrupted_by_user"
+    assert [m.get("role") for m in result["messages"]] == ["user"]
 
 
 # ---------------------------------------------------------------------------

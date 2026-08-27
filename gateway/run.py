@@ -50,6 +50,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
+    COMPACTION_START_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -384,6 +385,62 @@ def _gateway_compression_progress_notices_enabled() -> bool:
     except Exception:
         pass
     return False
+
+
+def _compression_progress_enabled_for_source(
+    gateway_config: Any,
+    platform: Any,
+    chat_id: Any,
+    event_type: Any,
+    message: Any,
+) -> bool:
+    """Return whether a canonical compaction start may notify this source."""
+    platform_value = getattr(platform, "value", platform)
+    if str(platform_value or "").lower() != "telegram":
+        return False
+    if str(event_type or "").lower() != "lifecycle":
+        return False
+    if str(message or "").strip() != COMPACTION_START_STATUS:
+        return False
+
+    platforms = getattr(gateway_config, "platforms", None)
+    if not isinstance(platforms, dict):
+        return False
+    telegram_config = next(
+        (
+            candidate
+            for key, candidate in platforms.items()
+            if str(getattr(key, "value", key) or "").lower() == "telegram"
+        ),
+        None,
+    )
+    extra = getattr(telegram_config, "extra", None)
+    if not isinstance(extra, dict):
+        return False
+    progress = extra.get("compression_progress")
+    if not isinstance(progress, dict) or progress.get("enabled") is not True:
+        return False
+    allowed_chat_ids = progress.get("chat_ids")
+    if not isinstance(allowed_chat_ids, (list, tuple, set)):
+        return False
+
+    normalized_chat_id = str(chat_id or "").strip()
+    if not normalized_chat_id:
+        return False
+    return normalized_chat_id in {
+        str(candidate).strip()
+        for candidate in allowed_chat_ids
+        if candidate is not None and str(candidate).strip()
+    }
+
+
+_COMPRESSION_PROGRESS_MESSAGE = "🗜️ Сжимаю контекст…"
+
+
+async def _send_compression_progress_coro(adapter: Any, chat_id: Any, metadata: Any) -> Any:
+    """Send a fresh topic-local compaction notice without status-cache edits."""
+    return await adapter.send(chat_id, _COMPRESSION_PROGRESS_MESSAGE, metadata=metadata)
+
 
 # Surfaces that consume gateway text programmatically (CLI/TUI "local"
 # diagnostics, API JSON, webhook payloads) and therefore must keep RAW
@@ -27292,7 +27349,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -27300,31 +27356,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys from the current Honcho config."""
         try:
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
-            try:
-                mtime_ns = path.stat().st_mtime_ns
-            except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
-            cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
-            if cached is not None:
-                return dict(cached)
-
             hcfg = HonchoClientConfig.from_global_config(config_path=path)
             aliases = hcfg.user_peer_aliases or {}
-            values = {
+            return {
                 "honcho.peer_name": hcfg.peer_name,
                 "honcho.ai_peer": hcfg.ai_peer,
                 "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
             }
-            cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
-            return dict(values)
         except Exception:
             return cls._empty_honcho_cache_busting_config()
 
@@ -32276,6 +32321,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         resolve_cron_scheduler,
         scheduler_for_profile_mode,
     )
+    from cron.scheduler import CRON_OWNER_STORE_UNAVAILABLE
     cron_stop = threading.Event()
     multiplex_cron = bool(getattr(runner.config, "multiplex_profiles", False))
     cron_provider = scheduler_for_profile_mode(
@@ -32283,6 +32329,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         multiplex_profiles=multiplex_cron,
     )
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    cron_extra_session_dbs: list[Any] = []
+    _primary_cron_owner_db = getattr(getattr(runner, "_session_db", None), "_db", None)
 
     # Multiplex profiles: tell the built-in ticker which profile homes to
     # tick so secondary-profile cron jobs actually fire (#69377).
@@ -32298,6 +32346,39 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                owner_session_dbs: Dict[Any, Any] = {}
+                for entry in profile_homes:
+                    profile_name = str(entry[0]) if isinstance(entry, tuple) else ""
+                    profile_home = entry[1] if isinstance(entry, tuple) else entry
+                    if profile_name == "default":
+                        owner = _primary_cron_owner_db or CRON_OWNER_STORE_UNAVAILABLE
+                    else:
+                        try:
+                            from hermes_constants import (
+                                reset_hermes_home_override,
+                                set_hermes_home_override,
+                            )
+                            from hermes_state import SessionDB
+
+                            token = set_hermes_home_override(str(profile_home))
+                            try:
+                                owner = SessionDB()
+                            finally:
+                                reset_hermes_home_override(token)
+                            cron_extra_session_dbs.append(owner)
+                        except Exception as exc:
+                            logger.warning(
+                                "Cron owner SessionDB unavailable for profile %s at %s: %s",
+                                profile_name or "<unnamed>",
+                                profile_home,
+                                exc,
+                            )
+                            owner = CRON_OWNER_STORE_UNAVAILABLE
+                    if profile_name:
+                        owner_session_dbs[profile_name] = owner
+                    owner_session_dbs[str(profile_home)] = owner
+                    owner_session_dbs[profile_home] = owner
+                cron_start_kwargs["owner_session_db"] = owner_session_dbs
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
@@ -32315,6 +32396,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active
+        )
+        cron_start_kwargs.setdefault(
+            "owner_session_db",
+            _primary_cron_owner_db or CRON_OWNER_STORE_UNAVAILABLE,
         )
     cron_thread = threading.Thread(
         target=cron_provider.start,
@@ -32411,7 +32496,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # delivery finishes before we tear down.
     cron_stop.set()
     _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    cron_thread_exited = await _await_thread_exit(
+        cron_thread,
+        timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    if not cron_thread_exited:
         logger.warning(
             "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
             "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
@@ -32419,6 +32508,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
+    if cron_thread_exited:
+        for _cron_db in cron_extra_session_dbs:
+            try:
+                await asyncio.to_thread(_cron_db.close)
+            except Exception as e:
+                logger.debug("Extra cron owner SessionDB close failed: %s", e)
+        if getattr(runner, "_session_db", None) is not None:
+            try:
+                await runner._session_db.close()
+            except Exception as e:
+                logger.debug("Gateway SessionDB close failed: %s", e)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()

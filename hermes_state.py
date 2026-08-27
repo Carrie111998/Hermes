@@ -1939,6 +1939,8 @@ def classify_persistence_error(exc_or_str) -> str:
         or "busy" in text
     ):
         return "locked"
+    if is_malformed_db_error(exc_or_str):
+        return "unknown"
     if (
         is_disk_full_error(exc_or_str)
         or "disk" in text
@@ -4443,6 +4445,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
+    _WRITE_LOCK_WARNING_AFTER_S = 10.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -5256,6 +5259,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        operation: str = "write",
+        session_id: Optional[str] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -5284,6 +5290,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        wait_started: Optional[float] = None
+        wait_warned = False
+        wait_attempts = 0
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
@@ -5312,6 +5321,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             pass
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
+                if wait_started is not None:
+                    self._log_write_lock_recovered(
+                        operation=operation,
+                        session_id=session_id,
+                        waited_s=time.monotonic() - wait_started,
+                        attempts=wait_attempts,
+                    )
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -5342,13 +5358,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    now = time.monotonic()
+                    if wait_started is None:
+                        wait_started = now
+                    wait_attempts += 1
+                    waited_s = now - wait_started
+                    if (
+                        not wait_warned
+                        and waited_s >= self._WRITE_LOCK_WARNING_AFTER_S
+                    ):
+                        wait_warned = True
+                        self._log_write_lock_wait(
+                            operation=operation,
+                            session_id=session_id,
+                            waited_s=waited_s,
+                            patience_s=patience_s,
+                            attempts=wait_attempts,
+                        )
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
+                    exhausted_s = (
+                        time.monotonic() - wait_started
+                        if wait_started is not None
+                        else patience_s
+                    )
                     raise sqlite3.OperationalError(
-                        f"database is locked (another Hermes process held the "
-                        f"state.db write lock for over {patience_s:.0f}s — "
+                        f"database is locked (another database connection held "
+                        f"the state.db write lock for over {patience_s:.3g}s; "
+                        f"db_path={self.db_path}; operation={operation}; "
+                        f"waited={exhausted_s:.3f}s; pid={os.getpid()}; "
+                        f"thread={threading.get_ident()}; "
+                        f"session={session_id or 'unknown'}; "
                         "likely a long maintenance operation such as VACUUM, "
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
@@ -5381,6 +5423,85 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+
+    def _write_lock_log_context(
+        self,
+        *,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        attempts: int,
+    ) -> dict:
+        return {
+            "db_path": str(self.db_path),
+            "operation": operation,
+            "waited_s": round(float(waited_s), 3),
+            "pid": os.getpid(),
+            "thread": threading.get_ident(),
+            "session": session_id or "unknown",
+            "attempts": int(attempts),
+            "db_holders": count_db_holders(self.db_path),
+            "holder": "another database connection",
+        }
+
+    def _log_write_lock_wait(
+        self,
+        *,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        patience_s: float,
+        attempts: int,
+    ) -> None:
+        context = self._write_lock_log_context(
+            operation=operation,
+            session_id=session_id,
+            waited_s=waited_s,
+            attempts=attempts,
+        )
+        logger.warning(
+            "SessionDB write lock wait: db_path=%s operation=%s waited=%.3fs "
+            "patience=%.3fs pid=%s thread=%s session=%s attempts=%s "
+            "db_holders=%s holder=%s",
+            context["db_path"],
+            context["operation"],
+            context["waited_s"],
+            patience_s,
+            context["pid"],
+            context["thread"],
+            context["session"],
+            context["attempts"],
+            context["db_holders"],
+            context["holder"],
+        )
+
+    def _log_write_lock_recovered(
+        self,
+        *,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        attempts: int,
+    ) -> None:
+        context = self._write_lock_log_context(
+            operation=operation,
+            session_id=session_id,
+            waited_s=waited_s,
+            attempts=attempts,
+        )
+        logger.info(
+            "SessionDB write lock recovered: db_path=%s operation=%s "
+            "waited=%.3fs pid=%s thread=%s session=%s attempts=%s "
+            "db_holders=%s recovery=success",
+            context["db_path"],
+            context["operation"],
+            context["waited_s"],
+            context["pid"],
+            context["thread"],
+            context["session"],
+            context["attempts"],
+            context["db_holders"],
+        )
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -6108,7 +6229,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
-        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        self._execute_write(
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            operation="create_session",
+            session_id=session_id,
+        )
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -11202,7 +11328,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
         return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            operation="append_message",
+            session_id=session_id,
         )
 
     def append_messages_batch(
@@ -11296,7 +11425,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            operation="append_messages_batch",
+            session_id=session_id,
         )
 
     def set_latest_matching_message_display_kind(

@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -955,6 +956,58 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class AwaitingPersistenceAgent:
+    """First turn blocks in the new persistence-wait state."""
+
+    calls: list[str] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls.append(message)
+        if len(type(self).calls) == 1:
+            type(self).started.set()
+            if self.status_callback is not None:
+                self.status_callback(
+                    "lifecycle",
+                    "Session storage is busy; waiting to save before continuing.",
+                )
+            assert type(self).release.wait(timeout=2)
+            return {
+                "final_response": "first done",
+                "messages": [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": "first done"},
+                ],
+                "api_calls": 1,
+            }
+        return {
+            "final_response": f"processed {message}",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": f"processed {message}"},
+            ],
+            "api_calls": 1,
+        }
+
+    def interrupt(self, message=None):
+        return None
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "current_tool": None,
+            "last_activity_ts": time.time(),
+            "last_activity_desc": "waiting for session storage lock",
+            "seconds_since_activity": 0.1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1379,6 +1432,75 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_awaiting_persistence_keeps_busy_followups_fifo(monkeypatch, tmp_path):
+    """Follow-ups queued while persistence is waiting drain only after it resumes."""
+    AwaitingPersistenceAgent.calls = []
+    AwaitingPersistenceAgent.started = threading.Event()
+    AwaitingPersistenceAgent.release = threading.Event()
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = AwaitingPersistenceAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    runner._busy_input_mode = "queue"
+    runner._busy_text_mode = "interrupt"
+    runner._is_user_authorized = lambda _source: True
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    session_key = "agent:main:telegram:group:-1001:17585"
+
+    task = asyncio.create_task(
+        runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-awaiting-persistence",
+            session_key=session_key,
+        )
+    )
+    for _ in range(200):
+        if AwaitingPersistenceAgent.started.is_set() and session_key in runner._running_agents:
+            break
+        await asyncio.sleep(0.01)
+
+    assert AwaitingPersistenceAgent.started.is_set()
+    for text in ("queued one", "queued two"):
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"m-{text}",
+        )
+        handled = await runner._handle_active_session_busy_message(event, session_key)
+        assert handled is True
+
+    assert adapter._pending_messages[session_key].text == "queued one"
+    assert [event.text for event in runner._queued_events[session_key]] == ["queued two"]
+
+    AwaitingPersistenceAgent.release.set()
+    result = await asyncio.wait_for(task, timeout=3)
+
+    assert AwaitingPersistenceAgent.calls == ["hello", "queued one", "queued two"]
+    assert result["final_response"] == "processed queued two"
 
 
 @pytest.mark.asyncio

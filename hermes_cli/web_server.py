@@ -266,7 +266,11 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
-def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
+def _start_desktop_cron_ticker(
+    stop_event: "threading.Event",
+    interval: int = 60,
+    owner_session_db=None,
+) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
     The scheduler tick loop normally lives in ``hermes gateway run`` — but the
@@ -313,6 +317,8 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
 
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
+    if isinstance(provider, InProcessCronScheduler):
+        start_kwargs["owner_session_db"] = owner_session_db
     provider.start(stop_event, **start_kwargs)
 
 
@@ -435,6 +441,8 @@ async def _lifespan(app: "FastAPI"):
     # dashboard` is unaffected — it relies on its own gateway.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
+    cron_session_db = None
+    cron_owner_session_db = None
     if os.getenv("HERMES_DESKTOP") == "1":
         # Before forking a fresh gateway, reap any orphan left by a previous
         # serve session. Graceful shutdown reaps the managed child, but an
@@ -449,10 +457,21 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
+        try:
+            from hermes_state import SessionDB
+
+            cron_session_db = SessionDB()
+            cron_owner_session_db = cron_session_db
+        except Exception as exc:
+            from cron.scheduler import CRON_OWNER_STORE_UNAVAILABLE
+
+            _log.warning("Desktop cron SessionDB owner unavailable: %s", exc)
+            cron_owner_session_db = CRON_OWNER_STORE_UNAVAILABLE
         cron_stop = threading.Event()
         cron_thread = threading.Thread(
             target=_start_desktop_cron_ticker,
             args=(cron_stop,),
+            kwargs={"owner_session_db": cron_owner_session_db},
             daemon=True,
             name="desktop-cron-ticker",
         )
@@ -480,6 +499,22 @@ async def _lifespan(app: "FastAPI"):
         await PTY_REGISTRY.close_all()
         if os.getenv("HERMES_DESKTOP") == "1":
             _terminate_desktop_managed_gateway()
+        if cron_thread is not None:
+            def _join_cron_thread() -> bool:
+                cron_thread.join(timeout=65.0)
+                return not cron_thread.is_alive()
+
+            cron_thread_exited = await asyncio.to_thread(_join_cron_thread)
+            if not cron_thread_exited:
+                _log.warning(
+                    "Desktop cron ticker did not exit within 65s; leaving its "
+                    "SessionDB owner open to avoid closing under an active job."
+                )
+            elif cron_session_db is not None:
+                try:
+                    await asyncio.to_thread(cron_session_db.close)
+                except Exception as exc:
+                    _log.debug("Desktop cron SessionDB close failed: %s", exc)
 
 
 def _get_event_state(app: "FastAPI"):
