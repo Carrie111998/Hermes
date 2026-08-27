@@ -81,8 +81,6 @@ function ownershipProofKey(token) {
 function verifyOwnershipChallengeProof(proof, token, challenge, spawnNonce, pid) {
   if (
     proof?.ok !== true ||
-    proof.sshOwnerNonce !== spawnNonce ||
-    proof.pid !== pid ||
     proof.protocolVersion !== PROTOCOL_VERSION ||
     !/^[0-9a-f]{64}$/.test(String(proof.proof || ''))
   ) {

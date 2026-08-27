@@ -84,6 +84,33 @@ test('ownership challenge probe receives no reuse credential and verifies the ke
   assert.deepEqual(probeArguments, ['http://127.0.0.1:50001', challenge])
 })
 
+test('ownership challenge verification binds nonce and pid in the HMAC, not echoed fields', async () => {
+  const token = 'stored-token'
+  const challenge = 'd'.repeat(64)
+  const pid = 333
+
+  const proof = crypto
+    .createHmac('sha256', ownershipProofKey(token))
+    .update(`${challenge}:${SPAWN_NONCE}:${pid}:${PROTOCOL_VERSION}`)
+    .digest('hex')
+
+  const verified = await proveOwnershipWithChallenge(
+    () =>
+      Promise.resolve({
+        ok: true,
+        protocolVersion: PROTOCOL_VERSION,
+        proof
+      }),
+    'http://127.0.0.1:50001',
+    token,
+    SPAWN_NONCE,
+    pid,
+    () => challenge
+  )
+
+  assert.equal(verified, true)
+})
+
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(
     classifySshReuseProof(
@@ -1148,8 +1175,24 @@ test('connect reuses a live wrapper after authenticated nonce and pid ownership 
 
 test.each([
   ['HMAC', { proof: '0'.repeat(64) }],
-  ['nonce', { sshOwnerNonce: 'fedcba9876543210' }],
-  ['pid', { pid: 334 }],
+  [
+    'nonce',
+    {
+      proof: crypto
+        .createHmac('sha256', ownershipProofKey('stored-token'))
+        .update(`${'b'.repeat(64)}:fedcba9876543210:333:2`)
+        .digest('hex')
+    }
+  ],
+  [
+    'pid',
+    {
+      proof: crypto
+        .createHmac('sha256', ownershipProofKey('stored-token'))
+        .update(`${'b'.repeat(64)}:${SPAWN_NONCE}:334:2`)
+        .digest('hex')
+    }
+  ],
   ['protocol', { protocolVersion: PROTOCOL_VERSION + 1 }]
 ])('connect fails closed on a forged wrapper ownership %s', async (_field, override) => {
   const reuseToken = 'stored-token'

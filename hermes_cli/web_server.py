@@ -564,12 +564,45 @@ def _remove_ssh_runtime_marker() -> None:
         pass
 
 
+def _sweep_stale_ssh_runtime_markers(purelib: str, keep: Optional[str] = None) -> None:
+    prefix = ".hermes-ssh-runtime-"
+    keep_name = os.path.basename(keep) if keep else None
+    try:
+        names = os.listdir(purelib)
+    except OSError:
+        return
+    for name in names:
+        if name == keep_name or not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix) :]
+        if not re.fullmatch(r"[0-9a-f]{16}", suffix):
+            continue
+        path = os.path.join(purelib, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                recorded = fh.readline().strip()
+            pid = int(recorded.split("=", 1)[1])
+            os.kill(pid, 0)
+            continue  # live sibling — leave its marker
+        except ProcessLookupError:
+            pass
+        except (PermissionError, ValueError, IndexError, OSError):
+            continue  # unreadable or not ours — do not delete a maybe-live marker
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
     global _SSH_OWNER_NONCE, _SSH_RUNTIME_PURELIB, _SSH_RUNTIME_MARKER
     _remove_ssh_runtime_marker()
-    _SSH_OWNER_NONCE = nonce
+    _SSH_OWNER_NONCE = None
     _SSH_RUNTIME_PURELIB = None
     _SSH_RUNTIME_MARKER = None
+    if nonce and not re.fullmatch(r"[0-9a-f]{16}", nonce):
+        return
+    _SSH_OWNER_NONCE = nonce
     if nonce:
         try:
             purelib = sysconfig.get_paths()["purelib"]
@@ -584,6 +617,7 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
             with open(marker, "w", encoding="utf-8") as fh:
                 fh.write(f"pid={os.getpid()}\n")
             _SSH_RUNTIME_MARKER = marker
+            _sweep_stale_ssh_runtime_markers(purelib, keep=marker)
         except OSError:
             pass  # read-only site-packages — fall back to the stat snapshot
         try:
@@ -3658,13 +3692,14 @@ async def get_ssh_ownership(request: Request):
 
     response = {
         "ok": True,
-        "sshOwnerNonce": _SSH_OWNER_NONCE,
         "protocolVersion": protocol_version,
-        "runtimeIntact": _ssh_runtime_intact(),
-        "pid": pid,
     }
     if proof is not None:
         response["proof"] = proof
+    else:
+        response["sshOwnerNonce"] = _SSH_OWNER_NONCE
+        response["runtimeIntact"] = _ssh_runtime_intact()
+        response["pid"] = pid
     return response
 
 

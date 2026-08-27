@@ -22,8 +22,9 @@ def test_ssh_ownership_valid_challenge_returns_verifiable_protocol_2_proof(monke
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["ok"] is True
     assert payload["protocolVersion"] == 2
-    assert payload["pid"] == os.getpid()
+    assert set(payload) == {"ok", "protocolVersion", "proof"}
     canonical = f"{challenge}:{nonce}:{os.getpid()}:2".encode()
     proof_key = hmac.new(
         token.encode(), b"hermes-ssh-ownership-v2", hashlib.sha256
@@ -253,3 +254,46 @@ def test_ssh_ownership_endpoint_is_absent_without_owner_nonce(monkeypatch):
         headers={"X-Hermes-Session-Token": token},
     )
     assert response.status_code == 404
+
+
+def test_ssh_owner_nonce_rejects_path_traversal(tmp_path, monkeypatch):
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    monkeypatch.setattr(
+        web_server,
+        "sysconfig",
+        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+    )
+
+    web_server._apply_ssh_owner_nonce("../../../../evil")
+    try:
+        assert web_server._SSH_OWNER_NONCE is None
+        assert web_server._SSH_RUNTIME_MARKER is None
+        assert not (tmp_path / "evil").exists()
+        assert list(purelib.iterdir()) == []
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
+
+
+def test_ssh_owner_nonce_sweeps_dead_runtime_markers_only(tmp_path, monkeypatch):
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    dead = purelib / ".hermes-ssh-runtime-fedcba9876543210"
+    dead.write_text("pid=4194304\n", encoding="utf-8")
+    live = purelib / ".hermes-ssh-runtime-aa00000000000001"
+    live.write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        web_server,
+        "sysconfig",
+        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+    )
+
+    web_server._apply_ssh_owner_nonce("0123456789abcdef")
+    try:
+        current = purelib / ".hermes-ssh-runtime-0123456789abcdef"
+        assert current.is_file()
+        assert not dead.exists()
+        assert live.is_file()
+        assert web_server._SSH_RUNTIME_MARKER == str(current)
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
