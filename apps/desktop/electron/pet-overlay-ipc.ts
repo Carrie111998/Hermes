@@ -1,6 +1,8 @@
 // IPC surface for the pop-out pet overlay (mascot window). Extracted from
 // main.ts; window handles stay injected because main.ts owns their lifecycle.
-import { type BrowserWindow, ipcMain } from 'electron'
+import { type BrowserWindow, ipcMain, screen } from 'electron'
+
+import { enumerateWindowsFrontToBack, enumerationFailed } from './window-below'
 
 export interface PetOverlayIpcDeps {
   getMainWindow: () => BrowserWindow | null
@@ -48,6 +50,44 @@ export function registerPetOverlayIpc({
     closePetOverlay()
 
     return { ok: true }
+  })
+  // Native roam geometry for the display currently containing the pet. Window
+  // enumeration is already shared with read_window_below and the HUD; expose
+  // bounds only (never app names, titles, or pixels). If the platform cannot
+  // enumerate other apps, an empty list leaves the work-area floor available.
+  ipcMain.handle('hermes:pet-overlay:roam-environment', async () => {
+    const petOverlayWindow = getPetOverlayWindow()
+
+    if (!petOverlayWindow || petOverlayWindow.isDestroyed()) {
+      return null
+    }
+
+    const workArea = screen.getDisplayMatching(petOverlayWindow.getBounds()).workArea
+    const enumerated = await enumerateWindowsFrontToBack(process.pid, false)
+
+    if (enumerationFailed(enumerated)) {
+      return { windows: [], workArea }
+    }
+
+    const right = workArea.x + workArea.width
+    const bottom = workArea.y + workArea.height
+
+    const windows = enumerated
+      .filter(({ bounds, pid }) => {
+        if (pid === process.pid || bounds.width <= 0 || bounds.height <= 0) {
+          return false
+        }
+
+        return (
+          bounds.x < right &&
+          bounds.x + bounds.width > workArea.x &&
+          bounds.y < bottom &&
+          bounds.y + bounds.height > workArea.y
+        )
+      })
+      .map(({ bounds }) => bounds)
+
+    return { windows, workArea }
   })
   // Drag/resize: the overlay reports new absolute screen bounds (it already knows
   // the pointer's screen coords). Drag keeps the size constant; the wheel-to-scale

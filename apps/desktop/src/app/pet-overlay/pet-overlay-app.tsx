@@ -3,10 +3,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { PetHeartField, playVibeHearts } from '@/components/chat/vibe-hearts'
 import { PetBubble } from '@/components/pet/pet-bubble'
-import { PetSprite } from '@/components/pet/pet-sprite'
+import { PetSprite, roamWalkRow } from '@/components/pet/pet-sprite'
+import { usePetOverlayRoam } from '@/components/pet/use-pet-overlay-roam'
 import { type PetZoomAnchor, usePetZoomGesture } from '@/components/pet/use-pet-zoom-gesture'
 import { Mail } from '@/lib/icons'
-import { $petActivity, $petInfo, setPetInfo } from '@/store/pet'
+import { $petActivity, $petAtRest, $petInfo, $petRoamDir, setPetInfo } from '@/store/pet'
 import { overlayWindowSize } from '@/store/pet-overlay'
 import { setAwaitingResponse, setBusy } from '@/store/session'
 
@@ -62,8 +63,11 @@ interface DragState {
 
 export function PetOverlayApp() {
   const info = useStore($petInfo)
+  const atRest = useStore($petAtRest)
+  const roamDir = useStore($petRoamDir)
   const [composerOpen, setComposerOpen] = useState(false)
   const [draft, setDraft] = useState('')
+  const [roamEnabled, setRoamEnabled] = useState(false)
   // Mirrored from the main renderer: a finish landed while you were away.
   const [unread, setUnread] = useState(false)
 
@@ -95,6 +99,7 @@ export function PetOverlayApp() {
       setBusy(Boolean(payload.busy))
       setAwaitingResponse(Boolean(payload.awaiting))
       setUnread(Boolean(payload.unread))
+      setRoamEnabled(Boolean(payload.roam))
 
       // Play a reaction on a new id (ignore the first sync, which just primes it).
       const reaction = payload.reaction ?? null
@@ -313,6 +318,20 @@ export function PetOverlayApp() {
 
   usePetZoomGesture(petRef, onScale, Boolean(info.enabled && info.spritesheetBase64))
 
+  const isInteracting = useCallback(() => Boolean(dragRef.current || composerOpenRef.current), [])
+  const petW = (info.frameW ?? DEFAULT_FRAME_W) * (info.scale ?? DEFAULT_SCALE)
+  const petH = (info.frameH ?? DEFAULT_FRAME_H) * (info.scale ?? DEFAULT_SCALE)
+
+  usePetOverlayRoam({
+    enabled: Boolean(roamEnabled && atRest && info.enabled && info.spritesheetBase64 && !composerOpen),
+    isInteracting,
+    loopMs: info.loopMs ?? 1100,
+    petH,
+    petW
+  })
+
+  const walk = roamWalkRow(roamDir, info.stateRows)
+
   // Grow/shrink the OS overlay window to fit the pet at its current scale so the
   // sprite is never cropped — covers both the wheel gesture here and a scale
   // changed from the app's settings slider (pushed in as a state update). With a
@@ -432,8 +451,14 @@ export function PetOverlayApp() {
         <div style={{ marginBottom: 4 }}>
           <PetBubble />
         </div>
-        <div style={{ lineHeight: 0, position: 'relative' }}>
-          <PetSprite info={info} pauseWhenUnfocused={false} />
+        <div
+          style={{
+            lineHeight: 0,
+            position: 'relative',
+            transform: roamDir !== 0 && walk.mirror ? 'scaleX(-1)' : 'none'
+          }}
+        >
+          <PetSprite info={info} pauseWhenUnfocused={false} rowOverride={walk.row} />
 
           {/* Hearts on the popped-out pet — identical to in-window. */}
           <PetHeartField

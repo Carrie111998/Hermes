@@ -87,6 +87,10 @@ declare global {
         setIgnoreMouse: (ignore: boolean) => void
         setFocusable: (focusable: boolean) => void
         pushState: (payload: PetOverlayStatePayload) => void
+        roamEnvironment: () => Promise<{
+          windows: Array<{ height: number; width: number; x: number; y: number }>
+          workArea: { height: number; width: number; x: number; y: number }
+        } | null>
         control: (payload: PetOverlayControl) => void
         onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
         onControl: (callback: (payload: PetOverlayControl) => void) => () => void
