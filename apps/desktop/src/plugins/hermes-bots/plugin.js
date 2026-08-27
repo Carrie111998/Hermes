@@ -438,8 +438,9 @@ function focusedRosterOwner(owner) {
 
 /** Optional secondary navigation inside the Bots pane (group-chat rooms). */
 
-/** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
- *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
+/** Group-chat rooms: { [group]: { log, pending, watermarks, epoch, running } }.
+ *  Log + pending messages + watermarks persist via plugin storage;
+ *  epoch/running/runSequence are runtime-only. */
 const $groupChats = atom({})
 /** Group whose room view is open in the Bots pane (secondary navigation
  *  inside the pane; a normal row click returns to the roster). */
@@ -1049,6 +1050,7 @@ function durableGroupChatRooms(all = $groupChats.get()) {
     }
     durable[name] = {
       log: room.log,
+      pending: Array.isArray(room.pending) ? room.pending : [],
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
       stranded: room.stranded || {},
@@ -7002,6 +7004,7 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
 
       durable[name] = {
         log: room.log,
+        pending: Array.isArray(room.pending) ? room.pending : [],
         watermarks: room.watermarks,
         sessions: room.sessions || {},
         sessionOwners: room.sessionOwners || {},
@@ -7101,6 +7104,7 @@ async function disbandGroupChat(group, members) {
       if (name !== group && Array.isArray(room.log)) {
         durable[name] = {
           log: room.log,
+          pending: Array.isArray(room.pending) ? room.pending : [],
           watermarks: room.watermarks,
           sessions: room.sessions || {},
           sessionOwners: room.sessionOwners || {},
@@ -8494,6 +8498,11 @@ async function runGroupChatRounds(group, members, thread) {
         return r
       })
 
+      // Busy sends stay outside the live log until the current drive settles,
+      // then advance FIFO. This avoids prompt.submit's busy redirect/interrupt
+      // policy and gives the UI a real, cancellable queue item meanwhile.
+      void drainQueuedGroupMessage(group, members)
+
       // #89545: the loop's harvest pass only ran at the top of each round of
       // an ACTIVE loop — a member whose turn timed out after the final round
       // stayed stranded until the user's NEXT send. Poll for the late reply
@@ -8545,11 +8554,111 @@ async function harvestStrandedUntilSettled(group, members, thread) {
   recordGroupActivity(group, { kind: 'failed', member: null, thread })
 }
 
-/** User send into a group room. `thread` continues that thread (its reply
- *  box); omitted/null mints a NEW thread — the main composer's Slack shape.
- *  Appends, bumps the room epoch (supersedes any running loop at its next
- *  member boundary), and starts the turn drive for the target thread.
- *  Returns the thread id the message landed in. */
+function runQueuedGroupMessage(group, members, queued) {
+  const roster = Array.isArray(members) && members.length ? members : ($groupChats.get()[group] || {}).members || []
+
+  if (!queued || !roster.length) {
+    return false
+  }
+
+  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
+  const sent = appendGroupChatEntry(group, { kind: 'user', name: 'You' }, queued.text, queued.thread, queued.images)
+
+  updateGroupChat(group, room => {
+    room.pending = (room.pending || []).filter(item => item.id !== queued.id)
+    room.members = durableGroupChatMembers(roster)
+    room.epoch = (room.epoch || 0) + 1
+    room.runSequence = (room.runSequence || 0) + 1
+    room.running = true
+    room.holds = applyGroupHoldDirective(
+      room.holds,
+      parseGroupChatMentions(queued.text, roster),
+      queued.text,
+      { at: sent?.at, byMessageId: sent?.id, thread: queued.thread },
+      roster.map(member => groupMemberKey(member))
+    )
+    return room
+  })
+
+  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: queued.thread })
+  void runGroupChatRounds(group, roster, queued.thread).catch(() => {
+    updateGroupChat(group, room => {
+      room.running = false
+      room.turn = null
+      return room
+    })
+    void drainQueuedGroupMessage(group, roster)
+  })
+  return true
+}
+
+/** Start the oldest queued send once no drive owns the room. Exactly one
+ * caller can win because the atom mutation and `running = true` are
+ * synchronous on the renderer thread. */
+function drainQueuedGroupMessage(group, members = null) {
+  const room = $groupChats.get()[group] || {}
+  const next = Array.isArray(room.pending) ? room.pending[0] : null
+
+  if (room.running || !next) {
+    return false
+  }
+
+  return runQueuedGroupMessage(group, members, next)
+}
+
+function cancelQueuedGroupMessage(group, messageId) {
+  const room = $groupChats.get()[group]
+
+  if (!room || !(room.pending || []).some(item => item.id === messageId)) {
+    return false
+  }
+
+  updateGroupChat(group, current => {
+    current.pending = current.pending.filter(item => item.id !== messageId)
+    return current
+  })
+  return true
+}
+
+function keepWaitingForQueuedGroupMessage(group, messageId) {
+  const room = $groupChats.get()[group]
+
+  if (!room || !(room.pending || []).some(item => item.id === messageId)) {
+    return false
+  }
+
+  updateGroupChat(group, current => {
+    current.pending = current.pending.map(item =>
+      item.id === messageId ? { ...item, decisionAt: Date.now() } : item
+    )
+    return current
+  })
+  return true
+}
+
+/** Stop the live member, then promote one selected queued send. Preserve
+ * pre-existing user holds: stopGroupThread's temporary all-member holds exist
+ * only long enough for the stale poll loop to observe cancellation. */
+async function interruptForQueuedGroupMessage(group, messageId, members = null) {
+  const room = $groupChats.get()[group] || {}
+  const queued = (room.pending || []).find(item => item.id === messageId)
+
+  if (!queued) {
+    return false
+  }
+
+  const priorHolds = { ...(room.holds || {}) }
+  const roster = Array.isArray(members) && members.length ? members : room.members || []
+  await stopGroupThread(group, queued.thread, roster)
+  updateGroupChat(group, current => {
+    current.holds = priorHolds
+    return current
+  })
+  return runQueuedGroupMessage(group, roster, queued)
+}
+
+/** User send into a group room. A busy room stores the send in a durable FIFO
+ * instead of submitting into the member's already-live gateway session. */
 function sendToGroupChat(group, members, text, thread, images) {
   const trimmed = String(text || '').trim()
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
@@ -8559,56 +8668,25 @@ function sendToGroupChat(group, members, text, thread, images) {
   }
 
   const target = thread || mintGroupThreadId()
+  const room = $groupChats.get()[group] || {}
+  const queued = {
+    id: groupChatEntryId(),
+    at: Date.now(),
+    text: trimmed,
+    thread: target,
+    ...(attached.length ? { images: attached } : {}),
+    queuedBehindRun: Math.max(1, Number(room.runSequence || 1))
+  }
 
-  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  // Refresh the durable room roster on every send. This backfills rooms made
-  // by older Desktop builds and keeps the gateway mirror complete even when
-  // members overlap across multiple groups.
-  updateGroupChat(group, room => {
-    room.members = durableGroupChatMembers(members)
-    return room
-  })
-  const sent = appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
-
-  const wasRunning = ($groupChats.get()[group] || {}).running === true
-
-  updateGroupChat(group, room => {
-    room.epoch = (room.epoch || 0) + 1
-    room.running = true
-    // #93129: user text is the ONLY input that changes member holds. An
-    // explicit "stop @member" sets a sticky hold; "@member resume" (or
-    // @all resume, or any direct non-stop mention of the held member)
-    // releases it. Bot replies never flow through this function.
-    room.holds = applyGroupHoldDirective(
-      room.holds,
-      parseGroupChatMentions(trimmed, members),
-      trimmed,
-      { at: sent?.at, byMessageId: sent?.id, thread: target },
-      members.map(member => groupMemberKey(member))
-    )
-    return room
-  })
-
-  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
-
-  if (!wasRunning) {
-    void runGroupChatRounds(group, members, target).catch(() => {
-      updateGroupChat(group, r => {
-        r.running = false
-        return r
-      })
+  if (room.running) {
+    updateGroupChat(group, current => {
+      current.members = durableGroupChatMembers(members)
+      current.pending = [...(current.pending || []), queued]
+      return current
     })
+    recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
   } else {
-    // A loop is live; it bails at its next boundary. Chain the fresh loop
-    // after a short settle so exactly one drive owns the room.
-    setTimeout(() => {
-      void runGroupChatRounds(group, members, target).catch(() => {
-        updateGroupChat(group, r => {
-          r.running = false
-          return r
-        })
-      })
-    }, 250)
+    runQueuedGroupMessage(group, members, queued)
   }
 
   return target
@@ -13233,6 +13311,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
+  const pendingQueue = Array.isArray(room.pending) ? room.pending : []
+  const [queueNow, setQueueNow] = useState(() => Date.now())
   const composerKey = groupComposerDraftKey(group, room)
   const composerKeyRef = useRef(composerKey)
   const [composerDraft, setComposerDraft] = useState(() => groupComposerDraftSnapshot(composerKey))
@@ -13297,6 +13377,15 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // already near the bottom, so reading history is never yanked away.
   const bottomSentinelRef = useRef(null)
   const stickToBottomRef = useRef(true)
+
+  useEffect(() => {
+    if (!pendingQueue.length) {
+      return undefined
+    }
+
+    const timer = setInterval(() => setQueueNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [pendingQueue.length])
 
   useEffect(() => {
     const sentinel = bottomSentinelRef.current
@@ -13479,6 +13568,20 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const stopRoomRun = async () => {
     await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
     host.notify({ kind: 'success', message: `Stopped ${group} — remaining turns are held until you resume` })
+  }
+
+  const cancelQueued = queued => {
+    if (!cancelQueuedGroupMessage(group, queued.id)) {
+      host.notifyError?.(new Error('queued message not found'), 'That queued message is no longer waiting')
+    }
+  }
+
+  const interruptQueued = async queued => {
+    const promoted = await interruptForQueuedGroupMessage(group, queued.id, memberDescriptors())
+
+    if (!promoted) {
+      host.notifyError?.(new Error('queued message not found'), 'That queued message is no longer waiting')
+    }
   }
 
   const activityPanel = jsxs('div', {
@@ -13987,6 +14090,53 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             ...roomClarifies.map(entry =>
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
+            ...pendingQueue.map(queued => {
+              const waitedMs = Math.max(0, queueNow - Number(queued.at || queueNow))
+              const decisionAge = Math.max(0, queueNow - Number(queued.decisionAt || queued.at || queueNow))
+              const overdue = decisionAge >= 60_000
+
+              return jsxs('div', {
+                className:
+                  'grid gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#181818) px-2 py-1.5 text-[0.7rem]',
+                children: [
+                  jsxs('div', {
+                    className: 'flex items-center gap-1.5',
+                    children: [
+                      jsx(Codicon, { name: 'clock', className: 'shrink-0 text-(--ui-accent)' }),
+                      jsx('span', {
+                        className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+                        children: `Queued — room agent busy (run #${queued.queuedBehindRun || 1}) · ${Math.floor(waitedMs / 1000)}s`
+                      }),
+                      jsx('button', {
+                        type: 'button',
+                        className: 'shrink-0 text-(--ui-accent) hover:underline',
+                        onClick: () => cancelQueued(queued),
+                        children: 'Cancel'
+                      })
+                    ]
+                  }),
+                  overdue
+                    ? jsxs('div', {
+                        className: 'flex items-center justify-end gap-2 text-[0.65rem]',
+                        children: [
+                          jsx('button', {
+                            type: 'button',
+                            className: 'text-(--ui-accent) hover:underline',
+                            onClick: () => void interruptQueued(queued),
+                            children: 'Interrupt & send'
+                          }),
+                          jsx('button', {
+                            type: 'button',
+                            className: 'text-(--ui-text-tertiary) hover:text-foreground',
+                            onClick: () => keepWaitingForQueuedGroupMessage(group, queued.id),
+                            children: 'Keep waiting'
+                          })
+                        ]
+                      })
+                    : null
+                ]
+              }, `queued:${queued.id}`)
+            }),
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
@@ -15743,6 +15893,7 @@ export default {
                   // Pre-thread entries get synthetic thread ids on hydrate so
                   // every UI/engine path can assume entry.thread exists.
                   log: assignLegacyThreads(room.log),
+                  pending: Array.isArray(room.pending) ? room.pending : [],
                   watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
@@ -15798,6 +15949,11 @@ export default {
           // empty overwrite and then rendering an empty conversation.
           await pullGroupChatServerState().catch(() => false)
           scheduleGroupChatServerSync($groupChats.get())
+          for (const [roomName, room] of Object.entries($groupChats.get())) {
+            if (!room.running && Array.isArray(room.pending) && room.pending.length) {
+              void drainQueuedGroupMessage(roomName, room.members)
+            }
+          }
         })
         .catch(() => undefined)
     } catch {

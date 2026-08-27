@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, drainQueuedGroupMessage, cancelQueuedGroupMessage, keepWaitingForQueuedGroupMessage, interruptForQueuedGroupMessage, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -341,6 +341,76 @@ test('delta injection: a second user send only feeds members the NEW messages', 
   const second = prompts.slice(firstCount).find(p => p.prompt.includes('second message'))
   assert.ok(second, 'second turn ran')
   assert.equal(second.prompt.includes('first message'), false, 'first message was already seen — not re-injected')
+})
+
+test('a send behind a busy room is a durable cancellable queue item, not a live-log submit', () => {
+  const gc = load(() => '(pass)')
+  gc.updateGroupChat('Busy', room => {
+    room.running = true
+    room.runSequence = 7
+    room.members = MEMBERS
+    return room
+  })
+
+  const thread = gc.sendToGroupChat('Busy', MEMBERS, 'wait behind the current turn')
+  const queued = gc.$groupChats.get().Busy.pending[0]
+
+  assert.equal(gc.$groupChats.get().Busy.log.length, 0, 'busy send never reaches the live delta')
+  assert.equal(queued.thread, thread)
+  assert.equal(queued.queuedBehindRun, 7)
+  assert.equal(gc.storageWrites.get('group-chats').Busy.pending.length, 1, 'queue survives a window reload')
+  assert.equal(gc.cancelQueuedGroupMessage('Busy', 'missing'), false, 'stale cancel is honest')
+  assert.equal(gc.$groupChats.get().Busy.pending.length, 1, 'failed cancel removes nothing')
+  assert.equal(gc.keepWaitingForQueuedGroupMessage('Busy', queued.id), true)
+  assert.ok(gc.$groupChats.get().Busy.pending[0].decisionAt >= queued.at)
+  assert.equal(gc.cancelQueuedGroupMessage('Busy', queued.id), true)
+  assert.equal(gc.$groupChats.get().Busy.pending.length, 0)
+})
+
+test('a settled room automatically drains queued messages in FIFO order', async () => {
+  const gc = load(() => '(pass)')
+  const roster = [{ name: 'research', title: '' }]
+  gc.updateGroupChat('FIFO', room => {
+    room.running = true
+    room.members = roster
+    return room
+  })
+  gc.sendToGroupChat('FIFO', roster, 'first queued')
+  gc.sendToGroupChat('FIFO', roster, 'second queued')
+  gc.updateGroupChat('FIFO', room => {
+    room.running = false
+    return room
+  })
+
+  assert.equal(gc.drainQueuedGroupMessage('FIFO'), true)
+  for (let i = 0; i < 200 && ((gc.$groupChats.get().FIFO || {}).running || (gc.$groupChats.get().FIFO || {}).pending?.length); i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  const userText = roomLog(gc, 'FIFO').filter(entry => entry.from.kind === 'user').map(entry => entry.text)
+  assert.equal(JSON.stringify(userText), JSON.stringify(['first queued', 'second queued']))
+  assert.equal(gc.$groupChats.get().FIFO.pending.length, 0)
+})
+
+test('interrupt-and-send promotes only the selected queue item and interrupts the live member', async () => {
+  const gc = load(() => '(pass)')
+  const roster = [{ name: 'research', title: '' }]
+  gc.updateGroupChat('Interrupt', room => {
+    room.running = true
+    room.turn = 'research'
+    room.runSequence = 2
+    room.sessions = { research: 'live-research-session' }
+    room.members = roster
+    return room
+  })
+  gc.sendToGroupChat('Interrupt', roster, 'send this now')
+  gc.sendToGroupChat('Interrupt', roster, 'leave this queued')
+  const [selected, waiting] = gc.$groupChats.get().Interrupt.pending
+
+  assert.equal(await gc.interruptForQueuedGroupMessage('Interrupt', selected.id), true)
+  assert.equal(roomLog(gc, 'Interrupt').some(entry => entry.text === 'send this now'), true)
+  assert.equal(gc.$groupChats.get().Interrupt.pending.some(item => item.id === waiting.id), true)
+  assert.equal(await gc.interruptForQueuedGroupMessage('Interrupt', 'missing'), false)
 })
 
 test('concurrent groups sharing one member keep sessions, deltas, and context isolated', async () => {
@@ -532,11 +602,12 @@ test('same-name group dedup reserves suffix length at the 64-char cap', () => {
   assert.equal(next, `${base.slice(0, 62)} 3`)
 })
 
-test('roomId persists with the room record and survives disband of other rooms', async () => {
+test('roomId and pending sends survive disband of another room', async () => {
   const gc = load(() => '(pass)')
 
   gc.updateGroupChat('Keep', r => {
     r.roomId = 'r-keep'
+    r.pending = [{ id: 'queued-1', at: 1, text: 'later', thread: 't1', queuedBehindRun: 1 }]
     return r
   })
   gc.updateGroupChat('Gone', r => {
@@ -548,6 +619,7 @@ test('roomId persists with the room record and survives disband of other rooms',
 
   const durable = gc.storageWrites.get('group-chats')
   assert.equal(durable.Keep.roomId, 'r-keep', 'roomId survives disband of another room')
+  assert.equal(durable.Keep.pending[0].id, 'queued-1', 'another room mutation cannot drop the queue')
   assert.ok(!('Gone' in durable), 'disbanded room not persisted')
 })
 
