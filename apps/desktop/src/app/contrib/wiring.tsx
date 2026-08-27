@@ -951,15 +951,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
     onLoadMoreSessions: loadMoreSessions,
-    onManageCronJob: (jobId, profile) => {
-      setCronFocusJobId(jobId, profile)
+    onManageCronJob: (jobId, profile, connectionId) => {
+      setCronFocusJobId(jobId, profile, connectionId)
       navigate(CRON_ROUTE)
     },
     onNavigate: selectSidebarItem,
     onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
     onNewSessionSplit: dir => void openNewSessionTile(dir),
-    onOpenCronRun: (jobId, outputId, profile) => {
-      setCronFocusOutput(jobId, outputId, profile)
+    onOpenCronRun: (jobId, outputId, profile, connectionId) => {
+      setCronFocusOutput(jobId, outputId, profile, connectionId)
       navigate(CRON_ROUTE)
     },
     onPasteClipboardImage: opts => composer.pasteClipboardImage(opts),
@@ -1002,8 +1002,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onThreadMessagesChange: handleThreadMessagesChange,
     onToggleSelectedPin: toggleSelectedPin,
     onTranscribeAudio: transcribeVoiceAudio,
-    onTriggerCronJob: (jobId, profile) =>
-      triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope, profile)
+    onTriggerCronJob: (jobId, profile, connectionId) =>
+      triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope, {
+        connectionId,
+        profile
+      })
         .then(() => undefined)
         .catch(() => undefined),
     getGateway: () => gatewayRef.current,

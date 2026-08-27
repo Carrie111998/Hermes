@@ -46,7 +46,7 @@ describe('CronJobSidebarRuns', () => {
     fireEvent.click(await screen.findByRole('button'))
 
     expect(getCronJobOutputs).toHaveBeenCalledWith('report-job', 5, 'worker_alpha')
-    expect(onOpenOutput).toHaveBeenCalledWith('report-job', '2026-08-11_09-00-00', 'worker_alpha')
+    expect(onOpenOutput).toHaveBeenCalledWith('report-job', '2026-08-11_09-00-00', 'worker_alpha', undefined)
     expect(getCronJobRuns).not.toHaveBeenCalled()
   })
 
@@ -71,18 +71,16 @@ describe('CronJobSidebarRuns', () => {
     const onOpenSession = vi.fn()
 
     render(
-      <CronJobSidebarRuns
-        jobId="report-job"
-        noAgent={false}
-        onOpenOutput={vi.fn()}
-        onOpenSession={onOpenSession}
-      />
+      <CronJobSidebarRuns jobId="report-job" noAgent={false} onOpenOutput={vi.fn()} onOpenSession={onOpenSession} />
     )
 
     fireEvent.click(await screen.findByRole('button'))
 
     expect(getCronJobRuns).toHaveBeenCalledWith('report-job', 5, undefined)
-    expect(onOpenSession).toHaveBeenCalledWith('cron_report-job_20260811_090000', undefined)
+    expect(onOpenSession).toHaveBeenCalledWith(
+      'cron_report-job_20260811_090000',
+      expect.objectContaining({ connection_id: undefined, profile: undefined })
+    )
     expect(getCronJobOutputs).not.toHaveBeenCalled()
   })
 
@@ -120,7 +118,10 @@ describe('CronJobSidebarRuns', () => {
     fireEvent.click(await screen.findByRole('button'))
 
     expect(getCronJobRuns).toHaveBeenCalledWith('shared-job', 5, 'worker_alpha')
-    expect(onOpenSession).toHaveBeenCalledWith('cron_shared-job_20260811_090000', 'worker_alpha')
+    expect(onOpenSession).toHaveBeenCalledWith(
+      'cron_shared-job_20260811_090000',
+      expect.objectContaining({ connection_id: undefined, profile: 'worker_alpha' })
+    )
   })
 
   it('falls back to durable output when an agent run has no stored session', async () => {
@@ -147,7 +148,7 @@ describe('CronJobSidebarRuns', () => {
 
     fireEvent.click(await screen.findByRole('button'))
 
-    expect(onOpenOutput).toHaveBeenCalledWith('report-job', '2026-08-11_09-00-00', 'worker_alpha')
+    expect(onOpenOutput).toHaveBeenCalledWith('report-job', '2026-08-11_09-00-00', 'worker_alpha', undefined)
   })
 
   it('does not describe a failed output request as an empty history', async () => {

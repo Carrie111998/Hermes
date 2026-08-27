@@ -23,7 +23,7 @@ import {
 // show up" bug), the counterpart to the backend-action-helper fix in
 // hermes-profile-scope.test.ts.
 describe('cron helpers are profile-scoped', () => {
-  const api = vi.fn(async (_req: { path: string; profile?: string }) => ({}) as never)
+  const api = vi.fn(async (_req: { connectionId?: null | string; path: string; profile?: string }) => ({}) as never)
 
   beforeEach(() => {
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = { api }
@@ -151,5 +151,31 @@ describe('cron helpers are profile-scoped', () => {
 
     void deleteCronJob('shared-job', 'worker_alpha')
     expect(api.mock.calls.at(-1)?.[0].path).toBe('/api/cron/jobs/shared-job?profile=worker_alpha')
+  })
+
+  it('pins same-id A/B job and output reads to their explicit origin', async () => {
+    api.mockImplementation(
+      async request => [{ enabled: true, id: 'shared-job', profile: 'default', source: request.connectionId }] as never
+    )
+
+    const jobsA = await getCronJobs({ connectionId: 'connection-a', profile: 'default' })
+    const jobsB = await getCronJobs({ connectionId: 'connection-b', profile: 'default' })
+
+    expect(jobsA[0]).toMatchObject({ connection_id: 'connection-a', id: 'shared-job' })
+    expect(jobsB[0]).toMatchObject({ connection_id: 'connection-b', id: 'shared-job' })
+
+    void getCronJobOutput('shared-job', 'same-output', { connectionId: 'connection-a', profile: 'default' })
+    void getCronJobOutput('shared-job', 'same-output', { connectionId: 'connection-b', profile: 'default' })
+
+    expect(api.mock.calls.at(-2)?.[0]).toMatchObject({
+      connectionId: 'connection-a',
+      path: '/api/cron/jobs/shared-job/outputs/same-output?profile=default',
+      profile: 'default'
+    })
+    expect(api.mock.calls.at(-1)?.[0]).toMatchObject({
+      connectionId: 'connection-b',
+      path: '/api/cron/jobs/shared-job/outputs/same-output?profile=default',
+      profile: 'default'
+    })
   })
 })

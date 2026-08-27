@@ -31,8 +31,8 @@ describe('triggerAndRefreshCronJobs', () => {
 
     const result = await triggerAndRefreshCronJobs('deleted-one-shot', 'work')
 
-    expect(triggerCronJob).toHaveBeenCalledWith('deleted-one-shot', 'work')
-    expect(getCronJobs).toHaveBeenCalledWith('work')
+    expect(triggerCronJob).toHaveBeenCalledWith('deleted-one-shot', { connectionId: null, profile: 'work' })
+    expect(getCronJobs).toHaveBeenCalledWith({ connectionId: null, profile: 'work' })
     expect(result).toEqual({ jobs: authoritative, refreshError: null, stale: false })
   })
 
@@ -53,7 +53,7 @@ describe('triggerAndRefreshCronJobs', () => {
     await triggerAndRefreshCronJobs('shared-job', 'all', 'worker_alpha')
 
     expect(triggerCronJob).toHaveBeenCalledWith('shared-job', 'worker_alpha')
-    expect(getCronJobs).toHaveBeenCalledWith('all')
+    expect(getCronJobs).toHaveBeenCalledWith({ connectionId: null, profile: 'all' })
   })
 
   it('still rejects when the trigger itself fails', async () => {

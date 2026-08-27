@@ -8,9 +8,14 @@ import type { CronJob } from '@/types/hermes'
 export const $cronJobs = atom<CronJob[]>([])
 
 /** Stable owner-qualified identity for aggregated cross-profile job lists. */
-export function cronJobIdentity(job: Pick<CronJob, 'id' | 'profile'>): string {
-  return JSON.stringify([job.profile?.trim() || 'default', job.id])
+export function cronJobIdentity(job: Pick<CronJob, 'connection_id' | 'id' | 'profile'>): string {
+  return JSON.stringify([job.connection_id?.trim() || '', job.profile?.trim() || 'default', job.id])
 }
+
+export const cronJobOwner = (job: Pick<CronJob, 'connection_id' | 'profile'>) => ({
+  connectionId: job.connection_id ?? null,
+  profile: job.profile
+})
 
 export interface CronJobsRequest {
   generation: number
@@ -105,16 +110,17 @@ export function removeCronJobForOwner(jobs: CronJob[], target: CronJob): CronJob
 // cron overlay, which reads it once to select + scroll to that job. Cleared
 // after consumption so re-opening cron normally doesn't re-focus a stale job.
 export interface CronFocusTarget {
+  connectionId?: null | string
   jobId: string
   outputId?: string
   profile?: string
 }
 
 export const $cronFocus = atom<CronFocusTarget | null>(null)
-export const setCronFocusJobId = (id: null | string, profile?: string) =>
-  $cronFocus.set(id ? { jobId: id, profile } : null)
-export const setCronFocusOutput = (jobId: string, outputId: string, profile?: string) =>
-  $cronFocus.set({ jobId, outputId, profile })
+export const setCronFocusJobId = (id: null | string, profile?: string, connectionId?: null | string) =>
+  $cronFocus.set(id ? { connectionId, jobId: id, profile } : null)
+export const setCronFocusOutput = (jobId: string, outputId: string, profile?: string, connectionId?: null | string) =>
+  $cronFocus.set({ connectionId, jobId, outputId, profile })
 
 // Shell-owned one-shot intent for stores without router context. Do not set a
 // focus id here: the cron overlay's first fetch may not have loaded that row.

@@ -303,9 +303,9 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
-  onManageCronJob: (jobId: string, profile?: string) => void
-  onOpenCronRun: (jobId: string, outputId: string, profile?: string) => void
-  onTriggerCronJob: (jobId: string, profile?: string) => Promise<void>
+  onManageCronJob: (jobId: string, profile?: string, connectionId?: null | string) => void
+  onOpenCronRun: (jobId: string, outputId: string, profile?: string, connectionId?: null | string) => void
+  onTriggerCronJob: (jobId: string, profile?: string, connectionId?: null | string) => Promise<void>
 }
 
 export function ChatSidebar({

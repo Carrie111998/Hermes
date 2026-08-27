@@ -51,7 +51,14 @@ import { AlertTriangle } from '@/lib/icons'
 import { requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import { $cronFocus, $cronJobs, cronJobIdentity, invalidateCronJobsRequests, setCronFocusJobId } from '@/store/cron'
+import {
+  $cronFocus,
+  $cronJobs,
+  cronJobIdentity,
+  cronJobOwner,
+  invalidateCronJobsRequests,
+  setCronFocusJobId
+} from '@/store/cron'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $profileScope, ALL_PROFILES } from '@/store/profile'
@@ -389,7 +396,8 @@ export function CronView({ onClose, setStatusbarItemGroup: _setStatusbarItemGrou
     const match = jobs.find(
       job =>
         (job.id === focusTarget.jobId || jobName(job) === focusTarget.jobId) &&
-        (!focusTarget.profile || job.profile === focusTarget.profile)
+        (!focusTarget.profile || job.profile === focusTarget.profile) &&
+        (focusTarget.connectionId === undefined || (job.connection_id ?? null) === focusTarget.connectionId)
     )
 
     if (match) {
@@ -480,7 +488,7 @@ export function CronView({ onClose, setStatusbarItemGroup: _setStatusbarItemGrou
       const isPaused = jobState(job) === 'paused'
 
       const { refreshError, stale } = await mutateAndRefreshCronJobs(profile, () =>
-        isPaused ? resumeCronJob(job.id, job.profile) : pauseCronJob(job.id, job.profile)
+        isPaused ? resumeCronJob(job.id, cronJobOwner(job)) : pauseCronJob(job.id, cronJobOwner(job))
       )
 
       if (stale) {
@@ -515,7 +523,7 @@ export function CronView({ onClose, setStatusbarItemGroup: _setStatusbarItemGrou
     try {
       const run = await controller.run(
         key,
-        () => triggerAndRefreshCronJobs(job.id, viewProfile, job.profile),
+        () => triggerAndRefreshCronJobs(job.id, viewProfile, cronJobOwner(job)),
         () => notify({ kind: 'info', title: c.triggerNow, message: truncate(jobTitle(job), 60) })
       )
 
@@ -553,7 +561,7 @@ export function CronView({ onClose, setStatusbarItemGroup: _setStatusbarItemGrou
     }
 
     const { refreshError, stale } = await mutateAndRefreshCronJobs(profile, () =>
-      deleteCronJob(pendingDelete.id, pendingDelete.profile)
+      deleteCronJob(pendingDelete.id, cronJobOwner(pendingDelete))
     )
 
     if (stale) {
@@ -605,7 +613,7 @@ export function CronView({ onClose, setStatusbarItemGroup: _setStatusbarItemGrou
         refreshError,
         stale
       } = await mutateAndRefreshCronJobs(profile, () =>
-        updateCronJob(editor.job.id, cronEditorUpdates(values, { scriptOnlyJob }), editor.job.profile)
+        updateCronJob(editor.job.id, cronEditorUpdates(values, { scriptOnlyJob }), cronJobOwner(editor.job))
       )
 
       if (stale || !updated) {
@@ -860,7 +868,13 @@ function CronJobDetail({
         </section>
       ) : null}
 
-      <CronJobRuns c={c} jobId={job.id} key={`${job.profile ?? ''}:${job.id}`} profile={job.profile} />
+      <CronJobRuns
+        c={c}
+        connectionId={job.connection_id}
+        jobId={job.id}
+        key={cronJobIdentity(job)}
+        profile={job.profile}
+      />
     </PanelDetail>
   )
 }
@@ -882,7 +896,17 @@ function formatRunTime(seconds?: null | number): string {
 const RUNS_POLL_INTERVAL_MS = 8000
 const RUNS_BACKSTOP_INTERVAL_MS = 60_000
 
-export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jobId: string; profile?: string }) {
+export function CronJobRuns({
+  c,
+  connectionId,
+  jobId,
+  profile
+}: {
+  c: Translations['cron']
+  connectionId?: null | string
+  jobId: string
+  profile?: string
+}) {
   const [runs, setRuns] = useState<null | CronJobOutput[]>(null)
   const [runsError, setRunsError] = useState(false)
   const [selectedOutputId, setSelectedOutputId] = useState<null | string>(null)
@@ -906,7 +930,7 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
     setOutputError(false)
     setOutputLoading(false)
     setFocusUnavailable(null)
-  }, [jobId, profile])
+  }, [connectionId, jobId, profile])
 
   const openOutput = useCallback(
     async (outputId: string) => {
@@ -919,7 +943,11 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
       setOutputLoading(true)
 
       try {
-        const detail = await getCronJobOutput(jobId, outputId, profile)
+        const detail = await getCronJobOutput(
+          jobId,
+          outputId,
+          connectionId === undefined ? profile : { connectionId, profile }
+        )
 
         if (outputRequestRef.current === requestId) {
           setOutput(detail.content)
@@ -934,7 +962,7 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
         }
       }
     },
-    [jobId, profile]
+    [connectionId, jobId, profile]
   )
 
   useEffect(() => {
@@ -944,7 +972,7 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
     const load = () => {
       const requestId = ++latestRequestId
 
-      return getCronJobOutputs(jobId, 20, profile)
+      return getCronJobOutputs(jobId, 20, connectionId === undefined ? profile : { connectionId, profile })
         .then(result => {
           if (!cancelled && requestId === latestRequestId) {
             setRunsError(false)
@@ -984,7 +1012,7 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
       document.removeEventListener('visibilitychange', onVisible)
     }
     // cronChangeTick: a fired run moves jobs.json bookkeeping → reload now.
-  }, [changeEventsAvailable, cronChangeTick, jobId, profile])
+  }, [changeEventsAvailable, connectionId, cronChangeTick, jobId, profile])
 
   useEffect(() => {
     if (
@@ -992,6 +1020,7 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
       runsError ||
       focusTarget?.jobId !== jobId ||
       (focusTarget.profile && focusTarget.profile !== profile) ||
+      (focusTarget.connectionId !== undefined && focusTarget.connectionId !== (connectionId ?? null)) ||
       !focusTarget.outputId
     ) {
       return
@@ -1009,7 +1038,7 @@ export function CronJobRuns({ c, jobId, profile }: { c: Translations['cron']; jo
     }
 
     setCronFocusJobId(null)
-  }, [focusTarget, jobId, openOutput, profile, runs, runsError])
+  }, [connectionId, focusTarget, jobId, openOutput, profile, runs, runsError])
 
   return (
     <div>

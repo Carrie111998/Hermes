@@ -845,6 +845,7 @@ export interface AnalyticsTotals {
 }
 
 export interface CronJob {
+  connection_id?: null | string
   deliver?: null | string
   enabled: boolean
   id: string

@@ -9,79 +9,98 @@ import type {
   SessionInfo
 } from '@/types/hermes'
 
-import { connectionScoped, hermesApi, profileScoped, STARTUP_REQUEST_TIMEOUT_MS } from './client'
+import {
+  connectionScoped,
+  getApiRequestConnection,
+  hermesApi,
+  profileScoped,
+  STARTUP_REQUEST_TIMEOUT_MS
+} from './client'
 
-// The cron trigger endpoint intentionally waits for the whole job so its
-// response reflects the persisted execution result. Agent jobs can run far
-// longer than the Electron fetch default; keep this override local to the one
-// synchronous long-operation endpoint rather than weakening all API timeouts.
 const CRON_TRIGGER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
-function ownerQuery(profile?: string): string {
-  return profile ? `?profile=${encodeURIComponent(profile)}` : ''
+export interface CronOwnerScope {
+  connectionId?: null | string
+  profile?: null | string
 }
 
-// Cron jobs are stored per-profile (<HERMES_HOME>/cron/jobs.json), and the
-// backend's list endpoint defaults to 'all'. Pass a concrete profile key to
-// list just that profile's jobs, or 'all' for the unified cross-profile view.
-// Omitting the arg keeps the legacy 'all' default for non-profile callers.
-// profileScoped() still rides along for backend-process routing.
-export function getCronJobs(profile?: string): Promise<CronJob[]> {
-  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+export type CronOwner = CronOwnerScope | string | undefined
 
-  return hermesApi<CronJob[]>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs${suffix}`,
+/** Resolve once at call entry. Object owners are authoritative (including
+ * explicit local/null); legacy strings retain the ambient gateway behavior. */
+function cronOwner(owner?: CronOwner): {
+  connectionId: null | string | undefined
+  profile: string | undefined
+  requestScope: { connectionId?: null | string; profile?: null | string }
+} {
+  if (owner && typeof owner === 'object') {
+    const profile = owner.profile?.trim() || undefined
+    const connectionId = owner.connectionId?.trim() || null
+
+    return { connectionId, profile, requestScope: { connectionId, profile: profile ?? null } }
+  }
+
+  return {
+    connectionId: getApiRequestConnection(),
+    profile: owner?.trim() || undefined,
+    requestScope: { ...profileScoped(), ...connectionScoped() }
+  }
+}
+
+function ownerQuery(scope: ReturnType<typeof cronOwner>, separator: '?' | '&' = '?'): string {
+  return scope.profile ? `${separator}profile=${encodeURIComponent(scope.profile)}` : ''
+}
+
+export async function getCronJobs(owner?: CronOwner): Promise<CronJob[]> {
+  const scope = cronOwner(owner)
+  const jobs = await hermesApi<CronJob[]>({
+    ...scope.requestScope,
+    path: `/api/cron/jobs${ownerQuery(scope)}`,
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
+
+  // The backend row is profile-qualified but the connection is a Desktop
+  // transport fact. Stamp it at the boundary so list identity and every later
+  // focus/read/mutation remain pinned to the backend that returned the row.
+  return Array.isArray(jobs) ? jobs.map(job => ({ ...job, connection_id: scope.connectionId ?? null })) : []
 }
 
-export function getCronJob(jobId: string, profile?: string): Promise<CronJob> {
+export function getCronJob(jobId: string, owner?: CronOwner): Promise<CronJob> {
+  const scope = cronOwner(owner)
   return hermesApi<CronJob>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${ownerQuery(profile)}`
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${ownerQuery(scope)}`
   })
 }
 
-export async function getCronJobRuns(jobId: string, limit = 20, profile?: string): Promise<SessionInfo[]> {
-  const owner = profile ? `&profile=${encodeURIComponent(profile)}` : ''
-
+export async function getCronJobRuns(jobId: string, limit = 20, owner?: CronOwner): Promise<SessionInfo[]> {
+  const scope = cronOwner(owner)
   const { runs } = await hermesApi<{ runs: SessionInfo[] }>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}${owner}`
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}${ownerQuery(scope, '&')}`
   })
 
   return runs ?? []
 }
 
-export async function getCronJobOutputs(jobId: string, limit = 20, profile?: string): Promise<CronJobOutput[]> {
-  const owner = profile ? `&profile=${encodeURIComponent(profile)}` : ''
-
+export async function getCronJobOutputs(jobId: string, limit = 20, owner?: CronOwner): Promise<CronJobOutput[]> {
+  const scope = cronOwner(owner)
   const { outputs } = await hermesApi<{ outputs: CronJobOutput[] }>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/outputs?limit=${limit}${owner}`
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/outputs?limit=${limit}${ownerQuery(scope, '&')}`
   })
 
   return outputs ?? []
 }
 
-export function getCronJobOutput(jobId: string, outputId: string, profile?: string): Promise<CronJobOutputDetail> {
-  const owner = profile ? `?profile=${encodeURIComponent(profile)}` : ''
-
+export function getCronJobOutput(jobId: string, outputId: string, owner?: CronOwner): Promise<CronJobOutputDetail> {
+  const scope = cronOwner(owner)
   return hermesApi<CronJobOutputDetail>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/outputs/${encodeURIComponent(outputId)}${owner}`
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/outputs/${encodeURIComponent(outputId)}${ownerQuery(scope)}`
   })
 }
 
-// The single source of truth for cron delivery targets (local + configured
-// gateways). Both the manual cron editor and the blueprint dialog use this so
-// they never offer a platform that isn't connected. Mirrors the dashboard.
 export async function getCronDeliveryTargets(): Promise<CronDeliveryTarget[]> {
   const { targets } = await hermesApi<{ targets: CronDeliveryTarget[] }>({
     ...profileScoped(),
@@ -92,74 +111,58 @@ export async function getCronDeliveryTargets(): Promise<CronDeliveryTarget[]> {
   return targets ?? []
 }
 
-export function createCronJob(body: CronJobCreatePayload, profile?: string): Promise<CronJob> {
-  return hermesApi<CronJob>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs${ownerQuery(profile)}`,
-    method: 'POST',
-    body
-  })
+export function createCronJob(body: CronJobCreatePayload, owner?: CronOwner): Promise<CronJob> {
+  const scope = cronOwner(owner)
+  return hermesApi<CronJob>({ ...scope.requestScope, path: `/api/cron/jobs${ownerQuery(scope)}`, method: 'POST', body })
 }
 
-export function updateCronJob(jobId: string, updates: CronJobUpdates, profile?: string): Promise<CronJob> {
+export function updateCronJob(jobId: string, updates: CronJobUpdates, owner?: CronOwner): Promise<CronJob> {
+  const scope = cronOwner(owner)
   return hermesApi<CronJob>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${ownerQuery(profile)}`,
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${ownerQuery(scope)}`,
     method: 'PUT',
     body: { updates }
   })
 }
 
-export function pauseCronJob(jobId: string, profile?: string): Promise<CronJob> {
+export function pauseCronJob(jobId: string, owner?: CronOwner): Promise<CronJob> {
+  const scope = cronOwner(owner)
   return hermesApi<CronJob>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause${ownerQuery(profile)}`,
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause${ownerQuery(scope)}`,
     method: 'POST'
   })
 }
 
-export function resumeCronJob(jobId: string, profile?: string): Promise<CronJob> {
+export function resumeCronJob(jobId: string, owner?: CronOwner): Promise<CronJob> {
+  const scope = cronOwner(owner)
   return hermesApi<CronJob>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume${ownerQuery(profile)}`,
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume${ownerQuery(scope)}`,
     method: 'POST'
   })
 }
 
-export function triggerCronJob(jobId: string, profile?: string): Promise<CronJob> {
+export function triggerCronJob(jobId: string, owner?: CronOwner): Promise<CronJob> {
+  const scope = cronOwner(owner)
   return hermesApi<CronJob>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger${ownerQuery(profile)}`,
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger${ownerQuery(scope)}`,
     method: 'POST',
     timeoutMs: CRON_TRIGGER_REQUEST_TIMEOUT_MS
   })
 }
 
-export function deleteCronJob(jobId: string, profile?: string): Promise<{ ok: boolean }> {
+export function deleteCronJob(jobId: string, owner?: CronOwner): Promise<{ ok: boolean }> {
+  const scope = cronOwner(owner)
   return hermesApi<{ ok: boolean }>({
-    ...profileScoped(),
-    ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${ownerQuery(profile)}`,
+    ...scope.requestScope,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${ownerQuery(scope)}`,
     method: 'DELETE'
   })
 }
 
-// Automation Blueprints — parameterized cron templates the backend serves from
-// cron/blueprint_catalog.py. getAutomationBlueprints returns the gallery
-// (deliver options already rewritten to this machine's configured gateways);
-// instantiateAutomationBlueprint fills the slots and creates a real cron job via
-// the same create_job path as createCronJob.
-//
-// Profile-scoping is intentionally asymmetric: the GET catalog is global (the
-// list endpoint takes no profile — only deliver options are rewritten from the
-// configured gateways), so it carries only the profileScoped() header for
-// routing. instantiate creates a real per-profile job, so it names the target
-// profile explicitly via ?profile=. This mirrors the dashboard's api.ts.
 export function getAutomationBlueprints(): Promise<{ blueprints: AutomationBlueprint[] }> {
   return hermesApi<{ blueprints: AutomationBlueprint[] }>({
     ...profileScoped(),

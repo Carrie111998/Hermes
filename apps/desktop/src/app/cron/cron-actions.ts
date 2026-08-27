@@ -1,4 +1,4 @@
-import { type CronJob, getApiRequestConnection, getCronJobs, triggerCronJob } from '@/hermes'
+import { type CronJob, type CronOwner, getApiRequestConnection, getCronJobs, triggerCronJob } from '@/hermes'
 import {
   beginCronJobsAction,
   beginCronJobsRequest,
@@ -18,13 +18,17 @@ export interface CronMutationRefreshResult<T> extends CronTriggerRefreshResult {
   value: T | null
 }
 
-function cronRequestScope(profile: string): string {
-  return `${getApiRequestConnection() ?? ''}\u0000${profile}`
+function cronRequestScope(profile: string, connectionId: null | string): string {
+  return `${connectionId ?? ''}\u0000${profile}`
 }
 
-async function refreshForGeneration(profile: string, request: CronJobsRequest): Promise<CronTriggerRefreshResult> {
+async function refreshForGeneration(
+  profile: string,
+  connectionId: null | string,
+  request: CronJobsRequest
+): Promise<CronTriggerRefreshResult> {
   try {
-    const jobs = await getCronJobs(profile)
+    const jobs = await getCronJobs({ connectionId, profile })
 
     if (!commitCronJobsRequest(request, jobs)) {
       return { jobs: null, refreshError: null, stale: true }
@@ -41,14 +45,16 @@ async function refreshForGeneration(profile: string, request: CronJobsRequest): 
 }
 
 export function refreshCronJobs(profile: string): Promise<CronTriggerRefreshResult> {
-  return refreshForGeneration(profile, beginCronJobsRequest(cronRequestScope(profile)))
+  const connectionId = getApiRequestConnection()
+  return refreshForGeneration(profile, connectionId, beginCronJobsRequest(cronRequestScope(profile, connectionId)))
 }
 
 export async function mutateAndRefreshCronJobs<T>(
   profile: string,
   mutate: () => Promise<T>
 ): Promise<CronMutationRefreshResult<T>> {
-  const scopeToken = beginCronJobsAction(cronRequestScope(profile))
+  const connectionId = getApiRequestConnection()
+  const scopeToken = beginCronJobsAction(cronRequestScope(profile, connectionId))
   let value: T
 
   try {
@@ -65,7 +71,11 @@ export async function mutateAndRefreshCronJobs<T>(
     return { jobs: null, refreshError: null, stale: true, value: null }
   }
 
-  const refreshed = await refreshCronJobs(profile)
+  const refreshed = await refreshForGeneration(
+    profile,
+    connectionId,
+    beginCronJobsRequest(cronRequestScope(profile, connectionId))
+  )
 
   if (!isCronJobsScopeCurrent(scopeToken)) {
     return { jobs: null, refreshError: null, stale: true, value: null }
@@ -90,10 +100,12 @@ export async function mutateAndRefreshCronJobs<T>(
 export async function triggerAndRefreshCronJobs(
   jobId: string,
   profile: 'all' | string,
-  ownerProfile?: string
+  owner?: CronOwner
 ): Promise<CronTriggerRefreshResult> {
-  const owner = ownerProfile ?? (profile === 'all' ? undefined : profile)
-  const { value: _value, ...result } = await mutateAndRefreshCronJobs(profile, () => triggerCronJob(jobId, owner))
+  const resolvedOwner = owner ?? (profile === 'all' ? undefined : { connectionId: getApiRequestConnection(), profile })
+  const { value: _value, ...result } = await mutateAndRefreshCronJobs(profile, () =>
+    triggerCronJob(jobId, resolvedOwner)
+  )
 
   return result
 }

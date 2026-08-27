@@ -48,6 +48,18 @@ describe('cron jobs request fencing', () => {
 })
 
 describe('cron job owner identity', () => {
+  it('keeps the same profile and job id on two connections distinct', () => {
+    const a = { connection_id: 'connection-a', id: 'shared-job', profile: 'default' }
+    const b = { connection_id: 'connection-b', id: 'shared-job', profile: 'default' }
+
+    expect(cronJobIdentity(a)).not.toBe(cronJobIdentity(b))
+    expect(removeCronJobForOwner([a, b] as never, a as never)).toEqual([b])
+    expect(replaceCronJobForOwner([a, b] as never, a as never, { ...a, state: 'paused' } as never)).toEqual([
+      { ...a, state: 'paused' },
+      b
+    ])
+  })
+
   it('keeps duplicate job ids in different profiles distinct', () => {
     expect(cronJobIdentity({ id: 'shared-job', profile: 'worker_alpha' })).not.toBe(
       cronJobIdentity({ id: 'shared-job', profile: 'worker_beta' })

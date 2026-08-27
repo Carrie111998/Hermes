@@ -14,11 +14,17 @@ import { useI18n } from '@/i18n'
 import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
-import { cronJobIdentity, removeCronJobForOwner, replaceCronJobForOwner, updateCronJobs } from '@/store/cron'
+import {
+  cronJobIdentity,
+  cronJobOwner,
+  removeCronJobForOwner,
+  replaceCronJobForOwner,
+  updateCronJobs
+} from '@/store/cron'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $selectedStoredSessionId } from '@/store/session'
-import type { CronJob } from '@/types/hermes'
+import type { CronJob, SessionInfo } from '@/types/hermes'
 
 import { jobState, jobTitle, STATE_DOT } from '../../cron/job-state'
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
@@ -70,6 +76,7 @@ interface CronSidebarRun {
   createdAt?: null | number
   id: string
   kind: 'output' | 'session'
+  session?: SessionInfo
 }
 
 interface SidebarCronJobsSectionProps {
@@ -77,13 +84,13 @@ interface SidebarCronJobsSectionProps {
   label: string
   max?: number
   // Open a durable no-agent output in the full Cron page.
-  onOpenOutput: (jobId: string, outputId: string, profile?: string) => void
+  onOpenOutput: (jobId: string, outputId: string, profile?: string, connectionId?: null | string) => void
   // Agent-backed jobs retain their real conversation-session navigation.
-  onOpenSession: (sessionId: string, profile?: string) => void
+  onOpenSession: (sessionId: string, owner?: SessionInfo | string) => void
   // Open the full Cron page focused on this job (manage / full history).
-  onManageJob: (jobId: string, profile?: string) => void
+  onManageJob: (jobId: string, profile?: string, connectionId?: null | string) => void
   // Fire the job now.
-  onTriggerJob: (jobId: string, profile?: string) => Promise<void>
+  onTriggerJob: (jobId: string, profile?: string, connectionId?: null | string) => Promise<void>
   onToggle: () => void
   open: boolean
 }
@@ -143,7 +150,7 @@ export function SidebarCronJobsSection({
 
     const jobKey = cronJobIdentity(job)
 
-    void controller.run(jobKey, () => onTriggerJob(job.id, job.profile)).catch(() => undefined)
+    void controller.run(jobKey, () => onTriggerJob(job.id, job.profile, job.connection_id)).catch(() => undefined)
   }
 
   const visible = usePaneVisible()
@@ -214,7 +221,7 @@ export function SidebarCronJobsSection({
                 job={job}
                 key={jobKey}
                 nowMs={nowMs}
-                onManage={() => onManageJob(job.id, job.profile)}
+                onManage={() => onManageJob(job.id, job.profile, job.connection_id)}
                 onOpenOutput={onOpenOutput}
                 onOpenSession={onOpenSession}
                 onTogglePeek={() => setPeekJobKey(prev => (prev === jobKey ? null : jobKey))}
@@ -250,8 +257,8 @@ function CronJobSidebarRow({
   job: CronJob
   nowMs: number
   onManage: () => void
-  onOpenOutput: (jobId: string, outputId: string, profile?: string) => void
-  onOpenSession: (sessionId: string, profile?: string) => void
+  onOpenOutput: (jobId: string, outputId: string, profile?: string, connectionId?: null | string) => void
+  onOpenSession: (sessionId: string, owner?: SessionInfo | string) => void
   onTogglePeek: () => void
   onTrigger: () => void
 }) {
@@ -270,7 +277,9 @@ function CronJobSidebarRow({
   // row updates in place.
   const togglePause = async () => {
     try {
-      const updated = isPaused ? await resumeCronJob(job.id, job.profile) : await pauseCronJob(job.id, job.profile)
+      const updated = isPaused
+        ? await resumeCronJob(job.id, cronJobOwner(job))
+        : await pauseCronJob(job.id, cronJobOwner(job))
       updateCronJobs(rows => replaceCronJobForOwner(rows, job, updated))
       notify({ kind: 'success', title: isPaused ? c.resumed : c.paused, message: label })
     } catch (err) {
@@ -291,7 +300,7 @@ function CronJobSidebarRow({
     }
 
     try {
-      await deleteCronJob(job.id, job.profile)
+      await deleteCronJob(job.id, cronJobOwner(job))
       updateCronJobs(rows => removeCronJobForOwner(rows, job))
       notify({ kind: 'success', title: c.deleted, message: label })
     } catch (err) {
@@ -397,6 +406,7 @@ function CronJobSidebarRow({
       </ActionsContextMenu>
       {expanded && (
         <CronJobSidebarRuns
+          connectionId={job.connection_id}
           jobId={job.id}
           noAgent={Boolean(job.no_agent)}
           onOpenOutput={onOpenOutput}
@@ -409,16 +419,18 @@ function CronJobSidebarRow({
 }
 
 export function CronJobSidebarRuns({
+  connectionId,
   jobId,
   noAgent,
   onOpenOutput,
   onOpenSession,
   profile
 }: {
+  connectionId?: null | string
   jobId: string
   noAgent: boolean
-  onOpenOutput: (jobId: string, outputId: string, profile?: string) => void
-  onOpenSession: (sessionId: string, profile?: string) => void
+  onOpenOutput: (jobId: string, outputId: string, profile?: string, connectionId?: null | string) => void
+  onOpenSession: (sessionId: string, owner?: SessionInfo | string) => void
   profile?: string
 }) {
   const { t } = useI18n()
@@ -439,18 +451,25 @@ export function CronJobSidebarRuns({
       const requestId = ++latestRequestId
 
       const loadOutputs = (): Promise<CronSidebarRun[]> =>
-        getCronJobOutputs(jobId, PEEK_RUN_LIMIT, profile).then(outputs =>
-          outputs.map(output => ({ createdAt: output.created_at, id: output.id, kind: 'output' }))
+        getCronJobOutputs(jobId, PEEK_RUN_LIMIT, connectionId === undefined ? profile : { connectionId, profile }).then(
+          outputs => outputs.map(output => ({ createdAt: output.created_at, id: output.id, kind: 'output' }))
         )
 
       const request = noAgent
         ? loadOutputs()
-        : getCronJobRuns(jobId, PEEK_RUN_LIMIT, profile).then<CronSidebarRun[]>(sessions =>
+        : getCronJobRuns(jobId, PEEK_RUN_LIMIT, connectionId === undefined ? profile : { connectionId, profile }).then<
+            CronSidebarRun[]
+          >(sessions =>
             sessions.length > 0
               ? sessions.map(session => ({
                   createdAt: session.last_active || session.started_at,
                   id: session.id,
-                  kind: 'session'
+                  kind: 'session',
+                  session: {
+                    ...session,
+                    connection_id: connectionId ?? undefined,
+                    profile: profile ?? session.profile
+                  }
                 }))
               : loadOutputs()
           )
@@ -495,7 +514,7 @@ export function CronJobSidebarRuns({
       window.clearInterval(intervalId)
     }
     // cronChangeTick: a fired run reloads the peek immediately.
-  }, [changeEventsAvailable, cronChangeTick, jobId, noAgent, profile, visible])
+  }, [changeEventsAvailable, connectionId, cronChangeTick, jobId, noAgent, profile, visible])
 
   return (
     <div className="mb-1 ml-[1.375rem] flex flex-col gap-px">
@@ -519,7 +538,9 @@ export function CronJobSidebarRuns({
               )}
               key={run.id}
               onClick={() =>
-                run.kind === 'output' ? onOpenOutput(jobId, run.id, profile) : onOpenSession(run.id, profile)
+                run.kind === 'output'
+                  ? onOpenOutput(jobId, run.id, profile, connectionId)
+                  : onOpenSession(run.id, run.session)
               }
               type="button"
             >
