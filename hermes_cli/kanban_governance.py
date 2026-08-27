@@ -114,3 +114,70 @@ def validate_block_transition(
         blocker_class=blocker_class,
         decision_class=decision_class,
     )
+
+
+@dataclass(frozen=True)
+class GovernanceReviewValidation:
+    """Result of validating a review-entry transition against governance rules."""
+
+    ok: bool
+    error: Optional[str] = None
+
+
+def validate_review_contract(
+    *,
+    goal: Optional[str] = None,
+    judge: Optional[str] = None,
+    evidence_contract: Optional[str] = None,
+) -> GovernanceReviewValidation:
+    """Validate a review-entry transition against governance invariants.
+
+    A valid review entry requires all three of:
+    - goal: what the implementation must achieve
+    - judge: who (or what automated process) will review it
+    - evidence_contract: what pass/fail evidence demonstrates success
+
+    For backwards compatibility, if ALL three are None (not provided), the
+    validation passes and no contract is enforced. However, if ANY of the three
+    are provided, then ALL three must be non-empty strings.
+
+    Args:
+        goal: The review goal (required if any contract field is provided, must not be empty).
+        judge: The reviewer or judge role (required if any contract field is provided, must not be empty).
+        evidence_contract: The pass/fail evidence contract (required if any contract field is provided, must not be empty).
+
+    Returns:
+        GovernanceReviewValidation with ok=True if validation passes,
+        ok=False with error message otherwise.
+    """
+    # Legacy compatibility: if all three are None, this is a backwards-compatible call
+    # from old code that doesn't pass these parameters. Accept it.
+    if goal is None and judge is None and evidence_contract is None:
+        return GovernanceReviewValidation(ok=True)
+
+    # If ANY field is provided, ALL three must be provided and non-empty
+    # Check goal
+    if not goal or not (isinstance(goal, str) and goal.strip()):
+        return GovernanceReviewValidation(
+            ok=False,
+            error="Review requires a 'goal' describing what the implementation must achieve.",
+        )
+
+    # Check judge
+    if not judge or not (isinstance(judge, str) and judge.strip()):
+        return GovernanceReviewValidation(
+            ok=False,
+            error="Review requires a 'judge' (reviewer or automated process).",
+        )
+
+    # Check evidence_contract
+    if (
+        not evidence_contract
+        or not (isinstance(evidence_contract, str) and evidence_contract.strip())
+    ):
+        return GovernanceReviewValidation(
+            ok=False,
+            error="Review requires an 'evidence_contract' describing pass/fail criteria.",
+        )
+
+    return GovernanceReviewValidation(ok=True)

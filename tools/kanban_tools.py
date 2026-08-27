@@ -936,6 +936,15 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
+    goal = args.get("goal") or None
+    if goal:
+        goal = redact_sensitive_text(str(goal), force=True)
+    judge = args.get("judge") or None
+    if judge:
+        judge = redact_sensitive_text(str(judge), force=True)
+    evidence_contract = args.get("evidence_contract") or None
+    if evidence_contract:
+        evidence_contract = redact_sensitive_text(str(evidence_contract), force=True)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -954,6 +963,9 @@ def _handle_request_review(args: dict, **kw) -> str:
                 metadata=metadata,
                 reviewer=reviewer,
                 expected_run_id=_worker_run_id(tid),
+                goal=goal,
+                judge=judge,
+                evidence_contract=evidence_contract,
                 with_reason=True,
             )
             if not ok:
@@ -1963,6 +1975,27 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                     "as changed_files, tests_run, commit, or decisions."
                 ),
                 "additionalProperties": True,
+            },
+            "goal": {
+                "type": "string",
+                "description": (
+                    "What the implementation must achieve (required if provided "
+                    "with judge/evidence_contract)."
+                ),
+            },
+            "judge": {
+                "type": "string",
+                "description": (
+                    "Who (or what automated process) will review it (required if "
+                    "provided with goal/evidence_contract)."
+                ),
+            },
+            "evidence_contract": {
+                "type": "string",
+                "description": (
+                    "What pass/fail evidence demonstrates success (required if "
+                    "provided with goal/judge)."
+                ),
             },
             "board": _board_schema_prop(),
         },

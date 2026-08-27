@@ -691,6 +691,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON object with structured reviewer handoff facts.",
     )
     p_request_review.add_argument(
+        "--goal", default=None,
+        help="What the implementation must achieve (required if provided with judge/evidence).",
+    )
+    p_request_review.add_argument(
+        "--judge", default=None,
+        help="Who (or what automated process) will review it (required if provided with goal/evidence).",
+    )
+    p_request_review.add_argument(
+        "--evidence-contract", default=None,
+        help="What pass/fail evidence demonstrates success (required if provided with goal/judge).",
+    )
+    p_request_review.add_argument(
         "--force", action="store_true",
         help=(
             "Override the live-claim guard: move a running, claimed task to "
@@ -2507,6 +2519,9 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             reviewer=reviewer,
             expected_run_id=_worker_run_id_for(tid),
             force=bool(getattr(args, "force", False)),
+            goal=getattr(args, "goal", None),
+            judge=getattr(args, "judge", None),
+            evidence_contract=getattr(args, "evidence_contract", None),
             with_reason=True,
         )
         if not ok:

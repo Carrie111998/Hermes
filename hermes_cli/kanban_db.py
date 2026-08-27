@@ -6665,6 +6665,9 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    goal: Optional[str] = None,
+    judge: Optional[str] = None,
+    evidence_contract: Optional[str] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -6689,6 +6692,16 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    # Validate review contract upfront
+    from hermes_cli import kanban_governance
+
+    review_validation = kanban_governance.validate_review_contract(
+        goal=goal,
+        judge=judge,
+        evidence_contract=evidence_contract,
+    )
+    if not review_validation.ok:
+        return _ret(False, review_validation.error)
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
@@ -6811,6 +6824,9 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "goal": goal,
+                "judge": judge,
+                "evidence_contract": evidence_contract,
             },
             run_id=run_id,
         )
