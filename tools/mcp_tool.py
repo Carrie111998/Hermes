@@ -4577,6 +4577,21 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
 _server_trust_levels: Dict[str, str] = {}
+
+# Servers that have asked to be told which conversation is calling them.
+#
+# OPT-IN, AND DEFAULT OFF, BECAUSE THIS IS SOMEBODY'S IDENTITY.
+#
+# The caller-session id is a stable handle on a real conversation. A server that
+# needs it -- one that will answer back into that conversation later -- must say
+# so; every other server, including any third party the user happens to have
+# configured, has no business receiving it. The first version of this attached it
+# to every tool call on every server, which turned one integration's transport
+# contract into a global disclosure.
+#
+# Keyed on config rather than on a server-name string so the coupling survives
+# the user renaming their server, and so nothing has to hardcode "delegate_wave".
+_server_wants_caller_session: Dict[str, bool] = {}
 _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
 
 _TRUST_FULL = "full"
@@ -4629,6 +4644,9 @@ def _record_tool_trust_metadata(
     with _lock:
         _server_trust_levels[server_name] = _normalize_server_trust(
             (config or {}).get("trust")
+        )
+        _server_wants_caller_session[server_name] = bool(
+            (config or {}).get("send_caller_session_context", False)
         )
         hints = _tool_read_only_hints.setdefault(server_name, {})
         for tool in tools:
@@ -6053,7 +6071,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
-        # THE CALLER'S IDENTITY, READ HERE AND NOWHERE ELSE.
+        # THE CALLER'S IDENTITY, FOR THE SERVERS THAT ASKED FOR IT.
         #
         # An MCP server that wants to call back into the conversation that asked
         # it for something needs to know which conversation that was. That is
@@ -6068,9 +6086,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # id, and the loop it runs on does not inherit this turn's ContextVars --
         # which is the precise problem gateway/session_context.py exists to solve.
         # Captured into the closure, it stays bound to the turn that made the call.
-        from gateway.session_context import get_session_env
+        #
+        # Only for a server whose config sets send_caller_session_context. This is
+        # a durable handle on one of the user's conversations, and a server that
+        # does not answer back into conversations has no use for it.
+        _caller_session_id = ""
+        if _server_wants_caller_session.get(server_name, False):
+            from gateway.session_context import get_session_env
 
-        _caller_session_id = (get_session_env("HERMES_SESSION_ID") or "").strip()
+            _caller_session_id = (get_session_env("HERMES_SESSION_ID") or "").strip()
 
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
