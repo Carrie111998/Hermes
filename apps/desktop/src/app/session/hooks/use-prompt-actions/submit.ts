@@ -367,7 +367,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // stalled turn can't stack the same prompt into multiple real turns. The
       // foreground ChatBar and background drainers can briefly overlap during a
       // session switch; this per-session lock makes that safe.
-      const submitLockKey = targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
+      const submitLockKey =
+        submittedStorageScope?.format === 'canonical' && submittedStorageScopeKey
+          ? submittedStorageScopeKey
+          : targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
 
       if (!acquireSubmitInFlight(submitLockKey)) {
         return false

@@ -1980,6 +1980,58 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
+  it('does not share an in-flight submit lock across exact owners with the same stored id', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    let settleA: (() => void) | undefined
+    const pendingA = new Promise<void>(resolve => {
+      settleA = resolve
+    })
+    const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+      if (params?.session_id === 'rt-owner-a') {
+        await pendingA
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={null}
+      />
+    )
+
+    const sendingA = handle!.submitText('owner A prompt', {
+      composerStorageScope: encodeComposerStorageScopeKey(ownerA, 'stored-shared'),
+      sessionId: 'rt-owner-a',
+      storedSessionId: 'stored-shared'
+    })
+
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith(
+        'prompt.submit',
+        { session_id: 'rt-owner-a', text: 'owner A prompt' },
+        1_800_000
+      )
+    )
+
+    await expect(
+      handle!.submitText('owner B prompt', {
+        composerStorageScope: encodeComposerStorageScopeKey(ownerB, 'stored-shared'),
+        sessionId: 'rt-owner-b',
+        storedSessionId: 'stored-shared'
+      })
+    ).resolves.toBe(true)
+
+    settleA?.()
+    await expect(sendingA).resolves.toBe(true)
+  })
+
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
     const seeds: Record<string, unknown>[] = []
     const requestGateway = vi.fn(async () => ({}) as never)
