@@ -1109,6 +1109,96 @@ class TestStuckLoopEscalation:
         adapter.handle_message.assert_not_awaited()
         assert json.loads(counts_file.read_text(encoding="utf-8")) == malformed_counts
 
+    def test_shutdown_preserves_malformed_attempt_ledger(self, tmp_path, monkeypatch):
+        """Graceful shutdown must not replace unknown retry evidence."""
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, _adapter = make_restart_runner()
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        malformed = "{not-json"
+        counts_file.write_text(malformed, encoding="utf-8")
+
+        runner._increment_restart_failure_counts({"agent:main:telegram:dm:active"})
+
+        assert counts_file.read_text(encoding="utf-8") == malformed
+
+    def test_failed_suspension_save_preserves_retry_evidence(
+        self, tmp_path, monkeypatch
+    ):
+        """An in-memory suspension cannot consume its durable retry count."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, _adapter = make_restart_runner()
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:save-failure",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+        runner.session_store._save = MagicMock(side_effect=OSError("disk full"))
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        counts = {entry.session_key: GatewayRunner._STUCK_LOOP_THRESHOLD}
+        counts_file.write_text(json.dumps(counts), encoding="utf-8")
+
+        assert runner._suspend_stuck_loop_sessions() == 0
+        assert entry.suspended is False
+        assert json.loads(counts_file.read_text(encoding="utf-8")) == counts
+
+    @pytest.mark.asyncio
+    async def test_retry_ledger_transactions_do_not_lose_concurrent_admission(
+        self, tmp_path, monkeypatch
+    ):
+        """A stale successful-turn clear cannot erase a newer admission."""
+        import json
+        import threading
+
+        from gateway.run import GatewayRunner, atomic_json_write as real_atomic_write
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, _adapter = make_restart_runner()
+        clearing_key = "agent:main:telegram:dm:clearing"
+        retained_key = "agent:main:telegram:dm:retained"
+        admitted_key = "agent:main:telegram:dm:admitted"
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        counts_file.write_text(
+            json.dumps({clearing_key: 1, retained_key: 1}), encoding="utf-8"
+        )
+        clear_write_started = threading.Event()
+        release_clear_write = threading.Event()
+
+        def controlled_write(path, payload, **kwargs):
+            if clearing_key not in payload and admitted_key not in payload:
+                clear_write_started.set()
+                assert release_clear_write.wait(timeout=5)
+            real_atomic_write(path, payload, **kwargs)
+
+        monkeypatch.setattr("gateway.run.atomic_json_write", controlled_write)
+        clear_task = asyncio.create_task(
+            runner._clear_restart_failure_count(clearing_key)
+        )
+        assert await asyncio.to_thread(clear_write_started.wait, 5)
+        admission_task = asyncio.create_task(
+            asyncio.to_thread(runner._record_startup_resume_attempt, admitted_key)
+        )
+        await asyncio.sleep(0)
+        assert not admission_task.done()
+
+        release_clear_write.set()
+        await clear_task
+        assert await admission_task is True
+        assert json.loads(counts_file.read_text(encoding="utf-8")) == {
+            retained_key: 1,
+            admitted_key: 1,
+        }
+
     @pytest.mark.asyncio
     async def test_startup_resume_dispatches_after_persisted_attempt(
         self, tmp_path, monkeypatch
