@@ -146,7 +146,9 @@ class TestResolveProjectScope:
         assert rt.resolve_project_scope() == ""
 
     def test_permission_error_on_ancestor_does_not_raise(self, monkeypatch, tmp_path):
-        """A PermissionError on an ancestor directory is caught and treated as no-match."""
+        """A PermissionError during marker probes on an ancestor is caught and
+        does not abort the walk — marker checks above the inaccessible level
+        still succeed."""
         project = tmp_path / "permission-project"
         project.mkdir()
         (project / ".git").mkdir()
@@ -155,31 +157,34 @@ class TestResolveProjectScope:
         deep = project / "a" / "b"
         deep.mkdir(parents=True)
 
-        # Monkeypatch Path.exists to raise PermissionError on a specific ancestor
-        # Actually, the spec says "use a try/except around .exists() probes or
-        # os.path.isdir-style cheap checks". We'll test by monkeypatching
-        # Path.exists to fail for the parent of project.
-        import builtins
+        # Monkeypatch Path.exists to raise PermissionError when probing any
+        # project-scope marker file inside the "b" directory.  The walk starts
+        # at permission-project/a/b; all three marker probes at depth=0 will
+        # fire the condition (self.name is one of the markers, and the parent
+        # is "b"), so PermissionError is actually exercised.
         original_exists = Path.exists
 
         def fragile_exists(self):
-            if self.name == "b" and str(self.parent).endswith("a"):
+            if (
+                self.name in (".git", "AGENTS.md", ".hermes-memory.md")
+                and self.parent.name == "b"
+            ):
                 raise PermissionError("Access denied")
             return original_exists(self)
 
         monkeypatch.setattr(Path, "exists", fragile_exists)
         monkeypatch.setenv("TERMINAL_CWD", str(deep))
 
-        # The walk starts at deep = permission-project/a/b.
-        # When checking for markers at deep's parent (permission-project/a/b/..),
-        # the first depth=0 includes deep itself; checking markers at deep.
-        # The fragile_exists will hit when checking a marker at "b" level or...
-        # Let me simplify: just make it so one of the markers exists calls fails.
-        # The spec says try/except so it shouldn't raise — just continue.
         result = rt.resolve_project_scope()
-        # If the permission error fires on some ancestor we still either get
-        # the project name or "". As long as it doesn't raise.
-        assert isinstance(result, str)
+
+        # The walk:
+        #   depth=0 (permission-project/a/b)  — all markers raise PermissionError → continue
+        #   depth=1 (permission-project/a)    — no markers exist
+        #   depth=2 (permission-project)      — .git found → returns "permission-project"
+        #
+        # The PermissionError is caught and the walk still resolves to the
+        # marker above the inaccessible directory.
+        assert result == "permission-project"
 
     def test_resolve_context_cwd_fallback_to_getcwd(self, monkeypatch, tmp_path):
         """When resolve_context_cwd returns None, resolve_project_scope falls back
