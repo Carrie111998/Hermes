@@ -2105,6 +2105,23 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
             except OSError:
                 cache.pop(key, None)
                 return None
+            # The stub proves this exact file was already served to this task
+            # and is unchanged on disk — for the background review fork's
+            # read-before-write guard that counts as a read of the CURRENT
+            # content. The guard's read marks are per-review-context while
+            # this dedup cache is per-task, so without marking here every
+            # turn-N re-view stubs out and the fork's patches get refused
+            # 100% of the time (#95976). mark_... is a no-op outside the
+            # background-review origin.
+            try:
+                from pathlib import Path as _P
+                from tools.skill_manager_tool import (
+                    mark_background_review_skill_read as _mark_read,
+                )
+
+                _mark_read(_P(src))
+            except Exception:
+                pass
             return json.dumps(
                 {
                     "success": True,

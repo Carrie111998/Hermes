@@ -92,3 +92,61 @@ class TestSkillViewDedup:
         # conversation_compression imports this lazily; keep the seam stable.
         from tools.skills_tool import reset_skill_view_dedup as f
         f(None)
+
+
+class TestDedupStubMarksReviewRead:
+    """#95976: the stub must satisfy the background review read-before-write guard.
+
+    The guard's read marks are per-review-context (reset each turn), the dedup
+    cache is per-task — so a turn-N re-view stubs out without re-marking and
+    every fork patch is refused. The stub path now marks the verified-unchanged
+    source as read, so the guard sees the current content as loaded.
+    """
+
+    def test_stub_satisfies_read_before_write_guard(self, skills_home, monkeypatch):
+        from tools import skill_manager_tool as smt
+
+        monkeypatch.setattr(
+            "tools.skill_provenance.is_background_review", lambda: True
+        )
+        smt._reset_background_review_read_marks()
+
+        md = skills_home / "skills" / "demo-dedup-skill" / "SKILL.md"
+
+        # Turn 1: full view marks the read; simulate the next review turn by
+        # resetting the per-context marks while the task-level dedup cache
+        # survives.
+        r1 = _view("demo-dedup-skill")
+        assert "Step one" in r1.get("content", "")
+        smt._reset_background_review_read_marks()
+        assert not smt._background_review_has_read(md)
+
+        # Turn 2: the repeat view returns the stub — and must re-mark, or the
+        # fork's patch is refused.
+        r2 = _view("demo-dedup-skill")
+        assert r2.get("dedup") is True
+        assert smt._background_review_has_read(md)
+
+        # The guard that refused every fork patch now passes.
+        guard = smt._background_review_read_before_write_guard(
+            "demo-dedup-skill", md, "patch", "SKILL.md"
+        )
+        assert guard is None
+
+    def test_stub_marks_supporting_file_too(self, skills_home, monkeypatch):
+        from tools import skill_manager_tool as smt
+
+        monkeypatch.setattr(
+            "tools.skill_provenance.is_background_review", lambda: True
+        )
+        smt._reset_background_review_read_marks()
+
+        guide = skills_home / "skills" / "demo-dedup-skill" / "references" / "guide.md"
+
+        r1 = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert "Guide" in r1.get("content", "")
+        smt._reset_background_review_read_marks()
+
+        r2 = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert r2.get("dedup") is True
+        assert smt._background_review_has_read(guide)
