@@ -63,10 +63,6 @@ function publicStoredId(key: string): string {
 
 export class SessionRuntimeIndex extends Map<string, string> {
   override get(storedSessionId: string): string | undefined {
-    if (super.has(storedSessionId)) {
-      return super.get(storedSessionId)
-    }
-
     const matches = [...super.entries()].filter(([key]) => publicStoredId(key) === storedSessionId)
 
     return matches.length === 1 ? matches[0][1] : undefined
@@ -81,10 +77,6 @@ export class SessionRuntimeIndex extends Map<string, string> {
   }
 
   override delete(storedSessionId: string): boolean {
-    if (super.has(storedSessionId)) {
-      return super.delete(storedSessionId)
-    }
-
     const matches = [...super.keys()].filter(key => publicStoredId(key) === storedSessionId)
 
     return matches.length === 1 ? super.delete(matches[0]) : false

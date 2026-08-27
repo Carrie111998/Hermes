@@ -194,9 +194,7 @@ describe('CronJobRuns', () => {
       </QueryClientProvider>
     )
 
-    await waitFor(() =>
-      expect(getCronJobOutput).toHaveBeenCalledWith('shared-job', 'worker-output', 'worker_alpha')
-    )
+    await waitFor(() => expect(getCronJobOutput).toHaveBeenCalledWith('shared-job', 'worker-output', 'worker_alpha'))
     expect(await screen.findByRole('heading', { name: 'Worker output' })).toBeTruthy()
     expect($cronFocus.get()).toBeNull()
   })

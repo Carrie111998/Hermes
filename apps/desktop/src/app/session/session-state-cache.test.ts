@@ -67,6 +67,36 @@ describe('SessionRuntimeIndex', () => {
     expect(index.deleteAll('stored-shared')).toBe(2)
     expect(index.size).toBe(0)
   })
+
+  it('counts direct and owner-qualified entries together for unqualified access', () => {
+    const index = new SessionRuntimeIndex()
+
+    index.set('stored-shared', 'runtime-primary')
+    index.setOwned('stored-shared', 'runtime-a', ownerA)
+
+    expect(index.size).toBe(2)
+    expect([...index.keys()]).toEqual(['stored-shared', 'stored-shared'])
+    expect(index.get('stored-shared')).toBeUndefined()
+    expect(index.delete('stored-shared')).toBe(false)
+    expect(index.size).toBe(2)
+    expect(index.getOwned('stored-shared', ownerA)).toBe('runtime-a')
+
+    expect(index.deleteAll('stored-shared')).toBe(2)
+    expect(index.size).toBe(0)
+  })
+
+  it('allows unqualified access when exactly one direct or owner-qualified entry exists', () => {
+    const index = new SessionRuntimeIndex()
+
+    index.set('stored-direct', 'runtime-direct')
+    expect(index.get('stored-direct')).toBe('runtime-direct')
+    expect(index.delete('stored-direct')).toBe(true)
+
+    index.setOwned('stored-owned', 'runtime-owned', ownerA)
+    expect(index.get('stored-owned')).toBe('runtime-owned')
+    expect(index.delete('stored-owned')).toBe(true)
+    expect(index.size).toBe(0)
+  })
 })
 
 describe('SessionStateCache', () => {
