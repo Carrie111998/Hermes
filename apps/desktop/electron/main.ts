@@ -10964,7 +10964,11 @@ async function ensureBackend(profile) {
     if (existing.alive) {
       const adopted = await adoptLocalGateway(existing)
       if (adopted) {
-        setWslBridgeProfileState(key, adopted.mode !== 'remote')
+        // AdoptedLocalConnection.mode is the literal 'local' by construction
+        // (adoptLocalGateway returns mode: 'local'), so the WSL bridge is
+        // never remote here; written as `true` to appease TS2367, which
+        // rejects the tautological `adopted.mode !== 'remote'` comparison.
+        setWslBridgeProfileState(key, true)
         return route.descriptorProfile
           ? { ...adopted, profile: route.descriptorProfile, sharedPrimary: true }
           : adopted
