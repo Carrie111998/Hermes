@@ -65,7 +65,7 @@ describe('Quick Entry duplicate-owner target contract', () => {
     expect(submitText).not.toHaveBeenCalled()
   })
 
-  it('pushes distinct exact recent targets and resumes the selected owner generation', async () => {
+  it('keeps the selected duplicate owner exact through post-resume submit', async () => {
     const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
     const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
     const resumeTile = vi.fn(async () => 'runtime-owner-b')
@@ -109,7 +109,7 @@ describe('Quick Entry duplicate-owner target contract', () => {
     })
 
     await vi.waitFor(() => expect(resumeTile).toHaveBeenCalledWith('shared', 9, ownerB))
-    expect(submitToSession).toHaveBeenCalledWith('runtime-owner-b', 'owner B only')
+    expect(submitToSession).toHaveBeenCalledWith('runtime-owner-b', 'owner B only', ownerB)
   })
 
   it('never redirects an exact picked target into the ambient composer when resume fails', async () => {

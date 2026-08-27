@@ -1484,8 +1484,11 @@ export interface SessionTileDelegate {
    *  it — the caller downgrades the mirror itself. Reconnect-time twin of
    *  invalidateRuntimeBindings (#93059). */
   retireBusyClaim?(runtimeId: string): boolean
-  /** Submit a prompt to a tile's live session. */
-  submitToSession(runtimeId: string, text: string): Promise<void>
+  /** Submit a prompt to a tile's live session. An exact owner captured by the
+   *  caller must survive async resume so duplicate stored ids route and recover
+   *  on the socket that minted the runtime. Ownerless calls keep the legacy
+   *  discovery path. */
+  submitToSession(runtimeId: string, text: string, ownerRoute?: SessionOwnerRoute): Promise<void>
   /** THE session-state write path — routes through the wiring cache so the
    *  cache, the primary view (when active), and every tile mirror agree. */
   updateSession(runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState): ClientSessionState

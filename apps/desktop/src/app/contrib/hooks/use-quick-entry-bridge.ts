@@ -102,7 +102,11 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
             : delegate.resumeTile(storedSessionId)
 
           void resume
-            .then(runtimeId => delegate.submitToSession(runtimeId, text))
+            .then(runtimeId =>
+              session?.ownerRoute
+                ? delegate.submitToSession(runtimeId, text, session.ownerRoute)
+                : delegate.submitToSession(runtimeId, text)
+            )
             .catch(error => {
               // Exact picked metadata is an authority boundary: redirecting its
               // prompt into whichever ambient composer happens to be selected

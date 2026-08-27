@@ -21,12 +21,13 @@ vi.mock('@/hermes', async importActual => ({
 }))
 vi.mock('@/store/gateway', async importActual => ({
   ...(await importActual<Record<string, unknown>>()),
+  retainGatewayForSessionTurn: vi.fn(async () => vi.fn()),
   requestGatewayForAgent: vi.fn(),
   requestGatewayForProfile: vi.fn()
 }))
 
 const { getLatestSessionMessages } = await import('@/hermes')
-const { requestGatewayForAgent, requestGatewayForProfile } = await import('@/store/gateway')
+const { requestGatewayForAgent, requestGatewayForProfile, retainGatewayForSessionTurn } = await import('@/store/gateway')
 
 const row = (over: Partial<SessionInfo>): SessionInfo =>
   ({
@@ -449,6 +450,82 @@ describe('useSessionTileDelegate resumeTile', () => {
     // The next resume goes cold instead of reusing the dead binding.
     const runtimeId = await sessionTileDelegate()!.resumeTile('stored-c')
     expect(runtimeId).toBe('runtime-fresh')
+  })
+})
+
+describe('useSessionTileDelegate submitToSession', () => {
+  beforeEach(() => {
+    setSessions([])
+    $sessionTiles.set([])
+    vi.mocked(requestGatewayForAgent).mockReset()
+    vi.mocked(retainGatewayForSessionTurn).mockClear()
+  })
+
+  afterEach(() => {
+    setSessions([])
+    $sessionTiles.set([])
+  })
+
+  it('routes a duplicate-id Quick Entry submit and its recovery through the captured exact owner', async () => {
+    const storedSessionId = 'shared-quick-entry'
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const ambientRequest = vi.fn(async () => ({ status: 'streaming' }) as never)
+
+    const sessionStateByRuntimeIdRef = {
+      current: new Map([['runtime-owner-b', { storedSessionId }]])
+    }
+
+    setSessions([
+      row({ connection_id: 'source-a', id: storedSessionId, profile: 'worker' }),
+      row({ connection_id: 'source-b', id: storedSessionId, profile: 'worker' })
+    ])
+    $sessionTiles.set([
+      { ownerRoute: ownerA, storedSessionId },
+      { ownerRoute: ownerB, storedSessionId }
+    ])
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method, params) => {
+      if (method === 'prompt.submit' && params?.session_id === 'runtime-owner-b') {
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'runtime-owner-b-recovered' } as never
+      }
+
+      return { status: 'streaming' } as never
+    })
+    renderTile(ambientRequest, { sessionStateByRuntimeIdRef })
+
+    await sessionTileDelegate()!.submitToSession('runtime-owner-b', 'owner B only', ownerB)
+
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(
+      1,
+      'source-b',
+      'worker',
+      'prompt.submit',
+      { session_id: 'runtime-owner-b', text: 'owner B only' },
+      expect.any(Number),
+      undefined
+    )
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(2, 'source-b', 'worker', 'session.resume', {
+      omit_messages: true,
+      profile: 'worker',
+      session_id: storedSessionId,
+      source: 'desktop'
+    })
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(
+      3,
+      'source-b',
+      'worker',
+      'prompt.submit',
+      { session_id: 'runtime-owner-b-recovered', text: 'owner B only' },
+      expect.any(Number),
+      undefined
+    )
+    expect(retainGatewayForSessionTurn).toHaveBeenNthCalledWith(1, 'source-b', 'worker', 'runtime-owner-b')
+    expect(retainGatewayForSessionTurn).toHaveBeenNthCalledWith(2, 'source-b', 'worker', 'runtime-owner-b-recovered')
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 })
 

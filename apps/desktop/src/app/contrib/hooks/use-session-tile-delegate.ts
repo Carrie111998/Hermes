@@ -421,7 +421,7 @@ export function useSessionTileDelegate({
 
         return runtimeId
       },
-      submitToSession: async (runtimeId, text) => {
+      submitToSession: async (runtimeId, text, capturedOwnerRoute) => {
         // A read-only stored-transcript tile has no live runtime to submit
         // into (#94724). Refuse with the explanation instead of minting a
         // misrouted prompt on a backend that never owned the session.
@@ -432,7 +432,11 @@ export function useSessionTileDelegate({
         }
 
         const storedSessionId = storedSessionIdForRuntime(runtimeId)
-        const owner = storedSessionId ? await ownerForStoredSession(storedSessionId) : undefined
+        // Quick Entry captures the exact owner before its asynchronous resume.
+        // Prefer that authority over raw-id discovery: duplicate stored ids can
+        // otherwise resolve to the first same-named row and submit/recover on a
+        // different backend. Ownerless tile callers retain the legacy ladder.
+        const owner = capturedOwnerRoute ?? (storedSessionId ? await ownerForStoredSession(storedSessionId) : undefined)
 
         const routedRequest = storedSessionId
           ? <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) =>
