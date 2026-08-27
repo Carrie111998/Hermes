@@ -2047,12 +2047,17 @@ class GatewayKanbanWatchersMixin:
                         # ordinary prerequisites alone are not proof either.
                         try:
                             with _kb.connect_closing(board=slug) as _guard_conn:
-                                _already_decomposed = _guard_conn.execute(
-                                    "SELECT 1 FROM task_events "
-                                    "WHERE task_id = ? AND kind = 'decomposed' "
-                                    "LIMIT 1",
-                                    (tid,),
-                                ).fetchone() is not None
+                                _history_kinds = {
+                                    row["kind"]
+                                    for row in _guard_conn.execute(
+                                        "SELECT kind FROM task_events "
+                                        "WHERE task_id = ? AND kind IN "
+                                        "('decomposed', 'specified')",
+                                        (tid,),
+                                    ).fetchall()
+                                }
+                                _already_decomposed = "decomposed" in _history_kinds
+                                _already_specified = "specified" in _history_kinds
                         except Exception as exc:
                             logger.warning(
                                 "kanban auto-decompose [%s]: %s history "
@@ -2067,6 +2072,49 @@ class GatewayKanbanWatchersMixin:
                                 tid,
                             )
                             continue
+                        if _already_specified:
+                            # A worker can legitimately re-route an already
+                            # specified task to triage after a needs-input
+                            # loop.  It is still a concrete task, not a fresh
+                            # rough idea requiring another auxiliary-model
+                            # pass.  Re-promote only when the durable spec is
+                            # present; specify_triage_task preserves parent
+                            # gating and lands the task in todo/ready as
+                            # appropriate.  Empty or malformed historical
+                            # specs remain fail-closed for normal triage.
+                            try:
+                                with _kb.connect_closing(board=slug) as _promote_conn:
+                                    _specified_task = _kb.get_task(_promote_conn, tid)
+                                    _promoted = bool(
+                                        _specified_task
+                                        and _specified_task.title.strip()
+                                        and _specified_task.body
+                                        and _specified_task.body.strip()
+                                        and _kb.specify_triage_task(
+                                            _promote_conn,
+                                            tid,
+                                            title=_specified_task.title,
+                                            body=_specified_task.body,
+                                            assignee=_specified_task.assignee,
+                                            author="auto-decomposer",
+                                        )
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "kanban auto-decompose: specified-task recovery "
+                                    "failed on %s",
+                                    tid,
+                                )
+                                _promoted = False
+                            if _promoted:
+                                successes += 1
+                                logger.info(
+                                    "kanban auto-decompose [%s]: %s → re-promoted "
+                                    "existing specification",
+                                    slug,
+                                    tid,
+                                )
+                                continue
                         # Protected roots must not consume the attempt budget
                         # and starve fresh triage work later in the queue.
                         attempted += 1
