@@ -64,3 +64,11 @@ This port addresses Teknium's July 12, 2026 review on PR #3987:
 3. The focused tests use real plugin discovery under a temporary
    `HERMES_HOME`, exercise direct plus sequential/concurrent dispatch, parse a
    structured host-LLM response, and cover classifier failure.
+
+The executable information-flow invariants and their explicit non-claims are
+documented in `docs/camel-guard-information-flow.md`.
+
+The reproducible Codex-subscription benchmark is
+`scripts/camel_guard_live_benchmark.py`; its current generated report is
+`docs/camel-guard-live-benchmark.md` with machine-readable results under
+`benchmarks/camel_guard/results/`.

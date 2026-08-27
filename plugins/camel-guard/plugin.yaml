@@ -29,4 +29,4 @@ config_schema:
   classifier_timeout_seconds:
     type: float
     default: 12.0
-    description: "Timeout for the trusted-intent classifier"
+    description: "Trusted-intent classifier timeout, clamped to 2-120 seconds"

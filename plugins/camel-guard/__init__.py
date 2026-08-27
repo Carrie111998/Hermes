@@ -74,7 +74,7 @@ def _load_settings(ctx: Any) -> GuardSettings:
             ctx.get_config("classifier_timeout_seconds", 12.0),
             default=12.0,
             minimum=2.0,
-            maximum=30.0,
+            maximum=120.0,
         ),
     )
 
@@ -105,6 +105,20 @@ def _history_untrusted_sources(history: Any) -> set[str]:
         if is_untrusted_output(name):
             sources.add(name)
     return sources
+
+
+def _strict_classifier_capabilities(payload: Mapping[str, Any], key: str) -> set[str]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        raise ValueError(f"classifier field {key} must be a list")
+    if any(
+        not isinstance(item, str) or item not in CAPABILITY_LABELS for item in value
+    ):
+        raise ValueError(f"classifier field {key} contains an invalid capability")
+    normalized = normalized_capabilities(value)
+    if len(normalized) != len(value):
+        raise ValueError(f"classifier field {key} contains duplicate capabilities")
+    return normalized
 
 
 class CamelGuardRuntime:
@@ -232,8 +246,23 @@ class CamelGuardRuntime:
                 payload = result.parsed
                 if not isinstance(payload, Mapping):
                     raise ValueError("classifier did not return a structured object")
-                allowed = normalized_capabilities(payload.get("allowed_capabilities"))
-                denied = normalized_capabilities(payload.get("denied_capabilities"))
+                required_fields = {
+                    "allowed_capabilities",
+                    "denied_capabilities",
+                    "rationale",
+                }
+                if set(payload) != required_fields:
+                    raise ValueError("classifier returned an invalid field set")
+                if not isinstance(payload.get("rationale"), str):
+                    raise ValueError("classifier rationale must be a string")
+                allowed = _strict_classifier_capabilities(
+                    payload,
+                    "allowed_capabilities",
+                )
+                denied = _strict_classifier_capabilities(
+                    payload,
+                    "denied_capabilities",
+                )
                 allowed.difference_update(denied)
                 state.plan = CapabilityPlan(
                     allowed=frozenset(allowed),
