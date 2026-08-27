@@ -522,8 +522,8 @@ def run_agent_case(
             redirect_stdout(quiet_output),
         ):
             agent = AIAgent(
-                api_key=api_key or None,
-                base_url=base_url or None,
+                api_key=api_key,
+                base_url=base_url,
                 provider=provider,
                 model=model,
                 max_tokens=768,

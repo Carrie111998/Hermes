@@ -308,7 +308,7 @@ def _make_agent_for_executor_path():
         )
     agent.client = MagicMock()
     agent.session_id = "session-executor"
-    agent._current_turn_id = "turn-executor"
+    setattr(agent, "_current_turn_id", "turn-executor")
     return agent
 
 

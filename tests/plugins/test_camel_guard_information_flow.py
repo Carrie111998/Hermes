@@ -17,6 +17,7 @@ from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 
@@ -187,7 +188,9 @@ def _pre_tool(*, session_id: str, turn_id: str, tool_name: str, args: dict):
 
 def _is_blocked(results: list[object]) -> bool:
     return any(
-        isinstance(item, dict) and item.get("action") == "block" for item in results
+        isinstance(item, dict)
+        and cast(dict[str, object], item).get("action") == "block"
+        for item in results
     )
 
 
