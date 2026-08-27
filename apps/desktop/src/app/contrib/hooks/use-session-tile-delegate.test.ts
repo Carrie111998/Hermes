@@ -1,6 +1,7 @@
 import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { SessionRuntimeIndex } from '@/app/session/session-state-cache'
 import type * as HermesModule from '@/hermes'
 import { setSessionOwnerHint, setSessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
@@ -254,7 +255,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     setSessions([row({ id: 'stored-c', profile: 'default' })])
 
     const liveState = { busy: false, messages: [{ id: 'm1' }], storedSessionId: 'stored-c' }
-    const runtimeIdByStoredSessionIdRef = { current: new Map([['stored-c', 'runtime-dead']]) }
+    const runtimeIdByStoredSessionIdRef = { current: new SessionRuntimeIndex([['stored-c', 'runtime-dead']]) }
     const sessionStateByRuntimeIdRef = { current: new Map([['runtime-dead', liveState]]) }
 
     const requestGateway = vi.fn(async () => ({}) as never)
@@ -270,6 +271,36 @@ describe('useSessionTileDelegate resumeTile', () => {
     // The next resume goes cold instead of reusing the dead binding.
     const runtimeId = await sessionTileDelegate()!.resumeTile('stored-c')
     expect(runtimeId).toBe('runtime-fresh')
+  })
+
+  it('prunes stale owner-qualified bindings while preserving a healthy connection', () => {
+    const runtimeIndex = new SessionRuntimeIndex()
+
+    runtimeIndex.setOwned('stored-a', 'runtime-a', { connectionId: 'connection-a', profile: 'default' })
+    runtimeIndex.setOwned('stored-b', 'runtime-b', { connectionId: 'connection-b', profile: 'default' })
+    runtimeIndex.setOwned('stored-shared', 'runtime-shared-a', {
+      connectionId: 'connection-a',
+      profile: 'default'
+    })
+    runtimeIndex.setOwned('stored-shared', 'runtime-shared-b', {
+      connectionId: 'connection-b',
+      profile: 'default'
+    })
+
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      {
+        runtimeIdByStoredSessionIdRef: { current: runtimeIndex }
+      }
+    )
+
+    sessionTileDelegate()!.invalidateRuntimeBindings!(new Set(['stored-b']))
+
+    expect([...runtimeIndex.entries()]).toEqual([['stored-b', 'runtime-b']])
+    expect(runtimeIndex.getOwned('stored-a', { connectionId: 'connection-a', profile: 'default' })).toBeUndefined()
+    expect(runtimeIndex.getOwned('stored-b', { connectionId: 'connection-b', profile: 'default' })).toBe('runtime-b')
+    expect(runtimeIndex.getOwned('stored-shared', { connectionId: 'connection-a', profile: 'default' })).toBeUndefined()
+    expect(runtimeIndex.getOwned('stored-shared', { connectionId: 'connection-b', profile: 'default' })).toBeUndefined()
   })
 })
 

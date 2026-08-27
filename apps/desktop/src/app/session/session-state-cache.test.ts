@@ -5,7 +5,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $sessionStates, $sessionTiles, releaseSessionTranscript } from '@/store/session-states'
 
-import { SessionStateCache } from './session-state-cache'
+import { SessionRuntimeIndex, SessionStateCache } from './session-state-cache'
 
 function transcript(id: string, text = id): ChatMessage[] {
   return [
@@ -17,6 +17,57 @@ function transcript(id: string, text = id): ChatMessage[] {
 function settled(storedSessionId: string, text = storedSessionId): ClientSessionState {
   return { ...createClientSessionState(storedSessionId), messages: transcript(storedSessionId, text) }
 }
+
+describe('SessionRuntimeIndex', () => {
+  const ownerA = { connectionId: 'connection-a', profile: 'default' }
+  const ownerB = { connectionId: 'connection-b', profile: 'default' }
+
+  it('exposes public stored ids through every Map iteration surface', () => {
+    const index = new SessionRuntimeIndex()
+    const visited: Array<[string, string, Map<string, string>]> = []
+
+    index.setOwned('stored-a', 'runtime-a', ownerA)
+    index.setOwned('stored-b', 'runtime-b', ownerB)
+    index.forEach((runtimeId, storedSessionId, map) => visited.push([storedSessionId, runtimeId, map]))
+
+    expect(index.size).toBe(2)
+    expect([...index.keys()]).toEqual(['stored-a', 'stored-b'])
+    expect([...index.values()]).toEqual(['runtime-a', 'runtime-b'])
+    expect([...index.entries()]).toEqual([
+      ['stored-a', 'runtime-a'],
+      ['stored-b', 'runtime-b']
+    ])
+    expect([...index]).toEqual([...index.entries()])
+    expect(visited).toEqual([
+      ['stored-a', 'runtime-a', index],
+      ['stored-b', 'runtime-b', index]
+    ])
+  })
+
+  it('keeps duplicate public ids ambiguous while owner-qualified lookup and deletion stay exact', () => {
+    const index = new SessionRuntimeIndex()
+
+    index.setOwned('stored-shared', 'runtime-a', ownerA)
+    index.setOwned('stored-shared', 'runtime-b', ownerB)
+
+    expect(index.size).toBe(2)
+    expect([...index.keys()]).toEqual(['stored-shared', 'stored-shared'])
+    expect(index.get('stored-shared')).toBeUndefined()
+    expect(index.delete('stored-shared')).toBe(false)
+    expect(index.getOwned('stored-shared', ownerA)).toBe('runtime-a')
+    expect(index.getOwned('stored-shared', ownerB)).toBe('runtime-b')
+
+    expect(index.deleteOwned('stored-shared', ownerA)).toBe(true)
+    expect(index.get('stored-shared')).toBe('runtime-b')
+    expect(index.delete('stored-shared')).toBe(true)
+    expect(index.size).toBe(0)
+
+    index.setOwned('stored-shared', 'runtime-a', ownerA)
+    index.setOwned('stored-shared', 'runtime-b', ownerB)
+    expect(index.deleteAll('stored-shared')).toBe(2)
+    expect(index.size).toBe(0)
+  })
+})
 
 describe('SessionStateCache', () => {
   beforeEach(() => {

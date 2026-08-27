@@ -128,9 +128,9 @@ export function useSessionTileDelegate({
       // re-bind a tile to a dead runtime; live bindings re-record from
       // post-reconnect events and fresh resumes.
       invalidateRuntimeBindings: preserveStoredSessionIds => {
-        for (const storedSessionId of runtimeIdByStoredSessionIdRef.current.keys()) {
+        for (const storedSessionId of new Set(runtimeIdByStoredSessionIdRef.current.keys())) {
           if (!preserveStoredSessionIds?.has(storedSessionId)) {
-            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+            runtimeIdByStoredSessionIdRef.current.deleteAll(storedSessionId)
           }
         }
       },

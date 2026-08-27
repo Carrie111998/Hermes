@@ -63,11 +63,10 @@ function publicStoredId(key: string): string {
 
 export class SessionRuntimeIndex extends Map<string, string> {
   override get(storedSessionId: string): string | undefined {
-    const direct = super.get(storedSessionId)
-
-    if (direct) {
-      return direct
+    if (super.has(storedSessionId)) {
+      return super.get(storedSessionId)
     }
+
     const matches = [...super.entries()].filter(([key]) => publicStoredId(key) === storedSessionId)
 
     return matches.length === 1 ? matches[0][1] : undefined
@@ -81,9 +80,44 @@ export class SessionRuntimeIndex extends Map<string, string> {
     return this.get(storedSessionId) !== undefined
   }
 
+  override delete(storedSessionId: string): boolean {
+    if (super.has(storedSessionId)) {
+      return super.delete(storedSessionId)
+    }
+
+    const matches = [...super.keys()].filter(key => publicStoredId(key) === storedSessionId)
+
+    return matches.length === 1 ? super.delete(matches[0]) : false
+  }
+
+  deleteAll(storedSessionId: string): number {
+    const matches = [...super.keys()].filter(key => publicStoredId(key) === storedSessionId)
+
+    for (const key of matches) {
+      super.delete(key)
+    }
+
+    return matches.length
+  }
+
   override *entries(): MapIterator<[string, string]> {
     for (const [key, runtimeId] of super.entries()) {
       yield [publicStoredId(key), runtimeId]
+    }
+  }
+
+  override *keys(): MapIterator<string> {
+    for (const key of super.keys()) {
+      yield publicStoredId(key)
+    }
+  }
+
+  override forEach(
+    callbackfn: (value: string, key: string, map: Map<string, string>) => void,
+    thisArg?: unknown
+  ): void {
+    for (const [storedSessionId, runtimeId] of this.entries()) {
+      callbackfn.call(thisArg, runtimeId, storedSessionId, this)
     }
   }
 
