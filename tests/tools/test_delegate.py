@@ -191,6 +191,234 @@ class TestDelegateRequirements(unittest.TestCase):
         result = delegate_task(goal="test", provider=[], parent_agent=parent)
         self.assertIn("provider", json.loads(result)["error"].lower())
 
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={
+        "model": "configured-model",
+        "provider": "configured-provider",
+    })
+    def test_spawn_model_only_override_keeps_configured_provider(
+        self, _mock_cfg, mock_creds
+    ):
+        mock_creds.return_value = {
+            "provider": "configured-provider",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": "spawn-model",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "spawn-model"
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ) as build_child:
+            delegate_task(goal="test", model="spawn-model", parent_agent=parent)
+
+        mock_creds.assert_called_once_with(
+            {"model": "spawn-model", "provider": "configured-provider"},
+            parent,
+        )
+        self.assertEqual(build_child.call_args.kwargs["model"], "spawn-model")
+        self.assertEqual(
+            build_child.call_args.kwargs["override_provider"], "configured-provider"
+        )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={
+        "model": "configured-model",
+        "provider": "configured-provider",
+    })
+    def test_spawn_provider_only_override_keeps_configured_model(
+        self, _mock_cfg, mock_creds
+    ):
+        mock_creds.return_value = {
+            "provider": "spawn-provider",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": "configured-model",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "configured-model"
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ) as build_child:
+            delegate_task(
+                goal="test",
+                provider="spawn-provider",
+                parent_agent=parent,
+            )
+
+        mock_creds.assert_called_once_with(
+            {"model": "configured-model", "provider": "spawn-provider"},
+            parent,
+        )
+        self.assertEqual(build_child.call_args.kwargs["model"], "configured-model")
+        self.assertEqual(
+            build_child.call_args.kwargs["override_provider"], "spawn-provider"
+        )
+
+    def test_spawn_model_provider_reject_empty_string_values(self):
+        parent = _make_mock_parent()
+        result = delegate_task(goal="test", model="   ", parent_agent=parent)
+        self.assertIn("model", json.loads(result)["error"].lower())
+        result = delegate_task(goal="test", provider="", parent_agent=parent)
+        self.assertIn("provider", json.loads(result)["error"].lower())
+
+    def test_validation_skipped_for_control_actions(self):
+        """Control actions (list/steer/stop) must not be blocked by model/provider validation."""
+        sentinel = '{"action":"list","count":0,"subagents":[]}'
+        with patch(
+            "tools.delegate_tool._handle_control_action", return_value=sentinel
+        ) as control_mock:
+            parent = _make_mock_parent()
+            result = delegate_task(
+                action="list",
+                model=123,
+                provider=object(),
+                parent_agent=parent,
+            )
+
+        self.assertEqual(result, sentinel)
+        control_mock.assert_called_once()
+        # Validation must not fire before the control plane, and the raw values
+        # (no stripping / no rejection) must reach the control handler.
+        self.assertEqual(control_mock.call_args.args[0], "list")
+        self.assertEqual(control_mock.call_args.args[1], None)
+        self.assertEqual(control_mock.call_args.args[2], None)
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={
+        "model": "configured-model",
+        "provider": "configured-provider",
+    })
+    def test_spawn_overrides_strip_whitespace(self, _mock_cfg, mock_creds):
+        mock_creds.return_value = {
+            "provider": "spawn-provider",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": "spawn-model",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "spawn-model"
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ) as build_child:
+            delegate_task(
+                goal="test",
+                model="  spawn-model  ",
+                provider="\tspawn-provider\n",
+                parent_agent=parent,
+            )
+
+        mock_creds.assert_called_once_with(
+            {"model": "spawn-model", "provider": "spawn-provider"},
+            parent,
+        )
+        self.assertEqual(build_child.call_args.kwargs["model"], "spawn-model")
+        self.assertEqual(
+            build_child.call_args.kwargs["override_provider"], "spawn-provider"
+        )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={
+        "model": "configured-model",
+        "provider": "configured-provider",
+    })
+    def test_spawn_override_combines_with_internal_credentials_cfg(
+        self, _mock_cfg, mock_creds
+    ):
+        mock_creds.return_value = {
+            "provider": "spawn-provider",
+            "base_url": "https://api.example",
+            "api_key": "secret",
+            "api_mode": "chat",
+            "model": "spawn-model",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "spawn-model"
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ) as build_child:
+            delegate_task(
+                goal="test",
+                model="spawn-model",
+                provider="spawn-provider",
+                credentials_cfg={
+                    "base_url": "https://api.example",
+                    "api_key": "secret",
+                    "api_mode": "chat",
+                    "model": "review-model",
+                    "provider": "review-provider",
+                },
+                parent_agent=parent,
+            )
+
+        # credentials_cfg wins over the global cfg, but per-spawn overrides
+        # still rewrite only the model/provider axes.
+        mock_creds.assert_called_once_with(
+            {
+                "base_url": "https://api.example",
+                "api_key": "secret",
+                "api_mode": "chat",
+                "model": "spawn-model",
+                "provider": "spawn-provider",
+            },
+            parent,
+        )
+        self.assertEqual(build_child.call_args.kwargs["model"], "spawn-model")
+        self.assertEqual(
+            build_child.call_args.kwargs["override_provider"], "spawn-provider"
+        )
+
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
         contract that exists nowhere else in the schema (keyword-level, not
