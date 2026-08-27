@@ -246,6 +246,36 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_round_trips_explicit_none_fallback_policy(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                fallback_policy="none",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["fallback_policy"] == "none"
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["fallback_policy"] == "none"
+
+    def test_create_rejects_explicit_empty_fallback_policy(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                fallback_policy="",
+            )
+        )
+
+        assert created["success"] is False
+        assert "fallback_policy" in created["error"]
+        assert json.loads(cronjob(action="list"))["count"] == 0
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
@@ -393,24 +423,25 @@ class TestUnifiedCronjobTool:
 # =========================================================================
 
 
-class TestAgentCannotSetModelPin:
-    """Per-job inference pins are user-owned (dashboard / `hermes cron`
-    --model / hand-edited jobs). The agent-facing tool schema must not expose
-    model/provider/base_url, and the registered handler must ignore them even
-    if a model hallucinates the old parameters."""
+class TestAgentCannotSetInferencePolicy:
+    """Per-job inference pins and fallback boundaries are user-owned.
 
-    def test_schema_has_no_inference_pin_params(self):
+    The agent-facing tool schema must not expose model/provider/base_url or
+    fallback_policy, and the registered handler must ignore them even if a
+    model hallucinates the parameters.
+    """
+
+    def test_schema_has_no_user_owned_inference_params(self):
         from tools.cronjob_tools import CRONJOB_SCHEMA
 
         props = CRONJOB_SCHEMA["parameters"]["properties"]
         assert "model" not in props
         assert "provider" not in props
         assert "base_url" not in props
+        assert "fallback_policy" not in props
 
-
-    def test_handler_update_leaves_user_pin_untouched(self):
-        """An update through the agent handler must not clear or change a
-        user-set pin (grandfathered agent-era pins included)."""
+    def test_handler_update_leaves_user_inference_policy_untouched(self):
+        """Agent updates cannot clear or relax user-owned inference policy."""
         from cron.jobs import get_job
         from tools.registry import registry
 
@@ -421,6 +452,7 @@ class TestAgentCannotSetModelPin:
                 schedule="every 1h",
                 model="anthropic/claude-sonnet-4",
                 provider="anthropic",
+                fallback_policy="none",
             )
         )
         job_id = created["job_id"]
@@ -433,6 +465,7 @@ class TestAgentCannotSetModelPin:
                     "job_id": job_id,
                     "name": "renamed",
                     "model": {"model": "openai/gpt-4.1"},
+                    "fallback_policy": "inherit",
                 },
             )
         )
@@ -441,6 +474,7 @@ class TestAgentCannotSetModelPin:
         assert stored is not None
         assert stored["model"] == "anthropic/claude-sonnet-4"
         assert stored["provider"] == "anthropic"
+        assert stored["fallback_policy"] == "none"
         assert stored["name"] == "renamed"
 
 

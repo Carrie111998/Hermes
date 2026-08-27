@@ -13005,6 +13005,7 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
 
 def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
     annotated = dict(job)
+    annotated.pop("fallback_snapshot", None)
     annotated["profile"] = profile
     annotated["profile_name"] = profile
     annotated["hermes_home"] = str(home)
@@ -13267,6 +13268,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             model=_cron_optional_text(body.model),
             provider=_cron_optional_text(body.provider),
             base_url=_cron_optional_text(body.base_url, strip_trailing_slash=True),
+            fallback_policy=body.fallback_policy,
             script=script,
             context_from=context_from,
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),

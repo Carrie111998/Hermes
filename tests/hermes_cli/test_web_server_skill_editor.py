@@ -206,3 +206,39 @@ class TestCronJobSkills:
         )
         assert resp.status_code == 200
         assert resp.json()["skills"] == []
+
+    def test_create_and_update_fallback_policy(self, client, isolated_profiles):
+        created = client.post(
+            "/api/cron/jobs",
+            json={
+                "prompt": "do private work",
+                "schedule": "every 1h",
+                "fallback_policy": "none",
+            },
+        )
+
+        assert created.status_code == 200
+        job = created.json()
+        assert job["fallback_policy"] == "none"
+        assert "fallback_snapshot" not in job
+
+        fetched = client.get(
+            f"/api/cron/jobs/{job['id']}", params={"profile": "default"}
+        )
+        assert fetched.status_code == 200
+        assert "fallback_snapshot" not in fetched.json()
+
+        listed = client.get("/api/cron/jobs", params={"profile": "default"})
+        assert listed.status_code == 200
+        matching = [item for item in listed.json() if item["id"] == job["id"]]
+        assert len(matching) == 1
+        assert "fallback_snapshot" not in matching[0]
+
+        updated = client.put(
+            f"/api/cron/jobs/{job['id']}",
+            json={"updates": {"fallback_policy": "inherit"}},
+            params={"profile": "default"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["fallback_policy"] == "inherit"
+        assert "fallback_snapshot" not in updated.json()

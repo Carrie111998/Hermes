@@ -54,6 +54,7 @@ from hermes_cli.config import (
     resolve_cron_model_drift_defaults,
 )
 from hermes_cli.fallback_config import get_fallback_chain
+from cron.jobs import normalize_fallback_policy, snapshot_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
@@ -121,7 +122,7 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
-def _fallback_chain_phrase() -> str:
+def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     """Wording for the fallback-chain clause of a provider-failure message.
 
     "Fallback chain was exhausted or unavailable." used to fire
@@ -135,6 +136,18 @@ def _fallback_chain_phrase() -> str:
     read (e.g. mid-shutdown, permissions) -- never let a lookup error crash
     failure-message generation itself.
     """
+    raw_policy: Any = "inherit"
+    if isinstance(job, dict) and "fallback_policy" in job:
+        raw_policy = job["fallback_policy"]
+    try:
+        policy = normalize_fallback_policy(raw_policy)
+    except ValueError:
+        return "Cron fallback policy is invalid; no fallback provider was attempted."
+    if policy == "none":
+        return "Cron fallback_policy=none; no fallback provider was attempted."
+    if policy == "pinned":
+        return "Pinned fallback chain was exhausted or unavailable."
+
     try:
         cfg = load_config() or {}
         chain = get_fallback_chain(cfg)
@@ -282,7 +295,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "quota limit"
         return (
             f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            f"{_fallback_chain_phrase()} "
+            f"{_fallback_chain_phrase(job)} "
             "Full details saved in cron output."
         )
 
@@ -329,7 +342,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     ):
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            f"{_fallback_chain_phrase()} "
+            f"{_fallback_chain_phrase(job)} "
             "Full details saved in cron output."
         )
 
@@ -4879,6 +4892,56 @@ DRIFT_SKIP_MARKER = "[drift_skip]"
 DRIFT_SKIP_SILENT_MARKER = "[drift_skip:silent]"
 
 
+def _blocked_config_result(
+    job_name: str,
+    job_id: str,
+    reason: str,
+    *,
+    preflight_opt_out: bool = False,
+) -> tuple[bool, str, str, str]:
+    """Build a fail-before-spend result using the existing alert-once lane."""
+    logger.warning(
+        "Job '%s' (ID: %s): BLOCKED by configuration validation — %s "
+        "(no LLM call was made)",
+        job_name,
+        job_id,
+        reason,
+    )
+    already_alerted = False
+    try:
+        from cron.jobs import mark_preflight_alerted
+
+        already_alerted = mark_preflight_alerted(job_id)
+    except Exception:
+        logger.debug(
+            "Job '%s': could not persist preflight alert marker",
+            job_id,
+            exc_info=True,
+        )
+    marker = (
+        BLOCKED_CONFIG_SILENT_MARKER
+        if already_alerted
+        else BLOCKED_CONFIG_MARKER
+    )
+    opt_out = (
+        " Set `cron.preflight: false` in config.yaml to disable ordinary "
+        "pre-dispatch checks."
+        if preflight_opt_out
+        else ""
+    )
+    blocked_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "**Status:** BLOCKED (configuration)\n\n"
+        "Configuration validation found a problem and the agent was NOT run "
+        "(no tokens spent).\n\n"
+        f"**Reason:** {reason}\n\n"
+        "The job will stay blocked without re-alerting until the configuration "
+        f"is fixed; the next healthy run clears this state.{opt_out}"
+    )
+    return False, blocked_doc, "", f"{marker} {reason}"
+
 
 def _is_transient_provider_resolve_error(exc: BaseException) -> bool:
     """True when primary provider resolution failed for a transient network reason.
@@ -4987,7 +5050,15 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return cron_cfg.get("preflight", True) is not False
 
 
-def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
+_FALLBACK_CHAIN_UNSET = object()
+
+
+def _preflight_check_provider_key(
+    job: dict,
+    cfg: dict,
+    *,
+    fallback_chain=_FALLBACK_CHAIN_UNSET,
+) -> Optional[str]:
     """READ-ONLY probe: would provider resolution fail for lack of a key?
 
     Mirrors the effective requested-provider computation from run_job's
@@ -4998,7 +5069,12 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     already guaranteed by the fallback resolution being config-local).
     """
     try:
-        if get_fallback_chain(cfg):
+        effective_chain = (
+            get_fallback_chain(cfg)
+            if fallback_chain is _FALLBACK_CHAIN_UNSET
+            else fallback_chain
+        )
+        if effective_chain:
             return None
     except Exception:
         return None  # fail-open: never block on a preflight-internal error
@@ -5150,7 +5226,12 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(
+    job: dict,
+    cfg: dict,
+    *,
+    fallback_chain=_FALLBACK_CHAIN_UNSET,
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -5167,7 +5248,14 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     alert-once pattern from the dead-pin auto-pause (#73506).
     """
     for name, check in (
-        ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
+        (
+            "provider_key",
+            lambda: _preflight_check_provider_key(
+                job,
+                cfg,
+                fallback_chain=fallback_chain,
+            ),
+        ),
         ("skills", lambda: _preflight_check_skills(job)),
         ("delivery", lambda: _preflight_check_delivery(job)),
     ):
@@ -5790,6 +5878,7 @@ def run_job(
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _non_dispatcher_token = None
+    _auxiliary_boundary_token = None
     try:
         if not _cwd_lock_acquired:
             # Fail closed (#79768): running without the lock would let a
@@ -5982,6 +6071,70 @@ def run_job(
         if _mt is None:
             _mt = _cfg.get("max_turns")
         max_iterations = _resolve_turn_limit(_mt)
+        cfg_dict: dict[str, Any] = _cfg if isinstance(_cfg, dict) else {}
+
+        # Per-job cross-provider fallback boundary. Missing policy means
+        # ``inherit`` for backward compatibility; a present malformed value is
+        # fail-closed so direct jobs.json edits cannot silently widen routing.
+        raw_fallback_policy = (
+            job["fallback_policy"]
+            if "fallback_policy" in job
+            else "inherit"
+        )
+        try:
+            fallback_policy = normalize_fallback_policy(raw_fallback_policy)
+        except ValueError:
+            return _blocked_config_result(
+                job_name,
+                job_id,
+                "stored fallback policy is invalid; update it explicitly to "
+                "inherit, none, or pinned",
+            )
+
+        global_fallback_chain = list(get_fallback_chain(cfg_dict) or [])
+        fallback_chain = global_fallback_chain
+        if fallback_policy == "none":
+            fallback_chain = []
+        elif fallback_policy == "pinned":
+            pinned_snapshot = job.get("fallback_snapshot")
+            pinned_fingerprint = (
+                str(pinned_snapshot.get("fingerprint") or "").strip()
+                if isinstance(pinned_snapshot, dict)
+                else ""
+            )
+            current_fingerprint = snapshot_fallback_chain(global_fallback_chain)[
+                "fingerprint"
+            ]
+            if not pinned_fingerprint or current_fingerprint != pinned_fingerprint:
+                already_alerted = False
+                try:
+                    from cron.jobs import mark_fallback_drift_alerted
+
+                    already_alerted = mark_fallback_drift_alerted(job_id)
+                except Exception:
+                    pass  # fail open: better a duplicate alert than none
+                marker = (
+                    DRIFT_SKIP_SILENT_MARKER
+                    if already_alerted
+                    else DRIFT_SKIP_MARKER
+                )
+                raise RuntimeError(
+                    f"{marker} Pinned fallback route no longer matches the "
+                    "current global configuration. No provider was contacted. "
+                    "Stored and current route details are intentionally omitted. "
+                    "Review the global fallback configuration, then re-pin this "
+                    f"job with `hermes cron edit {job_id} --fallback-policy "
+                    "pinned` to adopt it."
+                )
+            if job.get("fallback_drift_alerted"):
+                try:
+                    from cron.jobs import clear_fallback_drift_alerted
+
+                    clear_fallback_drift_alerted(job_id)
+                except Exception:
+                    pass
+
+        remaining_fallback_chain = list(fallback_chain)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -6017,8 +6170,12 @@ def run_job(
         # ---------------------------------------------------------------
         _pf_reason = None
         try:
-            if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+            if _cron_preflight_enabled(cfg_dict):
+                _pf_reason = _preflight_job_config(
+                    job,
+                    cfg_dict,
+                    fallback_chain=fallback_chain,
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -6124,6 +6281,21 @@ def run_job(
                 str(getattr(resolve_exc, "provider", "") or "").strip().lower()
                 or primary_provider_for_drift
             )
+            if not fallback_chain:
+                if fallback_policy == "none":
+                    logger.warning(
+                        "Job '%s': primary resolve failed and fallback_policy=none; "
+                        "no fallback provider will be attempted",
+                        job_id,
+                    )
+                    raise RuntimeError(
+                        f"{format_runtime_provider_error(resolve_exc)} "
+                        "Cron fallback_policy=none; no fallback provider was "
+                        "attempted."
+                    ) from resolve_exc
+                raise RuntimeError(
+                    format_runtime_provider_error(resolve_exc)
+                ) from resolve_exc
             reason = "auth" if is_auth else "transient network"
             logger.warning(
                 "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
@@ -6131,9 +6303,9 @@ def run_job(
                 reason,
                 resolve_exc,
             )
-            fb_list = get_fallback_chain(_cfg)
+            fb_list = fallback_chain
             runtime = None
-            for entry in fb_list:
+            for fb_index, entry in enumerate(fb_list):
                 if not isinstance(entry, dict):
                     continue
                 fb_provider = str(entry.get("provider") or "").strip()
@@ -6154,6 +6326,7 @@ def run_job(
                         fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
                     model = fb_model
+                    remaining_fallback_chain = list(fb_list[fb_index + 1 :])
                     logger.info(
                         "Job '%s': fallback resolved to %s model %s",
                         job_id,
@@ -6266,7 +6439,17 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        # Re-arm alert-once as soon as every drift guard has passed, not only
+        # after the agent succeeds. A later tool/provider failure is unrelated
+        # to route drift and must not suppress the next genuine drift alert.
+        try:
+            from cron.jobs import clear_drift_alerted
+
+            clear_drift_alerted(job_id)
+        except Exception:
+            pass
+
+        fallback_model = remaining_fallback_chain or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -6303,6 +6486,14 @@ def run_job(
             logger.warning(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
                 job_id, _mcp_exc,
+            )
+
+        if fallback_policy in {"none", "pinned"}:
+            from agent.auxiliary_client import set_auxiliary_fallback_boundary
+
+            _auxiliary_boundary_token = set_auxiliary_fallback_boundary(
+                fallback_policy,
+                chain=remaining_fallback_chain,
             )
 
         agent = AIAgent(
@@ -6681,6 +6872,10 @@ def run_job(
             _cron_session_var.reset(_cron_session_token)
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
+        if _auxiliary_boundary_token is not None:
+            from agent.auxiliary_client import reset_auxiliary_fallback_boundary
+
+            reset_auxiliary_fallback_boundary(_auxiliary_boundary_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

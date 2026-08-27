@@ -41,6 +41,21 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_fallback_policy_create_default_and_edit_tristate():
+    parser = _build()
+
+    created = parser.parse_args(["cron", "create", "30m", "run"])
+    assert created.fallback_policy == "inherit"
+    assert parser.parse_args(
+        ["cron", "create", "30m", "run", "--fallback-policy", "none"]
+    ).fallback_policy == "none"
+
+    assert parser.parse_args(["cron", "edit", "j"]).fallback_policy is None
+    assert parser.parse_args(
+        ["cron", "edit", "j", "--fallback-policy", "pinned"]
+    ).fallback_policy == "pinned"
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

@@ -71,6 +71,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--fallback-policy",
+        choices=["inherit", "none", "pinned"],
+        default="inherit",
+        help=(
+            "Cross-provider fallback boundary: inherit follows the current "
+            "global chain, none disables it, pinned snapshots the current "
+            "secret-free route and fails closed if it changes."
+        ),
+    )
+    cron_create.add_argument(
         "--monitor-script",
         dest="monitor_script",
         help=(
@@ -191,6 +201,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         action="store_const",
         const=False,
         help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
+    )
+    cron_edit.add_argument(
+        "--fallback-policy",
+        choices=["inherit", "none", "pinned"],
+        default=None,
+        help=(
+            "Set the cross-provider fallback boundary. Choosing pinned "
+            "captures the current global fallback route at edit time."
+        ),
     )
     cron_edit.add_argument(
         "--continuity",

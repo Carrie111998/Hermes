@@ -3305,6 +3305,65 @@ _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
 
+# Optional per-run fallback boundary. Cron installs this in the copied worker
+# context so auxiliary calls cannot silently escape the job's provider policy.
+# ``None`` means ordinary interactive behaviour; strict policies carry the
+# already-authorised in-memory chain (never persisted here).
+_AUXILIARY_FALLBACK_BOUNDARY_CONTEXT: contextvars.ContextVar[
+    Optional[Dict[str, Any]]
+] = contextvars.ContextVar("auxiliary_fallback_boundary", default=None)
+
+
+def set_auxiliary_fallback_boundary(
+    policy: str,
+    chain: Optional[List[Dict[str, Any]]] = None,
+) -> contextvars.Token:
+    """Bind one context-local auxiliary fallback boundary."""
+    normalized_policy = str(policy or "").strip().lower()
+    if normalized_policy not in {"inherit", "none", "pinned"}:
+        raise ValueError("invalid auxiliary fallback boundary policy")
+    normalized_chain = [
+        dict(entry) for entry in (chain or []) if isinstance(entry, dict)
+    ]
+    if normalized_policy == "none":
+        normalized_chain = []
+    return _AUXILIARY_FALLBACK_BOUNDARY_CONTEXT.set(
+        {"policy": normalized_policy, "chain": normalized_chain}
+    )
+
+
+def get_auxiliary_fallback_boundary() -> Optional[Dict[str, Any]]:
+    """Return a defensive copy of the active auxiliary fallback boundary."""
+    boundary = _AUXILIARY_FALLBACK_BOUNDARY_CONTEXT.get()
+    if not isinstance(boundary, dict):
+        return None
+    return {
+        "policy": str(boundary.get("policy") or ""),
+        "chain": [
+            dict(entry)
+            for entry in (boundary.get("chain") or [])
+            if isinstance(entry, dict)
+        ],
+    }
+
+
+def reset_auxiliary_fallback_boundary(token: contextvars.Token) -> None:
+    """Restore the auxiliary fallback boundary that preceded one scoped run."""
+    if token is None:
+        return
+    try:
+        _AUXILIARY_FALLBACK_BOUNDARY_CONTEXT.reset(token)
+    except (RuntimeError, ValueError):
+        pass
+
+
+def _strict_auxiliary_fallback_boundary() -> bool:
+    boundary = _AUXILIARY_FALLBACK_BOUNDARY_CONTEXT.get()
+    return isinstance(boundary, dict) and boundary.get("policy") in {
+        "none",
+        "pinned",
+    }
+
 _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_relay_call", default=None)
 )
@@ -5465,6 +5524,9 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _strict_auxiliary_fallback_boundary():
+        return None, None, ""
+
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -5537,6 +5599,9 @@ def _try_main_agent_model_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _strict_auxiliary_fallback_boundary():
+        return None, None, ""
+
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
     if main_provider.lower() == "moa":
@@ -5705,6 +5770,8 @@ def _try_configured_fallback_chain(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _strict_auxiliary_fallback_boundary():
+        return None, None, ""
     if not task:
         return None, None, ""
 
@@ -5863,14 +5930,22 @@ def _try_main_fallback_chain(
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
     """
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
+    boundary = get_auxiliary_fallback_boundary()
+    if boundary and boundary["policy"] in {"none", "pinned"}:
+        chain = boundary["chain"]
+    else:
+        try:
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.fallback_config import get_fallback_chain
 
-        chain = get_fallback_chain(load_config_readonly())
-    except Exception as exc:
-        logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
-        return None, None, ""
+            chain = get_fallback_chain(load_config_readonly())
+        except Exception as exc:
+            logger.debug(
+                "Auxiliary %s: could not load main fallback chain: %s",
+                task or "call",
+                exc,
+            )
+            return None, None, ""
 
     if not chain:
         return None, None, ""
@@ -5931,6 +6006,61 @@ def _try_main_fallback_chain(
             task or "call", ", ".join(tried),
         )
     return None, None, ""
+
+
+def _try_explicit_auxiliary_fallback(
+    task: Optional[str],
+    failed_provider: str,
+    *,
+    reason: str,
+    failed_model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Recover an explicit auxiliary primary without escaping a strict boundary."""
+    task_name = task or ""
+    candidate = _try_configured_fallback_chain(
+        task_name,
+        failed_provider or "auto",
+        reason=reason,
+        failed_model=failed_model,
+    )
+    if candidate[0] is not None:
+        return candidate
+    if _strict_auxiliary_fallback_boundary():
+        return _try_main_fallback_chain(task, failed_provider, reason=reason)
+    return _try_main_agent_model_fallback(
+        failed_provider,
+        task_name,
+        reason=reason,
+        failed_model=failed_model,
+    )
+
+
+def _try_stale_fallback_recovery(
+    failed_provider: str,
+    task: Optional[str],
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Continue within the authorised lane after quarantining a stale rung."""
+    reason = "stale fallback credential"
+    if _strict_auxiliary_fallback_boundary():
+        return _try_main_fallback_chain(task, failed_provider, reason=reason)
+    return _try_payment_fallback(failed_provider, task or "", reason=reason)
+
+
+def _try_unavailable_explicit_auxiliary_fallback(
+    task: Optional[str],
+    failed_provider: str,
+    *,
+    failed_model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Recover an unavailable explicit primary without escaping strict policy."""
+    if _strict_auxiliary_fallback_boundary():
+        return _try_explicit_auxiliary_fallback(
+            task,
+            failed_provider,
+            reason="provider unavailable before first request",
+            failed_model=failed_model,
+        )
+    return _try_configured_fallback_for_unavailable_client(task, failed_provider)
 
 
 def _resolve_single_provider(
@@ -6125,6 +6255,13 @@ def _resolve_auto_route(
         return fb_client, fb_model, fb_label
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
+    if _strict_auxiliary_fallback_boundary():
+        logger.info(
+            "Auxiliary %s: strict fallback boundary exhausted; built-in "
+            "provider discovery disabled",
+            task or "call",
+        )
+        return None, None, ""
     tried = []
     for label, try_fn in _get_provider_chain():
         if _is_provider_unhealthy(label):
@@ -9531,8 +9668,12 @@ def _call_llm_impl(
             # auth (for example openai-codex).
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                fb_client, fb_model, fb_label = (
+                    _try_unavailable_explicit_auxiliary_fallback(
+                        task,
+                        _explicit,
+                        failed_model=resolved_model,
+                    )
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
@@ -10116,13 +10257,12 @@ def _call_llm_impl(
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                fb_client, fb_model, fb_label = _try_explicit_auxiliary_fallback(
+                    task,
+                    resolved_provider or "auto",
+                    reason=reason,
+                    failed_model=_chain_failed_model,
+                )
 
             if fb_client is not None:
                 _record_route_info(
@@ -10140,8 +10280,10 @@ def _call_llm_impl(
                 # The candidate had a stale/unrefreshable credential and was
                 # quarantined — walk the discovery chain once more; unhealthy
                 # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                fb_client, fb_model, fb_label = _try_stale_fallback_recovery(
+                    resolved_provider,
+                    task,
+                )
                 if fb_client is not None:
                     _record_route_info(
                         route_info, _fallback_provider_from_label(fb_label), fb_model
@@ -10350,8 +10492,12 @@ async def _async_call_llm_impl(
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                fb_client, fb_model, fb_label = (
+                    _try_unavailable_explicit_auxiliary_fallback(
+                        task,
+                        _explicit,
+                        failed_model=resolved_model,
+                    )
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
@@ -10814,13 +10960,12 @@ async def _async_call_llm_impl(
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                fb_client, fb_model, fb_label = _try_explicit_auxiliary_fallback(
+                    task,
+                    resolved_provider or "auto",
+                    reason=reason,
+                    failed_model=_chain_failed_model,
+                )
 
             if fb_client is not None:
                 # Convert sync fallback client to async
@@ -10843,8 +10988,10 @@ async def _async_call_llm_impl(
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
                 # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                fb_client, fb_model, fb_label = _try_stale_fallback_recovery(
+                    resolved_provider,
+                    task,
+                )
                 if fb_client is not None:
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")

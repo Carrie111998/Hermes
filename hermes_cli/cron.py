@@ -185,6 +185,8 @@ def cron_list(show_all: bool = False):
                 print(f"    Changed:   {mon_state['last_changed_at']}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+        else:
+            print(f"    Fallback:  {job.get('fallback_policy') or 'inherit'}")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
@@ -506,6 +508,7 @@ def cron_create(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        fallback_policy=getattr(args, "fallback_policy", "inherit"),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
@@ -528,6 +531,8 @@ def cron_create(args):
         print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    else:
+        print(f"  Fallback: {job_data.get('fallback_policy') or 'inherit'}")
     if job_data.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
@@ -581,6 +586,7 @@ def cron_edit(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
+        fallback_policy=getattr(args, "fallback_policy", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
@@ -606,6 +612,8 @@ def cron_edit(args):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    else:
+        print(f"  Fallback: {updated.get('fallback_policy') or 'inherit'}")
     if updated.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):
