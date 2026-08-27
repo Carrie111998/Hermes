@@ -4264,12 +4264,11 @@ def _detect_venv_python_processes(
                 if candidate_pid in skip or not candidate_exe:
                     continue
                 candidate_exe_norm = str(candidate_exe).lower()
-                if not (
-                    candidate_exe_norm.startswith(venv_prefix)
-                    or _looks_like_python_image(candidate_name)
-                    or _looks_like_python_image(Path(str(candidate_exe)).name)
-                ):
-                    continue
+                # Preserve the base scanner's broad command-line contract:
+                # a renamed or alternate external launcher can still reference
+                # this venv even when neither its snapshot name nor executable
+                # basename is Python-like. Toolhelp still avoids the broad
+                # psutil process_iter metadata query.
                 try:
                     yield psutil.Process(candidate_pid), {
                         "pid": candidate_pid,
@@ -4328,8 +4327,6 @@ def _detect_venv_python_processes(
         # this venv's path, or a `-m hermes_cli.main ...` invocation tied to
         # this install (install root in the cmdline or as the working dir).
         if not is_holder:
-            if native and not (process_is_python or executable_is_python):
-                continue
             if native:
                 try:
                     cmdline_raw = " ".join(proc.cmdline() or [])

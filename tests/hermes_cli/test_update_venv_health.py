@@ -129,6 +129,12 @@ def test_detect_venv_python_fallback_preserves_full_process_contract(_winp, tmp_
 def test_detect_venv_python_native_path_catches_arbitrary_venv_executable(_winp, tmp_path):
     venv_exe = str(tmp_path / "venv" / "Scripts" / "custom-runner.exe")
     holder = _proc(303, venv_exe, "custom-runner.exe", [venv_exe, "worker.py"])
+    unrelated = _proc(
+        404,
+        r"C:\Program Files\nodejs\node.exe",
+        "node.exe",
+        [r"C:\Program Files\nodejs\node.exe", "server.js"],
+    )
     me = MagicMock()
     me.parents.return_value = []
     constructed_pids = []
@@ -137,7 +143,7 @@ def test_detect_venv_python_native_path_catches_arbitrary_venv_executable(_winp,
         if pid is None:
             return me
         constructed_pids.append(pid)
-        return holder
+        return {303: holder, 404: unrelated}[pid]
 
     fake_psutil = types.SimpleNamespace(
         process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
@@ -157,7 +163,7 @@ def test_detect_venv_python_native_path_catches_arbitrary_venv_executable(_winp,
         ]
 
     fake_psutil.process_iter.assert_not_called()
-    assert constructed_pids == [303]
+    assert constructed_pids == [303, 404]
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -204,6 +210,28 @@ def test_detect_venv_python_native_supports_versioned_external_python(_winp, tmp
     ), patch.dict(sys.modules, {"psutil": fake_psutil}):
         assert cli_main._detect_venv_python_processes() == [
             (505, "python3.11.exe", f"{external} {venv_py} worker.py")
+        ]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_native_catches_renamed_external_launcher(_winp, tmp_path):
+    external = r"C:\Tools\worker-host.exe"
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    holder = _proc(515, external, "worker-host.exe", [external, venv_py, "worker.py"])
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
+        Process=lambda pid=None: me if pid is None else holder,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module,
+        "_windows_process_image_rows",
+        return_value=[(515, "worker-host.exe", external)],
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == [
+            (515, "worker-host.exe", f"{external} {venv_py} worker.py")
         ]
 
 
