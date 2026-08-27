@@ -7,6 +7,7 @@ do not own the security policy or grant-construction responsibilities.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -55,11 +56,21 @@ def source_provenance_activation(agent: Any, function_name: str):
         return nullcontext()
 
 
-def attach_trusted_source_provenance_metadata(agent: Any, function_name: str) -> None:
-    """Keep opaque trusted-read grant digests off the provider message path."""
+def attach_trusted_source_provenance_metadata(
+    agent: Any,
+    function_name: str,
+    *,
+    content: Any | None = None,
+) -> dict[str, Any] | None:
+    """Return an opaque, content-bound trusted-read envelope.
+
+    The envelope is carried only in the internal tool message and consumed by
+    the egress runtime.  It binds the exact presentation bytes to grants for
+    the exact following provider request; it is never serialized to a provider.
+    """
 
     if function_name != "read_file":
-        return
+        return None
     try:
         from agent.llm_egress_firewall import source_grant_digest
         from agent.source_provenance import (
@@ -73,20 +84,28 @@ def attach_trusted_source_provenance_metadata(agent: Any, function_name: str) ->
             str(getattr(agent, "_current_api_request_id", "") or ""), turn_id
         )
         if not isinstance(registry, SourceProvenanceRegistry) or not request_id:
-            return
+            return None
         digests = tuple(
             source_grant_digest(grant)
             for grant in registry.grants_for_request(request_id)
         )
         if not digests:
-            return
+            return None
         metadata = getattr(agent, "_source_provenance_metadata", None)
         if not isinstance(metadata, dict):
             metadata = {}
             agent._source_provenance_metadata = metadata
-        metadata[request_id] = {"source_grant_digests": digests}
+        envelope: dict[str, Any] = {
+            "request_id": request_id,
+            "source_grant_digests": digests,
+        }
+        if isinstance(content, str):
+            envelope["content_sha256"] = sha256(content.encode("utf-8")).hexdigest()
+            envelope["presentation_kind"] = "read_file_json_v1"
+        metadata[request_id] = envelope
+        return envelope
     except Exception:
-        return
+        return None
 
 
 def issue_active_read_provenance(

@@ -1814,7 +1814,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        attach_trusted_source_provenance_metadata(agent, name)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1842,11 +1841,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
+        _source_provenance = attach_trusted_source_provenance_metadata(
+            agent, name, content=_tool_content
+        )
         tool_message = make_tool_result_message(
             name,
             _tool_content,
             tool_call_id,
             effect_disposition=effect_disposition,
+            source_provenance=_source_provenance,
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2737,7 +2740,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        attach_trusted_source_provenance_metadata(agent, function_name)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -2758,11 +2760,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
+        _source_provenance = attach_trusted_source_provenance_metadata(
+            agent, function_name, content=_tool_content
+        )
         tool_message = make_tool_result_message(
             function_name,
             _tool_content,
             tool_call_id,
             effect_disposition="unknown" if _execution_timed_out else None,
+            source_provenance=_source_provenance,
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")

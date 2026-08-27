@@ -279,15 +279,20 @@ def test_protected_kanban_runtime_does_not_hide_encoded_payload(tmp_path, monkey
         )
 
 
-def test_protected_kanban_types_only_recognized_terminal_result_syntax(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "output",
+    [
+        "https://github.com/acme/widget.git",
+        "refs/heads/codex/fix-135",
+        "a" * 40,
+        "b" * 64,
+    ],
+)
+def test_protected_kanban_never_promotes_generic_terminal_stdout_by_shape(
+    tmp_path, monkeypatch, output
 ):
     monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
     agent = _agent(tmp_path)
-    output = (
-        "https://github.com/acme/widget.git\n"
-        "run_id=1129 --force-with-lease refs/heads/codex/fix-135"
-    )
     kwargs = {
         "model": "test-model",
         "messages": [
@@ -309,10 +314,10 @@ def test_protected_kanban_types_only_recognized_terminal_result_syntax(
         ],
     }
 
-    authorized, receipt = authorize_agent_sdk_kwargs(agent, kwargs)
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(agent, kwargs)
 
-    assert authorized == kwargs
-    assert json.loads(receipt.payload_bytes) == kwargs
+    assert "untrusted_provenance" in exc_info.value.decision.reason_codes
 
 
 def test_protected_terminal_file_bytes_keep_untrusted_provenance(
@@ -443,7 +448,7 @@ def test_recognized_terminal_syntax_does_not_exempt_adjacent_base64(
         )
 
 
-def test_protected_kanban_recognizes_direct_codex_function_items(
+def test_protected_kanban_rejects_generic_codex_function_output(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
@@ -465,7 +470,88 @@ def test_protected_kanban_recognizes_direct_codex_function_items(
         ],
     }
 
-    authorized, receipt = authorize_agent_sdk_kwargs(agent, kwargs)
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(agent, kwargs)
 
-    assert authorized == kwargs
-    assert json.loads(receipt.payload_bytes) == kwargs
+    assert "untrusted_provenance" in exc_info.value.decision.reason_codes
+
+
+def test_real_read_file_wire_result_keeps_exact_source_provenance(
+    tmp_path, monkeypatch
+):
+    from agent.source_provenance_tools import (
+        attach_trusted_source_provenance_metadata,
+        source_provenance_activation,
+    )
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    from tools.file_tools import read_file_tool
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    source = tmp_path / "source.py"
+    source.write_text("first = 1\nsecond = 2\n", encoding="utf-8")
+    agent = _agent(tmp_path / "egress")
+    agent._current_api_request_id = "turn-1:api:1"
+
+    with source_provenance_activation(agent, "read_file"):
+        result = read_file_tool(str(source), task_id="egress-real-read")
+    metadata = attach_trusted_source_provenance_metadata(
+        agent, "read_file", content=result
+    )
+    message = make_tool_result_message(
+        "read_file",
+        result,
+        "call_read_1",
+        source_provenance=metadata,
+    )
+    agent._current_api_request_id = "turn-1:api:2"
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {"model": "test-model", "messages": [message]},
+    )
+
+    assert authorized["messages"][0]["content"] == result
+    assert "_source_provenance" not in authorized["messages"][0]
+    assert receipt.decision.source_grant_count == 1
+    assert receipt.decision.source_segment_count == 1
+
+
+@pytest.mark.parametrize("mutation", ["missing", "stale", "forged"])
+def test_read_file_wire_result_fails_closed_without_exact_metadata(
+    tmp_path, monkeypatch, mutation
+):
+    from agent.source_provenance_tools import (
+        attach_trusted_source_provenance_metadata,
+        source_provenance_activation,
+    )
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    from tools.file_tools import read_file_tool
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    source = tmp_path / "source.py"
+    source.write_text("safe = True\n", encoding="utf-8")
+    agent = _agent(tmp_path / "egress")
+    agent._current_api_request_id = "turn-1:api:1"
+    with source_provenance_activation(agent, "read_file"):
+        result = read_file_tool(str(source), task_id=f"egress-{mutation}")
+    metadata = attach_trusted_source_provenance_metadata(
+        agent, "read_file", content=result
+    )
+    if mutation == "missing":
+        metadata = None
+    elif mutation == "stale":
+        metadata = {**metadata, "request_id": "turn-1:api:1"}
+    else:
+        metadata = {**metadata, "content_sha256": "0" * 64}
+    message = make_tool_result_message(
+        "read_file", result, "call_read_1", source_provenance=metadata
+    )
+    agent._current_api_request_id = "turn-1:api:2"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {"model": "test-model", "messages": [message]},
+        )
+
+    assert "untrusted_provenance" in exc_info.value.decision.reason_codes

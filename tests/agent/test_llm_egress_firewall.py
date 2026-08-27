@@ -1119,6 +1119,21 @@ def test_receipts_form_a_content_free_hash_chain(tmp_path):
     assert second["receipt_sha256"]
 
 
+def test_receipt_emission_survives_platform_without_fchmod(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, "fchmod")
+    gate = firewall(tmp_path)
+
+    allowed = gate.preflight(_sanitized_request("safe request"), _route())
+    assert allowed.allowed is True
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        gate.preflight(_sanitized_request("c2VjcmV0LXBheWxvYWQ="), _route())
+    assert exc_info.value.decision.allowed is False
+
+    lines = (tmp_path / "llm-egress-receipts.jsonl").read_text().splitlines()
+    assert [json.loads(line)["decision"] for line in lines] == ["allow", "block"]
+
+
 def test_unknown_destination_fails_closed_even_with_source_grant(tmp_path):
     path = tmp_path / "private.py"
     path.write_text("private source\n", encoding="utf-8")
