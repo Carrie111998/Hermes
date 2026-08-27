@@ -19,6 +19,7 @@ WHAT COMMIT 7 GOT WRONG — every defect below has a test named after it:
    symlink was followed.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -918,6 +919,107 @@ def test_release_failure_terminates_the_acknowledged_worker(
             "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
         )]
         assert "confinement_violation" in kinds
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    proc.wait(timeout=3)
+        conn.close()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_real_board_database_does_not_block_a_compliant_sandbox_dispatch(
+    tmp_path, monkeypatch
+):
+    """Assertion 8 must be reachable with Hermes' own live kanban.db present."""
+    from hermes_cli import workspace_policy as wp
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    fixture = tmp_path / "fixture"
+    subprocess.run(["git", "init", "-q", str(fixture)], check=True)
+    (fixture / "src.txt").write_text("ordinary task-id and group_id content")
+    subprocess.run(["git", "-C", str(fixture), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(fixture), "-c", "user.email=t@t",
+         "-c", "user.name=t", "commit", "-qm", "fixture"],
+        check=True,
+    )
+    wp.build_fixture_attestation(str(fixture), build_source="test")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    kb._INITIALIZED_PATHS.clear()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _n: True)
+
+    policy = wp.WorkspacePolicy(
+        board="default", mode=wp.MODE_SANDBOX,
+        allowed_roots=(str(tmp_path),), protected_paths=("*/protected*",),
+        hermes_home_root=str(home),
+        required_deny_globs=("*git*push*", "*vercel*"),
+        prohibited_commands=("git push origin main", "vercel --prod"),
+        allowed_commands=("npm test", "git status"),
+    )
+    config = {
+        "approvals": {
+            "single_query_mode": "deny",
+            "deny": ["*git*push*", "*vercel*"],
+        }
+    }
+    monkeypatch.setattr(wp, "resolve_policy", lambda *a, **k: policy)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", lambda *a, **k: config
+    )
+
+    processes = []
+
+    def _shipped(task, workspace, *, board=None, env_vars=None):
+        env = dict(os.environ)
+        env.update(env_vars or {})
+        script = (
+            "from hermes_cli.dispatch_confinement import "
+            "wait_for_start_barrier; "
+            "raise SystemExit(0 if wait_for_start_barrier(timeout_seconds=20) "
+            "else 70)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script], cwd=workspace, env=env,
+            start_new_session=True,
+        )
+        processes.append(proc)
+        return proc.pid
+
+    monkeypatch.setattr(kb, "_default_spawn", _shipped)
+    conn = kb.connect(db_path=home / "kanban.db")
+    try:
+        tid = kb.create_task(
+            conn, title="ordinary task-id work", assignee="coder",
+            workspace_kind="dir", workspace_path=str(fixture),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
+
+        result = kb.dispatch_once(conn, spawn_fn=None)
+        assert tid in [task_id for task_id, _assignee, _path in result.spawned], result
+        assert result.refused_confinement == []
+
+        run = conn.execute(
+            "SELECT observed_cwd FROM task_runs WHERE task_id = ?", (tid,)
+        ).fetchone()
+        assert run["observed_cwd"] == os.path.realpath(fixture)
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'confinement_verified' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["contract_satisfied"] is True
+
+        assert processes
+        processes[0].wait(timeout=10)
+        assert processes[0].returncode == 0
     finally:
         for proc in processes:
             if proc.poll() is None:

@@ -446,6 +446,50 @@ def test_the_scanner_never_returns_a_secret_value(tmp_path):
     assert all(secret not in f for f in findings)
 
 
+def test_ordinary_runtime_text_is_not_credential_material(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    ordinary = (
+        "see the task-id column\n"
+        "this is a risk-free refactor\n"
+        "group_id: 12\n"
+        "setup_hooks: true\n"
+        "backup_dir: /tmp\n"
+    )
+    (home / "settings.yaml").write_text(ordinary)
+    (home / "keyboard.md").write_text("ordinary keyboard instructions")
+    (home / "authorship.md").write_text("ordinary authorship notes")
+    assert wp.scan_for_key_material(str(home)) == []
+
+
+def test_credential_shaped_filename_still_fails_closed(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    (home / "auth.json").write_text('{"session": "present"}')
+    findings = wp.scan_for_key_material(str(home))
+    assert findings and "credential-shaped filename" in findings[0]
+
+
+def test_runtime_databases_are_not_scanned_as_credential_text(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    for name in ("kanban.db", "kanban.db-wal", "kanban.db-shm"):
+        (home / name).write_bytes(
+            b"ordinary task-id group_id setup_hooks backup_dir sk-not-a-key"
+        )
+    assert wp.scan_for_key_material(str(home)) == []
+
+
+def test_realistic_long_provider_key_shape_is_detected(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    secret = "sk-ant-api03-EXAMPLENOTREAL0123456789abcdef"
+    (home / "settings.yaml").write_text(f"api_key: {secret}\n")
+    findings = wp.scan_for_key_material(str(home))
+    assert findings
+    assert all(secret not in finding for finding in findings)
+
+
 def test_key_material_refuses_without_exposing_the_value(tmp_path):
     home = tmp_path / "h"
     home.mkdir()

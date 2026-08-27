@@ -44,6 +44,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,11 +96,34 @@ SECRET_FILENAMES = (
 )
 SECRET_DIRNAMES = (".vercel", ".next", ".aws", ".ssh", ".gnupg")
 
-_KEY_PREFIXES = (
-    b"sk-", b"sk-ant-", b"sk-or-", b"ghp_", b"gho_", b"github_pat_",
-    b"AKIA", b"xoxb-", b"xoxp-", b"AIza", b"up_",
+_CREDENTIAL_PATTERNS = (
+    # OpenAI, Anthropic and OpenRouter. The generic sk- form is retained for
+    # older provider keys, but requires a token boundary and substantial body;
+    # raw substring matching made ordinary words such as "task-id" a key.
+    re.compile(rb"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}"),
+    # GitHub classic / OAuth / fine-grained PATs.
+    re.compile(rb"(?<![A-Za-z0-9_-])(?:ghp_|gho_)[A-Za-z0-9]{20,}"),
+    re.compile(rb"(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}"),
+    # AWS access-key id, Slack tokens, Google API keys, and Upstage-style keys.
+    re.compile(rb"(?<![A-Za-z0-9_-])AKIA[0-9A-Z]{16}(?![0-9A-Z])"),
+    re.compile(rb"(?<![A-Za-z0-9_-])(?:xoxb-|xoxp-)[A-Za-z0-9-]{20,}"),
+    re.compile(rb"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{20,}"),
+    re.compile(rb"(?<![A-Za-z0-9_-])up_[A-Za-z0-9_-]{20,}"),
 )
-_CREDENTIAL_FILE_HINTS = ("key", "token", "secret", "credential", "auth")
+_CREDENTIAL_FILENAME_RE = re.compile(
+    r"(?:^|[._-])(?:api[_-]?key|key|token|secret|credentials?|auth|oauth|"
+    r"authorization)(?:[._-]|$)",
+    re.IGNORECASE,
+)
+_TEXT_LIKE_SUFFIXES = {
+    ".cfg", ".conf", ".env", ".ini", ".json", ".jsonl", ".md",
+    ".properties", ".sh", ".toml", ".txt", ".yaml", ".yml", ".zsh",
+}
+_RUNTIME_DB_ENDINGS = (
+    ".db", ".db-journal", ".db-shm", ".db-wal",
+    ".sqlite", ".sqlite-journal", ".sqlite-shm", ".sqlite-wal",
+    ".sqlite3", ".sqlite3-journal", ".sqlite3-shm", ".sqlite3-wal",
+)
 _SPACE = " "
 
 # Assertions 18-20 are executed against these, through Hermes' own guards.
@@ -592,8 +616,26 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
     for dirpath, _dirnames, filenames in os.walk(root):
         for fname in filenames:
             fpath = Path(dirpath) / fname
+            lower_name = fname.lower()
+            # Hermes' own SQLite databases contain arbitrary task text and
+            # binary pages. They are runtime state, not credential stores; raw
+            # substring scanning produced universal false positives in
+            # "task-id" and WAL content. Known credential stores remain
+            # separate eligible files (for example auth.json / .env).
+            if lower_name.endswith(_RUNTIME_DB_ENDINGS):
+                continue
+            credential_named = bool(_CREDENTIAL_FILENAME_RE.search(lower_name))
+            text_like = (
+                fpath.suffix.lower() in _TEXT_LIKE_SUFFIXES
+                or lower_name.startswith(".env")
+                or credential_named
+            )
             try:
                 if fpath.stat().st_size > 1_000_000:
+                    if strict and text_like:
+                        findings.append(
+                            f"{fpath} (eligible file exceeds credential scan limit)"
+                        )
                     continue
                 blob = fpath.read_bytes()
             except OSError as exc:
@@ -604,9 +646,10 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
                 if hashlib.sha256(blob).hexdigest() in forbidden_sha256:
                     findings.append(f"{fpath} (matches a forbidden key digest)")
                     continue
-            if any(prefix in blob for prefix in _KEY_PREFIXES):
+            if text_like and any(pattern.search(blob)
+                                 for pattern in _CREDENTIAL_PATTERNS):
                 findings.append(f"{fpath} (contains provider key material)")
-            elif any(h in fname.lower() for h in _CREDENTIAL_FILE_HINTS) and blob.strip():
+            elif credential_named and blob.strip():
                 findings.append(f"{fpath} (credential-shaped filename)")
     return findings
 
