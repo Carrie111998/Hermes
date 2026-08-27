@@ -1,3 +1,5 @@
+import { translateNow } from '@/i18n'
+
 export interface CommandsCatalogSection {
   name: string
   pairs: [string, string][]
@@ -515,7 +517,14 @@ export function desktopSlashUnavailableMessage(command: string): string | null {
 }
 
 export function desktopSlashDescription(command: string, fallback = ''): string {
-  return SPEC_BY_NAME.get(canonicalDesktopSlashCommand(command))?.description || fallback
+  const canonical = canonicalDesktopSlashCommand(command)
+  const spec = SPEC_BY_NAME.get(canonical)
+
+  if (!spec?.description) {
+    return fallback
+  }
+
+  return translateNow(`desktop.slashCommandDescs.${canonical}`) || fallback
 }
 
 export function desktopSlashCommandArgumentMode(command: string): DesktopSlashArgumentMode | null {
