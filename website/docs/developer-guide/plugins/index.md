@@ -927,7 +927,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 |------|-----------|-------------------|---------|
 | [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str` | optional directive: `{"action": "block", "message": ...}` vetoes the call; `{"action": "approve", "message": ...}` escalates to the human-approval gate |
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
-| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
+| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection), [routing override](#per-turn-routing-override) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
 | `pre_api_request` | Before each raw provider API request (several per turn when the model calls tools) | `session_id: str, model: str, provider: str, base_url: str, api_mode: str, api_call_count: int, message_count: int, tool_count: int, approx_input_tokens: int, max_tokens: int, request: dict` | ignored |
 | `post_api_request` | After each raw provider API request returns | `pre_api_request` fields plus `api_duration: float, finish_reason: str, response_model: str \| None, usage: dict, response: dict, assistant_content_chars: int, assistant_tool_call_count: int` | ignored |
@@ -941,7 +941,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
 
-Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation, and `pre_tool_call`, which can return a block/approve directive.
+Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation and optionally [override the model for the turn](#per-turn-routing-override), and `pre_tool_call`, which can return a block/approve directive.
 
 All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally.
 
@@ -1059,6 +1059,88 @@ def register(ctx):
 #### Multiple plugins returning context
 
 When multiple plugins return context from `pre_llm_call`, their outputs are joined with double newlines and appended to the user message together. The order follows plugin discovery order (alphabetical by plugin directory name).
+
+#### Per-turn routing override
+
+Context injection tells the model more. A **routing override** changes *which model answers the turn*. Alongside `"context"`, a `pre_llm_call` result may carry a `"route"` key:
+
+```python
+def route_turn(user_message, model, **kwargs):
+    if is_mechanical(user_message):
+        return {"route": {"model": "deepseek/deepseek-v3.2",
+                          "provider": "openrouter"}}
+    return None  # no route -> the configured model answers
+
+def register(ctx):
+    ctx.register_hook("pre_llm_call", route_turn)
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `model` | yes | Model slug to run this turn |
+| `provider` | no | Provider to run it on; omit to stay on the current provider |
+| `base_url` | no | Explicit endpoint. When omitted and the route changes provider, the new provider's canonical endpoint is resolved for you |
+| `api_key` | no | Explicit credential |
+| `api_mode` | no | Wire format override; normally derived from the provider |
+
+Semantics:
+
+- **Turn-scoped.** The swap is reverted at the top of the next turn, exactly like reactive fallback. A routing override can never pin the session to another model.
+- **First match wins.** If several plugins return a `route`, the first well-formed one (in plugin discovery order) is used. Context from *all* plugins is still injected as usual.
+- **Fail-safe.** A malformed override, an unknown model, or a failed client rebuild leaves the agent on its configured model and logs a warning. A routing miss never breaks the turn.
+- **Reactive fallback still applies.** If the routed model errors mid-turn, the normal failover chain engages underneath it.
+- **Policy lives in the plugin.** Core provides only the actuation path; deciding *when* to route is entirely the plugin's business.
+
+Returning both keys at once is valid:
+
+```python
+return {"context": "[routing: mechanical task]",
+        "route": {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}}
+```
+
+##### Example: an opt-in cheap-turn router
+
+A complete plugin. Drop it in `~/.hermes/plugins/cheap-turn-router/`. It is
+inert until you install it, and it ships no defaults into core.
+
+`plugin.yaml`:
+
+```yaml
+name: cheap-turn-router
+version: 0.1.0
+description: Route short mechanical turns to a cheaper model.
+```
+
+`__init__.py`:
+
+```python
+import re
+
+# Keep the policy in the plugin — this is the part core deliberately does not own.
+CHEAP = {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}
+MECHANICAL = re.compile(
+    r"^\s*(ls|cat|grep|status|what time|rename|list|show me)\b", re.I
+)
+
+
+def route_turn(user_message="", **kwargs):
+    text = (user_message or "").strip()
+    if len(text) < 200 and MECHANICAL.match(text):
+        return {"route": dict(CHEAP)}
+    return None  # everything else answers on the configured model
+
+
+def register(ctx):
+    ctx.register_hook("pre_llm_call", route_turn)
+```
+
+Classification here is a deliberately dumb regex. Swap in whatever you like — a
+local classifier, a token-count threshold, a per-user policy — without touching
+core.
+
+:::note Identity line
+The cached system prompt is assembled before `pre_llm_call` fires, so a routed turn still carries the **pre-route** `Model:` / `Provider:` identity lines. The routed model will misreport which model it is if asked during that turn. Everything else about the turn — client, credentials, endpoint, wire format, reasoning config — belongs to the routed model.
+:::
 
 ### Middleware: change what happens
 
