@@ -68,8 +68,16 @@ def _projected_desktop_rooms() -> list[dict[str, Any]]:
             explicit_room_id
             or (str(key).strip() if snapshot_version >= 3 else f"name:{name}")
         )
-        if not name or not room_id:
+        if (
+            not name
+            or not room_id
+            or len(room_id) > 200
+            or any(char in room_id for char in ("\x00", "\r", "\n"))
+        ):
             continue
+        authority_hash = str(raw_room.get("desktopAuthorityHash") or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", authority_hash):
+            authority_hash = ""
         raw_log = raw_room.get("log")
         log = [dict(item) for item in raw_log if isinstance(item, Mapping)] if isinstance(raw_log, list) else []
         raw_members = raw_room.get("members")
@@ -93,6 +101,7 @@ def _projected_desktop_rooms() -> list[dict[str, Any]]:
                     default=updated_at,
                 ),
                 "updated_at": updated_at,
+                "desktop_authority_hash": authority_hash,
                 "_room_mode": "desktop",
             }
         )
@@ -117,13 +126,28 @@ def list_messaging_rooms(service: Any) -> list[dict[str, Any]]:
         return []
 
     from gateway.desktop_room_mailbox import (
+        MAX_ROOM_IDS,
         available_room_ids,
         default_db_path,
         latest_command_states,
+        register_projected_authorities,
     )
 
     mailbox_db = default_db_path()
     desktop_ids = [room["room_id"] for room in desktop]
+    commitments = [
+        {
+            "room_id": room["room_id"],
+            "authority_hash": room["desktop_authority_hash"],
+        }
+        for room in desktop
+        if room.get("desktop_authority_hash")
+    ]
+    for index in range(0, len(commitments), MAX_ROOM_IDS):
+        register_projected_authorities(
+            mailbox_db,
+            commitments[index : index + MAX_ROOM_IDS],
+        )
     available = available_room_ids(mailbox_db, desktop_ids)
     command_states = latest_command_states(mailbox_db, desktop_ids)
     rooms = [
@@ -780,6 +804,15 @@ def relay_provenance_is_unknown(event: Any) -> bool:
     )
 
 
+def _desktop_authority_hash(room: Mapping[str, Any]) -> str:
+    authority_hash = str(room.get("desktop_authority_hash") or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", authority_hash):
+        raise RoomControlError(
+            "Open this Group Chat once in the latest Hermes Desktop, then try again."
+        )
+    return authority_hash
+
+
 def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -> str:
     """Append or hand off one idempotent room turn."""
 
@@ -797,6 +830,7 @@ def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -
             default_db_path(),
             command_id=event_id,
             room_id=str(room["room_id"]),
+            authority_hash=_desktop_authority_hash(room),
             action="send",
             payload={
                 "message": text,
@@ -830,6 +864,7 @@ def stop_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
             default_db_path(),
             command_id=cancel_id,
             room_id=str(room["room_id"]),
+            authority_hash=_desktop_authority_hash(room),
             action="stop",
             payload={},
         )

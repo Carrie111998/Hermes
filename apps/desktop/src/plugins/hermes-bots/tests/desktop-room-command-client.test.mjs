@@ -10,16 +10,16 @@ import {
 
 test('descriptors expose classic rooms only with stable identities', () => {
   const rooms = {
-    Classic: { roomId: 'room-1', log: [] },
-    Legacy: { log: [{ text: 'hi' }] },
+    Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:classic', log: [] },
+    Legacy: { desktopAuthorityToken: 'authority:legacy', log: [{ text: 'hi' }] },
     Hosted: { roomId: 'room-2', hosted: 'gateway-a', log: [] },
     Deleted: { roomId: 'room-3', tombstone: true, log: [] }
   }
 
   assert.equal(desktopRoomIdentity('Legacy', rooms.Legacy), 'name:Legacy')
   assert.deepEqual(desktopRoomDescriptors(rooms), [
-    { name: 'Classic', roomId: 'room-1' },
-    { name: 'Legacy', roomId: 'name:Legacy' }
+    { name: 'Classic', roomId: 'room-1', authorityToken: 'authority:classic' },
+    { name: 'Legacy', roomId: 'name:Legacy', authorityToken: 'authority:legacy' }
   ])
 })
 
@@ -49,7 +49,7 @@ test('one cycle claims, executes and completes commands per gateway', async () =
       { connectionId: 'current' }
     ],
     consumerId: 'desktop:test',
-    rooms: { Classic: { roomId: 'room-1', log: [] } },
+    rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
     request,
     execute: async command => ({ thread_id: `thread:${command.command_id}` })
   })
@@ -72,7 +72,7 @@ test('execution failures are acknowledged without breaking later cycles', async 
   const outcomes = await runDesktopRoomCommandCycle({
     routes: [{ connectionId: 'current' }],
     consumerId: 'desktop:test',
-    rooms: { Classic: { roomId: 'room-1', log: [] } },
+    rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
     request: async (_route, method, params) => {
       if (method === 'groups.desktop.claim') {
         return {
@@ -84,7 +84,7 @@ test('execution failures are acknowledged without breaking later cycles', async 
           }]
         }
       }
-      completions.push(params)
+      if (method === 'groups.desktop.complete') completions.push(params)
       return {}
     },
     execute: async () => {
@@ -103,7 +103,7 @@ test('an unscoped local gateway still receives compatibility commands', async ()
   await runDesktopRoomCommandCycle({
     routes: [{ connectionId: '' }],
     consumerId: 'desktop:test',
-    rooms: { Local: { roomId: 'room-local', log: [] } },
+    rooms: { Local: { roomId: 'room-local', desktopAuthorityToken: 'authority:local', log: [] } },
     request: async (_route, method, params) => {
       calls.push({ method, params })
       return method === 'groups.desktop.claim' ? { commands: [] } : {}
@@ -112,7 +112,9 @@ test('an unscoped local gateway still receives compatibility commands', async ()
   })
 
   assert.equal(calls[0].method, 'groups.desktop.claim')
-  assert.deepEqual(calls[0].params.room_ids, ['room-local'])
+  assert.deepEqual(calls[0].params.room_authorities, [
+    { room_id: 'room-local', authority_token: 'authority:local' }
+  ])
 })
 
 
@@ -139,7 +141,7 @@ test('large room rosters are claimed in bounded pages', async () => {
   const rooms = Object.fromEntries(
     Array.from({ length: 260 }, (_, index) => [
       `Room ${index}`,
-      { roomId: `room-${index}`, log: [] }
+      { roomId: `room-${index}`, desktopAuthorityToken: `authority:${index}`, log: [] }
     ])
   )
   await runDesktopRoomCommandCycle({
@@ -147,7 +149,7 @@ test('large room rosters are claimed in bounded pages', async () => {
     consumerId: 'desktop:test',
     rooms,
     request: async (_route, method, params) => {
-      if (method === 'groups.desktop.claim') claimSizes.push(params.room_ids.length)
+      if (method === 'groups.desktop.claim') claimSizes.push(params.room_authorities.length)
       return { commands: [] }
     },
     execute: async () => ({})
@@ -167,7 +169,7 @@ test('one push drains more than one eight-command claim page', async () => {
   const outcomes = await runDesktopRoomCommandCycle({
     routes: [{ connectionId: 'current' }],
     consumerId: 'desktop:test',
-    rooms: { Classic: { roomId: 'room-1', log: [] } },
+    rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
     request: async (_route, method, params) => {
       if (method === 'groups.desktop.claim') {
         return { commands: pending.splice(0, params.limit) }
@@ -189,7 +191,7 @@ test('retryable execution leaves a claimed command unacknowledged', async () => 
   const outcomes = await runDesktopRoomCommandCycle({
     routes: [{ connectionId: 'current' }],
     consumerId: 'desktop:test',
-    rooms: { Classic: { roomId: 'room-1', log: [] } },
+    rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
     request: async (_route, method) => {
       methods.push(method)
       return method === 'groups.desktop.claim'
@@ -218,7 +220,7 @@ test('disposing after claim leaves the command leased for safe retry', async () 
   const outcomes = await runDesktopRoomCommandCycle({
     routes: [{ connectionId: 'current' }],
     consumerId: 'desktop:test',
-    rooms: { Classic: { roomId: 'room-1', log: [] } },
+    rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
     request: async (_route, method) => {
       methods.push(method)
       return method === 'groups.desktop.claim'
@@ -233,4 +235,75 @@ test('disposing after claim leaves the command leased for safe retry', async () 
 
   assert.deepEqual(outcomes, [])
   assert.deepEqual(methods, ['groups.desktop.claim'])
+})
+
+
+test('a Stop-only lane claims only Stop commands', async () => {
+  const claims = []
+  await runDesktopRoomCommandCycle({
+    routes: [{ connectionId: 'current' }],
+    consumerId: 'desktop:test',
+    rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
+    actions: ['stop'],
+    request: async (_route, method, params) => {
+      if (method === 'groups.desktop.claim') claims.push(params)
+      return { commands: [] }
+    },
+    execute: async () => ({})
+  })
+
+  assert.deepEqual(claims[0].actions, ['stop'])
+  assert.deepEqual(claims[0].room_authorities, [
+    { room_id: 'room-1', authority_token: 'authority:test' }
+  ])
+})
+
+
+test('lease renewal failure aborts execution and never acknowledges stale effects', async () => {
+  const originalSetInterval = globalThis.setInterval
+  const originalClearInterval = globalThis.clearInterval
+  let renewTick = null
+  let completed = 0
+  globalThis.setInterval = callback => {
+    renewTick = callback
+    return 1
+  }
+  globalThis.clearInterval = () => undefined
+  try {
+    const cycle = runDesktopRoomCommandCycle({
+      routes: [{ connectionId: 'current' }],
+      consumerId: 'desktop:test',
+      rooms: { Classic: { roomId: 'room-1', desktopAuthorityToken: 'authority:test', log: [] } },
+      request: async (_route, method) => {
+        if (method === 'groups.desktop.claim') {
+          return {
+            commands: [{
+              command_id: 'messaging:lease-lost',
+              room_id: 'room-1',
+              action: 'send',
+              lease_token: 'lease:one',
+              payload: { message: 'hello' }
+            }]
+          }
+        }
+        if (method === 'groups.desktop.renew') throw new Error('lease moved')
+        if (method === 'groups.desktop.complete') completed += 1
+        return {}
+      },
+      execute: async (_command, _rooms, { signal }) =>
+        new Promise((resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+    })
+    while (renewTick === null) await Promise.resolve()
+    renewTick()
+    const outcomes = await cycle
+
+    assert.equal(completed, 0)
+    assert.equal(outcomes[0].leaseLost, true)
+    assert.equal(outcomes[0].retryable, true)
+  } finally {
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
+  }
 })

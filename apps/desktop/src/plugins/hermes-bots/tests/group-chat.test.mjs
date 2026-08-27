@@ -8,7 +8,7 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
-function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false } = {}) {
+function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false, storageGet = () => null } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => {
@@ -45,6 +45,9 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
   }
   const context = {
     atom,
+    AbortController,
+    crypto: globalThis.crypto,
+    TextEncoder,
     setTimeout: fn => {
       if (deferredTimers) {
         setImmediate(fn)
@@ -178,7 +181,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             stored: session.stored,
             title: session.title
           })
-          const reply = turnScript(session.profile, params.text, calls.length, session)
+          const reply = await turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
           return {}
         }
@@ -205,12 +208,12 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, desktopCommandEligibleRooms, currentDesktopRoomCoordinatorId, executeDesktopRoomCommand, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, mergeGroupChatSyncSnapshots, groupChatSyncSnapshot, attachDesktopRoomAuthorityCommitments, groupChatGatewayJsonSize, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, desktopCommandEligibleRooms, currentDesktopRoomCoordinatorId, ensureDesktopRoomCommandConsumerId, executeDesktopRoomCommand, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
   context.plugin.register({
-    storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
+    storage: { get: storageGet, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
   return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, notifications, requests, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
@@ -221,6 +224,19 @@ const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }
 function roomLog(gc, group) {
   return (gc.$groupChats.get()[group] || { log: [] }).log
 }
+
+test('a delayed coordinator hydrate cannot replace an identity minted meanwhile', async () => {
+  let resolveStored
+  const stored = new Promise(resolve => { resolveStored = resolve })
+  const gc = load(undefined, { storageGet: () => stored })
+  const pending = gc.ensureDesktopRoomCommandConsumerId()
+  const minted = gc.currentDesktopRoomCoordinatorId()
+
+  resolveStored('desktop:stale')
+
+  assert.equal(await pending, minted)
+  assert.equal(gc.currentDesktopRoomCoordinatorId(), minted)
+})
 
 test('classic command pump advertises only rooms this Desktop can coordinate', () => {
   const gc = load(() => '(pass)')
@@ -286,6 +302,7 @@ test('classic room execution authority persists locally but never projects', () 
       roomId: 'room-1',
       log: [{ id: 'u1', at: 1, from: { kind: 'user', name: 'You' }, text: 'hi' }],
       desktopCoordinatorId: coordinator,
+      desktopAuthorityToken: 'authority:private-token',
       members: [{ name: 'research' }]
     }
   }
@@ -293,6 +310,26 @@ test('classic room execution authority persists locally but never projects', () 
   assert.equal(gc.durableGroupChatRooms(rooms).Classic.desktopCoordinatorId, coordinator)
   const snapshot = gc.groupChatSyncSnapshot(rooms)
   assert.equal(Object.hasOwn(snapshot.rooms['id:room-1'], 'desktopCoordinatorId'), false)
+  assert.equal(Object.hasOwn(snapshot.rooms['id:room-1'], 'desktopAuthorityToken'), false)
+})
+
+test('classic room projection carries only a one-way authority commitment', async () => {
+  const gc = load(() => '(pass)')
+  const rooms = {
+    Classic: {
+      roomId: 'room-1',
+      log: [{ id: 'u1', at: 1, from: { kind: 'user', name: 'You' }, text: 'hi' }],
+      desktopAuthorityToken: 'authority:private-token',
+      members: [{ name: 'research' }]
+    }
+  }
+  const snapshot = await gc.attachDesktopRoomAuthorityCommitments(
+    gc.groupChatSyncSnapshot(rooms),
+    rooms
+  )
+
+  assert.match(snapshot.rooms['id:room-1'].desktopAuthorityHash, /^[a-f0-9]{64}$/)
+  assert.equal(JSON.stringify(snapshot).includes('private-token'), false)
 })
 
 test('classic messaging send waits for a complete live roster', async () => {
@@ -346,6 +383,89 @@ test('classic messaging send treats a live-roster probe failure as retryable', a
     }, [{ name: 'Classic', roomId: 'room-1' }]),
     error => error.retryable === true
   )
+})
+
+test('lease loss during the reachability probe prevents every room effect', async () => {
+  let releaseProbe
+  const probe = new Promise(resolve => { releaseProbe = resolve })
+  const gc = load(() => '(pass)')
+  const members = [{ name: 'research' }]
+  gc.$lastRoster.set(members)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members,
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+  const request = gc.host.request
+  gc.host.request = async (method, params) => {
+    if (method === 'profiles.describe') return probe
+    return request(method, params)
+  }
+  const lease = new AbortController()
+  const execution = gc.executeDesktopRoomCommand({
+    command_id: 'messaging:preflight-fence',
+    room_id: 'room-1',
+    action: 'send',
+    payload: { message: 'Do not start this' }
+  }, [{ name: 'Classic', roomId: 'room-1' }], { signal: lease.signal })
+
+  await new Promise(resolve => setImmediate(resolve))
+  lease.abort('lease-lost')
+  releaseProbe({})
+
+  await assert.rejects(execution, error => error.retryable === true && /lease/.test(error.message))
+  assert.equal(gc.calls.length, 0)
+  assert.equal(gc.$groupChats.get().Classic.log.length, 0)
+})
+
+test('lease loss cancels without holds or settlement and the command can replay', async () => {
+  let releaseFirst
+  let turn = 0
+  const firstTurn = new Promise(resolve => { releaseFirst = resolve })
+  const gc = load(() => (++turn === 1 ? firstTurn : '(pass)'), { deferredTimers: true })
+  const members = [{ name: 'research', title: '' }]
+  const descriptors = [{ name: 'Classic', roomId: 'room-1', authorityToken: 'authority:test' }]
+  gc.$lastRoster.set(members)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members,
+      epoch: 1,
+      running: false,
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+  const command = {
+    command_id: 'messaging:lease-replay',
+    room_id: 'room-1',
+    action: 'send',
+    payload: { message: 'Complete this once' }
+  }
+  const lease = new AbortController()
+  const first = gc.executeDesktopRoomCommand(command, descriptors, { signal: lease.signal })
+  for (let i = 0; i < 50 && !gc.$groupChats.get().Classic?.running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  lease.abort('lease-lost')
+  await assert.rejects(first, error => error.retryable === true)
+  assert.equal(gc.$groupChats.get().Classic.running, false)
+  assert.equal(Object.keys(gc.$groupChats.get().Classic.holds || {}).length, 0)
+  assert.equal(Boolean(gc.$groupChats.get().Classic.desktopCommandSettled?.[command.command_id]), false)
+
+  releaseFirst('(pass)')
+  await new Promise(resolve => setImmediate(resolve))
+  const replay = await gc.executeDesktopRoomCommand(command, descriptors)
+
+  assert.equal(replay.room_name, 'Classic')
+  assert.equal(gc.calls.length, 2)
+  assert.equal(Boolean(gc.$groupChats.get().Classic.desktopCommandSettled?.[command.command_id]), true)
 })
 
 test('legacy local execution evidence migrates authority but a cold projection does not', () => {
@@ -450,6 +570,64 @@ test('lost stop acknowledgement cannot stop newer work twice', async () => {
   await gc.executeDesktopRoomCommand(command, [{ name: 'Classic', roomId: 'room-1' }])
 
   assert.equal(gc.$groupChats.get().Classic.epoch, stoppedEpoch)
+})
+
+test('a priority Stop interrupts an active messaging-driven room turn', async () => {
+  let releaseTurn
+  const blockedTurn = new Promise(resolve => { releaseTurn = resolve })
+  const gc = load(() => blockedTurn, { deferredTimers: true })
+  const members = [{ name: 'research', title: '' }]
+  const descriptors = [{ name: 'Classic', roomId: 'room-1', authorityToken: 'authority:test' }]
+  gc.$lastRoster.set(members)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members,
+      epoch: 1,
+      running: false,
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+
+  const send = gc.executeDesktopRoomCommand({
+    command_id: 'send:long',
+    room_id: 'room-1',
+    action: 'send',
+    payload: { message: 'Start the long task' }
+  }, descriptors)
+
+  for (let i = 0; i < 50 && !gc.$groupChats.get().Classic?.running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(gc.$groupChats.get().Classic?.running, true)
+
+  const stopped = await gc.executeDesktopRoomCommand({
+    command_id: 'stop:priority',
+    room_id: 'room-1',
+    action: 'stop',
+    payload: {}
+  }, descriptors)
+  const sendResult = await send
+
+  assert.equal(stopped.room_name, 'Classic')
+  assert.equal(stopped.stopped, true)
+  assert.equal(sendResult.room_name, 'Classic')
+  assert.equal(sendResult.stopped, true)
+  assert.equal(gc.$groupChats.get().Classic.running, false)
+  assert.ok(gc.$groupChats.get().Classic.holds.research)
+
+  gc.updateGroupChat('Classic', current => {
+    current.epoch += 1
+    current.running = true
+    current.holds = {}
+    return current
+  })
+  releaseTurn('(pass)')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(gc.$groupChats.get().Classic.running, true)
+  assert.deepEqual(gc.$groupChats.get().Classic.holds, {})
 })
 
 test('pass detection: (pass), pass, pass., empty are silence; real text is not', () => {

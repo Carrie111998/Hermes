@@ -18,9 +18,10 @@ export function desktopRoomDescriptors(rooms) {
     })
     .map(([name, room]) => ({
       name,
-      roomId: desktopRoomIdentity(name, room)
+      roomId: desktopRoomIdentity(name, room),
+      authorityToken: String(room?.desktopAuthorityToken || '').trim()
     }))
-    .filter(room => room.roomId && room.name)
+    .filter(room => room.roomId && room.name && room.authorityToken)
 }
 
 export function createDesktopRoomConsumerId() {
@@ -47,6 +48,7 @@ export async function runDesktopRoomCommandCycle({
   rooms,
   request,
   execute,
+  actions = null,
   shouldContinue = () => true
 }) {
   const descriptors = desktopRoomDescriptors(rooms)
@@ -68,6 +70,10 @@ export async function runDesktopRoomCommandCycle({
     let remaining = MAX_COMMANDS_PER_WAKE
     for (const batch of roomBatches) {
       if (remaining <= 0) return outcomes
+      const roomAuthorities = batch.map(room => ({
+        room_id: room.roomId,
+        authority_token: room.authorityToken
+      }))
 
       while (remaining > 0) {
         const claimLimit = Math.min(MAX_COMMANDS_PER_CLAIM, remaining)
@@ -75,7 +81,8 @@ export async function runDesktopRoomCommandCycle({
         try {
           claimed = await request(route, 'groups.desktop.claim', {
             consumer_id: consumerId,
-            room_ids: batch.map(room => room.roomId),
+            room_authorities: roomAuthorities,
+            ...(Array.isArray(actions) && actions.length ? { actions } : {}),
             limit: claimLimit
           })
         } catch {
@@ -89,6 +96,9 @@ export async function runDesktopRoomCommandCycle({
           let success = false
           let result
           let renewTimer = null
+          let leaseLost = false
+          const abortController =
+            typeof AbortController === 'function' ? new AbortController() : null
           const leaseToken = String(command?.lease_token || '')
           if (leaseToken && typeof setInterval === 'function') {
             renewTimer = setInterval(() => {
@@ -97,21 +107,37 @@ export async function runDesktopRoomCommandCycle({
                 consumer_id: consumerId,
                 command_id: command.command_id,
                 lease_token: leaseToken
-              }).catch(() => undefined)
+              }).catch(() => {
+                leaseLost = true
+                abortController?.abort('lease-lost')
+              })
             }, LEASE_RENEW_INTERVAL_MS)
           }
           try {
-            result = await execute(command, descriptors)
+            result = await execute(command, descriptors, {
+              signal: abortController?.signal || null
+            })
+            if (leaseLost) {
+              outcomes.push({
+                commandId: command.command_id,
+                connectionId: routeKey,
+                success: false,
+                retryable: true,
+                leaseLost: true
+              })
+              continue
+            }
             success = true
           } catch (error) {
-            if (error?.retryable === true) {
+            if (leaseLost || error?.retryable === true) {
               // Keep the lease unacknowledged. It expires back to pending so a
               // temporary member outage never turns into a terminal failure.
               outcomes.push({
                 commandId: command.command_id,
                 connectionId: routeKey,
                 success: false,
-                retryable: true
+                retryable: true,
+                ...(leaseLost ? { leaseLost: true } : {})
               })
               continue
             }

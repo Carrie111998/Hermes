@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 import tui_gateway.server as srv
@@ -64,6 +66,7 @@ def test_desktop_mailbox_rpc_claim_and_complete(home):
         default_db_path(),
         command_id="messaging:one",
         room_id="classic-room",
+        authority_hash=hashlib.sha256(b"authority:test").hexdigest(),
         action="send",
         payload={"message": "hello"},
     )
@@ -73,7 +76,12 @@ def test_desktop_mailbox_rpc_claim_and_complete(home):
             1,
             {
                 "consumer_id": "desktop:test",
-                "room_ids": ["classic-room"],
+                "room_authorities": [
+                    {
+                        "room_id": "classic-room",
+                        "authority_token": "authority:test",
+                    }
+                ],
             },
         )
     )["commands"]

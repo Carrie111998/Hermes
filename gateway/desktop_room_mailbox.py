@@ -7,6 +7,7 @@ idempotent and recoverable without making the gateway a second room runner.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ CLAIM_TTL_SECONDS = 45.0
 TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_AUTHORITY_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _ACTIONS = frozenset({"send", "stop"})
 _TERMINAL_STATES = frozenset({"completed", "failed"})
 
@@ -76,6 +78,48 @@ def _room_ids(value: Any) -> list[str]:
     if len(value) > MAX_ROOM_IDS:
         raise DesktopRoomMailboxError("too many room_ids")
     return list(dict.fromkeys(_room_identifier(item) for item in value))
+
+
+def _room_authorities(value: Any) -> list[tuple[str, str]]:
+    if not isinstance(value, (list, tuple)):
+        raise DesktopRoomMailboxError("room_authorities must be a list")
+    if len(value) > MAX_ROOM_IDS:
+        raise DesktopRoomMailboxError("too many room authorities")
+    authorities: dict[str, str] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            raise DesktopRoomMailboxError("invalid room authority")
+        room_id = _room_identifier(item.get("room_id"))
+        token = _identifier(item.get("authority_token"), label="authority_token")
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        prior = authorities.setdefault(room_id, digest)
+        if prior != digest:
+            raise DesktopRoomMailboxError("conflicting room authority")
+    return list(authorities.items())
+
+
+def _authority_hash(value: Any) -> str:
+    authority_hash = str(value or "").strip().casefold()
+    if not _AUTHORITY_HASH_RE.fullmatch(authority_hash):
+        raise DesktopRoomMailboxError("invalid room authority commitment")
+    return authority_hash
+
+
+def _room_commitments(value: Any) -> list[tuple[str, str]]:
+    if not isinstance(value, (list, tuple)):
+        raise DesktopRoomMailboxError("room commitments must be a list")
+    if len(value) > MAX_ROOM_IDS:
+        raise DesktopRoomMailboxError("too many room commitments")
+    commitments: dict[str, str] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            raise DesktopRoomMailboxError("invalid room commitment")
+        room_id = _room_identifier(item.get("room_id"))
+        authority_hash = _authority_hash(item.get("authority_hash"))
+        prior = commitments.setdefault(room_id, authority_hash)
+        if prior != authority_hash:
+            raise DesktopRoomMailboxError("conflicting room commitment")
+    return list(commitments.items())
 
 
 def _query_room_ids(value: Any) -> list[str]:
@@ -150,6 +194,21 @@ def _initialize(conn: sqlite3.Connection) -> None:
         """CREATE INDEX IF NOT EXISTS idx_desktop_room_owners_expiry
            ON desktop_room_owners(expires_at)"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS desktop_room_authorities (
+            room_id TEXT PRIMARY KEY,
+            consumer_id TEXT,
+            authority_hash TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )"""
+    )
+    authority_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(desktop_room_authorities)")
+    }
+    if "consumer_id" not in authority_columns:
+        conn.execute(
+            "ALTER TABLE desktop_room_authorities ADD COLUMN consumer_id TEXT"
+        )
 
 
 def _schema_is_current(conn: sqlite3.Connection) -> bool:
@@ -161,6 +220,9 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     }
     owners = {
         row[1] for row in conn.execute("PRAGMA table_info(desktop_room_owners)")
+    }
+    authorities = {
+        row[1] for row in conn.execute("PRAGMA table_info(desktop_room_authorities)")
     }
     return (
         {
@@ -179,6 +241,9 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         }.issubset(commands)
         and {"consumer_id", "room_id", "expires_at"}.issubset(presence)
         and {"room_id", "consumer_id", "expires_at"}.issubset(owners)
+        and {"room_id", "consumer_id", "authority_hash", "created_at"}.issubset(
+            authorities
+        )
     )
 
 
@@ -252,11 +317,47 @@ def _command(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, Any]:
     return result
 
 
+def register_projected_authorities(
+    db_path: Path | str,
+    commitments: Any,
+    *,
+    clock: Any = time.time,
+) -> list[str]:
+    """Record one-way owner proofs read from the trusted room projection.
+
+    Conflicts are isolated per room: an old or corrupted projection cannot
+    prevent healthy rooms in the same snapshot from advertising presence.
+    """
+
+    parsed = _room_commitments(commitments)
+    now = float(clock())
+    registered: list[str] = []
+    with _transaction(db_path, immediate=True) as conn:
+        for room_id, authority_hash in parsed:
+            existing = conn.execute(
+                """SELECT authority_hash FROM desktop_room_authorities
+                   WHERE room_id = ?""",
+                (room_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO desktop_room_authorities (
+                           room_id, consumer_id, authority_hash, created_at
+                       ) VALUES (?, NULL, ?, ?)""",
+                    (room_id, authority_hash, now),
+                )
+                registered.append(room_id)
+            elif str(existing["authority_hash"] or "") == authority_hash:
+                registered.append(room_id)
+    return registered
+
+
 def enqueue_command(
     db_path: Path | str,
     *,
     command_id: str,
     room_id: str,
+    authority_hash: str,
     action: str,
     payload: Any,
     clock: Any = time.time,
@@ -265,12 +366,29 @@ def enqueue_command(
 
     command_id = _identifier(command_id, label="command_id")
     room_id = _room_identifier(room_id)
+    authority_hash = _authority_hash(authority_hash)
     action = str(action or "").strip().casefold()
     if action not in _ACTIONS:
         raise DesktopRoomMailboxError("invalid action")
     encoded = _payload_json(payload)
     now = float(clock())
     with _transaction(db_path, immediate=True) as conn:
+        existing_authority = conn.execute(
+            """SELECT authority_hash FROM desktop_room_authorities
+               WHERE room_id = ?""",
+            (room_id,),
+        ).fetchone()
+        if existing_authority is None:
+            conn.execute(
+                """INSERT INTO desktop_room_authorities (
+                       room_id, consumer_id, authority_hash, created_at
+                   ) VALUES (?, NULL, ?, ?)""",
+                (room_id, authority_hash, now),
+            )
+        elif str(existing_authority["authority_hash"] or "") != authority_hash:
+            raise DesktopRoomMailboxError(
+                "room authority commitment does not match its existing owner"
+            )
         existing = conn.execute(
             "SELECT * FROM desktop_room_commands WHERE command_id = ?",
             (command_id,),
@@ -306,7 +424,8 @@ def claim_commands(
     db_path: Path | str,
     *,
     consumer_id: str,
-    room_ids: Any,
+    room_authorities: Any,
+    actions: Any = None,
     limit: int = MAX_COMMANDS_PER_CLAIM,
     presence_ttl: float = PRESENCE_TTL_SECONDS,
     claim_ttl: float = CLAIM_TTL_SECONDS,
@@ -315,12 +434,39 @@ def claim_commands(
     """Refresh room presence and lease pending commands to one Desktop."""
 
     consumer_id = _identifier(consumer_id, label="consumer_id")
-    rooms = _room_ids(room_ids)
+    authorities = _room_authorities(room_authorities)
+    requested_actions = (
+        {str(action or "").strip().casefold() for action in actions}
+        if isinstance(actions, (list, tuple, set, frozenset))
+        else set()
+    )
+    if requested_actions and not requested_actions.issubset(_ACTIONS):
+        raise DesktopRoomMailboxError("invalid action filter")
     limit = max(1, min(MAX_COMMANDS_PER_CLAIM, int(limit)))
     now = float(clock())
     with _transaction(db_path, immediate=True) as conn:
         conn.execute("DELETE FROM desktop_room_presence WHERE expires_at <= ?", (now,))
         conn.execute("DELETE FROM desktop_room_owners WHERE expires_at <= ?", (now,))
+        for room_id, authority_hash in authorities:
+            # The commitment was written by the messaging enqueue path from
+            # the Desktop's shared room projection. Only a caller that knows
+            # the unpublished token can bind the first consumer.
+            conn.execute(
+                """UPDATE desktop_room_authorities SET consumer_id = ?
+                   WHERE room_id = ? AND consumer_id IS NULL
+                     AND authority_hash = ?""",
+                (consumer_id, room_id, authority_hash),
+            )
+        rooms = [
+            room_id
+            for room_id, authority_hash in authorities
+            if conn.execute(
+                """SELECT 1 FROM desktop_room_authorities
+                   WHERE room_id = ? AND consumer_id = ? AND authority_hash = ?""",
+                (room_id, consumer_id, authority_hash),
+            ).fetchone()
+            is not None
+        ]
         if rooms:
             conn.executemany(
                 """INSERT INTO desktop_room_owners (
@@ -365,16 +511,23 @@ def claim_commands(
         if not owned:
             return []
         placeholders = ",".join("?" for _ in owned)
+        action_sql = ""
+        action_params: tuple[str, ...] = ()
+        if requested_actions:
+            action_placeholders = ",".join("?" for _ in requested_actions)
+            action_sql = f" AND action IN ({action_placeholders})"
+            action_params = tuple(sorted(requested_actions))
         rows = conn.execute(
             f"""SELECT * FROM desktop_room_commands
                 WHERE room_id IN ({placeholders})
+                  {action_sql}
                   AND (
                     state = 'pending'
                     OR (state = 'claimed' AND COALESCE(lease_expires_at, 0) <= ?)
                   )
                 ORDER BY created_at, command_id
                 LIMIT ?""",
-            (*owned, now, limit),
+            (*owned, *action_params, now, limit),
         ).fetchall()
         claimed: list[dict[str, Any]] = []
         for row in rows:
@@ -470,6 +623,7 @@ def renew_command(
     command_id: str,
     lease_token: str,
     claim_ttl: float = CLAIM_TTL_SECONDS,
+    presence_ttl: float = PRESENCE_TTL_SECONDS,
     clock: Any = time.time,
 ) -> dict[str, Any]:
     """Extend one live claim without allowing an expired attempt to revive."""
@@ -479,6 +633,28 @@ def renew_command(
     lease_token = _identifier(lease_token, label="lease_token")
     now = float(clock())
     with _transaction(db_path, immediate=True) as conn:
+        row = conn.execute(
+            """SELECT room_id FROM desktop_room_commands
+               WHERE command_id = ? AND state = 'claimed'
+                 AND lease_owner = ? AND lease_token = ?
+                 AND lease_expires_at > ?""",
+            (command_id, consumer_id, lease_token, now),
+        ).fetchone()
+        if row is None:
+            raise DesktopRoomMailboxError(
+                "command lease is no longer owned by this Desktop"
+            )
+        room_id = str(row["room_id"])
+        owner = conn.execute(
+            """UPDATE desktop_room_owners
+               SET expires_at = ?
+               WHERE room_id = ? AND consumer_id = ? AND expires_at > ?""",
+            (now + float(presence_ttl), room_id, consumer_id, now),
+        )
+        if owner.rowcount != 1:
+            raise DesktopRoomMailboxError(
+                "room authority is no longer owned by this Desktop"
+            )
         updated = conn.execute(
             """UPDATE desktop_room_commands
                SET lease_expires_at = ?, updated_at = ?
@@ -498,6 +674,14 @@ def renew_command(
             raise DesktopRoomMailboxError(
                 "command lease is no longer owned by this Desktop"
             )
+        conn.execute(
+            """INSERT INTO desktop_room_presence (
+                   consumer_id, room_id, expires_at
+               ) VALUES (?, ?, ?)
+               ON CONFLICT(consumer_id, room_id) DO UPDATE
+               SET expires_at = excluded.expires_at""",
+            (consumer_id, room_id, now + float(presence_ttl)),
+        )
         current = conn.execute(
             "SELECT * FROM desktop_room_commands WHERE command_id = ?",
             (command_id,),

@@ -571,12 +571,16 @@ let desktopRoomCommandConsumerId = ''
 let desktopRoomCommandConsumerPromise = null
 let desktopRoomCommandTimer = null
 let desktopRoomCommandRunning = false
+let desktopRoomStopRunning = false
 let desktopRoomCommandDisposed = false
 let desktopRoomCommandPushUnsub = null
 let desktopRoomCommandPushTimer = null
 let desktopRoomCommandRerun = false
+let desktopRoomStopRerun = false
 const desktopRoomCommandPendingConnections = new Set()
+const desktopRoomStopPendingConnections = new Set()
 const desktopRoomCommandRetentions = new Map()
+const activeDesktopRoomCommands = new Map()
 
 const HOSTED_ROOM_OUTBOX_KEY = 'hosted-room-outbox-v1'
 const HOSTED_ROOM_SYNC_INTERVAL_MS = 5000
@@ -764,6 +768,9 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
       // be interpreted as moving a hosted room back to local execution.
       hosted: groupChatHostedGateway(room) || null,
       hostedEpoch: groupChatHostedEpoch(room) || null,
+      ...(typeof room?.desktopAuthorityHash === 'string' && /^[a-f0-9]{64}$/.test(room.desktopAuthorityHash)
+        ? { desktopAuthorityHash: room.desktopAuthorityHash }
+        : {}),
       log,
       revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
       members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
@@ -1040,6 +1047,12 @@ function mergeGroupChatSyncSnapshots(
     // fence; a larger client-authored epoch cannot replace or clear it.
     const remoteHosted = groupChatHostedGateway(remoteRoom)
     const localHosted = groupChatHostedGateway(localRoom)
+    const remoteAuthorityHash = typeof remoteRoom?.desktopAuthorityHash === 'string' && /^[a-f0-9]{64}$/.test(remoteRoom.desktopAuthorityHash)
+      ? remoteRoom.desktopAuthorityHash
+      : ''
+    const localAuthorityHash = typeof localRoom?.desktopAuthorityHash === 'string' && /^[a-f0-9]{64}$/.test(localRoom.desktopAuthorityHash)
+      ? localRoom.desktopAuthorityHash
+      : ''
     if (remoteHosted) {
       hostedPresent = true
       hosted = remoteHosted
@@ -1059,6 +1072,9 @@ function mergeGroupChatSyncSnapshots(
       revision: Math.max(remoteRevision, localRevision),
       ...(hostedPresent ? { hosted: hosted || null } : {}),
       ...(hostedPresent ? { hostedEpoch: hostedEpoch || null } : {}),
+      ...(remoteAuthorityHash || localAuthorityHash
+        ? { desktopAuthorityHash: remoteAuthorityHash || localAuthorityHash }
+        : {}),
       ...(typeof image === 'string' && image ? { image } : {})
     }
   }
@@ -1223,6 +1239,13 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
           : existing.image || null,
       hosted: cachedHosted || null,
       hostedEpoch: cachedHostedEpoch || null,
+      desktopAuthorityHash:
+        (typeof existing.desktopAuthorityHash === 'string' && /^[a-f0-9]{64}$/.test(existing.desktopAuthorityHash)
+          ? existing.desktopAuthorityHash
+          : null) ||
+        (typeof projected.desktopAuthorityHash === 'string' && /^[a-f0-9]{64}$/.test(projected.desktopAuthorityHash)
+          ? projected.desktopAuthorityHash
+          : null),
       syncRevision: isPreserved ? localRevision : Math.max(remoteRevision, localRevision),
       epoch: Number(existing.epoch || 0),
       running: Boolean(existing.running)
@@ -1269,6 +1292,38 @@ function currentDesktopRoomCoordinatorId() {
   return desktopRoomCommandConsumerId
 }
 
+function mintDesktopRoomAuthorityToken() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return `authority:${globalThis.crypto.randomUUID()}`
+  }
+  return `authority:${groupChatEntryId()}:${Math.random().toString(36).slice(2)}`
+}
+
+async function attachDesktopRoomAuthorityCommitments(snapshot, all = $groupChats.get()) {
+  const subtle = globalThis.crypto?.subtle
+  const Encoder = globalThis.TextEncoder
+  if (!subtle || typeof subtle.digest !== 'function' || typeof Encoder !== 'function') {
+    return snapshot
+  }
+  const encoder = new Encoder()
+  for (const [name, room] of Object.entries(all || {})) {
+    if (groupChatHostedGateway(room)) continue
+    const token = String(room?.desktopAuthorityToken || '').trim()
+    const key = groupChatRoomKey(name, room)
+    const projected = snapshot?.rooms?.[key]
+    if (!token || !projected) continue
+    try {
+      const digest = await subtle.digest('SHA-256', encoder.encode(token))
+      projected.desktopAuthorityHash = [...new Uint8Array(digest)]
+        .map(value => value.toString(16).padStart(2, '0'))
+        .join('')
+    } catch {
+      delete projected.desktopAuthorityHash
+    }
+  }
+  return groupChatSyncEnvelope(snapshot.rooms || {}, snapshot.deleted || {})
+}
+
 async function ensureDesktopRoomCommandConsumerId() {
   if (desktopRoomCommandConsumerId) return desktopRoomCommandConsumerId
   if (desktopRoomCommandConsumerPromise) return desktopRoomCommandConsumerPromise
@@ -1279,6 +1334,9 @@ async function ensureDesktopRoomCommandConsumerId() {
       stored = String((await pluginCtx?.storage?.get?.(DESKTOP_ROOM_COMMAND_CONSUMER_KEY)) || '').trim()
     } catch {
       stored = ''
+    }
+    if (desktopRoomCommandConsumerId) {
+      return desktopRoomCommandConsumerId
     }
     if (stored) {
       desktopRoomCommandConsumerId = stored
@@ -1349,6 +1407,10 @@ function durableGroupChatRooms(all = $groupChats.get()) {
         typeof room.desktopCoordinatorId === 'string' && room.desktopCoordinatorId
           ? room.desktopCoordinatorId
           : null,
+      desktopAuthorityToken:
+        typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+          ? room.desktopAuthorityToken
+          : null,
       desktopCommandSettled: boundedDesktopCommandSettled(room.desktopCommandSettled),
       hosted: groupChatHostedGateway(room) || null,
       hostedEpoch: groupChatHostedEpoch(room) || null,
@@ -1391,6 +1453,10 @@ function hydratePersistedGroupChatRooms(value) {
       members: Array.isArray(room.members) ? room.members : [],
       roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
       desktopCoordinatorId: desktopRoomCoordinatorId(room, { migrate: true }),
+      desktopAuthorityToken:
+        typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+          ? room.desktopAuthorityToken
+          : null,
       desktopCommandSettled: boundedDesktopCommandSettled(room.desktopCommandSettled),
       hosted: groupChatHostedGateway(room) || null,
       hostedEpoch: groupChatHostedEpoch(room) || null,
@@ -1985,14 +2051,40 @@ function desktopCommandEligibleRooms(connectionIds) {
   )
 }
 
+function ensureDesktopRoomAuthorityTokens() {
+  const coordinator = String(desktopRoomCommandConsumerId || '')
+  if (!coordinator) return
+  for (const [name, room] of Object.entries($groupChats.get())) {
+    if (
+      groupChatHostedGateway(room) ||
+      room?.tombstone ||
+      String(room?.desktopCoordinatorId || '') !== coordinator ||
+      String(room?.desktopAuthorityToken || '').trim()
+    ) {
+      continue
+    }
+    updateGroupChat(
+      name,
+      current => {
+        current.desktopAuthorityToken = mintDesktopRoomAuthorityToken()
+        return current
+      },
+      { sync: false }
+    )
+  }
+}
+
 function retryableDesktopRoomCommand(message) {
   const error = new Error(message)
   error.retryable = true
   return error
 }
 
-async function waitForDesktopRoomCommandSettlement(group, commandId) {
+async function waitForDesktopRoomCommandSettlement(group, commandId, signal = null) {
   while (!desktopRoomCommandDisposed) {
+    if (signal?.aborted) {
+      throw retryableDesktopRoomCommand('The command lease moved to another Desktop.')
+    }
     const room = $groupChats.get()[group]
     if (!room) throw new Error('This group chat is no longer available.')
     if (room?.desktopCommandSettled?.[commandId]) return true
@@ -2002,7 +2094,13 @@ async function waitForDesktopRoomCommandSettlement(group, commandId) {
   throw retryableDesktopRoomCommand('Hermes Desktop closed before the group chat settled.')
 }
 
-async function executeDesktopRoomCommand(command, descriptors) {
+async function executeDesktopRoomCommand(command, descriptors, { signal = null } = {}) {
+  const assertLiveLease = () => {
+    if (signal?.aborted) {
+      throw retryableDesktopRoomCommand('The command lease moved to another Desktop.')
+    }
+  }
+  assertLiveLease()
   const roomId = String(command?.room_id || '')
   const entry = desktopRoomEntry(roomId, descriptors)
   if (!entry) throw new Error('This room is no longer available on this Desktop.')
@@ -2036,20 +2134,54 @@ async function executeDesktopRoomCommand(command, descriptors) {
       // room based on stale green rows.
       throw retryableDesktopRoomCommand('Waiting for every Bot in this room to reconnect.')
     }
+    assertLiveLease()
     const message = String(command?.payload?.message || '').trim()
     if (!message) throw new Error('The room message is empty.')
+    const localAbort = new AbortController()
+    const onLeaseAbort = () => localAbort.abort('lease-lost')
+    signal?.addEventListener?.('abort', onLeaseAbort, { once: true })
+    if (signal?.aborted) localAbort.abort('lease-lost')
+    activeDesktopRoomCommands.set(roomId, {
+      commandId: String(command.command_id || ''),
+      controller: localAbort
+    })
     let thread = null
-    while (!desktopRoomCommandDisposed) {
-      thread = sendToGroupChat(group, members, message, null, [], {
-        entryId: String(command.command_id || ''),
-        userName: String(command?.payload?.actor_display_name || 'Messaging')
-      })
-      if (!thread) throw new Error('The group chat could not accept the message.')
-      if (await waitForDesktopRoomCommandSettlement(group, String(command.command_id || ''))) {
-        return { room_name: group, thread_id: thread }
+    try {
+      while (!desktopRoomCommandDisposed) {
+        if (localAbort.signal.aborted) {
+          throw retryableDesktopRoomCommand('The command lease moved to another Desktop.')
+        }
+        thread = sendToGroupChat(group, members, message, null, [], {
+          entryId: String(command.command_id || ''),
+          userName: String(command?.payload?.actor_display_name || 'Messaging')
+        })
+        if (!thread) throw new Error('The group chat could not accept the message.')
+        if (
+          await waitForDesktopRoomCommandSettlement(
+            group,
+            String(command.command_id || ''),
+            localAbort.signal
+          )
+        ) {
+          return { room_name: group, thread_id: thread }
+        }
+        // A newer local turn may have superseded this thread. Once that drive
+        // settles, re-enter through the same command id so no user row is added.
       }
-      // A newer local turn may have superseded this thread. Once that drive
-      // settles, re-enter through the same command id so no user row is added.
+    } catch (error) {
+      if (localAbort.signal.aborted) {
+        if (localAbort.signal.reason === 'room-stop') {
+          return { room_name: group, stopped: true }
+        }
+        await cancelGroupThreadForLeaseLoss(group, members)
+        throw retryableDesktopRoomCommand('The command lease moved to another Desktop.')
+      }
+      throw error
+    } finally {
+      signal?.removeEventListener?.('abort', onLeaseAbort)
+      if (activeDesktopRoomCommands.get(roomId)?.controller === localAbort) {
+        activeDesktopRoomCommands.delete(roomId)
+      }
     }
     throw retryableDesktopRoomCommand('Hermes Desktop closed before the group chat settled.')
   }
@@ -2061,10 +2193,13 @@ async function executeDesktopRoomCommand(command, descriptors) {
     const latestThread = [...(Array.isArray(room?.log) ? room.log : [])]
       .reverse()
       .find(item => item?.thread)?.thread || null
+    const active = activeDesktopRoomCommands.get(roomId)
+    active?.controller?.abort('room-stop')
     await stopGroupThread(group, latestThread, members)
     updateGroupChat(group, current => {
       current.desktopCommandSettled = boundedDesktopCommandSettled({
         ...(current.desktopCommandSettled || {}),
+        ...(active?.commandId ? { [active.commandId]: Date.now() } : {}),
         [String(command.command_id || '')]: Date.now()
       })
       return current
@@ -2128,13 +2263,18 @@ function releaseDesktopRoomCommandRetention() {
 
 function scheduleDesktopRoomCommandPump(connectionId = null) {
   if (desktopRoomCommandDisposed || typeof setTimeout !== 'function') return
-  desktopRoomCommandPendingConnections.add(connectionId === null ? '*' : String(connectionId))
+  const key = connectionId === null ? '*' : String(connectionId)
+  desktopRoomCommandPendingConnections.add(key)
+  desktopRoomStopPendingConnections.add(key)
   if (desktopRoomCommandPushTimer !== null) return
   desktopRoomCommandPushTimer = setTimeout(() => {
     desktopRoomCommandPushTimer = null
     const pending = new Set(desktopRoomCommandPendingConnections)
+    const stopPending = new Set(desktopRoomStopPendingConnections)
     desktopRoomCommandPendingConnections.clear()
+    desktopRoomStopPendingConnections.clear()
     void runDesktopRoomCommandPump(pending.has('*') ? null : pending)
+    void runDesktopRoomStopPump(stopPending.has('*') ? null : stopPending)
   }, DESKTOP_ROOM_COMMAND_PUSH_DEBOUNCE_MS)
 }
 
@@ -2153,6 +2293,7 @@ async function runDesktopRoomCommandPump(targetConnectionIds = null) {
   try {
     const client = await import('./desktop-room-command-client.js')
     await ensureDesktopRoomCommandConsumerId()
+    ensureDesktopRoomAuthorityTokens()
     const connections = await desktopRoomCommandConnections()
     const connectionIds = connections.map(connection => connection.id)
     const rooms = desktopCommandEligibleRooms(connectionIds)
@@ -2173,6 +2314,7 @@ async function runDesktopRoomCommandPump(targetConnectionIds = null) {
           ? host.requestProfile(route, method, params)
           : groupChatSyncRequest({ connectionId: route.connectionId }, method, params),
       execute: executeDesktopRoomCommand,
+      actions: ['send'],
       shouldContinue: () => !desktopRoomCommandDisposed
     })
   } catch {
@@ -2192,14 +2334,73 @@ async function runDesktopRoomCommandPump(targetConnectionIds = null) {
   }
 }
 
+async function runDesktopRoomStopPump(targetConnectionIds = null) {
+  if (desktopRoomCommandDisposed) return
+  if (desktopRoomStopRunning) {
+    desktopRoomStopRerun = true
+    if (targetConnectionIds === null) {
+      desktopRoomStopPendingConnections.add('*')
+    } else {
+      for (const id of targetConnectionIds) {
+        desktopRoomStopPendingConnections.add(String(id))
+      }
+    }
+    return
+  }
+  desktopRoomStopRunning = true
+  try {
+    const client = await import('./desktop-room-command-client.js')
+    await ensureDesktopRoomCommandConsumerId()
+    ensureDesktopRoomAuthorityTokens()
+    const connections = await desktopRoomCommandConnections()
+    const connectionIds = connections.map(connection => connection.id)
+    const rooms = desktopCommandEligibleRooms(connectionIds)
+    if (!Object.keys(rooms).length) return
+    const selected = targetConnectionIds === null
+      ? connections
+      : connections.filter(connection => targetConnectionIds.has(connection.id))
+    await client.runDesktopRoomCommandCycle({
+      routes: selected.map(connection => connection.route),
+      consumerId: desktopRoomCommandConsumerId,
+      rooms,
+      request: (route, method, params) =>
+        typeof host.requestProfile === 'function'
+          ? host.requestProfile(route, method, params)
+          : groupChatSyncRequest({ connectionId: route.connectionId }, method, params),
+      execute: executeDesktopRoomCommand,
+      actions: ['stop'],
+      shouldContinue: () => !desktopRoomCommandDisposed
+    })
+  } catch {
+    // A reconnect or older backend simply leaves durable Stops pending.
+  } finally {
+    desktopRoomStopRunning = false
+    if (desktopRoomStopRerun && !desktopRoomCommandDisposed) {
+      desktopRoomStopRerun = false
+      const pending = [...desktopRoomStopPendingConnections]
+      desktopRoomStopPendingConnections.clear()
+      if (!pending.length || pending.includes('*')) {
+        void runDesktopRoomStopPump()
+      } else {
+        const targets = new Set(pending)
+        void runDesktopRoomStopPump(targets)
+      }
+    }
+  }
+}
+
 function startDesktopRoomCommandPump() {
   desktopRoomCommandDisposed = false
   if (typeof setInterval !== 'function' || desktopRoomCommandTimer !== null) return
   void ensureDesktopRoomCommandConsumerId().then(() => {
     if (desktopRoomCommandDisposed || desktopRoomCommandTimer !== null) return
     void runDesktopRoomCommandPump()
+    void runDesktopRoomStopPump()
     desktopRoomCommandTimer = setInterval(
-      () => void runDesktopRoomCommandPump(),
+      () => {
+        void runDesktopRoomCommandPump()
+        void runDesktopRoomStopPump()
+      },
       DESKTOP_ROOM_COMMAND_INTERVAL_MS
     )
     if (desktopRoomCommandPushUnsub === null && typeof host.onEvent === 'function') {
@@ -2214,7 +2415,9 @@ function startDesktopRoomCommandPump() {
 function stopDesktopRoomCommandPump() {
   desktopRoomCommandDisposed = true
   desktopRoomCommandRerun = false
+  desktopRoomStopRerun = false
   desktopRoomCommandPendingConnections.clear()
+  desktopRoomStopPendingConnections.clear()
   releaseDesktopRoomCommandRetention()
   if (desktopRoomCommandTimer !== null && typeof clearInterval === 'function') {
     clearInterval(desktopRoomCommandTimer)
@@ -2248,7 +2451,10 @@ async function flushGroupChatServerSync(connectionId) {
 
   try {
     const remoteState = await groupChatRemoteSnapshot(job)
-    const local = groupChatSyncSnapshot($groupChats.get())
+    const local = await attachDesktopRoomAuthorityCommitments(
+      groupChatSyncSnapshot($groupChats.get()),
+      $groupChats.get()
+    )
     const writeRevision = remoteState.revision + 1
     const snapshot = mergeGroupChatSyncSnapshots(remoteState.snapshot, local, {
       changedRooms: job.changedRooms,
@@ -7958,6 +8164,10 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
           typeof room.desktopCoordinatorId === 'string' && room.desktopCoordinatorId
             ? room.desktopCoordinatorId
             : null,
+        desktopAuthorityToken:
+          typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+            ? room.desktopAuthorityToken
+            : null,
         desktopCommandSettled: boundedDesktopCommandSettled(room.desktopCommandSettled),
         hosted: groupChatHostedGateway(room) || null,
         hostedEpoch: groupChatHostedEpoch(room) || null,
@@ -8057,6 +8267,10 @@ async function disbandGroupChat(group, members) {
           desktopCoordinatorId:
             typeof room.desktopCoordinatorId === 'string' && room.desktopCoordinatorId
               ? room.desktopCoordinatorId
+              : null,
+          desktopAuthorityToken:
+            typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+              ? room.desktopAuthorityToken
               : null,
           desktopCommandSettled: boundedDesktopCommandSettled(room.desktopCommandSettled),
           hosted: groupChatHostedGateway(room) || null,
@@ -9134,6 +9348,33 @@ async function stopGroupThread(group, thread, members = null) {
   }
 }
 
+/** Fence work after this Desktop loses its gateway command lease. Unlike a
+ *  user Stop, this does not place durable holds or settle the command: the
+ *  gateway must be able to lease the same idempotent turn to the current
+ *  owner and continue it safely. */
+async function cancelGroupThreadForLeaseLoss(group, members = null) {
+  const room = $groupChats.get()[group] || {}
+  const roster = Array.isArray(members) && members.length ? members : room.members || []
+  const turnName = room.turn || null
+
+  updateGroupChat(group, current => {
+    current.epoch = (current.epoch || 0) + 1
+    current.running = false
+    current.turn = null
+    return current
+  })
+
+  const onTurn = turnName ? roster.find(member => member?.name === turnName) : null
+  const sessionId = onTurn ? (room.sessions || {})[groupMemberKey(onTurn)] : null
+  if (onTurn && sessionId) {
+    try {
+      await requestForBot(onTurn, 'session.interrupt', { session_id: sessionId })
+    } catch {
+      /* best-effort: the epoch fence prevents stale room commits */
+    }
+  }
+}
+
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
  *  a time. A newer user send bumps the room epoch; this loop notices at the
  *  next member boundary, bails, and the newest send's own loop takes over.
@@ -9465,12 +9706,10 @@ async function runGroupChatRounds(group, members, thread) {
     if (current) {
       recordGroupActivity(group, { kind: exitKind, member: null, thread })
     }
-    if (current || externalIds.length) {
+    if (current) {
       updateGroupChat(group, r => {
-        if (current) {
-          r.running = false
-          r.turn = null
-        }
+        r.running = false
+        r.turn = null
         const settled = { ...(r.desktopCommandSettled || {}) }
         for (const id of externalIds) {
           settled[id] = Date.now()
@@ -9549,9 +9788,13 @@ function sendToGroupChat(group, members, text, thread, images, options = {}) {
     return null
   }
 
-  if (!hosted && !room?.desktopCoordinatorId) {
+  if (
+    !hosted &&
+    (!room?.desktopCoordinatorId || !room?.desktopAuthorityToken)
+  ) {
     room = updateGroupChat(group, current => {
-      current.desktopCoordinatorId = currentDesktopRoomCoordinatorId()
+      current.desktopCoordinatorId ||= currentDesktopRoomCoordinatorId()
+      current.desktopAuthorityToken ||= mintDesktopRoomAuthorityToken()
       return current
     })
   }
@@ -13739,6 +13982,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         room.members = roomMembers
         room.roomId = roomId
         room.desktopCoordinatorId = desktopCoordinator
+        room.desktopAuthorityToken = hostedRoom ? null : mintDesktopRoomAuthorityToken()
 
         if (hostedRoom) {
           room.hosted = hostedRoom.authority_gateway_id

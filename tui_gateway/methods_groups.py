@@ -118,7 +118,8 @@ def _(rid, params: dict) -> dict:
         commands = claim_commands(
             default_db_path(),
             consumer_id=params.get("consumer_id"),
-            room_ids=params.get("room_ids", []),
+            room_authorities=params.get("room_authorities", []),
+            actions=params.get("actions"),
             limit=params.get("limit", 8),
         )
         return _ok(rid, {"commands": commands})

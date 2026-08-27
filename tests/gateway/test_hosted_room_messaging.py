@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -240,6 +241,9 @@ def _seed_classic_projection(home, *, room_id="classic-room"):
                                 "name": "Desktop planning",
                                 "roomId": room_id,
                                 "hosted": None,
+                                "desktopAuthorityHash": hashlib.sha256(
+                                    b"authority:test"
+                                ).hexdigest(),
                                 "members": [
                                     {"name": "default", "handle": "hermes"},
                                     {"name": "reviewer", "handle": "reviewer"},
@@ -362,6 +366,28 @@ def test_more_than_128_classic_rooms_list_without_disabling_controls(tmp_path, m
     assert len({room["messaging_ref"] for room in listed}) == 260
 
 
+def test_malformed_projected_room_does_not_hide_healthy_group_chats(tmp_path, monkeypatch):
+    import yaml
+
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    profile = home / "profile.yaml"
+    raw = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    raw["ui_meta"]["hermes-bots-groups"]["rooms"]["id:broken"] = {
+        "name": "Broken",
+        "roomId": "x" * 201,
+        "desktopAuthorityHash": hashlib.sha256(b"authority:broken").hexdigest(),
+        "members": [{"name": "default"}],
+        "log": [],
+    }
+    profile.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    rooms = list_messaging_rooms(_FakeService(tmp_path / "state.db"))
+
+    assert [room["room_id"] for room in rooms] == ["classic-room"]
+
+
 def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
     from gateway import desktop_room_mailbox
 
@@ -395,7 +421,10 @@ def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
     commands = desktop_room_mailbox.claim_commands(
         desktop_room_mailbox.default_db_path(),
         consumer_id="desktop:test",
-        room_ids=["classic-room"],
+        room_authorities=[{
+            "room_id": "classic-room",
+            "authority_token": "authority:test",
+        }],
     )
     assert [(item["action"], item["payload"]) for item in commands] == [
         (
@@ -404,6 +433,29 @@ def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
         ),
         ("stop", {}),
     ]
+
+
+def test_legacy_desktop_room_control_requests_one_current_desktop_open(tmp_path, monkeypatch):
+    import yaml
+
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    profile = home / "profile.yaml"
+    raw = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    del raw["ui_meta"]["hermes-bots-groups"]["rooms"]["id:classic-room"][
+        "desktopAuthorityHash"
+    ]
+    profile.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    room = list_messaging_rooms(_FakeService(tmp_path / "state.db"))[0]
+
+    with pytest.raises(RoomControlError, match="Open this Group Chat once"):
+        send_to_room(
+            _FakeService(tmp_path / "state.db"),
+            room,
+            _event("/group 1 send hello", message_id="legacy-send"),
+            "hello",
+        )
 
 
 def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypatch):
@@ -417,13 +469,17 @@ def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypa
         db,
         command_id="messaging:failed",
         room_id="classic-room",
+        authority_hash=hashlib.sha256(b"authority:test").hexdigest(),
         action="send",
         payload={"message": "hello"},
     )
     claimed = desktop_room_mailbox.claim_commands(
         db,
         consumer_id="desktop:test",
-        room_ids=["classic-room"],
+        room_authorities=[{
+            "room_id": "classic-room",
+            "authority_token": "authority:test",
+        }],
     )[0]
     desktop_room_mailbox.complete_command(
         db,

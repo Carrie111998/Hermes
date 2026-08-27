@@ -93,3 +93,14 @@ test('long room turns renew their generation-fenced command lease', () => {
   assert.match(clientSource, /LEASE_RENEW_INTERVAL_MS = 15_000/)
   assert.match(clientSource, /clearInterval\(renewTimer\)/)
 })
+
+test('Stop commands use an independent priority lane', () => {
+  const start = pluginSource.indexOf('function scheduleDesktopRoomCommandPump(')
+  const end = pluginSource.indexOf('function stopDesktopRoomCommandPump(', start)
+  const lifecycle = pluginSource.slice(start, end)
+
+  assert.match(lifecycle, /runDesktopRoomStopPump/)
+  assert.match(lifecycle, /actions: \['send'\]/)
+  assert.match(lifecycle, /actions: \['stop'\]/)
+  assert.match(lifecycle, /desktopRoomStopRunning/)
+})
