@@ -789,6 +789,8 @@ async function cleanupStale(
   }
 
   if (owned) {
+    let useArgvTermination = !authenticatedIdentity
+
     if (authenticatedIdentity) {
       let result = ''
 
@@ -801,9 +803,34 @@ async function cleanupStale(
       }
 
       if (result !== 'TERMINATED' && result !== 'ALREADY_STOPPED') {
-        return false
+        // Darwin and older Linux Python runtimes cannot bind a signal to a
+        // pidfd. They may still use the pre-existing argv/nonce proof; wrapper
+        // processes that need HMAC-only ownership remain fail-closed.
+        if (result !== 'UNAVAILABLE') {
+          return false
+        }
+
+        try {
+          useArgvTermination = await pidIsOurDashboard(
+            ssh,
+            lock.pid,
+            lock.spawnNonce,
+            lock.hermesPath,
+            lock.hermesHome,
+            ownershipId,
+            lock.profile
+          )
+        } catch {
+          return false
+        }
+
+        if (!useArgvTermination) {
+          return false
+        }
       }
-    } else {
+    }
+
+    if (useArgvTermination) {
       try {
         const result = (
           await ssh.exec(

@@ -828,6 +828,24 @@ test('disconnect keeps an authenticated lock when signal-bound process identity 
   assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
+test('disconnect falls back to argv-verified termination when pidfd cleanup is unavailable', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/value="linux:"/, `${lock.creationTime}\n`],
+    [/pidfd_open/, 'UNAVAILABLE\n'],
+    [/print\("OWNED"/, 'OWNED\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID, async candidate => candidate.spawnNonce === SPAWN_NONCE)
+
+  assert.ok(ssh.calls.some(command => /pidfd_open/.test(command)))
+  assert.ok(ssh.calls.some(command => /\bkill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
 test('disconnect is a no-op when this desktop has no lockfile', async () => {
   const ssh = fakeSsh([[/cat .*backend\.lock\.json/, '']])
 
@@ -1230,7 +1248,7 @@ test('connect reaps an authenticated wrapper before replacing its stale runtime'
     .digest('hex')
 
   const ssh = fakeSsh([
-    [/uname/, 'Darwin\narm64'],
+    [/uname/, 'Linux\nx86_64'],
     [/\[ -x/, 'OK'],
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE'],
