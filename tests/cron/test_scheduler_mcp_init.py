@@ -1,26 +1,14 @@
-"""Regression tests for MCP server availability in cron jobs.
+"""Regression tests for cron MCP-discovery isolation.
 
-Background
-==========
-``cron/scheduler.py:run_job()`` constructs ``AIAgent(...)`` directly without
-calling ``discover_mcp_tools()`` — the initialization that CLI and gateway
-paths do at startup. Cron jobs therefore never saw any MCP tools from
-``mcp_servers`` in config.yaml. See #4219.
-
-The fix inserts ``discover_mcp_tools()`` before the ``AIAgent(...)`` call,
-wrapped in try/except so a broken MCP server can't kill an otherwise
-working cron job. ``discover_mcp_tools`` is idempotent — subsequent ticks
-short-circuit on already-connected servers.
+Cron jobs must not initialize or enumerate configured MCP servers before the
+agent is constructed. ``enabled_toolsets`` / ``no_mcp`` is a model-visible
+allowlist and is too late to prevent MCP startup side effects.
 """
 
 from __future__ import annotations
 
+import inspect
 from unittest.mock import patch
-
-
-
-
-
 
 
 def test_no_agent_cron_job_does_not_initialize_mcp():
@@ -51,3 +39,25 @@ def test_no_agent_cron_job_does_not_initialize_mcp():
         "discover_mcp_tools was called for a no_agent job — wasted MCP init "
         "for a script-only cron tick"
     )
+
+
+def test_llm_cron_scheduler_path_does_not_discover_mcp(monkeypatch):
+    """The LLM cron construction boundary must bypass MCP discovery too."""
+    from cron import scheduler
+
+    discover_called = []
+
+    def fake_discover():
+        discover_called.append(True)
+        return ["mcp_should_not_be_seen"]
+
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", fake_discover)
+    # The guard belongs in the scheduler's LLM path, not only in the job
+    # metadata. Inspect the complete function source so a future reintroduction
+    # of the startup call fails this regression test even if it is wrapped or
+    # moved away from the current line number.
+    source = inspect.getsource(scheduler.run_job)
+    assert "discover_mcp_tools()" not in source
+    assert "discover_mcp_tools" not in source
+    assert "MCP discovery is intentionally skipped for cron jobs" in source
+    assert not discover_called
