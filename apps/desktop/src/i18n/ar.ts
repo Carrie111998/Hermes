@@ -2287,7 +2287,10 @@ export const ar = defineLocale({
       openModelPicker: 'فتح اختيار النموذج',
       modelPinned: 'النموذج مثبت',
       modelTitle: (provider, model) => `${provider}: ${model}`,
-      providerModelTitle: (provider, model) => `${provider}: ${model}`
+      providerModelTitle: (provider, model) => `${provider}: ${model}`,
+      providerTag: provider => `· ${provider}`,
+      nonDefaultProvider: (provider, defaultProvider) =>
+        `يتم استخدام ${provider} — ليس الإعداد الافتراضي في الإعدادات (${defaultProvider})`
     }
   },
   rightSidebar: {

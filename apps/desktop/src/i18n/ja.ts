@@ -2578,7 +2578,10 @@ export const ja = defineLocale({
       openModelPicker: 'モデルピッカーを開く',
       modelPinned: '手動で固定中 — 新しいチャットは設定のデフォルトではなくこのモデルを使用します',
       modelTitle: (provider, model) => `モデル · ${provider}: ${model}`,
-      providerModelTitle: (provider, model) => `${provider} · ${model}`
+      providerModelTitle: (provider, model) => `${provider} · ${model}`,
+      providerTag: provider => `· ${provider}`,
+      nonDefaultProvider: (provider, defaultProvider) =>
+        `${provider} を使用中 — 設定のデフォルト (${defaultProvider}) ではありません`
     }
   },
 

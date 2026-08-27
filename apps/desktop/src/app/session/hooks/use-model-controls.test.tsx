@@ -612,6 +612,67 @@ describe('useModelControls', () => {
     expect(getCurrentModelSource()).toBe('default')
   })
 
+  // #96063: a stale persisted provider on a same-named model would silently
+  // send API calls to the wrong gateway. The persisted composer state is plain
+  // UI (NOT a manual pick); the profile default is the truth. refreshCurrentModel
+  // must reseed BOTH model and provider from the profile default when the
+  // source isn't 'manual', so the next session.create ships the config default
+  // even if the user never touched the picker.
+  it('reseeds a stale non-manual provider to the profile default (#96063)', async () => {
+    setCurrentModel('qwen3.7-plus')
+    setCurrentProvider('custom:token-plan-a')
+    setCurrentModelSource('default')
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({
+      model: 'qwen3.7-plus',
+      provider: 'custom:aliyun-coding-plan'
+    })
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient: new QueryClient(),
+        requestGateway: vi.fn()
+      })
+    )
+
+    await result.current.refreshCurrentModel()
+
+    expect($currentModel.get()).toBe('qwen3.7-plus')
+    expect($currentProvider.get()).toBe('custom:aliyun-coding-plan')
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  // #96063: the converse guard. A manual pick with the same drift (a forgotten
+  // pick from a provider that's no longer the profile default) stays sticky —
+  // wiping it on every refresh would be a worse UX surprise than the visible
+  // pill mismatch. The pill carries the tag so the user can re-pick if needed.
+  it('preserves a manual pick whose provider has drifted from the profile default (#96063)', async () => {
+    setCurrentModel('qwen3.7-plus')
+    setCurrentProvider('custom:token-plan-a')
+    setCurrentModelSource('manual')
+    const queryClient = new QueryClient()
+
+    queryClient.setQueryData(modelOptionsQueryKey('default'), {
+      providers: [
+        { models: ['qwen3.7-plus'], name: 'custom:aliyun-coding-plan', slug: 'custom:aliyun-coding-plan' },
+        { models: ['qwen3.7-plus'], name: 'custom:token-plan-a', slug: 'custom:token-plan-a' }
+      ]
+    })
+
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({
+      model: 'qwen3.7-plus',
+      provider: 'custom:aliyun-coding-plan'
+    })
+
+    const { result } = renderHook(() => useModelControls({ queryClient, requestGateway: vi.fn() }))
+
+    await result.current.refreshCurrentModel()
+
+    // Manual pick stays; the pill surfaces the mismatch via a muted provider tag.
+    expect($currentModel.get()).toBe('qwen3.7-plus')
+    expect($currentProvider.get()).toBe('custom:token-plan-a')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
   it('targets an explicit tile sessionId without clobbering the primary model', async () => {
     const queryClient = new QueryClient()
     $activeGatewayProfile.set('compass')

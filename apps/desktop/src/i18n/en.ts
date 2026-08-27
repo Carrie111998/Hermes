@@ -2950,7 +2950,14 @@ export const en: Translations = {
       openModelPicker: 'Open model picker',
       modelPinned: 'pinned by you; new chats use this instead of the Settings default',
       modelTitle: (provider, model) => `Model · ${provider}: ${model}`,
-      providerModelTitle: (provider, model) => `${provider} · ${model}`
+      providerModelTitle: (provider, model) => `${provider} · ${model}`,
+      // #96063: when two custom providers share a model id (e.g. `qwen3.7-plus`
+      // on both `custom:aliyun-coding-plan` and `custom:token-plan-a`) the pill
+      // would otherwise look identical for both routes. The muted tag makes the
+      // live provider visible without hover, so the user can spot the desync.
+      providerTag: provider => `· ${provider}`,
+      nonDefaultProvider: (provider, defaultProvider) =>
+        `Using ${provider} — not the Settings default (${defaultProvider})`
     }
   },
 

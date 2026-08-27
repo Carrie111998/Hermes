@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
@@ -10,9 +11,12 @@ import { releaseTypingFocus } from '@/components/ui/keyboard-first'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
+import { modelOptionsQueryKey } from '@/lib/model-options'
 import { formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
+import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { onComposerModelMenuRequest } from './focus'
 import { useComposerScope } from './scope'
@@ -89,9 +93,28 @@ export function ModelPill({
   const pinnedOverride =
     view.kind === 'primary' && !runtimeId && modelSource === 'manual' && Boolean(currentModel.trim())
 
-  // The model resolves a beat after the gateway/session comes up. Rather than
-  // flash a literal "No model", show a quiet loader (inherits the pill text
-  // color at half opacity) until a model lands.
+  // #96063: subscribe to the profile-scoped model-options cache so a config
+  // default change re-paints the pill with the new baseline. `enabled: false`
+  // keeps it a pure cache subscription — no fetch, no spinner; the catalog
+  // fetcher (model-menu-panel / ComposerControls) owns that.
+  const profile = useStore($activeGatewayProfile)
+
+  const defaultProvider = useQuery<ModelOptionsResponse | undefined>({
+    enabled: false,
+    queryFn: () => undefined,
+    queryKey: modelOptionsQueryKey(profile)
+  }).data?.provider?.trim() ?? ''
+
+  // Two same-named models on two providers (e.g. `qwen3.7-plus` on both
+  // `custom:aliyun-coding-plan` and `custom:token-plan-a`) would otherwise look
+  // identical. When the live provider has drifted from the Settings default,
+  // paint a muted tag inside the pill so the desync is visible at a glance
+  // — and extend the tooltip / aria-label so hover + screen readers both name
+  // both providers.
+  const liveProvider = currentProvider.trim()
+  const hasDefaultProvider = defaultProvider.length > 0
+  const showProviderTag = hasDefaultProvider && liveProvider.length > 0 && liveProvider !== defaultProvider
+
   const label = compact ? (
     <ChevronDown className="size-3.5 shrink-0 opacity-70" />
   ) : (
@@ -99,6 +122,15 @@ export function ModelPill({
       {currentModel.trim() ? (
         <span className="truncate">
           {formatModelStatusLabel(currentModel, { defaultEffort, fastMode, reasoningEffort })}
+          {showProviderTag && (
+            <span
+              aria-hidden="true"
+              className="ml-0.5 opacity-70"
+              data-testid="model-provider-tag"
+            >
+              {copy.providerTag(liveProvider)}
+            </span>
+          )}
         </span>
       ) : (
         <GlyphSpinner className="opacity-50" spinner="braille" />
@@ -128,13 +160,22 @@ export function ModelPill({
     ? copy.modelTitle(currentProvider, currentModel || copy.modelNone)
     : copy.switchModel
 
-  const title = pinnedOverride ? `${baseTitle} — ${copy.modelPinned}` : baseTitle
+  // #96063: when the live provider has drifted from the Settings default, name
+  // both so hover + screen readers can tell which provider the session will
+  // actually route to. The visible provider tag inside the label covers the
+  // "glance" path; this carries the same information into the tooltip /
+  // aria-label path so users who do hover (or who use AT) get the full picture.
+  const nonDefaultSuffix = showProviderTag ? ` — ${copy.nonDefaultProvider(liveProvider, defaultProvider)}` : ''
+
+  const title = `${baseTitle}${nonDefaultSuffix}${pinnedOverride ? ` — ${copy.modelPinned}` : ''}`
 
   if (!model.modelMenuContent) {
+    const pickerLabel = `${copy.openModelPicker}${nonDefaultSuffix}${pinnedOverride ? ` — ${copy.modelPinned}` : ''}`
+
     return (
-      <Tip label={pinnedOverride ? `${copy.openModelPicker} — ${copy.modelPinned}` : copy.openModelPicker} side="top">
+      <Tip label={pickerLabel} side="top">
         <Button
-          aria-label={copy.openModelPicker}
+          aria-label={pickerLabel}
           className={pillClass}
           disabled={disabled}
           onClick={() => setModelPickerOpen(true)}

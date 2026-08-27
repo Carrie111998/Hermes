@@ -2515,6 +2515,14 @@ export interface Translations {
       modelPinned: string
       modelTitle: (provider: string, model: string) => string
       providerModelTitle: (provider: string, model: string) => string
+      /** Short, muted pill tag showing the live provider when it differs from
+       *  the Settings → Model default. Prevents two same-named models on two
+       *  providers from looking identical (#96063). */
+      providerTag: (provider: string) => string
+      /** aria-label / tooltip body when the live provider has drifted from
+       *  the Settings → Model default. Carries both names so screen readers
+       *  and hover see the desync without having to dig into the picker. */
+      nonDefaultProvider: (provider: string, defaultProvider: string) => string
     }
   }
 

@@ -3114,7 +3114,10 @@ export const zh: Translations = {
       openModelPicker: '打开模型选择器',
       modelPinned: '已由你固定；新对话将使用此模型而非“设置”中的默认模型',
       modelTitle: (provider, model) => `模型 · ${provider}: ${model}`,
-      providerModelTitle: (provider, model) => `${provider} · ${model}`
+      providerModelTitle: (provider, model) => `${provider} · ${model}`,
+      providerTag: provider => `· ${provider}`,
+      nonDefaultProvider: (provider, defaultProvider) =>
+        `正在使用 ${provider} — 不是“设置”中的默认提供方 (${defaultProvider})`
     }
   },
 
