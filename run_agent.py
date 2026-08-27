@@ -220,7 +220,15 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
+from utils import (
+    atomic_json_write,
+    base_url_host_matches,
+    base_url_hostname,
+    env_float,
+    is_copilot_api_base_url,
+    is_truthy_value,
+    model_forces_max_completion_tokens,
+)
 
 
 # Internal flags that mark a message as ephemeral empty-response/prefill
@@ -1413,15 +1421,8 @@ class AIAgent:
 
     def _is_github_copilot_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
-        if base_url is not None:
-            hostname = base_url_hostname(base_url)
-        else:
-            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
-                getattr(self, "_base_url_lower", "")
-            )
-        if not hostname:
-            return False
-        return hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com")
+        url = base_url if base_url is not None else getattr(self, "_base_url_lower", "")
+        return is_copilot_api_base_url(url)
 
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
@@ -1594,7 +1595,7 @@ class AIAgent:
     def _is_copilot_url(self) -> bool:
         """Return True when the base URL targets GitHub Copilot or GitHub Models."""
         return (
-            base_url_host_matches(self._base_url_lower, "api.githubcopilot.com")
+            is_copilot_api_base_url(self._base_url_lower)
             or base_url_host_matches(self._base_url_lower, "models.github.ai")
         )
 
@@ -5409,7 +5410,7 @@ class AIAgent:
         # unaffected (they don't go through here).
         request_kwargs["max_retries"] = 0
         if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
+            is_copilot_api_base_url(str(request_kwargs.get("base_url", "")))
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
@@ -6344,7 +6345,7 @@ class AIAgent:
             self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
-        elif base_url_host_matches(base_url, "githubcopilot.com"):
+        elif is_copilot_api_base_url(base_url):
             from hermes_cli.models import copilot_default_headers
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
@@ -7639,7 +7640,7 @@ class AIAgent:
             return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
-            or base_url_host_matches(self._base_url_lower, "githubcopilot.com")
+            or is_copilot_api_base_url(self._base_url_lower)
         ):
             try:
                 from hermes_cli.models import github_model_reasoning_efforts

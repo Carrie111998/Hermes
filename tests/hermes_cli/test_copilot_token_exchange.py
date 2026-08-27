@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -50,6 +51,59 @@ class TestExchangeCopilotToken:
         req = call_args[0][0]
         assert req.get_header("Authorization") == "token gho_test123"
         assert "GitHubCopilotChat" in req.get_header("User-agent")
+
+    @patch("urllib.request.urlopen")
+    def test_ghec_exchange_uses_enterprise_api_host(self, mock_urlopen, monkeypatch):
+        from hermes_cli.copilot_auth import exchange_copilot_token
+
+        monkeypatch.setenv("COPILOT_GH_HOST", "acme.ghe.com")
+        mock_urlopen.return_value = self._mock_urlopen(token="tid=enterprise")
+
+        exchange_copilot_token("ghu_enterprise")
+
+        request = mock_urlopen.call_args.args[0]
+        assert request.full_url == (
+            "https://api.acme.ghe.com/copilot_internal/v2/token"
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_ghec_exchange_falls_back_to_api_v3(self, mock_urlopen, monkeypatch):
+        from hermes_cli.copilot_auth import exchange_copilot_token
+
+        monkeypatch.setenv("COPILOT_GH_HOST", "acme.ghe.com")
+        rejected = urllib.error.HTTPError(
+            url="https://api.acme.ghe.com/copilot_internal/v2/token",
+            code=404,
+            msg="not found",
+            hdrs=None,
+            fp=None,
+        )
+        mock_urlopen.side_effect = [
+            rejected,
+            self._mock_urlopen(token="tid=enterprise"),
+        ]
+
+        exchange_copilot_token("ghu_enterprise")
+
+        assert [call.args[0].full_url for call in mock_urlopen.call_args_list] == [
+            "https://api.acme.ghe.com/copilot_internal/v2/token",
+            "https://acme.ghe.com/api/v3/copilot_internal/v2/token",
+        ]
+
+    @patch("urllib.request.urlopen")
+    def test_exchange_cache_is_scoped_to_github_host(self, mock_urlopen, monkeypatch):
+        from hermes_cli.copilot_auth import exchange_copilot_token
+
+        mock_urlopen.side_effect = [
+            self._mock_urlopen(token="tid=public"),
+            self._mock_urlopen(token="tid=enterprise"),
+        ]
+        public_token, _, _ = exchange_copilot_token("ghu_shared")
+        monkeypatch.setenv("COPILOT_GH_HOST", "acme.ghe.com")
+        enterprise_token, _, _ = exchange_copilot_token("ghu_shared")
+
+        assert public_token == "tid=public"
+        assert enterprise_token == "tid=enterprise"
 
 
 

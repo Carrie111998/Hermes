@@ -281,3 +281,25 @@ def test_openrouter_headers_no_cache_when_disabled(mock_openai):
     assert "X-OpenRouter-Cache-TTL" not in headers
 
 
+@patch("run_agent.OpenAI")
+def test_ghec_copilot_base_url_applies_copilot_headers(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://copilot-api.acme.ghe.com",
+        model="gpt-5.4",
+        provider="copilot",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url(
+        "https://copilot-api.acme.ghe.com"
+    )
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["Editor-Version"].startswith("vscode/")
+    assert headers["Copilot-Integration-Id"] == "vscode-chat"
+
+
