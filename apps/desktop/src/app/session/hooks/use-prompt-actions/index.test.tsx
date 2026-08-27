@@ -4343,6 +4343,49 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(true)
   })
 
+  it('does not false-abort a duplicate tip when the canonical composer owner selects its lineage', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const sharedTip = 'shared-tip'
+    const rootA = 'root-a'
+    const rootB = 'root-b'
+
+    setSessions(() => [
+      sessionInfo({
+        connection_id: ownerA.connectionId,
+        id: sharedTip,
+        _lineage_root_id: rootA,
+        profile: ownerA.profile
+      }),
+      sessionInfo({
+        connection_id: ownerB.connectionId,
+        id: sharedTip,
+        _lineage_root_id: rootB,
+        profile: ownerB.profile
+      })
+    ])
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={sharedTip}
+      />
+    )
+
+    const ok = await handle!.submitText('owner B prompt', {
+      composerScope: rootB,
+      composerStorageScope: encodeComposerStorageScopeKey(ownerB, rootB)
+    })
+
+    expect(ok).toBe(true)
+    expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+
   it('aborts submit when the composer scope disagrees with the resolved target (#59305)', async () => {
     // The composer (ChatBar) and the session-side refs live in separate React
     // subtrees; each can be internally consistent yet still disagree with each

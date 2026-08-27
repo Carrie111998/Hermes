@@ -353,7 +353,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               // into the same lineage-root domain before comparing, or every
               // submit into a session that has ever compressed would
               // false-positive-abort.
-              submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
+              submitTargetComposerScope: resolveComposerSessionKey(
+                startingStoredSessionId,
+                $sessions.get(),
+                submittedStorageScope?.owner
+              )
             })
           : null
 
