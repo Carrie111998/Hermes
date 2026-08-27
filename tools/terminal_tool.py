@@ -1441,13 +1441,13 @@ def _session_isolation_enabled() -> bool:
       under non-persistent mode would let two independent ephemeral runs
       attach one live VM and delete it out from under each other).
     """
-    _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    config = _get_env_config()
+    env_type = config["env_type"]
     if env_type != "docker" and not _plugin_env_flag(
         env_type, "session_isolated_when_nonpersistent"
     ):
         return False
-    return os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() not in {"true", "1", "yes"}
+    return not config["container_persistent"]
 
 
 def _docker_session_isolation_enabled() -> bool:
@@ -1457,9 +1457,10 @@ def _docker_session_isolation_enabled() -> bool:
     selection, session-scoped container teardown) key off it; those must
     not fire for other backends.
     """
-    if os.getenv("TERMINAL_ENV", "local") != "docker":
+    config = _get_env_config()
+    if config["env_type"] != "docker":
         return False
-    return _session_isolation_enabled()
+    return not config["container_persistent"]
 
 
 def _docker_persistent_profile_scoped() -> bool:
@@ -1529,7 +1530,9 @@ def _resolve_container_base_task_id(task_id: Optional[str]) -> str:
     """Resolve aliases and isolation policy without adding a profile namespace."""
     if task_id and _has_isolation_overrides(task_id):
         return task_id
-    if task_id and _session_isolation_enabled():
+    if task_id and (
+        _docker_session_isolation_enabled() or _session_isolation_enabled()
+    ):
         return _resolve_container_alias(task_id)
     return "default"
 

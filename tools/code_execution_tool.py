@@ -436,15 +436,15 @@ _TOOL_STUBS = {
     ),
     "tool_search": (
         "tool_search",
-        "query: str, limit: int = 5",
-        '"""Search deferred MCP and plugin tools. Returns a dict with matching tool metadata."""',
-        '{"query": query, "limit": limit}',
+        "queries: list, limit: int = 5",
+        '"""Search deferred MCP and plugin tools for one or more queries."""',
+        '{"queries": queries, "limit": limit}',
     ),
     "tool_describe": (
         "tool_describe",
-        "name: str",
-        '"""Load the full schema for one deferred tool returned by tool_search."""',
-        '{"name": name}',
+        "names: list",
+        '"""Load full schemas for deferred tools returned by tool_search."""',
+        '{"names": names}',
     ),
     "tool_call": (
         "tool_call",

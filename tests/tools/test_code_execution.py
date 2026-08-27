@@ -838,8 +838,8 @@ print(json.dumps({"value": terminal("printf test")}))
 import json
 from hermes_tools import tool_search, tool_describe, tool_call
 
-found = tool_search("scope probe", limit=10)
-described = tool_describe("scope_probe_alpha")
+found = tool_search(["scope probe"], limit=10)
+described = tool_describe(["scope_probe_alpha"])
 alpha = tool_call("scope_probe_alpha", {})
 beta = tool_call("scope_probe_beta", {})
 print(json.dumps({
@@ -872,8 +872,11 @@ print(json.dumps({
 
         self.assertEqual(result["status"], "success")
         payload = json.loads(result["output"])
-        self.assertEqual([item["name"] for item in payload["found"]["matches"]], ["scope_probe_alpha"])
-        self.assertEqual(payload["described"]["name"], "scope_probe_alpha")
+        self.assertEqual(
+            payload["found"]["results"][0]["matches"],
+            ["scope_probe_alpha"],
+        )
+        self.assertIn("scope_probe_alpha", payload["described"]["tools"])
         self.assertEqual(
             payload["alpha"],
             {
