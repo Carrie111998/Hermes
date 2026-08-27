@@ -62,6 +62,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 
@@ -1216,8 +1217,16 @@ class MatrixAdapter(BasePlatformAdapter):
         self._device_id_unverified: bool = False
 
         self._client: Any = None  # mautrix.client.Client
+        self._pending_session: Any = None  # pre-Client HTTP session owner
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._sync_task: Optional[asyncio.Task] = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._fatal_notification_lock = asyncio.Lock()
+        self._lifecycle_cleanup_task: asyncio.Task | None = None
+        self._lifecycle_generation = 0
+        self._active_generation: int | None = None
+        self._published_sync: tuple[int, asyncio.Task] | None = None
+        self._sync_notification_tasks: set[asyncio.Task] = set()
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
         self._startup_ts: float = 0.0
@@ -1712,13 +1721,41 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Connect to the Matrix homeserver and start syncing."""
+        """Connect while exclusively owning adapter lifecycle resources."""
+        current = asyncio.current_task()
+        if current in getattr(self, "_detached_fatal_tasks", set()):
+            raise RuntimeError(
+                "Matrix fatal handler cannot reconnect the same adapter instance"
+            )
+        # Lock order is notification -> lifecycle. A fatal handler holds the
+        # notification lock while it mutates gateway state and may call
+        # disconnect(), so a replacement cannot publish until that mutation is
+        # complete. Public disconnect() takes only the lifecycle lock.
+        async with self._fatal_notification_lock:
+            async with self._lifecycle_lock:
+                if (
+                    self._lifecycle_cleanup_task is not None
+                    or self._active_generation is not None
+                    or self._client is not None
+                ):
+                    await self._disconnect_locked()
+
+                self._lifecycle_generation += 1
+                generation = self._lifecycle_generation
+                self._active_generation = generation
+                self._closing = False
+                try:
+                    connected = await self._connect_locked(generation)
+                except BaseException:
+                    await self._disconnect_locked(generation)
+                    raise
+                if not connected:
+                    await self._disconnect_locked(generation)
+                return connected
+
+    async def _connect_locked(self, generation: int) -> bool:
+        """Create one connection generation with ``_lifecycle_lock`` held."""
         self._device_id_unverified = False
-        if self._client is not None:
-            try:
-                await self.disconnect()
-            except Exception as exc:
-                logger.warning("Matrix: error disconnecting before reconnect: %s", exc)
 
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
@@ -1731,15 +1768,18 @@ class MatrixAdapter(BasePlatformAdapter):
         # Ensure store dir exists for E2EE key persistence.
         _STORE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Create the HTTP API layer.
+        # Publish the raw HTTP session before constructing the client. If either
+        # synchronous constructor fails, outer generation teardown transfers
+        # this session to the same cancellation-safe cleanup owner used after
+        # publication.
         client_session = _create_matrix_session(self._proxy_url)
+        self._pending_session = client_session
         api = HTTPAPI(
             base_url=self._homeserver,
             token=self._access_token or "",
             client_session=client_session,
         )
 
-        # Create the client.
         state_store = MemoryStateStore()
         sync_store = MemorySyncStore()
         client = Client(
@@ -1751,6 +1791,7 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         self._client = client
+        self._pending_session = None
 
         # Authenticate.
         if self._access_token:
@@ -1836,7 +1877,6 @@ class MatrixAdapter(BasePlatformAdapter):
                     exc,
                     exc_info=True,
                 )
-                await api.session.close()
                 return False
         elif self._password and self._user_id:
             try:
@@ -1851,13 +1891,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
                 logger.error("Matrix: login failed — %s", exc)
-                await api.session.close()
                 return False
         else:
             logger.error(
                 "Matrix: need MATRIX_ACCESS_TOKEN or MATRIX_USER_ID + MATRIX_PASSWORD"
             )
-            await api.session.close()
             return False
 
         # Set up E2EE if requested.
@@ -1876,7 +1914,6 @@ class MatrixAdapter(BasePlatformAdapter):
                         "Refusing to connect — encrypted rooms would silently fail.",
                         _E2EE_INSTALL_HINT,
                     )
-                    await api.session.close()
                     return False
             if not self._encryption:
                 pass
@@ -1902,7 +1939,6 @@ class MatrixAdapter(BasePlatformAdapter):
                             exc,
                             _E2EE_INSTALL_HINT,
                         )
-                        await api.session.close()
                         return False
             if self._encryption:
                 try:
@@ -1918,8 +1954,11 @@ class MatrixAdapter(BasePlatformAdapter):
                         f"sqlite:///{_CRYPTO_DB_PATH}",
                         upgrade_table=PgCryptoStore.upgrade_table,
                     )
-                    await crypto_db.start()
+                    # Database.start() can allocate before failing or being
+                    # cancelled. Publish ownership first so generation cleanup
+                    # always has a stop() path.
                     self._crypto_db = crypto_db
+                    await crypto_db.start()
 
                     _acct_id = self._user_id or "hermes"
                     # Use the resolved client.device_id (from whoami or password
@@ -1963,8 +2002,6 @@ class MatrixAdapter(BasePlatformAdapter):
                     await olm.load()
 
                     if not await self._verify_device_keys_on_server(client, olm):
-                        await crypto_db.stop()
-                        await api.session.close()
                         return False
 
                     try:
@@ -1979,8 +2016,6 @@ class MatrixAdapter(BasePlatformAdapter):
                                 "or generate a new access token to get a fresh device ID.",
                                 client.device_id,
                             )
-                            await crypto_db.stop()
-                            await api.session.close()
                             return False
                         logger.warning("Matrix: share_keys() warning during startup: %s", exc)
 
@@ -2061,7 +2096,6 @@ class MatrixAdapter(BasePlatformAdapter):
                             exc,
                             _E2EE_INSTALL_HINT,
                         )
-                        await api.session.close()
                         return False
 
         # Register event handlers.
@@ -2129,8 +2163,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: initial sync returned unexpected type %s",
                     type(sync_data).__name__,
                 )
+                return False
         except Exception as exc:
             logger.warning("Matrix: initial sync error: %s", exc)
+            return False
 
         # Share keys after initial sync if E2EE is enabled.
         if self._encryption and getattr(client, "crypto", None):
@@ -2139,53 +2175,144 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Matrix: initial key share failed: %s", exc)
 
-        # Start the sync loop.
-        self._sync_task = asyncio.create_task(self._sync_loop())
+        # The consumer owns startup until it has loaded its sync token.  It then
+        # waits for connect() to publish connected state before it may poll or
+        # notify the runtime supervisor.  This two-phase handoff avoids both a
+        # false-connected return and a pre-registration fatal notification.
+        loop = asyncio.get_running_loop()
+        consumer_started = loop.create_future()
+        consumer_published = asyncio.Event()
+        sync_task = asyncio.create_task(
+            self._sync_loop(consumer_started, consumer_published)
+        )
+        self._sync_task = sync_task
+        sync_task.add_done_callback(
+            lambda task, owner=generation: self._handle_sync_task_done(task, owner)
+        )
+        try:
+            started = await consumer_started
+        except BaseException:
+            sync_task.cancel()
+            await asyncio.gather(sync_task, return_exceptions=True)
+            raise
+        if not started or sync_task.done():
+            logger.error("Matrix: sync consumer exited during startup")
+            return False
         self._mark_connected()
+        self._published_sync = (generation, sync_task)
+        consumer_published.set()
         return True
 
     async def disconnect(self) -> None:
         """Disconnect from Matrix."""
-        self._closing = True
+        async with self._lifecycle_lock:
+            await self._disconnect_locked()
 
-        if self._sync_task and not self._sync_task.done():
-            self._sync_task.cancel()
-            try:
-                await self._sync_task
-            except (asyncio.CancelledError, Exception):
-                pass
+    async def _disconnect_locked(self, generation: int | None = None) -> None:
+        """Transfer one generation to cancellation-safe detached cleanup."""
+        cleanup_task = self._lifecycle_cleanup_task
+        if cleanup_task is not None:
+            # A prior caller may have been cancelled while cleanup continued.
+            # The task owns the captured resources; wait for it rather than
+            # creating a second closer or publishing a replacement too early.
+            await asyncio.shield(cleanup_task)
+            return
 
+        if generation is not None and generation != self._active_generation:
+            return
+
+        owned_generation = self._active_generation
+        sync_task = self._sync_task
         invite_join_tasks = list(self._invite_join_tasks.values())
-        for task in invite_join_tasks:
-            if not task.done():
-                task.cancel()
-        if invite_join_tasks:
-            await asyncio.gather(*invite_join_tasks, return_exceptions=True)
-        self._invite_join_tasks.clear()
-
         redaction_tasks = list(self._reaction_redaction_tasks)
-        for task in redaction_tasks:
-            if not task.done():
-                task.cancel()
-        if redaction_tasks:
-            await asyncio.gather(*redaction_tasks, return_exceptions=True)
+        crypto_db = getattr(self, "_crypto_db", None)
+        client = self._client
+        pending_session = self._pending_session
+        has_resources = any(
+            (
+                owned_generation is not None,
+                sync_task is not None,
+                bool(invite_join_tasks),
+                bool(redaction_tasks),
+                crypto_db is not None,
+                client is not None,
+                pending_session is not None,
+            )
+        )
+        if not has_resources:
+            self._mark_disconnected()
+            return
+
+        self._closing = True
+        self._active_generation = None
+        if (
+            self._published_sync is not None
+            and self._published_sync[0] == owned_generation
+        ):
+            self._published_sync = None
+
+        # Transfer sole ownership to the cleanup task before its first await.
+        # Callers may now be cancelled without losing the only references.
+        if self._sync_task is sync_task:
+            self._sync_task = None
+        self._invite_join_tasks.clear()
         self._reaction_redaction_tasks.clear()
-
-        # Close the SQLite crypto store database.
-        if hasattr(self, "_crypto_db") and self._crypto_db:
-            try:
-                await self._crypto_db.stop()
-            except Exception as exc:
-                logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
-
-        if self._client:
-            try:
-                await self._client.api.session.close()
-            except Exception:
-                pass
+        if self._crypto_db is crypto_db:
+            self._crypto_db = None
+        if self._client is client:
             self._client = None
+        if self._pending_session is pending_session:
+            self._pending_session = None
+        self._mark_disconnected()
 
-        logger.info("Matrix: disconnected")
+        async def _cleanup_generation() -> None:
+            try:
+                if sync_task and not sync_task.done():
+                    sync_task.cancel()
+                if sync_task:
+                    await asyncio.gather(sync_task, return_exceptions=True)
+
+                for task in invite_join_tasks:
+                    if not task.done():
+                        task.cancel()
+                if invite_join_tasks:
+                    await asyncio.gather(*invite_join_tasks, return_exceptions=True)
+
+                for task in redaction_tasks:
+                    if not task.done():
+                        task.cancel()
+                if redaction_tasks:
+                    await asyncio.gather(*redaction_tasks, return_exceptions=True)
+
+                if crypto_db:
+                    try:
+                        await crypto_db.stop()
+                    except Exception as exc:
+                        logger.debug(
+                            "Matrix: could not close crypto DB on disconnect: %s",
+                            exc,
+                        )
+
+                if client:
+                    try:
+                        await client.api.session.close()
+                    except Exception:
+                        pass
+                elif pending_session:
+                    try:
+                        close_result = pending_session.close()
+                        if inspect.isawaitable(close_result):
+                            await close_result
+                    except Exception:
+                        pass
+            finally:
+                logger.info("Matrix: disconnected")
+                if self._lifecycle_cleanup_task is asyncio.current_task():
+                    self._lifecycle_cleanup_task = None
+
+        cleanup_task = asyncio.create_task(_cleanup_generation())
+        self._lifecycle_cleanup_task = cleanup_task
+        await asyncio.shield(cleanup_task)
 
     async def send(
         self,
@@ -2263,6 +2390,9 @@ class MatrixAdapter(BasePlatformAdapter):
         token_present = bool(self._access_token)
         user_id = self._user_id or getattr(self._client, "mxid", "") or ""
         device_id = self._device_id or getattr(self._client, "device_id", "") or ""
+        consumer_running = bool(
+            self._sync_task is not None and not self._sync_task.done()
+        )
         return {
             "platform": "matrix",
             "homeserver": self._homeserver,
@@ -2275,7 +2405,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 "device_id_preview": _redact_matrix_value(device_id),
             },
             "sync": {
-                "connected": self._client is not None,
+                "connected": self.is_connected and consumer_running,
+                "consumer_running": consumer_running,
                 "joined_room_count": len(self._joined_rooms),
                 "last_sync_age_seconds": (
                     max(0.0, now - self._last_sync_ts) if self._last_sync_ts else None
@@ -3019,11 +3150,99 @@ class MatrixAdapter(BasePlatformAdapter):
     # Sync loop
     # ------------------------------------------------------------------
 
-    async def _sync_loop(self) -> None:
+    def _handle_sync_task_done(
+        self, task: asyncio.Task, generation: int | None = None
+    ) -> None:
+        """Surface unexpected Matrix consumer exits to the gateway supervisor."""
+        published = self._published_sync
+        # Publication, not ``_running``, owns supervisor notification. Fatal
+        # classifiers intentionally clear ``_running`` before the task exits.
+        if (
+            published is None
+            or published[1] is not task
+            or (generation is not None and published[0] != generation)
+            or published[0] != self._active_generation
+        ):
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError as cancelled:
+            exc = cancelled
+        except Exception as err:  # pragma: no cover - defensive
+            exc = err
+
+        if exc is None:
+            detail = "exited without an exception"
+        elif isinstance(exc, asyncio.CancelledError):
+            detail = "was cancelled unexpectedly"
+        else:
+            detail = "raised an exception"
+
+        logger.error(
+            "Matrix: sync consumer %s",
+            detail,
+            exc_info=exc if isinstance(exc, Exception) else False,
+        )
+        if not self.has_fatal_error:
+            # Persist a fixed message: exception strings can contain sync URLs
+            # and pagination tokens, which do not belong in runtime status.
+            self._set_fatal_error(
+                "matrix_sync_task_exited",
+                "Matrix sync consumer exited unexpectedly",
+                retryable=True,
+            )
+
+        async def _notify() -> None:
+            try:
+                # Serialize supervisor mutation with same-instance reconnect.
+                # The handler may call disconnect(), which takes only the
+                # lifecycle lock; connect takes these locks in this order.
+                async with self._fatal_notification_lock:
+                    if (
+                        self._published_sync != published
+                        or published[0] != self._active_generation
+                    ):
+                        return
+                    await self._notify_fatal_error()
+            except Exception as notify_exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Matrix: failed to notify gateway supervisor about sync exit: %s",
+                    notify_exc,
+                    exc_info=True,
+                )
+
+        carrier = asyncio.create_task(_notify())
+        self._sync_notification_tasks.add(carrier)
+        carrier.add_done_callback(self._sync_notification_tasks.discard)
+
+    async def _sync_loop(
+        self,
+        consumer_started: asyncio.Future | None = None,
+        consumer_published: asyncio.Event | None = None,
+    ) -> None:
         """Continuously sync with the homeserver."""
         client = self._client
         # Resume from the token stored during the initial sync.
-        next_batch = await client.sync_store.get_next_batch()
+        try:
+            next_batch = await client.sync_store.get_next_batch()
+        except asyncio.CancelledError:
+            if consumer_started is not None and not consumer_started.done():
+                consumer_started.set_result(False)
+            return
+        except Exception as exc:
+            if consumer_started is not None and not consumer_started.done():
+                consumer_started.set_result(False)
+            if self._closing:
+                return
+            logger.error("Matrix: sync consumer failed before startup: %s", exc)
+            return
+        if consumer_started is not None and not consumer_started.done():
+            consumer_started.set_result(True)
+        if consumer_published is not None:
+            await consumer_published.wait()
         while not self._closing:
             try:
                 # Wrap in asyncio.wait_for to guard against TCP-level hangs
