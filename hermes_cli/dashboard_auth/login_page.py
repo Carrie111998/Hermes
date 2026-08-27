@@ -4,15 +4,19 @@ No React, no JavaScript dependency. Listed providers come from the
 registry; clicking a provider sends a GET to
 ``/auth/login?provider=<name>``.
 
-Visual styling mirrors the Nous Research design system (the
-``@nous-research/ui`` package the React dashboard uses): the same
-``Collapse`` / ``Rules Compressed`` typeface, amber-on-dark colour
-tokens (``#170d02`` / ``#ffac02`` / ``#fff``), uppercase + wide-tracking
-brand chrome, and the inset-bevel button shadow. Fonts are served
-out of the SPA's ``/fonts/`` directory which the dashboard-auth gate
-already allowlists pre-auth (see ``_GATE_PUBLIC_PREFIXES`` in
-``middleware.py``), so the page renders without needing the React
-bundle loaded.
+Visual styling mirrors the Hermes Agent landing page design language
+(hermes-agent.nousresearch.com): the full-bleed electric-blue ground
+``--color-hermes`` (``#0000f2``), off-white ``--color-hermes-fg``
+(``#f5f5f5``) text, the lime ``--color-hermes-accent`` (``#edff45``)
+detail dot, and white ``--color-hermes-paper`` panels with blue text
+(``bg-hermes-paper text-hermes``), cards bordered ``border-hermes/15``
+and cornered ``rounded-[4px]``. The action button is blue-on-paper
+(``bg-hermes``), deepening to the site's ``#0029de`` on hover, with a
+lime focus ring. Fonts are the DS ``Collapse`` / ``Rules Compressed``
+faces served out of the SPA's ``/fonts/`` directory, which the
+dashboard-auth gate already allowlists pre-auth (see
+``_GATE_PUBLIC_PREFIXES`` in ``middleware.py``), so the page renders
+without needing the React bundle loaded.
 
 Test-stable class names: the existing test suite extracts the
 ``class="provider-btn"`` anchor href to walk the OAuth flow. That
@@ -22,8 +26,20 @@ class name MUST NOT change without updating
 from __future__ import annotations
 
 import html
+import random
 
 from hermes_cli.dashboard_auth import list_session_providers
+
+# Landing-page feature art. One piece is chosen at random per page load
+# as a decorative full-bleed backdrop (see ``body::before``): white
+# linework screen-blended at 30% over the blue ground. Hot-linked to
+# the public Nous CDN — the same host the landing page itself uses; the
+# page renders fine without them (plain blue ground).
+_FEATURE_ART_URLS = (
+    "https://web-assets.nousresearch.com/nousnet-web/img/desktop/feature-connect.00398e980c0dd2f8.webp",
+    "https://web-assets.nousresearch.com/nousnet-web/img/desktop/feature-memory.01a45f37b0af6978.webp",
+    "https://web-assets.nousresearch.com/nousnet-web/img/desktop/feature-automation.d44bac592cfe9298.webp",
+)
 
 # Inline minimal CSS. The dashboard's full skin lives in the React
 # bundle, which we deliberately do NOT load here — the login page must
@@ -70,13 +86,27 @@ _LOGIN_HTML_TEMPLATE = """\
     src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
   }}
 
+  /* Hermes palette — tokens mirror the landing page's design system:
+       --color-hermes        #0000f2  electric blue (ground + ink)
+       --color-hermes-fg     #f5f5f5  off-white (text on blue)
+       --color-hermes-accent #edff45  lime (detail dot, focus ring)
+       --color-hermes-paper  #ffffff  panels + card
+     plus the site's deeper blue #0029de for hover states. */
   :root {{
-    --background-base: #170d02;
-    --background: #170d02;
-    --midground: #ffac02;
-    --foreground: #ffffff;
-    --hairline: color-mix(in srgb, #ffac02 18%, transparent);
-    --hairline-strong: color-mix(in srgb, #ffac02 35%, transparent);
+    --bg: #0000f2;
+    --fg: #f5f5f5;
+    --accent: #edff45;
+    --paper: #ffffff;
+    --blue-deep: #0029de;
+    --ink: #0000f2;
+    --ink-mid: rgba(0, 0, 242, 0.72);
+    --ink-dim: rgba(0, 0, 242, 0.55);
+    --on-blue-strong: rgba(245, 245, 245, 0.95);
+    --on-blue-mid: rgba(245, 245, 245, 0.78);
+    --on-blue-dim: rgba(245, 245, 245, 0.6);
+    --hairline: rgba(0, 0, 242, 0.15);   /* card border, border-hermes/15 */
+    --field-line: rgba(0, 0, 242, 0.28);
+    --error: #cf222e;
   }}
 
   *, *::before, *::after {{ box-sizing: border-box; }}
@@ -85,8 +115,8 @@ _LOGIN_HTML_TEMPLATE = """\
     margin: 0;
     padding: 0;
     min-height: 100%;
-    background: var(--background-base);
-    color: var(--foreground);
+    background: var(--bg);
+    color: var(--fg);
     font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px;
     line-height: 1.5;
@@ -94,33 +124,54 @@ _LOGIN_HTML_TEMPLATE = """\
     -moz-osx-font-smoothing: grayscale;
   }}
 
-  /* Subtle dot-grid backdrop — DS idiom (see `.dither` in globals.css). */
+  /* Soft top glow — a whisper of the landing hero's lighting. */
   body {{
-    background-image:
-      radial-gradient(
-        ellipse at top,
-        color-mix(in srgb, var(--midground) 6%, transparent) 0%,
-        transparent 55%
-      ),
-      repeating-conic-gradient(
-        color-mix(in srgb, var(--midground) 4%, transparent) 0% 25%,
-        transparent 0% 50%
-      );
-    background-size: auto, 3px 3px;
+    background-image: radial-gradient(
+      ellipse at top,
+      color-mix(in srgb, var(--fg) 8%, transparent) 0%,
+      transparent 55%
+    );
     background-attachment: fixed;
   }}
 
-  /* Layout: vertically center on tall screens, top-anchor on short. */
+  /* One landing-page feature-art image (random pick, server-side),
+     screen-blended at 15% and cover-filled: the white linework glows
+     on the blue ground while the art's own blue background disappears
+     into the page. Pure decoration — pointer-events off, and dropped
+     entirely under forced colors. Images are hot-linked to the public
+     Nous web-assets CDN (same host the landing page itself uses);
+     if unreachable the blue ground simply shows through. */
+  body::before {{
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.15;
+    mix-blend-mode: screen;
+    background-image: url('{art_url}');
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: cover;
+  }}
+
+  /* Layout: vertically center on tall screens, top-anchor on short.
+     min-height 100dvh (with a vh fallback) makes the grid fill the
+     actual viewport — a percentage min-height would collapse to the
+     content height and defeat the centering. */
   body {{
     display: grid;
     place-items: center;
+    min-height: 100vh;
+    min-height: 100dvh;
     padding: clamp(1.5rem, 6vh, 6rem) 1.25rem;
   }}
 
   main {{
     width: 100%;
-    max-width: 26rem;
+    max-width: 27rem;
     position: relative;
+    z-index: 1;
     animation: slide-up 0.6s ease-out both;
   }}
 
@@ -133,152 +184,162 @@ _LOGIN_HTML_TEMPLATE = """\
     main {{ animation: none; }}
   }}
 
-  /* Brand wordmark above the card — same uppercase + wide-tracking
-     idiom DS Buttons use. */
+  /* Brand wordmark on the blue ground — off-white, wide-tracked caps
+     (--color-hermes-fg). */
   .brand {{
     text-align: center;
-    margin-bottom: 1.75rem;
+    margin-bottom: 2rem;
     font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600;
     font-size: 1.05rem;
     letter-spacing: 0.32em;
     text-transform: uppercase;
-    color: var(--midground);
-  }}
-  .brand .dot {{
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    background: var(--midground);
-    margin: 0 0.55em 0.18em;
-    vertical-align: middle;
-    border-radius: 1px;
+    color: var(--fg);
   }}
 
+  /* White paper panel — the landing's bg-hermes-paper surface:
+     white fill, border-hermes/15 border, 4px corners. */
   .card {{
     position: relative;
-    padding: 2.25rem 2rem 2rem;
-    background: color-mix(in srgb, #ffffff 2%, var(--background-base));
+    padding: 2.75rem 2.5rem 2.5rem;
+    background: var(--paper);
     border: 1px solid var(--hairline);
-    /* Hairline highlight + bevel shadow — matches DS Button SHADOW_DEFAULT
-       (`inset -1px -1px 0 #00000080, inset 1px 1px 0 #ffffff80`) at panel scale. */
+    border-radius: 4px;
     box-shadow:
-      inset 1px 1px 0 0 color-mix(in srgb, #ffffff 5%, transparent),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.4),
-      0 24px 60px -20px rgba(0, 0, 0, 0.6);
+      0 1px 0 0 rgba(255, 255, 255, 0.25) inset,
+      0 24px 60px -20px rgba(0, 0, 0, 0.45);
   }}
 
+  /* Heading on paper — text-hermes (blue ink), Rules Compressed. */
   h1 {{
-    margin: 0 0 0.4rem;
+    margin: 0 0 0.5rem;
     font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600;
-    font-size: 1.85rem;
+    font-size: 1.9rem;
     letter-spacing: 0.05em;
     text-transform: uppercase;
-    color: var(--foreground);
+    color: var(--ink);
   }}
 
   .subtitle {{
-    margin: 0 0 1.75rem;
-    color: color-mix(in srgb, var(--foreground) 65%, transparent);
+    margin: 0 0 2rem;
+    color: var(--ink-mid);
     font-size: 0.95rem;
+    line-height: 1.6;
   }}
 
   .provider-list {{
     display: grid;
-    gap: 0.75rem;
+    gap: 0.9rem;
   }}
 
-  /* Provider button — mirrors DS Button (default variant):
-     amber surface, dark text, uppercase + wide tracking, inset bevel. */
+  /* Provider button — the landing CTA rhythm (bg-hermes-on-paper):
+     blue fill, off-white label, 4px corners, soft blue under-glow.
+     Hover deepens to #0029de; focus ring is the lime accent. */
   .provider-btn {{
     display: block;
     width: 100%;
     box-sizing: border-box;
-    padding: 0.95rem 1rem;
+    padding: 1rem 1.25rem;
     text-align: center;
-    background: var(--midground);
-    color: var(--background-base);
+    background: var(--ink);
+    color: var(--fg);
     font-family: 'Collapse', sans-serif;
     font-weight: 700;
-    font-size: 0.78rem;
-    letter-spacing: 0.2em;
+    font-size: 0.8rem;
+    letter-spacing: 0.14em;
     text-transform: uppercase;
     text-decoration: none;
     border: 0;
-    border-radius: 0;  /* DS Button is squared — no rounded corners. */
+    border-radius: 4px;
     cursor: pointer;
     box-shadow:
-      inset 1px 1px 0 0 rgba(255, 255, 255, 0.5),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.5);
-    transition: filter 0.12s ease-out;
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.25),
+      0 8px 20px -8px rgba(0, 0, 242, 0.55);
+    transition: background-color 0.12s ease-out, box-shadow 0.12s ease-out;
   }}
   .provider-btn:hover {{
-    filter: brightness(1.08);
+    background: var(--blue-deep);
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.25),
+      0 10px 24px -8px rgba(0, 0, 242, 0.7);
   }}
   .provider-btn:active {{
-    /* DS Button uses `active:invert` on the default surface. */
-    filter: invert(1);
+    background: var(--blue-deep);
+    filter: brightness(0.92);
+  }}
+  .provider-btn:disabled {{
+    /* Armed by the inline password-form script while a sign-in POST
+       is in flight; keep the disabled state visible but quiet. */
+    opacity: 0.65;
+    cursor: wait;
+    filter: none;
   }}
   .provider-btn:focus-visible {{
-    outline: 2px solid var(--midground);
+    outline: 2px solid var(--accent);
     outline-offset: 3px;
   }}
 
-  /* Password provider form — same visual language as the OAuth buttons:
-     squared inputs, hairline borders, amber focus ring. */
+  /* Password provider form — blue ink on the paper panel:
+     squared-ish inputs with hairline blue borders and a soft focus ring. */
   .provider-form {{
     display: grid;
-    gap: 0.75rem;
+    gap: 1rem;
     text-align: left;
   }}
   .form-title {{
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600;
-    font-size: 0.72rem;
-    letter-spacing: 0.18em;
+    font-family: 'Collapse', sans-serif;
+    font-weight: 700;
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
     text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 70%, transparent);
+    color: var(--ink-mid);
   }}
   .field {{
     display: grid;
-    gap: 0.3rem;
+    gap: 0.35rem;
   }}
   .field-label {{
-    font-size: 0.72rem;
+    font-size: 0.73rem;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 55%, transparent);
+    color: var(--ink-dim);
   }}
   .field-input {{
     width: 100%;
     box-sizing: border-box;
-    padding: 0.7rem 0.8rem;
-    background: color-mix(in srgb, #000000 25%, var(--background-base));
-    color: var(--foreground);
-    border: 1px solid var(--hairline-strong);
-    border-radius: 0;
+    padding: 0.8rem 0.9rem;
+    background: var(--paper);
+    color: var(--ink);
+    border: 1px solid var(--field-line);
+    border-radius: 4px;
     font-family: 'Collapse', sans-serif;
     font-size: 0.95rem;
+    transition: border-color 0.12s ease-out, box-shadow 0.12s ease-out;
+  }}
+  .field-input::placeholder {{
+    color: var(--ink-dim);
+    opacity: 0.8;
   }}
   .field-input:focus-visible {{
     outline: none;
-    border-color: var(--midground);
-    box-shadow: 0 0 0 1px var(--midground);
+    border-color: var(--ink);
+    box-shadow: 0 0 0 3px rgba(0, 0, 242, 0.15);
   }}
   .form-error {{
-    color: #ff6b6b;
+    color: var(--error);
     font-size: 0.82rem;
     letter-spacing: 0.02em;
   }}
   .provider-form .provider-btn {{
-    margin-top: 0.25rem;
+    margin-top: 0.35rem;
   }}
 
+  /* Footer on the blue ground — dimmed off-white. */
   footer {{
-    margin-top: 1.75rem;
+    margin-top: 2.25rem;
     text-align: center;
-    color: color-mix(in srgb, var(--foreground) 45%, transparent);
+    color: var(--on-blue-dim);
     font-size: 0.75rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
@@ -288,21 +349,57 @@ _LOGIN_HTML_TEMPLATE = """\
     display: inline-block;
     width: 1.5rem;
     height: 1px;
-    background: var(--hairline-strong);
+    background: rgba(245, 245, 245, 0.4);
     vertical-align: middle;
     margin: 0 0.6em 0.2em;
   }}
 
-  /* Selection — DS uses midground bg + background text. */
+  /* Selection — blue ink on off-white, the palette's own swap. */
   ::selection {{
-    background: var(--midground);
-    color: var(--background-base);
+    background: var(--ink);
+    color: var(--fg);
+  }}
+
+  /* High-contrast / forced-colors mode (OS accessibility setting):
+     the browser swaps every color for the user's system palette, so
+     lean on system colors to keep the card, inputs, and the sign-in
+     button distinguishable instead of flat white-on-white. */
+  @media (forced-colors: active) {{
+    body::before {{
+      content: none;  /* decorative art is noise in forced-colors */
+    }}
+    .card, .field-input {{
+      border: 1px solid ButtonText;
+    }}
+    .brand, h1, .subtitle, .form-title, .field-label, footer {{
+      color: CanvasText;
+    }}
+    .field-input {{
+      background: Canvas;
+      color: CanvasText;
+    }}
+    .provider-btn {{
+      background: ButtonFace;
+      color: ButtonText;
+      border: 1px solid ButtonText;
+      box-shadow: none;
+    }}
+    .provider-btn:focus-visible {{
+      outline: 2px solid Highlight;
+      outline-offset: 3px;
+    }}
+    .provider-form .provider-btn {{
+      margin-top: 0.35rem;
+    }}
+    footer .sep {{
+      background: ButtonText;
+    }}
   }}
 </style>
 </head>
 <body>
 <main>
-  <div class="brand">Nous<span class="dot"></span>Research</div>
+  <div class="brand">Nous Research</div>
   <div class="card">
     <h1>Sign in</h1>
     <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
@@ -342,50 +439,56 @@ _EMPTY_HTML = """\
     src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
   }
   :root {
-    --background-base: #170d02;
-    --midground: #ffac02;
-    --foreground: #ffffff;
-    --hairline: color-mix(in srgb, #ffac02 18%, transparent);
+    --bg: #0000f2;
+    --fg: #f5f5f5;
+    --accent: #edff45;
+    --paper: #ffffff;
+    --ink: #0000f2;
+    --ink-mid: rgba(0, 0, 242, 0.72);
+    --ink-dim: rgba(0, 0, 242, 0.55);
+    --on-blue-mid: rgba(245, 245, 245, 0.78);
+    --hairline: rgba(0, 0, 242, 0.15);
   }
   *, *::before, *::after { box-sizing: border-box; }
   html, body {
     margin: 0; padding: 0; min-height: 100%;
-    background: var(--background-base);
-    color: var(--foreground);
+    background: var(--bg);
+    color: var(--fg);
     font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px; line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
   body {
     display: grid; place-items: center;
+    min-height: 100vh; min-height: 100dvh;
     padding: clamp(1.5rem, 6vh, 6rem) 1.25rem;
   }
   main {
     width: 100%; max-width: 32rem;
-    padding: 2.25rem 2rem;
-    background: color-mix(in srgb, #ffffff 2%, var(--background-base));
+    padding: 2.75rem 2.5rem;
+    background: var(--paper);
     border: 1px solid var(--hairline);
+    border-radius: 4px;
     box-shadow:
-      inset 1px 1px 0 0 color-mix(in srgb, #ffffff 5%, transparent),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.4),
-      0 24px 60px -20px rgba(0, 0, 0, 0.6);
+      0 1px 0 0 rgba(255, 255, 255, 0.25) inset,
+      0 24px 60px -20px rgba(0, 0, 0, 0.45);
   }
   h1 {
     margin: 0 0 1rem;
     font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600; font-size: 1.5rem;
     letter-spacing: 0.05em; text-transform: uppercase;
-    color: var(--midground);
+    color: var(--ink);
   }
-  p { margin: 0 0 1rem; }
+  p { margin: 0 0 1rem; color: var(--ink-mid); }
   code {
-    background: var(--midground);
-    color: var(--background-base);
+    background: var(--ink);
+    color: var(--fg);
     padding: 0.1em 0.35em;
     font-family: 'Courier New', monospace;
     font-size: 0.9em;
   }
-  a { color: var(--midground); }
+  a { color: var(--ink); }
 </style>
 </head>
 <body>
@@ -498,6 +601,7 @@ def render_login_html(*, next_path: str = "") -> str:
     return _LOGIN_HTML_TEMPLATE.format(
         provider_buttons="\n".join(buttons),
         password_script=script,
+        art_url=random.choice(_FEATURE_ART_URLS),
     )
 
 
