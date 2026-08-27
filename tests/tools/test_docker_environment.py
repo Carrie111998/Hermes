@@ -172,6 +172,7 @@ def _make_execute_only_env(forward_env=None):
     env._snapshot_ready = True
     env._last_sync_time = None
     env._init_env_args = []
+    env._init_env_values = {}
     return env
 
 
@@ -184,10 +185,12 @@ def test_init_env_args_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"DATABASE_URL": "value_from_dotenv"})
 
-    args = env._build_init_env_args()
-    args_str = " ".join(args)
+    args, values = env._build_init_env_args()
 
-    assert "DATABASE_URL=value_from_dotenv" in args_str
+    # Name-only argv (#96268): the value never appears in the command line.
+    assert "-e" in args and "DATABASE_URL" in args
+    assert "DATABASE_URL=value_from_dotenv" not in " ".join(args)
+    assert values["DATABASE_URL"] == "value_from_dotenv"
 
 
 def test_init_env_args_prefers_shell_env_over_hermes_dotenv(monkeypatch):
@@ -197,11 +200,10 @@ def test_init_env_args_prefers_shell_env_over_hermes_dotenv(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "value_from_shell")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"DATABASE_URL": "value_from_dotenv"})
 
-    args = env._build_init_env_args()
-    args_str = " ".join(args)
+    _args, values = env._build_init_env_args()
 
-    assert "DATABASE_URL=value_from_shell" in args_str
-    assert "value_from_dotenv" not in args_str
+    assert values["DATABASE_URL"] == "value_from_shell"
+    assert "value_from_dotenv" not in values.values()
 
 
 def test_init_env_args_uses_hermes_dotenv_for_empty_shell_env(monkeypatch):
@@ -216,12 +218,12 @@ def test_init_env_args_uses_hermes_dotenv_for_empty_shell_env(monkeypatch):
     monkeypatch.setenv("MY_SECRET", "")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"MY_SECRET": "value_from_dotenv"})
 
-    args = env._build_init_env_args()
+    args, values = env._build_init_env_args()
 
-    # Assert on the resolved value, not the printed -e flag: the disk value
-    # must win and a blank "MY_SECRET=" flag must never be emitted.
-    assert "MY_SECRET=value_from_dotenv" in args
-    assert "MY_SECRET=" not in args
+    # Assert on the resolved value, not a printed -e flag: the disk value
+    # must win and the argv never carries values at all (#96268).
+    assert values["MY_SECRET"] == "value_from_dotenv"
+    assert all(arg != "MY_SECRET=" for arg in args)
 
 
 def test_init_env_args_uses_active_profile_for_forwarded_env(monkeypatch):
@@ -234,13 +236,13 @@ def test_init_env_args_uses_active_profile_for_forwarded_env(monkeypatch):
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-routed-profile"})
     try:
-        args = env._build_init_env_args()
+        _args, values = env._build_init_env_args()
     finally:
         ss.reset_secret_scope(token)
         ss.set_multiplex_active(False)
 
-    assert "SERVICE_TOKEN=token-for-routed-profile" in args
-    assert "SERVICE_TOKEN=token-for-default" not in args
+    assert values["SERVICE_TOKEN"] == "token-for-routed-profile"
+    assert "token-for-default" not in values.values()
 
 
 def test_init_env_args_omits_missing_scoped_forwarded_env(monkeypatch):
@@ -253,12 +255,12 @@ def test_init_env_args_omits_missing_scoped_forwarded_env(monkeypatch):
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({})
     try:
-        args = env._build_init_env_args()
+        args, values = env._build_init_env_args()
     finally:
         ss.reset_secret_scope(token)
         ss.set_multiplex_active(False)
 
-    assert "SERVICE_TOKEN=token-for-default" not in args
+    assert "SERVICE_TOKEN" not in values
     assert "SERVICE_TOKEN" not in args
 
 
@@ -273,7 +275,7 @@ def test_runtime_exec_tracks_scope_and_clears_missing_value(monkeypatch):
     monkeypatch.setattr(
         docker_env,
         "_popen_bash",
-        lambda cmd, stdin_data=None: calls.append((cmd, stdin_data)) or object(),
+        lambda cmd, stdin_data=None, **kwargs: calls.append((cmd, kwargs)) or object(),
     )
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-profile-a"})
@@ -289,11 +291,16 @@ def test_runtime_exec_tracks_scope_and_clears_missing_value(monkeypatch):
         ss.reset_secret_scope(token)
         ss.set_multiplex_active(False)
 
-    first_cmd = calls[0][0]
-    assert "SERVICE_TOKEN=token-for-profile-a" in first_cmd
-    second_cmd = calls[1][0]
-    assert "SERVICE_TOKEN=token-for-profile-a" not in second_cmd
+    first_cmd, first_kwargs = calls[0]
+    # The value reaches the docker client through the subprocess environment,
+    # never through argv (#96268).
+    assert "-e" in first_cmd and "SERVICE_TOKEN" in first_cmd
+    assert "SERVICE_TOKEN=token-for-profile-a" not in first_cmd
+    assert first_kwargs["env"]["SERVICE_TOKEN"] == "token-for-profile-a"
+    second_cmd, second_kwargs = calls[1]
+    assert "SERVICE_TOKEN" not in second_cmd
     assert "unset SERVICE_TOKEN" in second_cmd[-1]
+    assert "SERVICE_TOKEN" not in (second_kwargs.get("env") or {})
 
 
 def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, tmp_path):
@@ -312,15 +319,18 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
     monkeypatch.setenv("EXPLICIT_TOKEN", "token-for-default")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
 
-    def _run_fake_docker_exec(cmd, stdin_data=None):
+    def _run_fake_docker_exec(cmd, stdin_data=None, **kwargs):
         """Execute the generated docker exec command in a real local bash."""
         container_index = cmd.index(env._container_id)
         child_env = os.environ.copy()
+        child_env.update(kwargs.get("env") or {})
         index = 2
         while index < container_index:
             assert cmd[index] == "-e"
-            key, value = cmd[index + 1].split("=", 1)
-            child_env[key] = value
+            # Name-only flags (#96268): the value arrives via the client
+            # subprocess env, never through argv.
+            assert "=" not in cmd[index + 1]
+            assert cmd[index + 1] in child_env
             index += 2
         assert cmd[container_index + 1 : container_index + 3] == ["bash", "-c"]
         return subprocess.Popen(
@@ -414,11 +424,10 @@ def test_forward_env_overrides_docker_env_in_init_args(monkeypatch):
     monkeypatch.setenv("MY_KEY", "dynamic_value")
     monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
 
-    args = env._build_init_env_args()
-    args_str = " ".join(args)
+    _args, values = env._build_init_env_args()
 
-    assert "MY_KEY=dynamic_value" in args_str
-    assert "MY_KEY=static_value" not in args_str
+    assert values["MY_KEY"] == "dynamic_value"
+    assert "static_value" not in values.values()
 
 
 def test_normalize_env_dict_filters_invalid_keys():
