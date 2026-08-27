@@ -445,6 +445,36 @@ def _discord_tools_loaded() -> bool:
         return False
 
 
+def _discord_message_id_actions() -> tuple[str, ...]:
+    """Return the loaded Discord actions that can consume a message id."""
+    try:
+        from agent.secret_scope import get_secret
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+        from tools.discord_tool import get_available_message_id_actions
+
+        if not (get_secret("DISCORD_BOT_TOKEN", "") or "").strip():
+            return ()
+        cfg = load_config()
+        enabled = set(
+            _get_platform_tools(cfg, "discord", include_default_mcp_servers=False)
+        )
+        return get_available_message_id_actions(enabled)
+    except Exception:
+        return ()
+
+
+def _format_discord_message_id_note(message_id: str) -> Optional[str]:
+    """Build the per-turn note without promising unavailable actions."""
+    actions = _discord_message_id_actions()
+    if not actions:
+        return None
+    return (
+        f"[Triggering message id: `{message_id}` — available as `message_id` for "
+        f"these loaded Discord actions: {', '.join(actions)}.]"
+    )
+
+
 _MAX_PROMPT_METADATA_CHARS = 240
 
 
@@ -643,7 +673,8 @@ def build_session_context_prompt(
                 id_lines.append(f"  - Thread: `{src.thread_id}` (use as `channel_id` for fetch_messages etc.)")
             else:
                 id_lines.append(f"  - Channel: `{src.chat_id}`")
-            if src.message_id:
+            message_id_actions = _discord_message_id_actions()
+            if src.message_id and message_id_actions:
                 # The triggering message id is volatile (changes every turn).
                 # Keep it OUT of this cached system-prompt block — including it
                 # here changes build_session_context_prompt() output per turn,
@@ -653,7 +684,8 @@ def build_session_context_prompt(
                 # "Triggering message id" note in run.py).
                 id_lines.append(
                     "  - Triggering message: provided per-turn in the incoming "
-                    "user message (use it as `message_id` for reply/react/pin)"
+                    "user message for these loaded actions: "
+                    f"{', '.join(message_id_actions)}"
                 )
             lines.extend(id_lines)
         else:

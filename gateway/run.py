@@ -18908,13 +18908,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and getattr(source, "platform", None) == Platform.DISCORD
             and getattr(event, "message_id", None)
         ):
-            from gateway.session import _discord_tools_loaded as _disc_tools_loaded
-            if _disc_tools_loaded():
-                message_text = (
-                    f"[Triggering message id: `{event.message_id}` — use as "
-                    f"`message_id` for reply/react/pin via the discord tools.]\n\n"
-                    f"{message_text}"
-                )
+            from gateway.session import _format_discord_message_id_note
+            message_id_note = _format_discord_message_id_note(str(event.message_id))
+            if message_id_note:
+                message_text = f"{message_id_note}\n\n{message_text}"
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
