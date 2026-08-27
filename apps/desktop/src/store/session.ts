@@ -701,6 +701,7 @@ export const $selectedStoredSessionId = atom<string | null>(null)
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
   previousStoredSessionId: string
+  profile: string
   runtimeSessionId: string
 }
 

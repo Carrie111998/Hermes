@@ -350,6 +350,7 @@ export function useSessionActions({
 
     if (
       activeSessionIdRef.current !== storedIdRotation.runtimeSessionId ||
+      normalizeProfileKey(selectedProfileRef.current) !== storedIdRotation.profile ||
       selectedStoredSessionId !== storedIdRotation.previousStoredSessionId ||
       (routedStoredSessionId !== null && routedStoredSessionId !== storedIdRotation.previousStoredSessionId)
     ) {

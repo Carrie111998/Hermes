@@ -62,6 +62,7 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     expect($activeSessionStoredIdRotation.get()).toEqual({
       nextStoredSessionId: 'stored-A-next',
       previousStoredSessionId: 'stored-A',
+      profile: 'default',
       runtimeSessionId: 'runtime-A'
     })
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)

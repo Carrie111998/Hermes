@@ -2,6 +2,7 @@ import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
+import { normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -81,7 +82,7 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
  * keeping the durable selection untouched. A live turn on the old runtime
  * (overlap window during a manual switch) refuses the adoption.
  */
-function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
+function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, eventProfile: string): boolean {
   const { deps, explicitSid, isActiveEvent, payload } = ctx
 
   if (!explicitSid || isActiveEvent || typeof payload?.stored_session_id !== 'string') {
@@ -96,6 +97,10 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
 
   const activeId = $activeSessionId.get()
   const oldState = activeId ? deps.sessionStateByRuntimeIdRef.current.get(activeId) : undefined
+
+  if (normalizeProfileKey(oldState?.profile ?? deps.activeGatewayProfile) !== eventProfile) {
+    return false
+  }
 
   // Only a dead old runtime may be adopted over: hijacking a streaming turn
   // would split one conversation's events across two panes.
@@ -125,12 +130,23 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
   } = deps
 
   if (event.type === 'session.info') {
+    const eventProfile = normalizeProfileKey(event.profile)
+    const installedState = sessionId ? sessionStateByRuntimeIdRef.current.get(sessionId) : undefined
+
+    // Runtime ids are only unique inside one profile gateway. If another
+    // profile happens to mint the foreground runtime id, its session.info must
+    // not rewrite that state's owner, rotate its stored id, or trigger any
+    // foreground-only side effect/navigation.
+    if (installedState?.profile && normalizeProfileKey(installedState.profile) !== eventProfile) {
+      return true
+    }
+
     // A rebuilt runtime (mid-conversation model/provider switch) speaks under
     // a NEW session_id. Before scoping anything by isActiveEvent, check
     // whether this event is the rebuilt runtime announcing itself for the
     // conversation already on screen — if so, re-bind the pane so every
     // subsequent isActiveEvent gate keeps matching (#93942 scenario B).
-    const rebound = maybeRebindPaneToRebuiltRuntime(ctx)
+    const rebound = maybeRebindPaneToRebuiltRuntime(ctx, eventProfile)
 
     // Apply session-scoped fields when the event targets the active
     // session, OR when it's a global broadcast and we have no session.
@@ -234,7 +250,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           branch: statePatch.branch ?? state.branch,
           cwd: statePatch.cwd ?? state.cwd
         }),
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        eventProfile
       )
     }
 
@@ -353,7 +370,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             turnLive: false
           }
         },
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        eventProfile
       )
 
       if (recoveredWithoutPayload) {

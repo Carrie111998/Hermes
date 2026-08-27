@@ -7,6 +7,7 @@ import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,
   $messages,
@@ -137,15 +138,24 @@ export function useSessionStateCache({
   }, [busy, busyRef])
 
   const ensureSessionState = useCallback(
-    (sessionId: string, storedSessionId?: string | null) => {
+    (sessionId: string, storedSessionId?: string | null, ownerProfile?: string) => {
       const existing = sessionStateCache.get(sessionId)
+      const normalizedOwnerProfile = ownerProfile === undefined ? undefined : normalizeProfileKey(ownerProfile)
 
       if (existing) {
-        if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
+        const nextProfile = normalizedOwnerProfile ?? existing.profile
+        const storedIdChanged = storedSessionId !== undefined && storedSessionId !== existing.storedSessionId
+        const ownerClaimed = nextProfile !== existing.profile
+
+        if (storedIdChanged || ownerClaimed) {
           // Stored id changed (e.g. auto-compression rotated it). Create a NEW
           // state object rather than mutating in place — updateSessionState needs
           // the PREVIOUS state to detect transitions (busy→idle, id rotation).
-          const updated = { ...existing, storedSessionId }
+          const updated = {
+            ...existing,
+            profile: nextProfile,
+            ...(storedIdChanged ? { storedSessionId: storedSessionId ?? null } : {})
+          }
 
           // Drop the obsolete stored→runtime reverse mapping as soon as the id
           // rotates (e.g. auto-compression forks a continuation). Leaving the
@@ -156,7 +166,7 @@ export function useSessionStateCache({
           // now skips publishSessionState (and thus handleTransition) when the
           // updater is a no-op — fire it here so the route-follow effect still
           // tracks compression without needing a dummy state write.
-          if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
+          if (storedIdChanged && existing.storedSessionId) {
             runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
 
             // A rotation event needs a real next id — a null/cleared stored id
@@ -165,6 +175,7 @@ export function useSessionStateCache({
               setActiveSessionStoredIdRotation({
                 nextStoredSessionId: storedSessionId,
                 previousStoredSessionId: existing.storedSessionId,
+                profile: normalizeProfileKey(updated.profile),
                 runtimeSessionId: sessionId
               })
             }
@@ -180,7 +191,10 @@ export function useSessionStateCache({
         return sessionStateCache.get(sessionId)!
       }
 
-      const created = createClientSessionState(storedSessionId ?? null)
+      const created = {
+        ...createClientSessionState(storedSessionId ?? null),
+        profile: normalizedOwnerProfile ?? null
+      }
 
       if (storedSessionId) {
         runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
@@ -352,9 +366,27 @@ export function useSessionStateCache({
     (
       sessionId: string,
       updater: (state: ClientSessionState) => ClientSessionState,
-      storedSessionId?: string | null
+      storedSessionId?: string | null,
+      ownerProfile?: string
     ) => {
-      const previous = ensureSessionState(sessionId, storedSessionId)
+      const normalizedOwnerProfile = ownerProfile === undefined ? undefined : normalizeProfileKey(ownerProfile)
+      const installed = sessionStateCache.get(sessionId)
+
+      // Gateway runtime ids are transport-local and can collide across profile
+      // sockets. A session.info publisher may claim an unowned state, but it may
+      // never rotate or mutate a runtime already installed for another profile.
+      // Check before ensureSessionState: ensure can rotate the stored id and emit
+      // the route-follow edge even when the updater itself is a no-op.
+      if (
+        normalizedOwnerProfile !== undefined &&
+        installed?.profile !== null &&
+        installed?.profile !== undefined &&
+        normalizeProfileKey(installed.profile) !== normalizedOwnerProfile
+      ) {
+        return installed
+      }
+
+      const previous = ensureSessionState(sessionId, storedSessionId, normalizedOwnerProfile)
       // Give the updater the raw previous state so it can return the same
       // reference when nothing changed (the caller sees a no-op). Previously
       // the param was always a fresh spread, so every call looked like a
@@ -366,7 +398,7 @@ export function useSessionStateCache({
 
       return next === previous ? previous : next
     },
-    [commitSessionState, ensureSessionState]
+    [commitSessionState, ensureSessionState, sessionStateCache]
   )
 
   const sessionStateHasOwner = useCallback(

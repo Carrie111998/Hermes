@@ -36,8 +36,8 @@ function mountStream() {
   sessionStates = stream.states
 }
 
-const sessionInfo = (sessionId: string, payload: Record<string, unknown>) =>
-  act(() => stream.handleEvent({ payload, session_id: sessionId, type: 'session.info' }))
+const sessionInfo = (sessionId: string, payload: Record<string, unknown>, profile?: string) =>
+  act(() => stream.handleEvent({ payload, profile, session_id: sessionId, type: 'session.info' }))
 
 beforeEach(() => {
   sessionStates = null
@@ -254,10 +254,10 @@ describe('session.info settles a turn that produced no assistant payload', () =>
     startTurn(ACTIVE_SID)
     vi.useFakeTimers()
 
-    sessionInfo(ACTIVE_SID, { running: false })
+    sessionInfo(ACTIVE_SID, { running: false }, 'meta')
     // Later heartbeats hit the unchanged-state guard, so recovery is edge-only.
-    sessionInfo(ACTIVE_SID, { running: false })
-    sessionInfo(ACTIVE_SID, { running: false })
+    sessionInfo(ACTIVE_SID, { running: false }, 'meta')
+    sessionInfo(ACTIVE_SID, { running: false }, 'meta')
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(400)

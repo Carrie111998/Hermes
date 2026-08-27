@@ -303,6 +303,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -340,6 +341,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: nextId,
         previousStoredSessionId: sharedId,
+        profile: 'meta',
         runtimeSessionId: 'runtime-meta'
       })
     })
@@ -347,6 +349,38 @@ describe('active stored-session id rotation routing', () => {
     await waitFor(() => expect(selectedStoredSessionIdRef.current).toBe(nextId))
     expect(selectedStoredSessionProfileRef.current).toBe('meta')
     expect(navigate).toHaveBeenCalledWith(sessionRoute(nextId, 'meta'), { replace: true })
+  })
+
+  it('rejects a stored-id rotation whose profile no longer owns the selected route', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-shared' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-shared' }
+    const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'default' }
+    const navigate = vi.fn()
+
+    setSelectedStoredSessionId('stored-shared')
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => 'stored-shared'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        selectedStoredSessionProfileRef={selectedStoredSessionProfileRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        nextStoredSessionId: 'meta-next',
+        previousStoredSessionId: 'stored-shared',
+        profile: 'meta',
+        runtimeSessionId: 'runtime-shared'
+      })
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect(selectedStoredSessionIdRef.current).toBe('stored-shared')
+    expect($selectedStoredSessionId.get()).toBe('stored-shared')
+    expect(navigate).not.toHaveBeenCalled()
   })
 
   it('keeps draft on the previous tip when the new tip row is not loaded yet', async () => {
@@ -375,6 +409,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
+        profile: 'default',
         runtimeSessionId
       })
     })
@@ -417,6 +452,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
+        profile: 'default',
         runtimeSessionId
       })
     })
@@ -451,6 +487,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -480,6 +517,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -509,6 +547,7 @@ describe('active stored-session id rotation routing', () => {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })

@@ -350,6 +350,7 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: next.storedSessionId,
         previousStoredSessionId: previous.storedSessionId,
+        profile: normalizeProfileKey(next.profile),
         runtimeSessionId: runtimeId
       })
     }
