@@ -7883,9 +7883,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
             if needs_core_dependency_repair or runtime_repaired is not None:
-                # Self-lock deferral (#86735): the repair rewrites the venv
-                # too — same mapped-extension hazard as the update sync.
-                _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
+                if needs_core_dependency_repair:
+                    # Self-lock deferral (#86735): the core sync rewrites the
+                    # venv and has the same mapped-extension hazard as an
+                    # update sync. Runtime repair has already completed here;
+                    # handing off now would discard the pre-repair snapshots.
+                    _m()._abort_dependency_sync_if_self_locked(
+                        _windows_gateway_resume
+                    )
                 _write_update_incomplete_marker()
                 # A managed install whose venv is gone entirely (interrupted
                 # repair after the old venv was moved aside) needs the venv

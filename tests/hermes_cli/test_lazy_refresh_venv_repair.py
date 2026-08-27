@@ -314,6 +314,13 @@ def test_cmd_update_restores_snapshots_after_healthy_runtime_repair(
     monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(
         m,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *args, **kwargs: pytest.fail(
+            "runtime-only restoration must not hand off after venv cutover"
+        ),
+    )
+    monkeypatch.setattr(
+        m,
         "_install_python_dependencies_with_optional_fallback",
         lambda *args, **kwargs: pytest.fail(
             "a healthy replacement must not reinstall core dependencies"

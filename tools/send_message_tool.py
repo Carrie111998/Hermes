@@ -10,6 +10,9 @@ import json
 import logging
 import os
 import re
+import shlex
+import subprocess
+import sys
 import time
 
 
@@ -1658,10 +1661,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             result["warnings"] = warnings
         return result
     except ImportError:
+        install_argv = [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "python-telegram-bot",
+        ]
+        install_command = (
+            subprocess.list2cmdline(install_argv)
+            if os.name == "nt"
+            else shlex.join(install_argv)
+        )
         return {
             "error": (
                 "python-telegram-bot not installed. "
-                "Run: uv pip install python-telegram-bot"
+                f"Run: {install_command}"
             )
         }
     except Exception as e:

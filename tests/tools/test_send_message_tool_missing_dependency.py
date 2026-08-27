@@ -1,5 +1,9 @@
 import asyncio
 import builtins
+import os
+import shlex
+import subprocess
+import sys
 
 from tools.send_message_tool import _send_telegram
 
@@ -16,9 +20,22 @@ def test_telegram_missing_dependency_recommends_uv(monkeypatch):
 
     result = asyncio.run(_send_telegram("token", "123", "hello"))
 
+    install_argv = [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        sys.executable,
+        "python-telegram-bot",
+    ]
+    install_command = (
+        subprocess.list2cmdline(install_argv)
+        if os.name == "nt"
+        else shlex.join(install_argv)
+    )
     assert result == {
         "error": (
             "python-telegram-bot not installed. "
-            "Run: uv pip install python-telegram-bot"
+            f"Run: {install_command}"
         )
     }
