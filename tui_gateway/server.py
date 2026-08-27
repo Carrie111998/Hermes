@@ -5252,6 +5252,33 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     return surfaces
 
 
+def _configured_disabled_toolsets(config: dict | None = None) -> list[str]:
+    """Return the profile-wide hard-suppression list in canonical form."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    agent_cfg = config.get("agent") or {}
+    disabled = agent_cfg.get("disabled_toolsets") or []
+    if not disabled:
+        return []
+
+    from agent.skill_utils import parse_config_string_list
+
+    return sorted({
+        name.strip() for name in parse_config_string_list(disabled) if name.strip()
+    })
+
+
+def _without_disabled_toolsets(toolsets: set[str], config: dict | None = None) -> set[str]:
+    """Apply the profile-wide deny list after client-surface injection."""
+    return toolsets - set(_configured_disabled_toolsets(config))
+
+
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     session_platform = platform or _resolve_session_platform()
     explicit = [
@@ -5278,7 +5305,11 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 # coding posture returns before the fallback path that normally
                 # adds them — without this the desktop loses its pane/project
                 # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+                return sorted(
+                    _without_disabled_toolsets(
+                        {*selection, *_gui_surface_toolsets(session_platform)}
+                    )
+                )
         except Exception:
             pass
 
@@ -5395,7 +5426,11 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
+        return sorted(
+            _without_disabled_toolsets(
+                enabled | _gui_surface_toolsets(session_platform), cfg
+            )
+        )
     except Exception:
         if fallback_notice is not None:
             print(
@@ -7826,6 +7861,11 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        # Apply profile denies again during final schema assembly.  Exact-name
+        # subtraction above protects injected surface bundles; this second
+        # boundary strips denied capabilities nested inside aggregate postures
+        # such as ``coding`` (which directly includes browser automation).
+        disabled_toolsets=_configured_disabled_toolsets(cfg),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.

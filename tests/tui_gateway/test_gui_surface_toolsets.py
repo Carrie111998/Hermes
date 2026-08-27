@@ -112,6 +112,78 @@ class TestResolverPlumbing:
         assert "desktop_ui" in desktop
         assert "desktop_ui" not in tui
 
+    def test_global_disabled_toolsets_suppress_client_surface_injection(
+        self, no_desktop_env
+    ):
+        """A profile deny must win even when Desktop normally adds GUI tools."""
+        import agent.coding_context as cc
+        import hermes_cli.config as config_mod
+
+        config = {
+            "agent": {"disabled_toolsets": ["desktop_ui", "project"]},
+            "platform_toolsets": {"cli": ["web"]},
+        }
+        no_desktop_env.setattr(config_mod, "load_config", lambda: config)
+
+        no_desktop_env.setattr(cc, "coding_selection", lambda **_: ["coding"])
+        assert server._load_enabled_toolsets("desktop") == ["coding"]
+
+        no_desktop_env.setattr(cc, "coding_selection", lambda **_: None)
+        resolved = server._load_enabled_toolsets("desktop")
+        assert resolved is not None
+        assert "web" in resolved
+        assert {"desktop_ui", "project"}.isdisjoint(resolved)
+
+    def test_make_agent_passes_global_denies_to_final_tool_assembly(
+        self, no_desktop_env
+    ):
+        """Aggregate postures cannot bypass profile-wide capability denies."""
+        from types import SimpleNamespace
+
+        import run_agent
+
+        config = {"agent": {"disabled_toolsets": ["browser"]}}
+        captured = {}
+
+        no_desktop_env.setattr(server, "_load_cfg", lambda: config)
+        no_desktop_env.setattr(
+            server,
+            "_resolve_startup_runtime",
+            lambda: ("test-model", "test-provider"),
+        )
+        no_desktop_env.setattr(
+            server,
+            "_resolve_runtime_with_fallback",
+            lambda *_a, **_k: SimpleNamespace(
+                runtime={"provider": "test-provider"},
+                used_fallback=False,
+                selected_model=None,
+            ),
+        )
+        no_desktop_env.setattr(server, "_load_provider_routing", lambda: {})
+        no_desktop_env.setattr(server, "_load_reasoning_config", lambda _model: {})
+        no_desktop_env.setattr(server, "_load_service_tier", lambda: None)
+        no_desktop_env.setattr(
+            run_agent,
+            "AIAgent",
+            lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+        )
+
+        server._make_agent("sid", "key", session_db=object(), platform_override="desktop")
+
+        assert captured["disabled_toolsets"] == ["browser"]
+
+        from model_tools import get_tool_definitions
+
+        definitions = get_tool_definitions(
+            enabled_toolsets=captured["enabled_toolsets"],
+            disabled_toolsets=captured["disabled_toolsets"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        tool_names = {item["function"]["name"] for item in definitions}
+        assert "browser_navigate" not in tool_names
+
     def test_explicit_env_pin_still_wins(self, no_desktop_env):
         """HERMES_TUI_TOOLSETS is an operator override; surface can't re-add."""
         no_desktop_env.setenv("HERMES_TUI_TOOLSETS", "web,memory")

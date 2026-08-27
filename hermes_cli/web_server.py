@@ -294,16 +294,24 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
         try:
-            from hermes_cli.profiles import profiles_to_serve
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                profiles_to_serve,
+            )
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
-                start_kwargs["profile_homes"] = profile_homes
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
-                )
+            # Per-profile Desktop backends are pooled separately.  Only the
+            # long-lived primary/default backend may multiplex every profile;
+            # otherwise secondary backends race each other and a Gandalf
+            # process can physically claim a Bilbo execution.
+            if get_active_profile_name() == "default":
+                profile_homes = list(profiles_to_serve(multiplex=True))
+                if len(profile_homes) > 1:
+                    start_kwargs["profile_homes"] = profile_homes
+                    _log.info(
+                        "Desktop cron scheduler will tick %d profile(s): %s",
+                        len(profile_homes),
+                        [name for name, _home in profile_homes],
+                    )
         except Exception:
             # Fail open to the single-store ticker — the active profile's
             # jobs must keep firing even if profile enumeration breaks.
