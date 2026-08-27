@@ -1129,6 +1129,28 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
+    # Claude Code owns these credentials globally (Keychain / ~/.claude),
+    # whereas Hermes profiles have their own auth stores.  ``auth remove``
+    # records a per-profile suppression rather than deleting Claude Code's
+    # credentials, so every runtime consumer must honour it *before* touching
+    # either external store.  This is deliberately at the shared reader:
+    # auxiliary refreshes call this reader directly and would otherwise bypass
+    # resolve_anthropic_token's credential-pool fallback.
+    try:
+        from hermes_cli.auth import is_source_suppressed
+
+        if is_source_suppressed("anthropic", "claude_code"):
+            logger.debug(
+                "Claude Code credentials are suppressed for this Hermes profile; "
+                "skipping global credential stores"
+            )
+            return None
+    except Exception:
+        # Credential discovery has always been best-effort.  A broken auth
+        # store must not turn into an authentication outage for installations
+        # that never opted into suppression.
+        pass
+
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
