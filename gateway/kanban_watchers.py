@@ -1874,6 +1874,9 @@ class GatewayKanbanWatchersMixin:
                     ),
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
+                    # Tasks without an explicit cap must still be bounded;
+                    # explicit per-card limits remain authoritative.
+                    default_max_runtime_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     max_in_progress_by_profile=max_in_progress_by_profile,

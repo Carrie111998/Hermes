@@ -8869,9 +8869,13 @@ def heartbeat_worker(
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
+    default_max_runtime_seconds: Optional[int] = None,
     signal_fn=None,
 ) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+    """Terminate workers whose runtime limit has elapsed.
+
+    ``default_max_runtime_seconds`` bounds tasks that do not carry an
+    explicit per-task override. An explicit task value always wins.
 
     Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
     ``timed_out`` event and restores the task's source phase so the next
@@ -8894,7 +8898,7 @@ def enforce_max_runtime(
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -8906,7 +8910,13 @@ def enforce_max_runtime(
         # intentionally records the first time a task ever started, so retries
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
-        if elapsed < int(row["max_runtime_seconds"]):
+        limit = row["max_runtime_seconds"]
+        if limit is None:
+            try:
+                limit = int(default_max_runtime_seconds)
+            except (TypeError, ValueError):
+                limit = None
+        if limit is None or limit <= 0 or elapsed < limit:
             continue
 
         pid = int(row["worker_pid"])
@@ -8949,14 +8959,14 @@ def enforce_max_runtime(
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
+                    "limit_seconds": int(limit),
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    error=f"elapsed {int(elapsed)}s > limit {int(limit)}s",
                     metadata=payload,
                 )
                 _append_event(
@@ -8971,7 +8981,7 @@ def enforce_max_runtime(
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                error=f"elapsed {int(elapsed)}s > limit {int(limit)}s",
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
@@ -10551,6 +10561,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    default_max_runtime_seconds: Optional[int] = None,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -10588,6 +10599,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -10610,6 +10622,7 @@ def dispatch_once(
                 max_in_progress=max_in_progress,
                 failure_limit=failure_limit,
                 stale_timeout_seconds=stale_timeout_seconds,
+                default_max_runtime_seconds=default_max_runtime_seconds,
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
@@ -10639,6 +10652,7 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    default_max_runtime_seconds: Optional[int] = None,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -10732,7 +10746,9 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(
+        conn, default_max_runtime_seconds=default_max_runtime_seconds,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
