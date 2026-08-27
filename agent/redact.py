@@ -924,9 +924,23 @@ def redact_sensitive_text(
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
+        auth_pattern_source_spans = []
+        if code_file:
+            search_from = 0
+            while True:
+                start = text.find(_AUTH_HEADER_RE.pattern, search_from)
+                if start < 0:
+                    break
+                end = start + len(_AUTH_HEADER_RE.pattern)
+                auth_pattern_source_spans.append((start, end))
+                search_from = end
+
         def _redact_auth_header(m):
             credential = m.group(3)
-            if code_file and m.group(0) in _AUTH_HEADER_RE.pattern:
+            if any(
+                start <= m.start() and m.end() <= end
+                for start, end in auth_pattern_source_spans
+            ):
                 return m.group(0)
             if _ENV_PLACEHOLDER_RE.fullmatch(credential):
                 return m.group(0)

@@ -272,6 +272,19 @@ class TestAuthHeaders:
         text = f'r"{_AUTH_HEADER_RE.pattern}"'
         assert redact_sensitive_text(text, force=True, code_file=True) == text
 
+    def test_auth_header_pattern_exemption_is_position_scoped(self):
+        matched_source = next(
+            _AUTH_HEADER_RE.finditer(_AUTH_HEADER_RE.pattern)
+        ).group(0)
+        text = f"{_AUTH_HEADER_RE.pattern}\ncredential={matched_source}"
+
+        result = redact_sensitive_text(text, force=True, file_read=True)
+
+        source, credential = result.split("\n", 1)
+        assert source == _AUTH_HEADER_RE.pattern
+        assert credential != f"credential={matched_source}"
+        assert matched_source not in credential
+
     @pytest.mark.parametrize(
         "text",
         [
