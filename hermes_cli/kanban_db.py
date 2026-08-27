@@ -1163,6 +1163,16 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Governance anomaly detection counters
+    governance_review_count: int = 0
+    # Number of times changes_requested (review loop fail count)
+    governance_fail_count: int = 0
+    # Number of crashes or timeouts
+    governance_crash_count: int = 0
+    # Counter for repeated identical block reasons
+    governance_same_block_reason_count: int = 0
+    # Text of the last block reason (for comparison)
+    governance_last_block_reason: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1256,6 +1266,29 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            governance_review_count=(
+                int(row["governance_review_count"])
+                if "governance_review_count" in keys and row["governance_review_count"] is not None
+                else 0
+            ),
+            governance_fail_count=(
+                int(row["governance_fail_count"])
+                if "governance_fail_count" in keys and row["governance_fail_count"] is not None
+                else 0
+            ),
+            governance_crash_count=(
+                int(row["governance_crash_count"])
+                if "governance_crash_count" in keys and row["governance_crash_count"] is not None
+                else 0
+            ),
+            governance_same_block_reason_count=(
+                int(row["governance_same_block_reason_count"])
+                if "governance_same_block_reason_count" in keys and row["governance_same_block_reason_count"] is not None
+                else 0
+            ),
+            governance_last_block_reason=(
+                row["governance_last_block_reason"] if "governance_last_block_reason" in keys else None
             ),
         )
 
@@ -2740,6 +2773,33 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # Not currently used but reserved for future expansion.
         _add_column_if_missing(
             conn, "tasks", "governance_metadata", "governance_metadata TEXT"
+        )
+
+    # Governance anomaly detection counters
+    if "governance_review_count" not in cols:
+        # Number of times this task has entered review status (review_requested events).
+        _add_column_if_missing(
+            conn, "tasks", "governance_review_count", "governance_review_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "governance_fail_count" not in cols:
+        # Number of times this task has been requested for changes (changes_requested events).
+        _add_column_if_missing(
+            conn, "tasks", "governance_fail_count", "governance_fail_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "governance_crash_count" not in cols:
+        # Number of times this task has crashed or timed out.
+        _add_column_if_missing(
+            conn, "tasks", "governance_crash_count", "governance_crash_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "governance_same_block_reason_count" not in cols:
+        # Counter for repeated identical block reasons (for detecting stuck loops).
+        _add_column_if_missing(
+            conn, "tasks", "governance_same_block_reason_count", "governance_same_block_reason_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "governance_last_block_reason" not in cols:
+        # Text of the last block reason (for comparing if the same reason repeats).
+        _add_column_if_missing(
+            conn, "tasks", "governance_last_block_reason", "governance_last_block_reason TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -6830,6 +6890,23 @@ def request_review(
             },
             run_id=run_id,
         )
+        
+        # Increment review counter and check for anomalies
+        conn.execute(
+            "UPDATE tasks SET governance_review_count = governance_review_count + 1 WHERE id = ?",
+            (task_id,),
+        )
+        
+        # Check for anomalies after incrementing
+        task = get_task(conn, task_id)
+        if task is not None:
+            anomaly = kanban_governance.classify_governance_anomaly(task)
+            if anomaly is not None:
+                # Convert anomaly to maintainer defect
+                kanban_governance.materialize_maintainer_defect(
+                    conn, task_id, anomaly
+                )
+    
     return _ret(True)
 
 
@@ -6949,6 +7026,23 @@ def request_changes(
             },
             run_id=run_id,
         )
+        
+        # Increment fail counter and check for anomalies
+        conn.execute(
+            "UPDATE tasks SET governance_fail_count = governance_fail_count + 1 WHERE id = ?",
+            (task_id,),
+        )
+        
+        # Check for anomalies after incrementing
+        task = get_task(conn, task_id)
+        if task is not None:
+            anomaly = kanban_governance.classify_governance_anomaly(task)
+            if anomaly is not None:
+                # Convert anomaly to maintainer defect
+                kanban_governance.materialize_maintainer_defect(
+                    conn, task_id, anomaly
+                )
+    
     return True, implementer
 
 

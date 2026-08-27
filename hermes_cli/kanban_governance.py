@@ -6,8 +6,9 @@ to ensure blocked cards follow governance invariants.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 # Required blocker classes for typed blocks
 BLOCKER_CLASSES = {
@@ -17,6 +18,9 @@ BLOCKER_CLASSES = {
     "dependency_wait",
     "human_decision",
 }
+
+# Thresholds for anomaly detection
+REVIEW_LOOP_THRESHOLD = 4  # Defect after 4 review requests on the same task
 
 # Valid decision classes for human_decision blocks
 HUMAN_DECISION_CLASSES = {
@@ -181,3 +185,86 @@ def validate_review_contract(
         )
 
     return GovernanceReviewValidation(ok=True)
+
+
+@dataclass(frozen=True)
+class GovernanceAnomaly:
+    """Detected pathological governance loop requiring escalation."""
+    kind: str  # "repeat_review_loop", "illegal_christopher_hold", etc.
+    reason: str  # Human-readable description
+    task_id: str
+    counter_value: int  # The actual counter value that triggered detection
+
+
+def classify_governance_anomaly(
+    task: Any,  # Task object with governance counters
+    recent_events: Optional[list] = None,
+) -> Optional[GovernanceAnomaly]:
+    """Detect governance anomalies that warrant escalation to maintainer defect.
+    
+    Args:
+        task: Task object with governance_review_count and other counters.
+        recent_events: Optional list of recent task events (for context).
+    
+    Returns:
+        GovernanceAnomaly if an anomaly is detected, None otherwise.
+    """
+    # Detect repeat review loop: task has exceeded the threshold for review cycles
+    if task.governance_review_count >= REVIEW_LOOP_THRESHOLD:
+        return GovernanceAnomaly(
+            kind="repeat_review_loop",
+            reason=f"Task has been in review {task.governance_review_count} times (threshold: {REVIEW_LOOP_THRESHOLD})",
+            task_id=task.id,
+            counter_value=task.governance_review_count,
+        )
+    
+    return None
+
+
+def materialize_maintainer_defect(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    anomaly: GovernanceAnomaly,
+) -> str:
+    """Convert a detected governance anomaly into a maintainer defect card.
+    
+    Creates a new task assigned to 'default' with a title describing the
+    governance defect found on the source task.
+    
+    Args:
+        conn: Database connection.
+        source_task_id: The task ID that triggered the anomaly detection.
+        anomaly: The detected GovernanceAnomaly.
+    
+    Returns:
+        The ID of the newly created defect task.
+    """
+    # Import here to avoid circular dependency
+    from hermes_cli import kanban_db as kb
+    
+    # Determine defect title and body based on anomaly kind
+    if anomaly.kind == "repeat_review_loop":
+        defect_title = f"Governance defect: review loop on {source_task_id}"
+        defect_body = (
+            f"Task {source_task_id} has entered review {anomaly.counter_value} times, "
+            f"exceeding threshold of {REVIEW_LOOP_THRESHOLD}.\n\n"
+            f"Reason: {anomaly.reason}\n\n"
+            f"This may indicate:\n"
+            f"- The review goal/judge/evidence_contract is misaligned with implementation\n"
+            f"- The implementation path is fundamentally flawed and needs decomposition\n"
+            f"- The review criteria are ambiguous or keep changing\n"
+        )
+    else:
+        defect_title = f"Governance defect: {anomaly.kind} on {source_task_id}"
+        defect_body = f"Anomaly: {anomaly.reason}"
+    
+    # Create the defect task assigned to default
+    defect_id = kb.create_task(
+        conn,
+        title=defect_title,
+        body=defect_body,
+        assignee="default",
+    )
+    
+    return defect_id
+
