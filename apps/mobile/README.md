@@ -62,6 +62,12 @@ This is intentional adaptation, not a separate dashboard: existing Desktop pages
 - Open external links only through an allowlisted system-browser path; gateway content cannot invoke arbitrary device schemes.
 - A release will require its own reviewed package identifier, signing identity, update channel, and real-device verification.
 
+## 🧪 Verified remote-session regression gate
+
+The Android bridge must implement both the primary connection methods **and** the registry-scoped connection methods used by the current Desktop renderer. Without the registry methods, a remote token gateway can populate the session list but fail when a user opens a conversation.
+
+The current candidate proves this route with a real private gateway: connect over HTTPS/WSS, restore the session list, select a stored session, and render its prior transcript. The regression test covers the bridge’s registry connection and fresh-WebSocket resolution; it uses synthetic values only.
+
 ## 🤳 Android capability boundaries
 
 Every mobile capability begins with a deliberate user action or the one-time first successful connection onboarding. Hermes never requests contacts, location, SMS, Accessibility, overlay, notification-reader, boot, or exact-alarm access.
