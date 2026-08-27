@@ -3,6 +3,7 @@
 import os
 import sys
 
+import psutil
 import pytest
 
 from tools import mcp_stdio_watchdog, mcp_tool
@@ -38,3 +39,19 @@ def test_wrap_command_uses_stable_parent_pid_and_preserves_command_tail():
         *command_args,
     ]
     assert "--create-time" not in wrapped_args
+
+
+def test_stdio_children_dead_is_false_while_any_tracked_child_is_alive(monkeypatch):
+    server = mcp_tool.MCPServerTask("filesystem")
+    server._stdio_child_pids = {101, 202}
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 202)
+
+    assert server._stdio_children_dead() is False
+
+
+def test_stdio_children_dead_is_true_after_every_tracked_child_exits(monkeypatch):
+    server = mcp_tool.MCPServerTask("filesystem")
+    server._stdio_child_pids = {101, 202}
+    monkeypatch.setattr(psutil, "pid_exists", lambda _pid: False)
+
+    assert server._stdio_children_dead() is True
