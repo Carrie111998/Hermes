@@ -5,7 +5,7 @@ import { stableRecord } from '@/lib/stable-array'
 import { parseTodoRevision, parseTodos, type TodoItem } from '@/lib/todos'
 
 import { $sessions, lineageAliases } from './session'
-import { $sessionStates } from './session-states'
+import { $sessionStates, sessionStatusMembershipIdentities } from './session-states'
 
 /**
  * Live todo list per runtime session, rendered by the composer status stack
@@ -43,9 +43,15 @@ export const $todoProgressBySession = computed(
       }
 
       const progress = `${counted.filter(t => t.status === 'completed').length}/${counted.length}`
+      const state = states[runtimeId]
+      const aliases = lineageAliases(state?.storedSessionId ?? runtimeId, sessions)
 
-      for (const alias of lineageAliases(states[runtimeId]?.storedSessionId ?? runtimeId, sessions)) {
-        next[alias] = progress
+      const identities = state
+        ? sessionStatusMembershipIdentities(aliases, states, sessions, candidate => candidate === state)
+        : aliases
+
+      for (const identity of identities) {
+        next[identity] = progress
       }
     }
 

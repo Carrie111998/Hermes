@@ -10,8 +10,14 @@ import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
 import { $sessions } from '@/store/session'
 import type * as SessionStore from '@/store/session'
-import { $sessionTiles, clearAllSessionStates, publishSessionState } from '@/store/session-states'
+import {
+  $sessionTiles,
+  clearAllSessionStates,
+  publishSessionState,
+  recordSessionEventScope
+} from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
+import { $todosBySession } from '@/store/todos'
 import type * as WindowsStore from '@/store/windows'
 
 import { startSessionDrag } from '../session-drag'
@@ -292,6 +298,31 @@ describe('SidebarSessionRow', () => {
     expect(ownerB.container.querySelector('.bg-\\(--ui-row-open-background\\)')).not.toBeNull()
 
     $sessionTiles.set([])
+    $sessions.set([])
+  })
+
+  it('shows todo progress only on the exact owner when same-profile ids collide', () => {
+    const sessionA = makeSession({ connection_id: 'source-a', id: 'duplicate-id', profile: 'worker', title: 'Owner A' })
+    const sessionB = makeSession({ connection_id: 'source-b', id: 'duplicate-id', profile: 'worker', title: 'Owner B' })
+
+    $sessions.set([sessionA, sessionB])
+    recordSessionEventScope({ connectionId: 'source-a', profile: 'worker', session_id: 'runtime-a' })
+    publishSessionState('runtime-a', createClientSessionState('duplicate-id'))
+    $todosBySession.set({
+      'runtime-a': [
+        { content: 'Done', id: 'done', status: 'completed' },
+        { content: 'Working', id: 'working', status: 'in_progress' }
+      ]
+    })
+
+    const ownerA = renderRow(sessionA, { card: true })
+    const ownerB = renderRow(sessionB, { card: true })
+
+    expect(ownerA.container.textContent).toContain('1/2')
+    expect(ownerB.container.textContent).not.toContain('1/2')
+
+    $todosBySession.set({})
+    clearAllSessionStates()
     $sessions.set([])
   })
 

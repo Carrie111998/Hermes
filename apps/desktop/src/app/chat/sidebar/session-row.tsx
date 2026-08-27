@@ -296,9 +296,12 @@ function SidebarSessionRowImpl({
   // between them (HTML collapses runs of whitespace to one).
   const model = card && session.model ? displayModelName(session.model) : ''
   const size = card && session.message_count > 0 ? r.messageCount(session.message_count) : ''
+
   // Live plan progress ("3/7"), far right of the footer. A selector keyed to
   // this row: only rows whose own fraction changes repaint on todo events.
-  const todoProgress = useStoreSelector($todoProgressBySession, progress => (card ? progress[session.id] : undefined))
+  const todoProgress = useStoreSelector($todoProgressBySession, progress =>
+    card ? (progress[sessionRowIdentity(session)] ?? progress[session.id]) : undefined
+  )
 
   // An archived session has no live status to paint, so the archive glyph takes
   // the lead slot the dot would occupy instead of adding a column of its own.
