@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -33,6 +33,7 @@ import {
   remotePidAlive,
   remoteSupportsSshOwnership,
   scrapeReadyPort,
+  shq,
   spawnLogPath,
   spawnRemoteDashboard,
   spawnTokenPath,
@@ -788,6 +789,90 @@ test('buildSpawnCommand always uses serve (legacy dashboard path removed)', () =
   assert.match(cmd, /setsid/)
 })
 
+test('buildSpawnCommand passes the expanded update mutex path as a shell fragment', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'work', {
+    hermesHome: '~/.hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  })
+
+  const mutexPath = expandRemotePath('~/.hermes/.hermes-update-in-progress.mutex')
+
+  assert.ok(cmd.includes(` ${mutexPath} `), 'the already-expanded mutex path must not be quoted again')
+})
+
+test('buildSpawnCommand captures only the live backend PID', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
+
+  assert.doesNotMatch(cmd, /hermes-update-child "\$1" & echo \$!\)/)
+})
+
+test.skipIf(process.platform === 'win32')('buildSpawnCommand publishes one live backend PID under POSIX sh', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-posix-spawn-'))
+  const hermesPath = path.join(home, 'hermes')
+  const reportPath = path.join(home, 'backend-pid')
+  const logPath = spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  const lockPath = path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID, 'backend.lock.json')
+  const reservationPath = path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID, '.connect.lock')
+  const mutexPath = path.join(home, '.hermes-posix-spawn', '.hermes-update-in-progress.mutex')
+  let spawnedPid = 0
+
+  try {
+    await writeFile(hermesPath, `#!/bin/sh\nprintf '%s' "$$" > ${shq(reportPath)}\nexec sleep 30\n`, { mode: 0o700 })
+
+    const command = buildSpawnCommand(hermesPath, '', {
+      hermesHome: '~/.hermes-posix-spawn',
+      logPath,
+      ownershipId: OWNERSHIP_ID,
+      reservationNonce: SPAWN_NONCE,
+      spawnNonce: SPAWN_NONCE,
+      lockMetadata: {
+        ownershipId: OWNERSHIP_ID,
+        spawnNonce: SPAWN_NONCE,
+        port: 0,
+        profile: '',
+        hermesPath: '/x/__PID__/hermes',
+        hermesHome: '~/.hermes-posix-spawn',
+        logPath,
+        tokenFingerprint: fingerprintToken('stored-token'),
+        protocolVersion: PROTOCOL_VERSION,
+        startedAt: '2026-07-14T00:00:00.000Z'
+      }
+    })
+
+    const result = await exec(command, { shell: '/bin/sh', env: { ...process.env, HOME: home } })
+
+    const returnedPids = result.stdout
+      .trim()
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean)
+
+    assert.equal(returnedPids.length, 1)
+    assert.match(returnedPids[0], /^\d+$/)
+    spawnedPid = Number(returnedPids[0])
+
+    const backendPid = await readFile(reportPath, 'utf8')
+    const published = JSON.parse(await readFile(lockPath, 'utf8'))
+
+    assert.equal(backendPid, returnedPids[0])
+    assert.equal(String(published.pid), returnedPids[0])
+    assert.equal(published.hermesPath, `/x/${returnedPids[0]}/hermes`)
+    process.kill(spawnedPid, 0)
+    await access(mutexPath)
+    await assert.rejects(access(reservationPath), (error: any) => error?.code === 'ENOENT')
+  } finally {
+    if (spawnedPid > 0) {
+      try {
+        process.kill(spawnedPid, 'SIGTERM')
+      } catch {
+        void 0
+      }
+    }
+
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('buildSpawnCommand atomically reserves the ownership slot through spawn and lock publication', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', {
     hermesHome: '~/.hermes',
@@ -1496,14 +1581,14 @@ test('buildSpawnCommand lockfile publication is POSIX sh (no bash substitution)'
     reservationNonce: SPAWN_NONCE,
     spawnNonce: SPAWN_NONCE,
     tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
-    lockMetadata: { ownershipId: OWNERSHIP_ID, pid: '__PID__' }
+    lockMetadata: { ownershipId: OWNERSHIP_ID, hermesPath: '/x/__PID__/hermes', pid: '__PID__' }
   })
 
   // ${var//pat/rep} is bash-only; dash aborts the payload on it AFTER the
   // serve was spawned, so the client sees an unknown failure, deletes the
   // token file, and orphans the backend.
   assert.doesNotMatch(cmd, /\$\{lock_json\/\//, 'must not use ${var//} substitution under sh')
-  assert.ok(cmd.includes('sed "s/__PID__/${child}/"'), 'pid substitution must use sed')
+  assert.ok(cmd.includes('sed "s/__PID__/${child}/g"'), 'pid substitution must preserve global replacement')
 })
 
 test('spawnRemoteDashboard removes a token file when upload reporting fails', async () => {
