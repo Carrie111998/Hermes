@@ -3260,13 +3260,24 @@ install_desktop() {
     #    the remaining seconds to the fallback (min 30s so it still gets a real
     #    attempt if `npm ci` failed fast rather than stalling).
     log_info "Installing desktop workspace dependencies (includes Electron ~150MB, 1-3min)..."
+    # NPM_DEV_DEP_INSTALL_GUARD (issue #94796): npm silently drops
+    # devDependencies when NODE_ENV === production (the dashboard subcommand
+    # sets it very early — #49920). A clean install with NODE_ENV=production
+    # produces a workspace tree WITHOUT typescript on disk, so the desktop
+    # build's `tsc --build ...` step fails with the opaque
+    # `'tsc' is not recognized as an internal or external command` exit 1.
+    # Force-unset NODE_ENV before any npm invocation so a parent's leak
+    # can't strip devDependencies silently. Snapshot + restore so we don't
+    # trample a caller who deliberately set it for their own reasons.
+    local _prev_node_env="${NODE_ENV:-}"
+    unset NODE_ENV
     local _deps_start _deps_remaining
     _deps_start=$(date +%s)
-    if run_with_timeout "$DESKTOP_BUILD_TIMEOUT" bash -c 'cd "$1" && npm ci' _ "$INSTALL_DIR"; then
+    if run_with_timeout "$DESKTOP_BUILD_TIMEOUT" bash -c 'cd "$1" && NODE_ENV="" npm ci' _ "$INSTALL_DIR"; then
         log_success "Desktop workspace dependencies installed"
     elif _deps_remaining=$(( DESKTOP_BUILD_TIMEOUT - ($(date +%s) - _deps_start) )); \
          [ "$_deps_remaining" -lt 30 ] && _deps_remaining=30; \
-         run_with_timeout "$_deps_remaining" bash -c 'cd "$1" && npm install' _ "$INSTALL_DIR"; then
+         run_with_timeout "$_deps_remaining" bash -c 'cd "$1" && NODE_ENV="" npm install' _ "$INSTALL_DIR"; then
         log_success "Desktop workspace dependencies installed"
     elif _electron_pkg_staged_missing_dist "$INSTALL_DIR"; then
         log_warn "Desktop dependency install failed with a missing Electron dist; attempting self-heal..."
@@ -3282,9 +3293,33 @@ install_desktop() {
         log_info "earlier 'sudo npm' or 'sudo npx'. Reclaim ownership and retry:"
         log_info "  sudo chown -R \"\$(id -un)\" ~/.npm && npm cache verify"
         log_info "Then re-run this installer, or build manually:"
-        log_info "  cd \"$INSTALL_DIR\" && npm ci && cd apps/desktop && npm run pack"
+        log_info "  cd \"$INSTALL_DIR\" && NODE_ENV=\"\" npm ci && cd apps/desktop && npm run pack"
+        export NODE_ENV="$_prev_node_env"
         return 1
     fi
+    # NPM_DEV_DEP_INSTALL_VERIFY (issue #94796): npm can exit 0 even with
+    # NODE_ENV=production and a completely-missing devDeps tree (silent skip
+    # — no warning). Probe for the bare minimum that the desktop build needs
+    # — typescript on disk at the desktop workspace OR the monorepo root —
+    # and bail with a clear, actionable error before launching "npm run pack"
+    # and discovering the same thing 1-3 minutes later as "tsc is not
+    # recognized". Probe BOTH locations because npm hoists typescript to
+    # the monorepo root when there's only one copy in the workspace set.
+    local _tsc_local="$desktop_dir/node_modules/.bin/tsc"
+    local _tsc_hoisted="$INSTALL_DIR/node_modules/.bin/tsc"
+    if [ ! -x "$_tsc_local" ] && [ ! -x "$_tsc_hoisted" ]; then
+        log_error "Desktop build dependency check failed: typescript is not on disk."
+        log_error "Expected to find tsc at one of:"
+        log_error "  - $_tsc_local"
+        log_error "  - $_tsc_hoisted"
+        log_error "Most common cause: NODE_ENV=production was inherited by 'npm ci' and npm"
+        log_error "silently dropped devDependencies (#49920 / #94796). Re-run with NODE_ENV"
+        log_error "unset from $INSTALL_DIR, then resume:"
+        log_error "  cd $INSTALL_DIR && NODE_ENV=\"\" npm ci"
+        export NODE_ENV="$_prev_node_env"
+        return 1
+    fi
+    export NODE_ENV="$_prev_node_env"
 
     # 2. Build, with up to three escalating attempts so a transient/blocked
     #    Electron download self-heals instead of failing the whole install:

@@ -3918,70 +3918,114 @@ function Install-Desktop {
     }
 
     # 1. Workspace-level install so apps/desktop's deps (Electron, Vite,
-    # node-pty prebuilds, etc.) actually land in node_modules. This is
-    # the SAME `npm install` Install-NodeDeps does for browser tools,
-    # but at the root rather than the browser-tools workspace, so all
-    # apps/* workspaces resolve.
-    Write-Info "Installing desktop workspace dependencies (this includes Electron ~150MB, takes 1-3min)..."
+        # node-pty prebuilds, etc.) actually land in node_modules. This is
+        # the SAME `npm install` Install-NodeDeps does for browser tools,
+        # but at the root rather than the browser-tools workspace, so all
+        # apps/* workspaces resolve.
+        #
+        # NPM_DEV_DEP_INSTALL_GUARD: npm silently drops devDependencies when
+        # NODE_ENV === production (the dashboard subcommand sets it very early,
+        # see #49920). A clean install with NODE_ENV=production produces a
+        # workspace tree WITHOUT typescript on disk, so the desktop build's
+        # `tsc --build ...` step fails with the opaque
+        # `'tsc' is not recognized as an internal or external command` exit 1
+        # (#94796). Force-unset NODE_ENV before any npm invocation in this
+        # stage so a parent's leak can't silently strip devDependencies.
+        # We snapshot + restore the prior value so we don't trample a caller
+        # who deliberately set NODE_ENV=production for their own reasons
+        # outside this stage.
+        $prevNodeEnv = $env:NODE_ENV
+        $env:NODE_ENV = ""
+        Write-Info "Installing desktop workspace dependencies (this includes Electron ~150MB, takes 1-3min)..."
     Push-Location $InstallDir
-    $prevEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        # Drop --silent so npm emits its full progress + error trail.
-        # When this fails on a non-dev box (e.g. native-module build
-        # without VS Build Tools, ETARGET on a transitive, etc.), the
-        # actual reason needs to reach the Tauri installer's log; with
-        # --silent it was completely suppressed and the user just saw
-        # "exit 1" with no actionable detail.
-        #
-        # The streaming sink in bootstrap.rs's run_install_script
-        # captures every stdout/stderr line as it's emitted, so we don't
-        # need a side TEMP log file -- the installer's bootstrap log
-        # IS the artifact a support engineer reads.
-        #
-        # Prefer `npm ci`: it wipes node_modules and reinstalls from the
-        # lockfile, always producing a complete tree. Bare `npm install`
-        # can report "up to date" against a stale
-        # node_modules\.package-lock.json marker while node_modules is
-        # actually empty (Windows workspace-hoisting flake), leaving
-        # tsc/typescript unresolved so `npm run pack`'s `tsc -b` dies with
-        # no obvious cause. Fall back to `npm install` only if `npm ci`
-        # fails (lockfile out of sync / very old npm without ci).
-        #
-        # Tee the merged output into $npmOut while still emitting every line
-        # live. We don't need a side log file (the bootstrap streaming sink
-        # is the artifact), but on failure we scan $npmOut for the TLS-trust
-        # signature so corporate-proxy users get the NODE_EXTRA_CA_CERTS hint
-        # instead of an opaque "exit 1" (issue #38016).
-        & $npmExe ci 2>&1 | ForEach-Object { "$_" } | Tee-Object -Variable npmOut
-        $code = $LASTEXITCODE
-        if ($code -ne 0) {
-            Write-Info "  npm ci failed (exit $code) -- retrying with npm install..."
-            & $npmExe install 2>&1 | ForEach-Object { "$_" } | Tee-Object -Variable npmOut
+        $prevEAP = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            # Drop --silent so npm emits its full progress + error trail.
+            # When this fails on a non-dev box (e.g. native-module build
+            # without VS Build Tools, ETARGET on a transitive, etc.), the
+            # actual reason needs to reach the Tauri installer's log; with
+            # --silent it was completely suppressed and the user just saw
+            # "exit 1" with no actionable detail.
+            #
+            # The streaming sink in bootstrap.rs's run_install_script
+            # captures every stdout/stderr line as it's emitted, so we don't
+            # need a side TEMP log file -- the installer's bootstrap log
+            # IS the artifact a support engineer reads.
+            #
+            # Prefer `npm ci`: it wipes node_modules and reinstalls from the
+            # lockfile, always producing a complete tree. Bare `npm install`
+            # can report "up to date" against a stale
+            # node_modules\.package-lock.json marker while node_modules is
+            # actually empty (Windows workspace-hoisting flake), leaving
+            # tsc/typescript unresolved so `npm run pack`'s `tsc -b` dies with
+            # no obvious cause. Fall back to `npm install` only if `npm ci`
+            # fails (lockfile out of sync / very old npm without ci).
+            #
+            # Tee the merged output into $npmOut while still emitting every line
+            # live. We don't need a side log file (the bootstrap streaming sink
+            # is the artifact), but on failure we scan $npmOut for the TLS-trust
+            # signature so corporate-proxy users get the NODE_EXTRA_CA_CERTS hint
+            # instead of an opaque "exit 1" (issue #38016).
+            # Mirror NODE_ENV="" to the child process explicitly. We already
+            # set it in the parent (see NPM_DEV_DEP_INSTALL_GUARD above), but
+            # cmd.exe's own copy of the environment can be cached -- passing
+            # it inline here is belt-and-suspenders against the silent drop
+            # of devDependencies that turns into the #94796 failure.
+            & $npmExe ci 2>&1 | ForEach-Object { "$_" } | Tee-Object -Variable npmOut
             $code = $LASTEXITCODE
-        }
-        $ErrorActionPreference = $prevEAP
-        if ($code -ne 0) {
-            if (Test-ElectronPkgStagedMissingDist -InstallDir $InstallDir) {
-                Write-Warn "Desktop dependency install failed with a missing Electron dist; attempting self-heal..."
-                Try-RestoreElectronDist -InstallDir $InstallDir | Out-Null
-            } else {
-                Show-NpmCertHint ($npmOut -join "`n") | Out-Null
-                # Replay npm's own debug log into our stream: the terse
-                # summary above rarely contains the postinstall stderr
-                # (e.g. Electron's install.js) that explains the failure.
-                Write-NpmDebugLogTail -NpmOutput ($npmOut -join "`n")
-                throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            if ($code -ne 0) {
+                Write-Info "  npm ci failed (exit $code) -- retrying with npm install..."
+                & $npmExe install 2>&1 | ForEach-Object { "$_" } | Tee-Object -Variable npmOut
+                $code = $LASTEXITCODE
             }
-        } else {
-            Write-Success "Desktop workspace dependencies installed"
+            $ErrorActionPreference = $prevEAP
+            if ($code -ne 0) {
+                if (Test-ElectronPkgStagedMissingDist -InstallDir $InstallDir) {
+                    Write-Warn "Desktop dependency install failed with a missing Electron dist; attempting self-heal..."
+                    Try-RestoreElectronDist -InstallDir $InstallDir | Out-Null
+                } else {
+                    Show-NpmCertHint ($npmOut -join "`n") | Out-Null
+                    # Replay npm's own debug log into our stream: the terse
+                    # summary above rarely contains the postinstall stderr
+                    # (e.g. Electron's install.js) that explains the failure.
+                    Write-NpmDebugLogTail -NpmOutput ($npmOut -join "`n")
+                    throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+                }
+            } else {
+                Write-Success "Desktop workspace dependencies installed"
+            }
+            # NPM_DEV_DEP_INSTALL_VERIFY (issue #94796): npm can exit 0 even
+            # with NODE_ENV=production and a completely-missing devDeps tree
+            # (silent skip -- no warning). Probe for the bare minimum that
+            # the desktop build needs -- typescript on disk at the desktop
+            # workspace OR the monorepo root -- and bail with a clear,
+            # actionable error before launching `npm run pack` and discovering
+            # the same thing 1-3 minutes later as `'tsc' is not recognized`.
+            # We probe BOTH locations because npm hoists typescript to the
+            # monorepo root when there's only one copy in the workspace set.
+            $tscCandidates = @(
+                (Join-Path $desktopDir "node_modules\.bin\tsc.cmd"),
+                (Join-Path $InstallDir  "node_modules\.bin\tsc.cmd")
+            )
+            $tscFound = $false
+            foreach ($cand in $tscCandidates) {
+                if (Test-Path $cand) { $tscFound = $true; break }
+            }
+            if (-not $tscFound) {
+                throw ("desktop build dependency check failed: typescript is not on disk. " +
+                       "Expected to find tsc.cmd at one of: $($tscCandidates -join '; '). " +
+                       "Most common cause: NODE_ENV=production was inherited by `npm ci` and npm silently dropped devDependencies (#49920 / #94796). " +
+                       "Re-run with NODE_ENV unset: `$env:NODE_ENV=''; & $npmExe ci` from $InstallDir, then resume.")
+            }
+        } catch {
+            if ($prevEAP) { $ErrorActionPreference = $prevEAP }
+            $env:NODE_ENV = $prevNodeEnv
+            Pop-Location
+            throw
         }
-    } catch {
-        if ($prevEAP) { $ErrorActionPreference = $prevEAP }
-        Pop-Location
-        throw
-    }
     Pop-Location
+    $env:NODE_ENV = $prevNodeEnv
 
     # 2. Build apps/desktop. `npm run pack` runs:
     #      assert-root-install + write-build-stamp + stage-native-deps +
