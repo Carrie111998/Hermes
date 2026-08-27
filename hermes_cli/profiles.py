@@ -137,6 +137,27 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 
+# Files whose presence marks a directory under ``profiles/`` as a real,
+# created profile rather than an internal runtime/data folder (audio_cache,
+# cache, cron, hooks, ...) that Hermes itself may drop next to them (#95953).
+# Every ``create_profile`` path writes at least one of these (``.env`` is
+# unconditional on creation; SOUL.md is seeded; config.yaml arrives with
+# config clones; the marker with ``--no-skills``).
+_PROFILE_MARKER_FILES = (
+    ".env",
+    "config.yaml",
+    "SOUL.md",
+    NO_BUNDLED_SKILLS_MARKER,
+)
+
+
+def _has_profile_artifacts(profile_dir: Path) -> bool:
+    """True when the directory carries at least one created-profile marker."""
+    try:
+        return any((profile_dir / marker).exists() for marker in _PROFILE_MARKER_FILES)
+    except OSError:
+        return False
+
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
     """Return True if the profile opted out of bundled-skill seeding."""
@@ -423,15 +444,23 @@ def list_profile_names() -> List[str]:
     """Cheap name-only profile listing: ``default`` plus profile dirs.
 
     Unlike :func:`list_profiles` this reads NO per-profile config/metadata —
-    it is a directory scan, safe to call from hot paths (cron delivery-target
-    listings, create-time validation).
+    it is a directory scan plus marker-file existence checks (a few stats per
+    entry), safe to call from hot paths (cron delivery-target listings,
+    create-time validation). Directories without any created-profile marker
+    are skipped: Hermes itself drops internal runtime/data folders next to
+    real profiles (#95953) and they must not become cron delivery targets.
     """
     names = ["default"]
     profiles_root = _get_profiles_root()
     try:
         if profiles_root.is_dir():
             for entry in sorted(profiles_root.iterdir()):
-                if entry.is_dir() and entry.name != "default" and _PROFILE_ID_RE.match(entry.name):
+                if (
+                    entry.is_dir()
+                    and entry.name != "default"
+                    and _PROFILE_ID_RE.match(entry.name)
+                    and _has_profile_artifacts(entry)
+                ):
                     names.append(entry.name)
     except OSError:
         pass
@@ -1021,6 +1050,12 @@ def list_profiles() -> List[ProfileInfo]:
             if name == "default":
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
+                continue
+            # Skip internal runtime/data folders that Hermes itself may
+            # create next to real profiles (audio_cache, cache, cron, hooks,
+            # ...) — a selectable profile must carry at least one
+            # created-profile marker (#95953).
+            if not _has_profile_artifacts(entry):
                 continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
