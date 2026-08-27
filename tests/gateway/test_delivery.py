@@ -6,7 +6,7 @@ import pytest
 from typing import Any, cast
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
-from gateway.delivery import DeliveryRouter, DeliveryTarget
+from gateway.delivery import DeliveryRouter, DeliveryTarget, resolve_delivery_transport
 from gateway.platforms.base import SendResult
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
@@ -208,6 +208,41 @@ async def test_disabled_native_adapter_does_not_shadow_relay(tmp_path, monkeypat
     assert native.calls == []
     assert len(transport.sent) == 1
     assert transport.sent[0][1] == "slack"
+
+
+def test_delivery_transport_uses_value_equivalent_live_platform_key():
+    """A reconstructed Platform enum must retain the live adapter."""
+    native = RecordingAdapter()
+
+    class ReconstructedPlatform:
+        value = "discord"
+
+    transport = resolve_delivery_transport(
+        Platform.DISCORD,
+        GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True)}),
+        cast(Any, {ReconstructedPlatform(): native}),
+    )
+
+    assert transport is not None
+    assert transport.adapter is native
+    assert transport.transport_platform is Platform.DISCORD
+
+
+def test_delivery_transport_accepts_string_platform_for_value_fallback():
+    """Compatibility fallback accepts callers with a plain platform string."""
+    native = RecordingAdapter()
+
+    class ReconstructedPlatform:
+        value = "discord"
+
+    transport = resolve_delivery_transport(
+        cast(Platform, "discord"),
+        GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True)}),
+        cast(Any, {ReconstructedPlatform(): native}),
+    )
+
+    assert transport is not None
+    assert transport.adapter is native
 
 
 class StaleTopicAdapter:

@@ -2316,6 +2316,120 @@ class TestCronDeliveryMirror:
         assert tid == "9001"
 
 
+    def test_open_thread_adds_origin_user_as_member(self):
+        """A Discord briefing thread explicitly includes the scheduling user."""
+        from cron.scheduler import _open_continuable_cron_thread
+        from concurrent.futures import Future
+        import asyncio
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9001")
+        adapter.add_thread_member = AsyncMock(return_value=True)
+        timeouts = []
+
+        def _run_now(coro, _loop):
+            result = asyncio.run(coro)
+            future = MagicMock()
+            future.result.side_effect = lambda *, timeout: timeouts.append(timeout) or result
+            return future
+
+        job = {
+            "id": "j1",
+            "name": "Brief",
+            "origin": {"user_id": "1505552312561832006"},
+        }
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            tid = _open_continuable_cron_thread(job, adapter, "123", loop=MagicMock())
+
+        assert tid == "9001"
+        adapter.add_thread_member.assert_awaited_once_with("9001", "1505552312561832006")
+        assert timeouts == [30, 10]
+
+    def test_open_thread_closes_member_coroutine_when_scheduling_is_rejected(self):
+        """A rejected membership scheduling attempt must not leak its coroutine."""
+        from concurrent.futures import Future
+        from cron.scheduler import _open_continuable_cron_thread
+        import asyncio
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9001")
+        adapter.add_thread_member = AsyncMock(return_value=True)
+        member_coroutines = []
+        schedule_calls = 0
+
+        def _schedule(coro, _loop):
+            nonlocal schedule_calls
+            schedule_calls += 1
+            if schedule_calls == 1:
+                future = Future()
+                future.set_result(asyncio.run(coro))
+                return future
+            member_coroutines.append(coro)
+            return None
+
+        job = {
+            "id": "j1",
+            "name": "Brief",
+            "origin": {"user_id": "1505552312561832006"},
+        }
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule):
+            tid = _open_continuable_cron_thread(job, adapter, "123", loop=MagicMock())
+
+        assert tid == "9001"
+        assert len(member_coroutines) == 1
+        assert member_coroutines[0].cr_frame is None
+
+    def test_open_thread_keeps_delivery_when_membership_call_fails(self):
+        """A membership failure does not discard an otherwise usable thread."""
+        from concurrent.futures import Future
+        from cron.scheduler import _open_continuable_cron_thread
+        import asyncio
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9001")
+        adapter.add_thread_member = AsyncMock(return_value=True)
+        schedule_calls = 0
+
+        def _schedule(coro, _loop):
+            nonlocal schedule_calls
+            schedule_calls += 1
+            future = Future()
+            if schedule_calls == 1:
+                future.set_result(asyncio.run(coro))
+            else:
+                coro.close()
+                future.set_exception(RuntimeError("Discord unavailable"))
+            return future
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule):
+            tid = _open_continuable_cron_thread(
+                {"id": "j1", "origin": {"user_id": "42"}}, adapter, "123", loop=MagicMock()
+            )
+
+        assert tid == "9001"
+
+    def test_open_thread_allows_adapters_without_membership_support(self):
+        """Thread creation remains compatible with adapters without membership APIs."""
+        from concurrent.futures import Future
+        from cron.scheduler import _open_continuable_cron_thread
+        from types import SimpleNamespace
+        import asyncio
+
+        adapter = SimpleNamespace(create_handoff_thread=AsyncMock(return_value="9001"))
+
+        def _schedule(coro, _loop):
+            future = Future()
+            future.set_result(asyncio.run(coro))
+            return future
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule):
+            tid = _open_continuable_cron_thread(
+                {"id": "j1", "origin": {"user_id": "42"}}, adapter, "123", loop=MagicMock()
+            )
+
+        assert tid == "9001"
+
+
     def test_seed_thread_session_creates_session_and_mirrors(self):
         """Seeding a freshly-opened thread creates the thread-keyed session via
         the adapter's live store and appends the brief via mirror_to_session."""
