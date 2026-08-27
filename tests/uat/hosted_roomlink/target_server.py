@@ -1,6 +1,7 @@
 """Isolated fake peer used by the two-host RoomLink UAT recipe."""
 
 import os
+import threading
 import time
 
 from aiohttp import web
@@ -10,13 +11,34 @@ from gateway.platforms.api_server import APIServerAdapter
 
 
 class FakeAgent:
+    _runs_started = 0
+    _runs_lock = threading.Lock()
     session_prompt_tokens = 0
     session_completion_tokens = 0
     session_total_tokens = 0
 
+    def __init__(self):
+        self._interrupted = threading.Event()
+
     def run_conversation(self, *_args, **_kwargs):
-        time.sleep(float(os.getenv("UAT_REPLY_DELAY", "2")))
+        self._interrupted.clear()
+        with type(self)._runs_lock:
+            type(self)._runs_started += 1
+            sequence = type(self)._runs_started
+        reply_delay = float(
+            os.getenv(
+                "UAT_FIRST_REPLY_DELAY" if sequence == 1 else "UAT_STOP_REPLY_DELAY",
+                "2" if sequence == 1 else "15",
+            )
+        )
+        deadline = time.monotonic() + reply_delay
+        while time.monotonic() < deadline:
+            if self._interrupted.wait(timeout=0.02):
+                return {"final_response": "", "interrupted": True}
         return {"final_response": "REMOTE_UAT_REPLY"}
+
+    def interrupt(self, *_args, **_kwargs):
+        self._interrupted.set()
 
 
 def app():

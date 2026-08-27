@@ -357,7 +357,7 @@ test('autonomous room planning chooses a persistent home and verified remote cat
   assert.equal(describeAutonomousRoomPlan(noAddress).level, 'desktop')
   assert.equal(
     describeAutonomousRoomPlan(noAddress, { unavailableLabel: 'Workshop' }).description,
-    'Workshop needs setup before this room can continue on its own.'
+    'On Workshop, set gateway.room_link_url to its reachable HTTPS address, then reopen this screen.'
   )
 })
 

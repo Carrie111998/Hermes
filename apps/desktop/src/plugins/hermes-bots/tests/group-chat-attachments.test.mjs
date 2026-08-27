@@ -108,7 +108,7 @@ function load(turnScript) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gca = { sendToGroupChat, formatGroupChatLine, $groupChats };\n'
+      '\nglobalThis.__gca = { sendToGroupChat, formatGroupChatLine, stageSameGatewayHostedAttachments, $groupChats };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   context.plugin.register({
@@ -126,6 +126,21 @@ async function drain(gc, group) {
     await new Promise(resolve => setImmediate(resolve))
   }
 }
+
+test('same-gateway hosted staging keeps one opaque ref per room member', async () => {
+  const gc = load(() => '(pass)')
+  const manifests = await gc.stageSameGatewayHostedAttachments(
+    'Hosted',
+    MEMBERS,
+    'event-1',
+    [IMG]
+  )
+
+  assert.equal(gc.attaches.length, 2)
+  assert.equal(manifests.length, 1)
+  assert.deepEqual(Object.keys(manifests[0].refs).sort(), ['builder', 'research'])
+  assert.match(manifests[0].refs.builder, /^staged:event-1-0-builder$/)
+})
 
 test('attachments are staged into EVERY responding member session before its submit', async () => {
   const gc = load(() => '(pass)')

@@ -427,7 +427,7 @@ export function describeAutonomousRoomPlan(
     level: 'desktop',
     title: 'Keep Desktop open for this room',
     description: needsSetup
-      ? `${unavailableLabel} needs setup before this room can continue on its own.`
+      ? `On ${unavailableLabel}, set gateway.room_link_url to its reachable HTTPS address, then reopen this screen.`
       : 'The selected gateways cannot continue this room on their own yet.'
   }
 }

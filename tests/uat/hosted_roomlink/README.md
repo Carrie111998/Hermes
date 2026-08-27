@@ -19,13 +19,14 @@ production state directory or API key.
 5. Repeating status/replay does not duplicate that reply.
 6. A second remote turn is stopped by exact task/generation and reaches a
    durable cancelled state before teardown.
-7. Revocation succeeds before temporary state and network routes are removed.
-8. The original network route configuration is restored byte-for-byte.
+7. The target run itself is terminal before the home reports Stop acknowledged.
+8. Revocation succeeds before temporary state and network routes are removed.
+9. The original network route configuration is restored byte-for-byte.
 
 `home_runner.py` prints the following only after assertions 1–6 pass:
 
 ```text
-UAT_OK remote_reply=1 restart_recovered=1 stop_acknowledged=1 scoped_route_revoked=1
+UAT_OK remote_reply=1 restart_recovered=1 stop_acknowledged=1 target_terminal=1 scoped_route_revoked=1
 ```
 
 Keep environment-specific hostnames, ports, credentials, and cleanup commands

@@ -160,6 +160,7 @@ try:
     wait_for(
         lambda: any(
             task["status"] == "running"
+            and task["identity"].thread_id == "thread-stop"
             for task in hosted_room_driver.list_tasks(db, room_id=room_id)
         ),
         timeout=3,
@@ -172,7 +173,7 @@ except RuntimeError:
 assert restarted.stop_room(
     room_id,
     cancel_id="uat-stop",
-    require_acknowledged=True,
+    require_acknowledged=False,
 ) == 1
 wait_for(
     lambda: any(
@@ -180,9 +181,38 @@ wait_for(
         for task in hosted_room_driver.list_tasks(db, room_id=room_id)
     )
 )
+cancelled_task = next(
+    task
+    for task in hosted_room_driver.list_tasks(db, room_id=room_id)
+    if task["status"] == "cancelled"
+)
+receipt = hosted_rooms.remote_run_receipt(
+    db,
+    task_id=cancelled_task["identity"].task_id,
+    execution_generation=cancelled_task["execution_generation"],
+)
+assert receipt is not None
+scoped.bind_observation(
+    task_id=cancelled_task["identity"].task_id,
+    execution_generation=cancelled_task["execution_generation"],
+)
+target_status = scoped.status(
+    room_id=room_id,
+    profile=receipt["target_profile"],
+    session_id=receipt["session_id"],
+    grant=invitation["grant"],
+)
+assert target_status["status"] in {"cancelled", "interrupted"}
+# A second acknowledged Stop sees no remaining live work; disband can now
+# revoke the route without racing an executor that is still running.
+assert restarted.stop_room(
+    room_id,
+    cancel_id="uat-stop-confirm",
+    require_acknowledged=True,
+) == 0
 assert restarted.stop(timeout=2)
 assert restarted.revoke_room_routes(room_id) == 1
 print(
     "UAT_OK remote_reply=1 restart_recovered=1 "
-    "stop_acknowledged=1 scoped_route_revoked=1"
+    "stop_acknowledged=1 target_terminal=1 scoped_route_revoked=1"
 )

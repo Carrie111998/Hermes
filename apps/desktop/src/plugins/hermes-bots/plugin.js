@@ -566,13 +566,17 @@ const groupChatSyncRetryCounts = new Map()
 let groupChatSyncDisposed = false
 
 const HOSTED_ROOM_OUTBOX_KEY = 'hosted-room-outbox-v1'
+const HOSTED_ROOM_CLEANUP_KEY = 'hosted-room-cleanup-v1'
+const HOSTED_ROOM_CLEANUP_LIMIT = 128
 const HOSTED_ROOM_SYNC_INTERVAL_MS = 5000
 const HOSTED_ROOM_UNSUPPORTED_REPROBE_MS = 30000
 const $hostedRoomCapabilities = atom({})
 const $hostedRoomOutbox = atom({ version: 1, commands: [] })
+const $hostedRoomCleanup = atom({ version: 1, operations: [] })
 let hostedRoomSyncTimer = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = false
+let hostedCleanupDispatching = false
 const hostedAuthorityRoutes = new Map()
 const hostedCapabilityRetryAt = new Map()
 
@@ -1538,6 +1542,147 @@ async function requestHostedConnection(route, method, params = {}) {
   )
 }
 
+const hostedCleanupOwnerId =
+  globalThis.crypto?.randomUUID?.() || `desktop-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+function normalizeHostedRoomCleanup(value) {
+  const operations = []
+
+  for (const raw of Array.isArray(value?.operations) ? value.operations : []) {
+    const operationId = String(raw?.operationId || '')
+    const setupId = String(raw?.setupId || '')
+    const kind = String(raw?.kind || '')
+    const connectionId = String(raw?.connectionId || '')
+
+    if (
+      !operationId ||
+      !setupId ||
+      !connectionId ||
+      !['home-disband', 'peer-revoke'].includes(kind)
+    ) {
+      continue
+    }
+    if (kind === 'home-disband' && !String(raw?.roomId || '')) continue
+    if (kind === 'peer-revoke' && (!String(raw?.grant || '') || !String(raw?.profile || ''))) continue
+    operations.push({
+      operationId,
+      setupId,
+      kind,
+      connectionId,
+      ownerId: String(raw?.ownerId || ''),
+      roomId: kind === 'home-disband' ? String(raw.roomId) : null,
+      cancelId: kind === 'home-disband' ? String(raw.cancelId || `rollback-${raw.roomId}`) : null,
+      profile: kind === 'peer-revoke' ? String(raw.profile) : null,
+      grant: kind === 'peer-revoke' ? String(raw.grant) : null
+    })
+  }
+
+  return { version: 1, operations: operations.slice(-HOSTED_ROOM_CLEANUP_LIMIT) }
+}
+
+async function persistHostedRoomCleanup(next = $hostedRoomCleanup.get()) {
+  if (typeof pluginCtx?.storage?.set !== 'function') {
+    throw new Error('Room setup cannot be secured because Desktop storage is unavailable.')
+  }
+  await pluginCtx.storage.set(HOSTED_ROOM_CLEANUP_KEY, next)
+}
+
+async function replaceHostedRoomCleanup(next) {
+  const previous = $hostedRoomCleanup.get()
+  $hostedRoomCleanup.set(next)
+  try {
+    await persistHostedRoomCleanup(next)
+  } catch (error) {
+    $hostedRoomCleanup.set(previous)
+    throw error
+  }
+}
+
+async function addHostedRoomCleanup(operation) {
+  const current = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
+  const next = normalizeHostedRoomCleanup({
+    version: 1,
+    operations: [
+      ...current.operations.filter(entry => entry.operationId !== operation.operationId),
+      { ...operation, ownerId: hostedCleanupOwnerId }
+    ]
+  })
+  if (next.operations.length >= HOSTED_ROOM_CLEANUP_LIMIT && current.operations.length >= HOSTED_ROOM_CLEANUP_LIMIT) {
+    throw new Error('Room cleanup is already pending. Reconnect the affected gateways before creating another room.')
+  }
+  await replaceHostedRoomCleanup(next)
+}
+
+async function releaseHostedRoomCleanup(setupId) {
+  const current = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
+  await replaceHostedRoomCleanup({
+    version: 1,
+    operations: current.operations.filter(operation => operation.setupId !== setupId)
+  })
+}
+
+async function armHostedRoomCleanup(setupId) {
+  const current = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
+  await replaceHostedRoomCleanup({
+    version: 1,
+    operations: current.operations.map(operation =>
+      operation.setupId === setupId ? { ...operation, ownerId: '' } : operation
+    )
+  })
+}
+
+async function hostedRouteForReference(connectionId, profile = 'default') {
+  if (typeof host.profileRoutes !== 'function') return null
+  const routes = await host.profileRoutes()
+  return (Array.isArray(routes) ? routes : []).find(route => {
+    const routeProfile = String(route?.targetProfile || route?.profile || '')
+    return String(route?.connectionId || '') === connectionId && routeProfile === profile
+  }) || null
+}
+
+function hostedCleanupAlreadySettled(error) {
+  const code = Number(error?.code ?? error?.error?.code)
+  const message = String(error?.message || error?.error?.message || '')
+  return code === 4007 || /not found|already (?:disbanded|revoked)|unknown room|unknown grant/i.test(message)
+}
+
+async function dispatchHostedRoomCleanup() {
+  if (hostedCleanupDispatching || hostedRoomSyncDisposed) return
+  hostedCleanupDispatching = true
+  try {
+    for (const operation of normalizeHostedRoomCleanup($hostedRoomCleanup.get()).operations) {
+      // A setup owned by this renderer is still in its commit window. A new
+      // renderer has a different owner id and immediately recovers leftovers.
+      if (operation.ownerId === hostedCleanupOwnerId) continue
+      const profile = operation.kind === 'peer-revoke' ? operation.profile : 'default'
+      const route = await hostedRouteForReference(operation.connectionId, profile)
+      if (!route) continue
+      try {
+        if (operation.kind === 'home-disband') {
+          await requestHostedConnection(route, 'groups.disband', {
+            room_id: operation.roomId,
+            cancel_id: operation.cancelId
+          })
+        } else {
+          await requestHostedConnection(route, 'groups.peer.revoke', {
+            grant: operation.grant,
+            profile: operation.profile
+          })
+        }
+      } catch (error) {
+        if (!hostedCleanupAlreadySettled(error)) continue
+      }
+      const latest = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
+      await replaceHostedRoomCleanup({
+        version: 1,
+        operations: latest.operations.filter(entry => entry.operationId !== operation.operationId)
+      })
+    }
+  } finally {
+    hostedCleanupDispatching = false
+  }
+}
+
 async function withHostedRoomProbeTimeout(task, timeoutMs = 3000) {
   let timer = null
 
@@ -1650,21 +1795,35 @@ async function refreshHostedRooms() {
       hostedCapabilityRetryAt.delete(connectionId)
 
       hostedAuthorityRoutes.set(capability.authorityId, route)
+      const source = sources.get(connectionId)
+      const label = source?.label || source?.connectionLabel || connectionId
       let listed
       try {
-        listed = await requestHostedConnection(route, 'groups.list', {})
+        listed = await requestHostedConnection(route, 'groups.list', { include_disbanded: true })
       } catch {
         markHostedConnectionUnavailable(connectionId)
         continue
       }
       if (hostedRoomSyncDisposed) return
+      if (!Array.isArray(listed?.rooms)) {
+        markHostedConnectionUnavailable(connectionId)
+        continue
+      }
+      const listedRooms = listed.rooms
       const listedRoomIds = new Set(
-        (Array.isArray(listed?.rooms) ? listed.rooms : [])
+        listedRooms
+          .filter(room => room?.disbanded_at == null)
+          .map(room => String(room?.room_id || ''))
+          .filter(Boolean)
+      )
+      const disbandedRoomIds = new Set(
+        listedRooms
+          .filter(room => room?.disbanded_at != null)
           .map(room => String(room?.room_id || ''))
           .filter(Boolean)
       )
 
-      for (const listedRoom of Array.isArray(listed?.rooms) ? listed.rooms : []) {
+      for (const listedRoom of listedRooms.filter(room => room?.disbanded_at == null)) {
         const roomId = String(listedRoom?.room_id || '')
         const roomName = String(listedRoom?.name || '').trim()
 
@@ -1684,9 +1843,16 @@ async function refreshHostedRooms() {
         let existingName = existingEntry?.[0] || roomName
         let existing = existingEntry?.[1] || {}
         if (existingEntry && existingName !== roomName) {
+          const occupant = $groupChats.get()[roomName]
+          const collision = occupant && String(occupant?.roomId || '') !== roomId
+          const taken = new Set(liveGroupChatNames())
+          taken.delete(existingName)
+          const localTarget = collision
+            ? uniqueGroupChatName(`${roomName} (${label})`.slice(0, 64), taken)
+            : roomName
           const renamed = await renameGroupChat(
             existingName,
-            roomName,
+            localTarget,
             Array.isArray(existing.members) ? existing.members : [],
             { hostedAlreadyRenamed: true }
           )
@@ -1714,8 +1880,6 @@ async function refreshHostedRooms() {
             })
         })
         if (hostedRoomSyncDisposed) return
-        const source = sources.get(connectionId)
-        const label = source?.label || source?.connectionLabel || connectionId
         const replayState = replay.state
         const driverStatus = serverState?.driver_status || {}
         const driverCounts = driverStatus?.counts || {}
@@ -1764,7 +1928,8 @@ async function refreshHostedRooms() {
           hostedRoomSyncDisposed ||
           String(room?.hostedConnectionId || '') !== connectionId ||
           !room?.roomId ||
-          listedRoomIds.has(String(room.roomId))
+          listedRoomIds.has(String(room.roomId)) ||
+          !disbandedRoomIds.has(String(room.roomId))
         ) {
           continue
         }
@@ -1791,6 +1956,7 @@ function scheduleHostedRoomSync(delay = HOSTED_ROOM_SYNC_INTERVAL_MS) {
     hostedRoomSyncTimer = null
     await refreshHostedRooms().catch(() => undefined)
     await dispatchHostedRoomOutbox().catch(() => undefined)
+    await dispatchHostedRoomCleanup().catch(() => undefined)
     scheduleHostedRoomSync()
   }, delay)
   // Node-based plugin harnesses expose Timeout.unref(); the browser returns
@@ -1814,6 +1980,14 @@ async function startHostedRoomSync(storage) {
   } catch {
     $hostedRoomOutbox.set(client.createHostedRoomOutbox())
   }
+  try {
+    $hostedRoomCleanup.set(normalizeHostedRoomCleanup(await storage?.get?.(HOSTED_ROOM_CLEANUP_KEY)))
+  } catch {
+    // Preserve an in-memory empty queue but do not advertise that cleanup was
+    // completed; a later successful storage read will retry on app restart.
+    $hostedRoomCleanup.set({ version: 1, operations: [] })
+  }
+  await dispatchHostedRoomCleanup().catch(() => undefined)
   await refreshHostedRooms().catch(() => undefined)
   await dispatchHostedRoomOutbox().catch(() => undefined)
   scheduleHostedRoomSync()
@@ -1944,21 +2118,88 @@ async function enqueueHostedRoomCommand(command) {
   )
 }
 
-async function sendHostedGroupChat(group, sent, thread) {
+function hostedAttachmentRef(eventId, index, memberId) {
+  const seed = `${eventId}-${index}-${memberId}`
+    .replace(/[^A-Za-z0-9._:-]/g, '-')
+    .slice(0, 220)
+  return `staged:${seed || `attachment-${index}`}`
+}
+
+function hostedAttachmentMime(attachment) {
+  if (attachment?.mime) return String(attachment.mime)
+  const match = /^data:([^;,]+)/i.exec(String(attachment?.data || ''))
+  return match?.[1] || (
+    attachment?.kind === 'pdf'
+      ? 'application/pdf'
+      : attachment?.kind === 'image'
+        ? 'image/png'
+        : 'application/octet-stream'
+  )
+}
+
+async function stageSameGatewayHostedAttachments(group, members, eventId, attachments) {
+  const picked = (Array.isArray(attachments) ? attachments : []).slice(0, 8)
+  if (!picked.length) return []
+  const manifests = picked.map(attachment => ({
+    kind: attachment.kind,
+    name: attachment.name || 'attachment',
+    size: Math.max(0, Number(attachment.size || 0)),
+    mime: hostedAttachmentMime(attachment),
+    refs: {}
+  }))
+
+  for (const member of members) {
+    const { runtime } = await ensureGroupChatSession(group, member)
+    if (!runtime) {
+      throw new Error(`${displayName(member, botRosterMeta(member, $botMeta.get()))} is unavailable.`)
+    }
+    const memberId = member.memberId || (member.name === 'default' ? 'default' : member.name)
+    for (let index = 0; index < picked.length; index++) {
+      const attachment = picked[index]
+      if (attachment.kind === 'pdf') {
+        await requestForBot(member, 'pdf.attach', {
+          session_id: runtime,
+          content_base64: attachment.data,
+          filename: attachment.name || 'attachment.pdf'
+        })
+      } else if (attachment.kind === 'file') {
+        await requestForBot(member, 'file.attach', {
+          session_id: runtime,
+          data_url: attachment.data,
+          name: attachment.name || 'attachment'
+        })
+      } else {
+        await requestForBot(member, 'image.attach_bytes', {
+          session_id: runtime,
+          content_base64: attachment.data,
+          filename: attachment.name || 'attachment.png'
+        })
+      }
+      manifests[index].refs[memberId] = hostedAttachmentRef(eventId, index, memberId)
+    }
+  }
+  return manifests
+}
+
+async function sendHostedGroupChat(group, members, sent, thread, attachments) {
   const room = $groupChats.get()[group]
   const connectionId = String(room?.hostedConnectionId || '')
   if (!connectionId) {
     throw new Error('This group is offline. Try again when its gateway reconnects.')
   }
-  await enqueueHostedRoomCommand({
+  const manifests = room?.continuityMode === 'distributed'
+    ? []
+    : await stageSameGatewayHostedAttachments(group, members, sent.id, attachments)
+  return enqueueHostedRoomCommand({
     commandId: sent.id,
     kind: 'send',
     roomId: room.roomId,
     authorityId: groupChatHostedGateway(room),
     connectionId,
     payload: {
-      text: sent.text || '',
-      thread_id: thread
+      text: sent.text || (manifests.length ? 'Shared an attachment.' : ''),
+      thread_id: thread,
+      ...(manifests.length ? { attachments: manifests } : {})
     }
   })
 }
@@ -2013,6 +2254,7 @@ async function approveHostedGroupChat(group, action, choice) {
     member_id: action.member_id,
     task_id: action.task_id,
     execution_generation: action.execution_generation,
+    request_id: action.request_id,
     choice
   })
   updateGroupChat(group, current => ({
@@ -2021,7 +2263,8 @@ async function approveHostedGroupChat(group, action, choice) {
       candidate?.kind !== 'approval' ||
       candidate?.member_id !== action.member_id ||
       candidate?.task_id !== action.task_id ||
-      Number(candidate?.execution_generation || 0) !== Number(action.execution_generation || 0)
+      Number(candidate?.execution_generation || 0) !== Number(action.execution_generation || 0) ||
+      candidate?.request_id !== action.request_id
     )
   }), { sync: false })
   scheduleHostedRoomSync(0)
@@ -9426,17 +9669,19 @@ async function harvestStrandedUntilSettled(group, members, thread) {
 function sendToGroupChat(group, members, text, thread, images) {
   const trimmed = String(text || '').trim()
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
-  const hosted = groupChatHostedGateway($groupChats.get()[group])
+  const room = $groupChats.get()[group]
+  const hosted = groupChatHostedGateway(room)
+  const distributedHosted = Boolean(hosted && room?.continuityMode === 'distributed')
 
   if ((!trimmed && !attached.length) || !members.length) {
     return null
   }
 
   if (hosted) {
-    if (attached.length) {
+    if (distributedHosted && attached.length) {
       host.notify?.({
         kind: 'info',
-        message: 'Files are not available in background rooms yet. The draft was kept.'
+        message: 'Files are not available across gateways yet. The draft was kept.'
       })
       return null
     }
@@ -9446,27 +9691,40 @@ function sendToGroupChat(group, members, text, thread, images) {
       { kind: 'user', name: 'You' },
       trimmed,
       target,
-      [],
+      attached,
       { hostedMirror: true, pending: true, sync: false }
     )
     if (!sent) return null
     updateGroupChat(group, room => {
       room.running = true
-      room.hostedStatus = { state: 'working', label: 'Working' }
+      room.hostedStatus = { state: 'sending', label: 'Sending…' }
       return room
     })
     recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
-    void sendHostedGroupChat(group, sent, target).catch(() => {
-      updateGroupChat(group, room => {
-        room.running = false
-        room.hostedStatus = { state: 'failed', label: 'Needs attention' }
-        room.continuityIssue = 'Message not sent. Retry when the gateway reconnects.'
-        room.log = room.log.map(entry =>
-          entry.id === sent.id ? { ...entry, pending: false, failed: true } : entry
-        )
-        return room
-      }, { sync: false })
-    })
+    void sendHostedGroupChat(group, members, sent, target, attached)
+      .then(acknowledged => {
+        updateGroupChat(group, room => ({
+          ...room,
+          running: true,
+          hostedStatus: acknowledged
+            ? { state: 'working', label: 'Working' }
+            : { state: 'queued', label: 'Queued until the gateway reconnects' },
+          continuityIssue: acknowledged
+            ? null
+            : 'Your message is saved and will send when the gateway reconnects.'
+        }), { sync: false })
+      })
+      .catch(() => {
+        updateGroupChat(group, room => {
+          room.running = false
+          room.hostedStatus = { state: 'failed', label: 'Needs attention' }
+          room.continuityIssue = 'Message not sent. Retry when the gateway reconnects.'
+          room.log = room.log.map(entry =>
+            entry.id === sent.id ? { ...entry, pending: false, failed: true } : entry
+          )
+          return room
+        }, { sync: false })
+      })
     return target
   }
 
@@ -13674,6 +13932,14 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         const hostedMembers = []
         const peerRegistrations = []
         try {
+          await addHostedRoomCleanup({
+            operationId: `${roomId}:home-disband`,
+            setupId: roomId,
+            kind: 'home-disband',
+            connectionId: String(hostPlan.homeConnectionId),
+            roomId,
+            cancelId: `rollback-${roomId}`
+          })
           for (const [index, bot] of selected.entries()) {
             const route = botConnectionRoute(bot)
             const connectionId = String(route?.connectionId || '')
@@ -13705,6 +13971,18 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
             })
             const targetCapability = hostCapabilities[connectionId]
             const targetUrl = targetCapability?.roomLink?.endpoint
+            const invitedProfile = String(invitation?.target_profile || profile || '')
+
+            if (invitation?.grant && invitedProfile) {
+              await addHostedRoomCleanup({
+                operationId: `${roomId}:peer-revoke:${memberId}`,
+                setupId: roomId,
+                kind: 'peer-revoke',
+                connectionId,
+                profile: invitedProfile,
+                grant: invitation.grant
+              })
+            }
 
             if (!targetUrl || !invitation?.grant || !invitation?.catalog || !invitation?.target_profile) {
               throw new Error('A gateway could not prepare this room.')
@@ -13745,23 +14023,20 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           for (const { bot: _bot, ...registration } of peerRegistrations) {
             await requestHostedConnection(homeRoute, 'groups.peer.register', registration)
           }
+          // The room becomes user-visible only after removing every rollback
+          // intent durably. If this commit cannot be persisted, fail creation
+          // and let the durable cleanup finish instead of exposing a room that
+          // a later restart could revoke underneath the user.
+          await releaseHostedRoomCleanup(roomId)
         } catch (error) {
-          const cleanup = await Promise.allSettled([
-            ...(hostedRoom
-              ? [requestHostedConnection(homeRoute, 'groups.disband', {
-                  room_id: roomId,
-                  cancel_id: `rollback-${roomId}`
-                })]
-              : []),
-            ...peerRegistrations.map(registration =>
-              requestForBot(registration.bot, 'groups.peer.revoke', {
-                grant: registration.grant,
-                profile: registration.target_profile
-              })
-            )
-          ])
+          await armHostedRoomCleanup(roomId).catch(() => undefined)
+          await dispatchHostedRoomCleanup().catch(() => undefined)
           hostedRoom = null
-          if (cleanup.some(result => result.status === 'rejected')) {
+          if (
+            normalizeHostedRoomCleanup($hostedRoomCleanup.get()).operations.some(
+              operation => operation.setupId === roomId
+            )
+          ) {
             throw new Error('Some gateways could not finish cleanup. Check gateway connections before trying again.')
           }
           throw error
@@ -14359,7 +14634,9 @@ function GroupClarifyCard({ entry, members, onAnswer = null }) {
                           return { ...prev, [q.qid]: next }
                         })
                       },
-                      children: choice
+                      children: isApproval
+                        ? ({ once: 'Allow once', deny: 'Deny' }[choice] || choice)
+                        : choice
                     }, `choice:${q.qid}:${choice}`)
                   })
                 })
@@ -14488,6 +14765,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
   const hosted = Boolean(groupChatHostedGateway(room))
+  const hostedAttachmentsUnavailable = hosted && room.continuityMode === 'distributed'
   const retryAction = Array.isArray(room.hostedPendingActions)
     ? room.hostedPendingActions.find(action => action?.kind === 'retry')
     : null
@@ -14624,10 +14902,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     }
 
     event.preventDefault()
-    if (hosted) {
+    if (hostedAttachmentsUnavailable) {
       host.notify({
         kind: 'info',
-        message: 'Files are not available in background rooms yet.'
+        message: 'Files are not available across gateways yet.'
       })
       return
     }
@@ -14649,10 +14927,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     }
 
     event.preventDefault()
-    if (hosted) {
+    if (hostedAttachmentsUnavailable) {
       host.notify({
         kind: 'info',
-        message: 'Files are not available in background rooms yet.'
+        message: 'Files are not available across gateways yet.'
       })
       return
     }
@@ -14670,7 +14948,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     .filter(entry => entry?.group === group)
     .sort((a, b) => (a.at || 0) - (b.at || 0))
   const hostedApprovals = (Array.isArray(room.hostedPendingActions) ? room.hostedPendingActions : [])
-    .filter(action => action?.kind === 'approval')
+    .filter(action => action?.kind === 'approval' && typeof action?.request_id === 'string' && action.request_id)
     .map(action => {
       const member = members.find(
         candidate =>
@@ -14684,7 +14962,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         kind: 'approval',
         memberKey: action.member_id,
         member: member?.name || action.member_id,
-        requestId: `${action.task_id || 'task'}:${Number(action.execution_generation || 0)}`,
+        requestId: String(action.request_id || ''),
         question: typeof approval.description === 'string' ? approval.description : '',
         command: typeof approval.command === 'string' ? approval.command : '',
         choices: Array.isArray(approval.choices) && approval.choices.length
@@ -15007,16 +15285,16 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
 
   const attachButton = thread =>
     jsx(Tip, {
-      label: hosted
-        ? 'Files are not available in background rooms yet'
+      label: hostedAttachmentsUnavailable
+        ? 'Files are not available across gateways yet'
         : 'Attach files — every responding bot sees them',
       children: jsx(Button, {
         type: 'button',
         variant: 'ghost',
         size: 'sm',
-        disabled: hosted,
+        disabled: hostedAttachmentsUnavailable,
         className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-        'aria-label': hosted ? 'File sharing unavailable in this room' : 'Attach files',
+        'aria-label': hostedAttachmentsUnavailable ? 'File sharing unavailable across gateways' : 'Attach files',
         onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
         children: jsx(Codicon, { name: 'attach' })
       })
@@ -15293,7 +15571,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     onDragOver: event => {
       if ([...(event.dataTransfer?.types || [])].includes('Files')) {
         event.preventDefault()
-        setDragOver(true)
+        // Background rooms do not transport bytes yet. Keep accepting the
+        // drop event so the browser does not navigate to the file, but do not
+        // advertise a drop target that will reject it.
+        if (!hostedAttachmentsUnavailable) setDragOver(true)
       }
     },
     onDragLeave: event => {

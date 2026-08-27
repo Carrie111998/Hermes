@@ -57,7 +57,11 @@ test('source contract: creation negotiates continuity without exposing routing j
 })
 
 test('source contract: an admitted autonomous room must roll back before any Desktop fallback', () => {
-  assert.match(pluginSource, /cancel_id: `rollback-\$\{roomId\}`/)
+  assert.match(pluginSource, /kind: 'home-disband'/)
+  assert.match(pluginSource, /cancelId: `rollback-\$\{roomId\}`/)
+  assert.match(pluginSource, /HOSTED_ROOM_CLEANUP_KEY/)
+  assert.match(pluginSource, /await releaseHostedRoomCleanup\(roomId\)/)
+  assert.match(pluginSource, /await armHostedRoomCleanup\(roomId\)/)
   assert.match(pluginSource, /'groups\.peer\.revoke'/)
   assert.match(
     pluginSource,
