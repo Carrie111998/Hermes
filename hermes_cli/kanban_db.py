@@ -1398,6 +1398,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Durable model-policy decision. This is generated at claim time and
+    -- checked again immediately before a worker is spawned.
+    routing_priority     TEXT,
+    routing_tier         TEXT,
+    route_snapshot       TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1484,7 +1489,16 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Copied from the task's approved claim-time policy decision. The token
+    -- and aggregate cost columns are Phase-A storage placeholders; Phase B
+    -- owns metering and the richer per-run accounting migration.
+    routing_priority    TEXT,
+    routing_tier        TEXT,
+    route_snapshot      TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cost_usd            REAL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2650,6 +2664,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
         )
 
+    # Policy-route fields are additive so both fresh and legacy boards can
+    # pass through the fail-closed claim/spawn boundary. Do not synthesize a
+    # snapshot here: normal dispatch must obtain it from the policy resolver.
+    for _name, _definition in (
+        ("routing_priority", "routing_priority TEXT"),
+        ("routing_tier", "routing_tier TEXT"),
+        ("route_snapshot", "route_snapshot TEXT"),
+    ):
+        if _name not in cols:
+            _add_column_if_missing(conn, "tasks", _name, _definition)
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2785,6 +2810,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        for _name, _definition in (
+            ("routing_priority", "routing_priority TEXT"),
+            ("routing_tier", "routing_tier TEXT"),
+            ("route_snapshot", "route_snapshot TEXT"),
+            ("input_tokens", "input_tokens INTEGER"),
+            ("output_tokens", "output_tokens INTEGER"),
+            ("cost_usd", "cost_usd REAL"),
+        ):
+            if _name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", _name, _definition)
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
