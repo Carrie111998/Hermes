@@ -7833,6 +7833,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # commit_count == 0 branch, which returns immediately after: an update
         # that pulled hundreds of upstream commits printed "Already up to
         # date!" and verified nothing).
+        # pre_pull_sha is captured later for the main pull path, but when the
+        # fork sync (below) already advances HEAD, the subsequent
+        # ``merge --ff-only origin/<branch>`` is a no-op — HEAD already equals
+        # origin/<branch>. Capturing pre_pull_sha AFTER the sync would make the
+        # "Code did not move" guard (line ~8207) false-positive, because
+        # post_pull_sha would equal the already-advanced pre_pull_sha. When the
+        # sync moves HEAD, stash the PRE-sync SHA here so the guard sees the
+        # real movement and the syntax-error rollback target is the last
+        # known-good checkout, not the post-sync tip.
+        pre_pull_sha = None
+
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
@@ -7847,6 +7858,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # HEAD moving is itself proof of an update. Keep the update
                 # path active even if the informational count cannot be read.
                 commit_count = max(1, synced_count)
+                # The sync already advanced HEAD; the main pull's
+                # ``merge --ff-only origin/<branch>`` will be a no-op. Use the
+                # pre-sync SHA as the pull baseline so the "Code did not move"
+                # guard and the syntax-error rollback both reference the state
+                # before ANY code moved this run.
+                pre_pull_sha = pre_sync_sha
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -8027,7 +8044,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # orphan merge-conflict markers in hermes_cli/config.py bricked
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
-        pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        #
+        # When the fork-sync path above already advanced HEAD, pre_pull_sha
+        # was set to the PRE-sync SHA so the "Code did not move" guard and
+        # the syntax-error rollback reference the real baseline. Don't
+        # clobber it here — the merge below is a no-op against the already
+        # advanced checkout, so re-capturing now would make the guard
+        # false-positive (post_pull_sha would equal the new pre_pull_sha).
+        if pre_pull_sha is None:
+            pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
