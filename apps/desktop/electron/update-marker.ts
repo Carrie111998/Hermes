@@ -21,13 +21,8 @@
  */
 
 import fs from 'fs'
+import crypto from 'node:crypto'
 import path from 'path'
-
-// Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
-export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
@@ -55,10 +50,10 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
  * Read + interpret the marker.
  *
  * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * (parseable pid that is alive). Returns `null` for every "no live update"
+ * case — absent, unreadable, malformed, or dead pid — and deletes a dead or
+ * malformed marker so it cannot strand future launches. Age is diagnostic
+ * only: elapsed time never authorizes takeover from a confirmed-live owner.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -67,11 +62,9 @@ export function readLiveUpdateMarker(
   hermesHome,
   {
     kill,
-    now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
+    now = Date.now
   }: {
     now?: () => number
-    maxAgeMs?: number
     kill?: typeof process.kill
   } = {}
 ) {
@@ -84,13 +77,14 @@ export function readLiveUpdateMarker(
     return null // absent or unreadable => no live update
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const [pidLine, startedLine] = raw.split(/\r?\n/)
+  const claimToken = raw.split(/\r?\n/)[2]?.trim() || null
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
+  const alive = Number.isInteger(pid) && Number.isFinite(startedAt) && isPidAlive(pid, kill)
 
-  if (!alive || ageMs > maxAgeMs) {
+  if (!alive) {
     try {
       fs.unlinkSync(file)
     } catch {
@@ -100,7 +94,7 @@ export function readLiveUpdateMarker(
     return null
   }
 
-  return { pid, ageMs }
+  return { pid, ageMs, claimToken }
 }
 
 /**
@@ -132,18 +126,18 @@ export function writeUpdateMarker(
   {
     kill,
     now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
-    startedAt
+    startedAt,
+    claimToken
   }: {
     now?: () => number
-    maxAgeMs?: number
     kill?: typeof process.kill
     startedAt?: number
+    claimToken?: string
   } = {}
 ) {
   const file = markerPath(hermesHome)
   const nowMs = now()
-  const owner = readLiveUpdateMarker(hermesHome, { kill, maxAgeMs, now: () => nowMs })
+  const owner = readLiveUpdateMarker(hermesHome, { kill, now: () => nowMs })
 
   const acquiredAt =
     typeof startedAt === 'number' && Number.isInteger(startedAt)
@@ -152,11 +146,26 @@ export function writeUpdateMarker(
         ? Math.floor((nowMs - owner.ageMs) / 1000)
         : Math.floor(nowMs / 1000)
 
+  const token = claimToken || crypto.randomUUID().replaceAll('-', '')
+  const temporary = `${file}.claim-${process.pid}-${token}`
+
   try {
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n`, 'utf8')
-  } catch {
-    // Best-effort: if we can't write the marker, proceed anyway. The
-    // updater will write its own when it reaches run_update.
+    fs.writeFileSync(temporary, `${pid}\n${acquiredAt}\n${token}\n`, { encoding: 'utf8', flag: 'wx' })
+    fs.linkSync(temporary, file)
+
+    return { acquired: true, claimToken: token }
+  } catch (error: any) {
+    if (error?.code === 'EEXIST') {
+      return { acquired: false, claimToken: token }
+    }
+
+    throw error
+  } finally {
+    try {
+      fs.unlinkSync(temporary)
+    } catch {
+      // The published hard link owns the inode; temporary cleanup is best-effort.
+    }
   }
 }
 
@@ -183,7 +192,6 @@ export function updateHandoffConflict(
   hermesHome,
   opts: {
     now?: () => number
-    maxAgeMs?: number
     kill?: typeof process.kill
   } = {}
 ) {

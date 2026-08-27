@@ -100,6 +100,31 @@ def test_non_handoff_run_never_hard_exits(monkeypatch):
     assert events["receipts"] == [(0, "completed at command boundary")]
 
 
+def test_lock_infrastructure_failure_is_diagnostic_and_finalizes(
+    monkeypatch, capsys, tmp_path
+):
+    events = []
+    not_a_directory = tmp_path / "not-a-directory"
+    not_a_directory.write_text("file", encoding="utf-8")
+    marker = not_a_directory / ".hermes-update-in-progress"
+
+    monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda root: "git")
+    monkeypatch.setattr("hermes_cli.update_lock.update_marker_path", lambda: marker)
+    monkeypatch.setattr(main_mod, "_install_hangup_protection", lambda gateway_mode=False: "io")
+    monkeypatch.setattr(main_mod, "_finalize_update_output", lambda state: events.append(state))
+
+    args = SimpleNamespace(plan=False, check=False, gateway=False, branch=None)
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_update(args)
+
+    assert excinfo.value.code == 2
+    output = capsys.readouterr().out
+    assert "could not claim update ownership" in output
+    assert "No update files were changed" in output
+    assert events == ["io"]
+
+
 def test_handoff_child_propagates_early_systemexit_code(monkeypatch):
     def early_refusal(args, gateway_mode=False):
         raise SystemExit(3)

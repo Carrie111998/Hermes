@@ -450,6 +450,33 @@ async fn run_bootstrap(
 ) -> Result<String> {
     let kind = ScriptKind::for_current_os();
 
+    // Install/repair and update replace the same checkout and managed venv.
+    // Claim the cross-entry marker before resolving or running any stage so a
+    // bootstrap cannot kill an in-flight updater's Python process (or overlap
+    // another bootstrap). Stage children adopt this parent claim through
+    // HERMES_UPDATE_HANDOFF_PID, set by powershell::run_script.
+    let ownership_home = args
+        .hermes_home
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::paths::hermes_home);
+    let _install_ownership = match crate::update::UpdateMarkerGuard::acquire(
+        ownership_home.join(".hermes-update-in-progress"),
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let msg = error.user_message();
+            emit_event(
+                &app,
+                BootstrapEvent::Failed {
+                    stage: None,
+                    error: msg.clone(),
+                },
+            );
+            return Err(anyhow!(msg));
+        }
+    };
+
     let pin = Pin {
         commit: args.commit.or_else(|| option_env_string("BUILD_PIN_COMMIT")),
         branch: args.branch.or_else(|| option_env_string("BUILD_PIN_BRANCH")),

@@ -128,10 +128,10 @@ test('parks across the flag→marker handoff without a gap', async () => {
   assert.deepEqual(reasons, ['update-in-flight', 'update-in-flight', 'marker', 'marker', 'marker'])
 })
 
-test('returns timeout when the gate never opens', async () => {
+test('returns timeout when the in-process-only gate never opens', async () => {
   let clock = 0
 
-  const outcome = await waitForUpdateClearance(deps(true, false), {
+  const outcome = await waitForUpdateClearance(deps(false, true), {
     now: () => clock,
     pollMs: 10,
     sleep: async ms => {
@@ -141,4 +141,30 @@ test('returns timeout when the gate never opens', async () => {
   })
 
   assert.equal(outcome, 'timeout')
+})
+
+test('a live marker remains authoritative past the wait deadline', async () => {
+  let clock = 0
+  let marker = true
+  let ticks = 0
+
+  const outcome = await waitForUpdateClearance(
+    { hasLiveMarker: () => marker, isUpdateInFlight: () => false },
+    {
+      now: () => clock,
+      pollMs: 10,
+      sleep: async ms => {
+        clock += ms
+        ticks += 1
+
+        if (ticks === 8) {
+          marker = false
+        }
+      },
+      timeoutMs: 50
+    }
+  )
+
+  assert.ok(clock > 50, 'the live operation lock must outlast the UI wait deadline')
+  assert.equal(outcome, 'finished')
 })

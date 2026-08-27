@@ -2091,11 +2091,11 @@ function directoryExists(filePath) {
 // cycle loops. Instead the fresh instance parks until the update finishes, then
 // brings the backend up itself (it is the surviving instance — the updater's
 // own relaunch hits our single-instance lock and quits). Marker parsing +
-// staleness self-heal live in update-marker.ts (unit-tested).
+// dead-owner self-heal lives in update-marker.ts (unit-tested).
 
-// How long we'll park the launch waiting for a live update to finish before
-// giving up and starting the backend anyway (belt-and-suspenders alongside the
-// marker's own age ceiling; covers a stuck-but-alive updater).
+// How long we'll park on the in-process-only update flag. A confirmed-live
+// marker owner never times out: starting the backend while that process is
+// replacing the managed venv would violate update ownership.
 const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
 const UPDATE_WAIT_POLL_MS = 1000
 // How long the desktop lingers on the "updating, don't reopen" overlay after
@@ -3806,6 +3806,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
     if (scriptHandoff) {
       const updateStartedAt = Math.floor(Date.now() / 1000)
+      const handoffClaimToken = crypto.randomUUID().replaceAll('-', '')
 
       // A bare detached+hidden powershell spawn silently dies before -File
       // processing (console-subsystem init failure — see
@@ -3831,6 +3832,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
           ...process.env,
           HERMES_HOME,
           HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
+          HERMES_UPDATE_CLAIM_TOKEN: handoffClaimToken,
           PATH: pathWithHermesManagedNode(venvBin)
         },
         detached: true,
@@ -3845,7 +3847,23 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // The `hermes update` child adopts the SCRIPT's claim via
       // update_lock.py's process-ancestry rule; no mtime heuristics needed.
       if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
+        const publication = writeUpdateMarker(HERMES_HOME, child.pid, {
+          startedAt: updateStartedAt,
+          claimToken: handoffClaimToken
+        })
+
+        if (!publication.acquired) {
+          const owner = readLiveUpdateMarker(HERMES_HOME)
+
+          if (owner?.claimToken !== handoffClaimToken) {
+            const message = 'Update aborted: another updater claimed Hermes during hand-off. Wait for it to finish, then retry.'
+            rememberLog(`[updates] refusing raced hand-off: ${message}`)
+            emitUpdateProgress({ stage: 'error', message, percent: null })
+            startHermes().catch(() => {})
+
+            return { ok: false, error: 'update-already-running', message }
+          }
+        }
       }
 
       rememberLog(
@@ -3879,7 +3897,20 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // strictly better than never updating again, and the updater still writes
       // its own marker moments later.
       if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-        writeUpdateMarker(HERMES_HOME, child.pid)
+        const publication = writeUpdateMarker(HERMES_HOME, child.pid)
+
+        if (!publication.acquired) {
+          const owner = readLiveUpdateMarker(HERMES_HOME)
+
+          if (owner?.pid !== child.pid) {
+            const message = 'Update aborted: another updater claimed Hermes during hand-off. Wait for it to finish, then retry.'
+            rememberLog(`[updates] refusing raced staged hand-off: ${message}`)
+            emitUpdateProgress({ stage: 'error', message, percent: null })
+            startHermes().catch(() => {})
+
+            return { ok: false, error: 'update-already-running', message }
+          }
+        }
       } else if (Number.isInteger(child.pid)) {
         rememberLog(
           `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`

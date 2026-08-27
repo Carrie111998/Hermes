@@ -23,10 +23,10 @@ unchanged and remain byte-compatible with the Rust and Electron readers:
 
     <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+A marker counts as a live update while its pid is alive. Elapsed age is retained
+for diagnostics but never authorizes a second updater to steal a live owner's
+lock. A dead or malformed marker is removed on read by whoever notices it first,
+so a crashed updater still self-heals instead of wedging every future update.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -50,21 +50,55 @@ Two mechanisms recognize the orchestrating parent, and either suffices:
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import os
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
-# apps/desktop/electron/update-marker.ts — the same marker is read by both, and
-# a shorter ceiling here would let Python steal a lock Electron still considers
-# live. A full update (git pull + uv sync + desktop rebuild) is minutes.
-UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
-
 MARKER_NAME = ".hermes-update-in-progress"
+_OWNERSHIP_MUTEX_NAME = "Global\\HermesUpdateMarkerOwnership"
+_fallback_mutex = threading.RLock()
+
+
+@contextlib.contextmanager
+def _ownership_transaction():
+    """Serialize marker inspect/reclaim/publish across Windows entrypoints."""
+    if os.name != "nt":
+        with _fallback_mutex:
+            yield
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.CreateMutexW(None, False, _OWNERSHIP_MUTEX_NAME)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "Could not create update ownership mutex")
+    acquired = False
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        if result not in (0, 0x80):
+            raise OSError(ctypes.get_last_error(), "Could not acquire update ownership mutex")
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
 
 # Set by an orchestrating updater (the Tauri `hermes-setup --update` flow) to
 # its own pid before spawning `hermes update` as a child stage. The parent
@@ -168,15 +202,15 @@ class UpdateHolder:
     age_seconds: float
 
 
-def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
+def _read_live_update_unlocked(marker: Path) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
     Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
-    Never raises.
+    unreadable, malformed, and dead-pid markers mean "no live update", and a
+    dead marker file is deleted so it can't strand future runs. Elapsed age is
+    diagnostic only: a confirmed-live owner keeps the operation lock until it
+    exits or releases it. Never raises.
     """
-    marker = path or update_marker_path()
     try:
         raw = marker.read_text(encoding="utf-8")
     except OSError:
@@ -190,10 +224,10 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     try:
         started_at = float(lines[1].strip())
     except (IndexError, ValueError):
-        started_at = float("-inf")
+        started_at = float("nan")
 
     age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
+    if not math.isfinite(started_at) or not _pid_alive(pid):
         try:
             marker.unlink()
         except OSError:
@@ -201,6 +235,13 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
         return None
 
     return UpdateHolder(pid=pid, age_seconds=age)
+
+
+def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
+    """Return the live owner while atomically pruning stale diagnostics."""
+    marker = path or update_marker_path()
+    with _ownership_transaction():
+        return _read_live_update_unlocked(marker)
 
 
 def describe_holder(holder: UpdateHolder) -> str:
@@ -231,6 +272,23 @@ class UpdateLock:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self.failure_reason: str | None = None
+        self.claim_token: str | None = None
+
+    def _fail(self, action: str, exc: BaseException) -> bool:
+        self.failure_reason = (
+            f"✗ Hermes could not claim update ownership at {self.path} "
+            f"while {action}: {exc}.\n\n"
+            "  No update files were changed. Check access to the Hermes home "
+            "directory, then retry."
+        )
+        logger.warning(
+            "Could not claim update ownership at %s while %s: %s",
+            self.path,
+            action,
+            exc,
+        )
+        return False
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -242,44 +300,71 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
-        existing = read_live_update(path=self.path)
-        if existing is not None:
-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
-                return True
-            self.holder = existing
-            return False
+        self.acquired = False
+        self.holder = None
+        self.failure_reason = None
+        self.claim_token = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
         except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
-            logger.debug("Could not write update marker %s: %s", self.path, exc)
-            return True
-        self.acquired = True
-        return True
+            return self._fail("creating the marker directory", exc)
+
+        try:
+            with _ownership_transaction():
+                existing = _read_live_update_unlocked(self.path)
+                if existing is not None:
+                    if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                        return True
+                    self.holder = existing
+                    return False
+                claim = self.path.with_name(
+                    f"{self.path.name}.claim-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+                )
+                claim_token = uuid.uuid4().hex
+                fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as marker:
+                    marker.write(f"{os.getpid()}\n{int(time.time())}\n{claim_token}\n")
+                try:
+                    if os.name == "nt":
+                        # Windows rename is non-replacing. Under the named
+                        # mutex this publishes a complete claim atomically and
+                        # also works on filesystems that do not support links.
+                        os.rename(claim, self.path)
+                    else:
+                        os.link(claim, self.path)
+                finally:
+                    claim.unlink(missing_ok=True)
+                self.acquired = True
+                self.claim_token = claim_token
+                return True
+        except OSError as exc:
+            return self._fail("publishing the ownership marker", exc)
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""
         if not self.acquired:
             return
         self.acquired = False
+        claim_token = self.claim_token
+        self.claim_token = None
         try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
-            return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
-            return
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+            with _ownership_transaction():
+                try:
+                    lines = self.path.read_text(encoding="utf-8").splitlines()
+                    owner = int(lines[0].strip())
+                    on_disk_token = lines[2].strip() if len(lines) > 2 else None
+                except (OSError, IndexError, ValueError):
+                    return
+                if owner != os.getpid() or on_disk_token != claim_token:
+                    return
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
+        except OSError as exc:
+            # Release is best-effort and must never replace the update's real
+            # outcome with a mutex/infrastructure traceback.
+            logger.warning("Could not release update ownership at %s: %s", self.path, exc)
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

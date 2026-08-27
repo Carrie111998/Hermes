@@ -10801,7 +10801,13 @@ def cmd_update(args):
 
     _update_lock = UpdateLock()
     if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
+        if _update_lock.holder is not None:
+            print(describe_holder(_update_lock.holder))
+        else:
+            print(
+                getattr(_update_lock, "failure_reason", None)
+                or "✗ Hermes could not claim update ownership. No update files were changed."
+            )
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 

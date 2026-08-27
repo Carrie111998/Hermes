@@ -6,10 +6,10 @@
  * Run with: node --test electron/update-marker.test.ts
  * (Wired into npm test:desktop:platforms in package.json.)
  *
- * Why this matters: the gate must (a) report a live update only when the
- * updater pid is alive AND the marker is fresh, (b) treat absent/malformed/
- * dead-pid/expired markers as "no live update" so a crashed updater can't
- * strand future launches, and (c) self-heal by deleting a stale marker file.
+ * Why this matters: the gate must (a) report a live update whenever the
+ * updater pid is alive, regardless of elapsed age, (b) treat absent/malformed/
+ * dead-pid markers as "no live update" so a crashed updater can't strand
+ * future launches, and (c) self-heal by deleting a dead marker file.
  */
 
 import fs from 'fs'
@@ -23,7 +23,6 @@ import {
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
-  UPDATE_MARKER_MAX_AGE_MS,
   updateHandoffConflict,
   writeUpdateMarker
 } from './update-marker'
@@ -52,7 +51,7 @@ test('absent marker => no live update', () => {
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
 })
 
-test('live pid within age ceiling => live update reported', () => {
+test('live pid => live update reported', () => {
   const home = tmpHome('live')
   const now = 1_000_000_000_000
   writeMarker(home, 4242, Math.floor(now / 1000) - 5) // 5s old
@@ -70,13 +69,14 @@ test('dead pid => no live update and marker is pruned', () => {
   assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
 })
 
-test('expired marker (past age ceiling) => no live update and pruned', () => {
-  const home = tmpHome('expired')
+test('old marker with a live pid remains authoritative', () => {
+  const home = tmpHome('old-live')
   const now = 1_000_000_000_000
-  writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  // Even though the pid is "alive", the marker is too old to trust.
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
-  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+  writeMarker(home, 4242, Math.floor((now - 24 * 60 * 60 * 1000) / 1000))
+  const owner = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+  assert.ok(owner, 'elapsed age alone must not release a live operation lock')
+  assert.equal(owner.pid, 4242)
+  assert.ok(fs.existsSync(markerPath(home)), 'an old live marker is not deleted')
 })
 
 test('malformed marker => no live update and pruned', () => {
@@ -115,17 +115,18 @@ test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () =
   assert.ok(fs.existsSync(markerPath(home)), 'marker file should exist after write')
 })
 
-test('writeUpdateMarker preserves a live holder age across pid hand-off', () => {
+test('writeUpdateMarker refuses to replace a live holder during hand-off', () => {
   const home = tmpHome('write-handoff-age')
   const now = 1_000_000_000_000
   const startedAt = Math.floor(now / 1000) - 300
 
   writeMarker(home, 1010, startedAt)
-  writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
+  const result = writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
 
   const [pidLine, startedLine] = fs.readFileSync(markerPath(home), 'utf8').split('\n')
-  assert.equal(Number.parseInt(pidLine, 10), 2020, 'the hand-off records the new owner')
-  assert.equal(Number.parseInt(startedLine, 10), startedAt, 'the holder age must not restart during hand-off')
+  assert.equal(result.acquired, false)
+  assert.equal(Number.parseInt(pidLine, 10), 1010, 'the existing owner must not be replaced')
+  assert.equal(Number.parseInt(startedLine, 10), startedAt, 'the existing claim remains byte-stable')
 })
 
 test('writeUpdateMarker uses the acquisition time passed to a detached script', () => {
@@ -139,10 +140,19 @@ test('writeUpdateMarker uses the acquisition time passed to a detached script', 
   assert.equal(Number.parseInt(startedLine, 10), startedAt)
 })
 
-test('writeUpdateMarker is best-effort (no throw on bad path)', () => {
-  // A non-existent directory should not throw.
+test('writeUpdateMarker fails closed on an unusable marker directory', () => {
   const badHome = path.join(os.tmpdir(), 'hermes-marker-nonexistent-' + Date.now())
-  assert.doesNotThrow(() => writeUpdateMarker(badHome, 4242))
+  assert.throws(() => writeUpdateMarker(badHome, 4242))
+})
+
+test('writeUpdateMarker never replaces an existing claim', () => {
+  const home = tmpHome('write-no-replace')
+  writeMarker(home, 1010, Math.floor(Date.now() / 1000))
+
+  const result = writeUpdateMarker(home, 2020, { claimToken: 'new-token', kill: ALIVE })
+
+  assert.equal(result.acquired, false)
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8').split(/\r?\n/)[0], '1010')
 })
 
 test('writeUpdateMarker + dead pid => self-heals on read', () => {
@@ -186,11 +196,13 @@ test('a dead-pid marker does not block a hand-off (self-heals)', () => {
   assert.equal(updateHandoffConflict(home, { kill: DEAD }), null)
 })
 
-test('an expired marker does not block a hand-off (self-heals)', () => {
-  const home = tmpHome('conflict-expired')
+test('an old marker with a live pid still blocks a hand-off', () => {
+  const home = tmpHome('conflict-old-live')
   const now = 1_000_000_000_000
-  writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
+  writeMarker(home, 1010, Math.floor((now - 24 * 60 * 60 * 1000) / 1000))
+  const conflict = updateHandoffConflict(home, { kill: ALIVE, now: () => now })
+  assert.ok(conflict, 'an old live owner must still block a second updater')
+  assert.equal(conflict.pid, 1010)
 })
 
 test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {
