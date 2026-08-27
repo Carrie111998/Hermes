@@ -363,6 +363,26 @@ Unlike index-backed providers (Brave, Tavily, Exa) which return verbatim search-
 
 ---
 
+### DeepSeek native search
+
+`deepseek-v4-flash`, `deepseek-v4-pro`, and the experimental `deepseek-v4-flash-vision-exp` can execute `web_search` inside the model's Responses API turn. Use the regular DeepSeek inference credential and opt in explicitly:
+
+```yaml
+# ~/.hermes/config.yaml
+model:
+  provider: deepseek
+  default: deepseek-v4-flash
+web:
+  search_backend: "deepseek"
+  extract_backend: "firecrawl"  # optional; native DeepSeek search does not extract
+```
+
+All three exact documented model IDs use this route. Unknown or dated variants that are not capability-enabled remain on Chat Completions and return an actionable error if the native backend is selected. Hermes never auto-enables this backend merely because `DEEPSEEK_API_KEY` exists, and it only swaps in the native tool when the `web_search` function is already enabled for the agent.
+
+Native search can be token-intensive because DeepSeek may run multiple searches and page opens in one turn. Server-side `web_search_call` items are saved and replayed on follow-up turns so the search context is preserved.
+
+---
+
 ## Configuration
 
 ### Single backend
@@ -372,7 +392,7 @@ Set one provider for all web capabilities:
 ```yaml
 # ~/.hermes/config.yaml
 web:
-  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai | deepseek
 ```
 
 ### Per-capability configuration
@@ -412,7 +432,7 @@ If no backend has **ever** been selected (no `web.backend` / per-capability key 
 
 **One-shot keyless rescue for keyed backends:** when your chosen/keyed backend fails a call (bad key, outage, upstream 5xx), that single call automatically retries on the keyless free-tier ring instead of erroring — the result notes which vendor served it and why (`rescued_from` / `backend_error`). The failover is never sticky: the very next `web_search`/`web_extract` call attempts your chosen backend again. Disable with `web.keyless_rescue: false` (also off whenever `keyless_fallback` is off).
 
-xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
+xAI and DeepSeek native Web Search are **not** in the auto-detection chain. Their credentials are also used for inference and native search can have different cost/behavior from a client-side search provider, so opt in explicitly with `web.search_backend: "xai"` or `web.search_backend: "deepseek"`.
 
 ---
 
