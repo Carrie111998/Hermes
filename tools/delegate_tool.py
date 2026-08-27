@@ -3725,7 +3725,7 @@ def delegate_task(
 
     # 编码工作区可单独使用编码模型；只有用户显式开启时才覆盖通用路由。
     credentials_source = credentials_cfg if credentials_cfg else cfg
-    if not credentials_cfg:
+    if not credentials_cfg and os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1":
         try:
             from agent.coding_router import resolve_coding_route
 
@@ -4496,6 +4496,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+    configured_max_output_tokens = cfg.get("max_output_tokens")
+    if not isinstance(configured_max_output_tokens, int) or configured_max_output_tokens <= 0:
+        configured_max_output_tokens = None
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
@@ -4551,6 +4554,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "max_output_tokens": configured_max_output_tokens,
         }
 
     if not configured_provider:
@@ -4606,7 +4610,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
-        "max_output_tokens": runtime.get("max_output_tokens"),
+        "max_output_tokens": configured_max_output_tokens or runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }

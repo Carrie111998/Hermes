@@ -1931,6 +1931,27 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # 明确代码任务可在首轮直接交给外部编码 Worker；默认关闭，且失败时回落
+    # 到普通主模型循环，避免任意对话被静默截断。
+    try:
+        from agent.automatic_coding_worker import maybe_run_automatic_coding_worker
+
+        _automatic_worker_result = maybe_run_automatic_coding_worker(
+            agent, original_user_message
+        )
+    except Exception:
+        logger.debug("自动编码 Worker 路由检查失败，继续普通会话", exc_info=True)
+        _automatic_worker_result = None
+    if _automatic_worker_result is not None:
+        return {
+            "final_response": _automatic_worker_result["final_response"],
+            "messages": messages,
+            "api_calls": 0,
+            "completed": bool(_automatic_worker_result.get("completed")),
+            "automatic_coding_worker": True,
+            "worker_result": _automatic_worker_result.get("worker_result"),
+        }
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()

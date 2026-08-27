@@ -5,10 +5,25 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 
 _ALLOWED_KEYS = {"provider", "model", "base_url", "api_key", "api_mode", "max_output_tokens"}
+
+# 仅识别明确的代码动作，避免把“总结 README”“查天气”等普通对话误送给编码 CLI。
+_CODING_TASK_RE = re.compile(
+    r"(?:修复|改(?:代码|功能|bug)|实现|开发|重构|新增(?:接口|功能|测试)|"
+    r"写(?:代码|测试|接口)|排查(?:代码|bug)|运行(?:测试|构建)|提交(?:代码|PR)|"
+    r"fix|implement|refactor|debug|add\s+(?:test|feature|endpoint)|"
+    r"write\s+(?:code|test)|run\s+tests?)",
+    re.IGNORECASE,
+)
+
+
+def is_explicit_coding_task(task: Any) -> bool:
+    """只接受用户明确表达的代码修改/验证任务。"""
+    return isinstance(task, str) and bool(_CODING_TASK_RE.search(task))
 
 
 def resolve_coding_route(

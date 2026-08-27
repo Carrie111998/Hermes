@@ -245,6 +245,7 @@ DEFAULT_CONFIG = {
         # 外部编码 CLI Worker。默认关闭，明确启用后才会调用本机 Codex/Claude。
         "coding_worker": {
             "enabled": False,
+            "auto_route": False,
             "worker": "codex",
             "review_worker": "claude",
             "timeout_seconds": 900,
