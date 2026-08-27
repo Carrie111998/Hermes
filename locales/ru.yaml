@@ -160,6 +160,11 @@ gateway:
     subscribed_suffix:     "(подписка оформлена — вы получите уведомление, когда {task_id} завершится или будет заблокирован)"
     truncated_suffix:      "… (сокращено; используйте `hermes kanban …` в терминале для полного вывода)"
     no_output:             "(нет вывода)"
+    gate:
+      plan_awaiting_approval: "ожидает решения человека по плану ({plan}) — агент не может пройти через этот шлюз"
+      plan_approved:          "план {plan} одобрен: {operator} → переходит в {landing}"
+      plan_rejected:          "план {plan} отклонён: {operator} → отправлен в triage"
+      gate_release_refused:   "отклонена попытка открыть шлюз {gate} через {via}"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

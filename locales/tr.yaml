@@ -160,6 +160,11 @@ gateway:
     subscribed_suffix:     "(abone olundu — {task_id} tamamlandığında veya engellendiğinde bildirim alacaksınız)"
     truncated_suffix:      "… (kısaltıldı; tam çıktı için terminalinizde `hermes kanban …` komutunu kullanın)"
     no_output:             "(çıktı yok)"
+    gate:
+      plan_awaiting_approval: "insan tarafından bir plan kararı bekleniyor ({plan}) — bir ajan bu kapıdan geçemez"
+      plan_approved:          "plan {plan}, {operator} tarafından onaylandı → {landing} durumuna geçiyor"
+      plan_rejected:          "plan {plan}, {operator} tarafından reddedildi → triage'a yönlendirildi"
+      gate_release_refused:   "{gate} kapısını {via} üzerinden açma girişimi reddedildi"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

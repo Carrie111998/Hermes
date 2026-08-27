@@ -160,6 +160,11 @@ gateway:
     subscribed_suffix:     "（已订阅 — 当 {task_id} 完成或被阻塞时将通知您）"
     truncated_suffix:      "…（已截断；如需完整输出请在终端运行 `hermes kanban …`）"
     no_output:             "（无输出）"
+    gate:
+      plan_awaiting_approval: "等待人工对计划做出决定（{plan}）— 智能体不能越过此关卡"
+      plan_approved:          "计划 {plan} 已由 {operator} 批准 → 进入 {landing}"
+      plan_rejected:          "计划 {plan} 已被 {operator} 拒绝 → 转入 triage"
+      gate_release_refused:   "已拒绝通过 {via} 解除 {gate} 关卡的尝试"
     wake:
       completed:           "已完成"
       gave_up:             "已放弃（重试次数耗尽）"

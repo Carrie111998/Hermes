@@ -164,6 +164,11 @@ gateway:
     subscribed_suffix:     "(síntiúsaithe — cuirfear in iúl duit nuair a chríochnóidh nó a stopfaidh {task_id})"
     truncated_suffix:      "… (giorraithe; úsáid `hermes kanban …` i do theirminéal le haghaidh aschur iomláin)"
     no_output:             "(gan aschur)"
+    gate:
+      plan_awaiting_approval: "ag fanacht le cinneadh daonna ar an bplean ({plan}) — ní féidir le gníomhaire an geata seo a thrasnú"
+      plan_approved:          "plean {plan} ceadaithe ag {operator} → ag dul go {landing}"
+      plan_rejected:          "plean {plan} diúltaithe ag {operator} → seolta chuig triage"
+      gate_release_refused:   "diúltaíodh d'iarracht an geata {gate} a scaoileadh trí {via}"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

@@ -160,6 +160,11 @@ gateway:
     subscribed_suffix:     "(ingeteken — jy sal in kennis gestel word wanneer {task_id} voltooi of vasval)"
     truncated_suffix:      "… (afgekap; gebruik `hermes kanban …` in jou terminale vir volle uitvoer)"
     no_output:             "(geen uitvoer)"
+    gate:
+      plan_awaiting_approval: "wag op 'n menslike planbesluit ({plan}) — 'n agent kan nie hierdie hek oorsteek nie"
+      plan_approved:          "plan {plan} goedgekeur deur {operator} → land in {landing}"
+      plan_rejected:          "plan {plan} verwerp deur {operator} → na triage gestuur"
+      gate_release_refused:   "'n poging om die {gate}-hek via {via} vry te stel, is geweier"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

@@ -33,6 +33,99 @@ _LOCAL_PATH_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Notifier event vocabulary (G11)
+# ---------------------------------------------------------------------------
+#
+# Three sets, one derivation. ``TERMINAL_KINDS`` is what the notifier CLAIMS
+# from the event log — claiming is what makes an event visible to a human and
+# what advances the per-subscription cursor past it. ``NEVER_WAKE_KINDS`` is
+# what must not additionally hand a turn back to an agent. ``WAKE_KINDS`` is
+# derived from the two, never hand-maintained, so a kind added to the human
+# side cannot be forgotten on the agent side.
+
+# Human plan/deploy gate events, emitted by ``kanban_db``:
+# ``park_for_plan_approval`` → ``plan_awaiting_approval``;
+# ``release_plan_gate`` → ``plan_approved`` / ``plan_rejected``;
+# ``record_gate_release_refusal`` / ``_audit_gate_refusal`` →
+# ``gate_release_refused``.
+#
+# A human gate exists to STOP an agent. Waking one because a gate was reached,
+# crossed, or refused would drive it straight back at the boundary it is
+# forbidden to cross — and a refusal event is precisely the record of an agent
+# having already tried. So these are passive ``notify`` only: claimed and
+# delivered so a person sees and can audit them, never a wake, never a
+# dispatch, never a promotion. (G11.)
+PLAN_GATE_NOTIFY_KINDS: tuple[str, ...] = (
+    "plan_awaiting_approval",
+    "plan_approved",
+    "plan_rejected",
+    "gate_release_refused",
+)
+
+# "status" covers dashboard drag-drop and ``_set_status_direct()`` writes —
+# surface those transitions to subscribers too. ``review_requested`` wakes the
+# origin subscriber like a block does, but is not a block (see
+# kanban_db.request_review); the task is not archived, so the subscription
+# stays alive and later review cycles keep notifying.
+TERMINAL_KINDS: tuple[str, ...] = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "archived", "unblocked", "block_loop_detected", "review_requested",
+    "changes_requested",
+    *PLAN_GATE_NOTIFY_KINDS,
+)
+
+# Claimed, but they must never make an agent take a turn.
+#
+# ``status`` / ``archived`` / ``unblocked`` are bookkeeping: an archive needs no
+# ping and ``unblocked`` is an internal transition. The gate kinds are here for
+# the different, load-bearing reason above.
+NEVER_WAKE_KINDS: tuple[str, ...] = (
+    "status", "archived", "unblocked",
+    *PLAN_GATE_NOTIFY_KINDS,
+)
+
+# Kinds that hand a decision back to the origin, so the origin has to take a
+# turn. ``review_requested`` (the implementation is done and waits for a
+# reviewer), ``changes_requested`` (a reviewer BLOCKed and work returns to the
+# implementer) and ``block_loop_detected`` (routed to triage) belong here for
+# the same reason ``blocked`` does.
+#
+# DERIVED. Membership order is irrelevant — this is only ever used as a set
+# test — but derivation is not: it is what makes G11 structural rather than a
+# convention someone has to remember.
+WAKE_KINDS: tuple[str, ...] = tuple(
+    kind for kind in TERMINAL_KINDS if kind not in NEVER_WAKE_KINDS
+)
+
+if not set(WAKE_KINDS).isdisjoint(PLAN_GATE_NOTIFY_KINDS):  # pragma: no cover
+    # Not an ``assert``: ``python -O`` strips those, and this invariant is the
+    # whole point of the module.
+    raise RuntimeError(
+        "G11 violated: a human-gate notification kind reached WAKE_KINDS"
+    )
+
+
+_GATE_EMOJI = {
+    "plan_awaiting_approval": "⏳",
+    "plan_approved": "✅",
+    "plan_rejected": "🚫",
+    "gate_release_refused": "⛔",
+}
+
+
+def _gate_plan_ref(payload: dict) -> str:
+    """``project/revision`` for an operator, or ``?`` for a legacy row."""
+    project = str(payload.get("project_id") or "?")
+    revision = payload.get("revision")
+    return f"{project} r{revision}" if revision is not None else project
+
+
+def _gate_operator(payload: dict) -> str:
+    """Who decided. Never a nonce or any other attestation secret."""
+    return str(payload.get("operator") or "an operator")
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -257,13 +350,9 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        # ``review_requested`` wakes the origin subscriber like a block does,
-        # but is not a block (see kanban_db.request_review); the task is not
-        # archived, so the subscription stays alive and later review
-        # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        # The claimed vocabulary — including the human plan/deploy gate kinds —
+        # is defined once at module scope so the G11 wake exclusion can be
+        # derived from it rather than restated here. See PLAN_GATE_NOTIFY_KINDS.
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -687,6 +776,44 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind in PLAN_GATE_NOTIFY_KINDS:
+                            # A human plan/deploy gate. Rendered for a person
+                            # and deliberately NOT in WAKE_KINDS: the decision
+                            # this event reports is one no agent may make, so
+                            # handing an agent a turn here would point it at the
+                            # boundary it is forbidden to cross. (G11.)
+                            payload = ev.payload or {}
+                            if kind == "plan_awaiting_approval":
+                                detail = t(
+                                    "gateway.kanban.gate.plan_awaiting_approval",
+                                    plan=_gate_plan_ref(payload),
+                                )
+                            elif kind == "plan_approved":
+                                detail = t(
+                                    "gateway.kanban.gate.plan_approved",
+                                    plan=_gate_plan_ref(payload),
+                                    operator=_gate_operator(payload),
+                                    landing=str(payload.get("landing_status")
+                                                or "todo"),
+                                )
+                            elif kind == "plan_rejected":
+                                detail = t(
+                                    "gateway.kanban.gate.plan_rejected",
+                                    plan=_gate_plan_ref(payload),
+                                    operator=_gate_operator(payload),
+                                )
+                            else:
+                                detail = t(
+                                    "gateway.kanban.gate.gate_release_refused",
+                                    gate=str(payload.get("gate_state") or "?"),
+                                    via=str(payload.get("via") or "?"),
+                                )
+                            reason = _safe_review_reason(payload.get("reason"))
+                            suffix = f": {reason}" if reason else ""
+                            msg = (
+                                f"{_GATE_EMOJI[kind]} {board_tag}{tag}"
+                                f"Kanban {sub['task_id']} — {detail}{suffix}"
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -831,19 +958,11 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        # Kinds that hand a decision back to the origin, so the
-                        # origin has to take a turn. ``review_requested`` (the
-                        # implementation is done and waits for a reviewer),
-                        # ``changes_requested`` (a reviewer BLOCKed and work
-                        # returns to the implementer) and ``block_loop_detected``
-                        # (routed to triage) belong here for the same reason
-                        # ``blocked`` does. ``status`` / ``archived`` /
-                        # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
-                        )
+                        # Derived at module scope from TERMINAL_KINDS minus
+                        # NEVER_WAKE_KINDS. Human plan/deploy gate events are
+                        # structurally absent from it (G11), so no gate event
+                        # can hand a turn to an agent here.
+                        _WAKE_KINDS = WAKE_KINDS
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
