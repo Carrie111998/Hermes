@@ -3140,6 +3140,42 @@ class GatewaySlashCommandsMixin:
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return f"✓ Added subgoal {idx}: {text}"
 
+    async def _handle_todo_command(self, event: "MessageEvent") -> str:
+        """Handle /todo — show the agent's task list for this session.
+
+        The list lives on the AIAgent instance (``_todo_store``), so this
+        resolves the running agent first (mid-turn, which is when the list is
+        most useful) and falls back to the cached agent between turns. This is
+        read-only, so it is safe to invoke while the agent is running.
+        """
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        session_key = self._session_key_for_source(event.source)
+
+        agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+                except Exception:
+                    agent = None
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            return "📋 No task list yet — no agent is resident for this session."
+
+        store = getattr(agent, "_todo_store", None)
+        if store is None:
+            return "📋 No task list yet — this session has no todo store."
+
+        rendered = store.format_for_display()
+        if not rendered:
+            return "📋 No task list yet."
+        return f"📋 Task list\n\n{rendered}"
+
     async def _get_loop_manager_for_event(self, event: "MessageEvent"):
         """Return a LoopManager bound to the session for this gateway event.
 

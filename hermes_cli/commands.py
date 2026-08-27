@@ -221,6 +221,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>", busy_policy="reject", busy_handler="moa"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]", busy_policy="dispatch"),
+    CommandDef("todo", "Show the agent's task list for this session", "Session",
+               aliases=("todos", "plan"), gateway_only=True, busy_policy="dispatch"),
     CommandDef("status", "Show session, model, token, and context info", "Session",
                busy_policy="dispatch"),
     CommandDef("egress", "Show Docker egress proxy status", "Session",
@@ -467,6 +469,7 @@ HELP_SESSION_SUBGROUPS: dict[str, tuple[str, ...]] = {
         "background", "bg", "btw", "agents", "tasks", "queue", "q", "steer",
         "goal", "subgoal", "heartbeat", "hb", "refine", "loop", "proactive",
         "moa", "journey", "learning", "memory-graph",
+        "todo", "todos", "plan",
     ),
 }
 

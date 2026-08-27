@@ -16788,6 +16788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
+                "todo": self._handle_todo_command,
                 "heartbeat": self._handle_heartbeat_command,
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
@@ -18249,6 +18250,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
+
+        if canonical == "todo":
+            return await self._handle_todo_command(event)
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
