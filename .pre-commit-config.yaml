@@ -19,7 +19,6 @@ repos:
         name: uv lock --check
         entry: uv lock --check
         language: system
-        files: [pyproject.toml, uv.lock]
         pass_filenames: false
 
       - id: trailing-whitespace
