@@ -437,7 +437,7 @@ class _AuxiliaryCancellationDecision:
 # deadline punishes SLOW summary models exactly as hard as HUNG ones: a
 # reasoning model happily streaming a large summary is killed mid-generation.
 # This thread-local hook lets the host observe liveness instead: the wire
-# consumers below tick it on every streamed token/SSE event, and the host
+# consumers below tick it only for non-empty streamed payloads, and the host
 # extends its deadline while tokens are moving (see gateway/run.py session
 # hygiene + CompressionCommitFence.touch_progress). Thread-local matches the
 # call topology — the aux call and its stream consumption run synchronously
@@ -458,6 +458,55 @@ def _notify_aux_progress() -> None:
 
 def _aux_progress_active() -> bool:
     return getattr(_aux_progress, "hook", None) is not None
+
+
+def _event_field(event: Any, name: str) -> Any:
+    if isinstance(event, dict):
+        return event.get(name)
+    return getattr(event, name, None)
+
+
+def _anthropic_event_has_content(event: Any) -> bool:
+    """Whether an Anthropic stream event carries a non-empty payload."""
+    event_type = _event_field(event, "type")
+    if event_type == "content_block_delta":
+        delta = _event_field(event, "delta")
+        return any(
+            bool(_event_field(delta, field))
+            for field in ("text", "thinking", "partial_json")
+        )
+    if event_type == "content_block_start":
+        block = _event_field(event, "content_block")
+        return _event_field(block, "type") == "tool_use" and any(
+            bool(_event_field(block, field)) for field in ("id", "name")
+        )
+    return False
+
+
+_CODEX_PROGRESS_DELTA_TYPES = frozenset(
+    {
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.text.delta",
+        "response.audio.delta",
+        "response.function_call_arguments.delta",
+        "response.reasoning_text.delta",
+    }
+)
+
+
+def _codex_event_has_content(event: Any) -> bool:
+    """Whether a Codex Responses event carries a non-empty payload."""
+    event_type = _event_field(event, "type")
+    if event_type in _CODEX_PROGRESS_DELTA_TYPES:
+        return bool(_event_field(event, "delta"))
+    if event_type == "response.output_item.added":
+        item = _event_field(event, "item")
+        return "function_call" in str(_event_field(item, "type") or "") and any(
+            bool(_event_field(item, field))
+            for field in ("id", "call_id", "name", "arguments")
+        )
+    return False
 
 
 @contextlib.contextmanager
@@ -1856,10 +1905,10 @@ class _CodexCompletionsAdapter:
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
-                # Each SSE event is also forward progress for hosts watching
-                # a progress hook (gateway session hygiene): a reasoning
-                # model streaming a long summary must not look hung.
-                _notify_aux_progress()
+                # Only non-empty deltas are summary progress; lifecycle and
+                # keepalive events must not reset the compression idle clock.
+                if _codex_event_has_content(_event):
+                    _notify_aux_progress()
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -2218,8 +2267,13 @@ class _AnthropicCompletionsAdapter:
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
             on_stream_event=(
-                (lambda _event: _notify_aux_progress())
-                if _aux_progress_active() else None
+                (
+                    lambda event: _notify_aux_progress()
+                    if _anthropic_event_has_content(event)
+                    else None
+                )
+                if _aux_progress_active()
+                else None
             ),
         )
         _transport = get_transport("anthropic_messages")
@@ -9127,16 +9181,15 @@ def _create_with_progress(
     neither trigger applies (every existing caller/task) or when the client's
     wire adapter streams internally. With a hook + a chunk-capable client,
     the request is sent with ``stream=True`` and aggregated, ticking the hook
-    per chunk — so the configured ``timeout`` acts per stream read (idle)
-    rather than as a total budget, and outer liveness watchdogs see tokens
-    moving. ``force_stream=True`` (stream-only providers such as Tencent
+    only for substantive chunks. The configured ``timeout`` acts per stream
+    read (idle) rather than as a total budget, and outer liveness watchdogs see
+    tokens moving. ``force_stream=True`` (stream-only providers such as Tencent
     Copilot — credit @kudi88, PR #60686) takes the same streamed path even
     without a hook. Providers that reject the streamed request fall back to
     the plain non-streaming call — except under ``force_stream``, where a
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_progress()  # request dispatched counts as progress
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
         return client.chat.completions.create(**kwargs)
 
@@ -9172,7 +9225,6 @@ def _create_with_progress(
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
     if hasattr(chunks, "choices"):
-        _notify_aux_progress()
         return chunks
     return _aggregate_chat_stream(
         chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
@@ -9187,7 +9239,8 @@ def _aggregate_chat_stream(
 ) -> Any:
     """Consume a chat.completions chunk stream into a complete response.
 
-    Ticks the thread-local aux progress hook on every chunk. Raises
+    Ticks the thread-local aux progress hook only for non-empty content,
+    reasoning, or tool-call fragments. Raises
     TimeoutError when *total_ceiling* seconds elapse before the stream
     finishes — phrased with "timed out" so existing timeout classification
     (``_is_timeout_error``) treats it exactly like a request timeout.
@@ -9228,7 +9281,7 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
+        made_progress = False
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -9253,25 +9306,35 @@ class _ChatStreamAccumulator:
         piece = getattr(delta, "content", None)
         if piece:
             self.content_parts.append(piece)
+            made_progress = True
         reasoning_piece = (
             getattr(delta, "reasoning", None)
             or getattr(delta, "reasoning_content", None)
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
+            made_progress = True
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
                 idx, {"id": "", "name": "", "arguments": []}
             )
+            tool_fragment = False
             if getattr(tc, "id", None):
                 acc["id"] = tc.id
+                tool_fragment = True
             fn = getattr(tc, "function", None)
             if fn is not None:
                 if getattr(fn, "name", None):
                     acc["name"] = fn.name
+                    tool_fragment = True
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+                    tool_fragment = True
+            made_progress = made_progress or tool_fragment
+
+        if made_progress:
+            _notify_aux_progress()
 
     def finish(self) -> Any:
         tool_calls = None
