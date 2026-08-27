@@ -1311,6 +1311,20 @@ class MatrixAdapter(BasePlatformAdapter):
         self._reactions_enabled: bool = os.getenv(
             "MATRIX_REACTIONS", "true"
         ).lower() not in {"false", "0", "no"}
+
+        # Read receipts: configurable via config.yaml ``matrix.read_receipts``
+        # (env ``MATRIX_READ_RECEIPTS`` as legacy fallback; YAML wins when set).
+        # Three modes control when an ``m.read`` receipt / fully-read marker is
+        # sent for an incoming message:
+        #   - "immediate" (default): mark read the instant the event arrives
+        #     (historical behavior).
+        #   - "after_processing": mark read only once the agent finishes the
+        #     turn, so the receipt reflects an actual reply rather than mere
+        #     ingestion.
+        #   - "disabled": never send read receipts. On Beeper this stops every
+        #     bridged network (Messenger/Instagram/WhatsApp/...) from showing
+        #     messages as read the instant the gateway processes them.
+        self._read_receipts_mode: str = self._parse_read_receipts_mode(config)
         self._pending_reactions: dict[tuple[str, str], str] = {}
         # Delay before redacting reactions so Matrix homeservers have time to
         # deliver the final message event without tripping "missing event"
@@ -1432,6 +1446,47 @@ class MatrixAdapter(BasePlatformAdapter):
         return os.getenv(
             "MATRIX_THREAD_REQUIRE_MENTION", "false"
         ).lower() in {"true", "1", "yes", "on"}
+
+    @staticmethod
+    def _parse_read_receipts_mode(config) -> str:
+        """Resolve read-receipt mode from config.yaml ``matrix.read_receipts``.
+
+        Falls back to the legacy ``MATRIX_READ_RECEIPTS`` env var; the YAML
+        value always wins when set. Returns one of ``"immediate"``,
+        ``"after_processing"``, or ``"disabled"``.
+
+        Back-compat: earlier releases exposed only a boolean env var, so
+        boolean / ``"true"`` / ``"false"`` / ``"on"`` / ``"off"`` / ``"1"`` /
+        ``"0"`` values are still accepted — truthy maps to ``"immediate"`` and
+        falsy to ``"disabled"``. Unrecognized values fall back to the default.
+        """
+        default = "immediate"
+        valid = {"immediate", "after_processing", "disabled"}
+
+        def _coerce(raw) -> Optional[str]:
+            if raw is None:
+                return None
+            if isinstance(raw, bool):
+                return "immediate" if raw else "disabled"
+            token = str(raw).strip().lower()
+            if not token:
+                return None
+            if token in valid:
+                return token
+            # Legacy boolean spellings (the pre-mode env flag).
+            if token in {"true", "1", "yes", "on", "enabled"}:
+                return "immediate"
+            if token in {"false", "0", "no", "off"}:
+                return "disabled"
+            return default
+
+        configured = _coerce(config.extra.get("read_receipts"))
+        if configured is not None:
+            return configured
+        env_mode = _coerce(os.getenv("MATRIX_READ_RECEIPTS"))
+        if env_mode is not None:
+            return env_mode
+        return default
 
     # ------------------------------------------------------------------
     # E2EE helpers
@@ -3460,7 +3515,10 @@ class MatrixAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
-        self._background_read_receipt(room_id, event_id)
+        # "immediate" marks read on arrival; "after_processing" defers the
+        # receipt to on_processing_complete; "disabled" never sends one.
+        if self._read_receipts_mode == "immediate":
+            self._background_read_receipt(room_id, event_id)
 
         return body, is_dm, chat_type, thread_id, display_name, source
 
@@ -3982,11 +4040,28 @@ class MatrixAdapter(BasePlatformAdapter):
         event: MessageEvent,
         outcome: ProcessingOutcome,
     ) -> None:
-        """Replace eyes with checkmark (success) or cross (failure)."""
-        if not self._reactions_enabled:
-            return
+        """Replace eyes with checkmark (success) or cross (failure).
+
+        Also emits a deferred read receipt when ``read_receipts`` is set to
+        ``after_processing`` — the message is marked read once the turn is
+        done rather than the instant it arrived.
+        """
         msg_id = event.message_id
         room_id = event.source.chat_id
+
+        # Deferred read receipt ("after_processing" mode). Independent of the
+        # reaction lifecycle below, and skipped on cancellation so a cancelled
+        # turn doesn't mark the triggering message read.
+        if (
+            self._read_receipts_mode == "after_processing"
+            and msg_id
+            and room_id
+            and outcome != ProcessingOutcome.CANCELLED
+        ):
+            self._background_read_receipt(room_id, msg_id)
+
+        if not self._reactions_enabled:
+            return
         if not msg_id or not room_id:
             return
         if outcome == ProcessingOutcome.CANCELLED:
@@ -5406,6 +5481,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
     if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
+    if "read_receipts" in matrix_cfg and not os.getenv("MATRIX_READ_RECEIPTS"):
+        os.environ["MATRIX_READ_RECEIPTS"] = str(matrix_cfg["read_receipts"]).lower()
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):

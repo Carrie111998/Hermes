@@ -2439,6 +2439,14 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in rooms
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
+        # When to send an m.read receipt / fully-read marker for an incoming
+        # message. On Beeper the receipt propagates to every bridged network
+        # (Messenger/Instagram/WhatsApp/...), so marking read on ingestion makes
+        # all of them show the message as read the instant the gateway sees it.
+        #   immediate         — mark read on arrival (default; historical behavior)
+        #   after_processing  — mark read only once the agent finishes the turn
+        #   disabled          — never send read receipts
+        "read_receipts": "immediate",
     },
 
     # Approval mode for dangerous commands:
