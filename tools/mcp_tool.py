@@ -316,9 +316,9 @@ def _ensure_mcp_sdk() -> bool:
 
     Idempotent and thread-safe. Sets the module-level ``_MCP_*`` flags and
     SDK symbol globals exactly as the old import-time block did. Honors a
-    test-patched ``_MCP_AVAILABLE=False`` (returns False without importing)
-    and test-installed mock symbols (``ClientSession`` already set → no
-    re-import, so mocks are never clobbered).
+    test-patched ``_MCP_AVAILABLE=False`` (returns False without importing).
+    Only the completed-import flag may short-circuit: one pre-bound symbol
+    does not prove that the rest of the SDK surface was materialized.
     """
     global _MCP_SDK_IMPORT_ATTEMPTED, _MCP_AVAILABLE, _MCP_HTTP_AVAILABLE
     global _MCP_SAMPLING_TYPES, _MCP_NOTIFICATION_TYPES, _MCP_ELICITATION_TYPES
@@ -334,10 +334,10 @@ def _ensure_mcp_sdk() -> bool:
 
     if not _MCP_AVAILABLE:
         return False
-    if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+    if _MCP_SDK_IMPORT_ATTEMPTED:
         return _MCP_AVAILABLE
     with _MCP_SDK_IMPORT_LOCK:
-        if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+        if _MCP_SDK_IMPORT_ATTEMPTED:
             return _MCP_AVAILABLE
         try:
             from mcp import ClientSession, StdioServerParameters
@@ -421,6 +421,7 @@ def _ensure_mcp_sdk() -> bool:
             except ImportError:
                 logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
         except ImportError:
+            _MCP_AVAILABLE = False
             logger.debug("mcp package not installed -- MCP tool support disabled")
 
         if _MCP_AVAILABLE:
