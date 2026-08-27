@@ -32,7 +32,7 @@ vi.mock('@capacitor/preferences', () => {
 })
 
 import { mintWsTicket, passwordLogin, probeGateway, verifyTokenGateway } from './auth'
-import { getConnection, getGatewayWsUrl } from './connection'
+import { getConnection, getConnectionFor, getGatewayWsUrl, getGatewayWsUrlFor } from './connection'
 import { api } from './http'
 import { currentTarget, loadTarget, setTarget, setTransientTarget } from './state'
 
@@ -192,6 +192,15 @@ describe('getConnection', () => {
     expect(c.mode).toBe('remote')
     expect(c.token).toBe('zzz')
     expect(c.wsUrl).toContain('token=zzz')
+  })
+
+  it('resolves registry-scoped session routes through the same mobile gateway', async () => {
+    await setTarget({ baseUrl: 'https://gw:9119', authMode: 'token', provider: null, token: 'zzz' })
+
+    const c = await getConnectionFor({ connectionId: 'remote-primary', profile: 'default' })
+
+    expect(c).toMatchObject({ connectionId: 'remote-primary', profile: 'default', registryScoped: true })
+    await expect(getGatewayWsUrlFor({ connectionId: 'remote-primary', profile: 'default' })).resolves.toContain('token=zzz')
   })
 })
 
