@@ -768,6 +768,16 @@ def _match_user_deny_rule(command: str) -> str | None:
     deobfuscated command variants the dangerous-pattern detector uses, so
     quoting tricks (``r\\m``, ``git st""atus``) can't sidestep a rule any
     more easily than they sidestep detection. Empty/absent list = no-op.
+
+    Read-only search tools (grep / egrep / fgrep / rg / ag / ack) only
+    READ files — they never execute a denied word the user typed in a
+    pattern. Without this carve-out, a broad glob like ``*docker *``
+    blocks ``grep -n docker file.sh`` (#94747): the shell wouldn't run
+    ``docker``, the agent is just searching text that mentions it. The
+    dangerous-pattern detector handles this via
+    ``_grep_safe_detection_variant``; user deny rules do the same here
+    via ``_deny_safe_variant`` — a glob is only treated as a match when
+    it survives BOTH on the raw form and on the read-only-safe form.
     """
     try:
         deny_patterns = _get_approval_config().get("deny") or []
@@ -779,12 +789,36 @@ def _match_user_deny_rule(command: str) -> str | None:
              if isinstance(p, str) and p.strip()]
     if not globs:
         return None
+    matched_pattern = None
     for command_variant in _command_detection_variants(command):
         candidate = command_variant.lower().strip()
         for pattern in globs:
             if fnmatch.fnmatchcase(candidate, pattern.lower()):
-                return pattern
-    return None
+                matched_pattern = pattern
+                break
+        if matched_pattern is not None:
+            break
+    if matched_pattern is None:
+        return None
+    # Glob also has to fire on the read-only-safe variant. If it does NOT,
+    # the only reason it matched was a search pattern operand's contents
+    # (or normalized equivalent). That is data, not a command — permit it.
+    # The safe form is fed back through _command_detection_variants() so
+    # shell-quoting deobfuscation variants (e.g. ``git pu""sh`` →
+    # ``git push``) keep matching the glob even after blanking.
+    safe_command, _ = _deny_safe_variant(command)
+    safe_matched = None
+    for safe_variant in _command_detection_variants(safe_command):
+        safe_lowered = safe_variant.lower().strip()
+        for pattern in globs:
+            if fnmatch.fnmatchcase(safe_lowered, pattern.lower()):
+                safe_matched = pattern
+                break
+        if safe_matched is not None:
+            break
+    if safe_matched is None:
+        return None
+    return matched_pattern
 
 
 def _user_deny_block_result(pattern: str) -> dict:
@@ -1726,6 +1760,146 @@ def _grep_safe_detection_variant(command: str) -> tuple[str, bool]:
     previous = 0
     for start, end in spans:
         parts.extend((command[previous:start], " " * (end - start)))
+        previous = end
+    parts.append(command[previous:])
+    return "".join(parts), False
+
+
+# Read-only search tools: their first non-flag argument is a regex PATTERN
+# the user is searching for, never code the agent runs. Treat that operand
+# (and any other pattern operands, including ones reached via -e / -f) as
+# data when matching user-defined approvals.deny globs (#94747).
+_READ_ONLY_SEARCH_TOOLS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "ag", "ack",
+})
+
+
+def _read_only_search_pattern_spans(command: str) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` byte spans of search-pattern operands for
+    every read-only search tool invocation in ``command``.
+
+    Quoted patterns AND unquoted first-arg-as-pattern operands for
+    grep / egrep / fgrep / rg / ag / ack. Returns an empty list if the
+    parse is ambiguous, in which case the safe behaviour is to leave the
+    command untouched (fail closed at the matching step instead of
+    silently dropping text). Unquoted operand spans are limited to the
+    same words those tools' own parsers would treat as the pattern
+    (skipping flags, including those that take a value).
+    """
+    spans: list[tuple[int, int]] = []
+    try:
+        segments = list(_iter_top_level_shell_segments(command))
+    except Exception:
+        return spans
+    for segment in segments:
+        segment_at = command.find(segment, 0 if not spans else 0)
+        if not spans:
+            segment_at = command.find(segment)
+        else:
+            segment_at = command.find(segment, spans[-1][1])
+        if segment_at == -1:
+            segment_at = command.find(segment)
+        for start, end, word in _iter_shell_command_word_spans(segment):
+            base = os.path.basename(
+                _deobfuscate_shell_word_for_detection(word)).lower()
+            if base not in _READ_ONLY_SEARCH_TOOLS:
+                continue
+            tokens = _shell_tokens_with_spans(segment, start)
+            if tokens is None:
+                continue  # ambiguous — leave raw form to the caller
+            operand_idxs = _read_only_pattern_operand_indexes(tokens[1:])
+            for idx in operand_idxs:
+                _, token_start, token_end, _quoted = tokens[1:][idx]
+                spans.append((segment_at + token_start,
+                              segment_at + token_end))
+    return spans
+
+
+def _read_only_pattern_operand_indexes(
+        args: list[tuple]) -> list[int]:
+    """Index list into ``args`` of operands that are pattern text for
+    read-only search tools. Mirrors ``_quoted_grep_pattern_spans`` but
+    extends coverage to all tools in ``_READ_ONLY_SEARCH_TOOLS``, and
+    returns indices even for UNQUOTED patterns (so the deny-rule matcher
+    can blank data inside ``grep -n docker file.sh``).
+    """
+    indexes: list[int] = []
+    explicit_patterns = False
+    operand_index: int | None = None
+    i = 0
+    options = True
+    while i < len(args):
+        token = args[i][0]
+        if options and token == "--":
+            options = False
+            i += 1
+            continue
+        if options and token.startswith("--"):
+            option, equals, _ = token.partition("=")
+            if option in {"--regexp", "--file"}:
+                explicit_patterns = True
+            if option in _GREP_OPTIONS_WITH_ARG and not equals:
+                if i + 1 >= len(args):
+                    return []
+                if option == "--regexp":
+                    indexes.append(i + 1)
+                i += 2
+                continue
+            if option == "--regexp":
+                indexes.append(i)
+            i += 1
+            continue
+        if options and token.startswith("-") and token != "-":
+            chars = token[1:]
+            j = 0
+            while j < len(chars):
+                char = chars[j]
+                if char in {"e", "f"}:
+                    explicit_patterns = True
+                if char in _GREP_SHORT_OPTIONS_WITH_ARG:
+                    if j + 1 < len(chars):
+                        if char == "e":
+                            indexes.append(i)
+                    else:
+                        if i + 1 >= len(args):
+                            return []
+                        if char == "e":
+                            indexes.append(i + 1)
+                        i += 1
+                    break
+                j += 1
+            i += 1
+            continue
+        if operand_index is None:
+            operand_index = i
+        i += 1
+    if not explicit_patterns and operand_index is not None:
+        indexes.append(operand_index)
+    return indexes
+
+
+def _deny_safe_variant(command: str) -> tuple[str, bool]:
+    """Return ``(masked_command, malformed)`` for use by user deny rules.
+
+    Strips the contents of read-only search pattern operands (quoted or
+    not) across the whole command. The ``malformed`` flag is propagated
+    from the underlying grep-pattern parser — on ambiguous parse the
+    function returns the original command so callers don't hide text on
+    uncertain structure.
+    """
+    grep_safe, malformed = _grep_safe_detection_variant(command)
+    spans = _read_only_search_pattern_spans(command)
+    if malformed or not spans:
+        return grep_safe, malformed
+    parts: list[str] = []
+    previous = 0
+    # De-duplicate overlapping spans & sort ascending so the join is safe.
+    spans = sorted(set(spans), key=lambda s: (s[0], s[1]))
+    for start, end in spans:
+        if start < previous:
+            continue
+        parts.append(command[previous:start])
+        parts.append(" " * (end - start))
         previous = end
     parts.append(command[previous:])
     return "".join(parts), False
