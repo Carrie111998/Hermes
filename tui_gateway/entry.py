@@ -17,6 +17,12 @@ import threading
 import time
 import traceback
 
+# This process speaks JSON-RPC over stdin/stdout (see main() below). Tell
+# tui_gateway.server it owns stdout as the protocol channel so the module
+# keeps its stdout->stderr redirect; every non-gateway importer (web server,
+# dashboard, desktop-embedded gateway) skips it and keeps sys.stdout intact.
+os.environ.setdefault("HERMES_TUI_GATEWAY_PROCESS", "1")
+
 from tui_gateway._stdin_recovery import handle_spurious_eof
 
 from tui_gateway import server

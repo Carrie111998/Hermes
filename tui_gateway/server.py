@@ -396,9 +396,15 @@ _current_rpc_method: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
-# of corrupting the JSON protocol.
+# of corrupting the JSON protocol. Only the TUI gateway SUBPROCESS
+# (tui_gateway.entry — which sets HERMES_TUI_GATEWAY_PROCESS) owns stdout as a
+# protocol channel. Every other importer (web server / dashboard / delegate
+# tool / desktop-embedded gateway) must keep sys.stdout intact: the desktop
+# announces its backend port on the real stdout pipe, and a module-level
+# stdout redirect here silently breaks that announcement (issue #96548).
 _real_stdout = sys.stdout
-sys.stdout = sys.stderr
+if os.environ.get("HERMES_TUI_GATEWAY_PROCESS") == "1":
+    sys.stdout = sys.stderr
 
 
 class _DropTransport:
