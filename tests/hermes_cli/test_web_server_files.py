@@ -375,3 +375,115 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
 
 
+# ---------------------------------------------------------------------------
+# Sibling write-endpoint sandbox (#95306 review follow-up): /api/files/upload,
+# /api/files/upload-stream and /api/files/mkdir serve the same remote sessions
+# as /api/fs/write-text, so they must pass the same _fs_write_guard — paths
+# outside the dashboard write roots are rejected, and credential /
+# shell-startup targets are denied even inside an allowed root.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sandboxed_files_client(monkeypatch, tmp_path):
+    """Unlocked managed-files client with the fs-write sandbox pinned to a subdir.
+
+    No ``HERMES_DASHBOARD_FILES_ROOT``, so the managed-files policy is unlocked
+    (the pre-guard state that let uploads land anywhere absolute). The shared
+    ``_fs_write_guard`` sandbox (``_fs_default_cwd``) points at a fresh
+    ``workspace`` dir; ``home`` sits outside it for escape attempts.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(web_server, "_fs_default_cwd", lambda: str(workspace))
+    monkeypatch.delenv("HERMES_DASHBOARD_WRITE_ROOTS", raising=False)
+
+    client, prev_auth_required, prev_bound_host = _client_with_app_state()
+    try:
+        yield client, home, workspace
+    finally:
+        _close_client(client)
+        _restore_app_state(prev_auth_required, prev_bound_host)
+
+
+def test_upload_rejects_escape_outside_write_sandbox(sandboxed_files_client):
+    client, home, _workspace = sandboxed_files_client
+    target = home / ".bashrc"
+
+    response = client.post(
+        "/api/files/upload",
+        json={"path": str(target), "data_url": "data:text/plain;base64,aGVsbG8="},
+    )
+
+    assert response.status_code == 403
+    assert not target.exists()
+
+
+def test_stream_upload_rejects_escape_outside_write_sandbox(sandboxed_files_client):
+    client, home, _workspace = sandboxed_files_client
+    target = home / "cron-job.sh"
+
+    response = client.post(
+        "/api/files/upload-stream",
+        data={"path": str(target), "overwrite": "true"},
+        files={"file": ("cron-job.sh", b"#!/bin/sh\nrm -rf /\n")},
+    )
+
+    assert response.status_code == 403
+    assert not target.exists()
+
+
+def test_mkdir_rejects_escape_outside_write_sandbox(sandboxed_files_client):
+    client, home, _workspace = sandboxed_files_client
+    target = home / "escape-dir"
+
+    response = client.post("/api/files/mkdir", json={"path": str(target)})
+
+    assert response.status_code == 403
+    assert not target.exists()
+
+
+def test_upload_denies_sensitive_targets_inside_locked_root(forced_files_client):
+    """Uploads honor the same sensitive-target denylist as spot-editor writes."""
+    client, root = forced_files_client
+
+    for name in (
+        ".env",
+        ".bashrc",
+        ".zshrc",
+        "config.yaml",
+        "auth.json",
+        ".ssh/authorized_keys",
+    ):
+        target = root / name
+        response = client.post(
+            "/api/files/upload",
+            json={"path": str(target), "data_url": "data:text/plain;base64,c2VjcmV0"},
+        )
+        assert response.status_code == 403, f"{target} should be denied"
+        assert not target.exists(), f"{target} must not be created"
+
+
+def test_upload_allows_configured_extra_write_root(
+    sandboxed_files_client, monkeypatch, tmp_path
+):
+    client, _home, _workspace = sandboxed_files_client
+    extra_root = tmp_path / "extra-root"
+    extra_root.mkdir()
+    monkeypatch.setenv("HERMES_DASHBOARD_WRITE_ROOTS", str(extra_root))
+
+    allowed = client.post(
+        "/api/files/upload",
+        json={
+            "path": str(extra_root / "ok.txt"),
+            "data_url": "data:text/plain;base64,aGVsbG8=",
+        },
+    )
+
+    assert allowed.status_code == 200
+    assert (extra_root / "ok.txt").read_bytes() == b"hello"

@@ -1,4 +1,5 @@
 import base64
+import os
 from pathlib import Path
 
 import pytest
@@ -84,8 +85,118 @@ def test_fs_endpoints_require_auth(tmp_path):
 
     list_response = client.get("/api/fs/list", params={"path": str(tmp_path)})
     read_response = client.get("/api/fs/read-text", params={"path": str(target)})
+    write_response = client.post(
+        "/api/fs/write-text", json={"path": str(target), "content": "nope"}
+    )
     default_response = client.get("/api/fs/default-cwd")
 
     assert list_response.status_code == 401
     assert read_response.status_code == 401
+    assert write_response.status_code == 401
     assert default_response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /api/fs/write-text sandbox (#95306): the endpoint also serves remote
+# dashboard sessions, so writes must stay inside the workspace roots and away
+# from credential / shell-startup targets.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sandboxed(monkeypatch, tmp_path):
+    """Pin the default write sandbox to a fresh dir and clear root overrides.
+
+    The sandbox is a *subdir* of ``tmp_path`` so the test's own ``tmp_path``
+    sits outside it — handy for escape attempts.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(web_server, "_fs_default_cwd", lambda: str(workspace))
+    monkeypatch.delenv("HERMES_DASHBOARD_WRITE_ROOTS", raising=False)
+    return workspace
+
+
+def test_fs_write_text_writes_inside_sandbox(client, sandboxed):
+    target = sandboxed / "notes.md"
+
+    response = client.post(
+        "/api/fs/write-text", json={"path": str(target), "content": "hello"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["byteSize"] == len("hello".encode("utf-8"))
+    assert target.read_text(encoding="utf-8") == "hello"
+
+
+def test_fs_write_text_rejects_escape_outside_sandbox(client, sandboxed, tmp_path):
+    outside_dir = tmp_path / "escape"
+    outside_dir.mkdir()
+    target = outside_dir / "cron-job.sh"
+
+    response = client.post(
+        "/api/fs/write-text", json={"path": str(target), "content": "#!/bin/sh\nrm -rf /\n"}
+    )
+
+    assert response.status_code == 403
+    assert not target.exists()
+
+
+def test_fs_write_text_rejects_file_url_escape(client, sandboxed, tmp_path):
+    outside_dir = tmp_path / "escape-file-url"
+    outside_dir.mkdir()
+    raw = (outside_dir / "authorized.txt").as_uri()
+
+    response = client.post(
+        "/api/fs/write-text", json={"path": raw, "content": "nope"}
+    )
+
+    assert response.status_code == 403
+
+
+def test_fs_write_text_rejects_sensitive_targets_inside_sandbox(client, sandboxed):
+    targets = [
+        sandboxed / ".env",
+        sandboxed / ".env.local",
+        sandboxed / "config.yaml",
+        sandboxed / "auth.json",
+        sandboxed / ".bashrc",
+        sandboxed / ".zshrc",
+        sandboxed / ".ssh" / "authorized_keys",
+        sandboxed / ".gnupg" / "privkey.asc",
+        sandboxed / "mcp-tokens" / "server.json",
+        sandboxed / "deep" / "pairing" / "code.txt",
+    ]
+
+    for target in targets:
+        response = client.post(
+            "/api/fs/write-text", json={"path": str(target), "content": "x"}
+        )
+
+        assert response.status_code == 403, f"{target} should be denied"
+        assert not target.exists()
+
+
+def test_fs_write_text_honors_configured_write_roots(client, sandboxed, monkeypatch, tmp_path):
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_WRITE_ROOTS", os.pathsep.join([str(root_a), str(root_b)])
+    )
+
+    allowed = client.post(
+        "/api/fs/write-text", json={"path": str(root_b / "allowed.txt"), "content": "y"}
+    )
+    denied = client.post(
+        "/api/fs/write-text",
+        json={"path": str(sandboxed / "elsewhere.txt"), "content": "y"},
+    )
+
+    assert allowed.status_code == 200
+    assert (root_b / "allowed.txt").read_text(encoding="utf-8") == "y"
+    assert denied.status_code == 403
+    assert not (sandboxed / "elsewhere.txt").exists()
