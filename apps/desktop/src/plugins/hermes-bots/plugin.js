@@ -466,6 +466,52 @@ const $groupClarify = atom({})
 const GROUP_ACTIVITY_LIMIT = 50
 const $groupActivity = atom({})
 
+function groupActivityMemberSource(member) {
+  const connectionId = String(member?.connectionId || '').trim()
+
+  return (
+    String(member?.connectionLabel || '').trim() ||
+    connectionId ||
+    String(member?.handle || groupMemberKey(member) || '').trim()
+  )
+}
+
+function groupActivityMemberEvent(room, member) {
+  const name = String(member?.name || '').trim()
+  const memberKey = String(groupMemberKey(member) || name)
+  const connectionId = String(member?.connectionId || '').trim()
+  const speaker = groupSpeakerLabel(name || 'A bot')
+  const speakerKey = speaker.trim().toLowerCase()
+  const collisions = (room?.members || []).filter(
+    candidate =>
+      groupSpeakerLabel(candidate?.name || '')
+        .trim()
+        .toLowerCase() === speakerKey
+  )
+  let memberLabel = ''
+
+  if (collisions.length > 1) {
+    let source = groupActivityMemberSource(member)
+    const sameSource = collisions.filter(
+      candidate => groupActivityMemberSource(candidate).toLowerCase() === source.toLowerCase()
+    )
+    const disambiguator = connectionId || memberKey
+
+    if (sameSource.length > 1 && disambiguator.toLowerCase() !== source.toLowerCase()) {
+      source = `${source} (${disambiguator})`
+    }
+
+    const qualifier = source && name ? `${source}/${name}` : source || name
+    memberLabel = qualifier ? `${speaker} · ${qualifier}` : speaker
+  }
+
+  return {
+    member: name || null,
+    ...(memberKey ? { memberKey } : {}),
+    ...(memberLabel ? { memberLabel } : {})
+  }
+}
+
 function recordGroupActivity(group, event) {
   const room = $groupChats.get()[group]
 
@@ -474,7 +520,11 @@ function recordGroupActivity(group, event) {
   }
 
   const current = $groupActivity.get()[group] || { events: [] }
-  const entry = { at: Date.now(), epoch: room.epoch || 0, ...event }
+  const normalizedEvent =
+    event?.member && typeof event.member === 'object'
+      ? { ...event, ...groupActivityMemberEvent(room, event.member) }
+      : event
+  const entry = { at: Date.now(), epoch: room.epoch || 0, ...normalizedEvent }
   const events = [...current.events, entry].slice(-GROUP_ACTIVITY_LIMIT)
   $groupActivity.set({ ...$groupActivity.get(), [group]: { ...current, events } })
 
@@ -494,11 +544,11 @@ function groupActivityLabel(event) {
   const kind = event?.kind
   const base = GROUP_ACTIVITY_LABELS[kind] || kind || 'did something'
 
-  if (kind === 'cancelled' || kind === 'settled' || kind === 'capped') {
+  if ((kind === 'cancelled' && !event?.member) || kind === 'settled' || kind === 'capped') {
     return base
   }
 
-  const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
+  const who = event?.member === 'You' ? 'You' : event?.memberLabel || groupSpeakerLabel(event?.member || 'A bot')
 
   return `${who} ${base}`
 }
@@ -7685,7 +7735,7 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
   const dispatchEpoch = ($groupChats.get()[group] || {}).epoch || 0
   const memberKey = groupMemberKey(member)
 
-  recordGroupActivity(group, { kind: 'working', member: member.name, thread })
+  recordGroupActivity(group, { kind: 'working', member, thread })
 
   // Baseline: how many messages exist before our submit.
   let before = 0
@@ -7797,14 +7847,14 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
       if (replyText !== null) {
         recordGroupActivity(group, {
           kind: isGroupPassText(replyText) ? 'passed' : 'replied',
-          member: member.name,
+          member,
           thread
         })
 
         return replyText
       }
 
-      recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
+      recordGroupActivity(group, { kind: 'passed', member, thread })
 
       return null
     }
@@ -7821,7 +7871,7 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
   // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
   // (runtime-only) so the finished reply can be posted late into the RIGHT
   // thread instead of vanishing.
-  recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
+  recordGroupActivity(group, { kind: 'timed-out', member, thread })
   syncGroupClarify(group, member, null)
   updateGroupChat(group, r => {
     r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
@@ -7885,7 +7935,7 @@ async function harvestStrandedGroupReply(group, member) {
   const reply = pickGroupTurnReply(messages, strandedBefore)
 
   if (reply && !isGroupPassText(reply)) {
-    recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
+    recordGroupActivity(group, { kind: 'delivered', member, thread: strandedThread })
     appendGroupChatEntry(
       group,
       { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
@@ -8257,7 +8307,7 @@ async function runGroupChatRounds(group, members, thread) {
           })
 
           if (!heldEntry.noted) {
-            recordGroupActivity(group, { kind: 'held', member: member.name, thread })
+            recordGroupActivity(group, { kind: 'held', member, thread })
           }
 
           continue
@@ -8300,7 +8350,7 @@ async function runGroupChatRounds(group, members, thread) {
           const reason = String(error?.data?.reason || '').trim()
           recordGroupActivity(group, {
             kind: 'failed',
-            member: member.name,
+            member,
             thread,
             ...(reason ? { reason } : {})
           })
@@ -8331,7 +8381,7 @@ async function runGroupChatRounds(group, members, thread) {
         )
 
         if (!shouldCommitMemberTurn(startEpoch, epochNow, newerUserEntryInThread)) {
-          recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
+          recordGroupActivity(group, { kind: 'cancelled', member, thread })
           return
         }
 
@@ -8430,7 +8480,7 @@ async function runGroupChatRounds(group, members, thread) {
                   clearBotAttention(memberKey)
                 }
               } catch (error) {
-                recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+                recordGroupActivity(group, { kind: 'failed', member, thread })
                 noteBotAttention(memberKey, error?.message || error)
                 continuationReply = null
               }
