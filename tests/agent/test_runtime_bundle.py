@@ -45,8 +45,13 @@ def test_openai_wire_bundle_passes_runtime_headers_and_tls_to_builder():
             "api_mode": "codex_responses",
             "api_key": "secret",
             "base_url": "https://btc.example/v1",
+            "default_headers": {
+                "User-Agent": "HermesAgent/test",
+                "CF-Access-Client-Secret": "stale-default",
+            },
             "extra_headers": {"CF-Access-Client-Secret": "service-secret"},
             "ssl_verify": False,
+            "default_query": {"api-version": "2026-08-01"},
         }
     )
 
@@ -54,8 +59,10 @@ def test_openai_wire_bundle_passes_runtime_headers_and_tls_to_builder():
 
     assert bundle.client is client
     assert observed["default_headers"]["CF-Access-Client-Secret"] == "service-secret"
+    assert observed["default_headers"]["User-Agent"] == "HermesAgent/test"
     assert observed["ssl_verify"] is False
     assert observed["timeout"] == 17
+    assert observed["default_query"] == {"api-version": "2026-08-01"}
 
 
 def test_anthropic_wire_bundle_merges_runtime_headers_through_builder():

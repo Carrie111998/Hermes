@@ -192,7 +192,12 @@ _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
 
 
-def _resolve_aux_verify(base_url: Optional[str]) -> Any:
+def _resolve_aux_verify(
+    base_url: Optional[str],
+    *,
+    ssl_ca_cert: Optional[str] = None,
+    ssl_verify: Optional[bool] = None,
+) -> Any:
     """Resolve httpx ``verify`` for an auxiliary-client base_url.
 
     Mirrors the main client's TLS resolution so auxiliary calls (compression,
@@ -208,9 +213,15 @@ def _resolve_aux_verify(base_url: Optional[str]) -> Any:
             load_config_readonly,
         )
 
-        tls = get_custom_provider_tls_settings(
-            str(base_url or ""), config=load_config_readonly()
-        )
+        if ssl_ca_cert is None and ssl_verify is None:
+            tls = get_custom_provider_tls_settings(
+                str(base_url or ""), config=load_config_readonly()
+            )
+        else:
+            tls = {
+                "ssl_ca_cert": ssl_ca_cert,
+                "ssl_verify": ssl_verify,
+            }
         return resolve_httpx_verify(
             ca_bundle=tls.get("ssl_ca_cert"),
             ssl_verify=tls.get("ssl_verify"),
@@ -227,14 +238,21 @@ def _openai_http_client_kwargs(
     base_url: Optional[str],
     *,
     async_mode: bool = False,
+    ssl_ca_cert: Optional[str] = None,
+    ssl_verify: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
     try:
         from agent.process_bootstrap import build_keepalive_http_client
+        verify_kwargs: Dict[str, Any] = {}
+        if ssl_ca_cert is not None:
+            verify_kwargs["ssl_ca_cert"] = ssl_ca_cert
+        if ssl_verify is not None:
+            verify_kwargs["ssl_verify"] = ssl_verify
         client = build_keepalive_http_client(
             str(base_url or ""),
             async_mode=async_mode,
-            verify=_resolve_aux_verify(base_url),
+            verify=_resolve_aux_verify(base_url, **verify_kwargs),
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves
@@ -261,12 +279,27 @@ def _openai_http_client_kwargs(
         return {}
     return {"http_client": client}
 
-def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+def _create_openai_client(
+    *,
+    api_key: Any,
+    base_url: str,
+    ssl_ca_cert: Optional[str] = None,
+    ssl_verify: Optional[bool] = None,
+    **kwargs: Any,
+) -> Any:
     if _aux_probe_active():
         # Availability probe: credentials/base_url resolved — that is the
         # answer. Skip the openai import + httpx/SSL construction entirely.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
-    kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
+    tls_kwargs: Dict[str, Any] = {}
+    if ssl_ca_cert is not None:
+        tls_kwargs["ssl_ca_cert"] = ssl_ca_cert
+    if ssl_verify is not None:
+        tls_kwargs["ssl_verify"] = ssl_verify
+    kwargs = {
+        **_openai_http_client_kwargs(base_url, **tls_kwargs),
+        **kwargs,
+    }
     # OpenCode Zen free tier: the keyless placeholder must never reach the
     # wire — the Zen relay serves free models anonymously but 401s any
     # unrecognized bearer. Override the SDK's Authorization header with an
@@ -6205,7 +6238,12 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
 # below — never look up auth env vars ad-hoc.
 
 
-def _to_async_client(sync_client, model: str, is_vision: bool = False):
+def _to_async_client(
+    sync_client,
+    model: str,
+    is_vision: bool = False,
+    runtime: Optional[Mapping[str, Any]] = None,
+):
     """Convert a sync client to its async counterpart, preserving Codex routing.
 
     When ``is_vision=True`` and the underlying base URL is Copilot, the
@@ -6279,11 +6317,30 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     _merged_async = _apply_user_default_headers(async_kwargs.get("default_headers"))
     if _merged_async:
         async_kwargs["default_headers"] = _merged_async
+    # A named custom provider's entry headers are the most-specific layer.
+    # Re-creating an AsyncOpenAI client from the sync client's public
+    # api_key/base_url attributes otherwise drops them and recreates the
+    # Cloudflare-403 failure only on async auxiliary tasks.
+    if runtime is not None:
+        runtime_headers = runtime.get("extra_headers")
+        if isinstance(runtime_headers, Mapping) and runtime_headers:
+            merged_runtime_headers = dict(async_kwargs.get("default_headers") or {})
+            merged_runtime_headers.update(runtime_headers)
+            async_kwargs["default_headers"] = merged_runtime_headers
     _apply_required_codex_headers(
         async_kwargs, access_token=sync_client.api_key, base_url=sync_base_url,
     )
+    async_tls_kwargs: Dict[str, Any] = {}
+    if runtime is not None and runtime.get("ssl_ca_cert") is not None:
+        async_tls_kwargs["ssl_ca_cert"] = runtime.get("ssl_ca_cert")
+    if runtime is not None and runtime.get("ssl_verify") is not None:
+        async_tls_kwargs["ssl_verify"] = runtime.get("ssl_verify")
     async_kwargs = {
-        **_openai_http_client_kwargs(sync_base_url, async_mode=True),
+        **_openai_http_client_kwargs(
+            sync_base_url,
+            async_mode=True,
+            **async_tls_kwargs,
+        ),
         **async_kwargs,
     }
     # See _create_openai_client: disable SDK-internal retries so Hermes owns
@@ -6699,7 +6756,10 @@ def resolve_provider_client(
 
     # ── Named custom providers (config.yaml providers dict / custom_providers list) ───
     try:
-        from hermes_cli.runtime_provider import _get_named_custom_provider
+        from hermes_cli.runtime_provider import (
+            _get_named_custom_provider,
+            resolve_runtime_provider,
+        )
         # When the raw requested name is an alias (``kimi`` → ``kimi-coding``)
         # and the user defined a ``custom_providers`` entry under that alias
         # name, the custom entry is the intended target — the built-in alias
@@ -6708,109 +6768,124 @@ def resolve_provider_client(
         # entries that coincidentally match a canonical provider (e.g. ``nous``)
         # still defer to the built-in per `_get_named_custom_provider`'s guard.
         custom_entry = None
+        custom_request = provider
         if original_provider and original_provider != provider:
             custom_entry = _get_named_custom_provider(original_provider)
+            if custom_entry is not None:
+                custom_request = original_provider
         if custom_entry is None:
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
-            custom_base = (custom_entry.get("base_url") or "").strip()
-            custom_key = (custom_entry.get("api_key") or "").strip()
-            custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
-            if not custom_key and custom_key_env:
-                custom_key = _scoped_key_env(custom_key_env)
-            # Auxiliary tasks resolve named custom providers here rather than
-            # through _resolve_named_custom_runtime, so key_cmd has to be
-            # honoured on both paths at matching precedence: otherwise the main
-            # agent turn works while every auxiliary call (title generation,
-            # compression, vision, embedding) 401s on the placeholder below.
-            custom_key_cmd = str(custom_entry.get("key_cmd", "") or "").strip()
-            if custom_key_cmd:
-                from agent.command_token_source import build_command_token_provider
-                custom_key = build_command_token_provider(
-                    custom_key_cmd, custom_entry.get("name") or provider
-                ) or custom_key
-            custom_key = custom_key or "no-key-required"
-            if custom_key == "no-key-required":
+            # Resolve credentials, wire mode, headers, TLS, key_cmd, and pooled
+            # credentials through the same immutable runtime boundary as the
+            # primary agent.  The former second implementation drifted from the
+            # resolver and omitted entry.extra_headers on auxiliary calls.
+            runtime = resolve_runtime_provider(
+                requested=custom_request,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
+                target_model=model,
+            )
+            if api_mode:
+                runtime = runtime.with_updates(api_mode=api_mode.strip())
+
+            custom_base = runtime.base_url.strip()
+            custom_key = runtime.api_key
+            if isinstance(custom_key, str) and custom_key == "no-key-required":
                 logger.warning(
                     "resolve_provider_client: named custom provider %r has no resolvable "
                     "api_key — request will be sent with placeholder no-key-required "
                     "and will 401 on auth-required endpoints",
                     custom_entry.get("name") or provider,
                 )
-            # An explicit per-task api_mode override (from _resolve_task_provider_model)
-            # wins; otherwise fall back to what the provider entry declared.
-            entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
             if custom_base:
                 final_model = _normalize_resolved_model(
-                    model
-                    or custom_entry.get("model")
+                    runtime.model
+                    or model
                     or (main_runtime.get("model") if main_runtime else None)
                     or _read_main_model_for_aux()
                     or "gpt-4o-mini",
                     provider,
                 )
-                # anthropic_messages talks to the /anthropic surface directly;
-                # OpenAI-wire paths (chat_completions / codex_responses) need the
-                # /v1 equivalent.  Rewrite only on the OpenAI-wire path so the
-                # Anthropic fallback SDK still sees the original URL.
-                if entry_api_mode == "anthropic_messages":
-                    openai_base = custom_base
-                    raw_base_for_wrap = custom_base
-                else:
+
+                # Preserve model.default_headers while keeping the provider
+                # entry as the most-specific layer, matching agent_init.
+                user_headers = _apply_user_default_headers(None)
+                merged_headers = dict(user_headers or {})
+                merged_headers.update(runtime.extra_headers)
+                if merged_headers:
+                    runtime = runtime.with_updates(extra_headers=merged_headers)
+
+                entry_api_mode = runtime.api_mode.strip().lower()
+                wire_runtime = runtime
+                if entry_api_mode != "anthropic_messages":
                     openai_base = _to_openai_base_url(custom_base)
-                    raw_base_for_wrap = custom_base
-                _clean_base2, _dq2 = _extract_url_query_params(openai_base)
-                _extra2 = {"default_query": _dq2} if _dq2 else {}
-                _headers2 = _apply_user_default_headers(_extra2.get("default_headers"))
-                if _headers2:
-                    _extra2["default_headers"] = _headers2
+                    clean_base, default_query = _extract_url_query_params(openai_base)
+                    wire_updates: Dict[str, Any] = {"base_url": clean_base}
+                    if default_query:
+                        wire_updates["default_query"] = default_query
+                    wire_runtime = runtime.with_updates(**wire_updates)
+
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s, api_mode=%s)",
                     provider, final_model, entry_api_mode or "chat_completions")
-                # anthropic_messages: route through the Anthropic Messages API
-                # via AnthropicAuxiliaryClient. Mirrors the anonymous-custom
-                # branch in _try_custom_endpoint(). See #15033.
-                if entry_api_mode == "anthropic_messages":
-                    try:
-                        from agent.anthropic_adapter import build_anthropic_client
-                        real_client = build_anthropic_client(custom_key, custom_base)
-                    except ImportError:
-                        logger.warning(
-                            "Named custom provider %r declares api_mode="
-                            "anthropic_messages but the anthropic SDK is not "
-                            "installed — falling back to OpenAI-wire.",
-                            provider,
-                        )
-                        # Fallback went OpenAI-wire after all — redo the query
-                        # extraction against the rewritten /v1 URL.
-                        _fallback_base = _to_openai_base_url(custom_base)
-                        _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
-                        _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
-                        _fb_headers = _apply_user_default_headers(_fb_extra.get("default_headers"))
-                        if _fb_headers:
-                            _fb_extra["default_headers"] = _fb_headers
-                        client = _create_openai_client(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
-                        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                                else (client, final_model))
-                    sync_anthropic = AnthropicAuxiliaryClient(
-                        real_client, final_model, custom_key, custom_base, is_oauth=False,
+
+                from agent.runtime_bundle import build_client_bundle
+
+                def _build_openai(client_kwargs: Dict[str, Any]) -> Any:
+                    return _create_openai_client(**client_kwargs)
+
+                try:
+                    bundle = build_client_bundle(
+                        wire_runtime,
+                        openai_builder=_build_openai,
                     )
-                    if async_mode:
-                        return AsyncAnthropicAuxiliaryClient(sync_anthropic), final_model
-                    return sync_anthropic, final_model
-                client = _create_openai_client(api_key=custom_key, base_url=_clean_base2, **_extra2)
-                # codex_responses or inherited auto-detect (via _wrap_if_needed).
-                # _wrap_if_needed reads the closed-over `api_mode` (the task-level
-                # override). Named-provider entry api_mode=codex_responses also
-                # flows through here.
-                if entry_api_mode == "codex_responses" and not isinstance(
-                    client, CodexAuxiliaryClient
-                ):
-                    client = CodexAuxiliaryClient(client, final_model)
+                except ImportError:
+                    if entry_api_mode != "anthropic_messages":
+                        raise
+                    logger.warning(
+                        "Named custom provider %r declares api_mode="
+                        "anthropic_messages but the anthropic SDK is not "
+                        "installed — falling back to OpenAI-wire.",
+                        provider,
+                    )
+                    fallback_base = _to_openai_base_url(custom_base)
+                    clean_base, default_query = _extract_url_query_params(fallback_base)
+                    fallback_updates: Dict[str, Any] = {
+                        "api_mode": "chat_completions",
+                        "base_url": clean_base,
+                    }
+                    if default_query:
+                        fallback_updates["default_query"] = default_query
+                    wire_runtime = runtime.with_updates(**fallback_updates)
+                    bundle = build_client_bundle(
+                        wire_runtime,
+                        openai_builder=_build_openai,
+                    )
+
+                if bundle.anthropic_client is not None:
+                    client = AnthropicAuxiliaryClient(
+                        bundle.anthropic_client,
+                        final_model,
+                        bundle.anthropic_api_key,
+                        bundle.anthropic_base_url,
+                        is_oauth=bundle.is_anthropic_oauth,
+                    )
                 else:
-                    client = _wrap_if_needed(client, final_model, raw_base_for_wrap, custom_key)
-                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                        else (client, final_model))
+                    client = bundle.client
+                    if entry_api_mode == "codex_responses" and not raw_codex:
+                        client = CodexAuxiliaryClient(client, final_model)
+
+                return (
+                    _to_async_client(
+                        client,
+                        final_model,
+                        is_vision=is_vision,
+                        runtime=wire_runtime,
+                    )
+                    if async_mode
+                    else (client, final_model)
+                )
             logger.warning(
                 "resolve_provider_client: named custom provider %r has no base_url",
                 provider)

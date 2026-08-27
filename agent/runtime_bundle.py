@@ -209,7 +209,16 @@ def build_client_bundle(
         if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
             effective_timeout = float(raw_timeout)
 
-    headers = dict(resolved.extra_headers)
+    declared_headers = resolved.get("default_headers")
+    headers = (
+        dict(declared_headers)
+        if isinstance(declared_headers, Mapping)
+        else {}
+    )
+    # ``extra_headers`` is the provider-entry override layer.  Keep it last so
+    # gateway credentials such as Cloudflare Access service tokens cannot be
+    # shadowed by a profile/default header with the same name.
+    headers.update(resolved.extra_headers)
     if api_mode == "anthropic_messages":
         if anthropic_builder is None:
             from agent.anthropic_adapter import build_anthropic_client
@@ -247,6 +256,9 @@ def build_client_bundle(
         client_kwargs["ssl_ca_cert"] = resolved.ssl_ca_cert
     if resolved.ssl_verify is not None:
         client_kwargs["ssl_verify"] = resolved.ssl_verify
+    default_query = resolved.get("default_query")
+    if isinstance(default_query, Mapping) and default_query:
+        client_kwargs["default_query"] = dict(default_query)
 
     builder = openai_builder or _default_openai_builder
     client = builder(dict(client_kwargs))

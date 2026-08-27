@@ -706,6 +706,23 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
+def _lift_tls_settings(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Copy validated per-provider TLS settings into a runtime mapping."""
+    ssl_ca_cert = entry.get("ssl_ca_cert")
+    if isinstance(ssl_ca_cert, str) and ssl_ca_cert.strip():
+        result["ssl_ca_cert"] = ssl_ca_cert.strip()
+
+    ssl_verify = entry.get("ssl_verify")
+    if isinstance(ssl_verify, str):
+        normalized = ssl_verify.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            ssl_verify = True
+        elif normalized in {"false", "0", "no", "off"}:
+            ssl_verify = False
+    if isinstance(ssl_verify, bool):
+        result["ssl_verify"] = ssl_verify
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
@@ -787,6 +804,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
                     _lift_extra_headers(entry, result)
+                    _lift_tls_settings(entry, result)
                     # Command that PRINTS a credential, for gateways issuing
                     # short-lived bearers instead of static keys. Propagated
                     # raw; wrapped in a per-request token provider at
@@ -845,6 +863,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
         _lift_extra_headers(entry, result)
+        _lift_tls_settings(entry, result)
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
@@ -1186,6 +1205,7 @@ def _resolve_named_custom_runtime(
         # credentials. NEVER log the values.
         if custom_provider.get("extra_headers"):
             pool_result["extra_headers"] = dict(custom_provider["extra_headers"])
+        _lift_tls_settings(custom_provider, pool_result)
         return pool_result
 
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
@@ -1245,6 +1265,7 @@ def _resolve_named_custom_runtime(
     # Values may carry credentials — NEVER log them.
     if custom_provider.get("extra_headers"):
         result["extra_headers"] = dict(custom_provider["extra_headers"])
+    _lift_tls_settings(custom_provider, result)
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = request_overrides

@@ -295,13 +295,12 @@ class TestAbsoluteExpiry:
 
 
 class TestAuxiliaryResolverHonoursKeyCmd:
-    """Auxiliary tasks resolve credentials on their own path.
+    """Auxiliary tasks reuse named-custom runtime credential resolution.
 
-    ``agent.auxiliary_client.resolve_provider_client`` does not go through
-    ``_resolve_named_custom_runtime``, so a key_cmd honoured only there leaves
-    title generation, compression, vision and embedding falling back to the
-    ``no-key-required`` placeholder — the main agent turn succeeds while every
-    auxiliary call 401s.
+    This pins the resolver + bundle route: ``key_cmd`` must remain a callable
+    API key all the way into auxiliary client construction, so title,
+    compression, vision, and embedding requests mint fresh credentials just
+    like the main agent.
     """
 
     @staticmethod
