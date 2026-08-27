@@ -27,7 +27,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -4781,12 +4780,6 @@ def _detect_venv_python_processes(
 
     matches: list[tuple[int, str, str]] = []
 
-    def _looks_like_python_image(value: str) -> bool:
-        return re.fullmatch(
-            r"python(?:w|[0-9.]*w?)?(?:\.exe)?",
-            value.lower(),
-        ) is not None
-
     native_rows = _windows_process_image_rows()
     if native_rows is None:
         # Fail-safe compatibility path for non-Windows tests or an unavailable
@@ -4834,17 +4827,11 @@ def _detect_venv_python_processes(
         exe = info.get("exe")
         if not exe:
             continue
-        snapshot_exe_norm = str(exe).lower()
-        process_is_python = _looks_like_python_image(process_name)
-        executable_is_python = _looks_like_python_image(Path(str(exe)).name)
-        # Revalidate native rows that can matter. This closes the
-        # Toolhelp-snapshot → psutil PID-reuse window without routing every
-        # process back through psutil's slow executable lookup.
-        if native and (
-            snapshot_exe_norm.startswith(venv_prefix)
-            or process_is_python
-            or executable_is_python
-        ):
+        # Revalidate every native row. Arbitrary external launchers are part of
+        # the holder contract, so no snapshot name/path can safely prefilter the
+        # Toolhelp → psutil PID-reuse boundary. A renamed external snapshot PID
+        # may now belong to a venv interpreter whose argv omits the venv path.
+        if native:
             try:
                 exe = proc.exe()
             except Exception:
@@ -4853,8 +4840,6 @@ def _detect_venv_python_processes(
                 continue
             live_executable_name = Path(str(exe)).name
             process_name = live_executable_name.lower()
-            process_is_python = _looks_like_python_image(process_name)
-            executable_is_python = process_is_python
             info["name"] = live_executable_name
         try:
             exe_norm = str(Path(exe).resolve()).lower()

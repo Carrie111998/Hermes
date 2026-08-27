@@ -237,6 +237,32 @@ def test_detect_venv_python_native_catches_renamed_external_launcher(_winp, tmp_
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_revalidates_renamed_snapshot_reused_as_venv_python(
+    _winp, tmp_path
+):
+    snapshot_exe = r"C:\Tools\worker-host.exe"
+    live_exe = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    reused = _proc(525, live_exe, "python.exe", ["python.exe", "worker.py"])
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
+        Process=lambda pid=None: me if pid is None else reused,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module,
+        "_windows_process_image_rows",
+        return_value=[(525, "worker-host.exe", snapshot_exe)],
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == [
+            (525, "python.exe", "python.exe worker.py")
+        ]
+
+    reused.exe.assert_called_once_with()
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
 def test_detect_venv_python_revalidates_native_pid_identity(_winp, tmp_path):
     snapshot_exe = str(tmp_path / "venv" / "Scripts" / "custom-runner.exe")
     reused = _proc(606, r"C:\Windows\System32\notepad.exe", "notepad.exe")
