@@ -17,8 +17,8 @@ import { isRemoteGateway } from '@/lib/media'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
+import { type RightRailTabId } from '@/store/layout'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeSessionId } from '@/store/session'
 import {
   $browserPages,
   $previewServerRestart,
@@ -28,6 +28,7 @@ import {
   popOutBrowserTab,
   type PreviewTarget
 } from '@/store/preview'
+import { $activeSessionId } from '@/store/session'
 import { canOpenBrowserWindow, isBrowserWindow } from '@/store/windows'
 
 import { ArtifactPreview } from './preview-artifact'
@@ -110,7 +111,7 @@ interface PreviewPaneProps {
   reloadRequest?: number
   /** The preview tab this pane renders. Keys the per-tab console store the
    *  browser bar's console toggle and the console panel both read. */
-  tabId?: string
+  tabId?: RightRailTabId
   target: PreviewTarget
 }
 

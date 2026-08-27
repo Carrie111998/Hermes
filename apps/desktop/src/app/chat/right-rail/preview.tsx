@@ -1,13 +1,14 @@
 import { useStore } from '@nanostores/react'
 
 import { $restartPreviewServer } from '@/app/contrib/panes'
+import { type RightRailTabId } from '@/store/layout'
 import { $previewReloadRequest, $previewTabs } from '@/store/preview'
 
 import { PreviewPane } from './preview-pane'
 
 interface PreviewTilePaneProps {
   /** The `$previewTabs` id this pane renders. */
-  tabId: string
+  tabId: RightRailTabId
 }
 
 /**

@@ -1,17 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import { hasLivePreviewForSession, registerPreviewPageReader, hasLivePreviewReaders } from './preview-reader'
+
 import { $previewTabs } from '@/store/preview'
+
+import { hasLivePreviewForSession, registerPreviewPageReader } from './preview-reader'
 
 describe('session-scoped preview reader gate (#95459)', () => {
   const setupTabs = () => {
     $previewTabs.set([
-      { id: 'tab-a', target: { kind: 'url', label: 'Browser', source: 'https://example.com', url: 'https://example.com' } },
+      { id: 'url:tab-a', target: { kind: 'url', label: 'Browser', source: 'https://example.com', url: 'https://example.com' } },
     ])
   }
 
   it('rejects when a different session owns the live preview', () => {
     setupTabs()
-    const unregister = registerPreviewPageReader('tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
+    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
 
     // Session B asks: should be rejected (session-A owns the preview)
     expect(hasLivePreviewForSession('session-B')).toBe(false)
@@ -24,7 +26,7 @@ describe('session-scoped preview reader gate (#95459)', () => {
 
   it('accepts the owning session after restart re-bind', () => {
     setupTabs()
-    const unregister = registerPreviewPageReader('tab-a', async () => ({ text: '', title: '', url: '' }), 'session-owner')
+    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-owner')
 
     expect(hasLivePreviewForSession('session-owner')).toBe(true)
     expect(hasLivePreviewForSession('session-other')).toBe(false)
@@ -34,7 +36,7 @@ describe('session-scoped preview reader gate (#95459)', () => {
 
   it('rejects when reader is unregistered', () => {
     setupTabs()
-    const unregister = registerPreviewPageReader('tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
+    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
 
     unregister()
     expect(hasLivePreviewForSession('session-A')).toBe(false)
@@ -42,7 +44,7 @@ describe('session-scoped preview reader gate (#95459)', () => {
 
   it('empty sessionId always rejects', () => {
     setupTabs()
-    const unregister = registerPreviewPageReader('tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
+    const unregister = registerPreviewPageReader('url:tab-a', async () => ({ text: '', title: '', url: '' }), 'session-A')
 
     expect(hasLivePreviewForSession('')).toBe(false)
 

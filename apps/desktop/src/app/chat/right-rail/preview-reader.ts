@@ -12,7 +12,7 @@
  * directly (read_file / the conversation's artifact).
  */
 
-import { $rightRailActiveTabId } from '@/store/layout'
+import { $rightRailActiveTabId, type RightRailTabId } from '@/store/layout'
 import { $previewTabs } from '@/store/preview'
 
 import { nudgeOverlay } from './preview-nudge'
@@ -49,10 +49,10 @@ type PageReader = () => Promise<PreviewPage>
  *  this crosses the gateway into model context. Page with start/count. */
 export const PREVIEW_READ_MAX_CHARS = 24_000
 
-const readers = new Map<string, PageReader>()
+const readers = new Map<RightRailTabId, PageReader>()
 
 /** Owning session for each registered reader (tabId -> sessionId). */
-const readerSessions = new Map<string, string>()
+const readerSessions = new Map<RightRailTabId, string>()
 
 /** True when at least one preview tab has a registered live page reader
  *  AND that tab is still open in `$previewTabs` (guards against stale
@@ -98,7 +98,7 @@ export function hasLivePreviewForSession(sessionId: string): boolean {
  *  treated as a legacy global registration and only counts for
  *  {@link hasLivePreviewReaders}. */
 export function registerPreviewPageReader(
-  tabId: string,
+  tabId: RightRailTabId,
   reader: PageReader,
   sessionId?: string
 ): () => void {

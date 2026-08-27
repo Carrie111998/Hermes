@@ -1,3 +1,4 @@
+import { type RightRailTabId } from './layout'
 import { notifyError } from './notifications'
 
 // Window flag set by the Electron main process when it opens a standalone
@@ -99,9 +100,9 @@ export function isBrowserWindow(): boolean {
   return result
 }
 
-export function windowBrowserTabId(): null | string {
+export function windowBrowserTabId(): null | RightRailTabId {
   try {
-    return new URLSearchParams(window.location.search).get('tab')?.trim() || null
+    return (new URLSearchParams(window.location.search).get('tab')?.trim() || null) as null | RightRailTabId
   } catch {
     return null
   }
