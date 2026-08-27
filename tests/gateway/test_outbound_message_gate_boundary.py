@@ -58,6 +58,21 @@ async def test_common_adapter_send_boundary_applies_rewrite(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_common_adapter_send_preserves_positional_metadata_api(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **kwargs: [{"action": "allow"}],
+    )
+    adapter = GateAdapter()
+    metadata = {"_hermes_session_id": "s1", "_hermes_turn_id": "t1"}
+
+    result = await adapter.send("paul", "original", "reply-1", metadata)
+
+    assert result.success is True
+    assert adapter.sent == [("paul", "original", metadata)]
+
+
+@pytest.mark.asyncio
 async def test_common_adapter_edit_boundary_applies_rewrite(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.lifecycle.invoke_hook",

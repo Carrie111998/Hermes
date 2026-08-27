@@ -54,6 +54,40 @@ def test_non_protected_target_is_unchanged():
     assert result == {"action": "allow"}
 
 
+def test_protected_target_matching_normalizes_platform_and_case_sensitive_id():
+    result = mod.gate_outbound_message(
+        platform="SLACK",
+        chat_id="C123",
+        content="The defect is fixed.",
+        metadata={},
+        settings=settings(" slack:C123 "),
+        fetcher=lambda _url: {"ok": True, "status": 200},
+    )
+
+    assert result["action"] == "rewrite"
+    assert result["reason"] == "claim_receipt_missing"
+
+
+def test_required_success_patterns_cannot_be_disabled_and_see_visible_markdown():
+    for claim in (
+        "**dＯne**.",
+        "The work is com**plete**.",
+        "The service is operational.",
+        "The bug no longer occurs.",
+        "All checks pass.",
+    ):
+        result = mod.gate_outbound_message(
+            platform="telegram",
+            chat_id="paul",
+            content=claim,
+            metadata={},
+            settings={"protected_targets": ["telegram:paul"], "success_terms": []},
+            fetcher=lambda _url: {"ok": True, "status": 200},
+        )
+        assert result["action"] == "rewrite", claim
+        assert result["reason"] == "claim_receipt_missing", claim
+
+
 def test_every_url_is_fetched_and_dead_url_replaces_original_with_honest_failure():
     seen = []
 
@@ -96,23 +130,30 @@ def test_unsupported_url_scheme_fails_closed_instead_of_bypassing_fetch():
     assert "unsupported or malformed URL" in result["content"]
 
 
-def test_live_fetch_follows_redirect_and_checks_final_response():
-    server, thread = _policy_server()
-    try:
-        result = mod.fetch_url_live(
-            f"http://127.0.0.1:{server.server_port}/redirect"
-        )
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
-        server.server_close()
+def test_live_fetch_rejects_local_private_link_local_metadata_and_tailnet_without_io(monkeypatch):
+    attempted = []
 
-    assert result["ok"] is True
-    assert result["status"] == 200
-    assert result["final_url"].endswith("/final")
+    def forbidden_open(*args, **kwargs):
+        attempted.append((args, kwargs))
+        raise AssertionError("network I/O must not start")
+
+    monkeypatch.setattr(mod, "urlopen", forbidden_open)
+    urls = (
+        "http://127.0.0.1/admin",
+        "http://10.0.0.1/private",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://100.64.0.1/tailnet",
+        "http://[::1]/admin",
+    )
+
+    for url in urls:
+        result = mod.fetch_url_live(url)
+        assert result["ok"] is False, url
+        assert result["error"] == "destination is not public", url
+    assert attempted == []
 
 
-def test_bare_oauth_callback_http_400_is_reachable_not_dead():
+def test_bare_oauth_callback_requires_narrow_configured_status_exception():
     server, thread = _policy_server()
     try:
         result = mod.fetch_url_live(
