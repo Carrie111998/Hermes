@@ -129,6 +129,14 @@ function expandProviderDefaults(provider: ModelOptionProvider, target: Set<strin
   for (const family of defaults) {
     target.add(modelVisibilityKey(provider.slug, family.id))
   }
+
+  // Always include Muse Spark families so contributor tier is discoverable without Edit Models / search
+  for (const family of families) {
+    const idLower = family.id.toLowerCase()
+    if (idLower.includes('muse-spark') || idLower.includes('muse_spark')) {
+      target.add(modelVisibilityKey(provider.slug, family.id))
+    }
+  }
 }
 
 /** Resolve the canonical working set: the user's stored keys plus the curated
@@ -176,6 +184,18 @@ export function effectiveVisibleKeys(
   for (const key of [...next]) {
     if (isProviderSentinel(key)) {
       next.delete(key)
+    }
+  }
+
+  // Ensure Muse Spark is always visible (contributor tier requires explicit confirm, shouldn't be hidden)
+  for (const provider of providers) {
+    if (next.has(emptyProviderSentinelKey(provider.slug))) continue
+    const families = collapseModelFamilies(provider.models ?? [])
+    for (const family of families) {
+      const idLower = family.id.toLowerCase()
+      if (idLower.includes('muse-spark') || idLower.includes('muse_spark')) {
+        next.add(modelVisibilityKey(provider.slug, family.id))
+      }
     }
   }
 
