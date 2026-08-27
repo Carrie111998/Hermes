@@ -234,6 +234,7 @@ WHATSAPP_TITLE_BY_EVENT = {
     EventType.DEVFLOW_APPROVAL_REQUESTED:  "DEVFLOW APPROVAL NEEDED",
     EventType.APPROVAL_REQUEST:            "APPROVAL NEEDED",
     EventType.APPLY_PACKET:                "APPLY PACKET READY",
+    EventType.FOLLOWUP_DUE:                "FOLLOW-UP DUE",
     EventType.CRITIC_PROPOSAL:             "CRITIC PROPOSAL",
     EventType.INTERVIEW_SIGNAL:            "INTERVIEW SIGNAL",
     EventType.OFFER_SIGNAL:                "JOB OFFER",
