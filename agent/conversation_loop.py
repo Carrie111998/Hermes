@@ -6283,16 +6283,17 @@ def run_conversation(
                     # is untouched (it is gated by is_rate_limited, not
                     # this threshold).
                     _fallback_allowed = _tft > 0 or not _is_transport_failure
-                    if _fallback_allowed and agent._has_pending_fallback():
-                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if _fallback_allowed and agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    if _fallback_allowed:
+                        if agent._has_pending_fallback():
+                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
