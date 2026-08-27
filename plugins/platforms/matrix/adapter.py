@@ -1574,36 +1574,19 @@ class MatrixAdapter(BasePlatformAdapter):
             "(discovery_probed=%s)", token_endpoint, discovery_probed,
         )
 
-        def _build_opener():
-            proxy_url = os.getenv("MATRIX_PROXY", "").strip()
-            handlers = []
-            if proxy_url:
-                if proxy_url.startswith(("socks4://", "socks5://", "socks://")):
-                    logger.warning(
-                        "Matrix: MATRIX_PROXY scheme %r not supported for the "
-                        "MAS refresh path (HTTP(S) only); ignoring.",
-                        proxy_url.split("://", 1)[0],
-                    )
-                else:
-                    handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-            return urllib.request.build_opener(*handlers) if handlers else None
-
         def _post_token_request():
             data = urllib.parse.urlencode({
                 "grant_type": "refresh_token",
                 "refresh_token": self._refresh_token,
                 "client_id": client_id,
             }).encode()
-            req = urllib.request.Request(
+            return self._mas_urlopen(
                 token_endpoint,
+                timeout=15,
                 data=data,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 method="POST",
             )
-            opener = _build_opener()
-            if opener is not None:
-                return opener.open(req, timeout=15)
-            return urllib.request.urlopen(req, timeout=15)
 
         try:
             doc = await asyncio.to_thread(_post_token_request)
@@ -1628,6 +1611,34 @@ class MatrixAdapter(BasePlatformAdapter):
             return True
         return False
 
+    def _mas_urlopen(self, url, *, timeout, data=None, headers=None, method=None):
+        """urllib fetch used by the whole MAS refresh path (discovery +
+        token POST), honoring ``MATRIX_PROXY`` (HTTP/HTTPS) uniformly.
+
+        SOCKS proxies are logged-and-ignored here (the aiohttp transport
+        owns SOCKS for adapter traffic; this helper covers only the
+        one-shot OAuth2 requests).
+        """
+        import urllib.request
+
+        proxy_url = os.getenv("MATRIX_PROXY", "").strip()
+        req = urllib.request.Request(
+            url, data=data, headers=headers or {}, method=method
+        )
+        if proxy_url:
+            if proxy_url.startswith(("socks4://", "socks5://", "socks://")):
+                logger.debug(
+                    "Matrix: MATRIX_PROXY scheme %r not supported for the "
+                    "MAS refresh path (HTTP(S) only); going direct.",
+                    proxy_url.split("://", 1)[0],
+                )
+                return urllib.request.urlopen(req, timeout=timeout)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+            return opener.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
+
     def _resolve_oauth_token_endpoint(self):
         """Return ``(token_endpoint, discovery_was_attempted)``.
 
@@ -1637,8 +1648,6 @@ class MatrixAdapter(BasePlatformAdapter):
            falling back to the MSC2965 homeserver pointer for the issuer.
         """
         import json as _json
-        import urllib.parse
-        import urllib.request
 
         override = (
             getattr(self, "_oidc_token_endpoint_override", "")
@@ -1654,7 +1663,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
         def _fetch_well_known(base):
             url = base.rstrip("/") + "/.well-known/openid-configuration"
-            with urllib.request.urlopen(url, timeout=10) as r:
+            with self._mas_urlopen(url, timeout=10) as r:
                 return url, _json.loads(r.read().decode("utf-8", errors="replace"))
 
         def _try_discover(base):
@@ -1697,7 +1706,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Second try: MSC2965 homeserver pointer to the issuer.
         try:
-            with urllib.request.urlopen(
+            with self._mas_urlopen(
                 homeserver + "/.well-known/matrix/client", timeout=10
             ) as r:
                 client_doc = _json.loads(r.read().decode("utf-8", errors="replace"))
