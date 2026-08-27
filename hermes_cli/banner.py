@@ -199,10 +199,14 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     Shallow installer clones and ls-remote-only probes know the two tip SHAs
     but have no local history to run ``rev-list --count`` across. GitHub's
     ``GET /repos/<owner>/<repo>/compare/<current>...<target>`` knows the full
-    graph regardless of local clone depth and returns ``ahead_by`` — exactly
-    the behind count the local graph lost. Unauthenticated, bounded, and
-    best-effort: any failure (offline, rate limit, diverged/unknown SHAs)
-    returns None so callers keep the honest UPDATE_AVAILABLE_NO_COUNT.
+    graph regardless of local clone depth. For ``compare/<current>...<target>``
+    the API reports ``behind_by`` == how many commits ``<current>`` (the local
+    checkout) is behind ``<target>`` (upstream main) — that is the number this
+    function returns. NOTE: ``ahead_by`` is the WRONG field here — it counts
+    commits local has that upstream lacks, and using it inverts the report
+    (a local-ahead checkout would be misreported as "behind"). Unauthenticated,
+    bounded, best-effort: any failure (offline, rate limit, diverged/unknown
+    SHAs) returns None so callers keep the honest UPDATE_AVAILABLE_NO_COUNT.
     """
     if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
         return None
@@ -225,9 +229,9 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
-    ahead = payload.get("ahead_by") if isinstance(payload, dict) else None
-    if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
-        return ahead
+    behind = payload.get("behind_by") if isinstance(payload, dict) else None
+    if isinstance(behind, int) and not isinstance(behind, bool) and behind >= 0:
+        return behind
     return None
 
 
