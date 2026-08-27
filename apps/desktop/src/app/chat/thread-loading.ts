@@ -15,11 +15,12 @@ export function lastVisibleMessageIsUser(messages: ChatMessage[]): boolean {
 
 export function threadLoadingState(
   loadingSession: boolean,
+  hasVisibleMessages: boolean,
   busy: boolean,
   awaitingResponse: boolean,
   lastVisibleIsUser: boolean
 ): ThreadLoadingState | undefined {
-  if (loadingSession) {
+  if (loadingSession && !hasVisibleMessages) {
     return 'session'
   }
 
@@ -49,7 +50,7 @@ export function routedSessionIsLoading({
     return false
   }
 
-  if (routeSessionMismatch) {
+  if (routeSessionMismatch || !activeSessionId) {
     return true
   }
 
@@ -61,5 +62,5 @@ export function routedSessionIsLoading({
   // knows has history must keep the loader up until a display-authoritative
   // transcript arrives — including the unproven warm-cache hold, where the
   // runtime is bound but messages are still suppressed.
-  return !activeSessionId || knownHistory
+  return knownHistory
 }

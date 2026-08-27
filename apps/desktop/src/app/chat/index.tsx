@@ -502,12 +502,11 @@ const ChatViewContent = memo(function ChatViewContent({
     selectedSessionId
   })
 
-  // Session is still loading if the route references a session we haven't
-  // resumed yet. Brand-new routed drafts are empty on purpose once a runtime
-  // is bound. A session the list already knows has history must keep the
-  // loader up until a display-authoritative transcript arrives — including
-  // the unproven warm-cache hold, where the runtime is bound but messages
-  // are still suppressed.
+  // A persisted transcript may paint before its runtime is rebound, but the
+  // composer stays gated until activeSessionId exists. Brand-new routed
+  // drafts are empty on purpose once a runtime is bound. A session the list
+  // already knows has history must keep the loader up until a
+  // display-authoritative transcript arrives.
   //
   // resumeExhausted: the bounded auto-retry in use-route-resume gave up on this
   // routed session (gateway RPC + REST fallback failed through every attempt).
@@ -530,7 +529,7 @@ const ChatViewContent = memo(function ChatViewContent({
     routedSessionView: isRoutedSessionView
   })
 
-  const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
+  const threadLoading = threadLoadingState(loadingSession, !messagesEmpty, busy, awaitingResponse, lastVisibleIsUser)
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.

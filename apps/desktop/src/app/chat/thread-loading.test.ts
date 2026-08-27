@@ -15,21 +15,25 @@ function message(id: string, role: ChatMessage['role'], hidden = false): ChatMes
 
 describe('thread loading state', () => {
   it('returns session when routed session is still hydrating', () => {
-    expect(threadLoadingState(true, true, true, false)).toBe('session')
+    expect(threadLoadingState(true, false, true, true, false)).toBe('session')
+  })
+
+  it('keeps a cached transcript visible while its runtime binds', () => {
+    expect(threadLoadingState(true, true, false, false, false)).toBeUndefined()
   })
 
   it('returns response while awaiting an assistant reply to the last visible user message', () => {
     const messages = [message('u1', 'user'), message('a1', 'assistant', true)]
 
     expect(lastVisibleMessageIsUser(messages)).toBe(true)
-    expect(threadLoadingState(false, true, true, lastVisibleMessageIsUser(messages))).toBe('response')
+    expect(threadLoadingState(false, true, true, true, lastVisibleMessageIsUser(messages))).toBe('response')
   })
 
   it('does not show response loading when the last visible message is not user-authored', () => {
     const messages = [message('u1', 'user'), message('a1', 'assistant')]
 
     expect(lastVisibleMessageIsUser(messages)).toBe(false)
-    expect(threadLoadingState(false, true, true, lastVisibleMessageIsUser(messages))).toBeUndefined()
+    expect(threadLoadingState(false, true, true, true, lastVisibleMessageIsUser(messages))).toBeUndefined()
   })
 })
 
@@ -42,6 +46,25 @@ describe('routedSessionIsLoading', () => {
     routeSessionMismatch: false,
     routedSessionView: true
   }
+
+  it('keeps the composer gated until a routed session has a bound runtime', () => {
+    expect(
+      routedSessionIsLoading({
+        ...base,
+        activeSessionId: null
+      })
+    ).toBe(true)
+  })
+
+  it('ends pending state when bounded recovery is exhausted', () => {
+    expect(
+      routedSessionIsLoading({
+        ...base,
+        activeSessionId: null,
+        resumeExhausted: true
+      })
+    ).toBe(false)
+  })
 
   it('keeps the session loader up when known history is held off the view', () => {
     expect(
