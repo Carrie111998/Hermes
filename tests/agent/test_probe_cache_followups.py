@@ -366,7 +366,14 @@ class TestLMStudioDetectionRequiresNativePayload:
     """
 
     def _detect(self, payload):
+        from agent import model_metadata
         from agent.model_metadata import detect_local_server_type
+
+        # Each payload below represents a different server. Do not let the
+        # detector's intentional per-endpoint cache turn this shape test into
+        # an order-dependent assertion about the first example it happened to
+        # run.
+        model_metadata._endpoint_probe_path_cache.clear()
 
         hit = MagicMock()
         hit.status_code = 200
@@ -383,7 +390,11 @@ class TestLMStudioDetectionRequiresNativePayload:
         client.get.side_effect = (
             lambda url, *a, **k: hit if url.endswith("/api/v1/models") else miss
         )
-        with patch("httpx.Client", return_value=client):
+        with (
+            patch("httpx.Client", return_value=client),
+            patch("agent.model_metadata._local_probe_disk_get", return_value=None),
+            patch("agent.model_metadata._local_probe_disk_put"),
+        ):
             return detect_local_server_type("http://127.0.0.1:8080/v1")
 
     def test_openai_listing_envelope_is_not_lm_studio(self):
@@ -415,10 +426,11 @@ class TestLMStudioDetectionRequiresNativePayload:
         ) == "lm-studio"
         # Idle LM Studio: running, no model loaded.
         assert self._detect({"models": []}) == "lm-studio"
-        # `type` + `state` together are an acceptable weaker signal.
+        # A data-keyed response remains OpenAI-compatible even when an entry
+        # happens to carry fields also seen in LM Studio's native response.
         assert self._detect(
             {"data": [{"id": "m", "type": "llm", "state": "loaded"}]}
-        ) == "lm-studio"
+        ) != "lm-studio"
 
     def test_unparseable_or_ambiguous_payloads_fail_closed(self):
         """Fail closed, never open: an unrecognised body must not classify as
@@ -427,6 +439,12 @@ class TestLMStudioDetectionRequiresNativePayload:
         assert self._detect({}) != "lm-studio"
         # An empty `data` list is indistinguishable from an idle OpenAI server.
         assert self._detect({"data": []}) != "lm-studio"
+        # The prior predicate accepted these rich data-keyed variants even
+        # though both LM Studio consumers only read payload["models"].
+        assert (
+            self._detect({"data": [{"id": "m", "key": "publisher/m"}]})
+            != "lm-studio"
+        )
 
     def test_detection_agrees_with_what_the_lm_studio_parser_can_read(self):
         """Contract between the detector and its consumer: this module's LM
@@ -477,7 +495,16 @@ class TestOpenAICompatProxyMetadataSurvivesDetection:
         payload = {
             "object": "list",
             "data": [
-                {"id": "big-ctx-model", "object": "model", "context_length": 1_000_000}
+                {
+                    "id": "big-ctx-model",
+                    "object": "model",
+                    "context_length": 1_000_000,
+                    # Gateway extension fields may reuse pricing aliases with
+                    # non-scalar values. They must not abort the whole metadata
+                    # parse before the real pricing object is reached.
+                    "modalities": {"input": [], "output": []},
+                    "pricing": {"input": 0, "output": 0},
+                }
             ],
         }
         model_metadata._endpoint_model_metadata_cache.clear()
@@ -506,4 +533,6 @@ class TestOpenAICompatProxyMetadataSurvivesDetection:
                 "http://127.0.0.1:8080/v1", force_refresh=True
             )
 
-        assert metadata.get("big-ctx-model", {}).get("context_length") == 1_000_000
+        entry = metadata.get("big-ctx-model", {})
+        assert entry.get("context_length") == 1_000_000
+        assert entry.get("pricing") == {"prompt": 0, "completion": 0}

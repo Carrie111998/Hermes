@@ -1011,25 +1011,16 @@ def _is_lmstudio_models_payload(response: Any) -> bool:
     ``{"object": "list", "data": [{"id": ..., "object": "model"}]}``.
 
     LM Studio's native listing is structurally different: it keys entries under
-    ``models``, does not stamp ``object="list"``, and each entry carries fields
-    the OpenAI envelope never has (``loaded_instances``, ``max_context_length``,
-    ``arch``, ``publisher``, a publisher-qualified ``key``, or a ``type`` such as
-    "llm" paired with a ``state``). Discriminating on that shape — rather than on
-    a bare 200 — is what keeps a generic OpenAI server out of the LM Studio
-    branch.
+    ``models``. Both consumers of a positive detection read that exact key, so
+    accepting a ``data``-keyed response would classify a payload they cannot
+    consume and discard its metadata. Discriminating on the consumer-readable
+    envelope — rather than on a bare 200 — keeps generic OpenAI servers out of
+    the LM Studio branch.
 
     Fails closed: any parse error or unrecognised shape returns False, so the
     caller simply continues its detection waterfall and ends up on the
     OpenAI-compatible path, which is the correct handling for such a server.
     """
-    # Any ONE of these is decisive — the OpenAI listing envelope has none of them.
-    strong_markers = (
-        "loaded_instances",
-        "max_context_length",
-        "arch",
-        "publisher",
-        "key",  # publisher-qualified id, e.g. "qwen/qwen3-4b"
-    )
     try:
         data = response.json()
     except Exception:
@@ -1041,27 +1032,10 @@ def _is_lmstudio_models_payload(response: Any) -> bool:
     # OpenAI-compatible server up front, whatever its entries happen to carry.
     if data.get("object") == "list":
         return False
-    # LM Studio keys entries under `models`; the OpenAI envelope never does, so
-    # the key itself is a positive signal. Fall back to `data` for builds that
-    # use it.
-    lmstudio_keyed = isinstance(data.get("models"), list)
-    entries = data.get("models") if lmstudio_keyed else data.get("data")
-    if not isinstance(entries, list):
-        return False
-    if not entries:
-        # An idle LM Studio (running, no model loaded) returns an empty list.
-        # Accept that only on the LM Studio-native `models` key — an empty
-        # `{"data": []}` is indistinguishable from an idle OpenAI server once
-        # the `object: "list"` envelope is absent, so fail closed there.
-        return lmstudio_keyed
-    first = entries[0]
-    if not isinstance(first, dict):
-        return False
-    if any(marker in first for marker in strong_markers):
-        return True
-    # `type` and `state` are individually too generic to be evidence, so they
-    # only count together.
-    return "type" in first and "state" in first
+    # Both LM Studio consumers read payload["models"]. Requiring that list is
+    # therefore a detector/consumer contract, not a vendor-field snapshot. It
+    # also preserves idle LM Studio detection via {"models": []}.
+    return isinstance(data.get("models"), list)
 
 
 def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
@@ -1331,8 +1305,9 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         pricing: Dict[str, Any] = {}
         for target, aliases in alias_map.items():
             for alias in aliases:
-                if alias in normalized and isinstance(normalized[alias], (int, float, str)) and normalized[alias] not in {None, ""}:
-                    pricing[target] = normalized[alias]
+                value = normalized.get(alias)
+                if isinstance(value, (int, float, str)) and value not in {None, ""}:
+                    pricing[target] = value
                     break
         if pricing:
             return pricing
