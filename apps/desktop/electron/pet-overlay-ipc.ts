@@ -170,6 +170,8 @@ export function registerPetOverlayIpc({
     }
 
     const win = petOverlayWindow
+    const x = Math.round(bounds.x)
+    const y = Math.round(bounds.y)
     const width = Math.max(80, Math.round(bounds.width))
     const height = Math.max(80, Math.round(bounds.height))
     const [curW, curH] = win.getSize()
@@ -179,7 +181,13 @@ export function registerPetOverlayIpc({
       win.setResizable(true)
     }
 
-    win.setBounds({ x: Math.round(bounds.x), y: Math.round(bounds.y), width, height })
+    if (resizing) {
+      win.setBounds({ x, y, width, height })
+    } else {
+      // Roaming only changes position. Avoid asking Windows to renegotiate the
+      // whole transparent window rectangle on every animation frame.
+      win.setPosition(x, y)
+    }
 
     if (resizing) {
       win.setResizable(false)

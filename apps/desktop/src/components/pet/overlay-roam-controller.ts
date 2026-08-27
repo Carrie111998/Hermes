@@ -39,15 +39,13 @@ const MAX_DT_S = 0.05
 const HOP_CHANCE = 0.35
 const DROP_CHANCE = 0.15
 const BASE_HOP_DURATION_MS = 800
+const LANDING_ANALYSIS_DELAY_MS = 250
 const PAUSE_POLL_MS = 250
 const SUPPORT_SNAP_TOLERANCE_PX = 8
 const DRAG_SETTLE_TOLERANCE_PX = 24
 const LEDGE_MATCH_TOLERANCE_PX = 8
 const SUPPORT_RETRY_MS = 1000
 const SUPPORT_FAILURE_LIMIT = 3
-const MOTION_SURFACE_PROBE_MS = 180
-const WALK_ENVIRONMENT_MAX_AGE_MS = 900
-const AIRBORNE_ENVIRONMENT_MAX_AGE_MS = 450
 const PLANNED_HOP_FAILURE_LIMIT = 2
 const OVERLAY_PAUSE_DWELL = { maxMs: 2500, meanMs: 900, minMs: 250 }
 
@@ -330,10 +328,6 @@ export const overlayMotionProbeIsCurrent = (
   currentPhase: Phase
 ): boolean => requestedEpoch === currentEpoch && requestedPhase === currentPhase
 
-function visualOnlyLedges(all: Ledge[], native: Ledge[]): Ledge[] {
-  return all.filter(ledge => ledge !== all[0] && !native.some(nativeLedge => sameOverlayLedge(nativeLedge, ledge)))
-}
-
 export function advanceOverlayVisualCandidate(
   previous: OverlayVisualCandidate | null,
   visual: Ledge | null
@@ -477,14 +471,12 @@ export function startPetOverlayRoam({
   let raf = 0
   let timer = 0
   let lastFrame = 0
-  let lastPaint = 0
+  let lastPaintX = Number.NaN
+  let lastPaintY = Number.NaN
   let current: OverlayBounds | null = null
   let ledges: Ledge[] = []
-  let nativeLandingLedges: Ledge[] = []
   let motionLandingLedges: Ledge[] = []
   let plannedHopLanding: Ledge | null = null
-  let plannedHopFailures = 0
-  let plannedHopSceneRevision: string | null = null
   let currentLedge: Ledge | null = null
   let targetLedge: Ledge | null = null
   let phase: Phase = 'walk'
@@ -499,10 +491,6 @@ export function startPetOverlayRoam({
   let supportMisses = 0
   let nextSupportRetryAt = 0
   let ignoredDropSurfaceY: number | null = null
-  let motionProbeInFlight = false
-  let motionVisualCandidate: OverlayVisualCandidate | null = null
-  let motionEpoch = 0
-  let lastMotionProbe = 0
   let settleFirstPlan = replanKey > 0
   let forceWalkNext = replanKey > 0
   const speed = (petW * 0.8) / Math.max(0.25, loopMs / 1000)
@@ -536,9 +524,17 @@ export function startPetOverlayRoam({
     }
   }
 
-  const paint = (now: number, force = false) => {
-    if (current && (force || now - lastPaint >= 1000 / 30)) {
-      lastPaint = now
+  const paint = (force = false) => {
+    if (current) {
+      const x = Math.round(current.x)
+      const y = Math.round(current.y)
+
+      if (!force && x === lastPaintX && y === lastPaintY) {
+        return
+      }
+
+      lastPaintX = x
+      lastPaintY = y
       api.setBounds(current)
     }
   }
@@ -552,13 +548,8 @@ export function startPetOverlayRoam({
     supportMisses = 0
     nextSupportRetryAt = 0
     ignoredDropSurfaceY = null
-    motionVisualCandidate = null
-    motionEpoch += 1
     plannedHopLanding = ledge
-    plannedHopFailures = 0
-    plannedHopSceneRevision = null
-    motionLandingLedges = overlayMotionLandingLedges(nativeLandingLedges, null, plannedHopLanding)
-    lastMotionProbe = 0
+    motionLandingLedges = appendOverlayLedge(ledges, plannedHopLanding)
     forceWalkNext = true
     targetLedge = ledge
     targetX = x
@@ -583,17 +574,12 @@ export function startPetOverlayRoam({
     supportMisses = 0
     nextSupportRetryAt = 0
     ignoredDropSurfaceY = surface.y
-    motionVisualCandidate = null
-    motionEpoch += 1
     plannedHopLanding = null
-    plannedHopFailures = 0
-    plannedHopSceneRevision = null
-    motionLandingLedges = nativeLandingLedges
+    motionLandingLedges = ledges
     forceWalkNext = true
     targetLedge = ledges[0]!
     phase = 'fall'
     fallVelocity = 0
-    lastMotionProbe = 0
     signal('jump')
   }
 
@@ -615,13 +601,8 @@ export function startPetOverlayRoam({
       targetLedge = currentLedge
       phase = 'fall'
       fallVelocity = 0
-      motionVisualCandidate = null
-      motionEpoch += 1
       plannedHopLanding = null
-      plannedHopFailures = 0
-      plannedHopSceneRevision = null
-      motionLandingLedges = nativeLandingLedges
-      lastMotionProbe = 0
+      motionLandingLedges = ledges
       forceWalkNext = true
       signal('jump')
 
@@ -674,10 +655,7 @@ export function startPetOverlayRoam({
     }
 
     forceWalkNext = false
-    motionEpoch += 1
     plannedHopLanding = null
-    plannedHopFailures = 0
-    plannedHopSceneRevision = null
     targetLedge = currentLedge
     phase = 'walk'
     signal('run', dir)
@@ -685,34 +663,11 @@ export function startPetOverlayRoam({
     return true
   }
 
-  const environmentLedges = (environment: OverlayRoamEnvironment) => {
-    const all = overlayRoamLedges(environment, current?.width ?? 1, petW, petH)
-    const native = overlayRoamLedges({ ...environment, visualLedges: [] }, current?.width ?? 1, petW, petH)
+  const environmentLedges = (environment: OverlayRoamEnvironment) =>
+    overlayRoamLedges(environment, current?.width ?? 1, petW, petH)
 
-    return { all, native }
-  }
-
-  const updateMotionLandingLedges = (all: Ledge[], native: Ledge[]) => {
-    nativeLandingLedges = native
-    const visual = visualOnlyLedges(all, native)[0]
-
-    if (!visual) {
-      motionVisualCandidate = null
-      motionLandingLedges = overlayMotionLandingLedges(native, null, phase === 'hop' ? plannedHopLanding : null)
-
-      return
-    }
-
-    motionVisualCandidate = advanceOverlayVisualCandidate(motionVisualCandidate, visual)
-
-    const confirmedVisual =
-      motionVisualCandidate && motionVisualCandidate.hits >= 2 ? motionVisualCandidate.ledge : null
-
-    motionLandingLedges = overlayMotionLandingLedges(
-      native,
-      confirmedVisual,
-      phase === 'hop' ? plannedHopLanding : null
-    )
+  const updateMotionLandingLedges = (freshLedges: Ledge[]) => {
+    motionLandingLedges = plannedHopLanding ? appendOverlayLedge(freshLedges, plannedHopLanding) : freshLedges
   }
 
   const reconcileRememberedSupport = (
@@ -757,75 +712,6 @@ export function startPetOverlayRoam({
     return { ledges: appendOverlayLedge(freshLedges, rememberedSupport), lostSupport: null }
   }
 
-  const refreshMotionLedges = (now: number) => {
-    const probeInterval = phase === 'walk' ? SUPPORT_RETRY_MS : MOTION_SURFACE_PROBE_MS
-
-    if (motionProbeInFlight || now - lastMotionProbe < probeInterval) {
-      return
-    }
-
-    lastMotionProbe = now
-    motionProbeInFlight = true
-    const requestedEpoch = motionEpoch
-    const requestedPhase = phase
-
-    void api
-      .roamEnvironment({
-        petHeight: petH,
-        petWidth: petW,
-        maxCacheAgeMs: requestedPhase === 'walk' ? WALK_ENVIRONMENT_MAX_AGE_MS : AIRBORNE_ENVIRONMENT_MAX_AGE_MS,
-        reuseCapture: true,
-        scanMode: requestedPhase === 'walk' ? 'support' : 'landing'
-      })
-      .then(environment => {
-        if (
-          !stopped &&
-          current &&
-          environment &&
-          overlayMotionProbeIsCurrent(requestedEpoch, motionEpoch, requestedPhase, phase)
-        ) {
-          const fresh = environmentLedges(environment)
-
-          if (
-            requestedPhase === 'hop' &&
-            environment.sceneRevision &&
-            environment.sceneRevision !== plannedHopSceneRevision
-          ) {
-            const validation = revalidateOverlayPlannedHop(plannedHopLanding, fresh.all, plannedHopFailures)
-
-            plannedHopLanding = validation.ledge
-            plannedHopFailures = validation.failures
-            plannedHopSceneRevision = environment.sceneRevision
-          }
-
-          updateMotionLandingLedges(fresh.all, fresh.native)
-
-          if (requestedPhase === 'walk') {
-            const support = reconcileRememberedSupport(fresh.all, performance.now())
-
-            ledges = support.ledges
-
-            if (support.lostSupport) {
-              beginDrop(support.lostSupport)
-              window.clearTimeout(timer)
-              timer = 0
-
-              if (raf === 0) {
-                lastFrame = performance.now()
-                raf = window.requestAnimationFrame(step)
-              }
-            }
-          } else {
-            ledges = fresh.all
-          }
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        motionProbeInFlight = false
-      })
-  }
-
   const step = (now: number) => {
     raf = 0
 
@@ -835,17 +721,12 @@ export function startPetOverlayRoam({
 
     if (isInteracting()) {
       syncFromWindow()
-      motionEpoch += 1
       plannedHopLanding = null
-      plannedHopFailures = 0
-      plannedHopSceneRevision = null
       signal(null)
       timer = window.setTimeout(plan, PAUSE_POLL_MS)
 
       return
     }
-
-    refreshMotionLedges(now)
 
     const dt = Math.min(MAX_DT_S, Math.max(0, now - lastFrame) / 1000)
     const targetY = restY(targetLedge)
@@ -882,10 +763,7 @@ export function startPetOverlayRoam({
     if (pathLanding) {
       targetLedge = pathLanding
       current.y = restY(pathLanding)
-      motionEpoch += 1
       plannedHopLanding = null
-      plannedHopFailures = 0
-      plannedHopSceneRevision = null
       rememberedSupport = pathLanding === liveLandingLedges[0] ? null : pathLanding
       supportMisses = 0
       ignoredDropSurfaceY = null
@@ -898,13 +776,9 @@ export function startPetOverlayRoam({
       // final horizontal position and continue downward until a live surface
       // on the path is actually crossed.
       phase = 'fall'
-      motionEpoch += 1
       plannedHopLanding = null
-      plannedHopFailures = 0
-      plannedHopSceneRevision = null
       targetLedge = resolveLedge(ledges, current.x, current.y, footHeight())
       fallVelocity = 0
-      lastMotionProbe = 0
       continuingFall = true
     }
 
@@ -916,13 +790,15 @@ export function startPetOverlayRoam({
         current.y = targetY
       }
 
-      paint(now, true)
+      paint(true)
 
       const retryDelay = supportMisses > 0 ? Math.max(0, nextSupportRetryAt - performance.now()) : undefined
 
-      schedulePlan(pathLanding ? 250 : retryDelay)
+      // Stop on the landing first. The next plan captures the now-stationary
+      // scene and traces the support sideways before choosing a walk target.
+      schedulePlan(pathLanding ? LANDING_ANALYSIS_DELAY_MS : retryDelay)
     } else {
-      paint(now)
+      paint()
       raf = window.requestAnimationFrame(step)
     }
   }
@@ -966,13 +842,21 @@ export function startPetOverlayRoam({
 
     current = clampOverlayRoamBounds(environment.workArea, raw, petW, petH)
     const now = performance.now()
-    const fresh = environmentLedges(environment)
+    const freshLedges = environmentLedges(environment)
 
-    updateMotionLandingLedges(fresh.all, fresh.native)
+    updateMotionLandingLedges(freshLedges)
 
-    const support = reconcileRememberedSupport(fresh.all, now)
+    const support = reconcileRememberedSupport(freshLedges, now)
 
     ledges = support.ledges
+
+    if (supportMisses > 0 && !support.lostSupport) {
+      // Keep the pet still while retrying a missing visual support. Capturing
+      // and contrast analysis during movement makes native window motion hitch.
+      schedulePlan(Math.max(0, nextSupportRetryAt - now))
+
+      return
+    }
 
     const settleAfterDrag = settleFirstPlan
 

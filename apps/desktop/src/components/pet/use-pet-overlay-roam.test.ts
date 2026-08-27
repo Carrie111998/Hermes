@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -289,6 +289,46 @@ describe('overlay roam geometry', () => {
     rerender({ replanKey: 1 })
     await waitFor(() => expect(roamEnvironment.mock.calls.length).toBeGreaterThan(callsBeforeRelease))
 
+    unmount()
+  })
+
+  it('does not capture or analyze the desktop while a movement frame is running', async () => {
+    const roamEnvironment = vi.fn(async () => ({
+      windows: [],
+      workArea: { height: 800, width: 1200, x: 0, y: 0 }
+    }))
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        petOverlay: {
+          control: vi.fn(),
+          roamEnvironment,
+          setBounds: vi.fn()
+        }
+      } as unknown as Window['hermesDesktop']
+    })
+
+    let nextFrame: FrameRequestCallback | undefined
+
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      nextFrame = callback
+
+      return 1
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+
+    const { unmount } = renderHook(() =>
+      usePetOverlayRoam({ enabled: true, isInteracting: () => false, loopMs: 1100, petH: 70, petW: 64 })
+    )
+
+    await waitFor(() => expect(nextFrame).toBeDefined())
+    const callsBeforeMovement = roamEnvironment.mock.calls.length
+    const frame = nextFrame!
+
+    act(() => frame(performance.now() + 20))
+
+    expect(roamEnvironment).toHaveBeenCalledTimes(callsBeforeMovement)
     unmount()
   })
 })
