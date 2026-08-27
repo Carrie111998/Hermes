@@ -47,6 +47,49 @@ class TestSaveConfigValueAtomic:
         result = yaml.safe_load(config_env.read_text())
         assert result["auxiliary"]["compression"]["model"] == "google/gemini-3-flash-preview"
 
+    def test_uses_shared_config_lock(self, config_env, monkeypatch):
+        """Single-key writes serialize with full save_config writes."""
+        from hermes_cli import config as config_module
+
+        class RecordingLock:
+            active = False
+
+            def __enter__(self):
+                self.active = True
+
+            def __exit__(self, *_args):
+                self.active = False
+
+        lock = RecordingLock()
+        monkeypatch.setattr(config_module, "_CONFIG_LOCK", lock)
+
+        def assert_locked(*_args):
+            assert lock.active is True
+
+        monkeypatch.setattr("utils.atomic_roundtrip_yaml_update", assert_locked)
+
+        from cli import save_config_value
+
+        assert save_config_value("display.skin", "mono") is True
+
+    def test_stale_loaded_snapshot_preserves_newer_single_key_write(
+        self, config_env
+    ):
+        """A later full save must not revert a value written after its load."""
+        from cli import save_config_value
+        from hermes_cli.config import load_config, save_config
+
+        stale = load_config()
+        assert stale["approvals"]["destructive_slash_confirm"] is True
+
+        assert save_config_value("approvals.destructive_slash_confirm", False) is True
+        stale["agent"]["max_turns"] = 42
+        save_config(stale)
+
+        saved = yaml.safe_load(config_env.read_text())
+        assert saved["approvals"]["destructive_slash_confirm"] is False
+        assert saved["agent"]["max_turns"] == 42
+
 
 
     def test_model_write_runs_shared_cron_drift_warning(self, config_env, monkeypatch):

@@ -304,6 +304,20 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+
+
+class _LoadedConfig(dict):
+    """Mutable config snapshot carrying the state it was loaded from.
+
+    ``save_config`` uses the baseline for a three-way merge so a caller that
+    saves an older snapshot does not overwrite keys changed on disk since its
+    ``load_config`` call. It remains a dict subclass to preserve the public
+    return contract and normal deepcopy behavior.
+    """
+
+    def __init__(self, value: Dict[str, Any]):
+        super().__init__(value)
+        self._baseline = copy.deepcopy(value)
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -2668,6 +2682,43 @@ def _merge_partial_save(raw: dict, override: dict) -> dict:
     return result
 
 
+_CONFIG_MISSING = object()
+
+
+def _merge_loaded_config_snapshot(base: Any, requested: Any, current: Any) -> Any:
+    """Merge a loaded snapshot without clobbering newer on-disk values.
+
+    Caller changes relative to *base* win. Paths the caller left untouched
+    take their value from *current*, including additions and deletions made by
+    another config writer after the caller loaded its snapshot.
+    """
+    if requested is _CONFIG_MISSING:
+        if base is _CONFIG_MISSING:
+            return copy.deepcopy(current)
+        return _CONFIG_MISSING
+
+    if base is not _CONFIG_MISSING and requested == base:
+        return copy.deepcopy(current)
+
+    if (
+        isinstance(base, dict)
+        and isinstance(requested, dict)
+        and isinstance(current, dict)
+    ):
+        merged: Dict[str, Any] = {}
+        for key in base.keys() | requested.keys() | current.keys():
+            value = _merge_loaded_config_snapshot(
+                base.get(key, _CONFIG_MISSING),
+                requested.get(key, _CONFIG_MISSING),
+                current.get(key, _CONFIG_MISSING),
+            )
+            if value is not _CONFIG_MISSING:
+                merged[key] = value
+        return merged
+
+    return copy.deepcopy(requested)
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base*, preserving nested defaults.
 
@@ -3585,7 +3636,7 @@ def load_config() -> Dict[str, Any]:
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
     """
-    return _load_config_impl(want_deepcopy=True)
+    return _LoadedConfig(_load_config_impl(want_deepcopy=True))
 
 
 def load_config_readonly() -> Dict[str, Any]:
@@ -4041,6 +4092,17 @@ def save_config(
         if is_managed():
             managed_error("save configuration")
             return
+
+        tracked_config = config if isinstance(config, _LoadedConfig) else None
+        loaded_baseline = getattr(tracked_config, "_baseline", None)
+        requested_snapshot = copy.deepcopy(dict(config))
+        if isinstance(loaded_baseline, dict):
+            current = _load_config_impl(want_deepcopy=True)
+            config = _merge_loaded_config_snapshot(
+                loaded_baseline,
+                requested_snapshot,
+                current,
+            )
         # Managed scope: strip any leaf the managed layer pins, so a bulk write
         # (wizard / programmatic save) never persists a user value that would
         # silently lose to managed on the next load. Single-key `config set`
@@ -4130,6 +4192,11 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        if tracked_config is not None:
+            # Track what this caller requested, not the merged disk state. This
+            # keeps a reused stale object from treating a preserved concurrent
+            # value as its own edit on the next save.
+            tracked_config._baseline = copy.deepcopy(requested_snapshot)
 
 
 def _parse_env_value(raw_value: str) -> str:

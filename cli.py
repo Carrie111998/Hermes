@@ -4918,13 +4918,21 @@ def save_config_value(key_path: str, value: any) -> bool:
     config_path = get_hermes_home() / 'config.yaml'
     
     try:
-        # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save back atomically while preserving comments, ordering, quotes, and
-        # readable Unicode in user-edited config.yaml.
-        from utils import atomic_roundtrip_yaml_update
-        atomic_roundtrip_yaml_update(config_path, key_path, value)
+        from hermes_cli import config as config_module
+
+        with config_module._CONFIG_LOCK:
+            # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Save back atomically while preserving comments, ordering, quotes, and
+            # readable Unicode in user-edited config.yaml.
+            from utils import atomic_roundtrip_yaml_update
+            atomic_roundtrip_yaml_update(config_path, key_path, value)
+
+            # The atomic replace invalidates stat-keyed caches naturally, but
+            # discard the raw cache eagerly for coarse-mtime filesystems.
+            config_module._RAW_CONFIG_CACHE.pop(str(config_path), None)
+            config_module._LOAD_CONFIG_CACHE.pop(str(config_path), None)
         
         # Enforce owner-only permissions on config files (contain API keys)
         try:
