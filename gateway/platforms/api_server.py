@@ -7539,6 +7539,8 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
+        if status != "waiting_for_approval":
+            current.pop("approval", None)
         self._run_statuses[run_id] = current
         should_persist = (
             status != previous_status
@@ -8570,7 +8572,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                if run_id in self._stopping_run_ids:
+                if (
+                    run_id in self._stopping_run_ids
+                    and isinstance(result, dict)
+                    and result.get("interrupted") is True
+                ):
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
@@ -8851,6 +8857,16 @@ class APIServerAdapter(BasePlatformAdapter):
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
         choice = aliases.get(raw_choice, raw_choice)
         room_scoped = bool(self._room_grant_token(request))
+        raw_request_id = body.get("request_id")
+        request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
+        if raw_request_id is not None and (not request_id or len(request_id) > 256):
+            return web.json_response(
+                _openai_error(
+                    "Approval request_id is invalid.",
+                    code="invalid_approval_request",
+                ),
+                status=400,
+            )
         allowed = {"once", "deny"} if room_scoped else {
             "once",
             "session",
@@ -8879,6 +8895,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        if room_scoped and not request_id:
+            return web.json_response(
+                _openai_error(
+                    "Room approvals require the exact request_id.",
+                    code="approval_request_required",
+                ),
+                status=400,
+            )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
@@ -8896,6 +8920,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                request_id=request_id or None,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -8919,6 +8944,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "choice": choice,
+                    **({"request_id": request_id} if request_id else {}),
                     "resolved": resolved,
                 })
             except Exception:
@@ -8928,6 +8954,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "hermes.run.approval_response",
             "run_id": run_id,
             "choice": choice,
+            **({"request_id": request_id} if request_id else {}),
             "resolved": resolved,
         })
 

@@ -9,9 +9,13 @@ import tui_gateway.server as srv
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
+    class DurableRunStore:
+        durable = True
+
     path = tmp_path / ".hermes"
     path.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(path))
+    monkeypatch.setattr(srv, "_run_idempotency_store", DurableRunStore(), raising=False)
     return path
 
 
@@ -82,6 +86,55 @@ def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch
     assert "." in invitation["grant"]
 
 
+def test_capabilities_disable_roomlink_when_run_replay_is_not_durable(
+    home, monkeypatch
+):
+    import tui_gateway.methods_groups as groups_methods
+
+    class VolatileRunStore:
+        durable = False
+
+    class BoundServer:
+        _run_idempotency_store = VolatileRunStore()
+
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    monkeypatch.setattr(groups_methods, "_bound_server", BoundServer())
+    result = _result(srv._methods["groups.capabilities"](1, {}))
+    assert result["room_link"] == {
+        "enabled": False,
+        "reason": "durable_run_storage_required",
+    }
+    invitation = srv._methods["groups.peer.invite"](
+        2,
+        {
+            "room_id": "room-volatile",
+            "home_install_id": "install-home",
+            "authority_gateway_id": "install-home",
+            "authority_epoch": 1,
+            "member_id": "member-peer",
+        },
+    )
+    assert invitation["error"]["code"] == 4120
+    assert "durable run idempotency" in invitation["error"]["message"]
+
+
+def test_capabilities_open_shared_durable_run_store_without_test_injection(
+    home, monkeypatch
+):
+    """The production dashboard server must not depend on fixture injection."""
+
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    monkeypatch.delattr(srv, "_run_idempotency_store", raising=False)
+
+    result = _result(srv._methods["groups.capabilities"](1, {}))
+    store = srv._run_idempotency_store
+    try:
+        assert store.durable is True
+        assert result["room_link"]["enabled"] is True
+    finally:
+        store.close()
+
+
 def test_app_managed_catalog_and_self_advertised_endpoint_are_consistent(
     home, monkeypatch
 ):
@@ -109,6 +162,32 @@ def test_app_managed_catalog_and_self_advertised_endpoint_are_consistent(
         "transport_security": "tls",
     }
     assert invitation["endpoint"] == capability["room_link"]["endpoint"]
+
+
+def test_launch_profile_is_valid_for_roomlink_invitation(home, monkeypatch):
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+
+    capability = _result(
+        srv._methods["groups.capabilities"](1, {"profile": "default"})
+    )
+    invitation = _result(
+        srv._methods["groups.peer.invite"](
+            2,
+            {
+                "room_id": "room-default",
+                "home_install_id": "install-home",
+                "authority_gateway_id": "install-home",
+                "authority_epoch": 1,
+                "member_id": "member-default",
+                "profile": "default",
+            },
+        )
+    )
+
+    assert capability["room_link"]["enabled"] is True
+    assert capability["room_link"]["profile"] == "default"
+    assert invitation["target_profile"] == "default"
 
 
 def test_roomlink_endpoint_absence_has_machine_reason(home, monkeypatch):
@@ -530,6 +609,7 @@ def test_approve_routes_one_exact_peer_action(home, monkeypatch):
                 "member_id": "member-peer",
                 "task_id": "task-1",
                 "execution_generation": 2,
+                "request_id": "approval-1",
                 "choice": "once",
             },
         )
@@ -541,5 +621,6 @@ def test_approve_routes_one_exact_peer_action(home, monkeypatch):
         "member_id": "member-peer",
         "task_id": "task-1",
         "execution_generation": 2,
+        "request_id": "approval-1",
         "choice": "once",
     }

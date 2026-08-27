@@ -17,6 +17,7 @@ class FakePeer(BaseHTTPRequestHandler):
     sessions = []
     runs = {}
     idempotency = []
+    approvals = []
 
     def _json(self, value, status=200):
         body = json.dumps(value).encode()
@@ -57,6 +58,9 @@ class FakePeer(BaseHTTPRequestHandler):
         if self.path == "/v1/runs/run-1/stop":
             type(self).runs["run-1"]["status"] = "cancelled"
             return self._json({"run_id": "run-1", "status": "stopping"})
+        if self.path == "/v1/runs/run-1/approval":
+            type(self).approvals.append(body)
+            return self._json({"run_id": "run-1", "resolved": 1})
         return self._json({"error": "not found"}, 404)
 
     def log_message(self, *args):
@@ -68,6 +72,7 @@ def peer_server():
     FakePeer.sessions = []
     FakePeer.runs = {}
     FakePeer.idempotency = []
+    FakePeer.approvals = []
     server = HTTPServer(("127.0.0.1", 0), FakePeer)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -127,7 +132,12 @@ def test_peer_client_rejects_plaintext_non_loopback():
 
 
 def test_scoped_peer_runs_client_uses_logical_session_and_durable_run(peer_server):
-    client = PeerRunsHTTPClient(base_url=peer_server, api_key="")
+    now = [0.0]
+    client = PeerRunsHTTPClient(
+        base_url=peer_server,
+        api_key="",
+        clock=lambda: now[0],
+    )
     accepted = client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
     assert accepted["status"] == "accepted"
     assert accepted["session_id"].startswith("roomlink_")
@@ -147,6 +157,7 @@ def test_scoped_peer_runs_client_uses_logical_session_and_durable_run(peer_serve
         "status": "completed",
         "output": "Remote review complete.",
     })
+    now[0] = 0.1
     history = client.history(
         room_id="room-1",
         profile="reviewer",
@@ -189,6 +200,7 @@ def test_remote_run_receipt_survives_home_restart(peer_server, tmp_path):
         api_key="",
         receipt_db_path=db,
     )
+    restarted.bind_observation(task_id="task-1", execution_generation=1)
     status = restarted.status(
         room_id="room-1",
         profile="reviewer",
@@ -198,6 +210,203 @@ def test_remote_run_receipt_survives_home_restart(peer_server, tmp_path):
     assert status["run_id"] == accepted["run_id"]
     stopped = restarted.stop(dispatch=dispatch, grant="signed.room.grant")
     assert stopped["status"] == "stopping"
+
+
+def test_ambiguous_admission_replays_the_identical_idempotency_key(tmp_path):
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+        receipt_db_path=tmp_path / "state.db",
+    )
+    requests = []
+
+    def response_lost_then_replayed(path, **kwargs):
+        requests.append((path, kwargs))
+        if len(requests) == 1:
+            raise PeerRunsHTTPError(
+                "peer response was lost",
+                retryable=True,
+                ambiguous=True,
+            )
+        return {"run_id": "run-recovered", "status": "running", "replayed": True}
+
+    client._request = response_lost_then_replayed
+    recovered = client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+
+    assert recovered["run_id"] == "run-recovered"
+    assert [request[1]["headers"]["Idempotency-Key"] for request in requests] == [
+        "room:task-1:1",
+        "room:task-1:1",
+    ]
+    assert requests[0][1]["body"] == requests[1][1]["body"]
+
+    restarted = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+        receipt_db_path=tmp_path / "state.db",
+    )
+    restarted._request = lambda *_args, **_kwargs: pytest.fail(
+        "durable receipt should avoid another admission"
+    )
+    assert restarted.recover_dispatch(
+        dispatch=_dispatch(), grant="signed.room.grant"
+    )["run_id"] == "run-recovered"
+
+
+def test_peer_approval_sends_the_exact_request_id(peer_server, tmp_path):
+    client = PeerRunsHTTPClient(
+        base_url=peer_server,
+        api_key="",
+        receipt_db_path=tmp_path / "state.db",
+    )
+    client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
+
+    result = client.approve_receipt(
+        task_id="task-1",
+        execution_generation=1,
+        request_id="approval-exact-1",
+        choice="once",
+        grant="signed.room.grant",
+    )
+
+    assert result["resolved"] == 1
+    assert FakePeer.approvals == [
+        {"choice": "once", "request_id": "approval-exact-1"}
+    ]
+
+
+def test_exact_receipt_polling_is_constant_with_large_room_history():
+    now = [0.0]
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+        poll_min_seconds=0.1,
+        poll_max_seconds=0.4,
+        clock=lambda: now[0],
+    )
+    session_id = "roomlink-session"
+    for index in range(200):
+        client._runs[(f"task-{index}", 1)] = {
+            "run_id": f"run-{index}",
+            "session_id": session_id,
+            "room_id": "room-1",
+            "member_id": "member-reviewer",
+            "task_id": f"task-{index}",
+            "execution_generation": 1,
+            "target_install_id": "install-peer",
+            "target_profile": "reviewer",
+        }
+    client.bind_observation(task_id="task-199", execution_generation=1)
+    requests = []
+
+    def status_response(path, **_kwargs):
+        requests.append(path)
+        if len(requests) == 1:
+            return {"run_id": "run-199", "status": "running"}
+        return {
+            "run_id": "run-199",
+            "status": "completed",
+            "output": "bounded result",
+            "ignored_large_field": "x" * 1000,
+        }
+
+    client._request = status_response
+    for _ in range(50):
+        assert client.history(
+            room_id="room-1",
+            profile="reviewer",
+            session_id=session_id,
+            grant="signed.room.grant",
+        ) == []
+        assert client.status(
+            room_id="room-1",
+            profile="reviewer",
+            session_id=session_id,
+            grant="signed.room.grant",
+        )["active"] is True
+
+    assert requests == ["/v1/runs/run-199"]
+    now[0] = 0.1
+    terminal = client.history(
+        room_id="room-1",
+        profile="reviewer",
+        session_id=session_id,
+        grant="signed.room.grant",
+    )
+    assert terminal[0]["content"] == "bounded result"
+
+    now[0] = 100
+    for _ in range(50):
+        client.status(
+            room_id="room-1",
+            profile="reviewer",
+            session_id=session_id,
+            grant="signed.room.grant",
+        )
+
+    assert requests == ["/v1/runs/run-199", "/v1/runs/run-199"]
+    compact = client._status_cache["run-199"]["status"]
+    assert compact == {
+        "run_id": "run-199",
+        "status": "completed",
+        "output": "bounded result",
+    }
+    client._runs[("task-200", 1)] = {
+        **client._runs[("task-199", 1)],
+        "run_id": "run-200",
+        "task_id": "task-200",
+    }
+    client.bind_observation(task_id="task-200", execution_generation=1)
+    assert ("task-199", 1) not in client._runs
+    assert len(client._status_cache) == 0
+
+
+def test_failed_exact_receipt_poll_honors_backoff():
+    now = [0.0]
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+        poll_min_seconds=0.1,
+        poll_max_seconds=0.4,
+        clock=lambda: now[0],
+    )
+    client._runs[("task-1", 1)] = {
+        "run_id": "run-1",
+        "session_id": "roomlink-session",
+        "room_id": "room-1",
+        "member_id": "member-reviewer",
+        "task_id": "task-1",
+        "execution_generation": 1,
+        "target_install_id": "install-peer",
+        "target_profile": "reviewer",
+    }
+    client.bind_observation(task_id="task-1", execution_generation=1)
+    requests = []
+
+    def unavailable(path, **_kwargs):
+        requests.append(path)
+        raise PeerRunsHTTPError("peer unavailable", retryable=True)
+
+    client._request = unavailable
+    for _ in range(20):
+        with pytest.raises(PeerRunsHTTPError):
+            client.status(
+                room_id="room-1",
+                profile="reviewer",
+                session_id="roomlink-session",
+                grant="signed.room.grant",
+            )
+    assert requests == ["/v1/runs/run-1"]
+
+    now[0] = 0.1
+    with pytest.raises(PeerRunsHTTPError):
+        client.status(
+            room_id="room-1",
+            profile="reviewer",
+            session_id="roomlink-session",
+            grant="signed.room.grant",
+        )
+    assert requests == ["/v1/runs/run-1", "/v1/runs/run-1"]
 
 
 def test_invalid_room_grant_is_classified_without_echoing_secret(monkeypatch):

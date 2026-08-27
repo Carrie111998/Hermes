@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
   HOSTED_ROOM_CLIENT_LIMITATIONS,
+  ROOM_LINK_PROTOCOL_VERSION,
   classifyHostedRoomCapability,
   createHostedRoomOutbox,
   createHostedRoomReplayState,
@@ -15,6 +17,49 @@ import {
   describeAutonomousRoomPlan,
   resolveSingleGatewayRoute
 } from '../hosted-room-client.js'
+
+const protocolFixture = JSON.parse(
+  readFileSync(new URL('../../../../../../tests/fixtures/room_link_protocol_v2.json', import.meta.url), 'utf8')
+)
+
+test('RoomLink client accepts the backend v2 catalog and rejects unpublished v1', () => {
+  assert.equal(ROOM_LINK_PROTOCOL_VERSION, protocolFixture.protocol_version)
+
+  const capability = classifyHostedRoomCapability({
+    driver: true,
+    persistent_process: true,
+    authority_gateway_id: 'install:peer',
+    room_link: {
+      enabled: true,
+      endpoint: { available: true, url: 'https://peer.example.test' },
+      catalog: protocolFixture.catalog
+    }
+  })
+  const members = [
+    { name: 'home', connectionId: 'home', sourceScoped: true },
+    { name: 'peer', connectionId: 'peer', sourceScoped: true }
+  ]
+  const plan = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: { home: capability, peer: capability }
+  })
+
+  assert.equal(plan.kind, 'multi-gateway')
+  const v1 = {
+    ...capability,
+    roomLink: {
+      ...capability.roomLink,
+      catalog: { ...capability.roomLink.catalog, protocolVersions: [1] }
+    }
+  }
+  assert.equal(
+    resolveAutonomousRoomPlan(members, {
+      activeConnectionId: 'home',
+      capabilities: { home: capability, peer: v1 }
+    }).reason,
+    'remote-needs-setup'
+  )
+})
 
 function attachmentManifest() {
   return [

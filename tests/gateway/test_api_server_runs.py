@@ -119,7 +119,7 @@ def _make_slow_agent(**kwargs):
         ready.set()
         # Block until interrupt() is called
         interrupted.wait(timeout=10)
-        return {"final_response": "interrupted"}
+        return {"final_response": "interrupted", "interrupted": True}
 
     mock_agent.run_conversation.side_effect = _slow_run
     mock_agent.session_prompt_tokens = 0
@@ -664,8 +664,10 @@ class TestRunLifecycleSweep:
 class TestStopRun:
 
     @pytest.mark.asyncio
-    async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):
-        """Cancelling an asyncio wrapper must not hide its live executor thread."""
+    async def test_completion_wins_before_uncooperative_stop_is_acknowledged(
+        self, adapter
+    ):
+        """A provisional Stop cannot discard a real completion."""
         app = _create_runs_app(adapter)
         run_can_finish = threading.Event()
         run_finished = threading.Event()
@@ -708,7 +710,8 @@ class TestStopRun:
 
                 assert run_id not in adapter._active_run_agents
                 assert run_id not in adapter._active_run_tasks
-                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert adapter._run_statuses[run_id]["status"] == "completed"
+                assert adapter._run_statuses[run_id]["output"] == "late result"
 
     @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):
@@ -1287,6 +1290,60 @@ class TestRunIdempotency:
 
 
 class TestHostedRoomRuns:
+    @pytest.mark.asyncio
+    async def test_room_approval_requires_and_resolves_exact_request_id(
+        self, auth_adapter
+    ):
+        run_id = "run-room-approval"
+        current = approval_mod._ApprovalEntry({
+            "request_id": "approval-B",
+            "command": "rm -rf build-B",
+        })
+        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            "approval": dict(current.data),
+        }
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [current]
+        app = _create_runs_app(auth_adapter)
+        try:
+            with (
+                patch.object(auth_adapter, "_check_run_auth", return_value=None),
+                patch.object(auth_adapter, "_request_owns_run", return_value=True),
+                patch.object(
+                    auth_adapter, "_room_grant_token", return_value="scoped-grant"
+                ),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    missing = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "once"},
+                    )
+                    stale = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "once", "request_id": "approval-A"},
+                    )
+                    exact = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "once", "request_id": "approval-B"},
+                    )
+                    missing_body = await missing.json()
+                    stale_body = await stale.json()
+                    exact_body = await exact.json()
+        finally:
+            approval_mod.unregister_gateway_notify(run_id)
+
+        assert missing.status == 400
+        assert missing_body["error"]["code"] == "approval_request_required"
+        assert stale.status == 409
+        assert stale_body["error"]["code"] == "approval_not_pending"
+        assert exact.status == 200
+        assert exact_body["request_id"] == "approval-B"
+        assert current.result == "once"
+        assert "approval" not in auth_adapter._run_statuses[run_id]
+
     @pytest.mark.asyncio
     async def test_room_grant_cannot_create_session_or_permanent_approval_policy(
         self, auth_adapter

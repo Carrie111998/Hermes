@@ -11,6 +11,8 @@ const MAX_ATTACHMENT_MIME_CHARS = 127
 const MAX_ATTACHMENT_REFS = 6
 const MAX_MEMBER_ID_CHARS = 128
 const MAX_STAGED_REF_CHARS = 256
+const MAX_OUTBOX_COMMANDS = 256
+export const ROOM_LINK_PROTOCOL_VERSION = 2
 
 export const HOSTED_ROOM_CLIENT_LIMITATIONS = Object.freeze({
   attachments: false,

@@ -17106,6 +17106,7 @@ get_hosted_room_service = _methods_groups.get_hosted_room_service
 _profile_name = _methods_groups._profile_name
 _requested_profile = _methods_groups._requested_profile
 _api_server_key = _methods_groups._api_server_key
+_room_link_run_storage_durable = _methods_groups._room_link_run_storage_durable
 
 for _m in (
     _methods_browser_control,

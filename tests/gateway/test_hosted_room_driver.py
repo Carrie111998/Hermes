@@ -617,6 +617,46 @@ def test_current_lease_can_commit_verified_indeterminate_receipt(db):
     assert next_attempt.execution_generation == 1
 
 
+def test_current_lease_can_commit_verified_indeterminate_cancellation(db):
+    clock = FakeClock()
+    running = _identity()
+    first = _lease(db, clock, ttl=5)
+    _admit(db, running, clock, payload=_payload(source_event_seq=1))
+    attempt = driver.start_task(
+        db,
+        running,
+        first,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    clock.advance(5)
+    recovered = _lease(db, clock, process="new-process")
+    driver.recover_room(db, recovered, clock=clock)
+
+    cancelled = driver.resolve_indeterminate_cancellation(
+        db,
+        running,
+        recovered,
+        expected_execution_generation=attempt.execution_generation,
+        expected_cancel_generation=attempt.cancel_generation,
+        cancel_id="remote-cancel:1",
+        clock=clock,
+    )
+    repeated = driver.resolve_indeterminate_cancellation(
+        db,
+        running,
+        recovered,
+        expected_execution_generation=attempt.execution_generation,
+        expected_cancel_generation=attempt.cancel_generation,
+        cancel_id="remote-cancel:1",
+        clock=clock,
+    )
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["execution_generation"] == attempt.execution_generation
+    assert repeated["idempotent"] is True
+
+
 def test_indeterminate_retry_is_explicit_and_advances_execution_generation(db):
     clock = FakeClock()
     identity = _identity()

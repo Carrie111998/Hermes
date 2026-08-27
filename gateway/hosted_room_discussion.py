@@ -105,6 +105,9 @@ _TERMINAL_EXTRA_FIELDS = {
     "turn.failed": frozenset({"error"}),
     "turn.cancelled": frozenset({"reason"}),
 }
+_TERMINAL_OPTIONAL_FIELDS = {
+    "turn.failed": frozenset({"reason_code"}),
+}
 _TERMINAL_EVENT_KINDS = frozenset(_TERMINAL_EXTRA_FIELDS)
 _ROOM_ACTIVITY_FIELDS = frozenset({
     "status",
@@ -831,7 +834,12 @@ def _validate_terminal_event(
     room: DiscussionRoom,
 ) -> None:
     required = _TERMINAL_COMMON_FIELDS | _TERMINAL_EXTRA_FIELDS[kind]
-    _exact_fields(payload, label=f"{kind} payload", required=required)
+    _exact_fields(
+        payload,
+        label=f"{kind} payload",
+        required=required,
+        optional=_TERMINAL_OPTIONAL_FIELDS.get(kind, frozenset()),
+    )
     _validate_turn_coordinates(payload, room)
     _positive_int(payload.get("seen_through_seq"), label="seen_through_seq")
     if (
@@ -855,6 +863,13 @@ def _validate_terminal_event(
         field = "error" if kind == "turn.failed" else "reason"
         if not isinstance(payload.get(field), str) or not payload[field].strip():
             raise DiscussionValidationError(f"{kind} {field} must be non-empty")
+        if kind == "turn.failed" and "reason_code" in payload:
+            from tools.bot_failure_reasons import ALL_REASONS
+
+            if payload["reason_code"] not in ALL_REASONS:
+                raise DiscussionValidationError(
+                    "turn.failed reason_code must use the shared failure vocabulary"
+                )
 
 
 def _validated_events(
@@ -1485,13 +1500,27 @@ def plan_publication(
         }
         terminal_kind = "turn.settled"
     elif effective_status == "failed":
+        error_text = _terminal_text(
+            result,
+            field="error",
+            fallback="member turn failed",
+        )
+        from tools.bot_failure_reasons import ALL_REASONS, classify_agent_error
+
+        supplied_reason = (
+            str(result.get("reason_code") or result.get("reason") or "").strip()
+            if isinstance(result, Mapping)
+            else ""
+        )
+        reason_code = (
+            supplied_reason
+            if supplied_reason in ALL_REASONS
+            else classify_agent_error(error_text)
+        )
         terminal_payload = {
             **common,
-            "error": _terminal_text(
-                result,
-                field="error",
-                fallback="member turn failed",
-            ),
+            "error": error_text,
+            "reason_code": reason_code,
         }
         terminal_kind = "turn.failed"
     else:

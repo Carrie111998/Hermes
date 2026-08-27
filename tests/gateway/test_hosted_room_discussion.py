@@ -374,6 +374,7 @@ def test_failed_members_advance_the_round_as_silence(
         )
         assert publication.terminal_kind == "turn.failed"
         assert len(publication.events) == 1
+        assert publication.events[0].payload["reason_code"] == "unknown"
         _append_publication(db, publication)
 
     decision = discussion.plan_next_task(
@@ -383,6 +384,40 @@ def test_failed_members_advance_the_round_as_silence(
     )
     assert decision.status == "settled"
     assert decision.reason == "silent_round"
+
+
+def test_failed_publication_preserves_a_typed_actionable_reason(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="Please continue.")
+    task = _next_task(room, db)
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        task,
+        status="failed",
+        result={"error": "HTTP 401 authentication failed"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert publication.events[0].payload["reason_code"] == "provider_auth_or_access"
+
+
+def test_failed_publication_rejects_an_untrusted_reason_code(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="Please continue.")
+    task = _next_task(room, db)
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        task,
+        status="failed",
+        result={"error": "failed", "reason_code": "invented"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert publication.events[0].payload["reason_code"] == "unknown"
 
 
 def test_publication_is_idempotent_and_changed_result_conflicts(

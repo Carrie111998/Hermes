@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,7 @@ from gateway.hosted_room_peer import (
     HostedMemberDispatch,
     HostedRoomGrantError,
     HostedRoomPeerError,
+    PROTOCOL_VERSION,
     RoomLinkProbe,
     catalog_mapping,
     issue_room_grant,
@@ -21,6 +24,17 @@ from gateway.hosted_room_peer import (
 
 
 SECRET = b"s" * 32
+
+
+def test_room_link_protocol_fixture_matches_backend_contract():
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "room_link_protocol_v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert fixture["protocol_version"] == PROTOCOL_VERSION
+    assert fixture["catalog"]["protocol_versions"] == [PROTOCOL_VERSION]
 
 
 def test_room_link_endpoint_reads_supported_config_with_env_override(

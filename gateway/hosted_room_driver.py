@@ -1175,6 +1175,66 @@ def resolve_indeterminate_task(
         return _task_from_row(_load_task(conn, identity))
 
 
+def resolve_indeterminate_cancellation(
+    db_path: Path | str,
+    identity: TaskIdentity,
+    lease: DriverLease,
+    *,
+    expected_execution_generation: int,
+    expected_cancel_generation: int,
+    cancel_id: Any,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Commit a verified terminal cancellation for an uncertain attempt."""
+    if lease.room_id != identity.room_id:
+        raise DriverValidationError("lease and task belong to different rooms")
+    if (
+        not isinstance(expected_execution_generation, int)
+        or expected_execution_generation < 1
+    ):
+        raise DriverValidationError(
+            "expected_execution_generation must be a positive integer"
+        )
+    if (
+        not isinstance(expected_cancel_generation, int)
+        or expected_cancel_generation < 0
+    ):
+        raise DriverValidationError("expected_cancel_generation must be non-negative")
+    cancel_id = _identifier(cancel_id, label="cancel_id")
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, lease, now=now)
+        row = _load_task(conn, identity)
+        if row["status"] == "cancelled" and row["cancel_id"] == cancel_id:
+            return _task_from_row(row, idempotent=True)
+        if (
+            row["status"] != "indeterminate"
+            or int(row["execution_generation"]) != expected_execution_generation
+            or int(row["cancel_generation"]) != expected_cancel_generation
+        ):
+            raise StaleTaskError("indeterminate cancellation proof is stale")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='cancelled', cancel_generation=?, cancel_id=?,
+                   terminal_at=?, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='indeterminate'
+                 AND execution_generation=? AND cancel_generation=?""",
+            (
+                expected_cancel_generation + 1,
+                cancel_id,
+                now,
+                now,
+                identity.room_id,
+                identity.task_id,
+                expected_execution_generation,
+                expected_cancel_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("indeterminate cancellation proof lost its fence")
+        return _task_from_row(_load_task(conn, identity))
+
+
 def requeue_indeterminate_task(
     db_path: Path | str,
     identity: TaskIdentity,

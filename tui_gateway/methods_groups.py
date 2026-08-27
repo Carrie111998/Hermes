@@ -14,6 +14,7 @@ _registry = HandlerRegistry()
 method = _registry.method
 
 _service_lock = threading.Lock()
+_run_store_lock = threading.Lock()
 _bound_server = None
 _service = None
 
@@ -71,6 +72,9 @@ def _requested_profile(params: dict) -> str:
         return _profile_name()
     if _bound_server is None:
         raise ValueError("profile routing is unavailable")
+    current = str(_bound_server._current_profile_name() or "").strip()
+    if requested == current:
+        return current
     home = _bound_server._profile_home(requested)
     if home is None:
         raise ValueError(f"profile '{requested}' is unavailable")
@@ -79,16 +83,18 @@ def _requested_profile(params: dict) -> str:
 
 def _api_server_key(profile: str | None = None) -> str:
     if profile and _bound_server is not None:
-        from agent.secret_scope import build_profile_secret_scope
+        current = str(_bound_server._current_profile_name() or "").strip()
+        if profile != current:
+            from agent.secret_scope import build_profile_secret_scope
 
-        home = _bound_server._profile_home(profile)
-        if home is None:
-            return ""
-        # An explicit routed profile is authoritative. Never borrow the
-        # process/default profile's API key on a multiplexed gateway.
-        return str(
-            build_profile_secret_scope(home).get("API_SERVER_KEY") or ""
-        ).strip()
+            home = _bound_server._profile_home(profile)
+            if home is None:
+                return ""
+            # An explicit routed profile is authoritative. Never borrow the
+            # process/default profile's API key on a multiplexed gateway.
+            return str(
+                build_profile_secret_scope(home).get("API_SERVER_KEY") or ""
+            ).strip()
     try:
         from agent.secret_scope import get_secret
 
@@ -98,6 +104,31 @@ def _api_server_key(profile: str | None = None) -> str:
     except Exception:
         pass
     return (os.getenv("API_SERVER_KEY") or "").strip()
+
+
+def _room_link_run_storage_durable() -> bool:
+    """Return whether peer-run replay survives this gateway process."""
+
+    if _bound_server is None:
+        # Direct method-contract tests and embedded callers without a bound API
+        # server do not expose peer-run transport. The production server always
+        # binds before advertising capabilities.
+        return True
+    store = getattr(_bound_server, "_run_idempotency_store", None)
+    if store is None:
+        # The dashboard/TUI process owns groups.* but does not construct the
+        # API adapter that normally owns this store. Open the same shared
+        # SQLite-backed store lazily so capability negotiation reflects the
+        # real /v1/runs replay boundary instead of depending on test-only
+        # injection. A separately enabled API adapter uses the same file.
+        from gateway.platforms.api_server import RunIdempotencyStore
+
+        with _run_store_lock:
+            store = getattr(_bound_server, "_run_idempotency_store", None)
+            if store is None:
+                store = RunIdempotencyStore()
+                _bound_server._run_idempotency_store = store
+    return bool(getattr(store, "durable", False))
 
 
 @method("groups.capabilities")
@@ -119,6 +150,8 @@ def _(rid, params: dict) -> dict:
         )
 
         profile = _requested_profile(params)
+        if not _room_link_run_storage_durable():
+            raise ValueError("durable run idempotency storage is required")
         derive_room_grant_secret(
             _api_server_key(profile if params.get("profile") else None)
         )
@@ -138,7 +171,11 @@ def _(rid, params: dict) -> dict:
     except Exception:
         room_link = {
             "enabled": False,
-            "reason": "gateway_api_key_required",
+            "reason": (
+                "durable_run_storage_required"
+                if not _room_link_run_storage_durable()
+                else "gateway_api_key_required"
+            ),
         }
     return _ok(
         rid,
@@ -193,6 +230,8 @@ def _(rid, params: dict) -> dict:
         )
         from gateway.hosted_rooms import local_authority_gateway_id
 
+        if not _room_link_run_storage_durable():
+            raise ValueError("durable run idempotency storage is required")
         installation_id = local_authority_gateway_id()
         profile = _requested_profile(params)
         ttl = float(params.get("ttl_seconds", 3600))
@@ -562,6 +601,7 @@ def _(rid, params: dict) -> dict:
             task_id=str(params.get("task_id") or ""),
             execution_generation=int(params.get("execution_generation") or 0),
             choice=str(params.get("choice") or ""),
+            request_id=str(params.get("request_id") or ""),
         )
         return _ok(rid, {"approved": True, "result": result})
     except Exception as exc:

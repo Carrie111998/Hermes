@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import threading
 import time
 from collections import Counter
@@ -16,7 +17,11 @@ from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
 from gateway import hosted_room_links
 from gateway import hosted_rooms
-from gateway.hosted_room_peer import GatewayRoomCatalog, PROTOCOL_VERSION
+from gateway.hosted_room_peer import (
+    GatewayRoomCatalog,
+    HostedMemberDispatch,
+    PROTOCOL_VERSION,
+)
 from tui_gateway.hosted_room_driver import HostedRoomBinding, HostedRoomRuntime
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
@@ -222,25 +227,83 @@ class HostedRoomService:
         client = self.peer_clients.get((binding.room_id, member_id))
         if client is None:
             raise RuntimeError("peer room client is unavailable")
+        identity = task.get("identity")
+        execution_generation = int(task.get("execution_generation") or 0)
+        bind_observation = getattr(client, "bind_observation", None)
+        if (
+            callable(bind_observation)
+            and isinstance(identity, driver.TaskIdentity)
+            and execution_generation > 0
+        ):
+            bind_observation(
+                task_id=identity.task_id,
+                execution_generation=execution_generation,
+            )
+        tracked_client = _RouteStatusPeerClient(
+            client,
+            on_ready=lambda: self._set_route_status(
+                binding.room_id, member_id, "ready"
+            ),
+            on_reauthorization=lambda: self._set_route_status(
+                binding.room_id, member_id, "needs_reauthorization"
+            ),
+            on_refreshed=lambda grant: self._rotate_route_grant(
+                binding.room_id, member_id, grant
+            ),
+        )
+        self._recover_peer_admission(binding, task, route, tracked_client)
         return PeerHostedRoomTransport(
             binding=binding,
             route=route,
-            client=_RouteStatusPeerClient(
-                client,
-                on_ready=lambda: self._set_route_status(
-                    binding.room_id, member_id, "ready"
-                ),
-                on_reauthorization=lambda: self._set_route_status(
-                    binding.room_id, member_id, "needs_reauthorization"
-                ),
-                on_refreshed=lambda grant: self._rotate_route_grant(
-                    binding.room_id, member_id, grant
-                ),
-            ),
+            client=tracked_client,
             source_event_seq=int(payload.get("source_event_seq") or 0),
             task_id=getattr(task.get("identity"), "task_id", None),
             execution_generation=int(task.get("execution_generation") or 0),
         )
+
+    def _recover_peer_admission(
+        self,
+        binding: HostedRoomBinding,
+        task: Mapping[str, Any],
+        route: PeerMemberRoute,
+        client: Any,
+    ) -> None:
+        """Rediscover an admitted peer run without advancing its generation."""
+        recover = getattr(client, "recover_dispatch", None)
+        identity = task.get("identity")
+        payload = task.get("payload")
+        execution_generation = int(task.get("execution_generation") or 0)
+        if (
+            not callable(recover)
+            or not isinstance(identity, driver.TaskIdentity)
+            or not isinstance(payload, Mapping)
+            or execution_generation < 1
+            or task.get("status") not in {"running", "indeterminate", "stopping"}
+        ):
+            return
+        prompt = payload.get("prompt")
+        source_event_seq = int(payload.get("source_event_seq") or 0)
+        if not isinstance(prompt, str) or source_event_seq < 1 or not route.trace_id:
+            raise RuntimeError("peer room admission identity is unavailable for recovery")
+        dispatch = HostedMemberDispatch.from_mapping({
+            "protocol_version": PROTOCOL_VERSION,
+            "room_id": identity.room_id,
+            "home_install_id": route.home_install_id,
+            "authority_gateway_id": binding.gateway_id,
+            "authority_epoch": binding.authority_epoch,
+            "member_id": route.member_id,
+            "target_install_id": route.target_install_id,
+            "target_profile": route.target_profile,
+            "task_id": identity.task_id,
+            "execution_generation": execution_generation,
+            "source_event_seq": source_event_seq,
+            "cancellation_scope_id": route.cancellation_scope_id,
+            "prompt": prompt,
+            "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "capability_digest": route.capability_digest,
+            "trace_id": route.trace_id,
+        })
+        recover(dispatch=dispatch.as_mapping(), grant=route.grant)
 
     def _member_is_peer(self, room_id: str, member_id: str) -> bool:
         room = hosted_rooms.room_state(self.db_path, room_id=room_id)
@@ -530,18 +593,27 @@ class HostedRoomService:
         cancelled = 0
         pending = 0
         with self._policy_lock:
+            tasks = {}
             for status in ("queued", "running", "indeterminate", "stopping"):
                 for task in driver.list_tasks(
                     self.db_path,
                     room_id=room_id,
                     status=status,
                 ):
-                    result = self.runtime.cancel(
-                        task["identity"], cancel_id=cancel_id
-                    )
-                    cancelled += 1
-                    if result["status"] == "stopping":
-                        pending += 1
+                    identity = task["identity"]
+                    tasks[(identity.room_id, identity.task_id)] = task
+            for task in tasks.values():
+                task_cancel_id = (
+                    str(task.get("cancel_id") or "")
+                    if task.get("status") == "stopping"
+                    else ""
+                )
+                result = self.runtime.cancel(
+                    task["identity"], cancel_id=task_cancel_id or cancel_id
+                )
+                cancelled += 1
+                if result["status"] == "stopping":
+                    pending += 1
         if require_acknowledged and pending:
             raise RuntimeError(
                 "room work is still stopping; retry deletion after Stop completes"
@@ -575,6 +647,7 @@ class HostedRoomService:
         task_id: str,
         execution_generation: int,
         choice: str,
+        request_id: str | None = None,
     ) -> Mapping[str, Any]:
         """Resolve one exact local or peer approval and wake room observation."""
         key = (room_id, member_id)
@@ -582,11 +655,16 @@ class HostedRoomService:
         client = self.peer_clients.get(key)
         with self._policy_lock:
             action = self._pending_actions.get(key)
+        requested_approval_id = str(request_id or "")
+        pending_approval_id = str((action or {}).get("request_id") or "")
         if (
             action is None
             or action.get("task_id") != task_id
             or int(action.get("execution_generation") or 0)
             != execution_generation
+            or not requested_approval_id
+            or not pending_approval_id
+            or requested_approval_id != pending_approval_id
         ):
             raise RuntimeError("room approval is no longer pending")
         if choice not in {"once", "deny"}:
@@ -596,22 +674,31 @@ class HostedRoomService:
             result = approve(
                 task_id=task_id,
                 execution_generation=execution_generation,
+                request_id=requested_approval_id,
                 choice=choice,
                 grant=route.grant,
             )
         else:
             session_id = str(action.get("session_id") or "")
-            request_id = str(action.get("request_id") or "")
-            if not session_id or not request_id:
+            if not session_id:
                 raise RuntimeError("local room approval identity is unavailable")
             result = self.rpc.approve(
                 session_id=session_id,
-                request_id=request_id,
+                request_id=requested_approval_id,
                 choice=choice,
             )
         if result is None:
             raise RuntimeError("room approval target is unavailable")
-        self._set_pending_action(room_id, member_id, None)
+        with self._policy_lock:
+            current = self._pending_actions.get(key)
+            if (
+                current is not None
+                and str(current.get("request_id") or "") == requested_approval_id
+                and current.get("task_id") == task_id
+                and int(current.get("execution_generation") or 0)
+                == execution_generation
+            ):
+                self._pending_actions.pop(key, None)
         self.runtime.wakeup()
         return result
 
@@ -675,7 +762,7 @@ class _RouteStatusPeerClient:
             return value
 
         def tracked(*args, **kwargs):
-            if name == "dispatch" and "grant" in kwargs:
+            if name in {"dispatch", "recover_dispatch"} and "grant" in kwargs:
                 from gateway.hosted_room_peer import (
                     room_grant_needs_dispatch_refresh,
                 )

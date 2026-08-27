@@ -112,6 +112,7 @@ class _TerminalReceipt:
 class _RecoveryInspection:
     terminal: _TerminalReceipt | None
     active: bool
+    status: str | None
 
 
 class HostedRoomRuntime:
@@ -249,14 +250,17 @@ class HostedRoomRuntime:
         )
         binding = self._binding_for_room(identity.room_id)
         try:
-            if binding is not None and self._interrupt_stopping_task(binding, stopping):
-                stopping = state.complete_task_cancel(
-                    self.db_path,
-                    identity,
-                    cancel_id=cancel_id,
-                    expected_cancel_generation=stopping["cancel_generation"],
-                    clock=self.clock,
-                )
+            if binding is not None:
+                lease = self._ensure_lease(binding)
+                if not self._settle_stopping_completion(binding, stopping, lease):
+                    if self._interrupt_stopping_task(binding, stopping):
+                        stopping = state.complete_task_cancel(
+                            self.db_path,
+                            identity,
+                            cancel_id=cancel_id,
+                            expected_cancel_generation=stopping["cancel_generation"],
+                            clock=self.clock,
+                        )
         except Exception as exc:
             self._record_error(f"stop remains pending: {exc}")
         stopping = state.get_task(self.db_path, identity)
@@ -274,6 +278,41 @@ class HostedRoomRuntime:
         if binding is None:
             raise state.RoomUnavailableError("hosted room is unavailable")
         lease = self._ensure_lease(binding)
+        inspection = self._inspect_recovery_session(binding, task)
+        if inspection.terminal is not None:
+            resolved = state.resolve_indeterminate_task(
+                self.db_path,
+                identity,
+                lease,
+                expected_execution_generation=task["execution_generation"],
+                expected_cancel_generation=task["cancel_generation"],
+                settlement_id=inspection.terminal.settlement_id,
+                status=inspection.terminal.status,
+                result=inspection.terminal.result,
+                clock=self.clock,
+            )
+            if self.publish_terminal is not None:
+                self.publish_terminal(binding, resolved)
+            return resolved
+        if inspection.status == "cancelled":
+            resolved = state.resolve_indeterminate_cancellation(
+                self.db_path,
+                identity,
+                lease,
+                expected_execution_generation=task["execution_generation"],
+                expected_cancel_generation=task["cancel_generation"],
+                cancel_id=f"remote-cancel:{task['execution_generation']}",
+                clock=self.clock,
+            )
+            if self.publish_terminal is not None:
+                self.publish_terminal(binding, resolved)
+            return resolved
+        if inspection.active:
+            with self._status_lock:
+                self._blocked_rooms.add(identity.room_id)
+            raise state.InvalidTaskTransitionError(
+                "cannot retry while the original task attempt is still active"
+            )
         retried = state.requeue_indeterminate_task(
             self.db_path,
             identity,
@@ -340,7 +379,6 @@ class HostedRoomRuntime:
         return result.get("interrupted") is True or str(result.get("status") or "") in {
             "cancelled",
             "interrupted",
-            "stopping",
         }
 
     def _settle_stopping_completion(
@@ -798,7 +836,7 @@ class HostedRoomRuntime:
                 source=ROOM_SESSION_SOURCE,
             )
             if session is None:
-                return _RecoveryInspection(terminal=None, active=False)
+                return _RecoveryInspection(terminal=None, active=False, status=None)
             session_id = _session_id(session)
             resumed = transport.resume(
                 profile=profile,
@@ -824,6 +862,7 @@ class HostedRoomRuntime:
             return _RecoveryInspection(
                 terminal=receipt,
                 active=_info_is_active_for(info, task["identity"]),
+                status=str(info.get("status") or "") or None,
             )
 
     def _reconcile_indeterminate(
@@ -838,6 +877,17 @@ class HostedRoomRuntime:
         )
         for task in unresolved:
             inspection = self._inspect_recovery_session(binding, task)
+            if inspection.status == "cancelled":
+                state.resolve_indeterminate_cancellation(
+                    self.db_path,
+                    task["identity"],
+                    lease,
+                    expected_execution_generation=task["execution_generation"],
+                    expected_cancel_generation=task["cancel_generation"],
+                    cancel_id=f"remote-cancel:{task['execution_generation']}",
+                    clock=self.clock,
+                )
+                continue
             if inspection.terminal is None:
                 with self._status_lock:
                     self._blocked_rooms.add(binding.room_id)
