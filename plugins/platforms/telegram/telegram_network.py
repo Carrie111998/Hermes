@@ -25,6 +25,15 @@ _TELEGRAM_API_HOST = "api.telegram.org"
 # from the (potentially unreachable) IP returned by the local system resolver.
 _DOH_TIMEOUT = 4.0  # seconds — bounded so connect() isn't noticeably delayed
 
+# Number of consecutive *hard application-layer* failures (``ReadError`` /
+# ``RemoteProtocolError``) recorded against a sticky IP before the transport
+# demotes it and walks the full IP ladder again (#95159). Module-level so
+# tests pin shared state instead of mutable per-instance attributes.
+# Timeout-class exceptions (``httpx.TimeoutException`` subclasses, incl.
+# ``ReadTimeout`` and ``PoolTimeout``) deliberately do NOT count toward this
+# threshold — see ``TelegramFallbackTransport._record_sticky_failure``.
+_STICKY_FAILURE_THRESHOLD = 2
+
 _DOH_PROVIDERS: list[dict] = [
     {
         "url": "https://dns.google/resolve",
@@ -85,6 +94,31 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         # hostname" (#87015).
         self._sticky_ip: object = _UNSET
         self._sticky_lock = asyncio.Lock()
+        # Per-IP wedged-IP failure counter (#95159). The transport already
+        # rotates sticky on a single ``httpx.ConnectTimeout`` / ``ConnectError``
+        # (``_is_retryable_connect_error``), but a sticky IP can also become
+        # unusable at the *application* layer — hard wedge signals:
+        # ``ReadError``, ``RemoteProtocolError`` (peer accepted the TCP
+        # connection, then broke it mid-request/response). Those exceptions are
+        # re-raised immediately without ever touching ``_sticky_ip``, so the
+        # next getUpdates long-poll hammers the same dead path again and
+        # PTB's ``network_retry_loop`` (which only re-issues getUpdates when
+        # the previous call *returns*) never advances. Track those failures
+        # here and demote the sticky IP once ``_STICKY_FAILURE_THRESHOLD``
+        # consecutive hard failures pile up against it; the next request then
+        # walks the full IP ladder again. The counter is reset on a
+        # successful response so a transient edge blip does not poison the
+        # sticky path for the rest of the connection's lifetime.
+        #
+        # Taxonomy notes: HTTP 5xx never appears in this counter — httpx
+        # returns a Response for error statuses instead of raising at the
+        # transport layer. Timeout-class exceptions are excluded too: a
+        # ``ReadTimeout`` on getUpdates is the *normal* long-poll outcome
+        # whenever the client read timeout is tighter than Telegram's poll
+        # window, and ``PoolTimeout`` is local pool exhaustion, not evidence
+        # of a wedged IP (see ``_record_sticky_failure``).
+        self._sticky_failure_counts: dict[str, int] = {}
+        self._sticky_failure_lock = asyncio.Lock()
 
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
@@ -143,6 +177,110 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             order.append(None)
         return order
 
+    async def _record_sticky_failure(self, ip: str | None, exc: Exception) -> None:
+        """Record a wedged-IP failure and demote sticky once the threshold is crossed.
+
+        Only *hard* application-layer wedge signals count toward demotion:
+        ``httpx.ReadError`` and ``httpx.RemoteProtocolError`` (the peer
+        accepted the TCP connection but then broke it mid-request/response).
+        Connect-level failures never reach this method —
+        ``_is_retryable_connect_error`` already rotates sticky on a single
+        ``httpx.ConnectTimeout`` / ``ConnectError`` — and a sticky IP can
+        therefore stay pinned to a wedged application-layer path forever
+        (#95159). Hard failures are tracked per IP and sticky is demoted
+        once the counter crosses ``_STICKY_FAILURE_THRESHOLD`` so the next
+        ``handle_async_request`` call walks the full ladder again. PTB's
+        ``network_retry_loop`` then re-issues ``getUpdates`` against the
+        fresh attempt and the gateway exits its silent outage without a
+        process restart.
+
+        Deliberately NOT counted (neither incremented nor cleared):
+
+        * Every ``httpx.TimeoutException`` subclass. A ``ReadTimeout``/
+          ``WriteTimeout`` on getUpdates is the *normal* long-poll outcome
+          whenever the configured client read timeout is tighter than
+          Telegram's poll window (and also what benign packet loss looks
+          like), so counting it would demote healthy IPs and force a full
+          ladder walk plus duplicated getUpdates traffic against every
+          candidate. They are ignored entirely rather than clearing the
+          counter so that interleaved hard failures still accumulate toward
+          the threshold.
+        * ``httpx.PoolTimeout`` in particular: it signals *local* pool
+          exhaustion on the shared connection pool (too many concurrent
+          requests), not a wedged remote IP. Demoting here punishes healthy
+          IPs exactly at peak load and resetting their pool mid-burst would
+          amplify the exhaustion — so it is logged and nothing else.
+        """
+        if ip is None:
+            # Dual-stack hostname path uses its own reset on primary failure.
+            return
+        if isinstance(exc, httpx.TimeoutException):
+            # Timeout-class failure: not a wedge signal. Neither counts nor
+            # clears the per-IP counter; the sticky path stays untouched.
+            if isinstance(exc, httpx.PoolTimeout):
+                logger.warning(
+                    "[Telegram] Local connection-pool exhaustion (%s) on %s "
+                    "— local condition, not a wedged IP; sticky and counter "
+                    "untouched",
+                    type(exc).__name__,
+                    ip,
+                )
+            else:
+                logger.debug(
+                    "[Telegram] Sticky path %s timed out (%s) — normal "
+                    "long-poll outcome, not a wedge signal; counter untouched",
+                    ip,
+                    type(exc).__name__,
+                )
+            return
+        async with self._sticky_failure_lock:
+            count = self._sticky_failure_counts.get(ip, 0) + 1
+            self._sticky_failure_counts[ip] = count
+            if count < _STICKY_FAILURE_THRESHOLD:
+                logger.debug(
+                    "[Telegram] Sticky path %s wedged-IP failure %d/%d — still sticky",
+                    ip,
+                    count,
+                    _STICKY_FAILURE_THRESHOLD,
+                )
+                return
+            # Threshold crossed — drop sticky so the next request walks
+            # the full ladder. Do NOT reset the counter here: the next
+            # attempt must reach a working IP, call _record_sticky_success,
+            # and clear the counter only after a confirmed round-trip. This
+            # avoids a re-attempt against the same wedged IP in the same
+            # burst.
+            async with self._sticky_lock:
+                if self._sticky_ip == ip:
+                    self._sticky_ip = _UNSET
+                    logger.warning(
+                        "[Telegram] Sticky path %s wedged after %d "
+                        "consecutive hard application-layer failures; "
+                        "demoting to walk the full IP ladder (#95159)",
+                        ip,
+                        count,
+                    )
+            # Reset the failed pool so its dead sockets are released, just
+            # like the connect-failure branch does. Without this the same
+            # poisoned httpx pool is reused on the next attempt and the
+            # wedge persists even after sticky is cleared.
+            await self._reset_fallback(ip)
+
+    def _record_sticky_success(self, ip: str) -> None:
+        """Clear the per-IP wedged-counter after a successful round-trip.
+
+        A successful response means the IP is healthy again. Clear the
+        counter so future transient blips don't accumulate and falsely
+        demote a recovered IP.
+        """
+        if ip is None:
+            return
+        # Synchronous map pop is safe: the lock only guards mutation from
+        # _record_sticky_failure on the same transport instance and a
+        # benign race (an extra failure counted) is bounded by the
+        # threshold reset below.
+        self._sticky_failure_counts.pop(ip, None)
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
             return await self._primary.handle_async_request(request)
@@ -155,6 +293,11 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
+                # Confirmed round-trip — clear the wedged-IP counter for
+                # this IP so a one-off edge blip does not poison the
+                # sticky path for the rest of the connection's lifetime
+                # (#95159).
+                self._record_sticky_success(ip if ip is not None else None)
                 if self._sticky_ip is _UNSET or self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip is _UNSET or self._sticky_ip != ip:
@@ -170,6 +313,21 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             except Exception as exc:
                 last_error = exc
                 if not _is_retryable_connect_error(exc):
+                    # Non-connect failure on a sticky IP can leave the
+                    # gateway silently dead (#95159): the exception
+                    # bubbles up without ever touching ``_sticky_ip``, so
+                    # the next ``getUpdates`` long-poll hits the same
+                    # dead path again. Record it so the transport demotes
+                    # the IP once enough consecutive *hard* wedge signals
+                    # pile up — timeout-class exceptions (``ReadTimeout``,
+                    # ``PoolTimeout``, ...) are ignored inside, since they
+                    # are normal long-poll outcomes or local pool
+                    # exhaustion rather than wedge evidence. Connect-level
+                    # failures already rotate sticky below; do not
+                    # double-count them.
+                    await self._record_sticky_failure(
+                        ip if ip is not None else None, exc
+                    )
                     raise
                 if self._sticky_ip is not _UNSET and ip == self._sticky_ip:
                     async with self._sticky_lock:
