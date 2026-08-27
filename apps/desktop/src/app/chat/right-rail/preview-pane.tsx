@@ -18,6 +18,7 @@ import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeSessionId } from '@/store/session'
 import {
   $browserPages,
   $previewServerRestart,
@@ -494,20 +495,26 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return
     }
 
-    return registerPreviewPageReader(tabId, async () => {
-      const webview = webviewRef.current
+    const owningSessionId = $activeSessionId.get() ?? undefined
 
-      if (!webview?.executeJavaScript) {
-        throw new Error('preview webview is not ready')
-      }
+    return registerPreviewPageReader(
+      tabId,
+      async () => {
+        const webview = webviewRef.current
 
-      const text = await webview.executeJavaScript('document.body ? document.body.innerText : ""')
+        if (!webview?.executeJavaScript) {
+          throw new Error('preview webview is not ready')
+        }
 
-      return {
-        text: typeof text === 'string' ? text : '',
-        ...guestPage(webview)
-      }
-    })
+        const text = await webview.executeJavaScript('document.body ? document.body.innerText : ""')
+
+        return {
+          text: typeof text === 'string' ? text : '',
+          ...guestPage(webview)
+        }
+      },
+      owningSessionId
+    )
   }, [isWebPreview, tabId])
 
   // Publish the SCRIPT runner for this tab: the one channel into the guest

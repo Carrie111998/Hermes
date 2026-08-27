@@ -71,10 +71,10 @@ export function hasLivePreviewReaders(): boolean {
 }
 
 /** Session-scoped variant: true when the given session owns at least one
- *  live preview reader whose tab is still open. Prefer this over the
- *  global {@link hasLivePreviewReaders} — a global gate lets any
- *  background session drive interactions on the interactive session's
- *  visible preview (review #95475). */
+ *  live preview reader whose tab is still open. Every production
+ *  registration passes a sessionId (see preview-pane.tsx), so this is
+ *  the authoritative check — a background session cannot pass the gate
+ *  solely because a different session owns the visible preview (#95459). */
 export function hasLivePreviewForSession(sessionId: string): boolean {
   if (!sessionId) {
     return false
@@ -84,16 +84,6 @@ export function hasLivePreviewForSession(sessionId: string): boolean {
 
   for (const [tabId, owner] of readerSessions.entries()) {
     if (owner === sessionId && openIds.has(tabId) && readers.has(tabId)) {
-      return true
-    }
-  }
-
-  // Legacy fallback: registrations made before session-scoped tracking
-  // (readerSessions empty for that tabId) still count, but only as a
-  // global signal — remove this fallback once every registration site
-  // passes a sessionId.
-  for (const tabId of readers.keys()) {
-    if (!readerSessions.has(tabId) && openIds.has(tabId)) {
       return true
     }
   }
@@ -147,7 +137,7 @@ function windowText(
  *  multiple preview zones — #89272), falling through to `tabs[0]` reads
  *  an arbitrary surface the user is NOT looking at. Returning null is
  *  honest — the agent retries or asks the user instead of narrating the
- *  wrong preview. */
+ *  wrong preview. The multi-tab resolution ladder is owned by #89277. */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
   const tab = tabs.find(t => t.id === $rightRailActiveTabId.get())
