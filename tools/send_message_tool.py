@@ -1800,6 +1800,15 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
+    from gateway.platforms.base import apply_terminal_outbound_text_policy
+
+    message = apply_terminal_outbound_text_policy(
+        platform=str(platform_name),
+        chat_id=str(chat_id),
+        content=str(message),
+        metadata={"thread_id": thread_id} if thread_id else None,
+        operation="registry_standalone_sender",
+    )
     return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
 
 

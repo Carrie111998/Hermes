@@ -649,6 +649,63 @@ async def test_unknown_async_native_publisher_added_after_class_creation_is_gate
 
 
 @pytest.mark.asyncio
+async def test_unknown_instance_publisher_added_after_construction_is_gated(monkeypatch):
+    unsafe = "fixed https://127.0.0.1/admin"
+    delivered = []
+    calls = []
+
+    async def publish_native(chat_id, content, metadata=None):
+        delivered.append((chat_id, content, metadata))
+        return True
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_final_gateway_send_policy",
+        lambda **kwargs: calls.append(kwargs) or {"action": "rewrite", "content": "SAFE"},
+    )
+    adapter = GateAdapter()
+    adapter.publish_native = publish_native
+
+    assert await adapter.publish_native("paul", unsafe) is True
+    assert delivered == [("paul", "SAFE", None)]
+    assert calls[-1]["operation"] == "publish_native"
+
+
+@pytest.mark.asyncio
+async def test_instance_callable_object_publisher_is_gated(monkeypatch):
+    delivered = []
+
+    class Publisher:
+        async def __call__(self, chat_id, content):
+            delivered.append((chat_id, content))
+            return True
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_final_gateway_send_policy",
+        lambda **_kwargs: {"action": "rewrite", "content": "SAFE"},
+    )
+    adapter = GateAdapter()
+    adapter.publish_native = Publisher()
+
+    assert await adapter.publish_native("paul", "fixed https://127.0.0.1/admin") is True
+    assert delivered == [("paul", "SAFE")]
+
+
+@pytest.mark.asyncio
+async def test_instance_non_content_helper_and_mutable_state_remain_ordinary():
+    async def _lookup_state(key):
+        return f"value:{key}"
+
+    adapter = GateAdapter()
+    adapter.retry_count = 3
+    adapter._lookup_state = _lookup_state
+
+    assert adapter.retry_count == 3
+    assert await adapter._lookup_state("ready") == "value:ready"
+
+
+@pytest.mark.asyncio
 async def test_unknown_post_class_publisher_without_named_destination_fails_closed(monkeypatch):
     delivered = []
 
@@ -716,6 +773,98 @@ async def bypass(client, chat_id, content):
     assert scan_terminal_transport_inventory(
         source, relative_path="plugins/unsafe_transport.py"
     ) == ["plugins/unsafe_transport.py:3:bypass:send_message"]
+
+
+def test_terminal_transport_inventory_rejects_send_tool_direct_transport():
+    source = """
+async def bypass(client, chat_id, content):
+    await client.send_message(chat_id=chat_id, text=content)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="tools/send_message_tool.py"
+    ) == ["tools/send_message_tool.py:3:bypass:send_message"]
+
+
+def test_terminal_transport_inventory_rejects_private_adapter_direct_transport():
+    source = """
+class UnsafeAdapter(BasePlatformAdapter):
+    async def _publish(self, client, chat_id, content):
+        await client.send_message(chat_id=chat_id, text=content)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="plugins/platforms/unsafe/adapter.py"
+    ) == ["plugins/platforms/unsafe/adapter.py:4:_publish:send_message"]
+
+
+def test_terminal_transport_inventory_rejects_unknown_transport_verb_by_shape():
+    source = """
+class UnsafeAdapter(BasePlatformAdapter):
+    async def _publish(self, client, chat_id, content):
+        await client.transmit(chat_id=chat_id, payload=content)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="plugins/platforms/unsafe/adapter.py"
+    ) == ["plugins/platforms/unsafe/adapter.py:4:_publish:transmit"]
+
+
+def test_terminal_transport_inventory_rejects_unknown_channel_transport_verb():
+    source = """
+async def bypass(channel, content):
+    await channel.transmit(content)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="plugins/unsafe_transport.py"
+    ) == ["plugins/unsafe_transport.py:3:bypass:transmit"]
+
+
+def test_terminal_transport_inventory_ignores_private_non_content_helper():
+    source = """
+class SafeAdapter(BasePlatformAdapter):
+    async def _lookup(self, cache, key):
+        return await cache.fetch(key)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="plugins/platforms/safe/adapter.py"
+    ) == []
+
+
+def test_terminal_transport_inventory_rejects_ungated_registry_sender():
+    source = """
+async def bypass(entry, pconfig, chat_id, content):
+    await entry.standalone_sender_fn(pconfig, chat_id, content)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="tools/send_message_tool.py"
+    ) == ["tools/send_message_tool.py:3:bypass:standalone_sender_fn"]
+
+
+def test_reviewed_private_transport_exemption_requires_wrapped_callers():
+    root = Path(__file__).resolve().parents[2]
+    relative = "plugins/platforms/discord/adapter.py"
+    source = (root / relative).read_text()
+    assert "async def send_image_file(" in source
+    unsafe_source = source.replace(
+        "async def send_image_file(", "async def _send_image_file(", 1
+    )
+
+    violations = scan_terminal_transport_inventory(
+        unsafe_source, relative_path=relative
+    )
+
+    assert "plugins/platforms/discord/adapter.py:4014:_send_file_attachment:send" in violations
+
+
+def test_registry_standalone_transport_has_its_own_terminal_envelope():
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "tools/send_message_tool.py").read_text()
+    tree = ast.parse(source)
+    function = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_registry_standalone_send"
+    )
+    function_source = ast.get_source_segment(source, function) or ""
+    assert "apply_terminal_outbound_text_policy" in function_source
 
 
 def test_terminal_transport_inventory_passes_reviewed_repository_sources():

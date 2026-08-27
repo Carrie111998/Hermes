@@ -3193,13 +3193,69 @@ class _TerminalOutboundBoundaryMeta(ABCMeta):
 class BasePlatformAdapter(ABC, metaclass=_TerminalOutboundBoundaryMeta):
     """
     Base class for platform adapters.
-    
+
     Subclasses implement platform-specific logic for:
     - Connecting and authenticating
     - Receiving messages
     - Sending messages/responses
     - Handling media
     """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Seal instance-level async publishers behind the terminal boundary.
+
+        Python functions stored on an instance are not descriptors, so an instance
+        monkey patch would otherwise bypass both class creation and metaclass
+        assignment wrapping. Public async callables and private callables whose
+        signature can carry recipient-visible content are rebound through the same
+        fail-closed wrapper. Private non-content helpers and ordinary mutable state
+        retain normal instance semantics.
+        """
+        async_callable = inspect.iscoroutinefunction(value) or (
+            callable(value)
+            and inspect.iscoroutinefunction(getattr(value, "__call__", None))
+        )
+        if async_callable and not getattr(value, "_hermes_outbound_gate_wrapped", False):
+            try:
+                assigned_signature = inspect.signature(value)
+                parameter_names = {
+                    parameter.name.lower()
+                    for parameter in assigned_signature.parameters.values()
+                }
+            except (TypeError, ValueError):
+                assigned_signature = None
+                parameter_names = set()
+            carries_visible_content = bool(
+                parameter_names
+                & {
+                    "content", "text", "message", "name", "title", "caption",
+                    "payload", "body", "card", "blocks", "options",
+                    "thread_name", "starter_message", "seed_content", "status",
+                }
+            )
+            if not str(name).startswith("_") or carries_visible_content:
+                if assigned_signature is None:
+                    raise TypeError(
+                        f"cannot safely seal async adapter assignment {name!r}: "
+                        "signature unavailable"
+                    )
+
+                assigned_callable: Any = value
+
+                async def _instance_implementation(_self, *args, **kwargs):
+                    return await assigned_callable(*args, **kwargs)
+
+                self_parameter = inspect.Parameter(
+                    "_self", inspect.Parameter.POSITIONAL_OR_KEYWORD
+                )
+                _instance_implementation.__signature__ = assigned_signature.replace(  # type: ignore[attr-defined]
+                    parameters=(self_parameter, *assigned_signature.parameters.values())
+                )
+                wrapped = type(self)._wrap_outbound_method(
+                    name, _instance_implementation, force_unknown_boundary=True
+                )
+                value = wrapped.__get__(self, type(self))
+        object.__setattr__(self, name, value)
 
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
