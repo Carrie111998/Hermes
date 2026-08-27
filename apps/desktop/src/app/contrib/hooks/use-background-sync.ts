@@ -47,7 +47,10 @@ export function resolveActiveTranscriptSession(
   ownerConnectionId?: null | string
 ): ActiveTranscriptSession | undefined {
   const owner = normalizeProfileKey(ownerProfile)
-  const connectionId = ownerConnectionId?.trim() || null
+  const connectionId = ownerConnectionId === undefined ? undefined : ownerConnectionId?.trim() || null
+
+  const matchesConnection = (route: SessionProfileRoute | undefined) =>
+    connectionId === undefined || (connectionId === null ? route === undefined : route?.connectionId === connectionId)
 
   const matchesOwner = (session: SessionInfo) => {
     const route = sessionOwnerRouteFromRow(session)
@@ -55,7 +58,7 @@ export function resolveActiveTranscriptSession(
     return (
       sessionMatchesStoredId(session, storedSessionId) &&
       normalizeProfileKey(session.profile) === owner &&
-      (!connectionId || route?.connectionId === connectionId)
+      matchesConnection(route)
     )
   }
 
@@ -69,7 +72,7 @@ export function resolveActiveTranscriptSession(
 
   return ownerRoute &&
     normalizeProfileKey(ownerRoute.targetProfile ?? ownerRoute.profile) === owner &&
-    (!connectionId || ownerRoute.connectionId === connectionId)
+    matchesConnection(ownerRoute)
     ? { ownerRoute, profile: ownerRoute.profile }
     : undefined
 }

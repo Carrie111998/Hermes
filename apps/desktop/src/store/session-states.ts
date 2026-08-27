@@ -1173,7 +1173,18 @@ export function storedSessionIdForRuntimeId(sessionId: string): null | string {
   // approval.respond from a native notification, a queued send — finds its
   // durable identity, and through it the exact owner (hint / tagged row).
   // Without this rung such ids fell straight to the ambient socket.
-  const mirrored = $sessionStates.get()[sessionId]?.storedSessionId?.trim()
+  const mirroredStates = Object.entries($sessionStates.get()).filter(
+    ([stateKey]) => runtimeIdFromStateKey(stateKey) === sessionId
+  )
+
+  // Runtime ids are transport-local. A bare id may alias one composite owner,
+  // but once two registry sources expose it there is no safe durable identity
+  // (and therefore no safe approval/clarification socket) to choose.
+  if (mirroredStates.length !== 1) {
+    return null
+  }
+
+  const mirrored = mirroredStates[0][1]?.storedSessionId?.trim()
 
   return mirrored || null
 }

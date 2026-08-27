@@ -207,6 +207,24 @@ afterEach(() => {
 })
 
 describe('active transcript reconciliation', () => {
+  it.each([
+    ['remote-first', [{ connection_id: 'remote-a' }, {}]],
+    ['local-first', [{}, { connection_id: 'remote-a' }]]
+  ] as const)('keeps an explicit local owner local with duplicate rows (%s)', (_order, owners) => {
+    setSessions(
+      owners.map(owner => ({
+        ...owner,
+        id: ACTIVE_STORED_ID,
+        profile: 'default'
+      })) as never
+    )
+
+    expect(resolveActiveTranscriptSession(ACTIVE_STORED_ID, 'default', null)).toEqual({
+      ownerRoute: undefined,
+      profile: 'default'
+    })
+  })
+
   it('resolves same-profile same-id rows by the selected connection owner', () => {
     setSessions([
       { connection_id: 'connection-a', id: ACTIVE_STORED_ID, profile: 'default' } as never,
