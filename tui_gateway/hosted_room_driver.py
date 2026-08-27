@@ -264,7 +264,15 @@ class HostedRoomRuntime:
         try:
             if binding is not None:
                 lease = self._ensure_lease(binding)
-                if not self._settle_stopping_completion(binding, stopping, lease):
+                if self._peer_stop_acknowledged(binding, stopping):
+                    stopping = state.complete_task_cancel(
+                        self.db_path,
+                        identity,
+                        cancel_id=cancel_id,
+                        expected_cancel_generation=stopping["cancel_generation"],
+                        clock=self.clock,
+                    )
+                elif not self._settle_stopping_completion(binding, stopping, lease):
                     if self._interrupt_stopping_task(binding, stopping):
                         stopping = state.complete_task_cancel(
                             self.db_path,
@@ -278,6 +286,50 @@ class HostedRoomRuntime:
         stopping = state.get_task(self.db_path, identity)
         self.wakeup()
         return stopping
+
+    @staticmethod
+    def _info_acknowledges_peer_cancel(
+        info: Mapping[str, Any], task: Mapping[str, Any]
+    ) -> bool:
+        """Accept only one exact peer task attempt's terminal Stop receipt."""
+
+        return (
+            not bool(info.get("active", info.get("running", False)))
+            and str(info.get("status") or "") in {"cancelled", "interrupted"}
+            and str(info.get("task_id") or "") == task["identity"].task_id
+            and int(info.get("execution_generation") or 0)
+            == int(task["execution_generation"])
+        )
+
+    def _peer_stop_acknowledged(
+        self,
+        binding: HostedRoomBinding,
+        task: Mapping[str, Any],
+    ) -> bool:
+        """Probe a peer's exact durable terminal status before reading history."""
+
+        transport = self._transport_for(binding, task)
+        if transport is None or transport is self.rpc:
+            return False
+        profile = task["payload"]["target_profile"]
+        session = transport.resolve_exact(
+            profile=profile,
+            title=room_session_title(binding.room_id),
+            source=ROOM_SESSION_SOURCE,
+        )
+        if session is None:
+            return False
+        resumed = transport.resume(
+            profile=profile,
+            session_id=_session_id(session),
+            source=ROOM_SESSION_SOURCE,
+        )
+        info = transport.info(
+            profile=profile,
+            session_id=_session_id(resumed),
+            source=ROOM_SESSION_SOURCE,
+        )
+        return self._info_acknowledges_peer_cancel(info, task)
 
     def retry_indeterminate(self, identity: state.TaskIdentity) -> dict[str, Any]:
         """Explicitly retry one uncertain attempt under the current room lease."""
@@ -370,6 +422,8 @@ class HostedRoomRuntime:
         )
         active = bool(info.get("active", info.get("running", False)))
         if not active:
+            if self._info_acknowledges_peer_cancel(info, task):
+                return True
             # History was checked immediately before this probe. An exact
             # local session that is no longer active cannot keep executing, and
             # after a restart its process-local task marker is expected to be
@@ -487,6 +541,15 @@ class HostedRoomRuntime:
         for task in pending:
             try:
                 lease = self._renew_lease_if_needed(binding, lease)
+                if self._peer_stop_acknowledged(binding, task):
+                    state.complete_task_cancel(
+                        self.db_path,
+                        task["identity"],
+                        cancel_id=task["cancel_id"],
+                        expected_cancel_generation=task["cancel_generation"],
+                        clock=self.clock,
+                    )
+                    continue
                 if self._settle_stopping_completion(binding, task, lease):
                     continue
                 if not self._interrupt_stopping_task(binding, task):

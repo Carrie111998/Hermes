@@ -19,6 +19,10 @@ from tui_gateway.hosted_room_driver import (
     room_session_title,
 )
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
+from tui_gateway.hosted_room_peer_transport import (
+    PeerHostedRoomTransport,
+    PeerMemberRoute,
+)
 
 
 ROOM_ID = "room-1"
@@ -273,6 +277,71 @@ class NotAdmittedThenSuccessRPC(FakeSessionRPC):
                 not_admitted=True,
             )
         return super().submit(**kwargs)
+
+
+class TerminalPeerClient:
+    """Peer client whose terminal history would look failed if read first."""
+
+    def __init__(self, *, task_id: str, execution_generation: int) -> None:
+        self.task_id = task_id
+        self.execution_generation = execution_generation
+        self.status_task_id = task_id
+        self.status_generation = execution_generation
+        self.status_value = "interrupted"
+        self.history_calls = 0
+
+    def prepare(self, **_kwargs):
+        return {"session_id": "peer-session"}
+
+    def status(self, **_kwargs):
+        return {
+            "active": False,
+            "status": self.status_value,
+            "task_id": self.status_task_id,
+            "execution_generation": self.status_generation,
+        }
+
+    def history(self, **_kwargs):
+        self.history_calls += 1
+        return [{
+            "role": "assistant",
+            "task_id": self.task_id,
+            "execution_generation": self.execution_generation,
+            "status": "failed",
+            "message_id": "peer-interrupted",
+            "content": "interrupted",
+        }]
+
+    def stop_receipt(self, **_kwargs):
+        return {"status": "stopping"}
+
+    def stop(self, **_kwargs):
+        return {"status": "stopping"}
+
+
+def _peer_resolver(client: TerminalPeerClient):
+    route = PeerMemberRoute(
+        home_install_id="install-home",
+        member_id=PROFILE,
+        target_install_id="install-peer",
+        target_profile=PROFILE,
+        capability_digest="a" * 64,
+        cancellation_scope_id="cancel-peer",
+        trace_id="trace-peer",
+        grant="signed-room-grant",
+    )
+
+    def resolve(binding, task):
+        return PeerHostedRoomTransport(
+            binding=binding,
+            route=route,
+            client=client,
+            source_event_seq=int(task["payload"]["source_event_seq"]),
+            task_id=task["identity"].task_id,
+            execution_generation=int(task["execution_generation"]),
+        )
+
+    return resolve
 
 
 @pytest.fixture
@@ -1051,6 +1120,92 @@ def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Pat
     cancelled = runtime.cancel(identity, cancel_id="cancel-peer")
 
     assert cancelled["status"] == "cancelled"
+
+
+def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=1,
+        clock=time.time,
+    )
+    runtime._leases[ROOM_ID] = lease
+    attempt = state.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    client = TerminalPeerClient(
+        task_id=identity.task_id,
+        execution_generation=attempt.execution_generation,
+    )
+    runtime.transport_resolver = _peer_resolver(client)
+    stopping = state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-peer-terminal",
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    assert stopping["status"] == "stopping"
+
+    runtime._retry_stopping_tasks(BINDING, lease)
+
+    assert state.get_task(db, identity)["status"] == "cancelled"
+    assert client.history_calls == 0
+
+
+def test_peer_terminal_status_must_match_exact_task_attempt(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=1,
+        clock=time.time,
+    )
+    runtime._leases[ROOM_ID] = lease
+    attempt = state.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    client = TerminalPeerClient(
+        task_id=identity.task_id,
+        execution_generation=attempt.execution_generation,
+    )
+    client.status_task_id = "different-task"
+    runtime.transport_resolver = _peer_resolver(client)
+
+    stopping = state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-mismatch",
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+
+    assert runtime._peer_stop_acknowledged(BINDING, stopping) is False
+    client.status_task_id = identity.task_id
+    client.status_generation = attempt.execution_generation + 1
+    assert runtime._peer_stop_acknowledged(BINDING, stopping) is False
+    assert state.get_task(db, identity)["status"] == "stopping"
 
 
 def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
