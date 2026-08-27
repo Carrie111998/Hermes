@@ -2423,10 +2423,22 @@ install_node_deps() {
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
         # Capture npm output so failures are diagnosable (#87340).
+        #
+        # node-gyp needs a python3 on PATH (node-pty has no prebuild on fresh
+        # Node ABIs, so it always compiles), and minimal images — Docker
+        # builds without a system python3 — fail there with output that
+        # --silent swallows entirely, leaving the captured log empty and the
+        # BuildKit failure undiagnosable (#96072). The installer's own venv
+        # already provides a python3; put it on PATH for this npm step only.
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$npm_log" 2>&1; then
+        if ! (
+                _py_bin="$(dirname "${PYTHON_PATH:-}")"
+                if [ -x "$_py_bin/python3" ]; then
+                    PATH="$_py_bin:$PATH"
+                fi
+                run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent
+            ) >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"
