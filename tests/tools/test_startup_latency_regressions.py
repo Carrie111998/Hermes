@@ -171,26 +171,36 @@ class TestBannerUpdateCheckNonBlocking:
         assert elapsed < 0.3, f"banner update check blocked {elapsed:.3f}s"
 
     def test_deferred_notice_prints_when_result_lands(self):
+        import re
+
         import hermes_cli.banner as banner
 
-        printed = []
+        # #95968: the notice must arrive through cprint (prompt_toolkit's
+        # renderer) as real ANSI — a background console.print races PT's
+        # raw-mode terminal and mangles the ESC bytes into literal '?'.
+        emitted = []
 
         class _Console:
+            width = 80
+
             def print(self, msg, *a, **k):
-                printed.append(msg)
+                emitted.append(("console", msg))
 
         done = threading.Event()
         with patch.object(banner, "_update_check_done", done), \
              patch.object(banner, "_update_result", None), \
-             patch.object(banner, "_deferred_update_notice_started", False):
+             patch.object(banner, "_deferred_update_notice_started", False), \
+             patch.object(banner, "cprint", lambda text: emitted.append(("cprint", text))):
             banner._defer_update_notice(_Console(), max_wait=5.0)
             banner._update_result = 3
             done.set()
             deadline = time.time() + 5
-            while not printed and time.time() < deadline:
+            while not emitted and time.time() < deadline:
                 time.sleep(0.02)
-        assert printed, "deferred update notice never printed"
-        assert "3 commits behind" in printed[0]
+        assert emitted, "deferred update notice never printed"
+        assert emitted[0][0] == "cprint", emitted
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", emitted[0][1])
+        assert "3 commits behind" in plain
 
     def test_deferred_notice_silent_when_up_to_date(self):
         import hermes_cli.banner as banner
