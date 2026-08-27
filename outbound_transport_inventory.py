@@ -110,6 +110,43 @@ _SEALED_PRIVATE_TRANSPORT_EXEMPTIONS = frozenset({
     "plugins/platforms/whatsapp/adapter.py:1062:_send_media_to_bridge:post",
 })
 
+_EXTERNAL_SEALED_TRANSPORT_CALLERS = {
+    fingerprint: ("tools/send_message_tool.py", "_send_to_platform")
+    for fingerprint in _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS
+    if "_standalone_send:" in fingerprint
+    or fingerprint.startswith("tools/send_message_tool.py:1984:_post:")
+    or fingerprint.startswith("tools/send_message_tool.py:2357:_send_qqbot:")
+    or fingerprint.startswith("tools/send_message_tool.py:2365:_send_qqbot:")
+    or fingerprint.startswith("tools/send_message_tool.py:2373:_send_qqbot:")
+}
+
+
+def validate_sealed_transport_exemptions(sources: dict[str, bytes]) -> None:
+    """Prove exact external exemptions still name a terminally gated caller."""
+    checked: set[tuple[str, str]] = set()
+    for caller_path, caller_name in _EXTERNAL_SEALED_TRANSPORT_CALLERS.values():
+        if (caller_path, caller_name) in checked:
+            continue
+        checked.add((caller_path, caller_name))
+        raw = sources.get(caller_path)
+        if raw is None:
+            raise RuntimeError(f"sealed transport caller source missing: {caller_path}")
+        source = raw.decode("utf-8")
+        tree = ast.parse(source)
+        caller = next(
+            (
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == caller_name
+            ),
+            None,
+        )
+        caller_source = ast.get_source_segment(source, caller) if caller is not None else ""
+        if not caller_source or "apply_terminal_outbound_text_policy" not in caller_source:
+            raise RuntimeError(
+                f"sealed transport caller is not terminally gated: {caller_path}:{caller_name}"
+            )
+
 
 def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> list[str]:
     """Return direct recipient-visible transport calls outside a closed boundary."""
