@@ -2469,7 +2469,12 @@ def _(rid, params: dict) -> dict:
     stale-while-revalidate read, so opening the panel repeatedly costs nothing;
     ``refresh: true`` is the manual button and skips the cache.
 
-    Fail-open like its billing siblings, and no scope required (read-only).
+    Fail-open like its billing siblings, and no scope required — same as
+    ``billing.state`` / ``usage.bars`` / ``subscription.state``. Not quite
+    read-only, though: resolving a credential goes through ``load_pool()``,
+    which for Copilot exchanges the raw ``gh`` token for an API token and
+    persists it. Detection never does that (see ``agent.provider_usage``); only
+    a provider that is actually being fetched pays it.
     """
     try:
         from agent.provider_usage import usage_payload

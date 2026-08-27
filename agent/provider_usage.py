@@ -13,7 +13,8 @@ every panel open would be a write, not a read.
 **Fetch** (network). Only for detected providers whose profile actually
 implements ``fetch_usage``. Credentials are resolved here, once, and handed to
 the plugin; failures are per-provider, so a dead Anthropic never hides a live
-Kimi.
+Kimi. This phase is where the pool's side effects are paid — deliberately, for
+the handful of providers being fetched rather than for all 58.
 
 Results are cached on disk with a per-provider TTL and served
 stale-while-revalidate, so the panel paints from cache immediately instead of
