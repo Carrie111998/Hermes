@@ -576,6 +576,49 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_opt_in_request_context_is_forwarded_as_mcp_metadata(self, tmp_path):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("hello world", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        server._config = {"request_context": True}
+        _servers["test_srv"] = server
+
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "tui",
+            "HERMES_SESSION_SOURCE": "",
+            "HERMES_SESSION_ID": "session-123",
+            "HERMES_SESSION_KEY": "fallback-key",
+        }
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with patch(
+                "agent.runtime_cwd.resolve_agent_cwd", return_value=tmp_path
+            ), patch(
+                "gateway.session_context.get_session_env",
+                side_effect=lambda name, default="": session_values.get(name, default),
+            ), self._patch_mcp_loop():
+                result = json.loads(handler({"name": "world"}))
+            assert result["result"] == "hello world"
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                meta={
+                    "host_context": {
+                        "cwd": str(tmp_path),
+                        "host": "hermes",
+                        "source": "tui",
+                        "session_id": "session-123",
+                    }
+                },
+            )
+        finally:
+            _servers.pop("test_srv", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
