@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kanban_governance
 from toolsets import get_toolset_names
 
 # Shadow-capture module for training substrate: record every dispatch for eval set
@@ -2716,6 +2717,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "blocker_class" not in cols:
+        # Typed blocker class for governance enforcement. One of:
+        # infra_default, lane_work, review_fix, dependency_wait, human_decision
+        # NULL for legacy un-typed blocks.
+        _add_column_if_missing(
+            conn, "tasks", "blocker_class", "blocker_class TEXT"
+        )
+
+    if "decision_class" not in cols:
+        # Decision class for human_decision blocks. One of:
+        # scope_authorization, irreversible_risk_acceptance, policy_override,
+        # principal_intent_ambiguity. Only valid when blocker_class='human_decision'.
+        _add_column_if_missing(
+            conn, "tasks", "decision_class", "decision_class TEXT"
+        )
+
+    if "governance_metadata" not in cols:
+        # JSON-encoded governance metadata for audit/debugging.
+        # Not currently used but reserved for future expansion.
+        _add_column_if_missing(
+            conn, "tasks", "governance_metadata", "governance_metadata TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -6372,7 +6396,10 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
-) -> bool:
+    blocker_class: Optional[str] = None,
+    decision_class: Optional[str] = None,
+    with_reason: bool = False,
+) -> bool | tuple[bool, str]:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
@@ -6404,6 +6431,17 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    
+    # Validate governance requirements
+    validation = kanban_governance.validate_block_transition(
+        reason=reason,
+        blocker_class=blocker_class,
+        decision_class=decision_class,
+    )
+    if not validation.ok:
+        if with_reason:
+            return False, validation.error
+        return False
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6437,12 +6475,14 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       blocker_class = ?,
+                       decision_class = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, blocker_class, decision_class, task_id) if expected_run_id is None
+                else (kind, blocker_class, decision_class, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6495,12 +6535,14 @@ def block_task(
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
-                       block_recurrences = ?
+                       block_recurrences = ?,
+                       blocker_class = ?,
+                       decision_class = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, blocker_class, decision_class, task_id) if expected_run_id is None
+                else (kind, recurrences, blocker_class, decision_class, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6534,11 +6576,13 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           blocker_class = ?,
+                           decision_class = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, blocker_class, decision_class, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -6549,12 +6593,14 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           blocker_class = ?,
+                           decision_class = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (kind, recurrences, blocker_class, decision_class, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
