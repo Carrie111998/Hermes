@@ -46,6 +46,9 @@ Hermes Mobile preserves the Desktop renderer instead of rebuilding it as a separ
 - Sheets and drawers have explicit close controls, scrims, Android Back priority, and keyboard Escape behavior. Focus returns to the invoking toolbar control after a sheet closes.
 - Native mobile never keeps a desktop rail docked beside chat, even on an unfolded Fold. Drawers overlay the full-width chat canvas instead.
 - Browser, PDF, Markdown, image, source, and artifact preview tabs open in a full-screen mobile surface. Closing that surface preserves the tabs; users can reopen it, switch tabs, close individual tabs, or create another Browser tab.
+- Browser workspaces offer local **9:16**, **1:1**, and **16:9** framing plus bounded zoom. These are content-frame controls, not WebView zoom: tabs, safe areas, and touch controls retain their correct geometry.
+- The System group offers independent **UI density** and **reading text** controls. They update theme tokens rather than raster-scaling the WebView, so overlays and Android safe areas remain sharp and correctly placed.
+- The System group exposes the complete **Thinking** range (Off through Ultra) alongside model selection; the selected effort is applied to the active session when one exists and remains the next-draft preference otherwise.
 - URL tabs embed only private **HTTPS** pages in a sandboxed in-app frame. The visible **Open** action hands a page to Android’s system browser when a site needs its normal browser session or blocks framing. Insecure and special schemes are never loaded inline.
 - Motion is deliberately limited to navigation changes and touch feedback: drawers, menus, preview tabs, list/detail transitions, onboarding cards, and controls animate quietly; transcript/body content stays still, and every motion treatment respects `prefers-reduced-motion`.
 
@@ -63,11 +66,12 @@ This is intentional adaptation, not a separate dashboard: existing Desktop pages
 
 Every mobile capability begins with a deliberate user action or the one-time first successful connection onboarding. Hermes never requests contacts, location, SMS, Accessibility, overlay, notification-reader, boot, or exact-alarm access.
 
-- **Files and images:** first successful connection requests the Android visual-media grant for gallery photos and videos. Regular document/photo pickers still use system URI grants; their bytes are held only for the current app process and are uploaded to the configured remote gateway only when the user sends the composer message.
-- **Camera:** first successful connection requests Android camera permission. **Capture photo** still requires a separate composer action, does not write the image to the gallery, and keeps the capture as a normal draft attachment until the user sends it.
+- **Files and images:** document/photo pickers use system URI grants; their bytes are held only for the current app process and are uploaded to the configured remote gateway only when the user sends the composer message.
+- **Camera and gallery:** Android capture/media permission is requested only after the person selects a camera or picker action. **Capture photo** does not write the image to the gallery and keeps it as a normal draft attachment until Send is pressed.
 - **Incoming shares:** Android’s Share sheet can open Hermes with text and attachments. Shared text and files are staged in the composer; Hermes does not auto-send shared content to an agent session. Each shared URI is read once through its grant and capped at 25 MiB.
-- **Microphone:** requested during first-connection onboarding and used only when the user starts voice input; the access probe immediately releases its test track.
-- **Notifications:** first successful connection asks for Android notification permission; Settings also offers a benign local test. Hermes separates attention-needed, activity, and non-urgent background-update channels. This is local-notification support only—server-to-device push while the app is suspended is not implemented or claimed.
+- **Microphone:** requested only after a voice or Wake action. Every probe releases its test track immediately; Hermes does not keep the microphone for ordinary chat, camera, browser, or notification work.
+- **Audio output:** ordinary synthesized replies prefer the device speaker. A future call surface must offer earpiece/Bluetooth selection as an explicit user choice rather than silently changing routes.
+- **Notifications:** first successful connection asks for Android notification permission; Settings also offers a benign local test. Hermes separates attention-needed, activity, and non-urgent background-update channels; a one-hour pause preserves per-kind choices. Android uses a dedicated monochrome Hermes status/lock-screen icon. This is local-notification support only—server-to-device push while the app is suspended is not implemented or claimed.
 - **Background reliability:** first successful connection opens Android’s own battery-optimization decision and arms a visible active-session service for the next background transition. Its top-bar notification shows that the remote session is being kept ready; it stops when the user dismisses the app task. This improves reliability but does not create a hidden agent, make a WebView immortal, or prove closed-app completion notifications.
 
 **Device-proof gate:** these source-level paths are covered by tests and native compilation, but camera, share-sheet, Android permission prompts, notification channels, and gallery behavior remain real-device acceptance items.
@@ -75,7 +79,7 @@ Every mobile capability begins with a deliberate user action or the one-time fir
 ## 🔄 After the first published release
 
 - A future GitHub Release check may compare a signed, published release against the installed version and show a user-controlled update link. It must never silently download or install an APK.
-- A home-screen widget is deferred until the core mobile client is accepted and published. Any widget proposal must preserve the same remote-session, permission, and notification boundaries.
+- The home-screen widget provides **Open**, **New task**, and **Wake**. New task opens a visible composer without sending; Wake is an explicit user tap and never a hidden recorder.
 
 ## 🧪 Contributor path
 
