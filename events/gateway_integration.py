@@ -21,6 +21,7 @@ from events.paths import (
     gateway_heartbeat_path,
     whatsapp_flush_state_path,
 )
+from events.producers.ai_usage_monitor import AIUsageCollectorMonitor
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
@@ -100,6 +101,7 @@ _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
 _resource_monitor: Optional[ResourcePressureMonitor] = None
+_ai_usage_monitor: Optional[AIUsageCollectorMonitor] = None
 _code_drift_monitors: List[CodeDriftMonitor] = []
 _partial_backlog_monitor: Optional[PartialBacklogMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
@@ -216,7 +218,7 @@ def _verify_subscriber_roster() -> None:
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _resource_monitor, _code_drift_monitors, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _ai_usage_monitor, _code_drift_monitors, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -228,6 +230,12 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
     _resource_monitor = ResourcePressureMonitor(_bus)
+    # Resident AI-usage collection. Default mode is 'shadow': it writes to
+    # ai-tokens-resident.json while the AIUsageCollector scheduled task keeps
+    # owning the real snapshot, so the two can be diffed before any cutover.
+    # Construction is side-effect-free and imports nothing heavy -- the
+    # collector's own imports are paid inside the worker on first run.
+    _ai_usage_monitor = AIUsageCollectorMonitor()
     # One monitor per repo whose WORKING TREE is deployed code, each with
     # its own trunk ref and its own episode-state file (2026-07-28: added
     # ~/.hermes on `master` alongside agent-src on `main`).
@@ -1081,6 +1089,18 @@ def _subscriber_poll_loop(
                 except Exception:
                     logger.exception("Partial backlog check failed")
                 last_partial_backlog_check = now
+
+            # Resident AI-usage collection (2026-08-26). Self-gating like the
+            # drift monitors above, so the per-tick cost is a clock comparison.
+            # check() NEVER does the work on this thread: a collection is 40-60s
+            # of network plus a CDP browser probe, which would stall the bus for
+            # a minute every interval. It hands off to a daemon worker and reaps
+            # on a later tick, at most one run in flight.
+            if _ai_usage_monitor:
+                try:
+                    _ai_usage_monitor.check()
+                except Exception:
+                    logger.exception("AI usage collection check failed")
 
             # Scan mailbox every 60 seconds
             if _mailbox_watcher and now - last_mailbox_scan >= 60:
