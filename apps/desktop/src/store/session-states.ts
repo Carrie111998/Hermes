@@ -1421,6 +1421,12 @@ export function unbindTileRuntime(runtimeId: string) {
 // store's pane closers.
 // ---------------------------------------------------------------------------
 
+export interface SessionTileSlashOptions {
+  composerStorageScope?: string
+  fromQueue?: boolean
+  storedSessionId?: null | string
+}
+
 export interface SessionTileResumeOptions {
   ownerGeneration?: number
   ownerRoute?: SessionOwnerRoute
@@ -1436,7 +1442,7 @@ export interface SessionTileDelegate {
   deleteSession(storedSessionId: string, ownerRoute?: SessionOwnerRoute): Promise<void>
   /** Run a slash command against a tile's session (app-level effects — e.g.
    *  branch/handoff — act on the main surface, as they should). */
-  executeSlash(rawCommand: string, sessionId: string): Promise<void>
+  executeSlash(rawCommand: string, sessionId: string, options?: SessionTileSlashOptions): Promise<boolean>
   /** Interrupt a tile's running turn. */
   interruptSession(runtimeId: string): Promise<void>
   /** Drop the wiring cache's stored→runtime bindings. Called on gateway

@@ -352,9 +352,21 @@ export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, s
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
+        const delegate = sessionTileDelegate()
 
-        return true
+        if (!delegate) {
+          return false
+        }
+
+        const canonicalScope = ownerRouteRef.current ? recoveryKey() : undefined
+
+        return await delegate.executeSlash(visibleText, runtimeIdRef.current, {
+          ...(options?.composerStorageScope !== undefined || canonicalScope
+            ? { composerStorageScope: options?.composerStorageScope ?? canonicalScope }
+            : {}),
+          ...(options?.fromQueue ? { fromQueue: true } : {}),
+          storedSessionId: options?.storedSessionId ?? storedIdRef.current
+        })
       }
 
       const tileRecoveryKey = recoveryKey()

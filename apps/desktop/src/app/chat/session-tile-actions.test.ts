@@ -90,7 +90,7 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
       archiveSession: vi.fn(async () => undefined),
       branchSession: vi.fn(async () => undefined),
       deleteSession: vi.fn(async () => undefined),
-      executeSlash: vi.fn(async () => undefined),
+      executeSlash: vi.fn(async () => true),
       interruptSession: vi.fn(async () => undefined),
       resumeTile: vi.fn(async () => RUNTIME_SESSION_ID),
       submitToSession: vi.fn(async () => undefined),
@@ -114,6 +114,39 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     $sessionTiles.set([])
     requestGatewayMock.mockReset()
     vi.restoreAllMocks()
+  })
+
+  it('retains a queued slash when the tile delegate cannot execute it', async () => {
+    const executeSlash = vi.fn(async () => false)
+    const composerStorageScope = 'owner-qualified-queue-scope'
+
+    setSessionTileDelegate({
+      archiveSession: vi.fn(async () => undefined),
+      branchSession: vi.fn(async () => undefined),
+      deleteSession: vi.fn(async () => undefined),
+      executeSlash,
+      interruptSession: vi.fn(async () => undefined),
+      resumeTile: vi.fn(async () => RUNTIME_SESSION_ID),
+      submitToSession: vi.fn(async () => undefined),
+      updateSession: vi.fn()
+    } as never)
+
+    const { result } = renderTileActions()
+
+    await expect(
+      result.current.submitText('/status', {
+        composerStorageScope,
+        fromQueue: true,
+        sessionId: RUNTIME_SESSION_ID,
+        storedSessionId: STORED_SESSION_ID
+      })
+    ).resolves.toBe(false)
+
+    expect(executeSlash).toHaveBeenCalledWith('/status', RUNTIME_SESSION_ID, {
+      composerStorageScope,
+      fromQueue: true,
+      storedSessionId: STORED_SESSION_ID
+    })
   })
 
   it('resumes the stored session and retries once when session.interrupt reports "session not found"', async () => {

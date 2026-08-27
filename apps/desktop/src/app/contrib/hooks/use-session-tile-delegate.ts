@@ -165,13 +165,25 @@ export function useSessionTileDelegate({
           await removeSession(storedSessionId)
         }
       },
-      executeSlash: async (rawCommand, sessionId) => {
-        const storedSessionId = storedSessionIdForRuntime(sessionId)
+      executeSlash: async (rawCommand, sessionId, options) => {
+        const discoveredStoredSessionId = storedSessionIdForRuntime(sessionId)
+
+        const storedSessionId =
+          options?.storedSessionId !== undefined ? options.storedSessionId : discoveredStoredSessionId
+
         const owner = storedSessionId ? await ownerForStoredSession(storedSessionId) : undefined
 
-        await executeSlashCommand(rawCommand, {
+        const composerStorageScope =
+          options?.composerStorageScope !== undefined
+            ? options.composerStorageScope
+            : storedSessionId && owner
+              ? coordinationIdentity(storedSessionId, owner)
+              : undefined
+
+        return await executeSlashCommand(rawCommand, {
           ...(storedSessionId ? { storedSessionId } : {}),
-          ...(storedSessionId && owner ? { composerStorageScope: coordinationIdentity(storedSessionId, owner) } : {}),
+          ...(composerStorageScope !== undefined ? { composerStorageScope } : {}),
+          ...(options?.fromQueue ? { fromQueue: true } : {}),
           sessionId
         })
       },
