@@ -150,6 +150,42 @@ def is_pii_or_sensitive(task_id: str, title: Optional[str], body: Optional[str])
     return False
 
 
+def needs_tools_to_finish(title: Optional[str], body: Optional[str]) -> bool:
+    """True when a card's DONE-CONDITION requires acting on the world, not answering.
+
+    The free-model wrapper (~/.hermes/scripts/free-model-worker-wrapper.py) is a
+    ONE-SHOT PROMPT RUNNER: it takes argv[1], prints the model's text, and exits. It
+    has no kanban tools, no terminal, and no completion path. A free-routed card
+    therefore CANNOT write a file, run a command, or call kanban_complete.
+
+    Measured 2026-08-27 on sandbox card t_400d4e4e: it free-routed, the model answered,
+    and the run ended `reclaimed` with the card archived unfinished. The work was
+    silently lost. Routing a tool-requiring card to a tool-less worker is not a cheap
+    win, it is a guaranteed dead card.
+
+    So free routing is for cards whose DELIVERABLE IS TEXT (classify, summarize, draft,
+    explain). Anything whose done-condition names a file, a command, a diff, or a board
+    transition needs a real worker.
+    """
+    combined = _normalize_text((title or "") + " " + (body or ""))
+    tool_markers = (
+        # producing an artifact
+        "write", "create", "generate", "output-to", "save", "append", "commit",
+        "patch", "edit", "delete", "archive", "mint", "emit",
+        # running something
+        "run", "execute", "invoke", "dispatch", "spawn", "install", "build",
+        "test", "pytest", "curl", "sqlite3", "python3", "bash",
+        # board transitions the wrapper cannot perform
+        "kanban-complete", "kanban-request-review", "request-review", "handoff",
+        # done-conditions that assert on the filesystem
+        "exists", "test-f", "test-s", "file-exists", "prints", "jq",
+    )
+    return any(
+        re.search(r"(?<![a-z0-9])" + re.escape(m) + r"(?![a-z0-9])", combined)
+        for m in tool_markers
+    )
+
+
 def should_route_free_first(task_id: str, title: Optional[str], body: Optional[str], 
                            model_override: Optional[str] = None) -> bool:
     """Determine if a task should route via free models first.
@@ -158,16 +194,24 @@ def should_route_free_first(task_id: str, title: Optional[str], body: Optional[s
     1. Task has no explicit model_override (use free classifier)
     2. Task is PROVEN-SKILL (routine, deterministic)
     3. Task is NO-CREDENTIAL (no secrets, no SoT writes, no Treva-time spend)
+    4. Task's deliverable is TEXT (the free wrapper has no tools — see
+       needs_tools_to_finish)
     
     Returns False if:
     1. Task has explicit model_override (respect the override)
     2. Task is NOT proven-skill (reasoning-heavy, management)
     3. Task involves credentials/SoT writes/Treva time (stay on Haiku)
+    4. Task must write a file, run a command, or close a card
     """
     # Respect explicit model overrides
     if model_override:
         return False
     
+    # The free wrapper cannot act on the world. Sending it a card whose done-condition
+    # is a file or a command produces a dead card, not a cheap one.
+    if needs_tools_to_finish(title, body):
+        return False
+
     # Check if task is a proven-skill routine
     if not is_proven_skill(task_id, title, body):
         # Not a routine task — default to Haiku for reasoning/management
