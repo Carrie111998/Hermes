@@ -620,7 +620,7 @@ Then frame:
 
 The parent and dashboard must be on the same schemeful site (for example `console.example.com` and `api.example.com` over HTTPS), because gated dashboard sessions use `SameSite=Lax` cookies. Cross-site embedding is deliberately unsupported; deploy a same-site dashboard hostname instead of weakening cookie policy. The `embed` ID must exist in `embed_profiles`, and the requested `profile` must match that mapping. The PTY WebSocket validates the mapping again before accepting, so changing the query cannot retarget the frame. Empty configuration disables external embedding. Only the chat document is frameable; OAuth remains a top-level popup flow.
 
-For OAuth, open the same URL in a top-level popup with `auth_bridge=1`. After the authenticated callback, the page posts a bounded `hermes.dashboard.embed` / `authenticated` event to the configured parent origin and closes. The framed chat posts `connecting`, `ready`, `reconnecting`, `disconnected`, and `ended` lifecycle events. Hosts must verify `event.origin`, `event.source`, `type`, and `embedId` before acting.
+For OAuth, open the same URL in a top-level popup with `auth_bridge=1`. After the authenticated callback, the page posts a bounded `hermes.dashboard.embed` / `authenticated` event to the configured parent origin and closes. The framed chat posts `ready` to `window.parent` once the authenticated chat is mounted, then `connecting`, `reconnecting`, `disconnected`, and `ended` for the PTY. Hosts must verify `event.origin`, `event.source`, `type`, and `embedId` before acting. Never post to `*`.
 
 ## Authentication (gated mode)
 

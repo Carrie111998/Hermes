@@ -38,6 +38,16 @@ export function EmbeddedChatHost({ request }: { request: DashboardEmbedRequest }
     window.close();
   }, [request.authBridge, request.embedId, request.parentOrigin]);
 
+  useEffect(() => {
+    if (request.authBridge) return;
+    postDashboardEmbedEvent(
+      window.parent,
+      request.parentOrigin,
+      "ready",
+      request.embedId,
+    );
+  }, [request.authBridge, request.embedId, request.parentOrigin]);
+
   const announcePtyState = useCallback(
     (state: PtyConnectionState) => {
       postDashboardEmbedEvent(

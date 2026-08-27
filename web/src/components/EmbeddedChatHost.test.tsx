@@ -46,6 +46,25 @@ afterEach(async () => {
 });
 
 describe("EmbeddedChatHost", () => {
+  it("posts ready to the parent origin once the authenticated iframe mounts", async () => {
+    const postMessage = vi.fn();
+    Object.defineProperty(window, "parent", {
+      configurable: true,
+      value: { postMessage },
+    });
+
+    await render(request);
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(postMessage).toHaveBeenCalledWith(
+      {
+        type: "hermes.dashboard.embed",
+        event: "ready",
+        embedId: "console-wolf",
+      },
+      "https://console.runi.services",
+    );
+  });
+
   it("renders the stripped terminal and announces readiness", async () => {
     const postMessage = vi.fn();
     Object.defineProperty(window, "parent", {
@@ -58,13 +77,17 @@ describe("EmbeddedChatHost", () => {
       .toContain('"embedded":true');
     expect(node.querySelector('[data-testid="chat-page"]')?.getAttribute("data-profile"))
       .toBe("wolf");
+    expect(postMessage).toHaveBeenCalledWith(
+      {
+        type: "hermes.dashboard.embed",
+        event: "ready",
+        embedId: "console-wolf",
+      },
+      "https://console.runi.services",
+    );
     await act(async () => {
       (chatMock.props?.onPtyStateChange as ((state: string) => void))("open");
     });
-    expect(postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ event: "ready", embedId: "console-wolf" }),
-      "https://console.runi.services",
-    );
 
     await act(async () => {
       (chatMock.props?.onPtyStateChange as ((state: string) => void))("reconnecting");
