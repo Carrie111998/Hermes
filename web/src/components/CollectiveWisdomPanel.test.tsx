@@ -125,6 +125,31 @@ describe('CollectiveWisdomPanel', () => {
     await waitFor(() => expect(getWisdomDiscovery).toHaveBeenCalledWith('research'))
   })
 
+  it('shows the structured setup failure instead of trailing log punctuation', async () => {
+    getWisdomStatus.mockResolvedValue({ configured: false, verified_org_id: null })
+    setupWisdom.mockResolvedValue({ ok: true, name: 'wisdom-setup', pid: 1 })
+    getActionStatus.mockResolvedValue({
+      name: 'wisdom-setup',
+      running: false,
+      exit_code: 3,
+      pid: 1,
+      lines: [
+        '=== wisdom-setup started ===',
+        '{',
+        '  "category": 3,',
+        '  "error": "Collective Wisdom is unavailable for this account",',
+        '  "ok": false',
+        '}'
+      ]
+    })
+
+    render(<CollectiveWisdomPanel profile="research" />)
+    fireEvent.click(await screen.findByRole('button', { name: /set up this profile/ }))
+
+    expect(await screen.findByText('Collective Wisdom is unavailable for this account')).toBeTruthy()
+    expect(screen.queryByText('}')).toBeNull()
+  })
+
   it('escapes server-controlled text and labels server scan state explicitly', async () => {
     getWisdomDiscovery.mockResolvedValue({
       next_cursor: null,

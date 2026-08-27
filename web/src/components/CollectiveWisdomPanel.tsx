@@ -53,12 +53,37 @@ function userFacingError(reason: unknown): string {
   return message.replace(/^Error:\s*/, '')
 }
 
+function wisdomActionFailure(status: { exit_code: number | null; lines: string[] }): string {
+  const lastRunMarker = status.lines.findLastIndex(line => line.startsWith('==='))
+  const latestRun = status.lines
+    .slice(lastRunMarker + 1)
+    .join('\n')
+    .trim()
+  const objectStart = latestRun.indexOf('{')
+  const objectEnd = latestRun.lastIndexOf('}')
+
+  if (objectStart >= 0 && objectEnd > objectStart) {
+    try {
+      const body = asRecord(JSON.parse(latestRun.slice(objectStart, objectEnd + 1)))
+      for (const key of ['error', 'detail', 'message']) {
+        const value = body[key]
+        if (typeof value === 'string' && value.trim()) return value
+      }
+    } catch {
+      // Action logs can also contain ordinary command output. Use the stable
+      // fallback below rather than leaking JSON punctuation into the UI.
+    }
+  }
+
+  return `Collective Wisdom action failed (${status.exit_code ?? 'unknown'})`
+}
+
 async function waitForWisdomAction(name: string): Promise<void> {
   for (let attempt = 0; attempt < 1200; attempt += 1) {
     const status = await api.getActionStatus(name, 80)
     if (!status.running) {
       if (status.exit_code !== 0) {
-        throw new Error(status.lines.at(-1) || `Collective Wisdom action failed (${status.exit_code ?? 'unknown'})`)
+        throw new Error(wisdomActionFailure(status))
       }
       return
     }
