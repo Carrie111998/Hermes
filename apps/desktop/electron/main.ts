@@ -87,7 +87,8 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { registerComposerQueueDrainIpc } from './composer-queue-drain-ipc'
+import { createComposerPersistenceFileStore } from './composer-persistence-file'
+import { ComposerPersistenceCoordinator, registerComposerQueueDrainIpc } from './composer-queue-drain-ipc'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -14496,7 +14497,13 @@ const hudIpc = registerHudIpc({
   }
 })
 
-registerComposerQueueDrainIpc(ipcMain)
+registerComposerQueueDrainIpc(
+  ipcMain,
+  undefined,
+  new ComposerPersistenceCoordinator(
+    createComposerPersistenceFileStore(path.join(app.getPath('userData'), 'composer-persistence.v1.json'))
+  )
+)
 
 ipcMain.handle('hermes:bootstrap:reset', async () => {
   // Renderer's "Reload and retry" path. Clear the latched failure and

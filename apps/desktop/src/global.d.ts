@@ -91,6 +91,9 @@ declare global {
         onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
         onControl: (callback: (payload: PetOverlayControl) => void) => () => void
       }
+      composerPersistence?: {
+        mutate: (request: unknown) => unknown
+      }
       composerQueueDrain?: {
         begin: (request: { entryId: string; scopeKey: string }) => number | null
         excluded: (request: { entryId: string; scopeKey: string }) => boolean

@@ -7,6 +7,7 @@ const LEGACY_SEPARATOR = '\0'
 const LEGACY_NEW_CHAT = '__new__'
 const MAX_ALIAS_DEPTH = 64
 const STORAGE_SCOPE_ALIASES_KEY = 'hermes.desktop.composerStorageScopeAliases.v1'
+const STORAGE_SCOPE_ALIAS_PREFIX = 'hermes.desktop.composerStorageScopeAlias.v1:'
 const composerStorageScopeAliases = new Map<string, string>()
 
 export type ComposerStorageOwner = Pick<SessionOwnerRoute, 'connectionId' | 'profile'>
@@ -220,39 +221,65 @@ function readPersistedComposerStorageScopeAliases(): Map<string, string> {
     return aliases
   }
 
+  // Import the original whole-map representation for upgrade compatibility.
+  // Independent records below are authoritative and cannot overwrite one
+  // another when different BrowserWindows publish at the same time.
   try {
     const raw = window.localStorage.getItem(STORAGE_SCOPE_ALIASES_KEY)
     const parsed: unknown = raw ? JSON.parse(raw) : null
 
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return aliases
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [from, to] of Object.entries(parsed)) {
+        if (typeof to === 'string' && validAlias(from, to)) {
+          aliases.set(from, to)
+        }
+      }
     }
+  } catch {
+    // Ignore a malformed compatibility map; independent records still load.
+  }
 
-    for (const [from, to] of Object.entries(parsed)) {
+  try {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const storageKey = window.localStorage.key(index)
+
+      if (!storageKey?.startsWith(STORAGE_SCOPE_ALIAS_PREFIX)) {
+        continue
+      }
+
+      const from = storageKey.slice(STORAGE_SCOPE_ALIAS_PREFIX.length)
+      const rawTarget = window.localStorage.getItem(storageKey)
+      const to: unknown = rawTarget ? JSON.parse(rawTarget) : null
+
       if (typeof to === 'string' && validAlias(from, to)) {
         aliases.set(from, to)
       }
     }
   } catch {
-    return aliases
+    // Best effort: retain every valid alias already collected.
   }
 
   return aliases
 }
 
-function persistComposerStorageScopeAliases(aliases: Map<string, string>): void {
+function persistComposerStorageScopeAlias(fromScopeKey: string, toScopeKey: string): void {
   if (typeof window === 'undefined') {
     return
   }
 
   try {
-    if (aliases.size === 0) {
-      window.localStorage.removeItem(STORAGE_SCOPE_ALIASES_KEY)
-    } else {
-      window.localStorage.setItem(STORAGE_SCOPE_ALIASES_KEY, JSON.stringify(Object.fromEntries(aliases)))
-    }
+    // One immutable source key per alias makes each publication a single atomic
+    // localStorage write. Concurrent migrations of different sources therefore
+    // never replace one another's records.
+    window.localStorage.setItem(`${STORAGE_SCOPE_ALIAS_PREFIX}${fromScopeKey}`, JSON.stringify(toScopeKey))
+
+    // Keep the old map as a best-effort downgrade/upgrade bridge. It is never
+    // authoritative once independent records exist.
+    const compatibilityAliases = readPersistedComposerStorageScopeAliases()
+    compatibilityAliases.set(fromScopeKey, toScopeKey)
+    window.localStorage.setItem(STORAGE_SCOPE_ALIASES_KEY, JSON.stringify(Object.fromEntries(compatibilityAliases)))
   } catch {
-    // Best effort: aliases remain valid inside this renderer.
+    // Best effort: activation still keeps the alias valid in this renderer.
   }
 }
 
@@ -274,10 +301,7 @@ export function publishComposerStorageScopeAlias(fromScopeKey: string, toScopeKe
     return false
   }
 
-  const persisted = readPersistedComposerStorageScopeAliases()
-
-  persisted.set(fromScopeKey, target)
-  persistComposerStorageScopeAliases(persisted)
+  persistComposerStorageScopeAlias(fromScopeKey, target)
 
   return true
 }
@@ -303,7 +327,21 @@ export function _resetComposerStorageScopeAliasesForTests(): void {
   composerStorageScopeAliases.clear()
 
   if (typeof window !== 'undefined') {
+    const independentKeys: string[] = []
+
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const storageKey = window.localStorage.key(index)
+
+      if (storageKey?.startsWith(STORAGE_SCOPE_ALIAS_PREFIX)) {
+        independentKeys.push(storageKey)
+      }
+    }
+
     window.localStorage.removeItem(STORAGE_SCOPE_ALIASES_KEY)
+
+    for (const storageKey of independentKeys) {
+      window.localStorage.removeItem(storageKey)
+    }
   }
 }
 
@@ -316,7 +354,7 @@ reloadComposerStorageScopeAliases()
 
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', event => {
-    if (event.key === STORAGE_SCOPE_ALIASES_KEY) {
+    if (event.key === STORAGE_SCOPE_ALIASES_KEY || event.key?.startsWith(STORAGE_SCOPE_ALIAS_PREFIX)) {
       reloadComposerStorageScopeAliases()
     }
   })

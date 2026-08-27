@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   _reloadComposerStorageScopeAliasesForTests,
@@ -101,5 +101,40 @@ describe('composer storage scope aliases', () => {
     _reloadComposerStorageScopeAliasesForTests()
 
     expect(resolveComposerStorageScopeKey(retired)).toBe(live)
+  })
+
+  it('publishes concurrent different migrations as independent atomic records', () => {
+    const owner = { connectionId: 'source-a', profile: 'omar' }
+    const retiredA = encodeComposerStorageScopeKey(owner, null, 7)
+    const liveA = encodeComposerStorageScopeKey(owner, 'stored-a')
+    const retiredB = encodeComposerStorageScopeKey(owner, null, 8)
+    const liveB = encodeComposerStorageScopeKey(owner, 'stored-b')
+    const originalSetItem = Storage.prototype.setItem
+    let interleaved = false
+
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, storageKey, value) {
+      if (storageKey === 'hermes.desktop.composerStorageScopeAliases.v1' && !interleaved) {
+        interleaved = true
+        registerComposerStorageScopeAlias(retiredB, liveB)
+      }
+
+      originalSetItem.call(this, storageKey, value)
+    })
+
+    registerComposerStorageScopeAlias(retiredA, liveA)
+
+    const independentlyStoredTargets = Array.from({ length: window.localStorage.length }, (_, index) =>
+      window.localStorage.key(index)
+    )
+      .filter(storageKey => storageKey?.startsWith('hermes.desktop.composerStorageScopeAlias.v1:'))
+      .map(storageKey => window.localStorage.getItem(storageKey!))
+      .sort()
+
+    expect(independentlyStoredTargets).toEqual([liveA, liveB].map(value => JSON.stringify(value)).sort())
+
+    _reloadComposerStorageScopeAliasesForTests()
+
+    expect(resolveComposerStorageScopeKey(retiredA)).toBe(liveA)
+    expect(resolveComposerStorageScopeKey(retiredB)).toBe(liveB)
   })
 })

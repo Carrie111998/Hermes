@@ -116,9 +116,58 @@ const saveParks = (state: Record<string, true>): void => {
  */
 export const $parkedQueueSessions = atom<Record<string, true>>(loadParks())
 
+interface ComposerPersistenceResponse {
+  parks: Record<string, true>
+  queues: QueueState
+  result?: unknown
+}
+
+const coordinatedMutation = (operation: Record<string, unknown>): ComposerPersistenceResponse | null => {
+  const bridge = typeof window === 'undefined' ? undefined : window.hermesDesktop?.composerPersistence
+
+  if (!bridge) {
+    return null
+  }
+
+  try {
+    const response = bridge.mutate({ operation, seed: { parks: loadParks(), queues: load() } })
+
+    if (!response || typeof response !== 'object') {
+      return null
+    }
+
+    const candidate = response as Partial<ComposerPersistenceResponse>
+
+    if (
+      !candidate.queues ||
+      typeof candidate.queues !== 'object' ||
+      Array.isArray(candidate.queues) ||
+      !candidate.parks ||
+      typeof candidate.parks !== 'object' ||
+      Array.isArray(candidate.parks)
+    ) {
+      return null
+    }
+
+    const coordinated = candidate as ComposerPersistenceResponse
+
+    $queuedPromptsBySession.set(coordinated.queues)
+    $parkedQueueSessions.set(coordinated.parks)
+    save(coordinated.queues)
+    saveParks(coordinated.parks)
+
+    return coordinated
+  } catch {
+    // Compatibility fallback for web/tests and older main-process bridges.
+    return null
+  }
+}
+
 export function reloadPersistedComposerQueue(): void {
-  $queuedPromptsBySession.set(load())
-  $parkedQueueSessions.set(loadParks())
+  if (!coordinatedMutation({ type: 'read' })) {
+    $queuedPromptsBySession.set(load())
+    $parkedQueueSessions.set(loadParks())
+  }
 }
 
 const setParked = (sid: string, parked: boolean) => {
@@ -142,10 +191,8 @@ const setParked = (sid: string, parked: boolean) => {
 
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', event => {
-    if (event.key === STORAGE_KEY) {
-      $queuedPromptsBySession.set(load())
-    } else if (event.key === PARK_STORAGE_KEY) {
-      $parkedQueueSessions.set(loadParks())
+    if (event.key === STORAGE_KEY || event.key === PARK_STORAGE_KEY) {
+      reloadPersistedComposerQueue()
     }
   })
 }
@@ -199,7 +246,14 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
 export const getLatestQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
   const sid = sidOf(key)
 
-  return sid ? (load()[sid] ?? []).map(entry => ({ ...entry, attachments: cloneAttachments(entry.attachments) })) : []
+  if (!sid) {
+    return []
+  }
+
+  const coordinated = coordinatedMutation({ type: 'read' })
+  const queue = coordinated?.queues[sid] ?? load()[sid] ?? []
+
+  return queue.map(entry => ({ ...entry, attachments: cloneAttachments(entry.attachments) }))
 }
 
 export const enqueueQueuedPrompt = (
@@ -220,11 +274,15 @@ export const enqueueQueuedPrompt = (
     queuedAt: Date.now()
   }
 
-  mutateSession(sid, queue => ({ next: [...queue, entry], result: undefined }))
-  // Queueing a new prompt is fresh intent to keep the conversation moving —
-  // a park from an earlier Stop must not hold this (or the entries ahead of
-  // it) back.
-  setParked(sid, false)
+  const coordinated = coordinatedMutation({ entry, scopeKey: sid, type: 'enqueue' })
+
+  if (!coordinated) {
+    mutateSession(sid, queue => ({ next: [...queue, entry], result: undefined }))
+    // Queueing a new prompt is fresh intent to keep the conversation moving —
+    // a park from an earlier Stop must not hold this (or the entries ahead of
+    // it) back.
+    setParked(sid, false)
+  }
 
   return entry
 }
@@ -234,6 +292,12 @@ export const dequeueQueuedPrompt = (key: string | null | undefined): null | Queu
 
   if (!sid) {
     return null
+  }
+
+  const coordinated = coordinatedMutation({ scopeKey: sid, type: 'dequeue' })
+
+  if (coordinated) {
+    return (coordinated.result as QueuedPromptEntry | null | undefined) ?? null
   }
 
   return mutateSession(sid, queue => {
@@ -250,6 +314,12 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
     return false
   }
 
+  const coordinated = coordinatedMutation({ entryId: id, scopeKey: sid, type: 'remove' })
+
+  if (coordinated) {
+    return coordinated.result === true
+  }
+
   return mutateSession(sid, queue => {
     const next = queue.filter(entry => entry.id !== id)
 
@@ -262,6 +332,12 @@ export const promoteQueuedPrompt = (key: string | null | undefined, id: string):
 
   if (!sid) {
     return false
+  }
+
+  const coordinated = coordinatedMutation({ entryId: id, scopeKey: sid, type: 'promote' })
+
+  if (coordinated) {
+    return coordinated.result === true
   }
 
   return mutateSession(sid, queue => {
@@ -286,6 +362,18 @@ export const updateQueuedPrompt = (
 
   if (!sid) {
     return false
+  }
+
+  const coordinated = coordinatedMutation({
+    ...(update.attachments ? { attachments: cloneAttachments(update.attachments) } : {}),
+    entryId: id,
+    scopeKey: sid,
+    text: update.text,
+    type: 'update'
+  })
+
+  if (coordinated) {
+    return coordinated.result === true
   }
 
   return mutateSession(sid, queue => {
@@ -326,7 +414,9 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
     return
   }
 
-  mutateSession(sid, () => ({ next: [], result: undefined }))
+  if (!coordinatedMutation({ scopeKey: sid, type: 'clear' })) {
+    mutateSession(sid, () => ({ next: [], result: undefined }))
+  }
 }
 
 export function clearQueuedPromptsForOwnerLineage(
@@ -363,6 +453,12 @@ export function migrateQueuedPromptsExact(from: string, to: string): boolean {
     return false
   }
 
+  const coordinated = coordinatedMutation({ fromScopeKey: from, toScopeKey: to, type: 'migrate' })
+
+  if (coordinated) {
+    return coordinated.result === true
+  }
+
   const current = load()
   const pending = current[from] ?? []
 
@@ -382,7 +478,9 @@ export function migrateQueuedPromptsExact(from: string, to: string): boolean {
   // The park is a property of the entries the user halted — it re-homes with
   // them. Without this, a backend bounce right after Stop would shed the park
   // and auto-send the exact prompts the user just held back.
-  if ($parkedQueueSessions.get()[from]) {
+  // Read persisted park truth at the migration boundary: a peer BrowserWindow
+  // may have handled Stop before this renderer receives its storage event.
+  if (loadParks()[from]) {
     setParked(from, false)
     setParked(to, true)
   }
@@ -406,9 +504,19 @@ export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: 
 export const parkQueuedPrompts = (key: string | null | undefined): boolean => {
   const sid = sidOf(key)
 
-  const current = sid ? load() : null
+  if (!sid) {
+    return false
+  }
 
-  if (!sid || !current || (current[sid] ?? []).length === 0) {
+  const coordinated = coordinatedMutation({ scopeKey: sid, type: 'park' })
+
+  if (coordinated) {
+    return coordinated.result === true
+  }
+
+  const current = load()
+
+  if ((current[sid] ?? []).length === 0) {
     return false
   }
 
@@ -422,7 +530,7 @@ export const parkQueuedPrompts = (key: string | null | undefined): boolean => {
 export const unparkQueuedPrompts = (key: string | null | undefined): void => {
   const sid = sidOf(key)
 
-  if (sid) {
+  if (sid && !coordinatedMutation({ scopeKey: sid, type: 'unpark' })) {
     setParked(sid, false)
   }
 }

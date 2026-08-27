@@ -8,11 +8,13 @@ import {
   clearQueuedPromptsForOwnerLineage,
   dequeueQueuedPrompt,
   enqueueQueuedPrompt,
+  getLatestQueuedPrompts,
   getQueuedPrompts,
   isQueueParked,
   migrateQueuedPrompts,
   parkQueuedPrompts,
   promoteQueuedPrompt,
+  type QueuedPromptEntry,
   reloadPersistedComposerQueue,
   removeQueuedPrompt,
   shouldAutoDrain,
@@ -52,6 +54,106 @@ describe('composer queue store', () => {
     expect(dequeueQueuedPrompt(SESSION_KEY)).toBeNull()
   })
 
+  it('routes queue mutations through the main-process coordinator when available', () => {
+    const originalDesktop = window.hermesDesktop
+    const requests: unknown[] = []
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        composerPersistence: {
+          mutate: (request: unknown) => {
+            requests.push(request)
+            const entry = (request as { operation: { entry: unknown } }).operation.entry
+
+            return { parks: {}, queues: { [SESSION_KEY]: [entry] }, result: entry }
+          }
+        }
+      }
+    })
+
+    try {
+      enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'coordinated' })
+
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toMatchObject({ operation: { scopeKey: SESSION_KEY, type: 'enqueue' } })
+      expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['coordinated'])
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
+  })
+
+  it('coordinates edits, removals, and migrations instead of renderer-local read-modify-write', () => {
+    const originalDesktop = window.hermesDesktop
+    const entry = enqueueQueuedPrompt('source', { attachments: [], text: 'original' })!
+    const operationTypes: string[] = []
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        composerPersistence: {
+          mutate: (request: unknown) => {
+            const typed = request as {
+              operation: { type: string }
+              seed: { parks: Record<string, true>; queues: Record<string, QueuedPromptEntry[]> }
+            }
+
+            operationTypes.push(typed.operation.type)
+
+            return { ...typed.seed, result: true }
+          }
+        }
+      }
+    })
+
+    try {
+      updateQueuedPromptText('source', entry.id, 'edited')
+      removeQueuedPrompt('source', entry.id)
+      migrateQueuedPrompts('source', 'target')
+
+      expect(operationTypes).toEqual(['update', 'remove', 'migrate'])
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
+  })
+
+  it('coordinates dequeue, promotion, and clear mutations too', () => {
+    const originalDesktop = window.hermesDesktop
+    const entry = enqueueQueuedPrompt('source', { attachments: [], text: 'original' })!
+    const operationTypes: string[] = []
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        composerPersistence: {
+          mutate: (request: unknown) => {
+            const typed = request as {
+              operation: { type: string }
+              seed: { parks: Record<string, true>; queues: Record<string, QueuedPromptEntry[]> }
+            }
+
+            operationTypes.push(typed.operation.type)
+
+            return {
+              ...typed.seed,
+              result: typed.operation.type === 'dequeue' ? typed.seed.queues.source?.[0] : true
+            }
+          }
+        }
+      }
+    })
+
+    try {
+      promoteQueuedPrompt('source', entry.id)
+      dequeueQueuedPrompt('source')
+      clearQueuedPrompts('source')
+
+      expect(operationTypes).toEqual(['promote', 'dequeue', 'clear'])
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
+  })
+
   it('dequeues the head from a fresh persisted snapshot', () => {
     const staleHead = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'stale local head' })!
     const externalHead = { ...staleHead, id: 'external-head', text: 'new persisted head' }
@@ -69,6 +171,41 @@ describe('composer queue store', () => {
     reloadPersistedComposerQueue()
 
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('reloads authoritative main-process state instead of a stale localStorage replica', () => {
+    const originalDesktop = window.hermesDesktop
+
+    const authoritative = {
+      attachments: [],
+      id: 'peer-entry',
+      queuedAt: 1,
+      text: 'from peer window'
+    }
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        composerPersistence: {
+          mutate: (request: unknown) => ({
+            parks: {},
+            queues: { [SESSION_KEY]: [authoritative] },
+            result: (request as { operation: { type: string } }).operation.type === 'read'
+          })
+        }
+      }
+    })
+
+    try {
+      window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+      expect(getLatestQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['from peer window'])
+
+      reloadPersistedComposerQueue()
+
+      expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['from peer window'])
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
   })
 
   it('appends from one fresh persisted snapshot when another window enqueues first', () => {
@@ -324,6 +461,7 @@ describe('shouldAutoDrain', () => {
 describe('parked queue sessions', () => {
   beforeEach(() => {
     window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    window.localStorage.removeItem(PARK_STORAGE_KEY)
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
   })
@@ -336,6 +474,44 @@ describe('parked queue sessions', () => {
 
     expect(parkQueuedPrompts(SESSION_KEY)).toBe(true)
     expect(isQueueParked(SESSION_KEY)).toBe(true)
+  })
+
+  it('coordinates park and unpark across BrowserWindows', () => {
+    const originalDesktop = window.hermesDesktop
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'held back' })
+    const operationTypes: string[] = []
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        composerPersistence: {
+          mutate: (request: unknown) => {
+            const typed = request as {
+              operation: { type: string }
+              seed: { parks: Record<string, true>; queues: Record<string, QueuedPromptEntry[]> }
+            }
+
+            operationTypes.push(typed.operation.type)
+
+            return {
+              parks: typed.operation.type === 'park' ? { [SESSION_KEY]: true } : {},
+              queues: typed.seed.queues,
+              result: true
+            }
+          }
+        }
+      }
+    })
+
+    try {
+      expect(parkQueuedPrompts(SESSION_KEY)).toBe(true)
+      unparkQueuedPrompts(SESSION_KEY)
+
+      expect(operationTypes).toEqual(['park', 'unpark'])
+      expect(isQueueParked(SESSION_KEY)).toBe(false)
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
   })
 
   it('parks a fresh persisted queue before the local storage event arrives', () => {
@@ -378,6 +554,17 @@ describe('parked queue sessions', () => {
     // there would auto-send the exact prompts the user just halted.
     enqueueQueuedPrompt('rt-old', { attachments: [], text: 'held back' })
     parkQueuedPrompts('rt-old')
+
+    migrateQueuedPrompts('rt-old', 'rt-new')
+
+    expect(isQueueParked('rt-old')).toBe(false)
+    expect(isQueueParked('rt-new')).toBe(true)
+  })
+
+  it('migrates a peer-window Stop from the latest persisted park snapshot', () => {
+    enqueueQueuedPrompt('rt-old', { attachments: [], text: 'held back by peer' })
+    window.localStorage.setItem(PARK_STORAGE_KEY, JSON.stringify({ 'rt-old': true }))
+    $parkedQueueSessions.set({})
 
     migrateQueuedPrompts('rt-old', 'rt-new')
 

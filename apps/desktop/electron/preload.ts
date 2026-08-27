@@ -75,6 +75,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       return () => ipcRenderer.removeListener('hermes:pet-overlay:control', listener)
     }
   },
+  composerPersistence: {
+    mutate: request => ipcRenderer.sendSync('hermes:composer-persistence:mutate', request)
+  },
   composerQueueDrain: {
     begin: request => ipcRenderer.sendSync('hermes:composer-queue-drain:begin', request),
     excluded: request => ipcRenderer.sendSync('hermes:composer-queue-drain:excluded', request),
