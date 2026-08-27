@@ -785,6 +785,48 @@ def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
 
 
 
+def test_named_custom_provider_providers_dict_honors_api_key_env(monkeypatch):
+    """The ``providers:`` dict resolver must honor ``api_key_env`` — the
+    documented snake_case alias for ``key_env`` (see
+    ``_normalize_custom_provider_entry`` in ``hermes_cli/config.py``).
+
+    Regression: ``_get_named_custom_provider`` read only ``key_env`` for
+    ``providers:`` entries, so a provider written with just ``api_key_env``
+    resolved to an empty key and every auxiliary/delegation/fallback call
+    401'd with ``no-key-required``.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("VENDOR_KEY", "vendor-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "vendor": {
+                    "base_url": "https://vendor.example.com/v1",
+                    "api_key_env": "VENDOR_KEY",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    entry = rp._get_named_custom_provider("vendor")
+
+    assert entry is not None
+    assert entry["base_url"] == "https://vendor.example.com/v1"
+    assert entry["api_key"] == "vendor-secret"
+
+
 def test_named_custom_provider_wins_over_builtin_alias(monkeypatch):
     """A custom_providers entry named after a built-in *alias* (not a canonical
     provider name) must win over the built-in.  Regression guard for #15743:

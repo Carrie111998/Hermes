@@ -750,8 +750,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             # they're not configured.
             if not is_provider_enabled(entry):
                 continue
-            # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
+            # Resolve the API key from the env var name stored in key_env.
+            # api_key_env is the documented snake_case alias for key_env (see
+            # _normalize_custom_provider_entry in hermes_cli/config.py); honor
+            # it here so providers: entries written with only api_key_env
+            # resolve their key instead of 401ing with no-key-required.
+            key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
             resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
