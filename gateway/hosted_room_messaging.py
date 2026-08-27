@@ -97,7 +97,7 @@ class RoomControlError(ValueError):
 
 @dataclass(frozen=True)
 class RoomCommand:
-    """Parsed mutating ``/rooms`` subcommand."""
+    """Parsed mutating ``/group`` subcommand."""
 
     action: str
     room_query: str
@@ -228,33 +228,41 @@ def command_form(event: Any) -> str:
     source = getattr(event, "source", None)
     platform = getattr(getattr(source, "platform", None), "value", "")
     if platform == "slack":
-        return "/hermes rooms"
+        return "/hermes group"
     if platform == "matrix":
-        return "!rooms"
-    return "/rooms"
+        return "!group"
+    return "/group"
 
 
-def parse_room_command(args: str, *, command_root: str = "/rooms") -> RoomCommand:
-    """Parse ``send`` and ``stop`` without making room names quote-only."""
+def parse_room_command(args: str, *, command_root: str = "/group") -> RoomCommand:
+    """Parse the number-first send/stop grammar used by messaging clients."""
 
     raw = str(args or "").strip()
-    action, _, remainder = raw.partition(" ")
-    action = action.casefold()
-    remainder = remainder.strip()
+    entity_first = raw.split(maxsplit=2)
+    if len(entity_first) < 2 or not entity_first[0].isdecimal():
+        raise RoomControlError(
+            f"Use `{command_root} <number> send <message>` or "
+            f"`{command_root} <number> stop`."
+        )
+    room_query = entity_first[0]
+    action = entity_first[1].casefold()
+    remainder = entity_first[2].strip() if len(entity_first) == 3 else ""
     if action == "send":
-        room_query, delimiter, message = remainder.partition(" -- ")
-        if not delimiter or not room_query.strip() or not message.strip():
+        message = remainder.removeprefix("--").strip()
+        if len(message) >= 2 and message[0] == message[-1] and message[0] in {'"', "'"}:
+            message = message[1:-1].strip()
+        if not message:
             raise RoomControlError(
-                f"Use `{command_root} send <room number> -- <message>`."
+                f"Use `{command_root} <number> send <message>`."
             )
-        return RoomCommand("send", room_query.strip(), message.strip())
+        return RoomCommand("send", room_query, message)
     if action == "stop":
-        if not remainder:
-            raise RoomControlError(f"Use `{command_root} stop <room number>`.")
-        return RoomCommand("stop", remainder)
+        if remainder:
+            raise RoomControlError(f"Use `{command_root} <number> stop`.")
+        return RoomCommand("stop", room_query)
     raise RoomControlError(
-        f"Use `{command_root} send <room number> -- <message>` or "
-        f"`{command_root} stop <room number>`."
+        f"Use `{command_root} <number> send <message>` or "
+        f"`{command_root} <number> stop`."
     )
 
 
@@ -272,7 +280,7 @@ def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
         ]
         if len(matches) == 1:
             return matches[0]
-        raise RoomControlError(f"No hosted Bot room is numbered {numeric_ref}.")
+        raise RoomControlError(f"No Group Chat is numbered {numeric_ref}.")
 
     if needle.startswith("id:"):
         internal_id = needle.removeprefix("id:")
@@ -283,7 +291,7 @@ def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
         ]
         if len(matches) == 1:
             return matches[0]
-        raise RoomControlError("No hosted Bot room matches that internal ID.")
+        raise RoomControlError("No Group Chat matches that internal ID.")
 
     def _keys(room: Mapping[str, Any]) -> tuple[str, str]:
         return (
@@ -315,9 +323,9 @@ def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
             )
             suffix = "…" if len(matches) > MAX_ROOM_CHOICES else ""
             raise RoomControlError(
-                f"That matches several rooms: {names}{suffix}. Enter more of the name."
+                f"That matches several group chats: {names}{suffix}. Enter more of the name."
             )
-    raise RoomControlError(f"No hosted Bot room matches “{_clean_line(query)}”.")
+    raise RoomControlError(f"No Group Chat matches “{_clean_line(query)}”.")
 
 
 def _room_status(service: Any, room_id: str) -> str:
@@ -353,13 +361,16 @@ def _room_status(service: Any, room_id: str) -> str:
     return "idle"
 
 
-def format_room_list(service: Any, *, rooms_command: str = "/rooms") -> str:
+def format_room_list(service: Any, *, rooms_command: str = "/group") -> str:
     """Render a bounded, scan-friendly hosted-room list."""
 
     rooms = list_messaging_rooms(service)
     if not rooms:
-        return "No hosted Bot rooms yet. Create one in Hermes Desktop first."
-    lines = ["Hosted Bot rooms"]
+        return (
+            "No Group Chats yet. Create one in Hermes Desktop first.\n\n"
+            f"Send: `{rooms_command} <number> send <message>`"
+        )
+    lines = ["Group Chats"]
     for room in rooms[:MAX_ROOM_CHOICES]:
         name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
         raw_members = room.get("members")
@@ -370,7 +381,15 @@ def format_room_list(service: Any, *, rooms_command: str = "/rooms") -> str:
         )
     if len(rooms) > MAX_ROOM_CHOICES:
         lines.append(f"…and {len(rooms) - MAX_ROOM_CHOICES} more")
-    lines.append(f"Use `{rooms_command} <number>` to see recent activity.")
+    lines.extend(
+        [
+            "",
+            "Commands",
+            f"Check: `{rooms_command} <number>`",
+            f"Send: `{rooms_command} <number> send <message>`",
+            f"Stop: `{rooms_command} <number> stop`",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -395,7 +414,7 @@ def format_room_detail(
     service: Any,
     room: Mapping[str, Any],
     *,
-    room_command: str = "/rooms",
+    room_command: str = "/group",
 ) -> str:
     """Render status plus the latest visible room messages."""
 
@@ -449,9 +468,9 @@ def format_room_detail(
     else:
         lines.append("No messages yet.")
     lines.append(
-        f"Send: `{room_command} send {room_reference(room)} -- <message>`"
+        f"Send: `{room_command} {room_reference(room)} send <message>`"
     )
-    lines.append(f"Stop: `{room_command} stop {room_reference(room)}`")
+    lines.append(f"Stop: `{room_command} {room_reference(room)} stop`")
     return "\n".join(lines)
 
 

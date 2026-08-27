@@ -535,10 +535,10 @@ class TestMatrixBangCommandAlias:
         from gateway.hosted_room_messaging import messaging_event_id
 
         captured_event = await self._dispatch_text(
-            "!rooms send release-room -- hello"
+            "!group 1 send hello"
         )
         assert captured_event is not None
-        assert captured_event.text == "/rooms send release-room -- hello"
+        assert captured_event.text == "/group 1 send hello"
         assert messaging_event_id(captured_event) == messaging_event_id(captured_event)
 
 

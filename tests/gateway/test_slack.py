@@ -3506,7 +3506,7 @@ class TestSlashCommands:
 
         command = {
             "command": "/hermes",
-            "text": "rooms send release-room -- hello",
+            "text": "group 1 send hello",
             "trigger_id": "trigger-room-1",
             "user_id": "U1",
             "channel_id": "C1",
@@ -3514,7 +3514,7 @@ class TestSlashCommands:
         }
         await adapter._handle_slash_command(command)
         event = adapter.handle_message.call_args[0][0]
-        assert event.text == "/rooms send release-room -- hello"
+        assert event.text == "/group 1 send hello"
         assert messaging_event_id(event) == messaging_event_id(event)
 
 

@@ -1,16 +1,17 @@
-"""Messaging controls for gateway-hosted Bot rooms."""
+"""Messaging controls for gateway-hosted Group Chats."""
 
 from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway import hosted_room_driver, hosted_rooms
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.hosted_room_messaging import (
     MessagingRoomBackend,
     RoomControlError,
@@ -222,20 +223,19 @@ def _runner(*, platform: Platform = Platform.SIGNAL, extra=None):
 
 
 def test_room_commands_are_gateway_dispatchable_without_interrupting_agent():
-    rooms = resolve_command("rooms")
-    assert rooms is not None and rooms.gateway_only and rooms.busy_policy == "dispatch"
-    assert rooms.subcommands == ("send", "stop")
-    assert resolve_command("room") is None
+    group = resolve_command("group")
+    assert group is not None and group.gateway_only and group.busy_policy == "dispatch"
+    assert group.subcommands == ()
+    assert resolve_command("groups") is None
+    assert resolve_command("rooms") is None
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        (
-            "send Release room -- check the build -- then report",
-            ("send", "Release room", "check the build -- then report"),
-        ),
-        ("stop Release room", ("stop", "Release room", "")),
+        ('1 send "hi there"', ("send", "1", "hi there")),
+        ("1 send -- quoted style", ("send", "1", "quoted style")),
+        ("1 stop", ("stop", "1", "")),
     ],
 )
 def test_parse_room_command_keeps_names_and_message_content(raw, expected):
@@ -245,7 +245,7 @@ def test_parse_room_command_keeps_names_and_message_content(raw, expected):
 
 @pytest.mark.parametrize("raw", ["", "send room", "send -- hello", "stop"])
 def test_parse_room_command_returns_actionable_usage(raw):
-    with pytest.raises(RoomControlError, match="Use `/rooms"):
+    with pytest.raises(RoomControlError, match="Use `/group"):
         parse_room_command(raw)
 
 
@@ -338,9 +338,9 @@ def test_room_resolution_explains_ambiguity_and_missing_names(tmp_path):
         authority_gateway_id="install:test-gateway",
     )
     rooms = hosted_rooms.list_rooms(db)
-    with pytest.raises(RoomControlError, match="matches several rooms"):
+    with pytest.raises(RoomControlError, match="matches several group chats"):
         resolve_room(rooms, "release")
-    with pytest.raises(RoomControlError, match="No hosted Bot room"):
+    with pytest.raises(RoomControlError, match="No Group Chat"):
         resolve_room(rooms, "missing")
 
 
@@ -361,10 +361,24 @@ async def test_reserved_word_room_name_opens_detail_without_triggering_stop(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
 
-    result = await _runner()._handle_rooms_command(_event("/rooms Stop signals"))
+    result = await _runner()._handle_rooms_command(_event("/group Stop signals"))
 
     assert result.startswith("Stop signals —")
     assert service.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_group_list_keyword_uses_the_same_helpful_listing(tmp_path, monkeypatch):
+    db, _, _ = _seed_rooms(tmp_path)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend",
+        lambda: _FakeService(db),
+    )
+
+    result = await _runner()._handle_rooms_command(_event("/group list"))
+
+    assert result.startswith("Group Chats\n")
+    assert "Commands\nCheck: `/group <number>`" in result
 
 
 @pytest.mark.asyncio
@@ -376,10 +390,12 @@ async def test_mutating_room_commands_require_the_stable_number(tmp_path, monkey
     )
 
     result = await _runner()._handle_room_command(
-        _event("/rooms stop Release room")
+        _event("/group stop Release room")
     )
 
-    assert result == "Use `/rooms stop <room number>`."
+    assert result == (
+        "Use `/group <number> send <message>` or `/group <number> stop`."
+    )
     assert service.stopped == []
 
 
@@ -413,19 +429,29 @@ def test_room_list_and_detail_are_bounded_and_user_facing(tmp_path):
     )
 
     listing = format_room_list(service)
-    assert "Hosted Bot rooms" in listing
+    assert "Group Chats" in listing
     assert "1. Release room — waiting for the room host, 2 bots" in listing
+    assert "Commands\nCheck: `/group <number>`" in listing
+    assert "Send: `/group <number> send <message>`" in listing
+    assert "Stop: `/group <number> stop`" in listing
     detail = format_room_detail(service, release)
     assert "Signal: Please inspect the release" in detail
     assert "Operations: The release is ready" in detail
-    assert "Send: `/rooms send 1 -- <message>`" in detail
-    assert "Stop: `/rooms stop 1`" in detail
+    assert "Send: `/group 1 send <message>`" in detail
+    assert "Stop: `/group 1 stop`" in detail
+
+
+def test_empty_group_list_still_explains_the_primary_command(tmp_path):
+    listing = format_room_list(_FakeService(tmp_path / "state.db"))
+
+    assert listing.startswith("No Group Chats yet.")
+    assert "`/group <number> send <message>`" in listing
 
 
 def test_messaging_identity_is_stable_private_and_edit_safe():
-    first = _event("/rooms send 1 -- hello", platform=Platform.TELEGRAM)
+    first = _event("/group 1 send hello", platform=Platform.TELEGRAM)
     first.platform_update_id = 123
-    second = _event("/rooms send 1 -- edited", platform=Platform.TELEGRAM)
+    second = _event("/group 1 send edited", platform=Platform.TELEGRAM)
     second.platform_update_id = 124
     actor = messaging_actor(first, gateway_id="install:test-gateway")
     assert actor["display_name"] == "Display Name via Telegram"
@@ -435,9 +461,9 @@ def test_messaging_identity_is_stable_private_and_edit_safe():
 
 
 def test_transport_specific_command_forms_are_actionable():
-    assert command_form(_event("/rooms", platform=Platform.SIGNAL)) == "/rooms"
-    assert command_form(_event("/rooms", platform=Platform.SLACK)) == "/hermes rooms"
-    assert command_form(_event("/rooms", platform=Platform.MATRIX)) == "!rooms"
+    assert command_form(_event("/group", platform=Platform.SIGNAL)) == "/group"
+    assert command_form(_event("/group", platform=Platform.SLACK)) == "/hermes group"
+    assert command_form(_event("/group", platform=Platform.MATRIX)) == "!group"
 
 
 @pytest.mark.parametrize(
@@ -449,7 +475,7 @@ def test_transport_specific_command_forms_are_actionable():
     ],
 )
 def test_real_channel_raw_ids_are_stable_without_normalized_message_id(raw_message):
-    event = _event("/rooms send 1 -- hello")
+    event = _event("/group 1 send hello")
     event.message_id = None
     event.source.message_id = None
     event.raw_message = raw_message
@@ -457,7 +483,7 @@ def test_real_channel_raw_ids_are_stable_without_normalized_message_id(raw_messa
 
 
 def test_mutation_fails_closed_without_a_transport_redelivery_id():
-    event = _event("/rooms send 1 -- hello")
+    event = _event("/group 1 send hello")
     event.message_id = None
     event.source.message_id = None
     with pytest.raises(RoomControlError, match="stable message ID"):
@@ -465,8 +491,8 @@ def test_mutation_fails_closed_without_a_transport_redelivery_id():
 
 
 def test_signal_group_idempotency_includes_sender_identity():
-    first = _event("/rooms send 1 -- hello", user_id="sender-a")
-    second = _event("/rooms send 1 -- hello", user_id="sender-b")
+    first = _event("/group 1 send hello", user_id="sender-a")
+    second = _event("/group 1 send hello", user_id="sender-b")
     for event in (first, second):
         event.message_id = None
         event.source.message_id = None
@@ -485,7 +511,7 @@ async def test_send_handler_is_shared_by_every_gateway_channel(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
     event = _event(
-        "/rooms send 1 -- hello from messaging",
+        "/group 1 send hello from messaging",
         platform=platform,
         message_id=f"message-{platform.value}",
     )
@@ -500,6 +526,22 @@ async def test_send_handler_is_shared_by_every_gateway_channel(
 
 
 @pytest.mark.asyncio
+async def test_entity_first_group_send_is_dispatched(tmp_path, monkeypatch):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+
+    result = await _runner()._handle_rooms_command(
+        _event("/group 1 send hello from Signal", message_id="entity-first-1")
+    )
+
+    assert result == "Queued in Release room. Check: `/group 1`."
+    assert service.sent[-1]["payload"]["text"] == "hello from Signal"
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_attachments_instead_of_silently_dropping_them(
     tmp_path, monkeypatch
 ):
@@ -509,7 +551,7 @@ async def test_send_rejects_attachments_instead_of_silently_dropping_them(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
     result = await _runner()._handle_room_command(
-        _event("/rooms send 1 -- inspect this", media=True)
+        _event("/group 1 send inspect this", media=True)
     )
     assert "Attachments from messaging chats aren’t supported yet" in result
     assert service.sent == []
@@ -526,12 +568,12 @@ async def test_bot_authored_controls_are_rejected_to_prevent_bridge_loops(
     )
     result = await _runner(platform=Platform.DISCORD)._handle_room_command(
         _event(
-            "/rooms send 1 -- repeat this",
+            "/group 1 send repeat this",
             platform=Platform.DISCORD,
             is_bot=True,
         )
     )
-    assert result == "Hosted Bot room controls are only available to people."
+    assert result == "Group Chat controls are only available to people."
     assert service.sent == []
 
 
@@ -544,10 +586,10 @@ async def test_raw_webhook_bot_marker_is_rejected_even_without_source_flag(
     monkeypatch.setattr(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
-    event = _event("/rooms send 1 -- repeat this")
+    event = _event("/group 1 send repeat this")
     event.raw_message = {"subtype": "bot_message", "bot_id": "B123"}
     result = await _runner()._handle_rooms_command(event)
-    assert result == "Hosted Bot room controls are only available to people."
+    assert result == "Group Chat controls are only available to people."
     assert service.sent == []
 
 
@@ -563,7 +605,7 @@ def test_relay_and_session_roundtrip_preserve_bot_provenance():
     assert SessionSource.from_dict(source.to_dict()).is_bot is True
     relayed = _event_from_wire(
         {
-            "text": "/rooms",
+            "text": "/group",
             "message_type": "command",
             "source": source.to_dict(),
         }
@@ -577,7 +619,7 @@ def test_legacy_relay_without_author_classification_fails_closed():
 
     relayed = _event_from_wire(
         {
-            "text": "/rooms",
+            "text": "/group",
             "message_type": "command",
             "source": {
                 "platform": "discord",
@@ -601,20 +643,20 @@ async def test_stop_requires_admin_when_operator_enabled_slash_gating(
     )
     extra = {
         "allow_admin_from": ["admin"],
-        "user_allowed_commands": ["rooms"],
+        "user_allowed_commands": ["groups"],
     }
     result = await _runner(extra=extra)._handle_room_command(
-        _event("/rooms stop 1", user_id="member")
+        _event("/group 1 stop", user_id="member")
     )
-    assert result.startswith("Room controls are off for this chat")
+    assert result.startswith("This chat can’t control Group Chats")
     assert service.stopped == []
 
     result = await _runner(extra=extra)._handle_room_command(
-        _event("/rooms stop 1", user_id="admin", message_id="stop-1")
+        _event("/group 1 stop", user_id="admin", message_id="stop-1")
     )
     assert result == (
         "Stop requested for Release room. Active work will stop safely. "
-        "Check: `/rooms 1`."
+        "Check: `/group 1`."
     )
     assert service.stopped[0][0] == "release-room"
 
@@ -628,12 +670,253 @@ async def test_room_history_and_mutation_require_an_explicit_admin(
     monkeypatch.setattr(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
-    runner = _runner(extra={})
-    denial = "Room controls are off for this chat"
-    assert denial in await runner._handle_rooms_command(_event("/rooms"))
+    runner = _runner(extra={"allow_from": ["user-1"]})
+    runner._is_user_authorized_for_source = lambda _source: True
+    denial = "This chat can’t control Group Chats"
+    assert denial in await runner._handle_rooms_command(_event("/group"))
     assert denial in await runner._handle_room_command(
-        _event("/rooms send 1 -- hello")
+        _event("/group 1 send hello")
     )
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_home_dm_controls_rooms_without_duplicate_admin_list(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "user-1")
+    runner = _runner(extra={})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+
+    listing = await runner._handle_rooms_command(_event("/group list"))
+    assert listing.startswith("Group Chats")
+    result = await runner._handle_room_command(
+        _event("/group 1 send hello", message_id="home-send-1")
+    )
+    assert result.startswith("Queued in Release room")
+    assert service.sent[0]["payload"]["text"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_non_home_dm_still_requires_explicit_admin(tmp_path, monkeypatch):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    runner = _runner(extra={})
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="different-chat",
+        name="Home",
+    )
+
+    result = await runner._handle_room_command(
+        _event("/group 1 send hello", message_id="other-send-1")
+    )
+    assert result.startswith("This chat can’t control Group Chats")
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_shared_home_dm_does_not_auto_promote_an_allowed_user(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    runner = _runner(extra={"allow_from": ["user-1", "user-2"]})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+
+    result = await runner._handle_room_command(
+        _event("/group 1 send hello", message_id="shared-send-1")
+    )
+    assert result.startswith("This chat can’t control Group Chats")
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allowed_users", "allow_all"),
+    [
+        ("user-1,user-2", ""),
+        ("user-1", "true"),
+    ],
+)
+async def test_builtin_platform_grants_fail_closed_without_registry(
+    tmp_path,
+    monkeypatch,
+    allowed_users,
+    allow_all,
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", allowed_users)
+    monkeypatch.setenv("SIGNAL_ALLOW_ALL_USERS", allow_all)
+    runner = _runner(extra={})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+
+    result = await runner._handle_room_command(
+        _event("/group 1 send hello", message_id="grant-send-1")
+    )
+    assert result.startswith("This chat can’t control Group Chats")
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_routed_profile_uses_transport_principals_for_owner_census(
+    tmp_path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from gateway import authz_mixin, run as gateway_run
+
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    active_scope = {"name": "routed"}
+
+    @contextmanager
+    def fake_profile_scope(path):
+        previous = active_scope["name"]
+        active_scope["name"] = Path(path).name
+        try:
+            yield
+        finally:
+            active_scope["name"] = previous
+
+    def fake_auth_env(name, default=""):
+        if name == "SIGNAL_ALLOWED_USERS":
+            return (
+                "user-1,user-2"
+                if active_scope["name"] == "transport"
+                else "user-1"
+            )
+        return default
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_profile_scope)
+    monkeypatch.setattr(authz_mixin, "_auth_env", fake_auth_env)
+    runner = _runner(extra={})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+    event = _event("/group 1 send hello", message_id="routed-send-1")
+    event.source.profile = "worker"
+    event.source._authorization_profile_home = Path("/transport")
+
+    result = await runner._handle_room_command(event)
+    assert result.startswith("This chat can’t control Group Chats")
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_secondary_adapter_allowlist_owns_the_owner_census(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    runner = _runner(extra={"allow_from": ["user-1"]})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+    adapter = SimpleNamespace(
+        config=PlatformConfig(extra={"allow_from": ["user-1", "user-2"]})
+    )
+    runner._profile_adapters = {"worker": {Platform.SIGNAL: adapter}}
+    runner.adapters = {}
+    event = _event("/group 1 send hello", message_id="secondary-send-1")
+    event.source.profile = "worker"
+    event.source._transport_adapter_ref = lambda: adapter
+
+    result = await runner._handle_room_command(event)
+    assert result.startswith("This chat can’t control Group Chats")
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_registered_adapter_without_visible_allowlist_fails_closed(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    runner = _runner(extra={"allow_from": ["user-1"]})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+    adapter = SimpleNamespace(config=PlatformConfig(extra={}))
+    runner._profile_adapters = {"worker": {Platform.SIGNAL: adapter}}
+    runner.adapters = {}
+    event = _event("/group 1 send hello", message_id="opaque-send-1")
+    event.source.profile = "worker"
+    event.source._transport_adapter_ref = lambda: adapter
+
+    result = await runner._handle_room_command(event)
+    assert result.startswith("This chat can’t control Group Chats")
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_relayed_home_dm_requires_explicit_admin(tmp_path, monkeypatch):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    runner = _runner(extra={"allow_from": ["user-1"]})
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner.config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
+        platform=Platform.SIGNAL,
+        chat_id="chat-signal",
+        name="Home",
+    )
+    event = _event("/group 1 send hello", message_id="relay-send-1")
+    event.source.delivered_via_upstream_relay = True
+    event.metadata = {"relay_author_classified": True}
+
+    result = await runner._handle_room_command(event)
+    assert result.startswith("This chat can’t control Group Chats")
     assert service.sent == []
 
 
@@ -641,10 +924,10 @@ async def test_room_history_and_mutation_require_an_explicit_admin(
 async def test_busy_dispatch_runs_room_control_without_touching_main_agent():
     runner = _runner()
     runner._handle_rooms_command = AsyncMock(return_value="room-dispatched")
-    event = _event("/rooms send 1 -- hello")
+    event = _event("/group 1 send hello")
     result = await runner._dispatch_busy_slash_command(
         event,
-        resolve_command("rooms"),
+        resolve_command("group"),
         "session-key",
         event.source,
     )
@@ -668,11 +951,11 @@ async def test_real_service_persists_server_owned_messaging_actor(tmp_path, monk
         lambda: MessagingRoomBackend(db_path=service.db_path, service=service),
     )
     event = _event(
-        "/rooms send 1 -- @ops inspect the release",
+        "/group 1 send @ops inspect the release",
         platform=Platform.SIGNAL,
     )
     result = await _runner()._handle_room_command(event)
-    assert result == "Queued in Release room. Check: `/rooms 1`."
+    assert result == "Queued in Release room. Check: `/group 1`."
     delta = hosted_rooms.read_events(
         service.db_path,
         room_id="release-room",
@@ -699,12 +982,12 @@ def test_cross_process_store_wakes_owner_without_desktop_transport(tmp_path):
     )
     messaging_process = MessagingRoomBackend(db_path=service.db_path)
     first_event = _event(
-        "/rooms send 1 -- @ops inspect the release",
+        "/group 1 send @ops inspect the release",
         platform=Platform.WHATSAPP,
         message_id="message-1",
     )
     second_event = _event(
-        "/rooms send 1 -- @ops check the notes",
+        "/group 1 send @ops check the notes",
         platform=Platform.WHATSAPP,
         message_id="message-2",
     )
@@ -774,7 +1057,7 @@ def test_cross_process_stop_cancels_durable_queued_work(tmp_path):
 def test_cross_process_send_is_idempotent_on_transport_redelivery(tmp_path):
     db, room, _ = _seed_rooms(tmp_path)
     messaging_process = MessagingRoomBackend(db_path=db)
-    event = _event("/rooms send 1 -- hello", platform=Platform.TELEGRAM)
+    event = _event("/group 1 send hello", platform=Platform.TELEGRAM)
     event_id = messaging_event_id(event)
     payload = {"text": "hello", "thread_id": event_id}
     actor = messaging_actor(event, gateway_id="install:test-gateway")
@@ -811,7 +1094,7 @@ def test_cross_process_stop_is_acknowledged_by_owner_for_running_work(tmp_path):
         ],
     )
     messaging_process = MessagingRoomBackend(db_path=service.db_path)
-    event = _event("/rooms send 1 -- inspect")
+    event = _event("/group 1 send inspect")
     messaging_process.send(
         room_id="release-room",
         event_id=messaging_event_id(event),

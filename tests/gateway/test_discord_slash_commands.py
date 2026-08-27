@@ -505,7 +505,7 @@ def test_discord_slash_interaction_supplies_room_control_idempotency(adapter):
     )
     event = adapter._build_slash_event(
         interaction,
-        "/rooms send release-room -- hello",
+        "/group 1 send hello",
     )
     assert messaging_event_id(event) == messaging_event_id(event)
 
@@ -617,4 +617,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
