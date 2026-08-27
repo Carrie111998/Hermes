@@ -242,6 +242,13 @@ DEFAULT_CONFIG = {
             "api_mode": "",
             "max_output_tokens": None,
         },
+        # 外部编码 CLI Worker。默认关闭，明确启用后才会调用本机 Codex/Claude。
+        "coding_worker": {
+            "enabled": False,
+            "worker": "codex",
+            "review_worker": "claude",
+            "timeout_seconds": 900,
+        },
         # Standing operator instructions for the coding posture. A string (or
         # list of strings) appended to the coding brief as an extra stable
         # system block — pin project-wide workflow rules here instead of editing

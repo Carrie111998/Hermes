@@ -1,0 +1,8 @@
+{
+  "acp.agents": {
+    "Hermes Agent": {
+      "command": "hermes",
+      "args": ["acp"]
+    }
+  }
+}

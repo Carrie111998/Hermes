@@ -260,8 +260,11 @@ CODING_AGENT_GUIDANCE = (
     "asked, and never read, print, or commit secrets — leave `.env` and "
     "credential files alone unless the user explicitly asks. The Workspace "
     "block below is a snapshot from session start — re-run `git status`/"
-    "`git branch` before relying on it. Be concise: lead with the change or "
-    "answer, not a preamble."
+    "`git branch` before relying on it. When the user explicitly requests code "
+    "changes and the `coding_worker` tool is available, delegate repository "
+    "implementation to it; it runs the configured external coding CLI and then "
+    "an independent review Worker. Review its real output before reporting "
+    "completion. Be concise: lead with the change or answer, not a preamble."
 )
 
 
