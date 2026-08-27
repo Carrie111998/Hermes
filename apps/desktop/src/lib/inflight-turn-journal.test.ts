@@ -644,15 +644,31 @@ describe('legacy journal migration', () => {
       turnStartedAt: 1,
       updatedAt: Date.now()
     }
+
     const legacyKey = legacyProfileSessionStorageKey('stored-1')
     const replacementKey = sessionStorageKey('stored-1')
     window.localStorage.setItem(legacyKey, JSON.stringify(legacy))
 
-    const originalSetItem = Storage.prototype.setItem
-    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key, value) {
+    // Node 26 defines its own global Storage. Spy on the jsdom realm that owns
+    // window.localStorage so the quota failure remains deterministic there too.
+    let storagePrototype: null | object = window.localStorage
+
+    while (storagePrototype && !Object.prototype.hasOwnProperty.call(storagePrototype, 'setItem')) {
+      storagePrototype = Object.getPrototypeOf(storagePrototype) as null | object
+    }
+
+    if (!storagePrototype) {
+      throw new Error('localStorage setItem implementation not found')
+    }
+
+    const localStorageMethods = storagePrototype as Storage
+    const originalSetItem = localStorageMethods.setItem
+
+    const setItem = vi.spyOn(localStorageMethods, 'setItem').mockImplementation(function (this: Storage, key, value) {
       if (key === replacementKey) {
         throw new DOMException('quota exceeded', 'QuotaExceededError')
       }
+
       return originalSetItem.call(this, key, value)
     })
 
