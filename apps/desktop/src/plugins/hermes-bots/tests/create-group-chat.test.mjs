@@ -44,6 +44,8 @@ test('source contract: every selected machine is persisted in the durable room r
 test('source contract: creation negotiates continuity without exposing routing jargon', () => {
   assert.match(pluginSource, /resolveAutonomousRoomPlan\(selected/)
   assert.match(pluginSource, /describeAutonomousRoomPlan\(plan/)
+  assert.match(pluginSource, /const scopedTargetUrl = hostedClient\.profileScopedRoomLinkEndpoint/)
+  assert.match(pluginSource, /describeHostedRoomCreationError\(error\)/)
   assert.match(pluginSource, /setKeepRunning\(copy\.defaultEnabled && keepRunningPreference\.current !== 'off'\)/)
   assert.match(pluginSource, /withHostedRoomProbeTimeout\(Promise\.all/)
   assert.match(pluginSource, /disabled: !canCreate \|\| createPending \|\| hostProbePending/)
@@ -67,9 +69,7 @@ test('source contract: an admitted autonomous room must roll back before any Des
     pluginSource,
     /try \{[\s\S]*?'groups\.peer\.invite'[\s\S]*?'groups\.create'[\s\S]*?'groups\.peer\.register'[\s\S]*?catch \(error\)/
   )
-  assert.match(
-    pluginSource,
-    /setCreateError\(error instanceof Error \? error\.message/
-  )
+  assert.match(pluginSource, /hostedClient\?\.describeHostedRoomCreationError\(error\)/)
+  assert.match(pluginSource, /const rawError = error instanceof Error \? error\.message/)
   assert.doesNotMatch(pluginSource, /Room created\. Keep Desktop open until its gateways are ready\./)
 })

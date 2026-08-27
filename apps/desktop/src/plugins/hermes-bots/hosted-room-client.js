@@ -432,6 +432,49 @@ export function describeAutonomousRoomPlan(
   }
 }
 
+/** Scope one advertised RoomLink endpoint to the selected Bot profile.
+ * Multiplex gateways expose named profiles below /p/<profile>; the bare
+ * endpoint intentionally remains the default profile. */
+export function profileScopedRoomLinkEndpoint(endpoint, profile) {
+  const base = text(endpoint)?.replace(/\/+$/, '') || null
+  const targetProfile = text(profile)
+
+  if (!base || !targetProfile || targetProfile === 'default') {
+    return base
+  }
+
+  const suffix = `/p/${encodeURIComponent(targetProfile)}`
+
+  if (base.endsWith(suffix)) {
+    return base
+  }
+  if (/\/p\/[^/]+$/i.test(base)) {
+    return null
+  }
+
+  return `${base}${suffix}`
+}
+
+/** Keep network and grant internals out of the group-creation dialog while
+ * still telling the user what they can do next. */
+export function describeHostedRoomCreationError(error) {
+  const message = errorMessage(error)
+
+  if (/unreachable|name or service not known|timed? ?out|connection refused|network is unreachable/i.test(message)) {
+    return 'One gateway cannot reach another. Check that both gateways are online, then try again.'
+  }
+
+  if (/non-json|authorization|grant|renewal|http 40[13]|unknown or unconfigured profile/i.test(message)) {
+    return 'One gateway could not verify this room. Update or reconnect that gateway, then try again.'
+  }
+
+  if (/capability catalog changed|changed during setup/i.test(message)) {
+    return 'A gateway changed while the room was being created. Wait for it to reconnect, then try again.'
+  }
+
+  return null
+}
+
 function cloneList(value) {
   return Array.isArray(value) ? value.map(item => (item && typeof item === 'object' ? { ...item } : item)) : []
 }

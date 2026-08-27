@@ -13939,9 +13939,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     setCreatePending(true)
     setCreateError('')
     let hostedRoom = null
+    let hostedClient = null
 
     try {
       if (keepRunning) {
+        hostedClient = await import('./hosted-room-client.js')
         if (!hostedEligible) {
           throw new Error('This gateway cannot keep group work running yet.')
         }
@@ -13995,6 +13997,10 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
             const targetCapability = hostCapabilities[connectionId]
             const targetUrl = targetCapability?.roomLink?.endpoint
             const invitedProfile = String(invitation?.target_profile || profile || '')
+            const scopedTargetUrl = hostedClient.profileScopedRoomLinkEndpoint(
+              targetUrl,
+              invitation?.target_profile
+            )
 
             if (invitation?.grant && invitedProfile) {
               await addHostedRoomCleanup({
@@ -14007,7 +14013,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
               })
             }
 
-            if (!targetUrl || !invitation?.grant || !invitation?.catalog || !invitation?.target_profile) {
+            if (!scopedTargetUrl || !invitation?.grant || !invitation?.catalog || !invitation?.target_profile) {
               throw new Error('A gateway could not prepare this room.')
             }
 
@@ -14026,7 +14032,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
               bot,
               room_id: roomId,
               member_id: memberId,
-              target_url: targetUrl,
+              target_url: scopedTargetUrl,
               target_profile: invitation.target_profile,
               grant: invitation.grant,
               catalog: invitation.catalog
@@ -14096,7 +14102,12 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       onClose()
       onCreated?.(groupName)
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : 'Could not create the group.')
+      const rawError = error instanceof Error ? error.message : 'Could not create the group.'
+      setCreateError(
+        keepRunning
+          ? hostedClient?.describeHostedRoomCreationError(error) || rawError
+          : rawError
+      )
     } finally {
       setCreatePending(false)
       createGuard.current = false

@@ -8,11 +8,13 @@ import {
   classifyHostedRoomCapability,
   createHostedRoomOutbox,
   createHostedRoomReplayState,
+  describeHostedRoomCreationError,
   deriveFriendlyHostedRoomStatus,
   isHostedRoomContinuityEligible,
   reduceHostedRoomEvents,
   reduceHostedRoomOutbox,
   replayHostedRoomPages,
+  profileScopedRoomLinkEndpoint,
   resolveAutonomousRoomPlan,
   describeAutonomousRoomPlan,
   resolveSingleGatewayRoute
@@ -65,6 +67,42 @@ test('RoomLink client accepts the backend v2 catalog and rejects unpublished v1'
     }).reason,
     'remote-needs-setup'
   )
+})
+
+test('named Bot routes use the multiplex profile path and creation errors stay actionable', () => {
+  assert.equal(
+    profileScopedRoomLinkEndpoint('https://peer.example.test/hermes/', 'research lead'),
+    'https://peer.example.test/hermes/p/research%20lead'
+  )
+  assert.equal(
+    profileScopedRoomLinkEndpoint('https://peer.example.test/hermes/p/research%20lead', 'research lead'),
+    'https://peer.example.test/hermes/p/research%20lead'
+  )
+  assert.equal(
+    profileScopedRoomLinkEndpoint('https://peer.example.test/hermes/p/other', 'research lead'),
+    null
+  )
+  assert.equal(
+    profileScopedRoomLinkEndpoint('https://peer.example.test/hermes/', 'default'),
+    'https://peer.example.test/hermes'
+  )
+  assert.equal(profileScopedRoomLinkEndpoint(null, 'research'), null)
+
+  assert.equal(
+    describeHostedRoomCreationError(
+      new Error('peer is unreachable: <urlopen error [Errno -2] Name or service not known>')
+    ),
+    'One gateway cannot reach another. Check that both gateways are online, then try again.'
+  )
+  assert.equal(
+    describeHostedRoomCreationError(new Error('peer room authorization needs renewal')),
+    'One gateway could not verify this room. Update or reconnect that gateway, then try again.'
+  )
+  assert.equal(
+    describeHostedRoomCreationError(new Error('target capability catalog changed during setup')),
+    'A gateway changed while the room was being created. Wait for it to reconnect, then try again.'
+  )
+  assert.equal(describeHostedRoomCreationError(new Error('local storage failed')), null)
 })
 
 function attachmentManifest() {
