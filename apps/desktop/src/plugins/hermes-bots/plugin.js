@@ -7616,6 +7616,40 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   }
 }
 
+/** A retained `inflight` object is not necessarily live. The gateway keeps a
+ * compact status=error snapshot after `running` flips false so reconnecting
+ * clients can replay the failure. Every other inflight shape is conservative
+ * live work, including a non-streaming gap between tool/provider operations. */
+function groupSessionTurnActive(state) {
+  if (state?.running) {
+    return true
+  }
+
+  const inflight = state?.inflight
+  if (!inflight) {
+    return false
+  }
+
+  if (typeof inflight !== 'object') {
+    return Boolean(inflight)
+  }
+
+  return inflight.streaming === true || inflight.status !== 'error'
+}
+
+function groupSessionTerminalError(state) {
+  const inflight = state?.inflight
+  if (!inflight || typeof inflight !== 'object') {
+    return null
+  }
+
+  if (inflight.status !== 'error' && !inflight.error) {
+    return null
+  }
+
+  return String(inflight.error || 'turn failed')
+}
+
 async function runGroupChatMemberTurnLeased(group, member, prompt, thread, images) {
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
@@ -7710,12 +7744,18 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
     }
 
     const messages = Array.isArray(state?.messages) ? state.messages : []
-    const busy = Boolean(state?.inflight || state?.running)
+    const terminalError = groupSessionTerminalError(state)
+    const busy = groupSessionTurnActive(state)
     // A clarify blocking inside the member's session is a question for the
     // HUMAN (#90694) — mirror it into the room store so a card renders, and
     // hold the turn open: the member isn't stalling, it's waiting on us.
     const awaitingUser = syncGroupClarify(group, member, state)
     const done = !busy && !awaitingUser
+
+    if (terminalError && !busy && !awaitingUser) {
+      syncGroupClarify(group, member, null)
+      throw new Error(terminalError)
+    }
 
     if (messages.length > before && done) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -7793,8 +7833,22 @@ async function harvestStrandedGroupReply(group, member) {
     return // source unreachable — leave the marker for the next boundary
   }
 
-  if (state?.inflight || state?.running) {
+  if (groupSessionTurnActive(state)) {
     return // still grinding — keep waiting
+  }
+
+  const terminalError = groupSessionTerminalError(state)
+  if (terminalError) {
+    syncGroupClarify(group, member, null)
+    updateGroupChat(group, r => {
+      const next = { ...(r.stranded || {}) }
+      delete next[memberKey]
+      r.stranded = next
+      return r
+    })
+    recordGroupActivity(group, { kind: 'failed', member: member.name, thread: strandedThread })
+    noteBotAttention(memberKey, terminalError)
+    return
   }
 
   // A stranded member blocked on a clarify is not "grinding" — surface the
