@@ -271,6 +271,11 @@ class TestProviderRequiresStream:
         assert _provider_requires_stream(
             "auto", "https://not-ollama.example.com/v1"
         ) is False
+        # Provider-name branch is intentionally URL-agnostic: the label alone
+        # forces the streamed path even for custom/self-hosted base URLs.
+        assert _provider_requires_stream(
+            "ollama-cloud", "https://my-server.local:11434/v1"
+        ) is True
 
 
 
