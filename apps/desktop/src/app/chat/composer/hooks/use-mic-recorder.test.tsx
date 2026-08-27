@@ -16,6 +16,7 @@ const copy: MicRecorderErrorCopy = {
 class FakeMediaRecorder {
   static instances: FakeMediaRecorder[] = []
   static isTypeSupported = () => false
+  static startError: Error | null = null
 
   mimeType = 'audio/webm'
   ondataavailable: ((event: { data: Blob }) => void) | null = null
@@ -28,6 +29,10 @@ class FakeMediaRecorder {
   }
 
   start() {
+    if (FakeMediaRecorder.startError) {
+      throw FakeMediaRecorder.startError
+    }
+
     this.state = 'recording'
   }
 
@@ -48,6 +53,7 @@ describe('useMicRecorder generations', () => {
 
   beforeEach(() => {
     FakeMediaRecorder.instances = []
+    FakeMediaRecorder.startError = null
     Object.defineProperty(globalThis, 'MediaRecorder', { configurable: true, value: FakeMediaRecorder })
   })
 
@@ -85,6 +91,30 @@ describe('useMicRecorder generations', () => {
 
     expect(acquired.stop).toHaveBeenCalledOnce()
     expect(hook.result.current.recording).toBe(false)
+  })
+
+  it('releases the microphone and permits retry when MediaRecorder.start throws', async () => {
+    const failed = stream()
+    const retry = stream()
+    const getUserMedia = vi.fn().mockResolvedValueOnce(failed.media).mockResolvedValueOnce(retry.media)
+
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } })
+    FakeMediaRecorder.startError = new DOMException('cannot start', 'InvalidStateError')
+
+    const hook = renderHook(() => useMicRecorder(copy))
+
+    await expect(act(async () => hook.result.current.handle.start())).rejects.toThrow('failed')
+
+    expect(failed.stop).toHaveBeenCalledOnce()
+    expect(hook.result.current.recording).toBe(false)
+
+    FakeMediaRecorder.startError = null
+    await act(async () => hook.result.current.handle.start())
+
+    expect(getUserMedia).toHaveBeenCalledTimes(2)
+    expect(FakeMediaRecorder.instances).toHaveLength(2)
+    expect(hook.result.current.recording).toBe(true)
+    expect(retry.stop).not.toHaveBeenCalled()
   })
 
   it('ignores a stale onstop after a replacement recorder starts', async () => {

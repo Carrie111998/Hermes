@@ -19,6 +19,11 @@ import { getApiRequestConnection, getApiRequestProfile, hermesApi } from '@/herm
  * `{mode:'relay'}` and callers fall back to the existing relay endpoints.
  */
 
+export interface VoiceOwnerRoute {
+  connectionId: string
+  profile: string
+}
+
 export interface DirectSttConfig {
   mode: 'direct'
   wire: 'elevenlabs-stt' | 'openai-multipart' | 'xai-stt'
@@ -61,7 +66,11 @@ const CONFIG_TTL_MS = 60_000
 let cached: { key: string; at: number; config: VoiceClientConfig } | null = null
 let inflight: { key: string; promise: Promise<null | VoiceClientConfig> } | null = null
 
-function scopeKey(): string {
+function scopeKey(ownerRoute?: VoiceOwnerRoute): string {
+  if (ownerRoute) {
+    return `${ownerRoute.connectionId.trim() || 'local'}::${ownerRoute.profile.trim() || 'default'}`
+  }
+
   return `${getApiRequestConnection() ?? 'local'}::${getApiRequestProfile() ?? 'default'}`
 }
 
@@ -71,8 +80,8 @@ export function clearVoiceClientConfigCache(): void {
   inflight = null
 }
 
-export async function fetchVoiceClientConfig(): Promise<null | VoiceClientConfig> {
-  const key = scopeKey()
+export async function fetchVoiceClientConfig(ownerRoute?: VoiceOwnerRoute): Promise<null | VoiceClientConfig> {
+  const key = scopeKey(ownerRoute)
 
   if (cached && cached.key === key && Date.now() - cached.at < CONFIG_TTL_MS) {
     return cached.config
@@ -87,10 +96,16 @@ export async function fetchVoiceClientConfig(): Promise<null | VoiceClientConfig
       // hermesApi carries connectionScoped(); profileScoped() adds the
       // profile — the same routing every relay audio call uses, so the
       // config comes from the backend the user is actually talking to.
-      const response = await hermesApi<{ ok: boolean } & VoiceClientConfig>({
-        ...profileScoped(),
-        path: '/api/audio/voice-config'
-      })
+      const response = ownerRoute
+        ? await window.hermesDesktop.api<{ ok: boolean } & VoiceClientConfig>({
+            connectionId: ownerRoute.connectionId.trim() || 'local',
+            profile: ownerRoute.profile.trim() || 'default',
+            path: '/api/audio/voice-config'
+          })
+        : await hermesApi<{ ok: boolean } & VoiceClientConfig>({
+            ...profileScoped(),
+            path: '/api/audio/voice-config'
+          })
 
       if (!response?.ok || !response.stt || !response.tts) {
         return null
@@ -177,8 +192,11 @@ export function transcriptFromOpenAiMultipartBody(body: string): string {
  * re-running the same request through the gateway would just fail again
  * slower and hide the real error.
  */
-export async function transcribeAudioClientDirect(audio: Blob): Promise<null | string> {
-  const config = await fetchVoiceClientConfig()
+export async function transcribeAudioClientDirect(
+  audio: Blob,
+  ownerRoute?: VoiceOwnerRoute
+): Promise<null | string> {
+  const config = await fetchVoiceClientConfig(ownerRoute)
   const stt = config?.stt
 
   if (!stt || stt.mode !== 'direct') {
@@ -272,8 +290,8 @@ export async function transcribeAudioClientDirect(audio: Blob): Promise<null | s
 // ---------------------------------------------------------------------------
 
 /** Resolve the profile's TTS config when it is client-callable, else null. */
-export async function directTtsConfig(): Promise<DirectTtsConfig | null> {
-  const config = await fetchVoiceClientConfig()
+export async function directTtsConfig(ownerRoute?: VoiceOwnerRoute): Promise<DirectTtsConfig | null> {
+  const config = await fetchVoiceClientConfig(ownerRoute)
 
   return config?.tts && config.tts.mode === 'direct' ? config.tts : null
 }

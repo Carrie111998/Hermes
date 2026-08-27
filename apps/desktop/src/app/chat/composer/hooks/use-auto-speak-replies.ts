@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useLayoutEffect, useRef } from 'react'
 
+import type { VoiceOwnerRoute } from '@/lib/voice-client-direct'
 import { playSpeechText } from '@/lib/voice-playback'
 import { ownsAmbientCue } from '@/store/ambient'
 import { notifyError } from '@/store/notifications'
@@ -20,6 +21,8 @@ interface UseAutoSpeakReplies {
   failureLabel: string
   /** Mark the current last reply spoken — shared dedupe with the conversation consumer. */
   markSpoken: () => void
+  /** Exact owner for tile playback; omitted keeps the ambient legacy path. */
+  ownerRoute?: VoiceOwnerRoute
   /** Latest completed assistant reply, or null; `pending` true while still streaming. */
   pendingReply: () => AutoSpeakReply | null
   /** Re-arm on session switch so opening a chat never reads its existing last reply. */
@@ -37,6 +40,7 @@ export function useAutoSpeakReplies({
   conversationActive,
   failureLabel,
   markSpoken,
+  ownerRoute,
   pendingReply,
   sessionId
 }: UseAutoSpeakReplies) {
@@ -86,13 +90,22 @@ export function useAutoSpeakReplies({
         if (
           owns &&
           active &&
+          !latest.current.conversationActive &&
           ownOwnershipGeneration === ownershipGeneration &&
           currentPlayback.sequence === playback.sequence &&
           currentPlayback.status === 'idle'
         ) {
-          void playSpeechText(reply.text, { messageId: reply.id, source: 'read-aloud' }).catch(error =>
-            notifyError(error, failureLabel)
-          )
+          const isCurrent = () =>
+            active &&
+            ownOwnershipGeneration === ownershipGeneration &&
+            !latest.current.conversationActive
+
+          void playSpeechText(reply.text, {
+            isCurrent,
+            messageId: reply.id,
+            ownerRoute,
+            source: 'read-aloud'
+          }).catch(error => notifyError(error, failureLabel))
         }
       })
     }
@@ -106,5 +119,5 @@ export function useAutoSpeakReplies({
       ownershipGeneration += 1
       stops.forEach(f => f())
     }
-  }, [$messages, enabled, sessionId])
+  }, [$messages, enabled, ownerRoute, sessionId])
 }

@@ -5,7 +5,8 @@ import {
   cutSentences,
   directTtsConfig,
   type DirectTtsConfig,
-  synthesizeSpeechClientDirect
+  synthesizeSpeechClientDirect,
+  type VoiceOwnerRoute
 } from '@/lib/voice-client-direct'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 import {
@@ -74,6 +75,7 @@ function currentState(
 export interface VoicePlaybackOptions {
   isCurrent?: () => boolean
   messageId?: string | null
+  ownerRoute?: VoiceOwnerRoute
   source: VoicePlaybackSource
 }
 
@@ -106,7 +108,7 @@ export function stopVoicePlayback() {
 
 /** Exported for tests: the (connection, profile) routing contract below is
  *  exactly what broke in the desktop-remote voice report — keep it pinned. */
-export async function resolveSpeakStreamUrl(): Promise<null | string> {
+export async function resolveSpeakStreamUrl(ownerRoute?: VoiceOwnerRoute): Promise<null | string> {
   const desktop = window.hermesDesktop
 
   if (!desktop?.getConnection) {
@@ -124,8 +126,8 @@ export async function resolveSpeakStreamUrl(): Promise<null | string> {
     // replies would synthesize with the local (often unconfigured) TTS
     // instead of the profile the user is actually talking to (#90051-adjacent
     // desktop-remote voice report, Aug 2026).
-    const profile = getApiRequestProfile()
-    const connectionId = getApiRequestConnection()
+    const profile = ownerRoute?.profile.trim() || getApiRequestProfile()
+    const connectionId = ownerRoute?.connectionId.trim() || getApiRequestConnection()
 
     // Both awaits below are IPC round-trips into the main process with no
     // timeout of their own (#93454) — a wedged main-process round-trip
@@ -523,7 +525,7 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
  * `playSpeechText`).
  */
 export async function startSpeechStream(options: VoicePlaybackOptions): Promise<null | SpeechStreamSession> {
-  const direct = await directTtsConfig().catch(() => null)
+  const direct = await directTtsConfig(options.ownerRoute).catch(() => null)
 
   if (options.isCurrent?.() === false) {
     return null
@@ -545,7 +547,7 @@ export async function startSpeechStream(options: VoicePlaybackOptions): Promise<
     return session
   }
 
-  const wsUrl = await resolveSpeakStreamUrl()
+  const wsUrl = await resolveSpeakStreamUrl(options.ownerRoute)
 
   if (!wsUrl || options.isCurrent?.() === false) {
     return null
@@ -580,7 +582,7 @@ async function playSpeechDataUrl(
   options: VoicePlaybackOptions,
   isCurrent: () => boolean
 ): Promise<boolean> {
-  const response = await speakText(speakableText)
+  const response = await speakText(speakableText, options.ownerRoute)
 
   if (!isCurrent()) {
     return false
@@ -669,14 +671,27 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
   }
 
   const ownSequence = sequence
-  const isCurrent = () => ownSequence === sequence
+  const ownsSequence = () => ownSequence === sequence
+  const isCurrent = () => ownsSequence() && options.isCurrent?.() !== false
+
+  const abortIfStale = () => {
+    if (isCurrent()) {
+      return false
+    }
+
+    if (ownsSequence()) {
+      stopVoicePlayback()
+    }
+
+    return true
+  }
 
   setVoicePlaybackState(currentState('preparing', options))
 
   try {
     // Ladder: client-direct synthesis (profile's own TTS, no gateway audio
     // hop) → streaming WS relay → POST data-URL fallback.
-    const direct = await directTtsConfig().catch(() => null)
+    const direct = await directTtsConfig(options.ownerRoute).catch(() => null)
 
     if (direct && isCurrent()) {
       const session = openClientDirectSpeechSession(direct, options)
@@ -686,7 +701,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
       const outcome = await session.done
 
       if (outcome === 'done') {
-        if (!isCurrent()) {
+        if (abortIfStale()) {
           return false
         }
 
@@ -696,17 +711,17 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
       }
     }
 
-    if (!isCurrent()) {
+    if (abortIfStale()) {
       return false
     }
 
-    const streamUrl = await resolveSpeakStreamUrl()
+    const streamUrl = await resolveSpeakStreamUrl(options.ownerRoute)
 
     if (streamUrl && isCurrent()) {
       const outcome = await playSpeechStream(streamUrl, speakableText, options)
 
       if (outcome === 'played') {
-        if (!isCurrent()) {
+        if (abortIfStale()) {
           return false
         }
 
@@ -716,13 +731,21 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
       }
     }
 
-    if (!isCurrent()) {
+    if (abortIfStale()) {
       return false
     }
 
     const played = await playSpeechDataUrl(speakableText, options, isCurrent)
 
-    if (played && isCurrent()) {
+    if (options.isCurrent?.() === false) {
+      if (ownsSequence()) {
+        stopVoicePlayback()
+      }
+
+      return false
+    }
+
+    if (played && ownsSequence()) {
       setVoicePlaybackState(currentState('idle'))
     }
 

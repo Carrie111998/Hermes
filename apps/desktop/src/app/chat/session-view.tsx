@@ -16,6 +16,7 @@ import {
   $selectedStoredSessionId,
   $turnStartedAt
 } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { $sessionStates } from '@/store/session-states'
 
 import { lastVisibleMessageIsUser } from './thread-loading'
@@ -42,6 +43,8 @@ import { lastVisibleMessageIsUser } from './thread-loading'
  */
 export interface SessionView {
   kind: 'primary' | 'tile'
+  /** Exact owner carried by tile views; primary keeps ambient legacy routing. */
+  ownerRoute?: SessionOwnerRoute
   $runtimeId: ReadableAtom<string | null>
   $storedId: ReadableAtom<string | null>
   $messages: ReadableAtom<ChatMessage[]>

@@ -6,6 +6,7 @@ import {
   clearVoiceClientConfigCache,
   cutSentences,
   type DirectTtsConfig,
+  directTtsConfig,
   fetchVoiceClientConfig,
   synthesizeSpeechClientDirect,
   transcribeAudioClientDirect,
@@ -64,6 +65,22 @@ describe('fetchVoiceClientConfig', () => {
     // hermesApi carries the ambient registry connection tag — the config
     // must come from the backend the user is talking to.
     expect(request.connectionId).toBe('gw-remote')
+  })
+
+  it('pins config lookup to an explicit session owner instead of ambient routing', async () => {
+    const api = mockDesktopApi({ ok: true, stt: directStt, tts: relay })
+    setApiRequestConnection('ambient-source')
+    setApiRequestProfile('ambient-profile')
+
+    await fetchVoiceClientConfig({ connectionId: 'tile-source', profile: 'tile-profile' })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'tile-source',
+        path: '/api/audio/voice-config',
+        profile: 'tile-profile'
+      })
+    )
   })
 
   it("a scope switch never reuses another scope's credentials", async () => {
@@ -146,6 +163,19 @@ describe('transcribeAudioClientDirect', () => {
     expect(await transcribeAudioClientDirect(new Blob(['x'], { type: 'audio/webm' }))).toBe('Hallo, bist du da?')
   })
 
+  it('uses the explicit session owner for STT config discovery', async () => {
+    const api = mockDesktopApi({ ok: true, stt: directStt, tts: relay })
+    setApiRequestConnection('ambient-source')
+    setApiRequestProfile('ambient-profile')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('tile transcript', { status: 200 })))
+
+    await transcribeAudioClientDirect(new Blob(['x']), { connectionId: 'tile-source', profile: 'tile-profile' })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionId: 'tile-source', profile: 'tile-profile' })
+    )
+  })
+
   it('returns null (relay) when the provider is not client-callable', async () => {
     mockDesktopApi({ ok: true, stt: relay, tts: relay })
     const fetchMock = vi.fn()
@@ -204,6 +234,43 @@ describe('transcribeAudioClientDirect', () => {
     expect(url).toBe('https://api.elevenlabs.io/v1/speech-to-text')
     expect((init.headers as Record<string, string>)['xi-api-key']).toBe('gsk_test')
     expect((init.body as FormData).get('model_id')).toBe('scribe_v2')
+  })
+})
+
+describe('directTtsConfig', () => {
+  beforeEach(() => clearVoiceClientConfigCache())
+
+  afterEach(() => {
+    setApiRequestConnection(null)
+    setApiRequestProfile(null)
+    Reflect.deleteProperty(window, 'hermesDesktop')
+    vi.restoreAllMocks()
+  })
+
+  it('uses the explicit session owner for TTS config discovery', async () => {
+    const api = mockDesktopApi({
+      ok: true,
+      stt: relay,
+      tts: {
+        api_key: 'test-only',
+        base_url: 'https://tts.invalid',
+        mode: 'direct',
+        model: null,
+        provider: 'test',
+        speed: null,
+        voice: null,
+        wire: 'openai-speech'
+      }
+    })
+
+    setApiRequestConnection('ambient-source')
+    setApiRequestProfile('ambient-profile')
+
+    await directTtsConfig({ connectionId: 'tile-source', profile: 'tile-profile' })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionId: 'tile-source', profile: 'tile-profile' })
+    )
   })
 })
 

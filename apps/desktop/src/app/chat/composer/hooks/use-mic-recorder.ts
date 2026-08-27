@@ -300,7 +300,17 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
         resolver?.(null)
       }
 
-      recorder.start()
+      try {
+        recorder.start()
+      } catch (error) {
+        recorderGenerationRef.current += 1
+        recorder.ondataavailable = null
+        recorder.onerror = null
+        recorder.onstop = null
+        cleanup()
+        throw micError(error, copy)
+      }
+
       setRecording(true)
       startMeter(stream, options)
     } finally {

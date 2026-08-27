@@ -14,6 +14,11 @@ interface ConversationOptions {
   onInterrupt?: () => Promise<void> | void
   onStopWord?: () => void
   onSubmit: (text: string) => Promise<void> | void
+  ownerRoute?: { connectionId: string; profile: string }
+}
+
+interface AutoSpeakOptions {
+  ownerRoute?: { connectionId: string; profile: string }
 }
 
 interface RecorderOptions {
@@ -22,6 +27,7 @@ interface RecorderOptions {
 }
 
 const mocks = vi.hoisted(() => ({
+  autoSpeakOptions: null as AutoSpeakOptions | null,
   conversationOptions: null as ConversationOptions | null,
   recorderCancel: vi.fn(),
   recorderOptions: null as RecorderOptions | null,
@@ -33,7 +39,11 @@ vi.mock('@/store/wake-word', async importOriginal => ({
   resumeWakeAfterVoice: mocks.resumeWakeAfterVoice
 }))
 
-vi.mock('./use-auto-speak-replies', () => ({ useAutoSpeakReplies: vi.fn() }))
+vi.mock('./use-auto-speak-replies', () => ({
+  useAutoSpeakReplies: vi.fn((options: AutoSpeakOptions) => {
+    mocks.autoSpeakOptions = options
+  })
+}))
 vi.mock('./use-voice-conversation', () => ({
   useVoiceConversation: vi.fn((options: ConversationOptions) => {
     mocks.conversationOptions = options
@@ -91,11 +101,38 @@ describe('useComposerVoice session-transition lifecycle', () => {
     cleanup()
     await act(async () => undefined)
     vi.clearAllMocks()
+    mocks.autoSpeakOptions = null
     mocks.conversationOptions = null
     mocks.recorderCancel.mockReset()
     mocks.recorderOptions = null
     mocks.resumeWakeAfterVoice.mockReset()
     $gateway.set(null)
+  })
+
+  it('binds conversation and auto-speak playback to the exact owner', () => {
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+
+    renderHook(
+      () =>
+        useComposerVoice({
+          busy: false,
+          clearDraft: vi.fn(),
+          disabled: false,
+          focusInput: vi.fn(),
+          insertText: vi.fn(),
+          maxRecordingSeconds: 120,
+          onSubmit: vi.fn(async () => true),
+          onTranscribeAudio: vi.fn(async () => 'transcript'),
+          ownerRoute,
+          sessionId: 'runtime-tile',
+          submissionKey: 'tile-source\0tile-profile\0stored-tile',
+          target: 'tile:stored-tile'
+        }),
+      { wrapper: Wrapper }
+    )
+
+    expect(mocks.conversationOptions?.ownerRoute).toEqual(ownerRoute)
+    expect(mocks.autoSpeakOptions?.ownerRoute).toEqual(ownerRoute)
   })
 
   it('drops A callbacks that finish after the composer has converged on B', async () => {

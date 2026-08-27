@@ -216,6 +216,164 @@ describe('useAutoSpeakReplies — async ownership', () => {
     expect($voicePlayback.get()).toMatchObject({ messageId: 'new-session-reply', sequence: 11, status: 'preparing' })
   })
 
+  it('binds read-aloud playback to the exact session owner', async () => {
+    $autoSpeakReplies.set(true)
+    ownsAmbientCueMock.mockResolvedValue(true)
+    vi.mocked(playSpeechText).mockResolvedValue(true)
+    const $messages = atom<ChatMessage[]>([])
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+
+    renderHook(
+      () =>
+        useAutoSpeakReplies({
+          conversationActive: false,
+          failureLabel: 'read-aloud failed',
+          markSpoken: vi.fn(),
+          ownerRoute,
+          pendingReply: () => ({ id: 'tile-reply', pending: false, text: 'owned reply' }),
+          sessionId: SESSION_ID
+        }),
+      {
+        wrapper: ({ children }) => (
+          <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, $messages }}>{children}</ComposerScopeProvider>
+        )
+      }
+    )
+
+    await waitFor(() =>
+      expect(playSpeechText).toHaveBeenCalledWith('owned reply', {
+        isCurrent: expect.any(Function),
+        messageId: 'tile-reply',
+        ownerRoute,
+        source: 'read-aloud'
+      })
+    )
+  })
+
+  it('invalidates playback setup when the exact owner changes', async () => {
+    $autoSpeakReplies.set(true)
+    const $messages = atom<ChatMessage[]>([])
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    let playbackIsCurrent: (() => boolean) | undefined
+
+    ownsAmbientCueMock.mockResolvedValueOnce(true).mockResolvedValueOnce(false)
+    vi.mocked(playSpeechText).mockImplementation(async (_text, options) => {
+      playbackIsCurrent = options.isCurrent
+
+      return false
+    })
+
+    const hook = renderHook(
+      ({ ownerRoute }: { ownerRoute: typeof ownerA }) =>
+        useAutoSpeakReplies({
+          conversationActive: false,
+          failureLabel: 'read-aloud failed',
+          markSpoken: vi.fn(),
+          ownerRoute,
+          pendingReply: () => ({ id: 'shared-reply', pending: false, text: 'owner-bound reply' }),
+          sessionId: SESSION_ID
+        }),
+      {
+        initialProps: { ownerRoute: ownerA },
+        wrapper: ({ children }) => (
+          <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, $messages }}>{children}</ComposerScopeProvider>
+        )
+      }
+    )
+
+    await waitFor(() => expect(playbackIsCurrent?.()).toBe(true))
+    hook.rerender({ ownerRoute: ownerB })
+
+    expect(playbackIsCurrent?.()).toBe(false)
+  })
+
+  it('invalidates a pending read-aloud claim when the exact owner changes', async () => {
+    $autoSpeakReplies.set(true)
+    const $messages = atom<ChatMessage[]>([])
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    let resolveOwnership: ((owns: boolean) => void) | undefined
+
+    ownsAmbientCueMock
+      .mockReturnValueOnce(
+        new Promise<boolean>(resolve => {
+          resolveOwnership = resolve
+        })
+      )
+      .mockResolvedValueOnce(false)
+    vi.mocked(playSpeechText).mockResolvedValue(true)
+
+    const hook = renderHook(
+      ({ ownerRoute }: { ownerRoute: typeof ownerA }) =>
+        useAutoSpeakReplies({
+          conversationActive: false,
+          failureLabel: 'read-aloud failed',
+          markSpoken: vi.fn(),
+          ownerRoute,
+          pendingReply: () => ({ id: 'shared-reply', pending: false, text: 'stale owner reply' }),
+          sessionId: SESSION_ID
+        }),
+      {
+        initialProps: { ownerRoute: ownerA },
+        wrapper: ({ children }) => (
+          <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, $messages }}>{children}</ComposerScopeProvider>
+        )
+      }
+    )
+
+    await waitFor(() => expect(ownsAmbientCueMock).toHaveBeenCalledTimes(1))
+    hook.rerender({ ownerRoute: ownerB })
+
+    await act(async () => {
+      resolveOwnership?.(true)
+      await Promise.resolve()
+    })
+
+    expect(playSpeechText).not.toHaveBeenCalled()
+  })
+
+  it('does not start read-aloud when a voice conversation starts while ownership is pending', async () => {
+    $autoSpeakReplies.set(true)
+    const $messages = atom<ChatMessage[]>([])
+    let resolveOwnership: ((owns: boolean) => void) | undefined
+
+    ownsAmbientCueMock.mockReturnValueOnce(
+      new Promise<boolean>(resolve => {
+        resolveOwnership = resolve
+      })
+    )
+    vi.mocked(playSpeechText).mockResolvedValue(true)
+
+    const hook = renderHook(
+      ({ conversationActive }: { conversationActive: boolean }) =>
+        useAutoSpeakReplies({
+          conversationActive,
+          failureLabel: 'read-aloud failed',
+          markSpoken: vi.fn(),
+          pendingReply: () => ({ id: 'reply-before-conversation', pending: false, text: 'do not overlap' }),
+          sessionId: SESSION_ID
+        }),
+      {
+        initialProps: { conversationActive: false },
+        wrapper: ({ children }) => (
+          <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, $messages }}>{children}</ComposerScopeProvider>
+        )
+      }
+    )
+
+    await waitFor(() => expect(ownsAmbientCueMock).toHaveBeenCalledWith('speak:reply-before-conversation'))
+
+    hook.rerender({ conversationActive: true })
+
+    await act(async () => {
+      resolveOwnership?.(true)
+      await Promise.resolve()
+    })
+
+    expect(playSpeechText).not.toHaveBeenCalled()
+  })
+
   it('does not speak an older claim after a newer reply loses ownership', async () => {
     $autoSpeakReplies.set(true)
     const $messages = atom<ChatMessage[]>([])

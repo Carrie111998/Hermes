@@ -5,6 +5,7 @@ import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { markAssistantIdSpoken, resolveSpokenReply } from '@/lib/spoken-reply'
+import type { VoiceOwnerRoute } from '@/lib/voice-client-direct'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -34,6 +35,8 @@ interface UseComposerVoiceArgs {
   onInterrupt?: () => Promise<void> | void
   onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
+  /** Exact owner for tile voice I/O; omitted keeps the ambient legacy path. */
+  ownerRoute?: VoiceOwnerRoute
   sessionId: string | null | undefined
   /** Durable identity for the route-scoped draft this callback belongs to. */
   submissionKey: string | null
@@ -62,6 +65,7 @@ export function useComposerVoice({
   onInterrupt,
   onSubmit,
   onTranscribeAudio,
+  ownerRoute,
   sessionId,
   submissionKey,
   target
@@ -242,6 +246,7 @@ export function useComposerVoice({
     },
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
+    ownerRoute,
     pendingResponse: pendingTurnResponse,
     // Establish the shared pause here as a safety net: inner hook effects run
     // before this hook's ownership effect, but the mic must still await pause.
@@ -364,6 +369,7 @@ export function useComposerVoice({
     conversationActive: voiceConversationActive,
     failureLabel: t.assistant.thread.readAloudFailed,
     markSpoken: consumePendingResponse,
+    ownerRoute,
     pendingReply: pendingResponse,
     sessionId
   })

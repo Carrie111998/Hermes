@@ -705,12 +705,12 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
     }
 
     try {
-      await playSpeechText(text, { messageId, source: 'read-aloud' })
+      await playSpeechText(text, { messageId, ownerRoute: view.ownerRoute, source: 'read-aloud' })
       markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
     } catch (error) {
       notifyError(error, copy.readAloudFailed)
     }
-  }, [copy.readAloudFailed, getText, messageId, sessionId, view.$messages])
+  }, [copy.readAloudFailed, getText, messageId, sessionId, view.$messages, view.ownerRoute])
 
   return (
     <TooltipIconButton

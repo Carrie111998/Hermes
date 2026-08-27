@@ -139,6 +139,7 @@ function buildTileView(storedSessionId: string, ownerRoute?: SessionOwnerRoute):
 
   return {
     kind: 'tile',
+    ownerRoute,
     $awaitingResponse: computed($state, state => Boolean(state?.awaitingResponse)),
     $busy: computed($state, state => Boolean(state?.busy)),
     $cwd: computed($state, state => state?.cwd ?? ''),
@@ -160,17 +161,17 @@ function buildTileView(storedSessionId: string, ownerRoute?: SessionOwnerRoute):
 // tiles have no pin/delete affordance, and transcription needs no per-tile state.
 const noop = () => undefined
 
-const tileTranscribeAudio = async (audio: Blob) => {
+const tileTranscribeAudio = async (audio: Blob, ownerRoute?: SessionOwnerRoute) => {
   // Client-direct first (profile's own STT provider, no gateway audio hop);
   // relay when the provider is not client-callable. Same ladder as the main
   // composer's transcribeVoiceAudio.
-  const direct = await transcribeAudioClientDirect(audio)
+  const direct = await transcribeAudioClientDirect(audio, ownerRoute)
 
   if (direct !== null) {
     return direct
   }
 
-  return (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript
+  return (await transcribeAudio(await blobToDataUrl(audio), audio.type, ownerRoute)).transcript
 }
 
 function TileChat({
@@ -253,6 +254,7 @@ function TileChat({
   const onPickFolders = useCallback(() => void pickContextPaths('folder'), [pickContextPaths])
   const onPickImages = useCallback(() => void pickImages(), [pickImages])
   const onRemoveAttachment = useCallback((id: string) => void removeAttachment(id), [removeAttachment])
+  const onTranscribeAudio = useCallback((audio: Blob) => tileTranscribeAudio(audio, ownerRoute), [ownerRoute])
 
   const onRetryResume = useCallback(
     () => patchSessionTile(storedSessionId, { error: undefined }, ownerRoute),
@@ -300,7 +302,7 @@ function TileChat({
           onSubmit={actions.submitText}
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
-          onTranscribeAudio={tileTranscribeAudio}
+          onTranscribeAudio={onTranscribeAudio}
           sessionOwnerRoute={ownerRoute}
         />
       </ComposerScopeProvider>

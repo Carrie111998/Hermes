@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { HermesGateway } from '@/hermes'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -76,6 +77,8 @@ export interface ChatBarProps {
   onSteer?: (text: string) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
   onTranscribeAudio?: (audio: Blob) => Promise<string>
+  /** Exact owner for tile voice I/O; omitted keeps the ambient legacy path. */
+  voiceOwnerRoute?: SessionOwnerRoute
 }
 
 export type VoiceStatus = 'idle' | 'recording' | 'transcribing'

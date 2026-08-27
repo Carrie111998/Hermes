@@ -88,6 +88,16 @@ describe('resolveSpeakStreamUrl', () => {
     expect(getGatewayWsUrl).not.toHaveBeenCalled()
   })
 
+  it('uses an explicit session owner instead of ambient routing', async () => {
+    setApiRequestConnection('ambient-source')
+    setApiRequestProfile('ambient-profile')
+
+    await resolveSpeakStreamUrl({ connectionId: 'tile-source', profile: 'tile-profile' })
+
+    expect(getConnectionFor).toHaveBeenCalledWith({ connectionId: 'tile-source', profile: 'tile-profile' })
+    expect(getGatewayWsUrlFor).toHaveBeenCalledWith({ connectionId: 'tile-source', profile: 'tile-profile' })
+  })
+
   it('keeps the legacy profile path byte-identical when no registry connection is active', async () => {
     setApiRequestProfile('coder')
 
@@ -150,7 +160,188 @@ describe('resolveSpeakStreamUrl', () => {
   })
 })
 
+describe('startSpeechStream owner routing', () => {
+  afterEach(() => {
+    stopVoicePlayback()
+    Reflect.deleteProperty(window, 'hermesDesktop')
+    directTtsConfigMock.mockReset()
+    speakTextMock.mockReset()
+    vi.unstubAllGlobals()
+  })
+
+  it('binds direct TTS discovery to the supplied session owner', async () => {
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+
+    directTtsConfigMock.mockResolvedValueOnce(null)
+    Reflect.deleteProperty(window, 'hermesDesktop')
+
+    await startSpeechStream({ ownerRoute, source: 'voice-conversation' })
+
+    expect(directTtsConfigMock).toHaveBeenCalledWith(ownerRoute)
+  })
+
+  it('binds one-shot direct TTS discovery to the supplied session owner', async () => {
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+
+    directTtsConfigMock.mockResolvedValueOnce(null)
+    speakTextMock.mockRejectedValueOnce(new Error('stop after routing assertion'))
+    Reflect.deleteProperty(window, 'hermesDesktop')
+
+    await expect(playSpeechText('tile reply', { ownerRoute, source: 'read-aloud' })).rejects.toThrow(
+      'stop after routing assertion'
+    )
+
+    expect(directTtsConfigMock).toHaveBeenCalledWith(ownerRoute)
+    expect(speakTextMock).toHaveBeenCalledWith('tile reply', ownerRoute)
+  })
+
+  it('binds one-shot WebSocket TTS discovery to the supplied session owner', async () => {
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+
+    const getConnection = vi.fn(async () => ({
+      authMode: 'token',
+      baseUrl: 'https://ambient.invalid',
+      wsUrl: 'wss://ambient.invalid/api/ws?ticket=ambient'
+    }))
+
+    const getConnectionFor = vi.fn(async () => ({
+      authMode: 'token',
+      baseUrl: 'https://tile.invalid',
+      wsUrl: 'wss://tile.invalid/api/ws?ticket=tile'
+    }))
+
+    const getGatewayWsUrlFor = vi.fn(async () => ({ ok: true, wsUrl: 'wss://tile.invalid/api/ws?ticket=tile' }))
+
+    class PendingWebSocket {
+      static CONNECTING = 0
+      static OPEN = 1
+      binaryType = ''
+      readyState = PendingWebSocket.CONNECTING
+      close = vi.fn()
+      send = vi.fn()
+    }
+
+    directTtsConfigMock.mockResolvedValueOnce(null)
+    vi.stubGlobal('WebSocket', PendingWebSocket)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { getConnection, getConnectionFor, getGatewayWsUrlFor }
+    })
+
+    const playback = playSpeechText('tile reply', { ownerRoute, source: 'read-aloud' })
+
+    await vi.waitFor(() => expect(directTtsConfigMock).toHaveBeenCalled())
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(getConnectionFor).toHaveBeenCalledWith(ownerRoute)
+    expect(getConnection).not.toHaveBeenCalled()
+    stopVoicePlayback()
+    await expect(playback).resolves.toBe(false)
+  })
+
+  it('binds WebSocket TTS discovery to the supplied session owner', async () => {
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+
+    const getConnection = vi.fn(async () => ({
+      authMode: 'token',
+      baseUrl: 'https://ambient.invalid',
+      wsUrl: 'wss://ambient.invalid/api/ws?ticket=ambient'
+    }))
+
+    const getConnectionFor = vi.fn(async () => ({
+      authMode: 'token',
+      baseUrl: 'https://tile.invalid',
+      wsUrl: 'wss://tile.invalid/api/ws?ticket=tile'
+    }))
+
+    const getGatewayWsUrlFor = vi.fn(async () => ({ ok: true, wsUrl: 'wss://tile.invalid/api/ws?ticket=tile' }))
+
+    class PendingWebSocket {
+      static CONNECTING = 0
+      static OPEN = 1
+      binaryType = ''
+      readyState = PendingWebSocket.CONNECTING
+      close = vi.fn()
+      send = vi.fn()
+    }
+
+    directTtsConfigMock.mockResolvedValueOnce(null)
+    vi.stubGlobal('WebSocket', PendingWebSocket)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { getConnection, getConnectionFor, getGatewayWsUrlFor }
+    })
+
+    const session = await startSpeechStream({ ownerRoute, source: 'voice-conversation' })
+
+    expect(session).not.toBeNull()
+    expect(getConnectionFor).toHaveBeenCalledWith(ownerRoute)
+    expect(getConnection).not.toHaveBeenCalled()
+    stopVoicePlayback()
+  })
+})
+
 describe('startSpeechStream setup cancellation', () => {
+  afterEach(() => {
+    stopVoicePlayback()
+    directTtsConfigMock.mockReset()
+    speakTextMock.mockReset()
+    Reflect.deleteProperty(window, 'hermesDesktop')
+    vi.unstubAllGlobals()
+  })
+
+  it('cancels one-shot playback setup when its caller generation becomes stale', async () => {
+    let resolveConfig: ((config: null) => void) | undefined
+
+    const pendingConfig = new Promise<null>(resolve => {
+      resolveConfig = resolve
+    })
+
+    let current = true
+
+    directTtsConfigMock.mockReturnValueOnce(pendingConfig)
+    speakTextMock.mockRejectedValueOnce(new Error('stale playback reached relay'))
+
+    const playback = playSpeechText('stale reply', {
+      isCurrent: () => current,
+      source: 'read-aloud'
+    })
+
+    current = false
+    resolveConfig?.(null)
+
+    await expect(playback).resolves.toBe(false)
+    expect(speakTextMock).not.toHaveBeenCalled()
+    expect($voicePlayback.get().status).toBe('idle')
+  })
+
+  it('clears preparing when caller generation expires during relay synthesis', async () => {
+    let resolveSpeech: ((response: { data_url: string }) => void) | undefined
+
+    const pendingSpeech = new Promise<{ data_url: string }>(resolve => {
+      resolveSpeech = resolve
+    })
+
+    let current = true
+
+    directTtsConfigMock.mockResolvedValueOnce(null)
+    speakTextMock.mockReturnValueOnce(pendingSpeech)
+    Reflect.deleteProperty(window, 'hermesDesktop')
+
+    const playback = playSpeechText('stale relay reply', {
+      isCurrent: () => current,
+      source: 'read-aloud'
+    })
+
+    await vi.waitFor(() => expect(speakTextMock).toHaveBeenCalled())
+    current = false
+    resolveSpeech?.({ data_url: 'data:audio/mpeg;base64,AA==' })
+
+    await expect(playback).resolves.toBe(false)
+    expect($voicePlayback.get().status).toBe('idle')
+  })
+
   it('does not disturb newer playback when stale discovery resolves', async () => {
     let resolveConfig: ((config: unknown) => void) | undefined
 

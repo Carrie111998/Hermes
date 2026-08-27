@@ -235,7 +235,9 @@ describe('useVoiceConversation playback rearm', () => {
     })
 
     await waitFor(() => expect(hook.result.current.status).toBe('idle'))
-    expect(mocks.stopVoicePlayback).toHaveBeenCalledTimes(2)
+    // Start clears any stale read-aloud, then the explicit Stop and stale
+    // stream-session teardown each stop once more.
+    expect(mocks.stopVoicePlayback).toHaveBeenCalledTimes(3)
     expect(mocks.handle.start).toHaveBeenCalledTimes(1)
   })
 

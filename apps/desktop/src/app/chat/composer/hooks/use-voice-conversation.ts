@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { useI18n } from '@/i18n'
 import { startThinkingSound, stopThinkingSound } from '@/lib/thinking-sound'
 import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
+import type { VoiceOwnerRoute } from '@/lib/voice-client-direct'
 import {
   markVoicePlaybackInterrupted,
   playSpeechText,
@@ -34,6 +35,8 @@ interface VoiceConversationOptions {
   onStopWord?: () => void
   onSubmit: (text: string) => Promise<void> | void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
+  /** Exact owner for tile playback; omitted keeps the ambient legacy path. */
+  ownerRoute?: VoiceOwnerRoute
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
   /** Awaited right before the mic is opened. Used to let the wake-word listener
@@ -53,6 +56,7 @@ export function useVoiceConversation({
   onStopWord,
   onSubmit,
   onTranscribeAudio,
+  ownerRoute,
   pendingResponse,
   consumePendingResponse,
   beforeMicOpen
@@ -578,7 +582,7 @@ export function useVoiceConversation({
         // this is a safety net for read-aloud-style entries into the loop.
         ensureBargeMonitor()
 
-        const playback = playSpeechText(response.text, { source: 'voice-conversation' })
+        const playback = playSpeechText(response.text, { ownerRoute, source: 'voice-conversation' })
         // playSpeechText performs its normal cleanup synchronously before
         // returning. Capture the sequence after that internal increment so
         // only a later, external stop suppresses the next listen cycle.
@@ -600,7 +604,7 @@ export function useVoiceConversation({
 
       poll()
     },
-    [ensureBargeMonitor, pendingResponse, settleAfterSpeech, voiceCopy.playbackFailed]
+    [ensureBargeMonitor, ownerRoute, pendingResponse, settleAfterSpeech, voiceCopy.playbackFailed]
   )
 
   /**
@@ -639,7 +643,7 @@ export function useVoiceConversation({
       ensureBargeMonitor()
 
       void (async () => {
-        const session = await startSpeechStream({ isCurrent, source: 'voice-conversation' })
+        const session = await startSpeechStream({ isCurrent, ownerRoute, source: 'voice-conversation' })
 
         // The session may resolve after the loop moved on (barge, disable).
         if (!isCurrent()) {
@@ -708,7 +712,7 @@ export function useVoiceConversation({
         settleAfterSpeech(bargedRef.current)
       })()
     },
-    [awaitFallbackSpeech, ensureBargeMonitor, feedSpeechSession, settleAfterSpeech]
+    [awaitFallbackSpeech, ensureBargeMonitor, feedSpeechSession, ownerRoute, settleAfterSpeech]
   )
 
   const start = useCallback(async () => {
@@ -723,6 +727,7 @@ export function useVoiceConversation({
       return
     }
 
+    stopVoicePlayback()
     conversationEpochRef.current += 1
     captureEpochRef.current += 1
     setMuted(false)

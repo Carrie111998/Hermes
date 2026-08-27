@@ -167,11 +167,29 @@ export function getActionStatus(name: string, lines = 200, profile?: ProfileScop
   })
 }
 
-export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
+export interface AudioOwnerRoute {
+  connectionId: string
+  profile: string
+}
+
+function audioScoped(ownerRoute?: AudioOwnerRoute): { connectionId?: string; profile?: string } {
+  return ownerRoute
+    ? {
+        connectionId: ownerRoute.connectionId.trim() || 'local',
+        profile: ownerRoute.profile.trim() || 'default'
+      }
+    : profileScoped()
+}
+
+export function transcribeAudio(
+  dataUrl: string,
+  mimeType?: string,
+  ownerRoute?: AudioOwnerRoute
+): Promise<AudioTranscriptionResponse> {
   return hermesApi<AudioTranscriptionResponse>({
     path: '/api/audio/transcribe',
     method: 'POST',
-    ...profileScoped(),
+    ...audioScoped(ownerRoute),
     body: {
       data_url: dataUrl,
       mime_type: mimeType
@@ -183,9 +201,9 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
   })
 }
 
-export function speakText(text: string): Promise<AudioSpeakResponse> {
+export function speakText(text: string, ownerRoute?: AudioOwnerRoute): Promise<AudioSpeakResponse> {
   return hermesApi<AudioSpeakResponse>({
-    ...profileScoped(),
+    ...audioScoped(ownerRoute),
     path: '/api/audio/speak',
     method: 'POST',
     body: { text },

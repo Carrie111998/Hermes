@@ -123,7 +123,8 @@ export function ChatBar({
   onRemoveAttachment,
   onSteer,
   onSubmit: onSubmitProp,
-  onTranscribeAudio
+  onTranscribeAudio,
+  voiceOwnerRoute
 }: ChatBarProps) {
   const hudMode = useStore($hudMode)
   const hudWindowing = window.hermesDesktop?.hud?.windowing
@@ -1048,6 +1049,7 @@ export function ChatBar({
     onInterrupt: haltRun,
     onSubmit,
     onTranscribeAudio,
+    ownerRoute: voiceOwnerRoute,
     sessionId,
     submissionKey: actionScopeKey,
     target: scope.target

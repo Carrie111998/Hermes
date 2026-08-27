@@ -633,6 +633,22 @@ describe('Hermes REST helpers', () => {
     })
   })
 
+  it('pins blocking TTS synthesis to an explicit session owner', async () => {
+    setApiRequestConnection('ambient-source')
+    setApiRequestProfile('ambient-profile')
+    api.mockResolvedValueOnce({ data_url: 'data:audio/mpeg;base64,AA==', ok: true })
+
+    await speakText('Tile reply', { connectionId: 'tile-source', profile: 'tile-profile' })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'tile-source',
+        path: '/api/audio/speak',
+        profile: 'tile-profile'
+      })
+    )
+  })
+
   it('bounds blocking transcription timeouts by payload length', () => {
     expect(audioTranscribeRequestTimeoutMs('data:audio/webm;base64,AA==')).toBe(AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS)
     expect(audioTranscribeRequestTimeoutMs('x'.repeat(3_000_000))).toBe(300_000)
@@ -658,6 +674,25 @@ describe('Hermes REST helpers', () => {
       path: '/api/audio/transcribe',
       timeoutMs: AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS
     })
+  })
+
+  it('pins blocking transcription to an explicit session owner', async () => {
+    setApiRequestConnection('ambient-source')
+    setApiRequestProfile('ambient-profile')
+    api.mockResolvedValueOnce({ ok: true, provider: 'openai', transcript: 'tile transcript' })
+
+    await transcribeAudio('data:audio/webm;base64,AA==', 'audio/webm', {
+      connectionId: 'tile-source',
+      profile: 'tile-profile'
+    })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'tile-source',
+        path: '/api/audio/transcribe',
+        profile: 'tile-profile'
+      })
+    )
   })
 
   it('defaults model options to configured providers only', async () => {

@@ -28,7 +28,13 @@ vi.mock('@/lib/voice-barge-in', () => ({
 const markVoicePlaybackInterrupted = vi.fn()
 
 const startSpeechStreamMock = vi.hoisted(() =>
-  vi.fn<(options: { isCurrent?: () => boolean; source: string }) => Promise<null>>(async () => null)
+  vi.fn<
+    (options: {
+      isCurrent?: () => boolean
+      ownerRoute?: { connectionId: string; profile: string }
+      source: string
+    }) => Promise<null>
+  >(async () => null)
 )
 
 const stopVoicePlayback = vi.fn()
@@ -84,6 +90,7 @@ interface HookProps {
 function renderConversation(
   overrides: {
     onInterrupt?: () => void
+    ownerRoute?: { connectionId: string; profile: string }
     pendingResponse?: () => null | { id: string; pending: boolean; text: string }
     strict?: boolean
     transcript?: string
@@ -120,6 +127,7 @@ function renderConversation(
         onStopWord,
         onSubmit,
         onTranscribeAudio,
+        ownerRoute: overrides.ownerRoute,
         pendingResponse: overrides.pendingResponse ?? (() => null)
       }),
     { initialProps: { busy: false }, wrapper: overrides.strict ? StrictWrapper : undefined }
@@ -332,6 +340,31 @@ describe('useVoiceConversation full-duplex barge-in', () => {
 
     act(() => hook.result.current.stopTurn())
     await waitFor(() => expect(micHandle.stop).toHaveBeenCalledTimes(2))
+  })
+
+  it('stops stale read-aloud before opening a voice conversation', async () => {
+    const { hook } = renderConversation()
+
+    stopVoicePlayback.mockClear()
+    await act(async () => hook.result.current.start())
+
+    expect(stopVoicePlayback).toHaveBeenCalledOnce()
+  })
+
+  it('binds live reply playback to the exact session owner', async () => {
+    let response: null | { id: string; pending: boolean; text: string } = null
+    const ownerRoute = { connectionId: 'tile-source', profile: 'tile-profile' }
+    const { hook } = renderConversation({ ownerRoute, pendingResponse: () => response })
+
+    await enterThinking(hook)
+    response = { id: 'owned-response', pending: true, text: 'hello' }
+    hook.rerender({ busy: true })
+
+    await waitFor(() => expect(startSpeechStreamMock).toHaveBeenCalled())
+
+    expect(startSpeechStreamMock).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerRoute, source: 'voice-conversation' })
+    )
   })
 
   it('keeps in-flight speech setup valid while mute tears down capture', async () => {

@@ -114,7 +114,14 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
       }
     }
 
-    recorder.start(250)
+    try {
+      recorder.start(250)
+    } catch {
+      recorder.ondataavailable = null
+      recorder.onstop = null
+      recorder = null
+      chunks = []
+    }
   }
 
   /** Restart the recorder to drop stale pre-roll — only valid while quiet. */

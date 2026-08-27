@@ -939,6 +939,7 @@ const ChatViewContent = memo(function ChatViewContent({
               state={chatBarState}
               storageMigration={storageMigration}
               storageScopeKey={composerStorageScopeKey}
+              voiceOwnerRoute={sessionOwnerRoute}
             />
           </Suspense>
         )}
