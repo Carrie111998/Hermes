@@ -1,57 +1,50 @@
-"""Per-board workspace policy — the M3a confinement contract's assertion set.
+"""Per-board workspace policy — the M3a confinement contract, as a registry.
 
 SCOPE — READ THIS FIRST
 -----------------------
 This protects against **accidental escape and cooperative execution**. It does
 **not** protect against **arbitrary malicious same-UID activity**.
 
-Every assertion here is a path predicate, a file check, or a string match —
-none is an OS-level sandbox. A deliberately adversarial process running as your
-user defeats all of them: it can `chdir` after launch, rewrite the config this
-module reads, or write `kanban.db` directly. The real containment for evaluation
-work is the origin-less fixture plus absent credentials; these checks stop the
-failure that actually happened.
+Every assertion is a path predicate, a file check, or a call into Hermes' own
+guards — none is an OS-level sandbox. A deliberately adversarial process running
+as your user defeats all of them: it can `chdir` after launch, rewrite the config
+this module reads, edit the attestation it verifies, or write `kanban.db`
+directly. What these checks stop is the failure that actually happened: a worker
+launched from the wrong directory that searched the filesystem, found a live
+production checkout whose default branch auto-deploys, and ran a command there.
 
-WHY THIS EXISTS
----------------
-During M2a a worker launched from the wrong directory searched the filesystem,
-found a live production checkout whose default branch auto-deploys, and ran a
-command there. Denials were added and the issue declared closed; a later run
-still *started* in the wrong place. The reference implementation
-(`sandbox/preflight.py`) then refused two real dispatches — but it was advisory
-to a cooperative harness: a dispatch that did not call it got no protection.
+EVIDENCE, NOT MODE
+------------------
+An earlier revision reported ``contract_satisfied`` from ``mode == sandbox``
+without executing anything. A board with no protected paths, no deny globs, no
+command matrices and no git fixture reported the contract satisfied on five
+assertions. That is fixed here: every one of the contract's **twenty**
+assertions is a registry entry that must record ``PASS`` against the **actual
+final workspace and a verified launch**. ``contract_satisfied`` is true only
+when all twenty did. A missing, skipped, disabled, approximated or unrun check
+makes it false — there is no path to true that does not run the check.
 
-This moves that check into the dispatch path, where it cannot be skipped, and
-makes it declarative per board rather than per harness.
+FAIL CLOSED MEANS INABILITY IS REFUSAL
+--------------------------------------
+The same revision treated "could not inspect" as "clean": a git config that
+could not be read became "no remotes", a failed ``git status`` became "no
+untracked files", and a non-git directory passed a policy demanding an
+origin-less git fixture. In sandbox mode every such case is now a refusal.
 
-MODES, AND AN HONEST DEFAULT
-----------------------------
-``open`` (the default when no policy is configured) runs only the launch checks
-that already shipped: a workspace must be absolute, plannable, and a directory.
-Existing boards keep working unchanged.
-
-``sandbox`` runs the full contract. **A board that is not in sandbox mode does
-not satisfy the confinement contract**, and this module says so rather than
-implying otherwise: :func:`policy_status` reports exactly which assertions ran.
-
-That is a deliberate trade. Refusing every dispatch on every existing board for
-want of a config key would be a worse failure than the one being prevented — but
-"configured open" must never be mistaken for "contained".
-
-CREDENTIAL HANDLING
--------------------
-Assertion 8 needs to know whether live key material sits in the sandbox
-``HERMES_HOME``. Values are **never** returned, logged, or included in refusal
-messages: matches report a path and a pattern name only. Operators who need to
-pin a specific key can configure its SHA-256 digest — a digest comparison never
-reveals the secret.
+MODES
+-----
+``open`` is **explicitly unconfined legacy behaviour**, kept so existing boards
+keep working. It runs the launch checks only, never claims the contract, and is
+labelled unconfined on every status surface. ``sandbox`` is the contract.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -61,24 +54,58 @@ from hermes_cli.dispatch_confinement import PreflightRefusal
 MODE_OPEN = "open"
 MODE_SANDBOX = "sandbox"
 
-# Files whose presence in a fixture means credentials or deploy config leaked in.
+PASS = "PASS"
+FAIL = "FAIL"
+SKIPPED = "SKIPPED"
+
+ATTESTATION_FILENAME = ".hermes-fixture-attestation.json"
+ATTESTATION_VERSION = 1
+
+# The contract's twenty pre-dispatch assertions, verbatim in intent from
+# M3A-CONFINEMENT-CONTRACT.md §4. The registry is the specification: a check
+# that is not here cannot count, and one that is here cannot be quietly dropped.
+ASSERTIONS: tuple = (
+    (1, "process-cwd-is-the-fixture"),
+    (2, "fixture-under-sandbox-root"),
+    (3, "git-has-zero-remotes"),
+    (4, "no-object-alternates"),
+    (5, "no-secret-files"),
+    (6, "no-untracked-source"),
+    (7, "hermes-home-under-sandbox-root"),
+    (8, "no-live-key-in-hermes-home"),
+    (9, "single-query-mode-deny"),
+    (10, "required-deny-globs-present"),
+    (11, "protected-paths-declared"),
+    (12, "workspace-not-protected"),
+    (13, "allowed-root-identity-pinned"),
+    (14, "fixture-attestation-valid"),
+    (15, "fixture-is-a-git-repository"),
+    (16, "prohibited-command-matrix-blocked"),
+    (17, "allowed-commands-not-false-positived"),
+    (18, "shipped-guard-blocks-git-push"),
+    (19, "shipped-guard-blocks-vercel"),
+    (20, "shipped-guard-refuses-execute-code"),
+)
+ASSERTION_NAMES: Dict[int, str] = {i: n for i, n in ASSERTIONS}
+REQUIRED_ASSERTION_IDS: frozenset = frozenset(ASSERTION_NAMES)
+
 SECRET_FILENAMES = (
     ".env", ".env.local", ".env.production", ".env.development",
     ".npmrc", ".netrc", "credentials.json", "service-account.json",
 )
 SECRET_DIRNAMES = (".vercel", ".next", ".aws", ".ssh", ".gnupg")
 
-# Name-shaped credential detection for HERMES_HOME. Content is matched against
-# provider key prefixes; the matched VALUE is never retained.
 _KEY_PREFIXES = (
     b"sk-", b"sk-ant-", b"sk-or-", b"ghp_", b"gho_", b"github_pat_",
     b"AKIA", b"xoxb-", b"xoxp-", b"AIza", b"up_",
 )
 _CREDENTIAL_FILE_HINTS = ("key", "token", "secret", "credential", "auth")
+_SPACE = " "
 
-# Never write a glob containing a literal space: fnmatch is literal on
-# whitespace, so "*git push*" is defeated by "git   push". Use "*a*b*" form.
-_SPACE_IN_GLOB = " "
+# Assertions 18-20 are executed against these, through Hermes' own guards.
+GUARD_PROBE_PUSH = "git push origin main"
+GUARD_PROBE_VERCEL = "vercel --prod"
+GUARD_PROBE_CODE = "import subprocess; subprocess.run(['git', 'push'])"
 
 
 @dataclass(frozen=True)
@@ -88,15 +115,11 @@ class WorkspacePolicy:
     allowed_roots: tuple = ()
     protected_paths: tuple = ()
     hermes_home_root: Optional[str] = None
-    require_origin_less: bool = True
-    require_no_alternates: bool = True
-    require_no_secrets: bool = True
-    require_no_untracked_source: bool = True
-    require_single_query_deny: bool = True
     required_deny_globs: tuple = ()
     prohibited_commands: tuple = ()
     allowed_commands: tuple = ()
     forbidden_key_sha256: tuple = ()
+    require_attestation: bool = True
 
     @property
     def is_sandbox(self) -> bool:
@@ -104,17 +127,69 @@ class WorkspacePolicy:
 
 
 @dataclass
+class AssertionResult:
+    id: int
+    name: str
+    status: str
+    detail: str = ""
+
+
+@dataclass
 class PolicyReport:
-    """What actually ran, so "passed" can never be read as "all 20 passed"."""
+    """What ran, what did not, and why — per assertion.
+
+    ``contract_satisfied`` is deliberately not derivable from configuration.
+    """
 
     board: str
     mode: str
-    passed: List[str] = field(default_factory=list)
-    skipped: List[str] = field(default_factory=list)
+    results: List[AssertionResult] = field(default_factory=list)
+
+    def record(self, assertion_id: int, status: str, detail: str = "") -> None:
+        self.results.append(AssertionResult(
+            id=assertion_id, name=ASSERTION_NAMES[assertion_id],
+            status=status, detail=detail,
+        ))
+
+    def _ids(self, status: str) -> set:
+        return {r.id for r in self.results if r.status == status}
+
+    @property
+    def passed(self) -> set:
+        return self._ids(PASS)
+
+    @property
+    def failed(self) -> set:
+        return self._ids(FAIL)
+
+    @property
+    def skipped(self) -> set:
+        return self._ids(SKIPPED)
+
+    @property
+    def missing(self) -> set:
+        return REQUIRED_ASSERTION_IDS - {r.id for r in self.results}
 
     @property
     def contract_satisfied(self) -> bool:
-        return self.mode == MODE_SANDBOX and not self.skipped
+        return (
+            self.mode == MODE_SANDBOX
+            and not self.failed
+            and not self.skipped
+            and not self.missing
+            and self.passed == REQUIRED_ASSERTION_IDS
+        )
+
+    def summary(self) -> dict:
+        return {
+            "board": self.board,
+            "mode": self.mode,
+            "contract_satisfied": self.contract_satisfied,
+            "passed": sorted(self.passed),
+            "failed": sorted(self.failed),
+            "skipped": sorted(self.skipped),
+            "missing": sorted(self.missing),
+        }
 
 
 def _as_tuple(value: Any) -> tuple:
@@ -126,10 +201,13 @@ def _as_tuple(value: Any) -> tuple:
 
 
 def resolve_policy(board: Optional[str] = None, *, config: Any = None) -> WorkspacePolicy:
-    """Resolve ``kanban.workspace_policy`` for a board.
+    """Resolve ``kanban.workspace_policy``.
 
-    Board-specific settings override the top-level defaults. A board with no
-    entry inherits the top level, which defaults to ``open``.
+    A config that cannot be loaded resolves to ``open`` — and ``open`` never
+    claims the contract, so an unreadable config can only ever *lose*
+    confinement claims, never gain them. A sandbox board's own settings are
+    validated separately by :func:`assert_policy_wellformed`, which refuses
+    rather than defaulting.
     """
     slug = (board or "").strip() or "default"
     if config is None:
@@ -139,13 +217,31 @@ def resolve_policy(board: Optional[str] = None, *, config: Any = None) -> Worksp
             config = load_config()
         except Exception:
             config = {}
-    root = ((config or {}).get("kanban") or {}).get("workspace_policy") or {}
-    board_cfg = (root.get("boards") or {}).get(slug) or {}
+    kanban_cfg = (config or {}).get("kanban") or {}
+    if not isinstance(kanban_cfg, dict):
+        raise PreflightRefusal("kanban config is malformed (expected a mapping)")
+    root = kanban_cfg.get("workspace_policy", {})
+    if root in (None, ""):
+        root = {}
+    if not isinstance(root, dict):
+        raise PreflightRefusal(
+            "kanban.workspace_policy is malformed (expected a mapping)"
+        )
+    boards = root.get("boards", {})
+    if boards in (None, ""):
+        boards = {}
+    if not isinstance(boards, dict):
+        raise PreflightRefusal(
+            "kanban.workspace_policy.boards is malformed (expected a mapping)"
+        )
+    board_cfg = boards.get(slug) or {}
+    if not isinstance(board_cfg, dict):
+        raise PreflightRefusal(
+            f"kanban.workspace_policy.boards.{slug} is malformed"
+        )
 
     def pick(key, default=None):
-        if key in board_cfg:
-            return board_cfg[key]
-        return root.get(key, default)
+        return board_cfg[key] if key in board_cfg else root.get(key, default)
 
     return WorkspacePolicy(
         board=slug,
@@ -153,25 +249,62 @@ def resolve_policy(board: Optional[str] = None, *, config: Any = None) -> Worksp
         allowed_roots=_as_tuple(pick("allowed_roots")),
         protected_paths=_as_tuple(pick("protected_paths")),
         hermes_home_root=(pick("hermes_home_root") or None),
-        require_origin_less=bool(pick("require_origin_less", True)),
-        require_no_alternates=bool(pick("require_no_alternates", True)),
-        require_no_secrets=bool(pick("require_no_secrets", True)),
-        require_no_untracked_source=bool(pick("require_no_untracked_source", True)),
-        require_single_query_deny=bool(pick("require_single_query_deny", True)),
         required_deny_globs=_as_tuple(pick("required_deny_globs")),
         prohibited_commands=_as_tuple(pick("prohibited_commands")),
         allowed_commands=_as_tuple(pick("allowed_commands")),
         forbidden_key_sha256=_as_tuple(pick("forbidden_key_sha256")),
+        require_attestation=bool(pick("require_attestation", True)),
     )
 
 
+def assert_policy_wellformed(policy: WorkspacePolicy) -> None:
+    """A sandbox board must declare every mandatory field, non-empty.
+
+    There is no way to disable a mandatory assertion. An earlier revision let
+    ``require_origin_less: false`` (and friends) silently switch checks off while
+    still reporting the contract satisfied; those switches no longer exist. A
+    board that needs relaxations is an ``open`` board, and open never claims the
+    contract.
+    """
+    if not policy.is_sandbox:
+        return
+    required = {
+        "allowed_roots": policy.allowed_roots,
+        "protected_paths": policy.protected_paths,
+        "hermes_home_root": policy.hermes_home_root,
+        "required_deny_globs": policy.required_deny_globs,
+        "prohibited_commands": policy.prohibited_commands,
+        "allowed_commands": policy.allowed_commands,
+    }
+    missing = sorted(k for k, v in required.items() if not v)
+    if missing:
+        raise PreflightRefusal(
+            f"board {policy.board!r} is in sandbox mode but declares no "
+            f"{missing}; 'unspecified' must never be read as 'unrestricted'"
+        )
+    for glob in tuple(policy.protected_paths) + tuple(policy.required_deny_globs):
+        if _SPACE in glob:
+            raise PreflightRefusal(
+                f"board {policy.board!r} declares the glob {glob!r}, which "
+                f"contains a literal space. fnmatch is literal on whitespace, "
+                f"so 'git   push' evades it. Use '*a*b*' form."
+            )
+
+
 # ---------------------------------------------------------------------------
-# Assertions 1-2, 5, 11-15 — path authorization
+# Path identity
 # ---------------------------------------------------------------------------
+
+
+def _identity(path: str) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
 
 
 def _under(path: str, root: str) -> bool:
-    """True when *path* is *root* or lives beneath it, by real path."""
     try:
         p = Path(os.path.realpath(path))
         r = Path(os.path.realpath(root))
@@ -180,163 +313,266 @@ def _under(path: str, root: str) -> bool:
     return p == r or r in p.parents
 
 
-def assert_path_authorized(task_id: str, path: str, policy: WorkspacePolicy) -> None:
-    """The workspace must be inside an authorized root and outside every
-    protected one.
+def pin_allowed_roots(policy: WorkspacePolicy) -> Dict[str, tuple]:
+    """Capture the filesystem identity of every authorized root.
 
-    Protected paths are checked on the **realpath**, so a symlink spelled
-    innocently cannot smuggle a worker into a canonical checkout — the defect
-    a reviewer demonstrated against the previous predicate, which canonicalized
-    the spelling but never asked whether the destination was allowed.
+    A root can be a symlink. Resolving it fresh on each check means it can be
+    retargeted between policy evaluation and worker release, and the later check
+    simply follows it. Pinning identity here is what makes
+    :func:`revalidate_allowed_roots` meaningful.
     """
-    real = os.path.realpath(path)
+    pinned: Dict[str, tuple] = {}
+    for root in policy.allowed_roots:
+        ident = _identity(root)
+        if ident is None:
+            raise PreflightRefusal(
+                f"board {policy.board!r} authorized root {root!r} does not "
+                f"exist or cannot be stat'd"
+            )
+        pinned[root] = ident
+    return pinned
 
-    for pattern in policy.protected_paths:
-        if _SPACE_IN_GLOB in pattern:
-            raise PreflightRefusal(
-                f"workspace_policy for board {policy.board!r} contains a glob "
-                f"with a literal space ({pattern!r}); fnmatch is literal on "
-                f"whitespace, so such a pattern is trivially evaded. Use "
-                f"'*a*b*' form."
-            )
-        if fnmatch.fnmatch(real, pattern) or fnmatch.fnmatch(path, pattern):
-            raise PreflightRefusal(
-                f"task {task_id} workspace {real!r} matches protected path "
-                f"{pattern!r}; refusing to launch a worker in a canonical, "
-                f"live, or otherwise protected checkout"
-            )
 
-    if policy.is_sandbox:
-        if not policy.allowed_roots:
-            raise PreflightRefusal(
-                f"board {policy.board!r} is in sandbox mode but declares no "
-                f"allowed_roots; refusing rather than treating 'unspecified' "
-                f"as 'anywhere'"
-            )
-        if not any(_under(real, root) for root in policy.allowed_roots):
-            raise PreflightRefusal(
-                f"task {task_id} workspace {real!r} is outside every authorized "
-                f"root {list(policy.allowed_roots)}"
-            )
+def revalidate_allowed_roots(task_id: str, authorized, policy: WorkspacePolicy,
+                             pinned: Optional[Dict[str, tuple]] = None) -> None:
+    """Re-check the roots, and that the workspace is still inside one.
+
+    Runs while the worker is still held at the start barrier.
+    """
+    if not policy.is_sandbox:
+        return
+    current = pin_allowed_roots(policy)
+    if pinned:
+        for root, ident in pinned.items():
+            if current.get(root) != ident:
+                raise PreflightRefusal(
+                    f"task {task_id}: authorized root {root!r} changed identity "
+                    f"after policy evaluation (symlink retargeted or directory "
+                    f"replaced)"
+                )
+    workspace = getattr(authorized, "path", str(authorized))
+    if not any(_under(workspace, root) for root in policy.allowed_roots):
+        raise PreflightRefusal(
+            f"task {task_id}: final workspace {workspace!r} is not inside any "
+            f"authorized root {list(policy.allowed_roots)}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Assertions 3-6 — fixture state
+# Git fixture state — inability to inspect is refusal
 # ---------------------------------------------------------------------------
 
 
-def _git_dir(path: str) -> Optional[Path]:
+def _git_dir(path: str) -> Path:
     p = Path(path) / ".git"
     if p.is_dir():
         return p
     if p.is_file():
-        # A linked worktree: .git is a file pointing at the real gitdir.
         try:
             text = p.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            return None
-        if text.startswith("gitdir:"):
-            target = Path(text.split(":", 1)[1].strip())
-            return target if target.exists() else None
-    return None
+        except OSError as exc:
+            raise PreflightRefusal(
+                f"fixture {path!r}: .git indirection could not be read ({exc})"
+            ) from exc
+        if not text.startswith("gitdir:"):
+            raise PreflightRefusal(
+                f"fixture {path!r}: .git file is not a gitdir indirection"
+            )
+        target = Path(text.split(":", 1)[1].strip())
+        if not target.exists():
+            raise PreflightRefusal(
+                f"fixture {path!r}: .git points at {target}, which does not exist"
+            )
+        return target
+    raise PreflightRefusal(
+        f"fixture {path!r} is not a git repository; an evaluation fixture must "
+        f"be an origin-less git checkout so its history can be asserted"
+    )
 
 
-def assert_fixture_state(task_id: str, path: str, policy: WorkspacePolicy) -> List[str]:
-    """Origin-less, alternate-free, secret-free, and free of untracked source.
+def _git(path: str, *args: str) -> str:
+    """Run git, refusing on failure, timeout, or a missing binary."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", path, *args],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise PreflightRefusal(
+            f"fixture {path!r}: git is not installed, so fixture state cannot "
+            f"be asserted"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PreflightRefusal(
+            f"fixture {path!r}: `git {' '.join(args)}` timed out"
+        ) from exc
+    if out.returncode != 0:
+        raise PreflightRefusal(
+            f"fixture {path!r}: `git {' '.join(args)}` failed "
+            f"(rc={out.returncode}): {(out.stderr or '').strip()[:200]}"
+        )
+    return out.stdout
 
-    ``git push`` having nowhere to go is defence in depth *beneath* the deny
-    globs, not a substitute for them. History cleanliness is asserted by the
-    fixture builder, not here — a full object-graph audit on every dispatch is
-    not affordable; what is checked here is that the fixture cannot reach a
-    canonical repository.
-    """
-    checks: List[str] = []
+
+def assert_no_remotes(path: str) -> None:
+    if _git(path, "remote").strip():
+        raise PreflightRefusal(
+            f"fixture {path!r} has a git remote; an evaluation fixture must be "
+            f"origin-less so a push has nowhere to go"
+        )
+
+
+def assert_no_alternates(path: str) -> None:
     gitdir = _git_dir(path)
+    alternates = gitdir / "objects" / "info" / "alternates"
+    if alternates.exists():
+        raise PreflightRefusal(
+            f"fixture {path!r} has an alternate object database ({alternates}); "
+            f"the canonical repository's objects are reachable from it"
+        )
 
-    if policy.require_origin_less and gitdir is not None:
-        config_path = gitdir / "config"
-        try:
-            text = config_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            text = ""
-        if '[remote "' in text:
+
+def assert_no_untracked_source(path: str) -> None:
+    out = _git(path, "status", "--porcelain", "--untracked-files=normal")
+    untracked = [
+        ln[3:] for ln in out.splitlines()
+        # The attestation is written INTO the fixture by the builder, so it is
+        # untracked by construction. Excluding it is not a loophole: its own
+        # contents are what assertion 14 verifies.
+        if ln.startswith("?? ") and ln[3:].strip() != ATTESTATION_FILENAME
+    ]
+    if untracked:
+        raise PreflightRefusal(
+            f"fixture {path!r} has untracked files ({untracked[:5]}); an "
+            f"evaluation fixture must be built from a clean archive so the "
+            f"answer cannot be sitting in the tree"
+        )
+
+
+def assert_no_secret_files(path: str) -> None:
+    base = Path(path)
+    for name in SECRET_FILENAMES:
+        if (base / name).exists():
             raise PreflightRefusal(
-                f"task {task_id} fixture {path!r} has a git remote configured; "
-                f"an evaluation fixture must be origin-less so a push has "
-                f"nowhere to go"
+                f"fixture {path!r} contains {name}; refusing to dispatch a "
+                f"worker into a directory carrying secrets or deploy config"
             )
-        checks.append("origin-less")
-
-    if policy.require_no_alternates and gitdir is not None:
-        alternates = gitdir / "objects" / "info" / "alternates"
-        if alternates.exists():
+    for name in SECRET_DIRNAMES:
+        if (base / name).is_dir():
             raise PreflightRefusal(
-                f"task {task_id} fixture {path!r} has an alternate object "
-                f"database ({alternates}); the canonical repository's objects "
-                f"are reachable from it"
+                f"fixture {path!r} contains {name}/; refusing to dispatch a "
+                f"worker into a directory carrying secrets or deploy config"
             )
-        checks.append("no-alternates")
-
-    if policy.require_no_secrets:
-        for name in SECRET_FILENAMES:
-            if (Path(path) / name).exists():
-                raise PreflightRefusal(
-                    f"task {task_id} fixture {path!r} contains {name}; refusing "
-                    f"to dispatch a worker into a directory carrying secrets or "
-                    f"deploy configuration"
-                )
-        for name in SECRET_DIRNAMES:
-            if (Path(path) / name).is_dir():
-                raise PreflightRefusal(
-                    f"task {task_id} fixture {path!r} contains {name}/; refusing "
-                    f"to dispatch a worker into a directory carrying secrets or "
-                    f"deploy configuration"
-                )
-        checks.append("no-secrets")
-
-    if policy.require_no_untracked_source and gitdir is not None:
-        import subprocess
-
-        try:
-            out = subprocess.run(
-                ["git", "-C", path, "status", "--porcelain", "--untracked-files=normal"],
-                capture_output=True, text=True, timeout=30,
-            )
-            untracked = [
-                ln[3:] for ln in out.stdout.splitlines() if ln.startswith("?? ")
-            ]
-        except Exception:
-            untracked = []
-        if untracked:
-            raise PreflightRefusal(
-                f"task {task_id} fixture {path!r} has untracked files "
-                f"({untracked[:5]}); an evaluation fixture must be built from a "
-                f"clean archive so the answer cannot be sitting in the tree"
-            )
-        checks.append("no-untracked-source")
-
-    return checks
 
 
 # ---------------------------------------------------------------------------
-# Assertions 7-8 — the sandbox HERMES_HOME
+# Fixture-build attestation
 # ---------------------------------------------------------------------------
 
 
-def _looks_like_credential_file(path: Path) -> bool:
-    name = path.name.lower()
-    return any(hint in name for hint in _CREDENTIAL_FILE_HINTS)
+def fixture_identity(path: str) -> dict:
+    """Immutable git identity: HEAD, refs, object inventory, reflogs, alternates.
+
+    Cheap enough to recompute per dispatch on an evaluation fixture, which is
+    what makes a build-time attestation verifiable at dispatch time instead of
+    re-auditing the object graph.
+    """
+    gitdir = _git_dir(path)
+    head = _git(path, "rev-parse", "HEAD").strip()
+    refs = _git(path, "show-ref", "--head")
+    objects = _git(path, "rev-list", "--objects", "--all")
+    reflog_digest = "none"
+    logs = gitdir / "logs"
+    if logs.exists():
+        h = hashlib.sha256()
+        for dirpath, _d, files in os.walk(logs):
+            for fname in sorted(files):
+                try:
+                    h.update((Path(dirpath) / fname).read_bytes())
+                except OSError as exc:
+                    raise PreflightRefusal(
+                        f"fixture {path!r}: reflog {fname} could not be read "
+                        f"({exc})"
+                    ) from exc
+        reflog_digest = h.hexdigest()
+    # Remotes are part of the attested identity: an origin-less fixture that
+    # later gains a remote has drifted from what was audited, even though its
+    # objects and refs are untouched.
+    remotes = _git(path, "remote", "-v")
+    return {
+        "version": ATTESTATION_VERSION,
+        "head": head,
+        "remotes_sha256": hashlib.sha256(remotes.encode()).hexdigest(),
+        "refs_sha256": hashlib.sha256(refs.encode()).hexdigest(),
+        "objects_sha256": hashlib.sha256(objects.encode()).hexdigest(),
+        "object_count": len([ln for ln in objects.splitlines() if ln.strip()]),
+        "reflog_sha256": reflog_digest,
+        "has_alternates": (gitdir / "objects" / "info" / "alternates").exists(),
+    }
 
 
-def scan_for_key_material(
-    home: str, *, forbidden_sha256: tuple = ()
-) -> List[str]:
-    """Report PATHS that carry credential-shaped material. Never values.
+def build_fixture_attestation(path: str, *, build_source: str = "",
+                              policy_version: str = "") -> dict:
+    """Builder-side: record what this fixture was, once, at build time.
 
-    Returns a list of ``"<path> (<reason>)"`` strings. No secret is returned,
-    logged, or placed in a refusal message: the caller learns *where* to look,
-    never *what* is there. Digest comparison lets an operator pin a specific
-    forbidden key without the digest revealing it.
+    INTEGRITY, NOT SECURITY. The attestation lives in the fixture and is
+    writable by the same user as everything else here. It proves the fixture has
+    not *drifted* since it was built; it cannot stop someone who edits both the
+    fixture and the attestation.
+    """
+    identity = fixture_identity(path)
+    identity["build_source"] = build_source
+    identity["policy_version"] = policy_version
+    target = Path(path) / ATTESTATION_FILENAME
+    target.write_text(json.dumps(identity, indent=2, sort_keys=True),
+                      encoding="utf-8")
+    return identity
+
+
+def verify_fixture_attestation(task_id: str, path: str) -> None:
+    """Dispatch-side: the fixture is still exactly what the builder attested."""
+    target = Path(path) / ATTESTATION_FILENAME
+    if not target.exists():
+        raise PreflightRefusal(
+            f"task {task_id}: fixture {path!r} carries no build attestation "
+            f"({ATTESTATION_FILENAME}); its history cannot be asserted at "
+            f"dispatch time"
+        )
+    try:
+        recorded = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PreflightRefusal(
+            f"task {task_id}: fixture attestation could not be read ({exc})"
+        ) from exc
+    if recorded.get("version") != ATTESTATION_VERSION:
+        raise PreflightRefusal(
+            f"task {task_id}: fixture attestation version "
+            f"{recorded.get('version')!r} is not {ATTESTATION_VERSION}"
+        )
+    current = fixture_identity(path)
+    for key in ("head", "refs_sha256", "objects_sha256", "object_count",
+                "reflog_sha256", "has_alternates", "remotes_sha256"):
+        if recorded.get(key) != current.get(key):
+            raise PreflightRefusal(
+                f"task {task_id}: fixture {path!r} has drifted from its build "
+                f"attestation ({key} differs); rebuild the fixture"
+            )
+
+
+# ---------------------------------------------------------------------------
+# HERMES_HOME
+# ---------------------------------------------------------------------------
+
+
+def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
+                          strict: bool = True) -> List[str]:
+    """Report PATHS carrying credential-shaped material. Never values.
+
+    Eligible local files ARE read, in binary, for prefix and digest detection.
+    Matched credential values are never returned, logged, or placed in a refusal
+    message: the caller learns *where* to look, never *what* is there. An
+    eligible file that cannot be read is reported as a finding under ``strict``
+    — inability to inspect is not evidence of cleanliness.
     """
     findings: List[str] = []
     root = Path(home)
@@ -349,183 +585,341 @@ def scan_for_key_material(
                 if fpath.stat().st_size > 1_000_000:
                     continue
                 blob = fpath.read_bytes()
-            except OSError:
+            except OSError as exc:
+                if strict:
+                    findings.append(f"{fpath} (unreadable: {exc.strerror})")
                 continue
             if forbidden_sha256:
-                digest = hashlib.sha256(blob).hexdigest()
-                if digest in forbidden_sha256:
+                if hashlib.sha256(blob).hexdigest() in forbidden_sha256:
                     findings.append(f"{fpath} (matches a forbidden key digest)")
                     continue
             if any(prefix in blob for prefix in _KEY_PREFIXES):
                 findings.append(f"{fpath} (contains provider key material)")
-            elif _looks_like_credential_file(fpath) and blob.strip():
+            elif any(h in fname.lower() for h in _CREDENTIAL_FILE_HINTS) and blob.strip():
                 findings.append(f"{fpath} (credential-shaped filename)")
     return findings
 
 
 def assert_hermes_home(task_id: str, policy: WorkspacePolicy,
-                       *, home: Optional[str] = None) -> List[str]:
+                       *, home: Optional[str] = None) -> None:
     resolved = home or os.environ.get("HERMES_HOME") or ""
     if not resolved:
         raise PreflightRefusal(
             f"task {task_id}: HERMES_HOME is not set, so the worker's "
             f"configuration root cannot be confined"
         )
-    if policy.hermes_home_root and not _under(resolved, policy.hermes_home_root):
+    if not os.path.isdir(resolved):
+        raise PreflightRefusal(
+            f"task {task_id}: HERMES_HOME {resolved!r} is not a directory"
+        )
+    if not policy.hermes_home_root or not _under(resolved, policy.hermes_home_root):
         raise PreflightRefusal(
             f"task {task_id}: HERMES_HOME {resolved!r} is outside the sandbox "
             f"root {policy.hermes_home_root!r}"
         )
+
+
+def assert_no_live_key(task_id: str, policy: WorkspacePolicy,
+                       *, home: Optional[str] = None) -> None:
+    resolved = home or os.environ.get("HERMES_HOME") or ""
     findings = scan_for_key_material(
-        resolved, forbidden_sha256=policy.forbidden_key_sha256
+        resolved, forbidden_sha256=policy.forbidden_key_sha256, strict=True
     )
     if findings:
         raise PreflightRefusal(
-            f"task {task_id}: live key material is present under HERMES_HOME. "
-            f"Locations only (values are never read out): {findings[:5]}"
+            f"task {task_id}: credential material (or unreadable files) under "
+            f"HERMES_HOME. Locations only, values are never read out: "
+            f"{findings[:5]}"
         )
-    return ["hermes-home-confined", "no-live-key"]
 
 
 # ---------------------------------------------------------------------------
-# Assertions 9, 10, 16-20 — the resolved guard matrix
+# Command guards — the shipped ones, executed directly
 # ---------------------------------------------------------------------------
 
 
-def assert_command_guards(task_id: str, policy: WorkspacePolicy,
-                          *, config: Any = None) -> List[str]:
-    """Re-run the guard matrix against the RESOLVED config, every dispatch.
-
-    Re-executed per dispatch rather than once at setup: a config edit between
-    two dispatches must not silently widen what a worker may run.
-    """
-    checks: List[str] = []
-    if config is None:
-        try:
-            from hermes_cli.config import load_config
-
-            config = load_config()
-        except Exception:
-            config = {}
-    approvals = (config or {}).get("approvals") or {}
-
-    if policy.require_single_query_deny:
-        mode = str(approvals.get("single_query_mode", "")).strip().lower()
-        if mode != "deny":
-            raise PreflightRefusal(
-                f"task {task_id}: approvals.single_query_mode is {mode!r}, not "
-                f"'deny'. Kanban workers run as single-query (-q) sessions, and "
-                f"'deny' is what blocks execute_code entirely for them"
-            )
-        checks.append("single_query_mode=deny")
-
-    if policy.required_deny_globs:
-        configured = set(_as_tuple(approvals.get("deny")))
-        missing = [g for g in policy.required_deny_globs if g not in configured]
-        if missing:
-            raise PreflightRefusal(
-                f"task {task_id}: approvals.deny is missing required globs "
-                f"{missing}"
-            )
-        bad = [g for g in configured if _SPACE_IN_GLOB in g]
-        if bad:
-            raise PreflightRefusal(
-                f"task {task_id}: approvals.deny contains globs with literal "
-                f"spaces {bad}; fnmatch is literal on whitespace, so "
-                f"'git   push' evades them. Use '*a*b*' form."
-            )
-        checks.append("deny-globs-present")
-
-    if policy.prohibited_commands:
-        leaked = [c for c in policy.prohibited_commands
-                  if not _command_is_blocked(c, approvals)]
-        if leaked:
-            raise PreflightRefusal(
-                f"task {task_id}: prohibited commands are not blocked by the "
-                f"resolved deny set: {leaked[:5]}"
-            )
-        checks.append("prohibited-matrix-blocked")
-
-    if policy.allowed_commands:
-        false_positives = [c for c in policy.allowed_commands
-                           if _command_is_blocked(c, approvals)]
-        if false_positives:
-            raise PreflightRefusal(
-                f"task {task_id}: legitimate commands are blocked by the deny "
-                f"set: {false_positives[:5]}"
-            )
-        checks.append("no-false-positives")
-
-    return checks
-
-
-def _command_is_blocked(command: str, approvals: dict) -> bool:
-    """True when the resolved deny set matches *command*.
-
-    Matched against the deobfuscated variants Hermes already computes, so
-    ``GIT_DIR=. git   push`` is judged the same as ``git push``.
-    """
-    patterns = _as_tuple(approvals.get("deny"))
-    if not patterns:
-        return False
+def _resolved_approvals(config: Any = None) -> dict:
+    if config is not None:
+        return (config or {}).get("approvals") or {}
     try:
-        from tools.approval import _command_detection_variants as _variants
+        from hermes_cli.config import load_config_readonly
 
-        candidates = list(_variants(command))
-    except Exception:
-        candidates = [command, " ".join(command.split())]
-    if command not in candidates:
-        candidates.append(command)
-    for cand in candidates:
-        for pattern in patterns:
-            if fnmatch.fnmatch(cand, pattern):
-                return True
-    return False
+        return (load_config_readonly() or {}).get("approvals") or {}
+    except Exception as exc:
+        raise PreflightRefusal(
+            f"the resolved approvals config could not be read ({exc}); "
+            f"command guards cannot be asserted"
+        ) from exc
+
+
+def assert_single_query_deny(task_id: str, config: Any = None) -> None:
+    mode = str(_resolved_approvals(config).get("single_query_mode", "")).strip().lower()
+    if mode != "deny":
+        raise PreflightRefusal(
+            f"task {task_id}: approvals.single_query_mode is {mode!r}, not "
+            f"'deny'. Kanban workers run as single-query (-q) sessions, and "
+            f"'deny' is what blocks execute_code entirely for them"
+        )
+
+
+def assert_required_deny_globs(task_id: str, policy: WorkspacePolicy,
+                               config: Any = None) -> None:
+    configured = set(_as_tuple(_resolved_approvals(config).get("deny")))
+    missing = [g for g in policy.required_deny_globs if g not in configured]
+    if missing:
+        raise PreflightRefusal(
+            f"task {task_id}: approvals.deny is missing required globs {missing}"
+        )
+    bad = [g for g in configured if _SPACE in g]
+    if bad:
+        raise PreflightRefusal(
+            f"task {task_id}: approvals.deny contains globs with literal spaces "
+            f"{bad}; 'git   push' evades them. Use '*a*b*' form."
+        )
+
+
+def shipped_guard_blocks(command: str) -> bool:
+    """Ask Hermes' OWN command guard, not a re-implementation.
+
+    An earlier revision matched ``fnmatch`` against the deny list itself. That
+    can drift from runtime semantics, and drift is exactly what an assertion is
+    supposed to catch. This calls the shipped path so the assertion measures what
+    a worker would actually hit.
+    """
+    from tools.approval import check_all_command_guards
+
+    result = check_all_command_guards(command, "local")
+    return not bool((result or {}).get("approved", True))
+
+
+def shipped_guard_refuses_execute_code(code: str) -> bool:
+    """Ask Hermes' OWN execute_code guard, in the condition a worker runs in.
+
+    Kanban workers are single-query (``-q``) sessions, and the guard only
+    consults ``approvals.single_query_mode`` when it is IN one — it is
+    documented to auto-approve an ordinary local non-interactive session. Probing
+    it without that condition would measure a session shape no worker ever has,
+    and report a refusal that never happens.
+
+    ``HERMES_SINGLE_QUERY_SESSION`` is therefore set for the duration of the
+    probe and restored immediately. The dispatcher runs no tools of its own, so
+    the window affects nothing else.
+    """
+    from tools.approval import check_execute_code_guard
+
+    key = "HERMES_SINGLE_QUERY_SESSION"
+    previous = os.environ.get(key)
+    os.environ[key] = "1"
+    try:
+        result = check_execute_code_guard(code, "local")
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+    return not bool((result or {}).get("approved", True))
+
+
+def assert_prohibited_matrix(task_id: str, policy: WorkspacePolicy) -> None:
+    leaked = [c for c in policy.prohibited_commands if not shipped_guard_blocks(c)]
+    if leaked:
+        raise PreflightRefusal(
+            f"task {task_id}: Hermes' own command guard does NOT block "
+            f"{leaked[:5]}"
+        )
+
+
+def assert_allowed_matrix(task_id: str, policy: WorkspacePolicy) -> None:
+    blocked = [c for c in policy.allowed_commands if shipped_guard_blocks(c)]
+    if blocked:
+        raise PreflightRefusal(
+            f"task {task_id}: legitimate commands are blocked by the resolved "
+            f"guard: {blocked[:5]}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# The single entry point the dispatcher calls
+# Entry points
 # ---------------------------------------------------------------------------
+
+
+def _check(report: PolicyReport, assertion_id: int, fn) -> None:
+    """Run one assertion, record PASS, or record FAIL and re-raise."""
+    try:
+        fn()
+    except PreflightRefusal as exc:
+        report.record(assertion_id, FAIL, str(exc))
+        raise
+    report.record(assertion_id, PASS)
+
+
+def assert_path_authorized(task_id: str, path: str, policy: WorkspacePolicy,
+                           report: Optional[PolicyReport] = None) -> None:
+    real = os.path.realpath(path)
+    for pattern in policy.protected_paths:
+        if _SPACE in pattern:
+            raise PreflightRefusal(
+                f"workspace_policy for board {policy.board!r} contains a glob "
+                f"with a literal space ({pattern!r}); use '*a*b*' form"
+            )
+        if fnmatch.fnmatch(real, pattern) or fnmatch.fnmatch(path, pattern):
+            raise PreflightRefusal(
+                f"task {task_id} workspace {real!r} matches protected path "
+                f"{pattern!r}; refusing to launch a worker in a canonical, "
+                f"live, or otherwise protected checkout"
+            )
+    if policy.is_sandbox and not any(
+        _under(real, root) for root in policy.allowed_roots
+    ):
+        raise PreflightRefusal(
+            f"task {task_id} workspace {real!r} is outside every authorized "
+            f"root {list(policy.allowed_roots)}"
+        )
 
 
 def enforce(task_id: str, intended_path: str, *, board: Optional[str] = None,
             policy: Optional[WorkspacePolicy] = None,
             config: Any = None) -> PolicyReport:
-    """Run every assertion this board's policy demands. Raises to refuse.
+    """PRE-CLAIM gate. Judges the DECLARED destination, creating nothing.
 
-    Called from the dispatcher BEFORE the task is claimed, so a refusal creates
-    no claim, no ``task_runs`` row, no session, and no worker.
+    Deliberately partial: the fixture does not exist yet for a scratch or
+    worktree task, so fixture-state assertions cannot run here and are recorded
+    ``SKIPPED``. :func:`enforce_final` is what runs the complete set against the
+    real artifact, while the worker is still held at the start barrier. This
+    function therefore never reports the contract satisfied.
     """
     pol = policy or resolve_policy(board, config=config)
     report = PolicyReport(board=pol.board, mode=pol.mode)
+    assert_policy_wellformed(pol)
 
     assert_path_authorized(task_id, intended_path, pol)
-    report.passed.append("path-authorized")
+    report.record(2, PASS if pol.is_sandbox else SKIPPED,
+                  "" if pol.is_sandbox else "open mode")
+    report.record(12, PASS)
+    report.record(11, PASS if pol.protected_paths else SKIPPED,
+                  "" if pol.protected_paths else "no protected paths declared")
 
-    if not pol.is_sandbox:
-        report.skipped.extend([
-            "allowed-root", "fixture-state", "hermes-home", "command-guards",
-        ])
-        return report
-
-    report.passed.extend(assert_fixture_state(task_id, intended_path, pol))
-    report.passed.extend(assert_hermes_home(task_id, pol))
-    report.passed.extend(assert_command_guards(task_id, pol, config=config))
+    for aid in sorted(REQUIRED_ASSERTION_IDS - {2, 11, 12}):
+        report.record(aid, SKIPPED, "deferred to enforce_final (pre-claim stage)")
     return report
 
 
-def policy_status(board: Optional[str] = None, *, config: Any = None) -> dict:
-    """Machine-readable "is this board actually contained?" answer."""
-    pol = resolve_policy(board, config=config)
-    return {
+def enforce_final(task_id: str, workspace: str, *,
+                  policy: WorkspacePolicy,
+                  launch=None,
+                  pinned_roots: Optional[Dict[str, tuple]] = None,
+                  config: Any = None,
+                  home: Optional[str] = None) -> PolicyReport:
+    """FINAL gate, against the PROVISIONED workspace, before the worker runs.
+
+    Called while the worker is held at the start barrier, so every assertion is
+    made about the artifact the worker will actually see — not the anchor that
+    was planned before provisioning, which an earlier revision checked instead.
+    """
+    report = PolicyReport(board=policy.board, mode=policy.mode)
+    if not policy.is_sandbox:
+        for aid in sorted(REQUIRED_ASSERTION_IDS):
+            report.record(aid, SKIPPED, "open mode: explicitly unconfined")
+        return report
+
+    assert_policy_wellformed(policy)
+
+    from hermes_cli.dispatch_confinement import VERIFIED
+
+    def _cwd_verified():
+        status = getattr(launch, "status", None)
+        if status != VERIFIED:
+            raise PreflightRefusal(
+                f"task {task_id}: the worker's actual working directory was not "
+                f"independently verified (status={status!r})"
+            )
+        observed = os.path.realpath(getattr(launch, "observed_cwd", "") or "")
+        if observed != os.path.realpath(workspace):
+            raise PreflightRefusal(
+                f"task {task_id}: verified cwd {observed!r} is not the final "
+                f"workspace {workspace!r}"
+            )
+
+    _check(report, 1, _cwd_verified)
+    _check(report, 2, lambda: assert_path_authorized(task_id, workspace, policy))
+    _check(report, 15, lambda: _git_dir(workspace))
+    _check(report, 3, lambda: assert_no_remotes(workspace))
+    _check(report, 4, lambda: assert_no_alternates(workspace))
+    _check(report, 5, lambda: assert_no_secret_files(workspace))
+    _check(report, 6, lambda: assert_no_untracked_source(workspace))
+    _check(report, 7, lambda: assert_hermes_home(task_id, policy, home=home))
+    _check(report, 8, lambda: assert_no_live_key(task_id, policy, home=home))
+    _check(report, 9, lambda: assert_single_query_deny(task_id, config))
+    _check(report, 10, lambda: assert_required_deny_globs(task_id, policy, config))
+    _check(report, 11, lambda: assert_policy_wellformed(policy))
+    _check(report, 12, lambda: assert_path_authorized(task_id, workspace, policy))
+    _check(report, 13, lambda: revalidate_allowed_roots(
+        task_id, workspace, policy, pinned_roots))
+    _check(report, 14, lambda: (
+        verify_fixture_attestation(task_id, workspace)
+        if policy.require_attestation else None))
+    _check(report, 16, lambda: assert_prohibited_matrix(task_id, policy))
+    _check(report, 17, lambda: assert_allowed_matrix(task_id, policy))
+    _check(report, 18, lambda: _require(
+        shipped_guard_blocks(GUARD_PROBE_PUSH),
+        f"task {task_id}: Hermes' command guard does not block "
+        f"{GUARD_PROBE_PUSH!r}"))
+    _check(report, 19, lambda: _require(
+        shipped_guard_blocks(GUARD_PROBE_VERCEL),
+        f"task {task_id}: Hermes' command guard does not block "
+        f"{GUARD_PROBE_VERCEL!r}"))
+    _check(report, 20, lambda: _require(
+        shipped_guard_refuses_execute_code(GUARD_PROBE_CODE),
+        f"task {task_id}: Hermes' execute_code guard does not refuse a "
+        f"push-issuing script"))
+    return report
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise PreflightRefusal(message)
+
+
+def policy_status(board: Optional[str] = None, *, config: Any = None,
+                  last_report: Optional[PolicyReport] = None) -> dict:
+    """Configuration readiness, or evidence from a real run. Never inference.
+
+    ``contract_satisfied`` is reported ONLY from a ``PolicyReport`` produced by
+    :func:`enforce_final`. Without one this returns ``configured_ready`` — is
+    this board *capable* of satisfying the contract — which is a different
+    question and is labelled as such.
+    """
+    try:
+        pol = resolve_policy(board, config=config)
+    except PreflightRefusal as exc:
+        return {"board": board or "default", "mode": "malformed",
+                "configured_ready": False, "contract_satisfied": False,
+                "note": f"policy is malformed: {exc}"}
+    ready = False
+    detail = ""
+    if pol.is_sandbox:
+        try:
+            assert_policy_wellformed(pol)
+            ready = True
+        except PreflightRefusal as exc:
+            detail = str(exc)
+    status = {
         "board": pol.board,
         "mode": pol.mode,
-        "contract_satisfied": pol.is_sandbox,
+        "configured_ready": ready,
+        "contract_satisfied": (
+            bool(last_report.contract_satisfied) if last_report else False
+        ),
+        "evidence": last_report.summary() if last_report else None,
         "note": (
-            "sandbox mode: the full confinement assertion set runs before every "
-            "dispatch"
-            if pol.is_sandbox else
-            "open mode: only launch-directory checks run. This board does NOT "
-            "satisfy the confinement contract."
+            "open mode: EXPLICITLY UNCONFINED legacy behaviour. Launch checks "
+            "only. This board does NOT satisfy the confinement contract."
+            if not pol.is_sandbox else
+            ("sandbox mode, policy complete: the twenty assertions run against "
+             "the final workspace before each worker is released. "
+             "contract_satisfied reflects the last recorded run, not the config."
+             if ready else
+             f"sandbox mode, policy INCOMPLETE: {detail}")
         ),
     }
+    return status

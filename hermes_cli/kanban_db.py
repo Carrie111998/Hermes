@@ -11479,75 +11479,164 @@ def _spawn_verified(
     spawn_fn,
     result: "DispatchResult",
 ):
-    """Spawn a worker and prove where it actually started.
+    """Spawn a worker, prove where it started, and only then let it run.
 
-    ONE path for both dispatch lanes. The review lane previously called the
-    spawner directly, so a custom review spawner bypassed every check — the
-    guard is no longer something a lane remembers to call.
+    ONE path for both dispatch lanes.
 
-    Returns the pid. Raises to the caller's spawn-failure handler when the
-    worker cannot be confirmed to have started where it was authorized to, after
-    terminating it.
+    SANDBOX vs OPEN — the difference is the whole point:
+
+    * ``sandbox`` is **fail-closed**. The worker is launched already waiting at a
+      cooperative start barrier and is released only after its final workspace
+      and root identities revalidate, its actual working directory is observed
+      from the OS, an owned process handle is bound, and the audit row is
+      durably stored. Any failure — including an unobservable launch, a
+      self-reported one, a malformed spawn result, or a persistence error —
+      terminates the entire owned worker tree before the claim is released.
+    * ``open`` is **explicitly unconfined legacy behaviour**. There is no
+      barrier, and an unobservable launch is recorded as unverified and allowed
+      to continue. Boards in this mode do not satisfy the confinement contract
+      and every status surface says so.
+
+    Returns the pid. Raises to the caller's spawn-failure handler on refusal,
+    after cleanup.
     """
     from hermes_cli import dispatch_confinement as _dc
+    from hermes_cli import workspace_policy as _wp
+
+    policy = _wp.resolve_policy(board)
+    sandbox = policy.is_sandbox
 
     authorized = _dc.authorize_workspace(claimed.id, workspace)
-    # Re-check identity immediately before the spawn: a symlink retargeted (or a
-    # directory swapped) after provisioning leaves the path string identical.
     _dc.revalidate_at_spawn(claimed.id, authorized)
+    # Pin the authorized roots BEFORE the spawn so a root symlink retargeted
+    # afterwards is detected rather than followed.
+    pinned_roots = _wp.pin_allowed_roots(policy) if sandbox else None
+
+    barrier = None
+    spawn_env = {}
+    if sandbox:
+        barrier = _dc.StartBarrier.create(
+            str(kanban_home() / "run" / "barriers"), claimed.id
+        )
+        spawn_env = barrier.env()
 
     _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-    # Back-compat: older spawn_fn signatures accept only (task, workspace).
     import inspect
     try:
-        sig = inspect.signature(_spawn)
-        supports_board = "board" in sig.parameters
+        params = inspect.signature(_spawn).parameters
     except (TypeError, ValueError):
-        supports_board = False
-    if supports_board:
-        raw = _spawn(claimed, authorized.path, board=board)
-    else:
-        raw = _spawn(claimed, authorized.path)
+        params = {}
+    kwargs = {}
+    if "board" in params:
+        kwargs["board"] = board
+    if spawn_env and "env_vars" in params:
+        kwargs["env_vars"] = dict(spawn_env)
+    elif spawn_env:
+        # A spawner that cannot carry the barrier env cannot be held. Rather
+        # than silently starting an unbarriered worker in sandbox mode, refuse.
+        if sandbox:
+            barrier.abort()
+            raise _dc.PreflightRefusal(
+                f"task {claimed.id}: sandbox mode requires a spawner that "
+                f"accepts env_vars so the start barrier can be passed; "
+                f"{getattr(_spawn, '__name__', _spawn)!r} does not"
+            )
 
-    pid, reported_cwd = _dc.normalize_spawn_result(raw)
-    verification = _dc.verify_launch(claimed.id, authorized, pid, reported_cwd)
+    owned = None
+    try:
+        raw = _spawn(claimed, authorized.path, **kwargs)
+        pid, reported_cwd = _dc.normalize_spawn_result(raw)
 
-    if verification.status == _dc.MISMATCH:
-        # A spawner that launched elsewhere. Stop the worker, then fail the
-        # dispatch closed through the caller's handler, which releases the claim.
-        _dc.terminate_escaped_worker(pid)
+        if sandbox and not pid:
+            raise _dc.LaunchVerificationError(
+                f"task {claimed.id}: spawner returned no usable pid "
+                f"({raw!r}); a worker that cannot be identified cannot be "
+                f"contained"
+            )
+
+        owned = _dc.own_process(pid)
+        if sandbox and owned is None:
+            raise _dc.LaunchVerificationError(
+                f"task {claimed.id}: the spawned process could not be bound to "
+                f"an owned handle (pid={pid}); it cannot be verified or cleaned "
+                f"up"
+            )
+
+        verification = _dc.verify_launch(
+            claimed.id, authorized, pid, reported_cwd
+        )
+
+        if verification.status == _dc.MISMATCH:
+            raise _dc.LaunchVerificationError(verification.detail)
+
+        if sandbox and verification.status != _dc.VERIFIED:
+            # unobservable, or self-reported with no corroboration.
+            raise _dc.LaunchVerificationError(verification.detail)
+
+        # Final revalidation while the worker is still held: the workspace and
+        # the authorized root must still be what policy approved.
+        _dc.revalidate_at_spawn(claimed.id, authorized)
+        if sandbox:
+            _wp.revalidate_allowed_roots(
+                claimed.id, authorized, policy, pinned_roots)
+            final_report = _wp.enforce_final(
+                claimed.id, authorized.path, policy=policy,
+                launch=verification, pinned_roots=pinned_roots,
+            )
+            if not final_report.contract_satisfied:
+                raise _dc.PreflightRefusal(
+                    f"task {claimed.id}: the confinement contract was not "
+                    f"satisfied for the final workspace: "
+                    f"{final_report.summary()}"
+                )
+            _record_confinement_event(
+                conn, claimed.id, "confinement_verified",
+                final_report.summary(),
+            )
+
+        if pid:
+            _set_worker_pid(conn, claimed.id, int(pid))
+
+        if verification.status == _dc.VERIFIED:
+            run_id = claimed.current_run_id
+            if run_id is None:
+                row = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id = ?", (claimed.id,)
+                ).fetchone()
+                run_id = row["current_run_id"] if row else None
+            record_observed_cwd(conn, run_id, verification.observed_cwd)
+        else:
+            _record_confinement_event(
+                conn, claimed.id, "confinement_unverified",
+                {"reason": verification.detail,
+                 "authorized_cwd": authorized.path,
+                 "mode": policy.mode},
+            )
+            result.unverified_launch.append(claimed.id)
+
+    except Exception as exc:
+        # A process may already exist. Every failure after that point owns the
+        # cleanup: reporting a dispatch closed while a worker keeps running is
+        # the outcome this exists to prevent.
+        if barrier is not None:
+            barrier.abort()
+        termination = _dc.terminate_worker_tree(owned) if owned else None
+        detail = str(exc)
+        if termination is not None and not termination.ok:
+            detail = f"{detail}; CLEANUP INCOMPLETE: {termination.detail}"
         _record_confinement_event(
             conn, claimed.id, "confinement_violation",
-            {"reason": verification.detail,
-             "observed_cwd": verification.observed_cwd,
-             "authorized_cwd": authorized.path},
+            {"reason": detail,
+             "authorized_cwd": authorized.path,
+             "mode": policy.mode,
+             "cleanup_ok": bool(termination.ok) if termination else None},
         )
-        raise _dc.LaunchVerificationError(verification.detail)
+        raise type(exc)(detail) if isinstance(exc, _dc.LaunchVerificationError) else exc
 
-    if pid:
-        _set_worker_pid(conn, claimed.id, int(pid))
-
-    if verification.status == _dc.VERIFIED:
-        # Mandatory: a confined launch that cannot be evidenced is not one.
-        run_id = claimed.current_run_id
-        if run_id is None:
-            row = conn.execute(
-                "SELECT current_run_id FROM tasks WHERE id = ?", (claimed.id,)
-            ).fetchone()
-            run_id = row["current_run_id"] if row else None
-        record_observed_cwd(conn, run_id, verification.observed_cwd)
-    else:
-        # Unobservable. Explicitly NOT confined: observed_cwd stays NULL rather
-        # than recording the path we asked for, and the task is reported so the
-        # gap is visible instead of silently passing as verified.
-        _record_confinement_event(
-            conn, claimed.id, "confinement_unverified",
-            {"reason": verification.detail,
-             "authorized_cwd": authorized.path},
-        )
-        result.unverified_launch.append(claimed.id)
+    # Everything passed. Only now may the worker begin.
+    if barrier is not None:
+        barrier.release()
     return pid
-
 
 
 def _default_spawn(
@@ -11555,6 +11644,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    env_vars: Optional[dict] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -11678,6 +11768,11 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Extra env from the dispatcher — currently the cooperative start barrier,
+    # which holds a sandbox worker at CLI entry until confinement is proven.
+    for key, value in (env_vars or {}).items():
+        env[str(key)] = str(value)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

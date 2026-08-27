@@ -69,6 +69,15 @@ from typing import Any, Optional, Tuple
 VERIFIED = "verified"
 MISMATCH = "mismatch"
 UNOBSERVABLE = "unobservable"
+# A spawner said where it launched, but nothing corroborated it. Telemetry —
+# never evidence. See verify_launch.
+REPORTED_ONLY = "reported-only"
+
+# How long a sandbox worker waits to be released before giving up. A worker
+# that is never released must exit rather than sit forever holding a claim.
+START_BARRIER_TIMEOUT_SECONDS = 120
+START_BARRIER_ENV = "HERMES_KANBAN_START_BARRIER"
+_BARRIER_GO = "GO"
 
 
 class PreflightRefusal(RuntimeError):
@@ -322,70 +331,321 @@ def verify_launch(
 ) -> LaunchVerification:
     """Decide whether the worker actually started where it was authorized to.
 
-    Three outcomes, and the difference between the last two matters:
+    **Only an independent observation of the process can produce VERIFIED.**
 
-    * ``verified``   — the OS (or a spawner report corroborated by identity)
-      places the child in the authorized directory.
-    * ``mismatch``   — the child is somewhere else. Fails closed.
-    * ``unobservable`` — nothing could be read. **Not** confined, not claimed to
-      be. A legacy spawner that returns only a pid for a process Hermes cannot
-      inspect lands here, and must not be labelled confined merely for having
-      returned a pid.
+    A previous revision fell back to the spawner's own ``observed_cwd`` when the
+    OS could not be read, and marked the launch verified if that *string*
+    resolved to the authorized inode. A spawner that ignored its workspace and
+    launched elsewhere could therefore report the authorized path and be
+    believed — the exact failure the observation was added to catch. A report is
+    now telemetry: it is recorded, it can still produce a MISMATCH (a spawner
+    naming somewhere unauthorized is taken at its word for refusal), but it can
+    never produce VERIFIED.
+
+    Four outcomes:
+
+    * ``verified``      — the OS places the child in the authorized directory.
+    * ``mismatch``      — observed, or self-reported, somewhere else. Fails closed.
+    * ``reported-only`` — a report with no corroboration. Not confined.
+    * ``unobservable``  — nothing could be read at all. Not confined.
+
+    The last two differ from ``verified`` in exactly the way that matters: in
+    sandbox mode the caller must terminate the worker. Only an authenticated
+    adapter that attests the process independently could raise a report to
+    evidence, and no such adapter exists.
     """
     observer = _observer or observe_process_cwd
     observed = observer(pid)
-    source = "process"
-    if observed is None and reported_cwd:
-        observed = str(reported_cwd)
-        source = "spawner-reported"
 
-    if observed is None:
+    if observed is not None:
+        if authorized.matches(observed):
+            return LaunchVerification(
+                pid=pid, observed_cwd=os.path.realpath(observed), status=VERIFIED,
+                detail=f"task {task_id}: launch directory verified by OS observation",
+            )
         return LaunchVerification(
-            pid=pid, observed_cwd=None, status=UNOBSERVABLE,
+            pid=pid, observed_cwd=observed, status=MISMATCH,
             detail=(
-                f"task {task_id}: the launch directory could not be observed "
-                f"(pid={pid}); this launch is NOT verified as confined"
+                f"task {task_id}: worker launched in {observed!r} but was "
+                f"authorized for {authorized.path!r} (OS-observed)"
             ),
         )
-    if authorized.matches(observed):
+
+    if reported_cwd:
+        if not authorized.matches(reported_cwd):
+            # Taking a self-report at its word to REFUSE is safe; the reverse
+            # is not.
+            return LaunchVerification(
+                pid=pid, observed_cwd=str(reported_cwd), status=MISMATCH,
+                detail=(
+                    f"task {task_id}: spawner reported launching in "
+                    f"{reported_cwd!r}, which is not the authorized "
+                    f"{authorized.path!r}"
+                ),
+            )
         return LaunchVerification(
-            pid=pid, observed_cwd=os.path.realpath(observed), status=VERIFIED,
-            detail=f"task {task_id}: launch directory verified via {source}",
+            pid=pid, observed_cwd=str(reported_cwd), status=REPORTED_ONLY,
+            detail=(
+                f"task {task_id}: the spawner reported the authorized directory "
+                f"but nothing corroborated it (pid={pid}); this launch is NOT "
+                f"verified as confined"
+            ),
         )
+
     return LaunchVerification(
-        pid=pid, observed_cwd=observed, status=MISMATCH,
+        pid=pid, observed_cwd=None, status=UNOBSERVABLE,
         detail=(
-            f"task {task_id}: worker launched in {observed!r} but was "
-            f"authorized for {authorized.path!r} (observed via {source})"
+            f"task {task_id}: the launch directory could not be observed "
+            f"(pid={pid}); this launch is NOT verified as confined"
         ),
     )
 
 
-def terminate_escaped_worker(pid: Optional[int]) -> bool:
-    """Stop a worker that launched outside its authorized directory.
+@dataclass(frozen=True)
+class OwnedProcess:
+    """A worker Hermes can prove it owns, and can clean up completely.
 
-    Best-effort by necessity — the process may already be gone — but the caller
-    must still fail the dispatch closed regardless of what this returns.
+    A bare pid is not ownership. It can be reused by an unrelated process
+    between the spawn and the cleanup, and signalling it kills only the leader
+    while descendants keep running — a benign reproduction left a sleeping
+    grandchild alive after the leader was terminated.
+
+    ``create_time`` is the PID-reuse guard: the kernel's start timestamp for
+    this exact process. ``pgid`` is the cleanup handle: the default spawner uses
+    ``start_new_session=True``, so the worker leads its own process group and the
+    whole tree can be signalled at once.
     """
+
+    pid: int
+    create_time: Optional[float] = None
+    pgid: Optional[int] = None
+
+    @property
+    def has_tree_handle(self) -> bool:
+        return self.pgid is not None and self.pgid > 0
+
+    def is_alive(self) -> bool:
+        return _process_matches(self.pid, self.create_time)
+
+
+@dataclass(frozen=True)
+class TerminationResult:
+    ok: bool
+    detail: str
+    survivors: tuple = ()
+
+
+def _process_matches(pid: Optional[int], create_time: Optional[float]) -> bool:
+    """True when *pid* is still the process we owned — not a recycled number."""
     if not pid:
         return False
+    try:
+        import psutil
+
+        proc = psutil.Process(int(pid))
+        # A zombie has already exited; its entry lingers only until the parent
+        # reaps it. Counting one as alive makes every successful termination
+        # look like a containment failure.
+        try:
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                return False
+        except Exception:
+            pass
+        if create_time is None:
+            return True
+        return abs(proc.create_time() - float(create_time)) < 0.001
+    except Exception:
+        return False
+
+
+def own_process(pid: Optional[int]) -> Optional[OwnedProcess]:
+    """Bind a spawned worker to an identity Hermes can verify later.
+
+    Returns None when the process cannot be inspected at all — which a sandbox
+    dispatch must treat as a failure, because a worker it cannot identify is a
+    worker it cannot clean up.
+    """
+    if not pid:
+        return None
+    create_time = None
+    pgid = None
+    try:
+        import psutil
+
+        create_time = psutil.Process(int(pid)).create_time()
+    except Exception:
+        return None
+    try:
+        pgid = os.getpgid(int(pid))
+    except Exception:
+        pgid = None
+    return OwnedProcess(pid=int(pid), create_time=create_time, pgid=pgid)
+
+
+def _descendants(pid: int) -> list:
+    try:
+        import psutil
+
+        return psutil.Process(int(pid)).children(recursive=True)
+    except Exception:
+        return []
+
+
+def terminate_worker_tree(owned: Optional[OwnedProcess], *,
+                          grace_seconds: float = 2.0) -> TerminationResult:
+    """Stop a worker and everything it started. Verified, not assumed.
+
+    Signals the process GROUP when one is available, so descendants go too, then
+    confirms nothing survived. The caller must treat ``ok=False`` as a failure to
+    contain — reporting a dispatch safely closed while descendants keep running
+    is precisely the outcome this exists to prevent.
+    """
     import signal
     import time
 
-    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGKILL", None)):
+    if owned is None:
+        return TerminationResult(False, "no owned process handle to terminate")
+    if not _process_matches(owned.pid, owned.create_time):
+        return TerminationResult(True, "process already gone (or pid recycled)")
+
+    own_group = None
+    try:
+        own_group = os.getpgid(0)
+    except Exception:
+        pass
+
+    # Never signal our OWN process group: that would take the dispatcher with it.
+    use_group = owned.has_tree_handle and owned.pgid != own_group
+
+    for sig_name in ("SIGTERM", "SIGKILL"):
+        sig = getattr(signal, sig_name, None)
         if sig is None:
             continue
+        if use_group:
+            try:
+                os.killpg(int(owned.pgid), sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        else:
+            # No usable group handle. Enumerate descendants FIRST — killing the
+            # leader can reparent them and lose the relationship — then signal
+            # children before the leader.
+            for child in _descendants(owned.pid):
+                try:
+                    os.kill(child.pid, sig)
+                except Exception:
+                    pass
+            try:
+                os.kill(int(owned.pid), sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        deadline = time.time() + grace_seconds
+        while time.time() < deadline:
+            if not _process_matches(owned.pid, owned.create_time):
+                break
+            time.sleep(0.05)
+        if not _process_matches(owned.pid, owned.create_time):
+            break
+
+    survivors = []
+    if _process_matches(owned.pid, owned.create_time):
+        survivors.append(owned.pid)
+    survivors.extend(c.pid for c in _descendants(owned.pid))
+    if survivors:
+        return TerminationResult(
+            False,
+            f"worker tree not fully terminated; survivors: {survivors[:8]}",
+            tuple(survivors),
+        )
+    return TerminationResult(True, "worker tree terminated")
+
+
+# Kept for callers that only have a pid. Prefer terminate_worker_tree.
+def terminate_escaped_worker(pid: Optional[int]) -> bool:
+    return terminate_worker_tree(own_process(pid)).ok
+
+
+# ---------------------------------------------------------------------------
+# The cooperative start barrier
+# ---------------------------------------------------------------------------
+
+
+class StartBarrier:
+    """Hold a worker before it does anything, until confinement is proven.
+
+    Verification after the spawn bounds how long a worker can run in the wrong
+    place; it does not prevent the work. A benign reproduction wrote a marker
+    file before mismatch verification terminated it. So in sandbox mode the
+    worker is launched already waiting: it blocks at CLI entry, before any
+    agent, model call, or tool execution, until Hermes has
+
+      * revalidated the final workspace and allowed-root identities,
+      * independently observed the process's actual working directory,
+      * bound an owned process handle, and
+      * durably stored the audit record.
+
+    **Cooperative by construction.** The worker chooses to wait because Hermes
+    asks it to. A process that ignores the barrier is not stopped by it — which
+    is the same same-user limit that applies to everything else here, and is why
+    this is a workflow-safety mechanism rather than a sandbox.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._released = False
+
+    @classmethod
+    def create(cls, directory: str, task_id: str) -> "StartBarrier":
+        os.makedirs(directory, exist_ok=True)
+        return cls(os.path.join(directory, f"{task_id}.barrier"))
+
+    def env(self) -> dict:
+        return {START_BARRIER_ENV: self.path}
+
+    def release(self) -> None:
+        """Let the worker start. Called only after every check has passed."""
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(_BARRIER_GO)
+        os.replace(tmp, self.path)
+        self._released = True
+
+    def abort(self) -> None:
+        """Remove the barrier without releasing it: the worker will time out."""
         try:
-            os.kill(int(pid), sig)
-        except ProcessLookupError:
-            return True
-        except Exception:
-            return False
-        time.sleep(0.05)
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+
+def wait_for_start_barrier(
+    *, timeout_seconds: int = START_BARRIER_TIMEOUT_SECONDS,
+    _env: Optional[dict] = None, _sleep=None,
+) -> bool:
+    """Worker side: block until released, or exit.
+
+    Returns True when the worker may proceed. Returns False when it must not —
+    the caller exits non-zero rather than starting work Hermes never authorized.
+    No barrier configured means no barrier: open-mode boards are unaffected.
+    """
+    import time
+
+    env = _env if _env is not None else os.environ
+    path = (env.get(START_BARRIER_ENV) or "").strip()
+    if not path:
+        return True
+    sleep = _sleep or time.sleep
+    deadline = time.time() + max(1, int(timeout_seconds))
+    while time.time() < deadline:
         try:
-            os.kill(int(pid), 0)
-        except ProcessLookupError:
-            return True
-        except Exception:
-            return False
+            with open(path, "r", encoding="utf-8") as fh:
+                if fh.read().strip() == _BARRIER_GO:
+                    return True
+        except OSError:
+            pass
+        sleep(0.1)
     return False

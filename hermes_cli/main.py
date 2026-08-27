@@ -13101,6 +13101,39 @@ def _advertise_agent_env() -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    # Cooperative start barrier. A dispatcher-spawned sandbox worker waits HERE
+    # — before argument parsing, before any agent, model call, or tool
+    # execution — until Hermes has independently observed where this process
+    # actually started, bound an owned process handle, revalidated the workspace
+    # and authorized-root identities, and durably stored the audit record.
+    #
+    # Verifying AFTER the spawn bounds how long a worker can run in the wrong
+    # place; it does not prevent the work. A benign reproduction wrote a marker
+    # file before mismatch verification could terminate it.
+    #
+    # COOPERATIVE BY CONSTRUCTION: this process waits because Hermes asked it
+    # to. A process that ignores the barrier is not stopped by it — the same
+    # same-user limit that applies to every other check in this area.
+    #
+    # No barrier configured means no wait, so ordinary CLI use and open-mode
+    # boards are entirely unaffected.
+    try:
+        from hermes_cli.dispatch_confinement import wait_for_start_barrier
+
+        if not wait_for_start_barrier():
+            print(
+                "hermes: refusing to start — the dispatcher never released "
+                "this worker's confinement barrier.",
+                file=sys.stderr,
+            )
+            raise SystemExit(70)
+    except SystemExit:
+        raise
+    except Exception:
+        # A barrier that cannot be evaluated must not brick the CLI for every
+        # other caller; the dispatcher fails the dispatch closed on its side.
+        pass
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()

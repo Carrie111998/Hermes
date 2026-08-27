@@ -21,11 +21,15 @@ WHAT COMMIT 7 GOT WRONG — every defect below has a test named after it:
 
 import os
 import subprocess
+import time
 
 import pytest
 
 from hermes_cli import dispatch_confinement as dc
 from hermes_cli import kanban_db as kb
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HERMES_BIN = os.path.join(REPO, ".venv", "bin", "hermes")
 
 
 def _task(tmp_path, workspace=None, task_id="t_pf", run_id=None, kind="worktree"):
@@ -246,8 +250,14 @@ def test_an_unobservable_launch_is_not_called_verified(tmp_path):
     assert not v.is_verified
 
 
-def test_a_spawner_report_is_cross_checked_not_trusted(tmp_path):
-    """A spawner may report where it launched; it is still judged on identity."""
+def test_a_spawner_report_can_refuse_but_never_verify(tmp_path):
+    """A self-report is telemetry, not evidence.
+
+    THIS TEST PREVIOUSLY ASSERTED THE DEFECT. It required an "honest" report to
+    produce VERIFIED, which is precisely what let a spawner that ignored its
+    workspace name the authorized path and be believed. Taking a report at its
+    word to REFUSE is safe; the reverse is not.
+    """
     ws = tmp_path / "ws"
     ws.mkdir()
     authorized = dc.authorize_workspace("t", str(ws))
@@ -258,7 +268,19 @@ def test_a_spawner_report_is_cross_checked_not_trusted(tmp_path):
 
     honest = dc.verify_launch("t", authorized, 1, reported_cwd=str(ws),
                               _observer=lambda _pid: None)
-    assert honest.status == dc.VERIFIED
+    assert honest.status == dc.REPORTED_ONLY
+    assert not honest.is_verified
+
+
+def test_only_os_observation_can_verify(tmp_path):
+    """The one route to VERIFIED."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    authorized = dc.authorize_workspace("t", str(ws))
+    v = dc.verify_launch("t", authorized, 1, reported_cwd=None,
+                         _observer=lambda _pid: str(ws))
+    assert v.status == dc.VERIFIED
+    assert "OS observation" in v.detail
 
 
 @pytest.mark.parametrize("value,expected_pid", [
@@ -524,3 +546,177 @@ def test_an_unobservable_launch_is_reported_not_assumed(dispatchable, monkeypatc
         assert "confinement_unverified" in kinds, kinds
     finally:
         conn.close()
+
+
+# ===========================================================================
+# Ownership, cleanup, and the start barrier
+#
+# TEST-PROCESS HYGIENE: children here are held open by an stdin PIPE and exit
+# when it closes, so ordinary cleanup needs no signals at all and cannot trip
+# the repository's live-system guard. Tests that exercise TERMINATION carry the
+# conftest's own `live_system_guard_bypass` marker — the supported narrow escape
+# for tests that genuinely deliver signals. The guard is not weakened.
+# ===========================================================================
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _held_child(cwd, *, own_session=True, spawn_descendant=False):
+    """A child that lives until its stdin closes. No signals required."""
+    script = "read x" if not spawn_descendant else "sleep 300 & read x"
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", script],
+        stdin=subprocess.PIPE, cwd=str(cwd),
+        start_new_session=own_session,
+    )
+    try:
+        yield proc
+    finally:
+        with contextlib.suppress(Exception):
+            proc.stdin.close()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=10)
+
+
+def test_ownership_binds_pid_creation_time_and_group(tmp_path):
+    with _held_child(tmp_path) as proc:
+        owned = dc.own_process(proc.pid)
+        assert owned is not None
+        assert owned.pid == proc.pid
+        assert owned.create_time is not None, "no PID-reuse guard was captured"
+        assert owned.has_tree_handle, "no process-group cleanup handle"
+        assert owned.pgid == proc.pid, "start_new_session should make it a leader"
+        assert owned.is_alive()
+
+
+def test_pid_reuse_is_detected_by_creation_time(tmp_path):
+    """A recycled PID must not be mistaken for the worker we owned."""
+    with _held_child(tmp_path) as proc:
+        owned = dc.own_process(proc.pid)
+        impostor = dc.OwnedProcess(
+            pid=owned.pid, create_time=(owned.create_time or 0) + 500.0,
+            pgid=owned.pgid,
+        )
+        assert owned.is_alive()
+        assert not impostor.is_alive(), "PID reuse was not detected"
+
+
+def test_a_short_lived_child_is_not_owned(tmp_path):
+    """A process that exits before inspection cannot be bound or verified."""
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"], cwd=str(tmp_path))
+    proc.wait()
+    assert dc.observe_process_cwd(proc.pid) is None
+    ws = tmp_path
+    authorized = dc.authorize_workspace("t", str(ws))
+    v = dc.verify_launch("t", authorized, proc.pid)
+    assert v.status in (dc.UNOBSERVABLE, dc.MISMATCH)
+    assert not v.is_verified
+
+
+def test_observation_errors_do_not_become_verification(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    authorized = dc.authorize_workspace("t", str(ws))
+
+    def _boom(_pid):
+        raise RuntimeError("psutil exploded")
+
+    v = dc.verify_launch("t", authorized, 1,
+                         _observer=lambda p: dc.observe_process_cwd(None))
+    assert not v.is_verified
+    # And the observer itself swallowing an error yields None, not a pass.
+    assert dc.observe_process_cwd(None) is None
+
+
+@pytest.mark.parametrize("value", [None, 0, False, "nonsense", object()])
+def test_malformed_spawn_results_yield_no_pid(value):
+    pid, _cwd = dc.normalize_spawn_result(value)
+    assert pid is None
+
+
+@pytest.mark.live_system_guard_bypass
+def test_termination_takes_the_whole_tree_not_just_the_leader(tmp_path):
+    """A benign descendant must not survive its leader.
+
+    Uses the conftest's supported marker because delivering real signals IS the
+    behaviour under test.
+    """
+    with _held_child(tmp_path, spawn_descendant=True) as proc:
+        time.sleep(0.4)
+        owned = dc.own_process(proc.pid)
+        descendants = [c.pid for c in dc._descendants(proc.pid)]
+        assert descendants, "no descendant was created; test proves nothing"
+
+        result = dc.terminate_worker_tree(owned)
+        assert result.ok, result.detail
+        assert dc._descendants(proc.pid) == []
+        assert not owned.is_alive()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_termination_never_signals_the_dispatchers_own_group(tmp_path, monkeypatch):
+    """Killing our own process group would take the dispatcher down with it."""
+    own_group = os.getpgid(0)
+    fake = dc.OwnedProcess(pid=os.getpid(), create_time=None, pgid=own_group)
+    killed = []
+    monkeypatch.setattr(os, "killpg", lambda pg, sig: killed.append(pg))
+    monkeypatch.setattr(os, "kill", lambda *a, **k: None)
+    monkeypatch.setattr(dc, "_process_matches", lambda *a, **k: False)
+    dc.terminate_worker_tree(fake)
+    assert own_group not in killed
+
+
+def test_the_barrier_holds_until_released(tmp_path):
+    barrier = dc.StartBarrier.create(str(tmp_path), "t1")
+    assert dc.wait_for_start_barrier(timeout_seconds=1, _env=barrier.env()) is False
+    barrier.release()
+    assert dc.wait_for_start_barrier(timeout_seconds=1, _env=barrier.env()) is True
+
+
+def test_an_aborted_barrier_never_releases(tmp_path):
+    barrier = dc.StartBarrier.create(str(tmp_path), "t1")
+    barrier.release()
+    barrier.abort()
+    assert dc.wait_for_start_barrier(timeout_seconds=1, _env=barrier.env()) is False
+
+
+def test_no_barrier_configured_means_no_wait():
+    """Ordinary CLI use and open-mode boards are unaffected."""
+    assert dc.wait_for_start_barrier(timeout_seconds=1, _env={}) is True
+
+
+def test_no_work_happens_before_the_barrier_is_released(tmp_path):
+    """The marker test: work must not begin, not merely be cut short.
+
+    A real `hermes` process is launched with a barrier set and given time to do
+    something. It must produce nothing until released.
+    """
+    hermes = HERMES_BIN
+    if not os.path.exists(hermes):
+        pytest.skip("built hermes console script not present")
+
+    barrier = dc.StartBarrier.create(str(tmp_path), "t1")
+    marker = tmp_path / "worker-ran.txt"
+    env = dict(os.environ)
+    env.update(barrier.env())
+    env["HERMES_HOME"] = str(tmp_path)
+
+    proc = subprocess.Popen(
+        [hermes, "project", "--help"], env=env,
+        stdout=open(marker, "w"), stderr=subprocess.STDOUT,
+    )
+    try:
+        time.sleep(2.5)
+        assert proc.poll() is None, "worker ran before the barrier was released"
+        assert marker.stat().st_size == 0, "worker produced output before release"
+
+        barrier.release()
+        proc.wait(timeout=90)
+        assert marker.stat().st_size > 0, "worker never ran after release"
+    finally:
+        if proc.poll() is None:
+            proc.stdin = None
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)

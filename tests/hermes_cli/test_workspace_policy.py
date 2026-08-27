@@ -1,44 +1,42 @@
-"""Per-board workspace policy — the M3a confinement contract assertion set.
+"""Per-board workspace policy — the twenty-assertion registry.
 
 SCOPE: protects against **accidental escape and cooperative execution**, not
 arbitrary malicious same-UID activity. Every assertion is a path predicate, a
-file check, or a string match — none is an OS-level sandbox. A process running
-as your user can `chdir` after launch, rewrite the config these checks read, or
-write `kanban.db` directly.
+file check, or a call into Hermes' own guards — none is an OS-level sandbox.
 
-All fixtures here are disposable `tmp_path` trees. Nothing touches a real
-repository, credential, Hermes configuration, or external service.
+All fixtures are disposable `tmp_path` trees. Nothing touches a real repository,
+credential, Hermes configuration, production system, or external service.
 
-WHAT MAKES THIS SUITE MEANINGFUL: `open` mode is the default, so a test that
-only exercised the default would prove nothing about the contract. Every
-contract assertion below is tested in `sandbox` mode, and
-`test_open_mode_does_not_satisfy_the_contract` pins the difference.
+WHAT THIS SUITE EXISTS TO PREVENT: an earlier revision reported the contract
+satisfied because `mode == sandbox`, having run five checks against a directory
+that was not even a git repository. `contract_satisfied` is now evidence:
+twenty named assertions, each PASS/FAIL/SKIPPED, against the real workspace and
+a verified launch.
 """
 
+import json
 import os
 import subprocess
 
 import pytest
 
 from hermes_cli import workspace_policy as wp
-from hermes_cli.dispatch_confinement import PreflightRefusal
+from hermes_cli.dispatch_confinement import PreflightRefusal, VERIFIED
 
 
-def _sandbox_policy(root, **over):
-    base = dict(
-        board="eval", mode=wp.MODE_SANDBOX, allowed_roots=(str(root),),
-        protected_paths=(), hermes_home_root=str(root),
-        required_deny_globs=(), prohibited_commands=(), allowed_commands=(),
-    )
-    base.update(over)
-    return wp.WorkspacePolicy(**base)
+class _Launch:
+    """Stands in for a dispatch_confinement.LaunchVerification."""
+
+    def __init__(self, cwd, status=VERIFIED):
+        self.observed_cwd = str(cwd)
+        self.status = status
 
 
-def _git_fixture(path, *, remote=None, alternates=False, untracked=False):
+def _fixture(path, *, remote=None, alternates=False, untracked=False,
+             attest=True):
     """A disposable git repo. Never a clone of anything real."""
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(path)], check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True, capture_output=True)
     (path / "src.txt").write_text("content")
     subprocess.run(["git", "-C", str(path), "add", "-A"], check=True,
                    capture_output=True)
@@ -52,185 +50,372 @@ def _git_fixture(path, *, remote=None, alternates=False, untracked=False):
         info = path / ".git" / "objects" / "info"
         info.mkdir(parents=True, exist_ok=True)
         (info / "alternates").write_text("/some/other/repo/.git/objects\n")
+    if attest:
+        wp.build_fixture_attestation(str(path), build_source="test")
     if untracked:
         (path / "leaked_answer.txt").write_text("the fix")
     return path
 
 
-# ===================== policy resolution ===================================
+def _policy(root, **over):
+    base = dict(
+        board="eval", mode=wp.MODE_SANDBOX,
+        allowed_roots=(str(root),),
+        protected_paths=("*/dev/visitreno*",),
+        hermes_home_root=str(root),
+        required_deny_globs=("*git*push*", "*vercel*"),
+        prohibited_commands=("git push origin main", "vercel --prod"),
+        allowed_commands=("npm test", "git status"),
+    )
+    base.update(over)
+    return wp.WorkspacePolicy(**base)
 
 
-def test_the_default_is_open_and_says_so():
-    status = wp.policy_status("unconfigured-board", config={})
-    assert status["mode"] == wp.MODE_OPEN
+GOOD_CONFIG = {"approvals": {"single_query_mode": "deny",
+                             "deny": ["*git*push*", "*vercel*"]}}
+
+
+@pytest.fixture
+def guards(monkeypatch):
+    """Drive Hermes' shipped guards from a disposable resolved config."""
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                        lambda *a, **k: GOOD_CONFIG)
+    return GOOD_CONFIG
+
+
+# ===================== the registry itself =================================
+
+
+def test_there_are_exactly_twenty_assertions():
+    assert len(wp.ASSERTIONS) == 20
+    assert sorted(wp.ASSERTION_NAMES) == list(range(1, 21))
+    assert wp.REQUIRED_ASSERTION_IDS == frozenset(range(1, 21))
+
+
+def test_contract_satisfied_requires_every_assertion_to_pass():
+    report = wp.PolicyReport(board="b", mode=wp.MODE_SANDBOX)
+    for aid in range(1, 20):
+        report.record(aid, wp.PASS)
+    assert report.missing == {20}
+    assert report.contract_satisfied is False
+
+    report.record(20, wp.PASS)
+    assert report.contract_satisfied is True
+
+
+@pytest.mark.parametrize("status", [wp.FAIL, wp.SKIPPED])
+def test_one_non_passing_assertion_defeats_the_contract(status):
+    report = wp.PolicyReport(board="b", mode=wp.MODE_SANDBOX)
+    for aid in range(1, 20):
+        report.record(aid, wp.PASS)
+    report.record(20, status)
+    assert report.contract_satisfied is False
+
+
+def test_open_mode_can_never_satisfy_the_contract():
+    report = wp.PolicyReport(board="b", mode=wp.MODE_OPEN)
+    for aid in range(1, 21):
+        report.record(aid, wp.PASS)
+    assert report.contract_satisfied is False
+
+
+# ===================== status is evidence, not inference ===================
+
+
+def test_status_does_not_infer_satisfaction_from_mode(tmp_path):
+    """The defect: sandbox mode alone reported the contract satisfied."""
+    cfg = {"kanban": {"workspace_policy": {"boards": {"eval": {
+        "mode": "sandbox", "allowed_roots": [str(tmp_path)],
+        "protected_paths": ["*x*"], "hermes_home_root": str(tmp_path),
+        "required_deny_globs": ["*git*push*"],
+        "prohibited_commands": ["git push"], "allowed_commands": ["npm test"],
+    }}}}}
+    status = wp.policy_status("eval", config=cfg)
+    assert status["mode"] == wp.MODE_SANDBOX
+    assert status["configured_ready"] is True
+    assert status["contract_satisfied"] is False, (
+        "satisfaction was inferred from configuration")
+    assert status["evidence"] is None
+
+
+def test_status_reports_evidence_when_a_run_exists():
+    report = wp.PolicyReport(board="eval", mode=wp.MODE_SANDBOX)
+    for aid in range(1, 21):
+        report.record(aid, wp.PASS)
+    status = wp.policy_status("eval", config={}, last_report=report)
+    assert status["contract_satisfied"] is True
+    assert status["evidence"]["passed"] == list(range(1, 21))
+
+
+def test_open_mode_is_labelled_unconfined():
+    status = wp.policy_status("nope", config={})
     assert status["contract_satisfied"] is False
-    assert "does NOT satisfy" in status["note"]
+    assert status["configured_ready"] is False
+    assert "UNCONFINED" in status["note"]
 
 
-def test_open_mode_does_not_satisfy_the_contract(tmp_path):
-    """The distinction the whole module rests on.
+def test_a_malformed_policy_is_reported_not_defaulted():
+    status = wp.policy_status("x", config={"kanban": {"workspace_policy": []}})
+    assert status["mode"] == "malformed"
+    assert status["contract_satisfied"] is False
 
-    An open board runs only the launch checks. Reporting that as "passed" without
-    reporting what was skipped is how "configured" gets mistaken for "contained".
-    """
+
+@pytest.mark.parametrize("bad", [
+    {"kanban": {"workspace_policy": []}},
+    {"kanban": {"workspace_policy": {"boards": []}}},
+    {"kanban": {"workspace_policy": {"boards": {"eval": "nope"}}}},
+])
+def test_malformed_policy_shapes_refuse(bad):
+    with pytest.raises(PreflightRefusal):
+        wp.resolve_policy("eval", config=bad)
+
+
+# ===================== mandatory fields cannot be empty ====================
+
+
+@pytest.mark.parametrize("field", [
+    "allowed_roots", "protected_paths", "hermes_home_root",
+    "required_deny_globs", "prohibited_commands", "allowed_commands",
+])
+def test_sandbox_refuses_an_empty_mandatory_field(tmp_path, field):
+    """'Unspecified' must never be read as 'unrestricted'."""
+    empty = None if field == "hermes_home_root" else ()
+    with pytest.raises(PreflightRefusal, match=field):
+        wp.assert_policy_wellformed(_policy(tmp_path, **{field: empty}))
+
+
+def test_a_wellformed_sandbox_policy_passes(tmp_path):
+    wp.assert_policy_wellformed(_policy(tmp_path))
+
+
+def test_there_is_no_switch_to_disable_a_mandatory_check():
+    """The earlier `require_*: false` relaxations are gone."""
+    fields = set(wp.WorkspacePolicy.__dataclass_fields__)
+    for gone in ("require_origin_less", "require_no_alternates",
+                 "require_no_secrets", "require_no_untracked_source",
+                 "require_single_query_deny"):
+        assert gone not in fields, f"{gone} can still disable a mandatory check"
+
+
+@pytest.mark.parametrize("glob", ["*git push*", "*Documents/dev *"])
+def test_a_glob_with_a_literal_space_is_refused(tmp_path, glob):
+    with pytest.raises(PreflightRefusal, match="literal space"):
+        wp.assert_policy_wellformed(_policy(tmp_path, protected_paths=(glob,)))
+
+
+# ===================== inability to inspect is refusal =====================
+
+
+def test_a_non_git_directory_is_refused(tmp_path):
+    """It previously passed a policy demanding an origin-less git fixture."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(PreflightRefusal, match="not a git repository"):
+        wp._git_dir(str(plain))
+
+
+def test_an_unreadable_git_indirection_is_refused(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
-    report = wp.enforce("t", str(ws), board="open-board", config={})
-    assert report.mode == wp.MODE_OPEN
-    assert report.contract_satisfied is False
-    assert set(report.skipped) >= {"fixture-state", "hermes-home", "command-guards"}
+    (ws / ".git").write_text("gitdir: /nonexistent/elsewhere")
+    with pytest.raises(PreflightRefusal, match="does not exist"):
+        wp._git_dir(str(ws))
 
 
-def test_board_settings_override_the_top_level():
-    cfg = {"kanban": {"workspace_policy": {
-        "mode": "open",
-        "boards": {"eval": {"mode": "sandbox", "allowed_roots": ["/tmp/x"]}},
-    }}}
-    assert wp.resolve_policy("other", config=cfg).mode == wp.MODE_OPEN
-    evalp = wp.resolve_policy("eval", config=cfg)
-    assert evalp.mode == wp.MODE_SANDBOX
-    assert evalp.allowed_roots == ("/tmp/x",)
+def test_a_malformed_git_file_is_refused(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".git").write_text("not an indirection")
+    with pytest.raises(PreflightRefusal, match="not a gitdir indirection"):
+        wp._git_dir(str(ws))
 
 
-# ===================== assertions 1-2, 11-15: paths ========================
+def test_a_failing_git_command_is_refused(tmp_path):
+    """A nonzero return code must not read as 'clean'."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(PreflightRefusal, match="failed"):
+        wp._git(str(plain), "remote")
 
 
-def test_sandbox_without_allowed_roots_refuses(tmp_path):
-    """"Unspecified" must never be read as "anywhere"."""
-    pol = _sandbox_policy(tmp_path, allowed_roots=())
-    with pytest.raises(PreflightRefusal, match="allowed_roots"):
-        wp.assert_path_authorized("t", str(tmp_path / "ws"), pol)
+def test_a_missing_git_binary_is_refused(tmp_path, monkeypatch):
+    def _no_git(*a, **k):
+        raise FileNotFoundError("git")
+    monkeypatch.setattr(subprocess, "run", _no_git)
+    with pytest.raises(PreflightRefusal, match="git is not installed"):
+        wp._git(str(tmp_path), "remote")
 
 
-def test_a_workspace_outside_every_allowed_root_refuses(tmp_path):
-    pol = _sandbox_policy(tmp_path / "sandbox")
-    (tmp_path / "sandbox").mkdir()
-    outside = tmp_path / "elsewhere"
-    outside.mkdir()
-    with pytest.raises(PreflightRefusal, match="outside every authorized root"):
-        wp.assert_path_authorized("t", str(outside), pol)
+def test_a_timed_out_git_command_is_refused(tmp_path, monkeypatch):
+    def _timeout(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    with pytest.raises(PreflightRefusal, match="timed out"):
+        wp._git(str(tmp_path), "remote")
 
 
-def test_a_workspace_inside_an_allowed_root_passes(tmp_path):
-    root = tmp_path / "sandbox"
-    ws = root / "fixture"
-    ws.mkdir(parents=True)
-    wp.assert_path_authorized("t", str(ws), _sandbox_policy(root))
-
-
-@pytest.mark.parametrize("subpath,pattern", [
-    ("dev/visitreno", "*/dev/visitreno*"),
-    ("Documents/dev/project", "*Documents/dev*"),
-    (".hermes/kanban", "*.hermes*"),
-    ("Documents/Main/live", "*Documents/Main*"),
-])
-def test_protected_paths_are_denied(tmp_path, subpath, pattern):
-    """The canonical checkouts M2a's escape reached, and their neighbours."""
-    target = tmp_path / subpath
-    target.mkdir(parents=True)
-    pol = _sandbox_policy(tmp_path, protected_paths=(pattern,))
-    with pytest.raises(PreflightRefusal, match="protected path"):
-        wp.assert_path_authorized("t", str(target), pol)
-
-
-def test_a_symlink_cannot_smuggle_a_worker_into_a_protected_path(tmp_path):
-    """The defect a reviewer demonstrated: realpath canonicalized the spelling
-    but nothing asked whether the destination was authorized."""
-    protected = tmp_path / "dev" / "visitreno"
-    protected.mkdir(parents=True)
-    innocent = tmp_path / "sandbox" / "looks-fine"
-    innocent.parent.mkdir(parents=True)
-    try:
-        innocent.symlink_to(protected)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
-
-    pol = _sandbox_policy(tmp_path, protected_paths=("*/dev/visitreno*",))
-    with pytest.raises(PreflightRefusal, match="protected path"):
-        wp.assert_path_authorized("t", str(innocent), pol)
-
-
-def test_a_glob_with_a_literal_space_is_rejected_as_a_footgun(tmp_path):
-    """`fnmatch` is literal on whitespace: `*git push*` is evaded by
-    `git   push`. A policy that ships one is refused rather than trusted."""
-    pol = _sandbox_policy(tmp_path, protected_paths=("*git push*",))
-    with pytest.raises(PreflightRefusal, match="literal space"):
-        wp.assert_path_authorized("t", str(tmp_path), pol)
-
-
-# ===================== assertions 3-6: fixture state =======================
+# ===================== fixture state =======================================
 
 
 def test_a_fixture_with_a_remote_is_refused(tmp_path):
-    fx = _git_fixture(tmp_path / "fx", remote="https://example.invalid/repo.git")
-    with pytest.raises(PreflightRefusal, match="remote"):
-        wp.assert_fixture_state("t", str(fx), _sandbox_policy(tmp_path))
+    fx = _fixture(tmp_path / "fx", remote="https://example.invalid/r.git")
+    with pytest.raises(PreflightRefusal, match="origin-less"):
+        wp.assert_no_remotes(str(fx))
 
 
 def test_an_origin_less_fixture_passes(tmp_path):
-    fx = _git_fixture(tmp_path / "fx")
-    checks = wp.assert_fixture_state("t", str(fx), _sandbox_policy(tmp_path))
-    assert "origin-less" in checks
+    wp.assert_no_remotes(str(_fixture(tmp_path / "fx")))
 
 
-def test_an_alternate_object_database_is_refused(tmp_path):
-    fx = _git_fixture(tmp_path / "fx", alternates=True)
+def test_alternates_are_refused(tmp_path):
+    fx = _fixture(tmp_path / "fx", alternates=True)
     with pytest.raises(PreflightRefusal, match="alternate"):
-        wp.assert_fixture_state("t", str(fx), _sandbox_policy(tmp_path))
+        wp.assert_no_alternates(str(fx))
 
 
 def test_untracked_source_is_refused(tmp_path):
-    """M2a's invalid comparison: the answer was reachable from the tree."""
-    fx = _git_fixture(tmp_path / "fx", untracked=True)
+    fx = _fixture(tmp_path / "fx", untracked=True)
     with pytest.raises(PreflightRefusal, match="untracked"):
-        wp.assert_fixture_state("t", str(fx), _sandbox_policy(tmp_path))
+        wp.assert_no_untracked_source(str(fx))
 
 
-@pytest.mark.parametrize("name", [".env", ".env.local", ".env.production"])
+@pytest.mark.parametrize("name", [".env", ".env.production", ".netrc"])
 def test_secret_files_are_refused(tmp_path, name):
-    fx = _git_fixture(tmp_path / "fx")
+    fx = _fixture(tmp_path / "fx")
     (fx / name).write_text("TOKEN=redacted")
     with pytest.raises(PreflightRefusal, match=name):
-        wp.assert_fixture_state("t", str(fx), _sandbox_policy(tmp_path))
+        wp.assert_no_secret_files(str(fx))
 
 
 @pytest.mark.parametrize("name", [".vercel", ".aws", ".ssh"])
 def test_secret_directories_are_refused(tmp_path, name):
-    fx = _git_fixture(tmp_path / "fx")
+    fx = _fixture(tmp_path / "fx")
     (fx / name).mkdir()
     with pytest.raises(PreflightRefusal, match=name):
-        wp.assert_fixture_state("t", str(fx), _sandbox_policy(tmp_path))
+        wp.assert_no_secret_files(str(fx))
 
 
-# ===================== assertions 7-8: HERMES_HOME =========================
+# ===================== fixture-build attestation ===========================
 
 
-def test_a_hermes_home_outside_the_sandbox_is_refused(tmp_path):
+def test_an_attestation_verifies_immediately_after_build(tmp_path):
+    fx = _fixture(tmp_path / "fx")
+    wp.verify_fixture_attestation("t", str(fx))
+
+
+def test_a_fixture_without_an_attestation_is_refused(tmp_path):
+    fx = _fixture(tmp_path / "fx", attest=False)
+    with pytest.raises(PreflightRefusal, match="no build attestation"):
+        wp.verify_fixture_attestation("t", str(fx))
+
+
+def test_a_new_commit_invalidates_the_attestation(tmp_path):
+    """Drift from the audited build is what this detects."""
+    fx = _fixture(tmp_path / "fx")
+    (fx / "new.txt").write_text("added later")
+    subprocess.run(["git", "-C", str(fx), "add", "-A"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(fx), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-qm", "drift"],
+                   check=True, capture_output=True)
+    with pytest.raises(PreflightRefusal, match="drifted"):
+        wp.verify_fixture_attestation("t", str(fx))
+
+
+def test_an_added_remote_invalidates_the_attestation(tmp_path):
+    fx = _fixture(tmp_path / "fx")
+    subprocess.run(["git", "-C", str(fx), "remote", "add", "origin",
+                    "https://example.invalid/r.git"], check=True,
+                   capture_output=True)
+    with pytest.raises(PreflightRefusal, match="drifted"):
+        wp.verify_fixture_attestation("t", str(fx))
+
+
+def test_a_corrupt_attestation_is_refused(tmp_path):
+    fx = _fixture(tmp_path / "fx")
+    (fx / wp.ATTESTATION_FILENAME).write_text("{not json")
+    with pytest.raises(PreflightRefusal, match="could not be read"):
+        wp.verify_fixture_attestation("t", str(fx))
+
+
+def test_a_wrong_version_attestation_is_refused(tmp_path):
+    fx = _fixture(tmp_path / "fx")
+    data = json.loads((fx / wp.ATTESTATION_FILENAME).read_text())
+    data["version"] = 999
+    (fx / wp.ATTESTATION_FILENAME).write_text(json.dumps(data))
+    with pytest.raises(PreflightRefusal, match="version"):
+        wp.verify_fixture_attestation("t", str(fx))
+
+
+def test_the_attestation_is_integrity_not_security(tmp_path):
+    """Documented honestly: same-user editable, so it proves drift, not intent.
+
+    Re-running the builder after tampering produces a valid attestation again.
+    That is the limit, and the docstring says so.
+    """
+    fx = _fixture(tmp_path / "fx")
+    (fx / "tampered.txt").write_text("x")
+    subprocess.run(["git", "-C", str(fx), "add", "-A"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(fx), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-qm", "t"], check=True,
+                   capture_output=True)
+    wp.build_fixture_attestation(str(fx))
+    wp.verify_fixture_attestation("t", str(fx))
+    assert "INTEGRITY, NOT SECURITY" in wp.build_fixture_attestation.__doc__
+
+
+# ===================== allowed-root identity ===============================
+
+
+def test_allowed_roots_are_pinned_by_identity(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    pinned = wp.pin_allowed_roots(_policy(root))
+    st = os.stat(root)
+    assert pinned[str(root)] == (st.st_dev, st.st_ino)
+
+
+def test_a_missing_allowed_root_is_refused(tmp_path):
+    with pytest.raises(PreflightRefusal, match="does not exist"):
+        wp.pin_allowed_roots(_policy(tmp_path / "absent"))
+
+
+def test_a_retargeted_allowed_root_is_caught(tmp_path):
+    """The reviewer's reproduction: the root symlink moved after evaluation."""
+    good = tmp_path / "good"
+    evil = tmp_path / "evil"
+    good.mkdir()
+    evil.mkdir()
+    link = tmp_path / "root"
+    try:
+        link.symlink_to(good)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    policy = _policy(link)
+    pinned = wp.pin_allowed_roots(policy)
+    ws = good / "ws"
+    ws.mkdir()
+
+    link.unlink()
+    link.symlink_to(evil)
+    with pytest.raises(PreflightRefusal, match="changed identity"):
+        wp.revalidate_allowed_roots("t", str(ws), policy, pinned)
+
+
+def test_a_workspace_outside_every_root_is_refused_at_revalidation(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    pol = _sandbox_policy(tmp_path / "sandbox")
-    (tmp_path / "sandbox").mkdir()
-    with pytest.raises(PreflightRefusal, match="outside the sandbox root"):
-        wp.assert_hermes_home("t", pol, home=str(outside))
+    policy = _policy(root)
+    with pytest.raises(PreflightRefusal, match="not inside any authorized root"):
+        wp.revalidate_allowed_roots("t", str(outside), policy,
+                                    wp.pin_allowed_roots(policy))
 
 
-def test_a_clean_sandbox_home_passes(tmp_path):
-    home = tmp_path / "hermes-home"
-    home.mkdir()
-    (home / "config.yaml").write_text("kanban:\n  max_in_progress: 1\n")
-    checks = wp.assert_hermes_home("t", _sandbox_policy(tmp_path), home=str(home))
-    assert "no-live-key" in checks
-
-
-def test_key_material_in_the_home_is_refused(tmp_path):
-    home = tmp_path / "hermes-home"
-    home.mkdir()
-    (home / "config.yaml").write_text("api_key: sk-ant-EXAMPLENOTREAL0000000000\n")
-    with pytest.raises(PreflightRefusal, match="live key material") as exc:
-        wp.assert_hermes_home("t", _sandbox_policy(tmp_path), home=str(home))
-    # Locations only — the value must never appear in the refusal.
-    assert "sk-ant-EXAMPLENOTREAL0000000000" not in str(exc.value)
-    assert "config.yaml" in str(exc.value)
+# ===================== credentials =========================================
 
 
 def test_the_scanner_never_returns_a_secret_value(tmp_path):
@@ -243,283 +428,174 @@ def test_the_scanner_never_returns_a_secret_value(tmp_path):
     assert all(secret not in f for f in findings)
 
 
-def test_a_forbidden_digest_matches_without_revealing_the_key(tmp_path):
-    """An operator can pin a specific key; the digest never reveals it."""
-    import hashlib
-
+def test_key_material_refuses_without_exposing_the_value(tmp_path):
     home = tmp_path / "h"
     home.mkdir()
-    blob = b"totally-opaque-bytes-with-no-known-prefix"
+    secret = "sk-ant-EXAMPLENOTREAL0000000000"
+    (home / "config.yaml").write_text(f"api_key: {secret}\n")
+    with pytest.raises(PreflightRefusal) as exc:
+        wp.assert_no_live_key("t", _policy(tmp_path), home=str(home))
+    assert secret not in str(exc.value)
+    assert "config.yaml" in str(exc.value)
+
+
+def test_an_unreadable_eligible_file_fails_closed(tmp_path):
+    """Inability to inspect is not evidence of cleanliness."""
+    home = tmp_path / "h"
+    home.mkdir()
+    blocked = home / "creds.json"
+    blocked.write_text("x")
+    os.chmod(blocked, 0o000)
+    try:
+        findings = wp.scan_for_key_material(str(home), strict=True)
+        if not findings:
+            pytest.skip("running as a user that can read mode-000 files")
+        assert any("unreadable" in f for f in findings)
+    finally:
+        os.chmod(blocked, 0o600)
+
+
+def test_a_forbidden_digest_matches_without_revealing_the_key(tmp_path):
+    import hashlib
+    home = tmp_path / "h"
+    home.mkdir()
+    blob = b"opaque-bytes-with-no-known-prefix"
     (home / "blob.bin").write_bytes(blob)
     digest = hashlib.sha256(blob).hexdigest()
-
     assert wp.scan_for_key_material(str(home)) == []
     findings = wp.scan_for_key_material(str(home), forbidden_sha256=(digest,))
     assert findings and "forbidden key digest" in findings[0]
 
 
-# ===================== assertions 9, 10, 16-20: guards =====================
+def test_a_hermes_home_outside_the_sandbox_is_refused(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(PreflightRefusal, match="outside the sandbox root"):
+        wp.assert_hermes_home("t", _policy(root), home=str(outside))
 
 
-def test_single_query_mode_must_be_deny(tmp_path):
-    pol = _sandbox_policy(tmp_path)
-    cfg = {"approvals": {"single_query_mode": "allow"}}
-    with pytest.raises(PreflightRefusal, match="single_query_mode"):
-        wp.assert_command_guards("t", pol, config=cfg)
-
-
-def test_single_query_deny_passes(tmp_path):
-    cfg = {"approvals": {"single_query_mode": "deny"}}
-    checks = wp.assert_command_guards("t", _sandbox_policy(tmp_path), config=cfg)
-    assert "single_query_mode=deny" in checks
-
-
-def test_missing_required_deny_globs_refuse(tmp_path):
-    pol = _sandbox_policy(tmp_path, required_deny_globs=("*git*push*", "*vercel*"))
-    cfg = {"approvals": {"single_query_mode": "deny", "deny": ["*vercel*"]}}
-    with pytest.raises(PreflightRefusal, match="missing required globs"):
-        wp.assert_command_guards("t", pol, config=cfg)
-
-
-def test_a_deny_glob_with_a_literal_space_is_refused(tmp_path):
-    """The real leak found in M2b: `*git push*` allowed `git   push`."""
-    pol = _sandbox_policy(tmp_path, required_deny_globs=("*git push*",))
-    cfg = {"approvals": {"single_query_mode": "deny", "deny": ["*git push*"]}}
-    with pytest.raises(PreflightRefusal, match="literal space"):
-        wp.assert_command_guards("t", pol, config=cfg)
-
-
-@pytest.mark.parametrize("command", [
-    "git push origin main",
-    "GIT_DIR=. git   push   origin   main",
-    'git pu""sh origin main',
-    "cd /tmp && git push",
-])
-def test_the_prohibited_matrix_blocks_obfuscated_variants(tmp_path, command):
-    """Whitespace, env prefixes, quote splitting and `cd x &&` chaining."""
-    pol = _sandbox_policy(tmp_path, prohibited_commands=(command,))
-    cfg = {"approvals": {"single_query_mode": "deny", "deny": ["*git*push*"]}}
-    checks = wp.assert_command_guards("t", pol, config=cfg)
-    assert "prohibited-matrix-blocked" in checks
-
-
-def test_an_unblocked_prohibited_command_refuses(tmp_path):
-    pol = _sandbox_policy(tmp_path, prohibited_commands=("vercel deploy",))
-    cfg = {"approvals": {"single_query_mode": "deny", "deny": ["*git*push*"]}}
-    with pytest.raises(PreflightRefusal, match="not blocked"):
-        wp.assert_command_guards("t", pol, config=cfg)
-
-
-def test_legitimate_commands_must_not_be_false_positived(tmp_path):
-    pol = _sandbox_policy(tmp_path, allowed_commands=("npm test", "git status"))
-    cfg = {"approvals": {"single_query_mode": "deny", "deny": ["*git*push*"]}}
-    checks = wp.assert_command_guards("t", pol, config=cfg)
-    assert "no-false-positives" in checks
-
-
-def test_an_overbroad_deny_that_blocks_real_work_refuses(tmp_path):
-    pol = _sandbox_policy(tmp_path, allowed_commands=("git status",))
-    cfg = {"approvals": {"single_query_mode": "deny", "deny": ["*git*"]}}
-    with pytest.raises(PreflightRefusal, match="legitimate commands"):
-        wp.assert_command_guards("t", pol, config=cfg)
-
-
-# ===================== the whole set, end to end ===========================
-
-
-def test_a_fully_compliant_sandbox_board_passes_everything(tmp_path, monkeypatch):
-    root = tmp_path / "sandbox"
-    fx = _git_fixture(root / "fixtures" / "app")
-    home = root / "hermes-home"
-    home.mkdir(parents=True)
-    (home / "config.yaml").write_text("kanban:\n  max_in_progress: 1\n")
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    cfg = {
-        "approvals": {"single_query_mode": "deny", "deny": ["*git*push*", "*vercel*"]},
-        "kanban": {"workspace_policy": {"boards": {"eval": {
-            "mode": "sandbox",
-            "allowed_roots": [str(root)],
-            "protected_paths": ["*/dev/visitreno*"],
-            "hermes_home_root": str(root),
-            "required_deny_globs": ["*git*push*", "*vercel*"],
-            "prohibited_commands": ["git push origin main", "vercel --prod"],
-            "allowed_commands": ["npm test", "git status"],
-        }}}},
-    }
-    report = wp.enforce("t", str(fx), board="eval", config=cfg)
-    assert report.contract_satisfied is True
-    assert report.skipped == []
-    for expected in ("path-authorized", "origin-less", "no-alternates",
-                     "no-secrets", "no-untracked-source", "hermes-home-confined",
-                     "no-live-key", "single_query_mode=deny", "deny-globs-present",
-                     "prohibited-matrix-blocked", "no-false-positives"):
-        assert expected in report.passed, f"{expected} did not run"
-
-
-def test_one_broken_assertion_refuses_the_whole_dispatch(tmp_path, monkeypatch):
-    """No warn tier: any failure refuses."""
-    root = tmp_path / "sandbox"
-    fx = _git_fixture(root / "fixtures" / "app",
-                      remote="https://example.invalid/x.git")
-    home = root / "hermes-home"
-    home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    cfg = {"approvals": {"single_query_mode": "deny"},
-           "kanban": {"workspace_policy": {"boards": {"eval": {
-               "mode": "sandbox", "allowed_roots": [str(root)],
-               "hermes_home_root": str(root)}}}}}
-    with pytest.raises(PreflightRefusal):
-        wp.enforce("t", str(fx), board="eval", config=cfg)
-
-
-# ===================== C1 and C2, end to end ===============================
-#
-# C1: a dispatch whose preflight fails creates no task_runs row.
-# C2: task_runs.observed_cwd, when recorded, is under the declared fixture root.
-
-
-@pytest.fixture
-def sandbox_board(tmp_path, monkeypatch):
-    """A real board on a disposable tree, in sandbox mode.
-
-    The policy is supplied by patching ``load_config`` — the same path
-    production reads — rather than by stubbing ``resolve_policy``, so these
-    tests exercise resolution too.
-    """
-    from hermes_cli import kanban_db as kb
-
-    home = tmp_path / "hermes-home"
+def test_an_unset_hermes_home_root_is_refused(tmp_path):
+    """It previously disabled confinement while still reporting confined."""
+    home = tmp_path / "h"
     home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    kb._INITIALIZED_PATHS.clear()
-    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _n: True)
+    with pytest.raises(PreflightRefusal, match="outside the sandbox root"):
+        wp.assert_hermes_home("t", _policy(tmp_path, hermes_home_root=None),
+                              home=str(home))
 
+
+# ===================== the shipped guards ==================================
+
+
+def test_assertions_18_19_call_hermes_own_guard(guards):
+    assert wp.shipped_guard_blocks(wp.GUARD_PROBE_PUSH) is True
+    assert wp.shipped_guard_blocks(wp.GUARD_PROBE_VERCEL) is True
+    assert wp.shipped_guard_blocks("npm test") is False
+
+
+def test_assertion_20_calls_hermes_own_execute_code_guard(guards):
+    assert wp.shipped_guard_refuses_execute_code(wp.GUARD_PROBE_CODE) is True
+
+
+def test_the_execute_code_probe_restores_the_session_env(guards):
+    key = "HERMES_SINGLE_QUERY_SESSION"
+    before = os.environ.get(key)
+    wp.shipped_guard_refuses_execute_code(wp.GUARD_PROBE_CODE)
+    assert os.environ.get(key) == before
+
+
+def test_a_config_that_does_not_block_pushes_fails_the_matrix(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                        lambda *a, **k: {"approvals": {"single_query_mode": "deny"}})
+    with pytest.raises(PreflightRefusal, match="does NOT block"):
+        wp.assert_prohibited_matrix("t", _policy(tmp_path))
+
+
+def test_an_overbroad_deny_blocking_real_work_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda *a, **k: {"approvals": {"single_query_mode": "deny",
+                                       "deny": ["*git*", "*npm*"]}})
+    with pytest.raises(PreflightRefusal, match="legitimate commands"):
+        wp.assert_allowed_matrix("t", _policy(tmp_path))
+
+
+def test_single_query_mode_must_be_deny(guards, monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                        lambda *a, **k: {"approvals": {"single_query_mode": "allow"}})
+    with pytest.raises(PreflightRefusal, match="single_query_mode"):
+        wp.assert_single_query_deny("t")
+
+
+def test_missing_required_deny_globs_refuse(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                        lambda *a, **k: {"approvals": {"deny": ["*vercel*"]}})
+    with pytest.raises(PreflightRefusal, match="missing required globs"):
+        wp.assert_required_deny_globs("t", _policy(tmp_path))
+
+
+# ===================== the full set, end to end ============================
+
+
+def test_a_fully_compliant_sandbox_board_passes_all_twenty(tmp_path, guards,
+                                                           monkeypatch):
     root = tmp_path / "sandbox"
     root.mkdir()
-    cfg = {
-        "approvals": {"single_query_mode": "deny", "deny": ["*git*push*"]},
-        "kanban": {"workspace_policy": {"boards": {"default": {
-            "mode": "sandbox",
-            "allowed_roots": [str(root)],
-            "protected_paths": ["*/dev/visitreno*"],
-            "hermes_home_root": str(tmp_path),
-            "required_deny_globs": ["*git*push*"],
-            # The fixture is a plain directory, not a git repo, so the
-            # git-specific assertions have nothing to inspect. They are
-            # exercised directly in the unit tests above.
-            "require_no_untracked_source": False,
-        }}}},
-    }
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: cfg)
-    return tmp_path, root, cfg
+    fx = _fixture(root / "fixtures" / "app")
+    home = root / "hermes-home"
+    home.mkdir()
+    (home / "settings.yaml").write_text("kanban:\n  max_in_progress: 1\n")
+
+    policy = _policy(root, hermes_home_root=str(root))
+    report = wp.enforce_final(
+        "t", str(fx), policy=policy, launch=_Launch(fx),
+        pinned_roots=wp.pin_allowed_roots(policy), home=str(home),
+    )
+    assert report.contract_satisfied is True, report.summary()
+    assert report.passed == wp.REQUIRED_ASSERTION_IDS
+    assert not report.skipped and not report.failed and not report.missing
 
 
-def _seed(conn, workspace, status="ready"):
-    from hermes_cli import kanban_db as kb
-
-    tid = kb.create_task(conn, title="w", assignee="coder",
-                         workspace_kind="dir", workspace_path=str(workspace))
-    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
-    conn.commit()
-    return tid
-
-
-def test_c1_a_policy_refusal_creates_no_run_row(sandbox_board, monkeypatch):
-    """C1, with a policy failure rather than an unusable path.
-
-    The workspace is perfectly usable — it is simply outside every authorized
-    root. Nothing may be created for it.
-    """
-    from hermes_cli import kanban_db as kb
-
-    tmp_path, root, cfg = sandbox_board
-    conn = kb.connect(db_path=tmp_path / "kanban.db")
-    try:
-        outside = tmp_path / "not-authorized"
-        outside.mkdir()
-        tid = _seed(conn, outside)
-
-        def _never(task, workspace, **kwargs):
-            pytest.fail("a worker was spawned for an unauthorized workspace")
-
-        result = kb.dispatch_once(conn, spawn_fn=_never)
-
-        assert tid in result.refused_confinement, result
-        runs = conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id = ?",
-                            (tid,)).fetchone()["c"]
-        assert runs == 0, "C1 violated: a refused dispatch created a run row"
-        task = kb.get_task(conn, tid)
-        assert task.status == "ready" and task.claim_lock is None
-        assert task.current_run_id is None
-    finally:
-        conn.close()
+def test_an_unverified_launch_fails_assertion_one(tmp_path, guards):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    fx = _fixture(root / "fixtures" / "app")
+    home = root / "hermes-home"
+    home.mkdir()
+    policy = _policy(root, hermes_home_root=str(root))
+    with pytest.raises(PreflightRefusal, match="not independently verified"):
+        wp.enforce_final("t", str(fx), policy=policy,
+                         launch=_Launch(fx, status="unobservable"),
+                         home=str(home))
 
 
-def test_c2_a_recorded_observed_cwd_is_under_the_declared_root(sandbox_board):
-    """C2, asserted against the value actually written to the database."""
-    from hermes_cli import kanban_db as kb
-
-    tmp_path, root, cfg = sandbox_board
-    conn = kb.connect(db_path=tmp_path / "kanban.db")
-    procs = []
-    try:
-        ws = root / "fixture"
-        ws.mkdir()
-        tid = _seed(conn, ws)
-
-        def _spawn(task, workspace, **kwargs):
-            p = subprocess.Popen(["/bin/sh", "-c", "sleep 5"], cwd=workspace)
-            procs.append(p)
-            return p.pid
-
-        result = kb.dispatch_once(conn, spawn_fn=_spawn)
-        assert tid in [i for i, _, _ in result.spawned], result
-
-        recorded = conn.execute(
-            "SELECT observed_cwd FROM task_runs WHERE task_id = ?",
-            (tid,)).fetchone()["observed_cwd"]
-        assert recorded is not None, "a confined launch must be evidenced"
-        assert wp._under(recorded, str(root)), (
-            f"C2 violated: {recorded!r} is outside the declared root {str(root)!r}")
-    finally:
-        for p in procs:
-            p.kill()
-            p.wait()
-        conn.close()
+def test_a_verified_launch_elsewhere_fails_assertion_one(tmp_path, guards):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    fx = _fixture(root / "fixtures" / "app")
+    other = root / "other"
+    other.mkdir()
+    home = root / "hermes-home"
+    home.mkdir()
+    policy = _policy(root, hermes_home_root=str(root))
+    with pytest.raises(PreflightRefusal, match="is not the final workspace"):
+        wp.enforce_final("t", str(fx), policy=policy, launch=_Launch(other),
+                         home=str(home))
 
 
-def test_c2_holds_for_an_escaped_launch_by_recording_nothing(sandbox_board):
-    """C2 must not be satisfied by writing a false value.
+def test_open_mode_final_enforcement_skips_everything_and_claims_nothing(tmp_path):
+    report = wp.enforce_final("t", str(tmp_path),
+                              policy=_policy(tmp_path, mode=wp.MODE_OPEN),
+                              launch=_Launch(tmp_path))
+    assert report.contract_satisfied is False
+    assert report.skipped == wp.REQUIRED_ASSERTION_IDS
 
-    An escaped worker records no observed_cwd at all, so the invariant "every
-    recorded value is under the root" stays true without ever claiming the
-    escape was confined.
-    """
-    from hermes_cli import kanban_db as kb
 
-    tmp_path, root, cfg = sandbox_board
-    conn = kb.connect(db_path=tmp_path / "kanban.db")
-    escaped = {}
-    try:
-        ws = root / "fixture"
-        ws.mkdir()
-        tid = _seed(conn, ws)
-
-        def _escaping(task, workspace, **kwargs):
-            p = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], cwd="/")
-            escaped["p"] = p
-            return p.pid
-
-        kb.dispatch_once(conn, spawn_fn=_escaping)
-
-        rows = conn.execute("SELECT observed_cwd FROM task_runs WHERE task_id = ?",
-                            (tid,)).fetchall()
-        assert all(r["observed_cwd"] is None for r in rows)
-        escaped["p"].wait(timeout=10)      # terminated, not left running
-    finally:
-        p = escaped.get("p")
-        if p and p.poll() is None:
-            p.kill()
-            p.wait()
-        conn.close()
+def test_the_pre_claim_gate_never_claims_the_contract(tmp_path):
+    """It judges a declared destination; the artifact does not exist yet."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    report = wp.enforce("t", str(ws), policy=_policy(tmp_path))
+    assert report.contract_satisfied is False
+    assert report.skipped, "pre-claim must record what it deferred"
