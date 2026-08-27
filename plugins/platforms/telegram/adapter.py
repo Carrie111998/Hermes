@@ -8793,6 +8793,25 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
         return bool(chat_id) and f"{chat_id}:{topic_id}" in allowed_topics
 
+    def _telegram_require_explicit_mention_topics(self) -> set[str]:
+        """Return exact ``<chat_id>:<thread_id>`` routes that require a tag."""
+        raw = self.config.extra.get("require_explicit_mention_topics", [])
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_requires_explicit_mention(self, message: Message) -> bool:
+        """True when replies and wake words must not substitute for ``@bot``."""
+        routes = self._telegram_require_explicit_mention_topics()
+        if not routes:
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not chat_id:
+            return False
+        thread_id = self._effective_message_thread_id(message)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return f"{chat_id}:{topic_id}" in routes
+
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
@@ -9245,20 +9264,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if not allowed or chat_id_str not in allowed:
             return False
 
+        strict_mention = self._telegram_requires_explicit_mention(message)
+
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
-        if chat_id_str in self._telegram_free_response_chats():
+        if not strict_mention and chat_id_str in self._telegram_free_response_chats():
             return False
-        if self._telegram_is_free_response_topic(message):
+        if not strict_mention and self._telegram_is_free_response_topic(message):
             return False
-        if not self._telegram_require_mention():
+        if not strict_mention and not self._telegram_require_mention():
             return False
-        if self._is_reply_to_bot(message):
+        if not strict_mention and self._is_reply_to_bot(message):
             return False
         if self._message_mentions_bot(message):
             return False
-        if self._message_matches_mention_patterns(message):
+        if not strict_mention and self._message_matches_mention_patterns(message):
             return False
         return True
 
@@ -9630,6 +9651,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
+        if self._telegram_requires_explicit_mention(message):
+            return self._message_mentions_bot(message)
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if self._telegram_is_free_response_topic(message):
