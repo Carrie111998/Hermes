@@ -30,8 +30,8 @@ def store(tmp_path, monkeypatch):
 
 
 def test_record_and_lookup_roundtrip(store):
-    sent_text_store.record("+1555", "m-1", "Good morning brief")
-    assert sent_text_store.lookup("+1555", "m-1") == "Good morning brief"
+    sent_text_store.record("+1555", "m-1", "Good morning.")
+    assert sent_text_store.lookup("+1555", "m-1") == "Good morning."
 
 
 def test_lookup_missing_returns_none(store):
@@ -124,7 +124,7 @@ def _tapback_event(target_id: str, target_text=None) -> dict:
             "targetDirection": "outbound",
             "targetText": target_text,
         },
-        "timestamp": "2026-08-27T05:44:00.000Z",
+        "timestamp": "2026-01-15T09:12:00.000Z",
     }
 
 
@@ -136,11 +136,11 @@ def _top_level_reply_event(target_id: str, target_text=None) -> dict:
         "platform": "iMessage",
         "space": {"id": "+155****4567", "type": "dm", "phone": "+155****4567"},
         "sender": {"id": "+155****4567"},
-        "content": {"type": "text", "text": "30 wtf"},
+        "content": {"type": "text", "text": "short reply"},
         "replyToMessageId": target_id,
         "replyToText": target_text,
         "replyToIsOwnMessage": True,
-        "timestamp": "2026-08-27T05:44:00.000Z",
+        "timestamp": "2026-01-15T09:12:00.000Z",
     }
 
 
@@ -150,10 +150,10 @@ async def test_photon_send_records_sent_text(photon_home, monkeypatch):
     fake = _FakeSidecar()
     monkeypatch.setattr(adapter, "_sidecar_call", fake)
 
-    await adapter.send("+155****4567", "Good morning brief 👻")
+    await adapter.send("+155****4567", "Good morning. 👻")
 
     stored = sent_text_store.lookup("+155****4567", "spc-msg-out-1")
-    assert stored is not None and "Good morning brief" in stored
+    assert stored is not None and "Good morning." in stored
 
 
 @pytest.mark.asyncio
@@ -181,7 +181,7 @@ async def test_tapback_hydrates_text_from_outbound_index(
     sent_text_store.record(
         "+155****4567",
         "spc-msg-cron-origin",
-        "Scheduled good-morning message: how is your body and brain feeling?",
+        "Morning reminder: the library visit moved to 3pm.",
     )
     raw = _tapback_event("spc-msg-cron-origin", target_text="")
     await adapter._dispatch_inbound(raw)
@@ -191,7 +191,7 @@ async def test_tapback_hydrates_text_from_outbound_index(
     assert evt.text.startswith("reaction:added:")
     assert evt.reply_to_message_id == "spc-msg-cron-origin"
     assert evt.reply_to_is_own_message is True
-    assert evt.reply_to_text and "good-morning" in evt.reply_to_text
+    assert evt.reply_to_text and "library" in evt.reply_to_text
 
 
 @pytest.mark.asyncio
@@ -213,7 +213,7 @@ async def test_top_level_reply_hydrates_empty_quoted_text(
     photon_home,
     monkeypatch,
 ):
-    """The production failure: '30 wtf' replying to a cron delivery whose
+    """The production failure: a short user reply anchoring to a cron delivery whose
     quoted text never made it through. Deployed sidecars emit the reply
     correlation as top-level fields; the adapter must preserve them and
     hydrate the missing text from the outbound index."""
@@ -222,19 +222,20 @@ async def test_top_level_reply_hydrates_empty_quoted_text(
 
     sent_text_store.record(
         "+155****4567",
-        "spc-msg-6405bb16",
-        "Good morning, Dan 👻 Amsterdam is overcast at about 18°C right now, "
-        "heading towards 30°C today.",
+        "spc-msg-00000000-0000-0000-0000-000000000000",
+        "Scheduled message for the morning. Take a moment to reset and enjoy the day.",
     )
-    await adapter._dispatch_inbound(_top_level_reply_event("spc-msg-6405bb16"))
+    await adapter._dispatch_inbound(
+        _top_level_reply_event("spc-msg-00000000-0000-0000-0000-000000000000")
+    )
 
     assert len(captured) == 1
     evt = captured[0]
-    assert evt.text == "30 wtf"
+    assert evt.text == "short reply"
     assert evt.message_type == MessageType.TEXT
-    assert evt.reply_to_message_id == "spc-msg-6405bb16"
+    assert evt.reply_to_message_id == "spc-msg-00000000-0000-0000-0000-000000000000"
     assert evt.reply_to_is_own_message is True
-    assert evt.reply_to_text and "Good morning" in evt.reply_to_text
+    assert evt.reply_to_text and "enjoy the day" in evt.reply_to_text
 
 
 @pytest.mark.asyncio
@@ -297,11 +298,12 @@ async def test_standalone_cron_send_records_sent_text(
     result = await adapter_mod._standalone_send(
         PlatformConfig(enabled=True, token="", extra={"sidecar_port": 41100}),
         "+155****4567",
-        "Scheduled good-morning message from cron job 'morning-brief'.",
+        "Good morning! Scheduled message for the morning: "
+        "take a moment to reset and enjoy the day.",
     )
     assert result.get("success") is True
     stored = sent_text_store.lookup("+155****4567", "spc-msg-cron-0")
-    assert stored is not None and stored.startswith("Scheduled good-morning")
+    assert stored is not None and stored.startswith("Good morning!")
 
 
 # ---------------------------------------------------------------------------
