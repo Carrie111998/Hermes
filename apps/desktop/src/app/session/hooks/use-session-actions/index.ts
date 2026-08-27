@@ -24,9 +24,9 @@ import {
 } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
-import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import {
@@ -928,7 +928,9 @@ export function useSessionActions({
         try {
           const persisted = await getLatestSessionMessages(storedSessionId, sessionProfile)
 
-          if (!isCurrentResume()) return
+          if (!isCurrentResume()) {
+            return
+          }
 
           const messages = toChatMessages(persisted.messages)
           setMessages(messages)
@@ -939,9 +941,41 @@ export function useSessionActions({
           setAwaitingResponse(false)
           setSessionStartedAt(Date.now())
 
-          if (storedForProfile) applyStoredUsage(storedForProfile)
+          if (storedForProfile) {
+            applyStoredUsage(storedForProfile)
+          }
+
+          // Durable REST history is painted first, then the receive-only live
+          // stream fills in new deltas. The spectator gateway owns reconnect
+          // cursors and permits no methods other than subscribe/unsubscribe.
+          const subscription = await requestGateway<{
+            session_id?: string
+            subscribed?: boolean
+          }>('session.subscribe', { session_id: storedSessionId }).catch(() => null)
+
+          if (!isCurrentResume()) {
+            return
+          }
+
+          const runtimeId = subscription?.subscribed ? subscription.session_id?.trim() : ''
+
+          if (runtimeId) {
+            const state = ensureSessionState(runtimeId, storedSessionId)
+
+            runtimeIdByStoredSessionIdRef.current.set(storedSessionId, runtimeId)
+            updateSessionState(
+              runtimeId,
+              current => ({ ...current, ...state, messages, storedSessionId }),
+              storedSessionId
+            )
+            setActiveSessionId(runtimeId)
+            activeSessionIdRef.current = runtimeId
+          }
         } catch (error) {
-          if (!isCurrentResume()) return
+          if (!isCurrentResume()) {
+            return
+          }
+
           setMessages([])
           notifyError(error, 'Could not load this conversation in spectator mode')
         }
@@ -1955,6 +1989,7 @@ export function useSessionActions({
       busyRef,
       copy,
       holdSessionTranscriptView,
+      ensureSessionState,
       requestGateway,
       resetViewSync,
       runtimeIdByStoredSessionIdRef,

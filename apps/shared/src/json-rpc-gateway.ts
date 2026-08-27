@@ -25,6 +25,8 @@ export type GatewayEventName =
   | (string & {})
 
 export interface GatewayEvent<P = unknown> {
+  /** Monotonic within one live runtime generation (spectator replay cursor). */
+  event_id?: number
   payload?: P
   /** Renderer-side source tag added by the Desktop gateway registry. */
   profile?: string
@@ -33,6 +35,8 @@ export interface GatewayEvent<P = unknown> {
   connectionId?: string
   session_id?: string
   type: GatewayEventName
+  /** Changes whenever the in-memory runtime/replay window is recreated. */
+  runtime_generation?: string
 }
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error'

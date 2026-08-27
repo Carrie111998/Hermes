@@ -21,6 +21,7 @@ import {
   getSession,
   getSessionMessages,
   getStatus,
+  HermesGateway,
   HermesSpectatorGateway,
   LATEST_SESSION_MESSAGES_LIMIT,
   listAllProfileSessions,
@@ -54,6 +55,90 @@ describe('Hermes spectator gateway', () => {
       )
     }
   )
+
+  it('permits only receive-only subscription RPCs', async () => {
+    const request = vi
+      .spyOn(HermesGateway.prototype, 'request')
+      .mockResolvedValue({
+        cursor: { event_id: 0, runtime_generation: 'generation-1' },
+        replay_gap: false,
+        runtime_generation: 'generation-1',
+        session_id: 'runtime-1',
+        session_key: 'session-1',
+        subscribed: true
+      })
+
+    const gateway = new HermesSpectatorGateway()
+
+    await gateway.request('session.subscribe', { session_id: 'session-1' })
+    await gateway.request('session.unsubscribe', { session_id: 'session-1' })
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      'session.subscribe',
+      'session.unsubscribe'
+    ])
+    request.mockRestore()
+  })
+
+  it('reuses observed cursors and recovers gaps from the durable baseline', async () => {
+    const request = vi.spyOn(HermesGateway.prototype, 'request')
+
+    const subscribed = {
+      cursor: { event_id: 2, runtime_generation: 'generation-1' },
+      replay_gap: false,
+      runtime_generation: 'generation-1',
+      session_id: 'runtime-1',
+      session_key: 'session-1',
+      subscribed: true
+    }
+
+    request.mockResolvedValueOnce(subscribed)
+    const gateway = new HermesSpectatorGateway()
+    await gateway.request('session.subscribe', { session_id: 'session-1' })
+
+    ;(gateway as unknown as { handleMessage(raw: string): void }).handleMessage(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'event',
+        params: {
+          event_id: 3,
+          runtime_generation: 'generation-1',
+          session_id: 'runtime-1',
+          type: 'message.delta'
+        }
+      })
+    )
+
+    request.mockResolvedValueOnce({
+      ...subscribed,
+      cursor: { event_id: 7, runtime_generation: 'generation-1' },
+      replay_gap: true,
+      subscribed: false
+    })
+    request.mockResolvedValueOnce({
+      ...subscribed,
+      cursor: { event_id: 7, runtime_generation: 'generation-1' }
+    })
+
+    await gateway.request('session.subscribe', { session_id: 'session-1' })
+
+    expect(request.mock.calls[1]).toEqual([
+      'session.subscribe',
+      {
+        cursor: { event_id: 3, runtime_generation: 'generation-1' },
+        session_id: 'session-1'
+      },
+      undefined,
+      undefined
+    ])
+    expect(request.mock.calls[2]).toEqual([
+      'session.subscribe',
+      { session_id: 'session-1' },
+      undefined,
+      undefined
+    ])
+    request.mockRestore()
+  })
 })
 
 describe('Hermes REST helpers', () => {

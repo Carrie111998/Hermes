@@ -38,19 +38,150 @@ export class HermesGateway extends JsonRpcGatewayClient {
   }
 }
 
-/** Receive-only gateway used by the browser spectator. Event delivery remains
- * identical to Desktop, but no JSON-RPC request may leave the browser. */
-export class HermesSpectatorGateway extends HermesGateway {
-  override request<T>(
-    method: string,
-    _params: Record<string, unknown> = {},
-    _timeoutMs?: number,
-    _signal?: AbortSignal
-  ): Promise<T> {
-    return Promise.reject(new Error(`Hermes iPad spectator is read-only: ${method}`))
-  }
+interface SpectatorCursor {
+  event_id: number
+  runtime_generation: string
 }
 
+interface SpectatorSubscriptionResult {
+  cursor: SpectatorCursor
+  replay_gap: boolean
+  runtime_generation: string
+  session_id: string
+  session_key: string
+  subscribed: boolean
+}
+
+const SPECTATOR_RPC_METHODS = new Set(['session.subscribe', 'session.unsubscribe'])
+
+/** Receive-only gateway used by the browser spectator. The server and browser
+ * both allow exactly subscribe/unsubscribe; every writer/mutation RPC remains
+ * fail-closed. Reconnect cursors stay in memory only and are scoped by runtime
+ * generation, so a dropped socket replays missed events without persisting
+ * credentials or treating replay as a durable transcript. */
+export class HermesSpectatorGateway extends HermesGateway {
+  private activeSubscription: null | string = null
+  private readonly cursors = new Map<string, SpectatorCursor>()
+  private readonly runtimeTargets = new Map<string, string>()
+  private subscriptionQueue: Promise<void> = Promise.resolve()
+
+  constructor() {
+    super()
+    this.onEvent(event => {
+      const target = event.session_id ? this.runtimeTargets.get(event.session_id) : null
+
+      if (
+        target &&
+        typeof event.event_id === 'number' &&
+        Number.isInteger(event.event_id) &&
+        event.event_id >= 0 &&
+        typeof event.runtime_generation === 'string' &&
+        event.runtime_generation
+      ) {
+        this.cursors.set(target, {
+          event_id: event.event_id,
+          runtime_generation: event.runtime_generation
+        })
+      }
+    })
+  }
+
+  override request<T>(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<T> {
+    if (!SPECTATOR_RPC_METHODS.has(method)) {
+      return Promise.reject(new Error(`Hermes iPad spectator is read-only: ${method}`))
+    }
+
+    const operation = () =>
+      method === 'session.subscribe'
+        ? this.subscribe<T>(params, timeoutMs, signal)
+        : this.unsubscribe<T>(params, timeoutMs, signal)
+
+    const result = this.subscriptionQueue.then(operation, operation)
+
+    this.subscriptionQueue = result.then(
+      () => undefined,
+      () => undefined
+    )
+
+    return result
+  }
+
+  private async subscribe<T>(
+    params: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<T> {
+    const target = String(params.session_id ?? '').trim()
+
+    if (!target) {
+      throw new Error('session.subscribe requires session_id')
+    }
+
+    if (this.activeSubscription && this.activeSubscription !== target) {
+      await super
+        .request('session.unsubscribe', { session_id: this.activeSubscription }, timeoutMs, signal)
+        .catch(() => undefined)
+      this.activeSubscription = null
+    }
+
+    const cleanParams = { ...params }
+
+    delete cleanParams.after_event_id
+    delete cleanParams.cursor
+    delete cleanParams.runtime_generation
+
+    const cursor = this.cursors.get(target)
+    const requestParams = cursor ? { ...cleanParams, cursor } : cleanParams
+
+    let result = await super.request<SpectatorSubscriptionResult>(
+      'session.subscribe',
+      requestParams,
+      timeoutMs,
+      signal
+    )
+
+    // The session-selection path hydrates the durable REST transcript before
+    // it calls subscribe. A gap therefore means that hydration is already the
+    // authoritative baseline: clear the stale cursor and attach at "now".
+    if (result.replay_gap && !result.subscribed) {
+      this.cursors.delete(target)
+      result = await super.request<SpectatorSubscriptionResult>(
+        'session.subscribe',
+        cleanParams,
+        timeoutMs,
+        signal
+      )
+    }
+
+    if (result.subscribed) {
+      this.activeSubscription = target
+      this.runtimeTargets.set(result.session_id, target)
+      this.cursors.set(target, result.cursor)
+    }
+
+    return result as T
+  }
+
+  private async unsubscribe<T>(
+    params: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<T> {
+    const result = await super.request<T>('session.unsubscribe', params, timeoutMs, signal)
+    const target = String(params.session_id ?? '').trim()
+
+    if (!target || target === this.activeSubscription) {
+      this.activeSubscription = null
+    }
+
+    return result
+  }
+}
 // Profile that profile-scoped REST settings (config/env/skills/tools/model/…)
 // should target. Mirrors $activeGatewayProfile, pushed in from the store via
 // setApiRequestProfile so this module needs no store import (avoids a cycle).

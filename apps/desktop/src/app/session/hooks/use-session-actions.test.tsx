@@ -982,32 +982,45 @@ describe('resumeSession failure recovery', () => {
     expect(state?.streamId).toBe(state?.messages.find(message => message.pending)?.id)
   })
 
-  it('hydrates a browser spectator through REST without binding the live runtime transport', async () => {
+  it('hydrates a browser spectator before attaching the read-only live stream', async () => {
     const desktop = window.hermesDesktop
     const spectator = window.__HERMES_SPECTATOR__
     delete (window as { hermesDesktop?: typeof window.hermesDesktop }).hermesDesktop
     window.__HERMES_SPECTATOR__ = true
-    const requestGateway = vi.fn(async () => {
-      throw new Error('spectator must not issue a gateway RPC')
+
+    const order: string[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      order.push(method)
+
+      return { session_id: 'runtime-observer-1', subscribed: true } as never
     })
 
     setSessions([storedSession({ message_count: 2, profile: 'default' })])
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
-      messages: [
-        { content: 'observed prompt', role: 'user', timestamp: 1 },
-        { content: 'observed answer', role: 'assistant', timestamp: 2 }
-      ],
-      session_id: 'stored-1'
-    } as never)
+    vi.mocked(getLatestSessionMessages).mockImplementation(async () => {
+      order.push('durable-hydration')
+
+      return {
+        messages: [
+          { content: 'observed prompt', role: 'user', timestamp: 1 },
+          { content: 'observed answer', role: 'assistant', timestamp: 2 }
+        ],
+        session_id: 'stored-1'
+      } as never
+    })
 
     try {
       await runResume(requestGateway)
 
-      expect(requestGateway).not.toHaveBeenCalled()
+      expect(requestGateway).toHaveBeenCalledOnce()
+      expect(requestGateway).toHaveBeenCalledWith('session.subscribe', {
+        session_id: 'stored-1'
+      })
+      expect(order).toEqual(['durable-hydration', 'session.subscribe'])
       expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-1', 'default')
       expect(JSON.stringify($messages.get())).toContain('observed prompt')
       expect(JSON.stringify($messages.get())).toContain('observed answer')
-      expect($activeSessionId.get()).toBeNull()
+      expect($activeSessionId.get()).toBe('runtime-observer-1')
     } finally {
       window.hermesDesktop = desktop
       window.__HERMES_SPECTATOR__ = spectator
