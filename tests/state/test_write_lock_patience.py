@@ -177,6 +177,34 @@ class TestTranscriptWritePatience:
         assert "db_path=" in recovery_events[0].message
         assert "recovery=success" in recovery_events[0].message
 
+    def test_append_messages_batch_honors_short_patience_override(self, db):
+        """The outer persistence wait can keep DB attempts short and cancellable."""
+        db.create_session("s-short-override", "cli")
+        db._conn.execute("PRAGMA busy_timeout=1")
+
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 0.5, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(5.0)
+            t0 = time.monotonic()
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db.append_messages_batch(
+                    "s-short-override",
+                    [{"role": "user", "content": "short patience"}],
+                    write_patience_s=0.05,
+                )
+            elapsed = time.monotonic() - t0
+        finally:
+            holder.join(timeout=10.0)
+
+        assert not holder.is_alive()
+        assert elapsed < 0.5
+        assert "another database connection" in str(excinfo.value)
+        assert db.get_messages("s-short-override") == []
+
     def test_write_succeeds_immediately_when_uncontended(self, db):
         """Patience must cost nothing when there is no contention."""
         db.create_session("s2", "cli")

@@ -461,7 +461,20 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
+        if (
+            interrupted
+            and getattr(agent, "_session_persistence_wait_cancelled", False)
+        ):
+            from agent.persistence_wait import wait_for_session_persistence
+
+            wait_for_session_persistence(
+                agent,
+                lambda: agent._persist_session(messages, conversation_history),
+                stage="turn finalization after interrupt",
+                allow_interrupted_start=True,
+            )
+        else:
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

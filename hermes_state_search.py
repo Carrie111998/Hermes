@@ -48,6 +48,15 @@ logger = logging.getLogger("hermes_state")
 # stripping it here widened those queries onto unrelated rows.
 _FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
 _FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
+_FTS5_SHADOW_SUFFIXES = ("_config", "_content", "_data", "_docsize", "_idx")
+
+
+def _fts5_shadow_table_names(*base_tables: str) -> tuple[str, ...]:
+    return tuple(
+        f"{base}{suffix}"
+        for base in base_tables
+        for suffix in _FTS5_SHADOW_SUFFIXES
+    )
 
 
 class SessionSearchMixin:
@@ -709,15 +718,23 @@ class SessionSearchMixin:
                     "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
                 )
                 conn.execute("PRAGMA writable_schema=RESET")
+                shadow_names = _fts5_shadow_table_names(
+                    "messages_fts",
+                    "messages_fts_trigram",
+                )
+                shadow_placeholders = ",".join("?" for _ in shadow_names)
                 shadows = [
                     r[0] for r in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' "
-                        "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
-                        "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
+                        f"AND name IN ({shadow_placeholders})",
+                        shadow_names,
                     ).fetchall()
                 ]
                 for sh in shadows:
-                    conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
+                    safe = str(sh).replace('"', '""')
+                    conn.execute(
+                        f'ALTER TABLE "{safe}" RENAME TO "fts_v22_trash_{safe}"'
+                    )
             # Claim the backfill *before* empty v23 tables exist. A crash
             # between this commit and schema ensure still leaves markers, so
             # optimize-storage resumes instead of tearing down trash and
@@ -992,10 +1009,13 @@ class SessionSearchMixin:
             ):
                 conn.execute(ddl)
                 dropped += 1
+            shadow_names = _fts5_shadow_table_names("messages_fts_trigram")
+            shadow_placeholders = ",".join("?" for _ in shadow_names)
             shadows = [
                 r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name LIKE 'messages_fts_trigram_%' ESCAPE '\\'"
+                    f"AND name IN ({shadow_placeholders})",
+                    shadow_names,
                 ).fetchall()
             ]
             for table in shadows:

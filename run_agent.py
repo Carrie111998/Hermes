@@ -35,6 +35,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -88,6 +89,17 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
     except OSError:
         # cwd was unlinked out from under us — nothing meaningful to record.
         return None
+
+
+def _call_accepts_kw(callable_obj: Any, name: str) -> bool:
+    try:
+        params = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD or param.name == name
+        for param in params
+    )
 
 
 def _session_source_for_agent(platform: Optional[str]) -> str:
@@ -671,19 +683,36 @@ class AIAgent:
                     _init_model_config["yolo_mode"] = True
             except Exception:
                 pass
-            self._session_db.create_session(
-                session_id=self.session_id,
-                source=source,
-                model=self.model,
-                model_config=_init_model_config,
-                system_prompt=self._cached_system_prompt,
-                user_id=None,
-                parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
-                profile_name=_profile_for_session,
+            _create_kwargs = {
+                "session_id": self.session_id,
+                "source": source,
+                "model": self.model,
+                "model_config": _init_model_config,
+                "system_prompt": self._cached_system_prompt,
+                "user_id": None,
+                "parent_session_id": self._parent_session_id,
+                "cwd": _launch_cwd_for_session(source),
+                "profile_name": _profile_for_session,
+            }
+            _write_patience = getattr(
+                self,
+                "_session_persistence_operation_patience_s",
+                None,
             )
+            if (
+                _write_patience is not None
+                and _call_accepts_kw(self._session_db.create_session, "write_patience_s")
+            ):
+                _create_kwargs["write_patience_s"] = _write_patience
+            self._session_db.create_session(**_create_kwargs)
             self._session_db_created = True
         except Exception as e:
+            try:
+                from hermes_state import classify_persistence_error
+
+                self._last_persistence_error_cause = classify_persistence_error(e)
+            except Exception:
+                self._last_persistence_error_cause = "unknown"
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(
@@ -2177,6 +2206,10 @@ class AIAgent:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
                 self._ensure_db_session()
+                if not self._session_db_created:
+                    if getattr(self, "_last_persistence_error_cause", None) is None:
+                        self._last_persistence_error_cause = "unknown"
+                    return False
             # Positional flushing used to slice at
             # max(len(conversation_history), _last_flushed_db_idx). That
             # assumes the live `messages` list is the original history plus a
@@ -2410,20 +2443,34 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
+                _append_kwargs = {
+                    "session_id": self.session_id,
+                    "messages": _batch_rows,
+                    "compression_lock_holder": getattr(
                         self, "_active_compression_lock_holder", None
                     ),
-                    turn_lease_holder=getattr(
+                    "turn_lease_holder": getattr(
                         self, "_active_session_turn_lease_holder", None
                     ),
-                    turn_lease_ttl_seconds=getattr(
+                    "turn_lease_ttl_seconds": getattr(
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                }
+                _write_patience = getattr(
+                    self,
+                    "_session_persistence_operation_patience_s",
+                    None,
                 )
+                if (
+                    _write_patience is not None
+                    and _call_accepts_kw(
+                        self._session_db.append_messages_batch,
+                        "write_patience_s",
+                    )
+                ):
+                    _append_kwargs["write_patience_s"] = _write_patience
+                self._session_db.append_messages_batch(**_append_kwargs)
                 from agent.transcript_repair import sync_flushed_message_markers
 
                 sync_flushed_message_markers(_batch_msgs, _batch_rows)

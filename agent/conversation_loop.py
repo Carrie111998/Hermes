@@ -1961,6 +1961,7 @@ def run_conversation(
     # turn's flush must not be reported against this turn.
     agent._compression_adoption_failed = False
     agent._session_persistence_wait_cancelled = False
+    agent._tool_execution_interrupted = False
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -7535,6 +7536,13 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                if getattr(agent, "_tool_execution_interrupted", False):
+                    interrupted = True
+                    _turn_exit_reason = "interrupted_by_user"
+                    final_response = ""
+                    failed = False
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

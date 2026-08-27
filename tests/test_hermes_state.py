@@ -3415,6 +3415,46 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_optimize_demote_preserves_similarly_named_non_fts_tables(self, tmp_path):
+        db_path = tmp_path / "v22-preserve-neighbor.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db._conn.execute(
+                "CREATE TABLE messages_fts_trigram_backup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messages_fts_trigram_backup (id) VALUES (7)"
+            )
+            db._conn.execute(
+                "CREATE TABLE messagesXftsXtrigramXbackup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messagesXftsXtrigramXbackup (id) VALUES (8)"
+            )
+            db._conn.commit()
+
+            result = db.optimize_fts_storage(vacuum=False)
+
+            assert result["ok"] is True
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messages_fts_trigram_backup"
+                ).fetchall()
+            ] == [7]
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messagesXftsXtrigramXbackup"
+                ).fetchall()
+            ] == [8]
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE name = 'fts_v22_trash_messages_fts_trigram_backup'"
+            ).fetchone() is None
+        finally:
+            db.close()
+
 
 
 
@@ -3477,6 +3517,50 @@ class TestFTSExternalContentMigration:
             assert len(enabled.search_messages("disabled")) >= 1
         finally:
             enabled.close()
+
+    def test_reclaim_disabled_trigram_preserves_similarly_named_tables(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": False}},
+        )
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db._conn.execute(
+                "CREATE TABLE messagesXftsXtrigramXbackup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messagesXftsXtrigramXbackup (id) VALUES (1)"
+            )
+            db._conn.execute(
+                "CREATE TABLE messages_fts_trigram_backup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messages_fts_trigram_backup (id) VALUES (2)"
+            )
+            db._conn.commit()
+
+            result = db.reclaim_disabled_trigram_fts(vacuum=False)
+
+            assert result["ok"] is True
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messagesXftsXtrigramXbackup"
+                ).fetchall()
+            ] == [1]
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messages_fts_trigram_backup"
+                ).fetchall()
+            ] == [2]
+        finally:
+            db.close()
 
     def test_invalid_trigram_policy_config_fails_before_trigram_ddl(
         self, tmp_path, monkeypatch

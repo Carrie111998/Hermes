@@ -18,6 +18,7 @@ drives it and stops promptly.
 """
 import threading
 import time
+import inspect
 from unittest.mock import patch
 
 
@@ -348,6 +349,18 @@ def test_hooks_did_not_change_required_surface():
     from cron.scheduler_provider import CronScheduler
 
     assert set(CronScheduler.__abstractmethods__) == {"name", "start"}
+
+
+def test_owner_session_db_is_builtin_private_start_kwarg():
+    """External providers must not inherit the built-in SessionDB owner hook."""
+    from cron.scheduler_provider import CronScheduler, InProcessCronScheduler
+
+    assert "owner_session_db" not in inspect.signature(
+        CronScheduler.start
+    ).parameters
+    assert "owner_session_db" in inspect.signature(
+        InProcessCronScheduler.start
+    ).parameters
 
 
 def test_builtin_inherits_hook_defaults():

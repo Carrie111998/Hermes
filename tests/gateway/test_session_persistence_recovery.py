@@ -24,7 +24,7 @@ from tests.run_agent.test_tool_call_incremental_persistence import (
     ("error_text", "cause"),
     [
         ("attempt to write a readonly database", "disk"),
-        ("database disk image is malformed", "unknown"),
+        ("database disk image is malformed", "corrupt"),
     ],
 )
 def test_non_lock_persistence_failures_stay_terminal(error_text, cause):
@@ -270,6 +270,13 @@ def test_mixed_surface_lock_incident_recovers_in_subprocess(tmp_path):
                  patch("run_agent.AIAgent", CronAgent), \
                  patch.object(sched, "get_due_jobs", return_value=jobs), \
                  patch.object(sched, "advance_next_runs"), \
+                 patch.object(
+                     sched,
+                     "claim_job_for_fire",
+                     side_effect=lambda job_id, return_job=False: next(
+                         job for job in jobs if job["id"] == job_id
+                     ),
+                 ), \
                  patch.object(sched, "claim_dispatch", return_value=True), \
                  patch.object(
                      sched,

@@ -122,7 +122,6 @@ class CronScheduler(ABC):
         adapters: Any = None,
         loop: Any = None,
         interval: int = 60,
-        owner_session_db: Any = None,
     ) -> None:
         """Begin firing due jobs.
 

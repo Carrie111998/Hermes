@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import sqlite3
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
@@ -32,6 +33,10 @@ import pytest
 
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.agent_runtime_helpers import sanitize_api_messages
+from agent.persistence_wait import (
+    session_persistence_wait_was_cancelled,
+    wait_for_session_persistence,
+)
 from agent.tool_executor import execute_tool_calls_segmented
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -375,8 +380,6 @@ def test_persistence_cause_resets_between_turns():
 
 def test_stop_during_locked_assistant_wait_cancels_before_tool_execution():
     """A /stop while awaiting persistence cancels the pending tool safely."""
-    import sqlite3
-
     agent = _make_agent()
     agent._session_persistence_lock_wait_initial_s = 0.0
     agent._session_persistence_lock_wait_max_sleep_s = 0.0
@@ -406,6 +409,270 @@ def test_stop_during_locked_assistant_wait_cancels_before_tool_execution():
     assert result["failed"] is False
     assert result["turn_exit_reason"] == "interrupted_by_user"
     assert [m.get("role") for m in result["messages"]] == ["user"]
+
+
+def test_interrupted_locked_wait_uses_short_operation_patience_once():
+    """A pre-set /stop still gets one cancellation-safe write attempt.
+
+    The outer wait loop must regain control quickly enough to observe the
+    interrupt instead of blocking inside SessionDB's long transcript patience.
+    """
+    agent = _make_agent()
+    agent._session_persistence_lock_write_patience_s = 0.01
+    agent._session_persistence_lock_wait_initial_s = 0.0
+    agent._session_persistence_lock_wait_max_sleep_s = 0.0
+    agent._interrupt_requested = True
+
+    append_patiences: list[float | None] = []
+
+    class LockedDb:
+        def append_messages_batch(self, **kwargs):
+            append_patiences.append(kwargs.get("write_patience_s"))
+            raise sqlite3.OperationalError("database is locked")
+
+    agent._session_db = LockedDb()
+    agent._session_db_created = True
+    agent.session_id = "interrupted-short-patience"
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_disabled = False
+
+    messages = [{"role": "tool", "content": "cancelled", "tool_call_id": "c1"}]
+
+    ok = wait_for_session_persistence(
+        agent,
+        lambda: agent._flush_messages_to_session_db(messages),
+        stage="cancelled tool results",
+        allow_interrupted_start=True,
+    )
+
+    assert ok is False
+    assert session_persistence_wait_was_cancelled(agent) is True
+    assert append_patiences == [0.01]
+    assert not hasattr(agent, "_session_persistence_operation_patience_s")
+
+
+def test_locked_session_create_blocks_message_append_until_retry():
+    """A failed first-use session row creation must not write orphan messages."""
+    agent = _make_agent()
+    agent.session_id = "locked-create"
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_disabled = False
+
+    class LockedCreateDb:
+        def __init__(self):
+            self.append_messages_batch = MagicMock()
+
+        def create_session(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    locked_db = LockedCreateDb()
+    agent._session_db = locked_db
+
+    ok = agent._flush_messages_to_session_db(
+        [{"role": "user", "content": "must wait for session row"}]
+    )
+
+    assert ok is False
+    assert agent._last_persistence_error_cause == "locked"
+    locked_db.append_messages_batch.assert_not_called()
+
+
+def test_sequential_interrupt_persists_cancelled_results_before_return():
+    """Queued tool calls cancelled by /stop are durably closed before return."""
+    agent = _make_agent()
+    agent._interrupt_requested = True
+    tool_calls = [
+        _mock_tool_call(name="web_search", call_id="c1"),
+        _mock_tool_call(name="web_search", call_id="c2"),
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    flush_snapshots: list[list] = []
+
+    def _record_flush(flush_messages, conversation_history=None):
+        flush_snapshots.append(copy.deepcopy(flush_messages))
+        return True
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+
+    with patch("run_agent.handle_function_call") as dispatch:
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_not_called()
+    assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
+    assert all(m["effect_disposition"] == "none" for m in messages)
+    assert len(flush_snapshots) == 1
+    assert [m["tool_call_id"] for m in flush_snapshots[0]] == ["c1", "c2"]
+    assert getattr(agent, "_tool_execution_interrupted", False) is True
+    assert getattr(agent, "_incremental_persistence_failed", False) is False
+
+
+def test_sequential_interrupt_locked_cancel_flush_stays_user_interrupt():
+    """A locked cancelled-result flush must not become storage failure."""
+    agent = _make_agent()
+    agent._interrupt_requested = True
+    messages: list = []
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call(name="web_search", call_id="c1")],
+    )
+
+    def _locked_flush(_messages, conversation_history=None):
+        agent._last_persistence_error_cause = "locked"
+        return False
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_locked_flush)
+
+    with patch("run_agent.handle_function_call") as dispatch:
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_not_called()
+    assert agent._flush_messages_to_session_db.call_count == 1
+    assert [m["tool_call_id"] for m in messages] == ["c1"]
+    assert getattr(agent, "_tool_execution_interrupted", False) is True
+    assert getattr(agent, "_incremental_persistence_failed", False) is False
+    assert session_persistence_wait_was_cancelled(agent) is True
+
+
+def test_sequential_interrupt_marks_failure_when_cancel_flush_fails():
+    """A cancelled batch must not silently leave an unclosed durable sequence."""
+    agent = _make_agent()
+    agent._interrupt_requested = True
+    messages: list = []
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call(name="web_search", call_id="c1")],
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+
+    with patch("run_agent.handle_function_call") as dispatch:
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_not_called()
+    assert [m["tool_call_id"] for m in messages] == ["c1"]
+    assert getattr(agent, "_incremental_persistence_failed", False) is True
+
+
+def test_concurrent_preflight_interrupt_attempts_bounded_cancel_flush():
+    """Parallel batches get the same cancellation-safe persistence boundary."""
+    agent = _make_agent()
+    agent._interrupt_requested = True
+    messages: list = []
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[
+            _mock_tool_call(name="web_search", call_id="c1"),
+            _mock_tool_call(name="web_search", call_id="c2"),
+        ],
+    )
+
+    def _locked_flush(_messages, conversation_history=None):
+        agent._last_persistence_error_cause = "locked"
+        return False
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_locked_flush)
+
+    with patch.object(agent, "_invoke_tool") as invoke:
+        agent._execute_tool_calls_concurrent(
+            assistant_message,
+            messages,
+            "task-1",
+        )
+
+    invoke.assert_not_called()
+    assert agent._flush_messages_to_session_db.call_count == 1
+    assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
+    assert getattr(agent, "_tool_execution_interrupted", False) is True
+    assert getattr(agent, "_incremental_persistence_failed", False) is False
+    assert session_persistence_wait_was_cancelled(agent) is True
+
+
+def test_tool_execution_interrupt_exits_loop_without_storage_failure():
+    """The conversation loop maps tool-batch cancellation to interrupted."""
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="cancelled-later")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+
+    def _interrupt_execute(*_args, **_kwargs):
+        agent._tool_execution_interrupted = True
+        agent.interrupt("stop requested")
+
+    with (
+        patch.object(agent, "_persist_session", return_value=True),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_interrupt_execute),
+    ):
+        result = agent.run_conversation("inspect the repository")
+
+    assert result["interrupted"] is True
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "interrupted_by_user"
+    assert "failure_reason" not in result
+    assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_interrupted_finalizer_uses_short_retry_after_cancelled_wait():
+    """Finalization after a cancelled wait must not enter 60s transcript patience."""
+    agent = _make_agent()
+    agent._session_persistence_lock_write_patience_s = 0.01
+    tool_call = _mock_tool_call(call_id="cancelled-later")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+    finalizer_patiences: list[float | None] = []
+
+    def _interrupt_execute(*_args, **_kwargs):
+        agent._tool_execution_interrupted = True
+        agent._session_persistence_wait_cancelled = True
+        agent.interrupt("stop requested")
+
+    def _persist_session(_messages, conversation_history=None):
+        if getattr(agent, "_tool_execution_interrupted", False):
+            finalizer_patiences.append(
+                getattr(agent, "_session_persistence_operation_patience_s", None)
+            )
+            agent._last_persistence_error_cause = "locked"
+            return False
+        return True
+
+    with (
+        patch.object(agent, "_persist_session", side_effect=_persist_session),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_interrupt_execute),
+    ):
+        result = agent.run_conversation("inspect the repository")
+
+    assert result["interrupted"] is True
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "interrupted_by_user"
+    assert finalizer_patiences == [0.01]
 
 
 # ---------------------------------------------------------------------------

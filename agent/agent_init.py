@@ -1775,9 +1775,9 @@ def init_agent(
     agent._persist_disabled = False
     agent._awaiting_session_persistence = False
     agent._awaiting_session_persistence_stage = None
-    agent._awaiting_session_persistence_started_at = None
     agent._session_persistence_wait_attempts = 0
     agent._session_persistence_wait_cancelled = False
+    agent._tool_execution_interrupted = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

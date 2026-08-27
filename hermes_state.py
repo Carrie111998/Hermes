@@ -6057,6 +6057,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        write_patience_s: Optional[float] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -6231,7 +6232,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # session_persistence_failed. Ride out long sibling holds.
         self._execute_write(
             _do,
-            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if write_patience_s is None
+                else write_patience_s
+            ),
             operation="create_session",
             session_id=session_id,
         )
@@ -11211,6 +11216,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        write_patience_s: Optional[float] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -11329,7 +11335,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # process's FTS optimize) can't destroy a healthy turn (#74478).
         return self._execute_write(
             _do,
-            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if write_patience_s is None
+                else write_patience_s
+            ),
             operation="append_message",
             session_id=session_id,
         )
@@ -11342,6 +11352,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        write_patience_s: Optional[float] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -11382,6 +11393,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     compression_lock_holder=compression_lock_holder,
                     turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    write_patience_s=write_patience_s,
                 )
             return inserted_total
 
@@ -11426,7 +11438,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
             _do,
-            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if write_patience_s is None
+                else write_patience_s
+            ),
             operation="append_messages_batch",
             session_id=session_id,
         )

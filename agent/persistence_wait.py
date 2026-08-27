@@ -12,9 +12,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_INITIAL_SLEEP_S = 0.25
 _DEFAULT_MAX_SLEEP_S = 5.0
 _DEFAULT_PROGRESS_INTERVAL_S = 10.0
+_DEFAULT_OPERATION_PATIENCE_S = 0.5
 _INTERRUPT_POLL_S = 0.2
 
 _WAITING_MESSAGE = "Session storage is busy; waiting to save before continuing."
+_MISSING = object()
 
 
 def _agent_float(agent: Any, attr: str, default: float) -> float:
@@ -73,7 +75,6 @@ def _begin_wait(agent: Any, stage: str, attempts: int) -> float:
     started_mono = time.monotonic()
     agent._awaiting_session_persistence = True
     agent._awaiting_session_persistence_stage = stage
-    agent._awaiting_session_persistence_started_at = time.time()
     agent._session_persistence_wait_attempts = attempts
     _touch_wait_activity(agent, stage)
     _emit_wait_progress(agent, stage, attempts, 0.0)
@@ -94,7 +95,6 @@ def _finish_wait(
 ) -> None:
     agent._awaiting_session_persistence = False
     agent._awaiting_session_persistence_stage = None
-    agent._awaiting_session_persistence_started_at = None
     agent._session_persistence_wait_cancelled = bool(cancelled)
     agent._session_persistence_wait_attempts = attempts
 
@@ -103,11 +103,21 @@ def session_persistence_wait_was_cancelled(agent: Any) -> bool:
     return getattr(agent, "_session_persistence_wait_cancelled", False) is True
 
 
+def session_persistence_write_patience(agent: Any) -> float:
+    """Short DB patience for one operation inside the outer interruptible wait."""
+    return _agent_float(
+        agent,
+        "_session_persistence_lock_write_patience_s",
+        _DEFAULT_OPERATION_PATIENCE_S,
+    )
+
+
 def wait_for_session_persistence(
     agent: Any,
     operation: Callable[[], Any],
     *,
     stage: str,
+    allow_interrupted_start: bool = False,
 ) -> bool:
     """Retry ``operation`` while SessionDB reports lock/busy contention.
 
@@ -138,12 +148,24 @@ def wait_for_session_persistence(
     agent._session_persistence_wait_cancelled = False
 
     while True:
-        if getattr(agent, "_interrupt_requested", False):
+        if (
+            getattr(agent, "_interrupt_requested", False)
+            and not allow_interrupted_start
+        ):
             _finish_wait(agent, cancelled=True, attempts=attempts)
             return False
+        allow_interrupted_start = False
 
         attempts += 1
         agent._last_persistence_error_cause = None
+        previous_patience = getattr(
+            agent,
+            "_session_persistence_operation_patience_s",
+            _MISSING,
+        )
+        agent._session_persistence_operation_patience_s = (
+            session_persistence_write_patience(agent)
+        )
         try:
             persisted = operation()
         except Exception as exc:
@@ -168,6 +190,14 @@ def wait_for_session_persistence(
             if cause != "locked":
                 _finish_wait(agent, attempts=attempts)
                 return False
+        finally:
+            if previous_patience is _MISSING:
+                try:
+                    delattr(agent, "_session_persistence_operation_patience_s")
+                except AttributeError:
+                    pass
+            else:
+                agent._session_persistence_operation_patience_s = previous_patience
 
         if started_mono is None:
             started_mono = _begin_wait(agent, stage, attempts)
@@ -209,6 +239,7 @@ def wait_for_session_persistence(
 
 
 __all__ = [
+    "session_persistence_write_patience",
     "session_persistence_wait_was_cancelled",
     "wait_for_session_persistence",
 ]
