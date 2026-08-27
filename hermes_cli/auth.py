@@ -4616,6 +4616,14 @@ def _pool_codex_access_token() -> str:
     singleton has no creds.  Reads ``credential_pool.openai-codex`` entries
     directly from auth.json and picks the first non-empty access_token,
     preferring entries that are not currently in an exhaustion cooldown.
+
+    If the selected entry's access_token is within
+    ``CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS`` of expiry, adopt a fresh pair
+    from ``~/.codex/auth.json`` (kept current by the Codex CLI) via
+    ``_recover_codex_tokens_from_cli`` — the same self-heal the singleton
+    path uses. Recovery failures (e.g. lock contention, disk errors) fall
+    through to the still-present entry token rather than swallowing it.
+
     Returns ``""`` when no usable entry is found (caller handles by raising
     the original AuthError).
     """
@@ -4643,7 +4651,33 @@ def _pool_codex_access_token() -> str:
 
         for entry in entries:
             if _entry_usable(entry):
-                return str(entry.get("access_token", "")).strip()
+                token = str(entry.get("access_token", "")).strip()
+                # Self-heal: when the selected entry's access_token is near
+                # expiry, adopt a fresh pair from ~/.codex/auth.json (the Codex
+                # CLI keeps it current). Recovery runs outside the auth-store
+                # lock and can raise (lock timeout, disk error); on failure,
+                # fall through to the entry token — which may still have up
+                # to CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS of life left —
+                # rather than swallowing it and surfacing an empty credential.
+                if token and _codex_access_token_is_expiring(
+                    token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+                ):
+                    try:
+                        recovered = _recover_codex_tokens_from_cli(
+                            "pool access_token expiring"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Codex pool self-heal failed; falling back to "
+                            "the entry access_token",
+                            exc_info=True,
+                        )
+                        recovered = None
+                    if recovered:
+                        return str(
+                            recovered.get("access_token", "") or ""
+                        ).strip()
+                return token
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""
