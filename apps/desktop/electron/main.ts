@@ -400,6 +400,7 @@ import {
   debounce,
   sanitizeWindowState,
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
+  MIN_VISIBLE,
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
@@ -13919,6 +13920,43 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
+// Keep the main window on a live display. A window restored to a display that
+// later goes away (e.g. a remote-desktop virtual display the user isn't
+// currently connected to) gets parked by Windows at (-32000,-32000) — with no
+// display event on some drivers — and Chromium treats the hidden page as
+// frozen, silently killing async work (queries, IPC replies, timers). Recover
+// to the primary work area.
+function keepMainWindowOnScreen(reason: string): void {
+  const win = mainWindow
+  if (!win || win.isDestroyed()) return
+
+  try {
+    const bounds = win.getBounds()
+    const displays = screen.getAllDisplays()
+    const onScreen = displays.some(({ workArea: a }) => {
+      if (!a) return false
+      const x = Math.min(bounds.x + bounds.width, a.x + a.width) - Math.max(bounds.x, a.x)
+      const y = Math.min(bounds.y + bounds.height, a.y + a.height) - Math.max(bounds.y, a.y)
+      return x >= MIN_VISIBLE && y >= MIN_VISIBLE
+    })
+
+    if (onScreen) return
+
+    const parked = bounds.x === -32000 && bounds.y === -32000
+    if (win.isMaximized()) win.unmaximize()
+    const primary = screen.getPrimaryDisplay().workArea
+    win.setBounds({
+      x: primary.x + 80,
+      y: primary.y + 80,
+      width: Math.min(bounds.width, primary.width - 160),
+      height: Math.min(bounds.height, primary.height - 160)
+    })
+    rememberLog(`[window-state] main window off-screen (${bounds.x},${bounds.y})${parked ? ' [parked]' : ''}; moved to primary display (${reason})`)
+  } catch (error) {
+    rememberLog(`[window-state] keepMainWindowOnScreen failed: ${error?.message || error}`)
+  }
+}
+
 function createWindow() {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
@@ -14011,6 +14049,12 @@ function createWindow() {
   if (process.env.TEST_WORKER_INDEX !== undefined) {
     revealController.reveal()
   }
+
+  // Displays can disappear after the window was restored onto them (e.g. a
+  // remote-desktop virtual display drops when the session ends), parking the
+  // window off-screen where Chromium freezes the page. See keepMainWindowOnScreen.
+  createdMainWindow.on('show', () => keepMainWindowOnScreen('show'))
+  setTimeout(() => keepMainWindowOnScreen('startup'), 1500)
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
@@ -17383,6 +17427,14 @@ app.whenReady().then(() => {
     screen.on('display-metrics-changed', reposition)
 
     screen.on('display-removed', reposition)
+  }
+
+  // Keep the main window on a live display (see keepMainWindowOnScreen): some
+  // virtual-display drivers vanish without a display event, so the event alone
+  // isn't enough — poll cheaply as a safety net on non-mac platforms.
+  screen.on('display-removed', () => keepMainWindowOnScreen('display-removed'))
+  if (!IS_MAC) {
+    setInterval(() => keepMainWindowOnScreen('interval'), 60_000)
   }
 
   // A hard crash can interrupt the in-memory restore loop after exact remote
