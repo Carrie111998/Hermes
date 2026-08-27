@@ -12,10 +12,15 @@ import { Capacitor } from '@capacitor/core'
 import { SafeArea, SystemBarsStyle } from '@capacitor-community/safe-area'
 import { StatusBar } from '@capacitor/status-bar'
 
+import { preferSpeakerOutput } from '~bridge/native'
+
 export async function initNativeChrome(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return
   try {
     await StatusBar.setOverlaysWebView({ overlay: true })
+    // Ensure ordinary TTS/media begins on the audible device speaker. Call-mode
+    // routing is deliberately not inferred or changed here.
+    void preferSpeakerOutput()
     syncSystemBars()
     observeThemeChanges()
   } catch {

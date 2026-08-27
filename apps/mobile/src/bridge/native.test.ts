@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { mobileCapabilities } = vi.hoisted(() => ({
-  mobileCapabilities: { enableActiveSession: vi.fn(), requestBackgroundReliability: vi.fn(), requestMedia: vi.fn() },
+  mobileCapabilities: { enableActiveSession: vi.fn(), requestBackgroundReliability: vi.fn(), requestMedia: vi.fn(), useSpeaker: vi.fn() },
 }))
 
 vi.mock('@capacitor/app', () => ({ App: { addListener: vi.fn() } }))
@@ -42,6 +42,7 @@ import {
   notify,
   onPowerResume,
   openExternal,
+  preferSpeakerOutput,
   requestInitialMobilePermissions,
   requestMicrophoneAccess,
   requestNotificationPermission,
@@ -58,6 +59,7 @@ beforeEach(() => {
   mobileCapabilities.requestBackgroundReliability.mockReset()
   mobileCapabilities.requestMedia.mockReset()
   mobileCapabilities.enableActiveSession.mockReset()
+  mobileCapabilities.useSpeaker.mockReset()
   vi.unstubAllGlobals()
 })
 
@@ -79,6 +81,15 @@ describe('requestMicrophoneAccess', () => {
     })
 
     await expect(requestMicrophoneAccess()).resolves.toBe(false)
+  })
+})
+
+describe('preferSpeakerOutput', () => {
+  it('uses the native speaker route without requesting microphone permission', async () => {
+    mobileCapabilities.useSpeaker.mockResolvedValue(undefined)
+
+    await expect(preferSpeakerOutput()).resolves.toBe(true)
+    expect(mobileCapabilities.useSpeaker).toHaveBeenCalledOnce()
   })
 })
 

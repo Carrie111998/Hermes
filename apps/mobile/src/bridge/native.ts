@@ -19,7 +19,25 @@ interface MobileCapabilitiesPlugin {
   requestMedia(): Promise<{ granted: boolean; supported: boolean }>
 }
 
+interface MobileAudioRoutePlugin {
+  useSpeaker(): Promise<void>
+}
+
 const MobileCapabilities = registerPlugin<MobileCapabilitiesPlugin>('MobileCapabilities')
+const MobileAudioRoute = registerPlugin<MobileAudioRoutePlugin>('MobileAudioRoute')
+
+/** Prefer the device speaker for normal synthesized replies. This is a playback
+ * route only: it does not request or retain microphone access. */
+export async function preferSpeakerOutput(): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false
+
+  try {
+    await MobileAudioRoute.useSpeaker()
+    return true
+  } catch {
+    return false
+  }
+}
 
 export async function writeClipboard(text: string): Promise<boolean> {
   try {
