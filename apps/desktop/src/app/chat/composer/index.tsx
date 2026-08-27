@@ -432,7 +432,8 @@ export function ChatBar({
     queuedPrompts,
     sessionId,
     setComposerText,
-    stashAt
+    stashAt,
+    submitScopeKey
   })
 
   // Resting / reconnecting / starting placeholder text, re-rolled only on a real

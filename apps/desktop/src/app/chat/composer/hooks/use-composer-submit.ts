@@ -47,6 +47,7 @@ interface UseComposerSubmitArgs {
   sessionId: string | null | undefined
   setComposerText: (value: string) => void
   stashAt: (scope: string | null, text?: string, attachments?: ComposerAttachment[]) => void
+  submitScopeKey: string | null
 }
 
 /**
@@ -82,7 +83,8 @@ export function useComposerSubmit({
   queuedPrompts,
   sessionId,
   setComposerText,
-  stashAt
+  stashAt,
+  submitScopeKey
 }: UseComposerSubmitArgs) {
   const paneVisible = usePaneVisible()
   const scope = useComposerScope()
@@ -133,8 +135,8 @@ export function useComposerSubmit({
 
     void Promise.resolve(
       attachments
-        ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
-        : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
+        ? onSubmit(text, { attachments, composerScope: submitScopeKey, ...(displayKind ? { displayKind } : {}) })
+        : onSubmit(text, { composerScope: submitScopeKey, ...(displayKind ? { displayKind } : {}) })
     )
       .then(accepted => {
         if (accepted === false) {

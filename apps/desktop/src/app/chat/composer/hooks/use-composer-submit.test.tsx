@@ -27,6 +27,7 @@ interface SubmitHarnessOptions {
   inputDisabled?: boolean
   scopeTarget?: ComposerTarget
   sessionKey?: string | null
+  submitScopeKey?: string | null
   submitOnHide?: boolean
   surfaceId?: string | null
   text?: string
@@ -43,6 +44,7 @@ function renderSubmitHook({
   inputDisabled = false,
   scopeTarget = 'main',
   sessionKey = 'stored-session',
+  submitScopeKey = sessionKey,
   submitOnHide = false,
   surfaceId,
   text = '',
@@ -121,6 +123,7 @@ function renderSubmitHook({
         queuedPrompts: [],
         sessionId: 'runtime-session',
         setComposerText: vi.fn(),
+        submitScopeKey,
         stashAt
       }),
     { wrapper: Wrapper }
@@ -495,6 +498,25 @@ describe('useComposerSubmit busy-turn routing', () => {
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('hello', expect.objectContaining({ composerScope: 'stored-session' }))
+    )
+  })
+
+  it('submits the raw scope when draft storage uses a profile-qualified key', async () => {
+    const { hook, onSubmit } = renderSubmitHook({
+      sessionKey: 'connection-a\0profile-a\0stored-session',
+      submitScopeKey: 'stored-session',
+      text: 'hello from profile A'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(
+        'hello from profile A',
+        expect.objectContaining({ composerScope: 'stored-session' })
+      )
     )
   })
 })
