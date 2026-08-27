@@ -130,3 +130,45 @@ test('attach tolerates a child with missing stdio streams', () => {
   tail.attach({ stderr: null, stdout: null })
   assert.equal(tail.text(), '')
 })
+
+test('observe() receives raw chunks from both streams and unsubscribes cleanly', () => {
+  const child = { stderr: new EventEmitter(), stdout: new EventEmitter() }
+  const tail = createBackendOutputTail(64)
+  const seen: string[] = []
+
+  tail.attach(child)
+  const stop = tail.observe(chunk => seen.push(chunk))
+
+  child.stdout.emit('data', Buffer.from('out\n'))
+  child.stderr.emit('data', Buffer.from('err\n'))
+  stop()
+  child.stdout.emit('data', Buffer.from('after\n'))
+
+  assert.deepEqual(seen, ['out\n', 'err\n'])
+})
+
+test('observe() sees chunks the ring buffer has already evicted', () => {
+  const tail = createBackendOutputTail(8)
+  const seen: string[] = []
+
+  tail.observe(chunk => seen.push(chunk))
+  tail.append('HERMES_BACKEND_READY port=50468\n')
+
+  assert.equal(seen.length, 1)
+  assert.match(seen[0], /port=50468/)
+  assert.doesNotMatch(tail.text(), /HERMES_BACKEND_READY/)
+})
+
+test('a throwing observer cannot break buffering or the other observers', () => {
+  const tail = createBackendOutputTail(64)
+  const seen: string[] = []
+
+  tail.observe(() => {
+    throw new Error('observer fault')
+  })
+  tail.observe(chunk => seen.push(chunk))
+
+  assert.doesNotThrow(() => tail.append('still buffered\n'))
+  assert.deepEqual(seen, ['still buffered\n'])
+  assert.match(tail.text(), /still buffered/)
+})

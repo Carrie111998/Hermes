@@ -62,7 +62,7 @@ import {
   shouldTrustHermesOverride,
   verifyHermesCli
 } from './backend-probes'
-import { waitForDashboardPortAnnouncement } from './backend-ready'
+import { armPortAnnouncement, waitForDashboardPortAnnouncement } from './backend-ready'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import {
   isHostKeyChangedBootFailure,
@@ -12070,6 +12070,11 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // the claim, and would miss anything printed before it.
   const outputTail = createBackendOutputTail()
   outputTail.attach(child)
+  // Arm the READY scanner in the SAME tick as attach(), before the first await
+  // below: the claim can take tens of seconds (Windows start-marker probe), and
+  // a sentinel emitted while it runs reaches only the listeners that already
+  // exist (#96315).
+  const announcement = armPortAnnouncement(outputTail)
   await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
 
   child.stdout.on('data', rememberLog)
@@ -12104,7 +12109,11 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   // Discover the ephemeral port the child bound to
   const port = await Promise.race([
-    waitForDashboardPortAnnouncement(child, { describeOutputTail: () => outputTail.describe(), readyFile }),
+    waitForDashboardPortAnnouncement(child, {
+      announcement,
+      describeOutputTail: () => outputTail.describe(),
+      readyFile
+    }),
     startFailed
   ])
 
@@ -12457,6 +12466,10 @@ async function startHermes() {
     // later, after the claim, and would miss anything printed before it.
     const primaryOutputTail = createBackendOutputTail()
     primaryOutputTail.attach(hermesProcess)
+    // Same-tick arming as the pool path above: the READY sentinel must be
+    // matched by a listener that exists from the instant of spawn, not by one
+    // attached after the claim + boot-progress awaits (#96315).
+    const primaryAnnouncement = armPortAnnouncement(primaryOutputTail)
     await claimBackendChild(
       hermesProcess,
       `${backend.command} ${backend.args.join(' ')}`,
@@ -12545,6 +12558,7 @@ async function startHermes() {
     // Discover the ephemeral port the child bound to
     const port = await Promise.race([
       waitForDashboardPortAnnouncement(hermesProcess, {
+        announcement: primaryAnnouncement,
         describeOutputTail: () => primaryOutputTail.describe(),
         readyFile
       }),

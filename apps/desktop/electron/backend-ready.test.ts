@@ -19,7 +19,9 @@ import path from 'node:path'
 
 import { test } from 'vitest'
 
+import { createBackendOutputTail } from './backend-claim'
 import {
+  armPortAnnouncement,
   DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS,
   MIN_PORT_ANNOUNCE_TIMEOUT_MS,
   readDashboardReadyFile,
@@ -30,17 +32,32 @@ import {
 } from './backend-ready'
 
 type FakeChildProcess = EventEmitter & {
+  stderr: EventEmitter
   stdout: EventEmitter
 }
 
-// A minimal stand-in for a spawned child process: an EventEmitter with a
-// stdout EventEmitter, matching the surface waitForDashboardPort consumes
-// (child.stdout.on('data'), child.on('exit'|'error') + the .off() teardown).
+// A minimal stand-in for a spawned child process: an EventEmitter with stdout
+// and stderr EventEmitters, matching the surface the waiters and the output
+// tail consume (child.std*.on('data'), child.on('exit'|'error') + .off()).
 function makeFakeChild(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
   child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
 
   return child
+}
+
+/**
+ * Reproduce the spawn path's real ordering: attach the output tail and arm the
+ * announcement in one tick, then let the caller emit output BEFORE the waiter
+ * is created — which is what happens while `claimBackendChild` is awaited.
+ */
+function spawnWithArmedTail() {
+  const child = makeFakeChild()
+  const tail = createBackendOutputTail()
+  tail.attach(child)
+
+  return { announcement: armPortAnnouncement(tail), child, tail }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +154,121 @@ test('a late announcement after timeout does not throw (listeners torn down)', a
   assert.doesNotThrow(() => {
     child.stdout.emit('data', 'HERMES_DASHBOARD_READY port=9999\n')
   })
+})
+
+// ---------------------------------------------------------------------------
+// armPortAnnouncement (#96315): the sentinel is scanned from the spawn-time
+// output tail, so it survives the awaits between spawn and the READY wait.
+// ---------------------------------------------------------------------------
+
+test('resolves a sentinel that was emitted BEFORE the waiter was created', async () => {
+  const { announcement, child } = spawnWithArmedTail()
+
+  // The claim is in flight here; the only listener on the stream is the tail.
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=50468\n')
+  child.stdout.emit('data', '  Hermes backend listening on 127.0.0.1:50468\n')
+
+  // Waiter created several awaits later — pre-fix this could never settle and
+  // burned the full deadline against a healthy, listening backend.
+  const port = await waitForDashboardPortAnnouncement(child, { announcement, timeoutMs: 50 })
+  assert.equal(port, 50468)
+})
+
+test('a late-created waiter WITHOUT the armed announcement misses the sentinel', async () => {
+  const child = makeFakeChild()
+  const tail = createBackendOutputTail()
+  tail.attach(child)
+
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=50468\n')
+
+  // Documents the bug this fix removes: the tail consumed the chunk, and a
+  // `data` listener attached afterwards can never see it again.
+  await assert.rejects(waitForDashboardPortAnnouncement(child, { timeoutMs: 20 }), /Timed out/)
+  assert.match(tail.text(), /HERMES_BACKEND_READY port=50468/)
+})
+
+test('resolves a sentinel that lands on stderr (import-time stdout redirect)', async () => {
+  const { announcement, child } = spawnWithArmedTail()
+  const wait = waitForDashboardPortAnnouncement(child, { announcement, timeoutMs: 1000 })
+
+  child.stderr.emit('data', 'INFO: started\nHERMES_BACKEND_READY port=43210\n')
+
+  assert.equal(await wait, 43210)
+})
+
+test('parses a tail-fed sentinel split across chunks and across streams', async () => {
+  const { announcement, child } = spawnWithArmedTail()
+  const wait = waitForDashboardPortAnnouncement(child, { announcement, timeoutMs: 1000 })
+
+  child.stderr.emit('data', 'HERMES_BACKEND_READY po')
+  child.stderr.emit('data', 'rt=8080\n')
+
+  assert.equal(await wait, 8080)
+})
+
+test('a burst larger than the tail ring cannot evict an unscanned sentinel', async () => {
+  const child = makeFakeChild()
+  const tail = createBackendOutputTail(64)
+  tail.attach(child)
+  const announcement = armPortAnnouncement(tail)
+
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=61234\n')
+  child.stdout.emit('data', `${'x'.repeat(4096)}\n`)
+
+  // The ring buffer has long since dropped the line; the scanner saw the chunk.
+  assert.doesNotMatch(tail.text(), /HERMES_BACKEND_READY/)
+  assert.equal(await waitForDashboardPortAnnouncement(child, { announcement, timeoutMs: 50 }), 61234)
+})
+
+test('the armed announcement settles the ready-file wait when no file appears', async () => {
+  const { announcement, child } = spawnWithArmedTail()
+  const readyFile = path.join(os.tmpdir(), `hermes-ready-absent-${process.pid}-${Date.now()}.json`)
+
+  const wait = waitForDashboardPortAnnouncement(child, { announcement, readyFile, timeoutMs: 1000 })
+
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=7777\n')
+
+  assert.equal(await wait, 7777)
+})
+
+test('exit before any announcement still rejects with the output tail', async () => {
+  const { announcement, child, tail } = spawnWithArmedTail()
+
+  child.stderr.emit('data', 'ModuleNotFoundError: hermes_cli\n')
+
+  const wait = waitForDashboardPortAnnouncement(child, {
+    announcement,
+    describeOutputTail: () => tail.describe(),
+    timeoutMs: 1000
+  })
+
+  child.emit('exit', 1, null)
+
+  await assert.rejects(wait, /exited before port announcement \(1\)[\s\S]*ModuleNotFoundError: hermes_cli/)
+})
+
+test('a settled waiter detaches from the tail (a later sentinel is inert)', async () => {
+  const { announcement, child } = spawnWithArmedTail()
+  const wait = waitForDashboardPortAnnouncement(child, { announcement, timeoutMs: 1000 })
+
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=5555\n')
+  assert.equal(await wait, 5555)
+
+  assert.doesNotThrow(() => {
+    child.stdout.emit('data', 'HERMES_BACKEND_READY port=9999\n')
+  })
+  assert.equal(announcement.port(), 5555)
+})
+
+test('a timed-out armed waiter tears down and does not double-settle', async () => {
+  const { announcement, child } = spawnWithArmedTail()
+
+  await assert.rejects(waitForDashboardPortAnnouncement(child, { announcement, timeoutMs: 20 }), /Timed out/)
+
+  assert.doesNotThrow(() => {
+    child.stdout.emit('data', 'HERMES_BACKEND_READY port=9999\n')
+  })
+  assert.equal(announcement.port(), null)
 })
 
 // ---------------------------------------------------------------------------
