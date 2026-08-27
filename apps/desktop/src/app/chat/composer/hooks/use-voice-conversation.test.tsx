@@ -1,4 +1,5 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
+import { type PropsWithChildren, StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { BargeMonitorCallbacks } from '@/lib/voice-barge-in'
@@ -84,6 +85,7 @@ function renderConversation(
   overrides: {
     onInterrupt?: () => void
     pendingResponse?: () => null | { id: string; pending: boolean; text: string }
+    strict?: boolean
     transcript?: string
   } = {}
 ) {
@@ -106,6 +108,8 @@ function renderConversation(
     transcriptions++ === 0 ? 'kick off the task' : (overrides.transcript ?? 'and another thing')
   )
 
+  const StrictWrapper = ({ children }: PropsWithChildren) => <StrictMode>{children}</StrictMode>
+
   const hook = renderHook(
     ({ busy }: HookProps) =>
       useVoiceConversation({
@@ -118,7 +122,7 @@ function renderConversation(
         onTranscribeAudio,
         pendingResponse: overrides.pendingResponse ?? (() => null)
       }),
-    { initialProps: { busy: false } }
+    { initialProps: { busy: false }, wrapper: overrides.strict ? StrictWrapper : undefined }
   )
 
   onBusyChange.current = busy => hook.rerender({ busy })
@@ -290,6 +294,21 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     expect(stopMonitor).toHaveBeenCalled()
   })
 
+  it('runs mute lifecycle teardown once when React replays state calculations', async () => {
+    const { hook } = renderConversation({ strict: true })
+
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+    micHandle.cancel.mockClear()
+    stopMonitor.mockClear()
+
+    act(() => hook.result.current.toggleMute())
+
+    expect(hook.result.current.muted).toBe(true)
+    expect(micHandle.cancel).toHaveBeenCalledOnce()
+    expect(stopMonitor).toHaveBeenCalledOnce()
+  })
+
   it('allows the next listening turn to close after muting a pending close', async () => {
     let settleFirstStop: ((recording: MicRecording | null) => void) | undefined
 
@@ -315,7 +334,7 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     await waitFor(() => expect(micHandle.stop).toHaveBeenCalledTimes(2))
   })
 
-  it('invalidates an in-flight speech setup before its discovery can mutate playback', async () => {
+  it('keeps in-flight speech setup valid while mute tears down capture', async () => {
     let response: null | { id: string; pending: boolean; text: string } = null
     const { hook } = renderConversation({ pendingResponse: () => response })
 
@@ -328,6 +347,7 @@ describe('useVoiceConversation full-duplex barge-in', () => {
 
     expect(isCurrent?.()).toBe(true)
     act(() => hook.result.current.toggleMute())
-    expect(isCurrent?.()).toBe(false)
+    expect(isCurrent?.()).toBe(true)
+    expect(stopMonitor).toHaveBeenCalled()
   })
 })

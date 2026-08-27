@@ -8,10 +8,8 @@ import { markAssistantIdSpoken, resolveSpokenReply } from '@/lib/spoken-reply'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
-import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
-import { resumeWakeAfterVoice } from '@/store/wake-word'
 
 import type { ComposerTarget } from '../focus'
 import { onComposerVoiceToggleRequest } from '../focus'
@@ -22,8 +20,7 @@ import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useCommittedActionScope } from './use-committed-action-scope'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
-
-let wakeVoiceOperationGeneration = 0
+import { acquireWakeForVoice, releaseWakeForVoice } from './wake-voice-coordinator'
 
 interface UseComposerVoiceArgs {
   busy: boolean
@@ -200,13 +197,26 @@ export function useComposerVoice({
     await voiceActionStateRef.current.onInterrupt?.()
   }
 
-  const wakePausedRef = useRef(false)
+  const wakeVoiceOwnerRef = useRef(Symbol('composer-voice'))
   // Resolves once the in-flight wake.pause round-trip completes (mic released by
   // the wake listener). The conversation awaits this before opening its own mic
   // so the two never contend for the device — on Windows especially, opening the
   // capture device while the wake listener still holds it makes getUserMedia
   // fail and the conversation never starts listening.
   const wakePauseBarrierRef = useRef<Promise<void> | null>(null)
+
+  const pauseWakeForVoice = useCallback(() => {
+    const barrier = acquireWakeForVoice(wakeVoiceOwnerRef.current)
+
+    wakePauseBarrierRef.current = barrier
+
+    return barrier
+  }, [])
+
+  const resumeWakeIfPaused = useCallback(() => {
+    wakePauseBarrierRef.current = null
+    releaseWakeForVoice(wakeVoiceOwnerRef.current)
+  }, [])
 
   const conversation = useVoiceConversation({
     busy,
@@ -233,24 +243,30 @@ export function useComposerVoice({
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
-    // Before the conversation opens the mic, wait for any in-flight wake.pause
-    // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
+    // Establish the shared pause here as a safety net: inner hook effects run
+    // before this hook's ownership effect, but the mic must still await pause.
+    beforeMicOpen: () => wakePauseBarrierRef.current ?? pauseWakeForVoice()
   })
 
   const mountedVoiceScopeKeyRef = useRef(submissionKey)
+  const mountedVoiceDisabledRef = useRef(disabled)
 
   // eslint-disable-next-line no-restricted-syntax -- local lifecycle token, not an atom mirror
   useEffect(() => {
-    if (mountedVoiceScopeKeyRef.current === submissionKey) {
+    const scopeChanged = mountedVoiceScopeKeyRef.current !== submissionKey
+    const becameDisabled = disabled && !mountedVoiceDisabledRef.current
+
+    mountedVoiceScopeKeyRef.current = submissionKey
+    mountedVoiceDisabledRef.current = disabled
+
+    if (!scopeChanged && !becameDisabled) {
       return
     }
 
-    mountedVoiceScopeKeyRef.current = submissionKey
     cancelDictationRef.current()
     setVoiceConversationActive(false)
     void conversation.end()
-  }, [conversation, submissionKey])
+  }, [conversation, disabled, submissionKey])
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
   useEffect(() => {
@@ -298,61 +314,6 @@ export function useComposerVoice({
       setVoiceConversationActive(true)
     }
   }, [disabled, target, voiceConversationActive, voiceStartRequest])
-
-  const resumeWakeIfPaused = useCallback(() => {
-    if (!wakePausedRef.current) {
-      return
-    }
-
-    const operationGeneration = ++wakeVoiceOperationGeneration
-    const pauseBarrier = wakePauseBarrierRef.current
-
-    wakePausedRef.current = false
-
-    // Reconcile, don't just resume: the wake word is a persistent setting, so
-    // ending a voice chat must re-arm the listener whenever config says
-    // enabled — including when the raw resume loses the mic-release race.
-    void (async () => {
-      await pauseBarrier
-
-      if (wakeVoiceOperationGeneration !== operationGeneration || wakePausedRef.current) {
-        return
-      }
-
-      await resumeWakeAfterVoice()
-
-      if (wakeVoiceOperationGeneration === operationGeneration && wakePauseBarrierRef.current === pauseBarrier) {
-        wakePauseBarrierRef.current = null
-      }
-    })()
-  }, [])
-
-  // The ref is a request token (did WE issue wake.pause?), not an atom mirror —
-  // it guards resumeWakeIfPaused from resuming a detector another surface owns.
-  const pauseWakeForVoice = useCallback(() => {
-    const operationGeneration = ++wakeVoiceOperationGeneration
-    const previousBarrier = wakePauseBarrierRef.current
-
-    wakePausedRef.current = true
-
-    const barrier = (async () => {
-      await previousBarrier
-
-      if (wakeVoiceOperationGeneration !== operationGeneration || !wakePausedRef.current) {
-        return
-      }
-
-      try {
-        await $gateway.get()?.request('wake.pause', {})
-      } catch {
-        // No wake listener / older backend — nothing held the mic.
-      }
-    })()
-
-    wakePauseBarrierRef.current = barrier
-
-    return barrier
-  }, [])
 
   useEffect(() => {
     if (voiceConversationActive) {

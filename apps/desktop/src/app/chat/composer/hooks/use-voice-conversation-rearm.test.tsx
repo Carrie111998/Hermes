@@ -203,6 +203,25 @@ describe('useVoiceConversation playback rearm', () => {
     expect(hook.result.current.status).toBe('listening')
   })
 
+  it('keeps live speech authoritative across mute until playback completes', async () => {
+    const hook = renderRearmConversation('reply-muted', 'Keep speaking')
+
+    await beginReply(hook)
+    await waitFor(() => expect(mocks.sessions).toHaveLength(1))
+
+    act(() => hook.result.current.toggleMute())
+    expect(hook.result.current.muted).toBe(true)
+
+    act(() => hook.result.current.toggleMute())
+    expect(hook.result.current.muted).toBe(false)
+    expect(mocks.handle.start).toHaveBeenCalledTimes(1)
+
+    await act(async () => mocks.finishSpeech('done'))
+
+    await waitFor(() => expect(mocks.handle.start).toHaveBeenCalledTimes(2))
+    expect(hook.result.current.status).toBe('listening')
+  })
+
   it('honors Stop while streaming playback is still preparing', async () => {
     mocks.deferStreamStart()
     const hook = renderRearmConversation('reply-preparing', 'Do not play this')
