@@ -987,6 +987,9 @@ class TestToolsEndpoint:
             "model_tools.get_tool_definitions",
             return_value=schemas,
         ) as get_definitions, patch(
+            "tools.mcp_tool.get_mcp_tool_catalog_snapshot",
+            return_value={"audit": {"connected": True, "schemas": []}},
+        ), patch(
             "tools.registry.registry.get_registered_toolset_aliases",
             return_value={"audit": "mcp-audit"},
         ), patch(
@@ -1024,6 +1027,7 @@ class TestToolsEndpoint:
             "added_below_explicit_config": False,
         }
         assert by_name["mcp__audit__inspect"]["provenance"]["source"] == "mcp"
+        assert by_name["mcp__audit__inspect"]["available"] is True
         assert by_name["mcp__audit__inspect"]["provenance"]["source_server"] == "audit"
         assert by_name["mcp__audit__inspect"]["provenance"]["added_below_explicit_config"] is False
         assert by_name["bfl_flux"]["provenance"]["source"] == "recently_shipped"
@@ -1046,6 +1050,56 @@ class TestToolsEndpoint:
             skip_tool_search_assembly=True,
             update_last_resolved=False,
         )
+
+    def test_tool_catalog_retains_known_tools_from_disconnected_mcp_server(self):
+        disconnected_schema = {
+            "name": "mcp__aurora__search",
+            "description": "Search Aurora",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        with patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"aurora"},
+        ), patch(
+            "model_tools.get_tool_definitions",
+            return_value=[],
+        ), patch(
+            "tools.mcp_tool.get_mcp_tool_catalog_snapshot",
+            return_value={
+                "aurora": {
+                    "connected": False,
+                    "schemas": [disconnected_schema],
+                }
+            },
+        ), patch(
+            "tools.registry.registry.get_registered_toolset_aliases",
+            return_value={"aurora": "mcp-aurora"},
+        ), patch(
+            "tools.registry.registry.get_entry",
+            return_value=None,
+        ), patch.object(
+            APIServerAdapter,
+            "_dynamic_platform_tool_definitions",
+            return_value=([], {}),
+        ):
+            data, enabled, explicit = APIServerAdapter._model_tool_catalog(
+                {"platform_toolsets": {"api_server": ["aurora"]}},
+                "api_server",
+            )
+
+        assert enabled == ["aurora"]
+        assert explicit is True
+        assert data == [{
+            **disconnected_schema,
+            "available": False,
+            "provenance": {
+                "source": "mcp",
+                "toolset": "mcp-aurora",
+                "requested_toolsets": ["aurora"],
+                "source_server": "aurora",
+                "added_below_explicit_config": False,
+            },
+        }]
 
     @pytest.mark.asyncio
     async def test_tools_rejects_unknown_platform(self, adapter):

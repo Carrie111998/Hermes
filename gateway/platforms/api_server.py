@@ -4172,6 +4172,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _get_platform_tools,
         )
         from model_tools import get_tool_definitions
+        from tools.mcp_tool import get_mcp_tool_catalog_snapshot
         from tools.registry import registry
 
         enabled = _get_platform_tools(config, platform)
@@ -4184,6 +4185,9 @@ class APIServerAdapter(BasePlatformAdapter):
         dynamic_definitions, dynamic_toolsets = (
             APIServerAdapter._dynamic_platform_tool_definitions(config, platform, enabled)
         )
+        mcp_snapshot = get_mcp_tool_catalog_snapshot()
+        aliases = registry.get_registered_toolset_aliases()
+        enabled_canonical = {aliases.get(name, name) for name in enabled}
         known_names = {
             (definition.get("function") or {}).get("name")
             for definition in definitions
@@ -4194,11 +4198,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 continue
             definitions.append(definition)
             known_names.add(name)
+        for server_name, snapshot in mcp_snapshot.items():
+            if f"mcp-{server_name}" not in enabled_canonical:
+                continue
+            if snapshot.get("connected"):
+                continue
+            for schema in snapshot.get("schemas", []):
+                name = schema.get("name")
+                if not name or name in known_names:
+                    continue
+                definitions.append({"type": "function", "function": dict(schema)})
+                dynamic_toolsets[name] = f"mcp-{server_name}"
+                known_names.add(name)
 
         configured = (config.get("platform_toolsets") or {}).get(platform)
         explicit_config_present = isinstance(configured, list)
         explicit_names = {str(name) for name in configured} if explicit_config_present else set()
-        aliases = registry.get_registered_toolset_aliases()
         explicit_canonical = {aliases.get(name, name) for name in explicit_names}
 
         requested_by_canonical: Dict[str, List[str]] = {}
@@ -4247,6 +4262,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 source = "default_injected"
 
             row = dict(schema)
+            if source == "mcp":
+                row["available"] = bool(
+                    mcp_snapshot.get(source_server, {}).get("connected", True)
+                )
             row["provenance"] = {
                 "source": source,
                 "toolset": canonical_toolset,
