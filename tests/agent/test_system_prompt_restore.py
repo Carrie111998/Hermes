@@ -21,6 +21,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from hermes_state import SessionDB
+from run_agent import AIAgent
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -142,6 +144,43 @@ class TestLegitimateFreshBuild:
         _restore_or_build_system_prompt(agent, None, [])
         agent._build_system_prompt.assert_called_once()
         assert agent._cached_system_prompt == "BUILT_PROMPT"
+
+    def test_first_group_turn_persists_prompt_for_next_agent(self, tmp_path):
+        """A fresh group-run row is durable before the next agent restores it."""
+        with SessionDB(db_path=tmp_path / "state.db") as db:
+
+            def group_agent():
+                agent = AIAgent.__new__(AIAgent)
+                agent._cached_system_prompt = None
+                agent._persist_disabled = False
+                agent._session_db_created = False
+                agent._session_init_model_config = None
+                agent._parent_session_id = None
+                agent._session_db = db
+                agent._use_prompt_caching = False
+                agent.session_id = "gc_run_test"
+                agent.model = "test-model"
+                agent.provider = "openrouter"
+                agent.platform = "desktop"
+                agent._build_system_prompt = MagicMock(return_value="GROUP_PROMPT")
+                return agent
+
+            first = group_agent()
+            _restore_or_build_system_prompt(
+                first, None, [{"role": "user", "content": "start group turn"}]
+            )
+
+            stored = db.get_session(first.session_id)
+            assert stored is not None
+            assert stored["system_prompt"] == "GROUP_PROMPT"
+
+            resumed = group_agent()
+            _restore_or_build_system_prompt(
+                resumed, None, [{"role": "user", "content": "continue group turn"}]
+            )
+
+            assert resumed._cached_system_prompt == "GROUP_PROMPT"
+            resumed._build_system_prompt.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

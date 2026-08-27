@@ -1075,6 +1075,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
+            # ``UPDATE`` does not create a missing row. Group-run agents can be
+            # short-lived, so persist their row here instead of relying on the
+            # later turn prologue to create it after this write has no-op'd.
+            if not getattr(agent, "_session_db_created", False):
+                ensure_session = getattr(agent, "_ensure_db_session", None)
+                if callable(ensure_session):
+                    ensure_session()
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         except Exception as exc:
             logger.warning(
