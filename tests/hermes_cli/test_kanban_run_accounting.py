@@ -108,6 +108,15 @@ def test_actual_cost_is_stored_separately_and_wrong_run_is_rejected(routed_conn,
     assert row["actual_cost_usd"] == pytest.approx(0.7)
 
 
+def test_completion_records_nonnegative_duration_for_the_exact_run(routed_conn):
+    task_id, run_id = _claimed_run(routed_conn)
+    routed_conn.execute("UPDATE task_runs SET started_at = started_at - 2 WHERE id=?", (run_id,))
+    assert kb.complete_task(routed_conn, task_id, expected_run_id=run_id)
+    row = routed_conn.execute("SELECT duration_ms FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    assert row["duration_ms"] is not None
+    assert row["duration_ms"] >= 2000
+
+
 def test_retry_is_a_separate_linked_attempt(routed_conn):
     task_id, first_run = _claimed_run(routed_conn)
     assert kb.block_task(routed_conn, task_id, reason="retry later", kind="transient", expected_run_id=first_run)

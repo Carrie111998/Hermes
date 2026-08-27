@@ -4535,6 +4535,7 @@ def _end_run(
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
+               duration_ms   = MAX(0, (? - started_at) * 1000),
                claim_lock    = NULL,
                claim_expires = NULL,
                worker_pid    = NULL
@@ -4547,6 +4548,7 @@ def _end_run(
             summary,
             error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            now,
             now,
             run_id,
         ),
