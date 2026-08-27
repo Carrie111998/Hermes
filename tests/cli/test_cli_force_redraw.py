@@ -426,3 +426,20 @@ class TestFocusRegainRedraw:
         bare_cli._schedule_focus_regain_redraw(min_interval=0.0)
 
         assert calls == ["redraw", "redraw"]
+
+    def test_first_focus_regain_fires_even_in_first_second_of_process(
+        self, bare_cli, monkeypatch
+    ):
+        """#87392 carry-over: with a 0.0 initial sentinel, a focus-in during
+        the process's first ``min_interval`` seconds was silently suppressed
+        (monotonic() - 0.0 < min_interval). None = "never redrawn"."""
+        calls = []
+        bare_cli._force_full_redraw = lambda: calls.append("redraw")
+        # Simulate a process alive for 0.2s: monotonic returns a small value.
+        import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 0.2)
+
+        bare_cli._schedule_focus_regain_redraw(min_interval=1.0)
+
+        assert calls == ["redraw"]

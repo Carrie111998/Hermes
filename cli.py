@@ -5791,8 +5791,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         per ``min_interval`` seconds.
         """
         now = time.monotonic()
-        last = getattr(self, "_last_focus_regain_redraw", 0.0)
-        if now - last < min_interval:
+        last = getattr(self, "_last_focus_regain_redraw", None)
+        # ``time.monotonic()`` is relative to process start, so a ``0.0``
+        # initial timestamp reads as "redrawn at t=0" and suppresses the
+        # first focus-regain redraw whenever the process has been alive for
+        # less than ``min_interval`` seconds. ``None`` means "never redrawn".
+        if last is not None and now - last < min_interval:
             return
         self._last_focus_regain_redraw = now
         self._force_full_redraw()
