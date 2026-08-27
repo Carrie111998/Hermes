@@ -93,6 +93,19 @@ def test_build_proxy_config_custom_allowed_hosts(tmp_path):
     assert "openrouter.ai" in domains  # comes from the mapping
 
 
+def test_secret_rules_do_not_match_connect_tunnel_handshake(tmp_path):
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping("OPENROUTER_API_KEY")],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    secret_rules = cfg["transforms"][1]["config"]["secrets"][0]["rules"]
+    assert secret_rules
+    for rule in secret_rules:
+        assert "CONNECT" not in rule["methods"]
+        assert {"GET", "POST"}.issubset(set(rule["methods"]))
+
+
 # ---------------------------------------------------------------------------
 # Default SSRF deny list (regression: docs promise cloud metadata is denied)
 # ---------------------------------------------------------------------------

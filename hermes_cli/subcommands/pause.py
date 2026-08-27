@@ -45,7 +45,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def build_pause_parser(subparsers) -> None:
-    """Attach the ``pause`` and ``resume`` subcommands to ``subparsers``."""
+    """Attach the ``pause``/``resume`` and fleet ESTOP subcommands."""
     pause_parser = subparsers.add_parser(
         "pause",
         help="Emergency stop: pause cron/kanban dispatch and new gateway turns",
@@ -68,3 +68,7 @@ def build_pause_parser(subparsers) -> None:
         description="Remove the ESTOP sentinel; dispatch resumes on the next tick.",
     )
     resume_parser.set_defaults(func=cmd_resume)
+
+    from hermes_cli.fleet_estop import build_fleet_estop_parser
+
+    build_fleet_estop_parser(subparsers)

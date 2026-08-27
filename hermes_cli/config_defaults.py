@@ -149,6 +149,18 @@ DEFAULT_CONFIG = {
             # leaves the budget untouched.
             "cost_threshold_usd": 0.25,
         },
+        # Additive per-session guardrail for runaway prompt/cost growth.
+        # Disabled by default for upstream-safe behaviour; StrongIQ/Pacey can
+        # enable it in config.yaml. A hard breach latches after a successful
+        # provider response and pauses before the next paid provider call.
+        "session_budget_guardrail": {
+            "enabled": False,
+            "soft_prompt_tokens": 180_000,
+            "hard_prompt_tokens": 240_000,
+            "hard_consecutive_soft_hits": 3,
+            "hard_projected_cost_usd": 25.0,
+            "pause_and_ask": True,
+        },
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
