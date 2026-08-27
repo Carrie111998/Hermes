@@ -10868,6 +10868,25 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
+    # A board-wide worker route is opt-in. Resolve it at dispatch time so
+    # profile-scoped config remains authoritative when the route is empty.
+    # Per-task overrides retain precedence over this route.
+    configured_worker_route = ("", "")
+    if not task.model_override and not task.provider_override:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            kanban_cfg = (load_config_readonly() or {}).get("kanban", {})
+            if isinstance(kanban_cfg, dict):
+                configured_worker_route = (
+                    str(kanban_cfg.get("default_model") or "").strip(),
+                    str(kanban_cfg.get("default_provider") or "").strip(),
+                )
+        except Exception:
+            # Retain the historical profile-default fallback if config cannot
+            # be read during dispatcher startup.
+            configured_worker_route = ("", "")
+
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
@@ -10876,6 +10895,11 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
+    elif all(configured_worker_route):
+        cmd.extend([
+            "-m", configured_worker_route[0],
+            "--provider", configured_worker_route[1],
+        ])
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.

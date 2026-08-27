@@ -2160,6 +2160,38 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 "Set voice.submit_mode to direct (submit immediately) or draft (edit before sending)",
             ))
 
+    # ── kanban worker route: both values are required when configured ─────
+    kanban_cfg = config.get("kanban")
+    if kanban_cfg is not None and not isinstance(kanban_cfg, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"kanban should be a dict, got {type(kanban_cfg).__name__}",
+            "Change to a YAML mapping such as: kanban:\n  default_model: <model>\n  default_provider: <provider>",
+        ))
+    elif isinstance(kanban_cfg, dict):
+        default_model = kanban_cfg.get("default_model")
+        default_provider = kanban_cfg.get("default_provider")
+        if default_model is not None and not isinstance(default_model, str):
+            issues.append(ConfigIssue(
+                "error",
+                f"kanban.default_model must be a string, got {type(default_model).__name__}",
+                "Set it to a model name or an empty string",
+            ))
+        if default_provider is not None and not isinstance(default_provider, str):
+            issues.append(ConfigIssue(
+                "error",
+                f"kanban.default_provider must be a string, got {type(default_provider).__name__}",
+                "Set it to a provider name or an empty string",
+            ))
+        model_set = isinstance(default_model, str) and bool(default_model.strip())
+        provider_set = isinstance(default_provider, str) and bool(default_provider.strip())
+        if model_set != provider_set:
+            issues.append(ConfigIssue(
+                "warning",
+                "kanban.default_model and kanban.default_provider must be configured together",
+                "Set both values, or clear both to use each assigned profile's configured route",
+            ))
+
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
     if cp is not None:
