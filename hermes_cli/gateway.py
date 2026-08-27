@@ -96,6 +96,21 @@ class ProfileGatewayProcess:
     profile: str
     path: Path
     pid: int
+    create_time: float = 0.0
+
+
+@dataclass(frozen=True)
+class WindowsGatewayService:
+    """A real Windows service supervising a profile gateway process tree."""
+
+    name: str
+    profile: str
+    service_pid: int
+    gateway_pid: int
+    descendant_pids: frozenset[int]
+    descendant_identities: tuple[tuple[int, float], ...]
+    service_create_time: float = 0.0
+    gateway_create_time: float = 0.0
 
 
 def _get_service_pids(all_profiles: bool = False) -> set:
@@ -784,29 +799,175 @@ def find_gateway_pids(
 
 def find_profile_gateway_processes(
     exclude_pids: set | None = None,
+    *,
+    strict: bool = False,
 ) -> list[ProfileGatewayProcess]:
     """Return running gateway PIDs mapped to Hermes profiles via PID files."""
     _exclude = set(exclude_pids or set())
     processes: list[ProfileGatewayProcess] = []
     try:
-        from gateway.status import get_running_pid
+        from gateway.status import get_running_pid, get_running_pid_identity_strict
         from hermes_cli.profiles import list_profiles
     except Exception:
+        if strict:
+            raise
         return processes
 
     seen: set[int] = set()
-    for profile in list_profiles():
+    try:
+        profiles = list_profiles()
+    except Exception:
+        if strict:
+            raise
+        return processes
+    for profile in profiles:
         try:
-            pid = get_running_pid(profile.path / "gateway.pid", cleanup_stale=False)
-        except Exception:
+            if strict:
+                identity = get_running_pid_identity_strict(profile.path / "gateway.pid")
+                pid = identity[0] if identity else None
+                create_time = identity[1] if identity else 0.0
+            else:
+                pid = get_running_pid(profile.path / "gateway.pid", cleanup_stale=False)
+                create_time = 0.0
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(
+                    f"Could not inspect gateway PID for profile {profile.name}"
+                ) from exc
             continue
         if pid is None or pid <= 0 or pid in _exclude or pid in seen:
             continue
         seen.add(pid)
         processes.append(
-            ProfileGatewayProcess(profile=profile.name, path=profile.path, pid=pid)
+            ProfileGatewayProcess(
+                profile=profile.name,
+                path=profile.path,
+                pid=pid,
+                create_time=create_time,
+            )
         )
     return processes
+
+
+def find_windows_gateway_services(
+    *,
+    psutil_module=None,
+    profile_processes: list[ProfileGatewayProcess] | None = None,
+) -> list[WindowsGatewayService]:
+    """Find profile gateways supervised by real Windows services.
+
+    Service-logon processes can deny the interactive Desktop access to their
+    command lines. The updater can still identify them without guessing: a
+    validated profile gateway PID comes from Hermes's own PID file, and its
+    parent chain terminates at a running SCM service PID. The complete service
+    subtree is returned so the Desktop preflight exempts only processes the CLI
+    updater will stop through the Service Control Manager.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        if psutil_module is None:
+            import psutil as psutil_module  # type: ignore[no-redef]  # noqa: PLC0415
+        if profile_processes is None:
+            profile_processes = find_profile_gateway_processes(strict=True)
+        service_names_by_pid: dict[int, set[str]] = {}
+        for service in psutil_module.win_service_iter():
+            try:
+                if all(
+                    callable(getattr(service, field, None))
+                    for field in ("name", "status", "pid")
+                ):
+                    service_name = str(service.name() or "")
+                    service_status = service.status()
+                    service_pid = int(service.pid() or 0)
+                else:
+                    data = service.as_dict()
+                    service_name = str(data.get("name") or "")
+                    service_status = data.get("status")
+                    service_pid = int(data.get("pid") or 0)
+            except FileNotFoundError:
+                # The service was deleted between enumeration and inspection;
+                # it cannot still supervise a live gateway tree.
+                continue
+            except Exception as exc:
+                raise RuntimeError("SCM service inspection failed") from exc
+            if not service_name:
+                raise RuntimeError("SCM service has an empty name")
+            if service_status == "stopped":
+                continue
+            if service_status != "running":
+                raise RuntimeError(
+                    f"SCM service {service_name} has indeterminate status: {service_status}"
+                )
+            if service_pid <= 0:
+                raise RuntimeError(
+                    f"Running SCM service {service_name} has no valid process ID"
+                )
+            service_names_by_pid.setdefault(service_pid, set()).add(service_name)
+    except Exception as exc:
+        raise RuntimeError("SCM service enumeration failed") from exc
+
+    found: dict[str, WindowsGatewayService] = {}
+    for profile_process in profile_processes:
+        try:
+            gateway_process = psutil_module.Process(int(profile_process.pid))
+            gateway_create_time = float(gateway_process.create_time())
+            if profile_process.create_time <= 0 or abs(
+                gateway_create_time - profile_process.create_time
+            ) > 0.001:
+                raise RuntimeError("Gateway process identity changed during SCM discovery")
+            ancestor_pids = [int(parent.pid) for parent in gateway_process.parents()]
+            shared_service_pids = [
+                pid
+                for pid in ancestor_pids
+                if len(service_names_by_pid.get(pid, set())) > 1
+            ]
+            if shared_service_pids:
+                raise RuntimeError(
+                    "Gateway ownership is ambiguous under shared SCM host PID(s): "
+                    + ", ".join(str(pid) for pid in shared_service_pids)
+                )
+            service_pid = next(
+                (
+                    pid
+                    for pid in ancestor_pids
+                    if len(service_names_by_pid.get(pid, set())) == 1
+                ),
+                None,
+            )
+            if service_pid is None:
+                continue
+            service_name = next(iter(service_names_by_pid[service_pid]))
+            service_process = psutil_module.Process(service_pid)
+            service_create_time = float(service_process.create_time())
+            descendant_processes = service_process.children(recursive=True)
+            descendants = frozenset(int(child.pid) for child in descendant_processes)
+            if int(profile_process.pid) not in descendants:
+                continue
+            descendant_identities = tuple(
+                sorted(
+                    (int(child.pid), float(child.create_time()))
+                    for child in descendant_processes
+                )
+            )
+            found[service_name] = WindowsGatewayService(
+                name=service_name,
+                profile=str(profile_process.profile),
+                service_pid=service_pid,
+                gateway_pid=int(profile_process.pid),
+                descendant_pids=descendants,
+                descendant_identities=descendant_identities,
+                service_create_time=service_create_time,
+                gateway_create_time=gateway_create_time,
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not determine SCM ownership for gateway profile "
+                f"{profile_process.profile}"
+            ) from exc
+    return [found[name] for name in sorted(found)]
 
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
@@ -4720,10 +4881,22 @@ def _timestamped_stderr_gateway_command(
     ``hermes update`` sees the flag on the live grandchild argv and hands
     the process back to launchd instead of starting a detached watcher
     (#86893 / #87005). The detached nohup fallback stays unmarked.
+
+    Supervised starts also drop ``--replace`` (issue #79048): a launchd
+    service is respawned by KeepAlive, so takeover authority would be
+    re-armed on every respawn — two profiles legitimately sharing one
+    platform token would each terminate the sibling, and launchd would
+    revive the victim forever. Bounded replacement is the lifecycle
+    commands' job (``launchctl kickstart -k``, drain in
+    ``launchd_restart()``, bootout+bootstrap in install/refresh), which
+    run before supervision resumes. Mirrors ``generate_systemd_unit``,
+    whose ExecStart also runs ``gateway run`` without ``--replace``.
     """
     inner = _gateway_run_command()
     if external_supervisor and "--external-supervisor" not in inner:
         inner = [*inner, "--external-supervisor"]
+    if external_supervisor and "--replace" in inner:
+        inner = [part for part in inner if part != "--replace"]
     return [
         get_python_path(),
         "-m",
@@ -5375,8 +5548,8 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
-    drain_timeout = _get_restart_drain_timeout()
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     from gateway.status import get_running_pid
 
     try:
@@ -5400,26 +5573,57 @@ def launchd_restart():
             _escalate_wedged_gateway(pid)
             pid = None
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
+            # Graceful in-band restart, mirroring the systemd branch.
+            #
+            # Previously this sent a bare SIGTERM and waited
+            # ``_get_restart_drain_timeout()`` — which defaults to 0, so the
+            # wait could never succeed and every restart fell through to
+            # ``kickstart -k``. A bare SIGTERM also leaves
+            # ``restart_requested`` False, so the gateway exits 1 instead of
+            # 75 and reports itself to chat as "shutting down" rather than
+            # "restarting", losing the resume_pending handoff.
+            #
+            # SIGUSR1 is the drain-aware path: refuse new turns, wait for
+            # in-flight work (``agent.restart_after_turn_timeout``), then
+            # stop() within ``agent.restart_drain_timeout``. The wait budget
+            # must cover BOTH phases plus headroom (#77184) — the raw drain
+            # timeout covers only the second.
+            #
+            # Announce the wait BEFORE it runs: it can last the full budget
+            # while the old gateway finishes in-flight agent runs, and it
+            # streams into surfaces with no other feedback — the desktop
+            # updater's live output most of all, where a silent stop here
+            # reads as "update stuck" (#44515).
+            wait_budget = _get_restart_exit_wait_budget()
             print(
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
-                f"(up to {drain_timeout:.0f}s)..."
+                f"(up to {wait_budget:.0f}s)..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
-                    )
+            if _graceful_restart_via_sigusr1(pid, wait_budget):
+                # The gateway exited with the planned-restart code. When
+                # launchd is actually supervising this label, KeepAlive
+                # revives it — do NOT kickstart (the replacement may already
+                # be up, and ``-k`` would kill it and restart a second time).
+                # But a graceful exit alone doesn't prove supervision:
+                # detached-fallback gateways and unloaded jobs also exit
+                # cleanly with nobody to revive them (and the SIGUSR1 helper
+                # returns True for an already-gone PID). Verify a replacement
+                # PID appears before trusting KeepAlive — mirrors the systemd
+                # branch's replacement observation.
+                if _wait_for_launchd_service_pid(
+                    label, pid, timeout=15.0, domain=domain
+                ):
+                    print("✓ Service restart requested")
+                    _clear_launchd_unsupported_marker()
+                    return
+                print(
+                    "⚠ launchd did not revive the gateway after its graceful "
+                    "exit — forcing restart"
+                )
+            else:
+                print(
+                    f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart"
+                )
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
