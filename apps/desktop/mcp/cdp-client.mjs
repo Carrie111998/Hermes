@@ -58,6 +58,15 @@ export function createCdpClient({ port, match, onConsole, discoverTargetImpl = d
       throw e
     }
 
+    // A1: when the socket closes (renderer reload / window close), drop the
+    // cached handle so the next tool call rediscovers instead of failing on a
+    // dead socket until the server restarts. Identity guard: a stale socket's
+    // late close event must never clear a NEWER handle.
+    const thisHandle = handle
+    handle.ws?.addEventListener?.('close', () => {
+      if (handle === thisHandle) handle = null
+    })
+
     handle.on('Runtime.consoleAPICalled', (p) => {
       onConsole({
         level: p.type,
