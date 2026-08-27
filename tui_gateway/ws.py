@@ -376,6 +376,7 @@ async def handle_ws(
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
                     "payload": {
+                        "language": server.resolve_language(),
                         "skin": skin_payload,
                         "change_events": True,
                         "heartbeat": True,
