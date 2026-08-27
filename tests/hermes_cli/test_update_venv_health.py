@@ -263,6 +263,57 @@ def test_detect_venv_python_revalidates_renamed_snapshot_reused_as_venv_python(
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_revalidates_null_native_image(_winp, tmp_path):
+    live_exe = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    holder = _proc(535, live_exe, "python.exe", ["python.exe", "worker.py"])
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
+        Process=lambda pid=None: me if pid is None else holder,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module,
+        "_windows_process_image_rows",
+        return_value=[(535, "python.exe", None)],
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == [
+            (535, "python.exe", "python.exe worker.py")
+        ]
+
+    holder.exe.assert_called_once_with()
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_skips_definitive_inaccessible_native_image(
+    _winp, tmp_path
+):
+    me = MagicMock()
+    me.parents.return_value = []
+
+    def process(pid=None):
+        if pid is None:
+            return me
+        raise AssertionError("definitive inaccessible row must not reach psutil")
+
+    process_factory = MagicMock(side_effect=process)
+    fake_psutil = types.SimpleNamespace(
+        process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
+        Process=process_factory,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module,
+        "_windows_process_image_rows",
+        return_value=[(536, "System", "")],
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == []
+
+    assert process_factory.call_args_list == [call()]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
 def test_detect_venv_python_revalidates_native_pid_identity(_winp, tmp_path):
     snapshot_exe = str(tmp_path / "venv" / "Scripts" / "custom-runner.exe")
     reused = _proc(606, r"C:\Windows\System32\notepad.exe", "notepad.exe")
@@ -359,6 +410,22 @@ def test_windows_process_image_rows_closes_snapshot_and_process_handles(_winp):
         (707, "custom-runner.exe", r"C:\Hermes\venv\Scripts\custom-runner.exe")
     ]
     assert kernel.CloseHandle.call_args_list == [call(200), call(100)]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_windows_process_image_rows_marks_access_denied_as_definitive(_winp):
+    kernel, _last_error = _fake_kernel32()
+    kernel.OpenProcess.return_value = 0
+    errors = iter([5, 18])
+    with (
+        patch.object(ctypes, "WinDLL", create=True, return_value=kernel),
+        patch.object(ctypes, "get_last_error", side_effect=lambda: next(errors)),
+    ):
+        rows = update_module._windows_process_image_rows()
+
+    assert rows == [(707, "custom-runner.exe", "")]
+    assert kernel.QueryFullProcessImageNameW.call_count == 0
+    assert kernel.CloseHandle.call_args_list == [call(100)]
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)

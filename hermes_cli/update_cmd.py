@@ -4672,7 +4672,11 @@ def _windows_process_image_rows() -> list[tuple[int, str, str | None]] | None:
         def _query_image(pid: int) -> str | None:
             process = kernel32.OpenProcess(0x1000, False, pid)
             if not process:
-                return None
+                # Access denied and invalid/system PIDs cannot be strengthened by
+                # psutil's executable query, which crosses the same Win32 access
+                # boundary. Use "" as a definitive inaccessible sentinel; reserve
+                # None for a transient identity failure that must be revalidated.
+                return "" if ctypes.get_last_error() in {5, 87} else None
             try:
                 size = wintypes.DWORD(32768)
                 buffer = ctypes.create_unicode_buffer(size.value)
@@ -4682,7 +4686,7 @@ def _windows_process_image_rows() -> list[tuple[int, str, str | None]] | None:
                     buffer,
                     ctypes.byref(size),
                 ):
-                    return None
+                    return "" if ctypes.get_last_error() in {5, 87} else None
                 return buffer.value
             finally:
                 kernel32.CloseHandle(process)
@@ -4798,9 +4802,8 @@ def _detect_venv_python_processes(
 
         def _native_proc_rows():
             for candidate_pid, candidate_name, candidate_exe in native_rows:
-                if candidate_pid in skip or not candidate_exe:
+                if candidate_pid in skip or candidate_exe == "":
                     continue
-                candidate_exe_norm = str(candidate_exe).lower()
                 # Preserve the base scanner's broad command-line contract:
                 # a renamed or alternate external launcher can still reference
                 # this venv even when neither its snapshot name nor executable
@@ -4825,12 +4828,11 @@ def _detect_venv_python_processes(
             continue
         native = bool(info.get("_native"))
         exe = info.get("exe")
-        if not exe:
-            continue
-        # Revalidate every native row. Arbitrary external launchers are part of
-        # the holder contract, so no snapshot name/path can safely prefilter the
-        # Toolhelp → psutil PID-reuse boundary. A renamed external snapshot PID
-        # may now belong to a venv interpreter whose argv omits the venv path.
+        # Revalidate every native row, including rows whose Toolhelp image query
+        # failed. The PID may still be a live venv holder that psutil can identify.
+        # Arbitrary external launchers are part of the holder contract, so no
+        # snapshot name/path can safely prefilter the Toolhelp → psutil PID-reuse
+        # boundary.
         if native:
             try:
                 exe = proc.exe()
@@ -4841,6 +4843,8 @@ def _detect_venv_python_processes(
             live_executable_name = Path(str(exe)).name
             process_name = live_executable_name.lower()
             info["name"] = live_executable_name
+        elif not exe:
+            continue
         try:
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):
