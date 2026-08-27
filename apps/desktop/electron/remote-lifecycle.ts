@@ -735,9 +735,11 @@ async function disconnect(ssh, ownershipId) {
 
 function buildOwnedStaleTerminationCommand(lock, ownershipId) {
   const pid = Number(lock.pid)
-  const expectedPath = shq(expandRemotePath(lock.hermesPath))
-  const expectedHome = lock.hermesHome ? shq(expandRemotePath(lock.hermesHome)) : "''"
-  const expectedToken = shq(expandRemotePath(spawnTokenPath(ownershipId, lock.spawnNonce)))
+  // expandRemotePath already returns a fully shell-quoted word; do not shq()
+  // it a second time or the literal quotes never match the live argv below.
+  const expectedPath = expandRemotePath(lock.hermesPath)
+  const expectedHome = lock.hermesHome ? expandRemotePath(lock.hermesHome) : "''"
+  const expectedToken = expandRemotePath(spawnTokenPath(ownershipId, lock.spawnNonce))
   const nonce = shq(lock.spawnNonce)
   const profile = shq(lock.profile || '')
   const command = `$(ps -ww -o command= -p ${pid} 2>/dev/null || true)`
@@ -910,7 +912,10 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
+  // mutexPath arrives already shell-quoted via expandRemotePath at the call
+  // site; wrapping it in shq() again would double-escape the path (the
+  // "reservation='\"$HOME\"'..." boot failure).
+  return `python3 -c ${shq(script)} ${mutexPath} ${shq(command)}`
 }
 
 /**
@@ -1083,7 +1088,11 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
 
   return withRemoteUpdateMutex(
     `umask 077 && mkdir -p "$(dirname ${reservation})"; ` +
-      `reservation=${shq(reservation)}; lock=${shq(lockPath)}; owner_file=${shq(ownerPath)}; ` +
+      // reservation/lockPath/ownerPath are already fully shell-quoted words
+      // from expandRemotePath (or a quoted word + literal suffix). Do NOT shq()
+      // them again — that bakes literal quotes into the path, so the remote
+      // mkdir creates `"$HOME"'/...' ` instead of the real directory.
+      `reservation=${reservation}; lock=${lockPath}; owner_file=${ownerPath}; ` +
       `reservation_nonce=${shq(reservationNonce)}; ` +
       `i=0; while ! mkdir "$reservation" 2>/dev/null; do ` +
       `owner_data=$(cat "$owner_file" 2>/dev/null || true); owner_pid=${'${owner_data%%:*}'}; ` +
