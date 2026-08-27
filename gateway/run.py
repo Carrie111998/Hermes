@@ -3880,6 +3880,17 @@ def _parse_session_key(session_key: str) -> "dict | None":
     return None
 
 
+def _raw_watch_session_id(evt: dict) -> str:
+    """Return an unstructured wake target carried by a watch event."""
+    raw_sid = str(evt.get("origin_session_id") or "").strip()
+    if raw_sid:
+        return raw_sid
+    session_key = str(evt.get("session_key") or "").strip()
+    if session_key and _parse_session_key(session_key) is None:
+        return session_key
+    return ""
+
+
 def _shorten_command_for_display(command: str, limit: int = 80) -> str:
     """Collapse a shell command onto one line and cap its length for display."""
     one_line = " ".join((command or "").split())
@@ -25625,11 +25636,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Recover the raw session id and wake the real session via the API
             # server's own /v1/chat/completions entry point instead of
             # dropping the event.
-            raw_sid = str(evt.get("origin_session_id") or "").strip()
-            if not raw_sid:
-                _sk = str(evt.get("session_key") or "").strip()
-                if _sk and _parse_session_key(_sk) is None:
-                    raw_sid = _sk
+            raw_sid = _raw_watch_session_id(evt)
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
                 from gateway.wake import adapter_supports_push, deliver_wake
@@ -25854,6 +25861,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
+            raw_sid = _raw_watch_session_id(evt)
+            if (
+                durable_delegation_id
+                and raw_sid
+                and self.adapters.get(Platform.API_SERVER) is None
+            ):
+                # No transport exists in this gateway lifecycle for this raw
+                # session. Leave the durable row untouched so startup restore
+                # can re-arm it in a future lifecycle without burning the
+                # bounded delivery-failure budget on an attempt never made.
+                logger.warning(
+                    "Deferring watch notification for raw session %s: no "
+                    "api_server adapter is available; durable completion %s "
+                    "remains pending for a future gateway start",
+                    raw_sid,
+                    durable_delegation_id,
+                )
+                return None
             if durable_delegation_id:
                 try:
                     from tools.async_delegation import claim_completion_delivery
