@@ -134,6 +134,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Human approval gates. A gated task is parked in the EXISTING ``scheduled``
+# status (already non-dispatchable) with ``tasks.gate_state`` set, so no new
+# status is added to VALID_STATUSES and none of the literal status guards
+# throughout this module change. ``gate_state IS NULL`` is an ordinary
+# time-parked ``scheduled`` task and behaves exactly as before.
+VALID_GATE_STATES = {"plan", "deploy"}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1524,6 +1531,77 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- ---------------------------------------------------------------------
+-- Project-manager layer (plan gate). Additive: a board that never creates
+-- a pm_projects row behaves exactly as it did before these tables existed.
+--
+-- These live in kanban.db, NOT in the per-profile projects.db, because the
+-- approval transaction must be atomic with the task rows it materialises and
+-- because every profile's worker must read the same rows. projects.db stays
+-- the per-profile *workspace* store and gains only a pointer.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pm_projects (
+    id                TEXT PRIMARY KEY,
+    slug              TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL,
+    parent_project_id TEXT,
+    objective         TEXT,
+    success_criteria  TEXT,          -- JSON array
+    lifecycle_status  TEXT,          -- NULL (legacy) | planning | awaiting_plan_approval | active | done | archived
+    plan_revision     INTEGER NOT NULL DEFAULT 0,
+    aliases           TEXT,          -- JSON array, for natural-language resolution
+    primary_repo_path TEXT,
+    obsidian_rel_path TEXT,
+    vault_state       TEXT,
+    archived          INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+
+-- One immutable row per plan revision. A rejected revision is never edited;
+-- the PM proposes revision N+1.
+CREATE TABLE IF NOT EXISTS pm_plans (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    body          TEXT NOT NULL,
+    proposed_by   TEXT,
+    proposed_at   INTEGER NOT NULL,
+    root_task_id  TEXT,
+    approved_by   TEXT,
+    approved_at   INTEGER,
+    rejected_at   INTEGER,
+    reject_reason TEXT,
+    UNIQUE (project_id, revision)
+);
+
+-- Append-only attestation ledger. Written in the SAME transaction as the state
+-- change it authorises, so a bare status flip with no approval row is
+-- impossible. UNIQUE(subject, binding_hash) is the replay defence.
+--
+-- operator_display is a human-readable label ONLY. It is NOT an identity
+-- boundary: Hermes runs as the same OS user as its agents, so this column
+-- records who the operator claims to be, not who they are proven to be.
+CREATE TABLE IF NOT EXISTS pm_approvals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject          TEXT NOT NULL,
+    binding_hash     TEXT NOT NULL,
+    decision         TEXT NOT NULL,   -- approved | rejected
+    reason           TEXT,
+    operator_display TEXT,
+    os_user          TEXT,
+    os_uid           INTEGER,
+    host_id          TEXT,
+    tty_path         TEXT,
+    surface          TEXT,            -- 'cli-tty' in this slice
+    nonce            TEXT UNIQUE,
+    created_at       INTEGER NOT NULL,
+    UNIQUE (subject, binding_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pm_plans_proj  ON pm_plans(project_id, revision);
+CREATE INDEX IF NOT EXISTS idx_pm_appr_subj   ON pm_approvals(subject);
 """
 
 
@@ -2610,6 +2688,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "gate_state" not in cols:
+        # Which human gate this task is parked at, or NULL when it is not
+        # gated. A gated task sits in the existing ``scheduled`` status, which
+        # is already non-dispatchable, so no new status is introduced and no
+        # existing status guard changes. ``gate_state`` is what distinguishes
+        # "waiting on a human" from "waiting on a clock".
+        _add_column_if_missing(conn, "tasks", "gate_state", "gate_state TEXT")
+    # Indexed here rather than in SCHEMA_SQL: on a legacy DB the column does not
+    # exist when SCHEMA_SQL runs, and CREATE INDEX over a missing column aborts
+    # initialization. Same reason idx_tasks_tenant / idx_tasks_session_id live
+    # in this function.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_gate ON tasks(gate_state)")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
