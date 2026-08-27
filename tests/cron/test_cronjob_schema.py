@@ -19,3 +19,17 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
+def test_cronjob_schema_keeps_user_owned_inference_policy_out_of_model_tool():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    properties = CRONJOB_SCHEMA["parameters"]["properties"]
+    for user_owned_route_field in (
+        "model",
+        "provider",
+        "base_url",
+        "reasoning_effort",
+        "fallback_policy",
+    ):
+        assert user_owned_route_field not in properties
+
+

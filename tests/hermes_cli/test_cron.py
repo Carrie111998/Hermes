@@ -128,6 +128,28 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
 
+    def test_create_forwards_fallback_policy(self, tmp_cron_dir, capsys):
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 1h",
+                prompt="Run privately",
+                name="Private job",
+                deliver="local",
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                no_agent=False,
+                fallback_policy="none",
+            )
+        )
+
+        jobs = list_jobs()
+        assert len(jobs) == 1
+        assert jobs[0]["fallback_policy"] == "none"
+        assert "Fallback: none" in capsys.readouterr().out
 
 
 class TestGatewayNotRunningWarning:

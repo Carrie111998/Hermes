@@ -44,7 +44,7 @@ def _job(**overrides):
     return job
 
 
-def _tick(job, tmp_path, current_provider, deliveries):
+def _tick(job, tmp_path, current_provider, deliveries, *, agent_error=None):
     """Run one run_one_job tick with the provider resolution pinned."""
     fake_db = MagicMock()
 
@@ -68,7 +68,10 @@ def _tick(job, tmp_path, current_provider, deliveries):
          patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
          patch("run_agent.AIAgent") as mock_agent_cls:
         mock_agent = MagicMock()
-        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        if agent_error is None:
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        else:
+            mock_agent.run_conversation.side_effect = agent_error
         mock_agent_cls.return_value = mock_agent
         ok = sched.run_one_job(job)
     return ok, mock_agent_cls.called
@@ -121,6 +124,44 @@ class TestDriftAlertOnce:
             _tick(fresh, tmp_path, "nous", deliveries)
 
         drift_alerts = [d for d in deliveries if "drift" in d.lower()]
+        assert len(drift_alerts) == 2, f"expected re-alert after heal: {deliveries}"
+
+    def test_healed_drift_rearms_even_when_agent_run_then_fails(self, tmp_path):
+        job = _job()
+        deliveries = []
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+
+            fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            _tick(fresh, tmp_path, "nous", deliveries)
+            assert len(
+                [
+                    d
+                    for d in deliveries
+                    if "skipped to prevent unintended spend" in d.lower()
+                ]
+            ) == 1
+
+            fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            _processed, agent_called = _tick(
+                fresh,
+                tmp_path,
+                "openrouter",
+                deliveries,
+                agent_error=RuntimeError("boom unrelated"),
+            )
+            assert agent_called is True
+            stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            assert not stored.get("drift_alerted")
+
+            fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            _tick(fresh, tmp_path, "nous", deliveries)
+
+        drift_alerts = [
+            d
+            for d in deliveries
+            if "skipped to prevent unintended spend" in d.lower()
+        ]
         assert len(drift_alerts) == 2, f"expected re-alert after heal: {deliveries}"
 
     def test_non_drift_failures_untouched_by_the_bit(self, tmp_path):

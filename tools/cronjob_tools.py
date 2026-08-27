@@ -763,6 +763,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "model": job.get("model"),
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
+        "fallback_policy": job.get("fallback_policy") or "inherit",
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
@@ -1371,6 +1372,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    fallback_policy: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1473,6 +1475,9 @@ def cronjob(
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
+                    fallback_policy=(
+                        fallback_policy if fallback_policy is not None else "inherit"
+                    ),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
@@ -1693,6 +1698,8 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            if fallback_policy is not None:
+                updates["fallback_policy"] = fallback_policy
             if reasoning_effort is not None:
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
@@ -1960,11 +1967,12 @@ def _cronjob_handler(args, **kw):
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        # model / provider / base_url are intentionally NOT read from the
-        # agent's arguments: per-job inference pins are user-owned (dashboard,
-        # `hermes cron create/edit --model`, or hand-edited jobs). The agent
-        # must not be able to point unattended spend at a different model.
-        # Programmatic callers of cronjob() itself retain the parameters.
+        # model / provider / base_url / fallback_policy are intentionally NOT
+        # read from the agent's arguments: per-job inference policy is user-owned
+        # (`hermes cron create/edit --model/--fallback-policy`, dashboard API, or
+        # hand-edited jobs). The agent must not point unattended spend at a
+        # different route or relax its fallback boundary. Programmatic callers
+        # of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
         context_from=args.get("context_from"),

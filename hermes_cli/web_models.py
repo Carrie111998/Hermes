@@ -386,6 +386,7 @@ class CronJobCreate(BaseModel):
     model: Optional[str] = None
     provider: Optional[str] = None
     base_url: Optional[str] = None
+    fallback_policy: Literal["inherit", "none", "pinned"] = "inherit"
     script: Optional[str] = None
     context_from: Optional[Any] = None
     enabled_toolsets: Optional[List[str]] = None

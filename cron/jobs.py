@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -35,6 +36,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -457,7 +459,93 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "fallback_snapshot"})
+
+_FALLBACK_POLICIES = frozenset({"inherit", "none", "pinned"})
+
+
+def normalize_fallback_policy(value: Any) -> str:
+    """Return one supported cron fallback policy or raise ``ValueError``."""
+    allowed = ", ".join(sorted(_FALLBACK_POLICIES))
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Invalid cron fallback_policy {value!r}; expected one of: {allowed}"
+        )
+    normalized = value.strip().lower()
+    if normalized not in _FALLBACK_POLICIES:
+        raise ValueError(
+            f"Invalid cron fallback_policy {value!r}; expected one of: {allowed}"
+        )
+    return normalized
+
+
+def snapshot_fallback_chain(chain: Any) -> Dict[str, Any]:
+    """Snapshot an ordered fallback route without persisting cleartext secrets."""
+    routes: List[Dict[str, Optional[str]]] = []
+    identity_routes: List[Dict[str, Optional[str]]] = []
+    for raw in chain or []:
+        if not isinstance(raw, dict):
+            continue
+        provider = str(raw.get("provider") or "").strip() or None
+        model = str(raw.get("model") or "").strip() or None
+        base_url = str(raw.get("base_url") or "").strip().rstrip("/") or None
+        if not any((provider, model, base_url)):
+            continue
+
+        safe_base_url = None
+        identity_base_url = None
+        if base_url:
+            try:
+                parsed = urlsplit(base_url)
+                if parsed.scheme and parsed.hostname:
+                    host = parsed.hostname
+                    if ":" in host and not host.startswith("["):
+                        host = f"[{host}]"
+                    try:
+                        port = f":{parsed.port}" if parsed.port is not None else ""
+                    except ValueError:
+                        port = ""
+                    safe_base_url = f"{parsed.scheme.lower()}://{host.lower()}{port}"
+                    identity_base_url = f"{safe_base_url}{parsed.path or ''}"
+                else:
+                    safe_base_url = "<configured endpoint>"
+                    identity_base_url = safe_base_url
+            except (TypeError, ValueError):
+                safe_base_url = "<configured endpoint>"
+                identity_base_url = safe_base_url
+
+        identity_routes.append(
+            {"provider": provider, "model": model, "base_url": identity_base_url}
+        )
+        routes.append(
+            {"provider": provider, "model": model, "base_url": safe_base_url}
+        )
+
+    payload = json.dumps(
+        identity_routes,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return {
+        "fingerprint": hashlib.sha256(payload).hexdigest(),
+        "routes": routes,
+    }
+
+
+def _resolve_current_fallback_chain() -> List[Dict[str, Any]]:
+    """Resolve the active profile's effective global fallback chain."""
+    from hermes_cli.config import _expand_env_vars, load_config
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    cfg = load_config()
+    try:
+        from hermes_cli import managed_scope
+
+        cfg = managed_scope.apply_managed_overlay(cfg)
+    except Exception:
+        pass
+    return get_fallback_chain(_expand_env_vars(cfg))
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -567,6 +655,8 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     ensure consumers never crash while formatting or running those records.
     """
     normalized = _apply_skill_fields(job)
+    normalized.setdefault("fallback_policy", "inherit")
+    normalized.setdefault("fallback_snapshot", None)
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
@@ -1933,6 +2023,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    fallback_policy: str = "inherit",
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2000,6 +2091,10 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        fallback_policy: Per-job cross-provider fallback boundary. ``inherit``
+                follows the active profile chain, ``none`` stops after the
+                primary provider fails, and ``pinned`` snapshots the current
+                route and fails closed if it changes.
 
     Returns:
         The created job dict
@@ -2031,6 +2126,9 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_fallback_policy = normalize_fallback_policy(fallback_policy)
+    if normalized_no_agent:
+        normalized_fallback_policy = "inherit"
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
@@ -2080,6 +2178,16 @@ def create_job(
         base_url=normalized_base_url,
         no_agent=normalized_no_agent,
     )
+    fallback_snapshot = None
+    if normalized_fallback_policy == "pinned":
+        fallback_snapshot = snapshot_fallback_chain(
+            _resolve_current_fallback_chain()
+        )
+        if not fallback_snapshot["routes"]:
+            raise ValueError(
+                "fallback_policy='pinned' requires a configured global "
+                "fallback route to snapshot"
+            )
 
     next_run_at = compute_next_run(parsed_schedule)
     if parsed_schedule.get("kind") == "once" and next_run_at is None:
@@ -2103,6 +2211,8 @@ def create_job(
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": normalized_model,
         "provider": normalized_provider,
+        "fallback_policy": normalized_fallback_policy,
+        "fallback_snapshot": fallback_snapshot,
         # Provider/model resolution captured at creation for unpinned jobs
         # (#44585). None for pinned axes, no_agent jobs, resolution failures, and
         # any pre-existing job written before these fields existed (back-compat).
@@ -2293,6 +2403,32 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                 )
+
+            if {"fallback_policy", "no_agent"}.intersection(updates):
+                raw_fallback_policy = (
+                    updated["fallback_policy"]
+                    if "fallback_policy" in updated
+                    else "inherit"
+                )
+                fallback_policy = normalize_fallback_policy(
+                    raw_fallback_policy
+                )
+                if bool(updated.get("no_agent")):
+                    fallback_policy = "inherit"
+
+                fallback_snapshot = None
+                if fallback_policy == "pinned":
+                    fallback_snapshot = snapshot_fallback_chain(
+                        _resolve_current_fallback_chain()
+                    )
+                    if not fallback_snapshot["routes"]:
+                        raise ValueError(
+                            "fallback_policy='pinned' requires a configured "
+                            "global fallback route to snapshot"
+                        )
+
+                updated["fallback_policy"] = fallback_policy
+                updated["fallback_snapshot"] = fallback_snapshot
 
             if any(k in updates for k in _PAYLOAD_FIELDS):
                 if job_payload_is_empty(updated):
@@ -2578,8 +2714,9 @@ def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
     job's condition, so the scheduler alerts exactly once and stays silent
     on subsequent ticks until the condition heals (same alert-once shape as
     the dead-pin auto-pause in #73506). Persisted on the job record so the
-    dedup survives gateway restarts. Fields: ``preflight_alerted`` (blocked
-    config, T1-26) and ``drift_alerted`` (#44585 drift-guard skip).
+    dedup survives gateway restarts. Fields include ``preflight_alerted``
+    (blocked config, T1-26), ``drift_alerted`` (#44585 primary-route drift),
+    and ``fallback_drift_alerted`` (the per-job pinned fallback chain).
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -2620,6 +2757,16 @@ def mark_drift_alerted(job_id: str) -> bool:
 def clear_drift_alerted(job_id: str) -> None:
     """Clear the drift alert-dedup marker (resolution matches again)."""
     _set_alert_flag(job_id, "drift_alerted", False)
+
+
+def mark_fallback_drift_alerted(job_id: str) -> bool:
+    """Mark pinned-fallback drift; return True if it was already marked."""
+    return _set_alert_flag(job_id, "fallback_drift_alerted", True)
+
+
+def clear_fallback_drift_alerted(job_id: str) -> None:
+    """Clear pinned-fallback drift once the authorised chain matches again."""
+    _set_alert_flag(job_id, "fallback_drift_alerted", False)
 
 
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:

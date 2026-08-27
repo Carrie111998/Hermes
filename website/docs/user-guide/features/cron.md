@@ -35,6 +35,56 @@ All of this is available to Hermes itself through the `cronjob` tool, so you can
 **Per-job reasoning effort.** A job can pin its own thinking level, independent of the model pin: one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. When set, it overrides both the global `agent.reasoning_effort` and per-model `agent.reasoning_overrides` for that job's runs (`none` disables thinking). Set it via `hermes cron create/edit --reasoning-effort high`; pass an empty string on edit to clear the pin and follow config again. (It is deliberately not exposed on the agent's `cronjob` tool — model configuration stays a user decision.) Levels a model doesn't support are clamped or omitted by the provider at request time — pinning `xhigh` on a model that caps at `high` runs at `high`. The pin has no effect on `no_agent` jobs (there is no LLM call to tune). Use it to run heavy scheduled analyses at `high` while cheap recurring jobs run at `minimal`, without touching your global default.
 :::
 
+## Per-job fallback boundaries
+
+Operators can constrain an agent-backed cron job's cross-provider fallback
+independently of its primary model/provider pin:
+
+| Policy | Behaviour |
+| --- | --- |
+| `inherit` | Default. Use the profile's current ordered `fallback_providers` chain. |
+| `none` | Do not recover through a fallback provider after the primary route fails. The normal same-provider credential pool still applies. |
+| `pinned` | Snapshot the current ordered fallback route and fail closed if that route later changes. |
+
+Set the boundary when creating or editing a job:
+
+```bash
+hermes cron create "every 2h" "Check server status" \
+  --fallback-policy none
+
+hermes cron edit <job_id> --fallback-policy pinned
+```
+
+The web API accepts the same `fallback_policy` field. Like model/provider pins,
+this is deliberately not exposed to the agent-facing `cronjob` tool: unattended
+agent actions cannot relax a user-owned inference boundary.
+
+`pinned` requires at least one configured fallback route. Its stored snapshot
+contains a SHA-256 route fingerprint plus display metadata limited to
+provider/model and the endpoint origin (`scheme://host[:port]`). The fingerprint
+also covers the normalised endpoint path so a same-origin path change is treated
+as drift. Cleartext URL userinfo, path, query, and fragment are not persisted;
+userinfo, query, and fragment are excluded from the fingerprint, while the path
+contributes only inside the SHA-256 digest. If the route drifts, Hermes contacts
+no provider, records `drift_skip`, and alerts once; later identical ticks are
+silent until the route is restored or the job is explicitly re-pinned.
+
+The same authorised route is used by preflight, initial authentication
+recovery, and the agent runtime. Therefore a `none` job cannot be rescued by a
+global fallback during preflight, and a selected auth fallback is not offered
+to the agent a second time. Setting `cron.preflight: false` does **not** disable
+the fallback boundary.
+
+Automatic auxiliary-model recovery follows the same boundary. `none` disables
+task-specific fallback chains, the global main fallback chain, and built-in
+provider discovery for auxiliary calls. `pinned` permits only the already
+authorised pinned chain and likewise disables other discovery. An explicitly
+configured auxiliary task's primary provider, and providers contacted by an
+explicit tool action, are not fallback routes and remain outside this policy.
+
+Script-only (`no_agent`) jobs do not perform inference, so their stored policy
+is canonicalised to `inherit` and no fallback snapshot is retained.
+
 :::warning
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
