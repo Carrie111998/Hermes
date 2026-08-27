@@ -106,6 +106,22 @@ class TestMinting:
         with pytest.raises(CommandTokenError, match="shell"):
             _mint(command, "dbx")
 
+    @pytest.mark.parametrize("command", [
+        'env -u SECRET bash -c "echo pwned"',
+        'env --split-string="bash -c echo"',
+        'nice bash -c "echo pwned"',
+        'nohup sh -c "echo pwned"',
+        'xargs -0 bash -c "echo pwned"',
+        'wsl sh -c "echo pwned"',
+    ])
+    def test_process_dispatch_wrappers_are_rejected(self, monkeypatch, command):
+        monkeypatch.setattr(
+            "agent.command_token_source.subprocess.run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+        )
+        with pytest.raises(CommandTokenError, match="process wrapper"):
+            _mint(command, "dbx")
+
     def test_nul_command_is_normalized_to_provider_error(self):
         with pytest.raises(CommandTokenError, match="could not be parsed") as excinfo:
             _mint("helper\x00--token", "dbx")

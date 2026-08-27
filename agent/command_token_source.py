@@ -108,29 +108,31 @@ _SHELL_EXECUTABLES = frozenset(
 )
 
 
+_PROCESS_DISPATCH_WRAPPERS = frozenset({
+    "doas", "doas.exe", "env", "env.exe", "nice", "nice.exe",
+    "nohup", "nohup.exe", "runuser", "runuser.exe", "script", "script.exe",
+    "setsid", "setsid.exe", "sudo", "sudo.exe", "timeout", "timeout.exe",
+    "wsl", "wsl.exe", "xargs", "xargs.exe",
+})
+
+
 def _command_basename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1].casefold()
 
 
 def _reject_shell_launcher(argv: list[str], label: str) -> None:
-    """Keep a child shell from restoring shell semantics behind shell=False."""
+    """Keep child shells and dispatch wrappers behind the trusted boundary."""
     executable = _command_basename(argv[0])
+    if executable in _PROCESS_DISPATCH_WRAPPERS:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} cannot launch a process wrapper; "
+            "use the credential executable directly"
+        )
     if executable in _SHELL_EXECUTABLES:
         raise CommandTokenError(
             f"key_cmd for provider {label!r} cannot launch a shell; "
             "use an executable plus explicit arguments"
         )
-    if executable == "env":
-        # ``env VAR=value bash -c ...`` is a common indirect shell launcher.
-        for argument in argv[1:]:
-            if argument.startswith("-") or "=" in argument:
-                continue
-            if _command_basename(argument) in _SHELL_EXECUTABLES:
-                raise CommandTokenError(
-                    f"key_cmd for provider {label!r} cannot launch a shell; "
-                    "use an executable plus explicit arguments"
-                )
-            break
 
 
 def _has_unquoted_shell_syntax_posix(command: str) -> bool:
