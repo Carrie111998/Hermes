@@ -298,6 +298,16 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     assert "stopped retrying" in result["final_response"]
     assert result["guardrail"]["code"] == "repeated_exact_failure_block"
     assert result["guardrail"]["tool_name"] == "web_search"
+    assert result["turn_execution_evidence"] == {
+        "tool_calls": [
+            {"name": "web_search", "call_id": "c1"},
+            {"name": "web_search", "call_id": "c2"},
+        ]
+    }
+    assert result["execution_receipt"]["tool_calls"] == 2
+    assert result["execution_receipt"]["status"] == "completed"
+    assert "2 tool call(s) ran" in result["execution_status"]["text"]
+    assert "3 tool call(s) ran" not in result["execution_status"]["text"]
 
     assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
     for assistant_msg in assistant_tool_calls:

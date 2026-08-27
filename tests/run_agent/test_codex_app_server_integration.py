@@ -84,6 +84,19 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_projected_tool_call_produces_completed_execution_receipt(self, fake_session):
+        """Projected app-server tool results are authoritative execution evidence."""
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("use a tool")
+
+        assert result["turn_execution_evidence"] == {
+            "tool_calls": [{"name": "exec_command", "call_id": "exec_1"}]
+        }
+        assert result["execution_receipt"]["status"] == "completed"
+        assert result["execution_receipt"]["tool_calls"] == 1
+        assert "1 tool call(s) ran" in result["execution_status"]["text"]
+
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()
         with patch.object(agent, "_spawn_background_review", return_value=None):

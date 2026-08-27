@@ -47,6 +47,13 @@ from tools.tool_result_storage import (
 
 logger = logging.getLogger(__name__)
 
+
+def _record_executed_tool_call(agent, name: str, call_id: str | None) -> None:
+    """Record a call only once execution has passed every blocking gate."""
+    evidence = getattr(agent, "_turn_execution_evidence", None)
+    if isinstance(evidence, dict):
+        evidence.setdefault("tool_calls", []).append({"name": name, "call_id": call_id})
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
@@ -300,6 +307,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
+        _record_executed_tool_call(agent, function_name, getattr(tool_call, "id", None))
         try:
             result = agent._invoke_tool(
                 function_name,
@@ -672,6 +680,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+
+        if not _execution_blocked:
+            _record_executed_tool_call(
+                agent, function_name, getattr(tool_call, "id", None)
+            )
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.

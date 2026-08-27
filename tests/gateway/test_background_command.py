@@ -5,6 +5,8 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+import concurrent.futures
+import contextvars
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -44,6 +46,17 @@ def _make_runner():
 
     from gateway.hooks import HookRegistry
     runner.hooks = HookRegistry()
+
+    async def _run_isolated(func, *args):
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            return await loop.run_in_executor(executor, ctx.run, func, *args)
+        finally:
+            executor.shutdown(wait=True)
+
+    runner._run_in_executor_with_context = _run_isolated
 
     return runner
 
@@ -266,6 +279,85 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("final_response", "interrupted", "expected_footer_count"),
+        [
+            ("Background work finished.", False, 1),
+            (
+                "Background work finished.\n\n"
+                "Execution status: completed; 1 tool call(s) ran and no managed "
+                "process remains active.",
+                False,
+                1,
+            ),
+            ("Background work was interrupted.", True, 0),
+        ],
+    )
+    async def test_execution_status_is_rendered_at_background_delivery_boundary(
+        self,
+        monkeypatch,
+        final_response,
+        interrupted,
+        expected_footer_count,
+    ):
+        """Background delivery uses the normal renderer without changing interrupts."""
+        from gateway import run as gateway_run
+
+        status_text = (
+            "Execution status: completed; 1 tool call(s) ran and no managed "
+            "process remains active."
+        )
+        result = {
+            "final_response": final_response,
+            "interrupted": interrupted,
+            "execution_receipt": {
+                "status": "completed",
+                "tool_calls": 1,
+                "active_processes": [],
+                "exited_processes": [],
+            },
+            "execution_status": {"status": "completed", "text": status_text},
+            "messages": [],
+        }
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._run_in_executor_with_context = AsyncMock(return_value=result)
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(
+            side_effect=lambda response: ([], response)
+        )
+        mock_adapter.extract_images = MagicMock(
+            side_effect=lambda response: ([], response)
+        )
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        await runner._run_background_task("do work", source, "bg_receipt")
+
+        delivered = mock_adapter.send.call_args.kwargs["content"]
+        assert delivered.count(status_text) == expected_footer_count
 
     @pytest.mark.asyncio
     async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(self, monkeypatch):

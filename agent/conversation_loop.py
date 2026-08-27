@@ -422,6 +422,10 @@ def run_conversation(
         persist_user_message = _sanitize_surrogates(persist_user_message)
 
     # Store stream callback for _interruptible_api_call to pick up
+    # Stable current-turn evidence survives message-list replacement during
+    # context compression. It is the source of truth for final receipts.
+    turn_execution_evidence: Dict[str, Any] = {"tool_calls": []}
+    agent._turn_execution_evidence = turn_execution_evidence
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
@@ -750,13 +754,15 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        result.setdefault("turn_execution_evidence", turn_execution_evidence)
+        return result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -4532,6 +4538,7 @@ def run_conversation(
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
+        "turn_execution_evidence": turn_execution_evidence,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

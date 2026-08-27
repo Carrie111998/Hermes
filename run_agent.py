@@ -4339,9 +4339,38 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Run a turn and attach its authoritative execution receipt."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        from agent.execution_receipt import finalize_execution_result
+        from tools.process_registry import process_registry
+
+        initial_session_ids = {
+            session.get("session_id")
+            # Snapshot globally so a task id resolved or changed inside the
+            # loop cannot make an older session look newly created.
+            for session in process_registry.list_sessions(task_id=None)
+            if session.get("session_id")
+        }
+        result = run_conversation(
+            self,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+        )
+        effective_task_id = getattr(self, "_current_task_id", None) or task_id
+        new_sessions = [
+            session
+            for session in process_registry.list_sessions(task_id=effective_task_id)
+            if session.get("session_id") not in initial_session_ids
+        ]
+        return finalize_execution_result(
+            result,
+            turn_evidence=result.get("turn_execution_evidence"),
+            process_sessions=new_sessions,
+        )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

@@ -12036,6 +12036,13 @@ class GatewayRunner:
 
             result = await self._run_in_executor_with_context(run_sync)
 
+            # Background tasks bypass the normal gateway run path, so apply
+            # the same delivery-boundary renderer before extracting content.
+            # The renderer is idempotent and preserves interrupted responses.
+            if result:
+                from agent.execution_receipt import attach_execution_status_for_delivery
+                attach_execution_status_for_delivery(result)
+
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
@@ -17416,6 +17423,12 @@ class GatewayRunner:
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = message
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                # The agent returns an authoritative structured receipt. Render
+                # it only at this delivery boundary so core callers retain the
+                # original model response while gateway streaming/non-streaming
+                # paths share the exact same final text.
+                from agent.execution_receipt import attach_execution_status_for_delivery
+                attach_execution_status_for_delivery(result)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -17469,6 +17482,8 @@ class GatewayRunner:
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "execution_receipt": result.get("execution_receipt"),
+                    "execution_status": result.get("execution_status"),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -17632,6 +17647,8 @@ class GatewayRunner:
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "execution_receipt": result.get("execution_receipt"),
+                "execution_status": result.get("execution_status"),
             }
         
         # Start progress message sender if enabled
@@ -18127,10 +18144,46 @@ class GatewayRunner:
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
+                    _receipt_rendered = bool(result.get("execution_status"))
+                    _receipt_finalized = False
+                    if _receipt_rendered and _sc and getattr(_sc, "message_id", None):
+                        try:
+                            _receipt_edit_result = await _sc.adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=_sc.message_id,
+                                content=result.get("final_response", ""),
+                                finalize=True,
+                            )
+                            _receipt_finalized = bool(
+                                _receipt_edit_result
+                                and getattr(_receipt_edit_result, "success", False)
+                            )
+                            if not _receipt_finalized:
+                                logger.warning(
+                                    "Failed to finalize streamed execution receipt for queued turn %s: %s",
+                                    session_key or "?",
+                                    getattr(
+                                        _receipt_edit_result,
+                                        "error",
+                                        "edit returned no successful delivery result",
+                                    ),
+                                )
+                        except Exception as _receipt_edit_err:
+                            logger.warning(
+                                "Failed to finalize streamed execution receipt for queued turn %s: %s",
+                                session_key or "?",
+                                _receipt_edit_err,
+                            )
                     _already_streamed = bool(
-                        (_sc and getattr(_sc, "final_response_sent", False))
-                        or _previewed
-                        or (_sc and getattr(_sc, "final_content_delivered", False))
+                        _receipt_finalized
+                        or (
+                            not _receipt_rendered
+                            and (
+                                (_sc and getattr(_sc, "final_response_sent", False))
+                                or _previewed
+                                or (_sc and getattr(_sc, "final_content_delivered", False))
+                            )
+                        )
                     )
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
@@ -18316,7 +18369,8 @@ class GatewayRunner:
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
-            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered):
+            _receipt_rendered = bool(response.get("execution_status"))
+            if not _is_empty_sentinel and not (_transformed or _receipt_rendered) and (_streamed or _previewed or _content_delivered):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -18325,23 +18379,34 @@ class GatewayRunner:
                     _content_delivered,
                 )
                 response["already_sent"] = True
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
+            elif not _is_empty_sentinel and (_transformed or _receipt_rendered) and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if _edit_result and getattr(_edit_result, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to edit streamed message for session %s: %s",
+                                session_key or "?",
+                                getattr(
+                                    _edit_result,
+                                    "error",
+                                    "edit returned no successful delivery result",
+                                ),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

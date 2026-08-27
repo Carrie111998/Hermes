@@ -2920,6 +2920,8 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
         assert result["final_response"] == "Done searching"
         assert result["api_calls"] == 2
+        assert result["execution_receipt"]["status"] == "completed"
+        assert result["execution_receipt"]["tool_calls"] == 1
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 

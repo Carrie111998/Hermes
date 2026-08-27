@@ -110,6 +110,28 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
+    # App-server tools execute outside Hermes' standard executor. Count only
+    # projected calls that have a matching projected tool result; a call-shaped
+    # assistant item alone is merely attempted, not authoritative evidence that
+    # Codex actually ran it.
+    completed_call_ids = {
+        message.get("tool_call_id")
+        for message in turn.projected_messages
+        if isinstance(message, dict) and message.get("role") == "tool"
+    }
+    executed_tool_calls = []
+    for message in turn.projected_messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict) or tool_call.get("id") not in completed_call_ids:
+                continue
+            function = tool_call.get("function") or {}
+            executed_tool_calls.append({
+                "name": function.get("name", ""),
+                "call_id": tool_call.get("id"),
+            })
+
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
     # in the run_conversation() pre-loop block (lines ~11793-11817) so we
@@ -170,6 +192,7 @@ def run_codex_app_server_turn(
         "error": turn.error,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        "turn_execution_evidence": {"tool_calls": executed_tool_calls},
     }
 
 

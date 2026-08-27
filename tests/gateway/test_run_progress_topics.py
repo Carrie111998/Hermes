@@ -1,6 +1,8 @@
 """Tests for topic-aware gateway progress updates."""
 
 import asyncio
+import contextvars
+import concurrent.futures
 import importlib
 import sys
 import time
@@ -112,6 +114,21 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
             }
         )
         return SendResult(success=True, message_id=message_id)
+
+
+class FailingMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=False, error="edit rejected")
 
 
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -242,6 +259,16 @@ def _make_runner(adapter):
         group_sessions_per_user=False,
         stt_enabled=False,
     )
+    async def _run_isolated(func, *args):
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            return await loop.run_in_executor(executor, ctx.run, func, *args)
+        finally:
+            executor.shutdown(wait=True)
+
+    runner._run_in_executor_with_context = _run_isolated
     return runner
 
 
@@ -620,6 +647,33 @@ class StreamingRefineAgent:
         }
 
 
+class StreamingReceiptAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        raw = "I’ll keep working and report back later."
+        if self.stream_delta_callback:
+            self.stream_delta_callback(raw)
+        status_text = (
+            "Execution status: not started; no tools ran and no managed process "
+            "was started this turn."
+        )
+        return {
+            "final_response": raw,
+            "execution_receipt": {
+                "status": "not_started",
+                "tool_calls": 0,
+                "active_processes": [],
+                "exited_processes": [],
+            },
+            "execution_status": {"status": "not_started", "text": status_text},
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -916,6 +970,106 @@ async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_pat
 
     assert result.get("already_sent") is True
     assert [call["content"] for call in adapter.sent] == ["You're welcome."]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_nonstreaming_propagates_execution_receipt(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingReceiptAgent,
+        session_id="sess-receipt-nonstreaming",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": False},
+        },
+    )
+
+    assert result["execution_receipt"]["status"] == "not_started"
+    assert result["execution_status"]["status"] == "not_started"
+    assert "Execution status: not started" in result["final_response"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_streaming_finalizes_authoritative_execution_status(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingReceiptAgent,
+        session_id="sess-receipt-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["execution_receipt"]["status"] == "not_started"
+    assert result.get("already_sent") is True
+    assert adapter.edits, "the raw streamed prose must be finalized authoritatively"
+    assert "Execution status: not started" in adapter.edits[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_streaming_failed_receipt_edit_does_not_suppress_fallback(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingReceiptAgent,
+        session_id="sess-receipt-streaming-edit-failed",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        adapter_cls=FailingMetadataEditProgressCaptureAdapter,
+    )
+
+    assert adapter.edits
+    assert result.get("already_sent") is not True
+    assert "Execution status: not started" in result["final_response"]
+
+
+@pytest.mark.asyncio
+async def test_queued_streaming_turn_finalizes_receipt_before_followup(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingReceiptAgent,
+        session_id="sess-receipt-streaming-queued",
+        pending_text="next question",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["execution_receipt"]["status"] == "not_started"
+    assert any("Execution status: not started" in edit["content"] for edit in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_queued_streaming_failed_receipt_edit_sends_authoritative_fallback(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingReceiptAgent,
+        session_id="sess-receipt-streaming-queued-edit-failed",
+        pending_text="next question",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        adapter_cls=FailingMetadataEditProgressCaptureAdapter,
+    )
+
+    authoritative = result["final_response"]
+    assert "Execution status: not started" in authoritative
+    assert any(call["content"] == authoritative for call in adapter.sent)
 
 
 @pytest.mark.asyncio
