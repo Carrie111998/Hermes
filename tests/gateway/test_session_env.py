@@ -155,6 +155,48 @@ def test_session_key_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_KEY") == ""
 
 
+@pytest.mark.asyncio
+async def test_set_session_env_includes_preloaded_session_cwd(tmp_path):
+    """A DB-loaded workspace is pinned before the tool context is set."""
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    session_key = "tg:-1001"
+    session_id = "sess-cwd"
+
+    class _AsyncDB:
+        async def get_session(self, sid):
+            return {"id": sid, "cwd": str(tmp_path)}
+
+    runner._session_db = _AsyncDB()
+    registered = []
+    runner._register_gateway_session_cwd = (
+        lambda task_id, cwd: registered.append((task_id, cwd))
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key=session_key,
+        session_id=session_id,
+    )
+
+    cwd = await runner._session_db_cwd(session_id)
+    runner._register_gateway_session_cwd(session_id, cwd)
+    context.cwd = cwd
+    tokens = runner._set_session_env(context)
+    try:
+        assert resolve_agent_cwd() == tmp_path
+        assert registered == [(session_id, str(tmp_path))]
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_session_key_no_race_condition_with_contextvars(monkeypatch):
     """Prove contextvars isolates SESSION_KEY across concurrent async tasks.
 

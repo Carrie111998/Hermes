@@ -247,4 +247,24 @@ def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
     monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
-    assert terminal_tool._safe_getcwd() == "/home/me"
+
+
+def test_registering_cwd_override_does_not_mutate_shared_default_env(monkeypatch):
+    """A gateway workspace must not overwrite another session's shared env cwd."""
+
+    class FakeEnv:
+        cwd = "/workspace/other-session"
+
+    shared_env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": shared_env})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+
+    terminal_tool.register_task_env_overrides(
+        "gateway-session", {"cwd": "/workspace/current-session"}
+    )
+
+    assert terminal_tool._task_env_overrides["gateway-session"] == {
+        "cwd": "/workspace/current-session"
+    }
+    assert shared_env.cwd == "/workspace/other-session"

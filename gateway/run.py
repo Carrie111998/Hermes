@@ -18256,6 +18256,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
 
+        if canonical == "workspace":
+            return await self._handle_workspace_command(event)
+
         if canonical == "compress":
             return await self._handle_compress_command(event)
 
@@ -19665,6 +19668,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+        session_cwd = await self._session_db_cwd(context.session_id)
+        if session_cwd:
+            self._register_gateway_session_cwd(context.session_id, session_cwd)
+        context.cwd = session_cwd
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -20479,7 +20486,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
+                                            _hyg_old_sid = session_entry.session_id
                                             session_entry.session_id = _hyg_new_sid
+                                            await self._carry_gateway_session_workspace(
+                                                _hyg_old_sid, _hyg_new_sid
+                                            )
                                             # The held turn lease follows the
                                             # rotation so an alias key resolving
                                             # the fresh child still serializes
@@ -20997,7 +21008,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 if session_entry.session_id == _run_start_session_id:
+                    _old_session_id = session_entry.session_id
                     session_entry.session_id = agent_result["session_id"]
+                    await self._carry_gateway_session_workspace(
+                        _old_session_id, session_entry.session_id
+                    )
                     # The held turn lease follows the rotation: the transcript
                     # persistence below writes to the NEW id, so the
                     # serialization boundary must move with it or an alias
@@ -25161,6 +25176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
+            cwd=getattr(context, "cwd", ""),
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",

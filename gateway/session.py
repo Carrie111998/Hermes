@@ -333,6 +333,7 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    cwd: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -346,6 +347,7 @@ class SessionContext:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "cwd": self.cwd,
         }
 
 

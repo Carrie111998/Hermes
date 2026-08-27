@@ -129,6 +129,124 @@ class GatewaySlashCommandsMixin:
     async_session_store: AsyncSessionStore
 
     def _typed_command_prefix_for(self, platform) -> str:
+        """Return the platform's usable typed slash-command prefix."""
+        adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
+        return (
+            getattr(adapter, "typed_command_prefix", "/")
+            if adapter is not None
+            else "/"
+        )
+
+    def _global_gateway_cwd(self) -> str:
+        raw = os.environ.get("TERMINAL_CWD", "").strip()
+        if raw:
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                return str(path.resolve())
+        try:
+            return str(Path.cwd().resolve())
+        except Exception:
+            return str(Path.home().resolve())
+
+    async def _session_db_workspace(self, session_id: str | None) -> dict[str, Any]:
+        if not session_id:
+            return {}
+        try:
+            db = getattr(self, "_session_db", None)
+            if db is None:
+                return {}
+            row = await db.get_session(session_id)
+        except Exception:
+            logger.debug("failed to load gateway session workspace", exc_info=True)
+            return {}
+        return row or {}
+
+    async def _session_db_cwd(self, session_id: str | None) -> str:
+        row = await self._session_db_workspace(session_id)
+        cwd = str(row.get("cwd") or "").strip()
+        if not cwd:
+            return ""
+        path = Path(cwd).expanduser()
+        try:
+            return str(path.resolve()) if path.is_dir() else ""
+        except OSError:
+            return ""
+
+    async def _effective_gateway_cwd(self, session_id: str | None = None) -> str:
+        return await self._session_db_cwd(session_id) or self._global_gateway_cwd()
+
+    async def _workspace_source_label(self, session_id: str | None = None) -> str:
+        return (
+            t("gateway.workspace.source_session")
+            if await self._session_db_cwd(session_id)
+            else t("gateway.workspace.source_global")
+        )
+
+    def _register_gateway_session_cwd(self, task_id: str, cwd: str) -> None:
+        if not task_id or not cwd:
+            return
+        try:
+            from tools.terminal_tool import register_task_env_overrides
+
+            register_task_env_overrides(task_id, {"cwd": cwd})
+        except Exception:
+            logger.debug("gateway workspace cwd registration skipped", exc_info=True)
+
+    def _clear_gateway_session_cwd(self, task_id: str) -> None:
+        if not task_id:
+            return
+        try:
+            from tools.terminal_tool import clear_task_env_overrides
+
+            clear_task_env_overrides(task_id)
+        except Exception:
+            logger.debug("gateway workspace cwd clear skipped", exc_info=True)
+
+    def _refresh_gateway_session_runtime(self, session_key: str, task_id: str) -> None:
+        self._evict_cached_agent(session_key)
+        if not task_id:
+            return
+        try:
+            from tools.terminal_tool import cleanup_vm
+
+            cleanup_vm(task_id)
+        except Exception:
+            logger.debug("gateway workspace terminal cleanup skipped", exc_info=True)
+
+    async def _carry_gateway_session_workspace(
+        self, old_session_id: str, new_session_id: str
+    ) -> None:
+        if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return
+        row = await self._session_db_workspace(old_session_id)
+        cwd = str(row.get("cwd") or "").strip()
+        if not cwd:
+            return
+        path = Path(cwd).expanduser()
+        try:
+            if not path.is_dir():
+                return
+            cwd = str(path.resolve())
+        except OSError:
+            return
+        try:
+            db = getattr(self, "_session_db", None)
+            if db is None:
+                return
+            await db.update_session_cwd(
+                new_session_id,
+                cwd,
+                git_branch=str(row.get("git_branch") or "").strip() or None,
+                git_repo_root=str(row.get("git_repo_root") or "").strip() or None,
+                replace_git_meta=True,
+            )
+        except Exception:
+            logger.debug("failed to carry gateway session workspace", exc_info=True)
+            return
+        self._register_gateway_session_cwd(new_session_id, cwd)
+        self._clear_gateway_session_cwd(old_session_id)
+
+
         """Return the prefix users can always type to reach Hermes commands.
 
         Reads the adapter's ``typed_command_prefix`` capability flag
@@ -3333,6 +3451,58 @@ class GatewaySlashCommandsMixin:
         platform_config.home_channel = home
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
+
+    async def _handle_workspace_command(self, event: MessageEvent) -> str:
+        """Handle /workspace and bind the current messaging session to a cwd."""
+        source = event.source
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        arg = event.get_command_args().strip()
+        global_cwd = self._global_gateway_cwd()
+
+        if not arg or arg.lower() in {"status", "show"}:
+            return t(
+                "gateway.workspace.status",
+                cwd=await self._effective_gateway_cwd(session_entry.session_id),
+                source=await self._workspace_source_label(session_entry.session_id),
+                global_cwd=global_cwd,
+            )
+
+        if arg.lower() in {"clear", "reset", "default"}:
+            db = getattr(self, "_session_db", None)
+            if db is None:
+                return t("gateway.workspace.save_failed", error="session database unavailable")
+            try:
+                await db.clear_session_workspace(session_entry.session_id)
+            except Exception as exc:
+                logger.warning("failed to clear gateway session workspace: %s", exc)
+                return t("gateway.workspace.save_failed", error=exc)
+            self._clear_gateway_session_cwd(session_entry.session_id)
+            self._refresh_gateway_session_runtime(session_key, session_entry.session_id)
+            return t("gateway.workspace.cleared", cwd=global_cwd)
+
+        path = Path(os.path.expanduser(arg))
+        if not path.is_absolute():
+            return t("gateway.workspace.relative_rejected")
+        try:
+            resolved = path.resolve()
+        except Exception as exc:
+            return t("gateway.workspace.invalid", path=arg, error=str(exc))
+        if not resolved.is_dir():
+            return t("gateway.workspace.not_dir", path=str(resolved))
+
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            return t("gateway.workspace.save_failed", error="session database unavailable")
+        cwd = str(resolved)
+        try:
+            await db.set_session_workspace(session_entry.session_id, cwd)
+        except Exception as exc:
+            logger.warning("failed to persist gateway session workspace: %s", exc)
+            return t("gateway.workspace.save_failed", error=exc)
+        self._register_gateway_session_cwd(session_entry.session_id, cwd)
+        self._refresh_gateway_session_runtime(session_key, session_entry.session_id)
+        return t("gateway.workspace.set", cwd=cwd)
 
     async def _handle_voice_command(self, event: MessageEvent) -> str:
         """Handle /voice [on|off|tts|channel|leave|status] command."""

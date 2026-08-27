@@ -5350,3 +5350,37 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+def test_clear_session_workspace_clears_all_workspace_metadata(db):
+    db.create_session(session_id="s-cwd", source="telegram", cwd="/tmp/project")
+    db.update_session_cwd(
+        "s-cwd",
+        "/tmp/project",
+        git_branch="feature/workspace",
+        git_repo_root="/tmp/project",
+    )
+
+    db.clear_session_workspace("s-cwd")
+
+    row = db.get_session("s-cwd")
+    assert row["cwd"] is None
+    assert row["git_branch"] is None
+    assert row["git_repo_root"] is None
+
+
+def test_set_session_workspace_replaces_stale_metadata(db):
+    db.create_session(session_id="s-cwd", source="telegram", cwd="/tmp/old")
+    db.update_session_cwd(
+        "s-cwd",
+        "/tmp/old",
+        git_branch="feature/old",
+        git_repo_root="/tmp/old",
+    )
+
+    db.set_session_workspace("s-cwd", "/tmp/new")
+
+    row = db.get_session("s-cwd")
+    assert row["cwd"] == "/tmp/new"
+    assert row["git_branch"] is None
+    assert row["git_repo_root"] is None
