@@ -3813,6 +3813,10 @@ def _get_channel_override(
 
     Looks up ``channel_overrides`` by ``chat_id``, then ``thread_id``, then
     ``parent_id`` (forum threads / child channels inherit the parent entry).
+    Finally falls back to a platform-wide ``"default"`` key when present, so an
+    operator can set one override for every channel on a platform (e.g. route
+    all Matrix DMs to a cheaper model) without enumerating each chat_id. A
+    specific chat_id/thread_id/parent_id entry always wins over ``"default"``.
     """
     platforms = getattr(config, "platforms", None)
     if not platforms:
@@ -3827,7 +3831,9 @@ def _get_channel_override(
         ov = overrides.get(key)
         if ov is not None:
             return ov
-    return None
+    # Platform-wide default (lowest priority): applies to any channel with no
+    # specific entry. Keyed literally by "default" in channel_overrides.
+    return overrides.get("default")
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:

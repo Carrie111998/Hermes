@@ -68,6 +68,61 @@ class TestGetChannelOverride:
         assert result is not None
         assert result.model == "topic-model"
 
+    def test_platform_wide_default_applies_when_no_specific_entry(self):
+        """A ``"default"`` key applies to any channel with no specific entry."""
+        config = GatewayConfig(
+            platforms={
+                Platform.MATRIX: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "default": ChannelOverride(
+                            model="stealth/ox-alpha", provider="openrouter"
+                        ),
+                    },
+                ),
+            },
+        )
+        result = _get_channel_override(config, Platform.MATRIX, "!unlisted:server")
+        assert result is not None
+        assert result.model == "stealth/ox-alpha"
+        assert result.provider == "openrouter"
+
+    def test_specific_entry_wins_over_platform_wide_default(self):
+        """A chat_id/thread_id/parent_id entry always beats ``"default"``."""
+        config = GatewayConfig(
+            platforms={
+                Platform.MATRIX: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "default": ChannelOverride(model="cheap-default"),
+                        "!vip:server": ChannelOverride(model="premium-model"),
+                    },
+                ),
+            },
+        )
+        # Specific chat_id hits its own entry, not "default".
+        specific = _get_channel_override(config, Platform.MATRIX, "!vip:server")
+        assert specific is not None
+        assert specific.model == "premium-model"
+        # An unlisted chat_id falls through to "default".
+        fallback = _get_channel_override(config, Platform.MATRIX, "!other:server")
+        assert fallback is not None
+        assert fallback.model == "cheap-default"
+
+    def test_no_default_key_still_returns_none(self):
+        """Without a ``"default"`` key, an unlisted channel returns None."""
+        config = GatewayConfig(
+            platforms={
+                Platform.MATRIX: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "!vip:server": ChannelOverride(model="premium-model"),
+                    },
+                ),
+            },
+        )
+        assert _get_channel_override(config, Platform.MATRIX, "!other:server") is None
+
 
 class TestResolveModelForChannel:
     def test_uses_channel_override_when_present(self):
