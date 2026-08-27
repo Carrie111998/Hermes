@@ -145,8 +145,6 @@ def _mock_aiohttp_download(raw_bytes: bytes):
     resp = AsyncMock()
     resp.status = 200
     resp.read = AsyncMock(return_value=raw_bytes)
-    resp.content = MagicMock()
-    resp.content.read = AsyncMock(return_value=raw_bytes)
     resp.__aenter__ = AsyncMock(return_value=resp)
     resp.__aexit__ = AsyncMock(return_value=False)
 
@@ -262,8 +260,6 @@ class TestIncomingDocumentHandling:
                     resp = AsyncMock()
                     resp.status = 200
                     resp.read = AsyncMock(return_value=data)
-                    resp.content = MagicMock()
-                    resp.content.read = AsyncMock(return_value=data)
                     resp.__aenter__ = AsyncMock(return_value=resp)
                     resp.__aexit__ = AsyncMock(return_value=False)
                     return resp

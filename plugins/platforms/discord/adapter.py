@@ -8063,9 +8063,7 @@ class DiscordAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}")
-                return await _read_response_bytes_bounded(
-                    resp, _DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES
-                )
+                return await resp.read()
 
     async def _handle_message(
         self,
@@ -9873,7 +9871,6 @@ _DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES = 1 * 1024 * 1024
 _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # generous limit for images/animations
-_DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024  # generous for file attachments
 
 
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
@@ -9881,14 +9878,56 @@ def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
 
 
 async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
-    """Read at most *limit_bytes* from an aiohttp response, raising on overflow."""
-    data = await resp.content.read(limit_bytes + 1)
-    if len(data) > limit_bytes:
-        resp.close()
+    """Read an aiohttp response body with an aggregate byte limit."""
+    headers = getattr(resp, "headers", {}) or {}
+    declared_length = None
+    for header_name in ("Content-Length", "content-length"):
+        try:
+            raw_length = headers.get(header_name)
+        except (AttributeError, TypeError):
+            raw_length = None
+        if raw_length is not None:
+            try:
+                if isinstance(raw_length, (str, bytes, bytearray, int)):
+                    declared_length = int(raw_length)
+            except (TypeError, ValueError):
+                pass
+            break
+
+    def close_response() -> None:
+        for method_name in ("close", "release"):
+            method = getattr(resp, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method()
+            except Exception:
+                pass
+            break
+
+    if declared_length is not None and declared_length > limit_bytes:
+        close_response()
         raise ValueError(
-            f"Response body exceeded {limit_bytes} bytes ({len(data)} bytes read)"
+            f"Response body exceeded {limit_bytes} bytes "
+            f"({declared_length} bytes declared)"
         )
-    return data
+
+    chunks = []
+    total_bytes = 0
+    while True:
+        chunk = await resp.content.read(limit_bytes - total_bytes + 1)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > limit_bytes:
+            close_response()
+            raise ValueError(
+                f"Response body exceeded {limit_bytes} bytes "
+                f"({total_bytes} bytes read)"
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
 
 
 def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:

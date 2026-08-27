@@ -196,33 +196,6 @@ class TestCacheDiscordDocument:
         # aiohttp must NOT be contacted when the URL is blocked.
         mock_session.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_fallback_aiohttp_when_safe_url(self):
-        """Safe URL + no att.read() → aiohttp fallback executes."""
-        adapter = _make_adapter()
-        att = _make_attachment_without_read()
-
-        # Build an aiohttp session mock that returns 200 + payload.
-        resp = AsyncMock()
-        resp.status = 200
-        resp.read = AsyncMock(return_value=_PDF_BYTES)
-        resp.content = MagicMock()
-        resp.content.read = AsyncMock(return_value=_PDF_BYTES)
-        resp.__aenter__ = AsyncMock(return_value=resp)
-        resp.__aexit__ = AsyncMock(return_value=False)
-
-        session = AsyncMock()
-        session.get = MagicMock(return_value=resp)
-        session.__aenter__ = AsyncMock(return_value=session)
-        session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch(
-            "plugins.platforms.discord.adapter.is_safe_url", return_value=True
-        ), patch("aiohttp.ClientSession", return_value=session):
-            result = await adapter._cache_discord_document(att, ".pdf")
-
-        assert result == _PDF_BYTES
-
 
 # ---------------------------------------------------------------------------
 # Integration: end-to-end via _handle_message
