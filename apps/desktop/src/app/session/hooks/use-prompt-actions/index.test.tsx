@@ -14,6 +14,7 @@ import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import { $readOnlyStoredTranscripts, markStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $busy,
   $connection,
@@ -44,6 +45,7 @@ beforeEach(() => {
   window.localStorage.removeItem('hermes.desktop.composerQueue.v1')
   window.localStorage.removeItem('hermes.desktop.composerQueueParks.v1')
   $queuedPromptsBySession.set({})
+  $readOnlyStoredTranscripts.set(new Set())
 })
 
 vi.mock('@/hermes', () => ({
@@ -420,6 +422,48 @@ describe('usePromptActions fresh-session composer handoff', () => {
 
     expect(onSessionCreatedForSend).toHaveBeenCalledOnce()
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+})
+
+describe('usePromptActions read-only exact-owner gate', () => {
+  afterEach(cleanup)
+
+  it('blocks the exact read-only owner without treating a duplicate owner as read-only', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const sharedStoredId = 'stored-shared-read-only'
+    const requestGateway = vi.fn(async () => ({ accepted: true }) as never)
+
+    markStoredTranscriptReadOnly(sharedStoredId, ownerA)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async () => ({ accepted: true }) as never)
+
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId="runtime-shared"
+        onReady={next => (handle = next)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={sharedStoredId}
+      />
+    )
+
+    await expect(
+      handle!.submitText('must stay blocked on owner A', {
+        composerStorageScope: encodeComposerStorageScopeKey(ownerA, sharedStoredId),
+        sessionId: 'runtime-shared',
+        storedSessionId: sharedStoredId
+      })
+    ).resolves.toBe(false)
+
+    await expect(
+      handle!.submitText('owner B remains live', {
+        composerStorageScope: encodeComposerStorageScopeKey(ownerB, sharedStoredId),
+        sessionId: 'runtime-shared',
+        storedSessionId: sharedStoredId
+      })
+    ).resolves.toBe(true)
   })
 })
 

@@ -293,6 +293,9 @@ export function useSessionTileDelegate({
 
         const ownerIdentity = coordinationIdentity(storedSessionId, owner)
 
+        const readOnlyOwnerRoute =
+          typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+
         const restScope =
           owner && typeof owner === 'object'
             ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
@@ -340,13 +343,14 @@ export function useSessionTileDelegate({
             }
 
             return stored
-          }
+          },
+          readOnlyOwnerRoute
         )
 
         const prefetch = await prefetchPromise
 
         if (outcome.mode === 'read-only') {
-          const readOnlyId = readOnlyRuntimeIdFor(storedSessionId)
+          const readOnlyId = readOnlyRuntimeIdFor(storedSessionId, readOnlyOwnerRoute)
 
           updateSessionState(
             readOnlyId,

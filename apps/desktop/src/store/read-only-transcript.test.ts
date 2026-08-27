@@ -105,6 +105,30 @@ describe('read-only stored-transcript resume (#94724 no-owner recovery)', () => 
     expect(isStoredTranscriptReadOnly('legacy-3')).toBe(false)
   })
 
+  it('records fallback state only for the exact owner supplied to the resume wrapper', async () => {
+    $connectionsRegistry.set(registry('source-a', 'source-b'))
+    $profiles.set([{ name: 'worker' }] as never)
+
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+
+    const outcome = await resumeWithStoredTranscriptFallback(
+      'shared-wrapper',
+      async () => {
+        assertSessionOwnerResolved(undefined, { method: 'session.resume', sessionId: 'shared-wrapper' })
+
+        return { session_id: 'never' }
+      },
+      async () => ({ messages: [] }),
+      ownerA
+    )
+
+    expect(outcome.mode).toBe('read-only')
+    expect(isStoredTranscriptReadOnly('shared-wrapper', ownerA)).toBe(true)
+    expect(isStoredTranscriptReadOnly('shared-wrapper', ownerB)).toBe(false)
+    expect(isStoredTranscriptReadOnly('shared-wrapper')).toBe(false)
+  })
+
   it('rethrows the ORIGINAL owner error when even the stored read fails', async () => {
     $connectionsRegistry.set(registry('gw-a', 'gw-b'))
     $profiles.set([{ name: 'default' }, { name: 'researcher' }] as never)
@@ -137,5 +161,22 @@ describe('read-only stored-transcript resume (#94724 no-owner recovery)', () => 
     expect(isStoredTranscriptReadOnly('stored-9')).toBe(true)
     clearStoredTranscriptReadOnly('stored-9')
     expect(isStoredTranscriptReadOnly('stored-9')).toBe(false)
+  })
+
+  it('isolates read-only latches and synthetic runtimes for duplicate exact owners', () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+
+    markStoredTranscriptReadOnly('shared', ownerA)
+
+    expect(isStoredTranscriptReadOnly('shared', ownerA)).toBe(true)
+    expect(isStoredTranscriptReadOnly('shared', ownerB)).toBe(false)
+    expect(readOnlyRuntimeIdFor('shared', ownerA)).not.toBe(readOnlyRuntimeIdFor('shared', ownerB))
+
+    clearStoredTranscriptReadOnly('shared', ownerB)
+    expect(isStoredTranscriptReadOnly('shared', ownerA)).toBe(true)
+
+    clearStoredTranscriptReadOnly('shared', ownerA)
+    expect(isStoredTranscriptReadOnly('shared', ownerA)).toBe(false)
   })
 })

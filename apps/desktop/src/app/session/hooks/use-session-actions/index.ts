@@ -1708,7 +1708,7 @@ export function useSessionActions({
         // A live resume proves the owner routed — retire any read-only latch
         // a previous no-owner open left behind (#94724: the backfill stamped
         // the row, or a topology change made the owner resolvable again).
-        clearStoredTranscriptReadOnly(storedSessionId)
+        clearStoredTranscriptReadOnly(storedSessionId, coordinationOwner ?? undefined)
         const pendingApproval = restorePendingApproval(resumed, resumed.session_id)
         const pendingClarifyState = restorePendingClarifyFromSnapshot(resumed, resumed.session_id, resumeStartedAt)
         const pendingClarify = pendingClarifyState.request
@@ -1879,7 +1879,7 @@ export function useSessionActions({
           }
 
           if (painted) {
-            markStoredTranscriptReadOnly(storedSessionId)
+            markStoredTranscriptReadOnly(storedSessionId, coordinationOwner ?? undefined)
             notify({
               kind: 'info',
               title: copy.readOnlyTranscriptTitle,

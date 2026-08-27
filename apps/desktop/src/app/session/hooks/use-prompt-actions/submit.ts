@@ -234,11 +234,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // to another chat.
       let targetStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
 
+      const submittedStorageScopeKey = options?.composerStorageScope
+
+      const submittedStorageScope = submittedStorageScopeKey
+        ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
+        : null
+
+      const submittedOwnerRoute = submittedStorageScope?.format === 'canonical' ? submittedStorageScope.owner : undefined
+
       // A read-only stored-transcript open (#94724: owner unresolvable under
       // registry topology) has no routable live runtime — refuse the send
       // with the explanation rather than minting a prompt on a backend that
       // never owned the session.
-      if (isStoredTranscriptReadOnly(targetStoredSessionId)) {
+      if (isStoredTranscriptReadOnly(targetStoredSessionId, submittedOwnerRoute)) {
         notify({ kind: 'info', message: copy.readOnlyTranscriptSendBlocked })
 
         return false
@@ -256,12 +264,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const isBackgroundQueueDrain = Boolean(
         options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
       )
-
-      const submittedStorageScopeKey = options?.composerStorageScope
-
-      const submittedStorageScope = submittedStorageScopeKey
-        ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
-        : null
 
       let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
 

@@ -17,16 +17,24 @@
  */
 import { atom } from 'nanostores'
 
+import { ownerQualifiedSessionIdentity } from '@/lib/session-row-identity'
+
 import type { SessionOwnerResolutionError } from './session-owner-resolution'
 import { isSessionOwnerResolutionError } from './session-owner-resolution'
+import type { SessionOwnerRoute } from './session-request-router'
 
 /** Stored session ids currently open as read-only stored transcripts. The
  *  composer/submit surfaces consult this to refuse writes into a session
  *  that has no routable live runtime. */
 export const $readOnlyStoredTranscripts = atom<ReadonlySet<string>>(new Set())
 
-export function markStoredTranscriptReadOnly(storedSessionId: string): void {
-  const id = storedSessionId.trim()
+const readOnlyTranscriptIdentity = (storedSessionId: string, ownerRoute?: SessionOwnerRoute): string =>
+  ownerRoute
+    ? ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedSessionId.trim())
+    : storedSessionId.trim()
+
+export function markStoredTranscriptReadOnly(storedSessionId: string, ownerRoute?: SessionOwnerRoute): void {
+  const id = readOnlyTranscriptIdentity(storedSessionId, ownerRoute)
 
   if (!id || $readOnlyStoredTranscripts.get().has(id)) {
     return
@@ -35,8 +43,8 @@ export function markStoredTranscriptReadOnly(storedSessionId: string): void {
   $readOnlyStoredTranscripts.set(new Set([...$readOnlyStoredTranscripts.get(), id]))
 }
 
-export function clearStoredTranscriptReadOnly(storedSessionId: string): void {
-  const id = storedSessionId.trim()
+export function clearStoredTranscriptReadOnly(storedSessionId: string, ownerRoute?: SessionOwnerRoute): void {
+  const id = readOnlyTranscriptIdentity(storedSessionId, ownerRoute)
 
   if (!id || !$readOnlyStoredTranscripts.get().has(id)) {
     return
@@ -48,8 +56,13 @@ export function clearStoredTranscriptReadOnly(storedSessionId: string): void {
   $readOnlyStoredTranscripts.set(next)
 }
 
-export function isStoredTranscriptReadOnly(storedSessionId: null | string | undefined): boolean {
-  return Boolean(storedSessionId && $readOnlyStoredTranscripts.get().has(storedSessionId.trim()))
+export function isStoredTranscriptReadOnly(
+  storedSessionId: null | string | undefined,
+  ownerRoute?: SessionOwnerRoute
+): boolean {
+  return Boolean(
+    storedSessionId && $readOnlyStoredTranscripts.get().has(readOnlyTranscriptIdentity(storedSessionId, ownerRoute))
+  )
 }
 
 /** Synthetic runtime-id namespace for read-only tiles: a stored transcript
@@ -58,8 +71,8 @@ export function isStoredTranscriptReadOnly(storedSessionId: null | string | unde
  *  gateway runtime id. */
 export const READ_ONLY_RUNTIME_ID_PREFIX = 'read-only:'
 
-export function readOnlyRuntimeIdFor(storedSessionId: string): string {
-  return `${READ_ONLY_RUNTIME_ID_PREFIX}${storedSessionId}`
+export function readOnlyRuntimeIdFor(storedSessionId: string, ownerRoute?: SessionOwnerRoute): string {
+  return `${READ_ONLY_RUNTIME_ID_PREFIX}${readOnlyTranscriptIdentity(storedSessionId, ownerRoute)}`
 }
 
 export function isReadOnlyRuntimeId(runtimeId: null | string | undefined): boolean {
@@ -84,14 +97,15 @@ export type StoredTranscriptResumeOutcome<TResumed, TTranscript> =
 export async function resumeWithStoredTranscriptFallback<TResumed, TTranscript>(
   storedSessionId: string,
   resume: () => Promise<TResumed>,
-  fetchStoredTranscript: () => Promise<TTranscript>
+  fetchStoredTranscript: () => Promise<TTranscript>,
+  ownerRoute?: SessionOwnerRoute
 ): Promise<StoredTranscriptResumeOutcome<TResumed, TTranscript>> {
   try {
     const resumed = await resume()
 
     // A live resume proves the owner is routable again (the backfill stamped
     // the row, or a topology change resolved it) — drop the read-only latch.
-    clearStoredTranscriptReadOnly(storedSessionId)
+    clearStoredTranscriptReadOnly(storedSessionId, ownerRoute)
 
     return { mode: 'live', resumed }
   } catch (error) {
@@ -107,7 +121,7 @@ export async function resumeWithStoredTranscriptFallback<TResumed, TTranscript>(
       throw error
     }
 
-    markStoredTranscriptReadOnly(storedSessionId)
+    markStoredTranscriptReadOnly(storedSessionId, ownerRoute)
 
     return { error, mode: 'read-only', transcript }
   }
