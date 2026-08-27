@@ -241,6 +241,7 @@ $GAPI drive create-folder "Q4" --parent FOLDER_ID
 
 # Move — preview is the default and never writes. After explicit confirmation,
 # repeat with --execute. Cross-drive moves require separate confirmation.
+# Folder self/descendant moves and unexpected multi-parent state fail safely.
 $GAPI drive move FILE_ID --to FOLDER_ID
 $GAPI drive move FILE_ID --to FOLDER_ID --execute
 $GAPI drive move FILE_ID --to FOLDER_ID --execute --allow-cross-drive

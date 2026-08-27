@@ -610,6 +610,7 @@ def drive_get(args):
 
 _DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 _DRIVE_MOVE_FIELDS = "id, name, mimeType, parents, driveId, webViewLink"
+_DRIVE_MOVE_MAX_PARENT_HOPS = 100
 
 
 def _drive_move_get(file_id: str) -> dict:
@@ -630,30 +631,84 @@ def _drive_move_duplicates(name: str, destination_id: str, moving_file_id: str) 
     params = {
         "q": f"'{escaped_parent}' in parents and name = '{escaped_name}' and trashed = false",
         "pageSize": 100,
-        "fields": "files(id, name, mimeType, webViewLink)",
+        "fields": "nextPageToken, files(id, name, mimeType, webViewLink)",
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
     }
-    if _gws_binary():
-        result = _run_gws(["drive", "files", "list"], params=params)
-    else:
-        service = build_service("drive", "v3")
-        result = service.files().list(**params).execute()
-    return [item for item in result.get("files", []) if item.get("id") != moving_file_id]
+    use_gws = bool(_gws_binary())
+    service = None if use_gws else build_service("drive", "v3")
+    files = []
+    while True:
+        if use_gws:
+            result = _run_gws(["drive", "files", "list"], params=params)
+        else:
+            assert service is not None
+            result = service.files().list(**params).execute()
+        files.extend(result.get("files", []))
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+        params = {**params, "pageToken": page_token}
+
+    duplicates = []
+    seen_ids = set()
+    for item in files:
+        item_id = item.get("id")
+        if item_id == moving_file_id or item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        duplicates.append(item)
+    return duplicates
 
 
 def _drive_move_update(file_id: str, destination_id: str, current_parents: list[str]) -> dict:
     params = {
         "fileId": file_id,
         "addParents": destination_id,
-        "removeParents": ",".join(current_parents),
         "supportsAllDrives": True,
         "fields": _DRIVE_MOVE_FIELDS,
     }
+    if current_parents:
+        params["removeParents"] = ",".join(current_parents)
     if _gws_binary():
         return _run_gws(["drive", "files", "update"], params=params)
     service = build_service("drive", "v3")
     return service.files().update(**params).execute()
+
+
+def _drive_move_reject_descendant(source_id: str, destination: dict) -> None:
+    """Reject moving a folder beneath itself without following ancestry forever."""
+    current = destination
+    seen: set[str] = set()
+    parent_hops = 0
+    while True:
+        current_id = current.get("id")
+        if current_id in seen:
+            raise SystemExit("ERROR: Drive folder ancestry contains a cycle; manual handling is required.")
+        if current_id:
+            seen.add(current_id)
+
+        parents = list(current.get("parents") or [])
+        if not parents:
+            return
+        if len(parents) > 1:
+            raise SystemExit(
+                "ERROR: Drive folder ancestry contains multiple parents; "
+                "manual handling is required."
+            )
+        parent_id = parents[0]
+        if parent_id == source_id:
+            raise SystemExit("ERROR: A folder cannot be moved into its descendant.")
+        if parent_id in seen:
+            raise SystemExit("ERROR: Drive folder ancestry contains a cycle; manual handling is required.")
+
+        parent_hops += 1
+        if parent_hops > _DRIVE_MOVE_MAX_PARENT_HOPS:
+            raise SystemExit(
+                "ERROR: Drive folder ancestry exceeded the safe traversal limit; "
+                "manual handling is required."
+            )
+        current = _drive_move_get(parent_id)
 
 
 def drive_move(args):
@@ -667,6 +722,11 @@ def drive_move(args):
         raise SystemExit("ERROR: The destination ID is not a Google Drive folder.")
 
     current_parents = list(source.get("parents") or [])
+    if len(current_parents) > 1:
+        raise SystemExit(
+            "ERROR: Drive returned multiple current parents for this item. "
+            "Drive v3 supports a single parent; manual handling is required."
+        )
     if current_parents == [args.destination_id]:
         print(json.dumps({
             "status": "unchanged",
@@ -675,6 +735,9 @@ def drive_move(args):
             "parent": {"id": destination.get("id", args.destination_id), "name": destination.get("name", "")},
         }, indent=2, ensure_ascii=False))
         return
+
+    if source.get("mimeType") == _DRIVE_FOLDER_MIME:
+        _drive_move_reject_descendant(args.file_id, destination)
 
     duplicates = _drive_move_duplicates(
         source.get("name", ""), args.destination_id, args.file_id
