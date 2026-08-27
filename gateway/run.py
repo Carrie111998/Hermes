@@ -25845,6 +25845,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         return "deliver"
 
+    def _defer_unroutable_durable_raw_completion(self, evt: dict) -> bool:
+        """Leave a durable raw-session wake pending until transport exists."""
+        if evt.get("type") != "async_delegation":
+            return False
+        delegation_id = str(evt.get("delegation_id") or "")
+        raw_sid = _raw_watch_session_id(evt)
+        if (
+            not delegation_id
+            or not raw_sid
+            or self.adapters.get(Platform.API_SERVER) is not None
+        ):
+            return False
+        logger.warning(
+            "Deferring watch notification for raw session %s: no api_server "
+            "adapter is available; durable completion %s remains pending for "
+            "a future gateway start",
+            raw_sid,
+            delegation_id,
+        )
+        return True
+
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -25861,23 +25882,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
-            raw_sid = _raw_watch_session_id(evt)
-            if (
-                durable_delegation_id
-                and raw_sid
-                and self.adapters.get(Platform.API_SERVER) is None
-            ):
-                # No transport exists in this gateway lifecycle for this raw
-                # session. Leave the durable row untouched so startup restore
-                # can re-arm it in a future lifecycle without burning the
-                # bounded delivery-failure budget on an attempt never made.
-                logger.warning(
-                    "Deferring watch notification for raw session %s: no "
-                    "api_server adapter is available; durable completion %s "
-                    "remains pending for a future gateway start",
-                    raw_sid,
-                    durable_delegation_id,
-                )
+            if self._defer_unroutable_durable_raw_completion(evt):
                 return None
             if durable_delegation_id:
                 try:
@@ -26300,6 +26305,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             deliverable.append((evt, synth_text))
 
         if not deliverable:
+            return None
+        # Preflight the whole group before claiming any sibling. A missing raw
+        # session transport is shared by the route, so no durable row in this
+        # batch has made a delivery attempt yet.
+        if any(
+            self._defer_unroutable_durable_raw_completion(evt)
+            for evt, _synth_text in deliverable
+        ):
             return None
         if len(deliverable) == 1:
             evt, synth_text = deliverable[0]
