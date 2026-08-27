@@ -7720,9 +7720,10 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
         # receive a non-functional client on the next cache hit.
         return
     with _client_cache_lock:
-        old_entry = _client_cache.get(cache_key)
-        if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
+        # Cache lookups hand the raw client to callers without a usage lease,
+        # so a displaced entry may still own an in-flight request.  Replacing
+        # the cache reference is safe; closing the old transport here is not.
+        # Its remaining callers retain it until their requests complete.
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
