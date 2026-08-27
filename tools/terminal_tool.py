@@ -1137,9 +1137,9 @@ NEVER pipe a build/test command through tail/head/cat (e.g. `cargo build | tail 
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); pair with notify_on_complete=true for bounded tasks, leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — background=true is how Hermes tracks the process. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Background: set background=true (returns a session_id); pair with notify_on_complete=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
-PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+PTY: set pty=true for interactive CLIs (they hang without it); local backend only.
 """
 
 # Global state for environment lifecycle management
@@ -4119,7 +4119,7 @@ TERMINAL_SCHEMA = {
             },
             "pty": {
                 "type": "boolean",
-                "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
+                "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Local backend only. Default: false.",
                 "default": False
             },
             "notify_on_complete": {
