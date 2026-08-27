@@ -35,7 +35,9 @@ export function createReadTools(deps) {
   async function evalBounded(expression) {
     const c = await connect()
     const out = await c.eval(expression)
-    const s = typeof out === 'string' ? out : JSON.stringify(out)
+    // A2: JSON.stringify(undefined) is undefined (not a string) — a renderer
+    // expression returning undefined must not crash the tool call.
+    const s = typeof out === 'string' ? out : JSON.stringify(out) ?? 'null'
     if (s.length <= MAX_EVAL) return s
     const cut = s.length - MAX_EVAL
     return s.slice(0, MAX_EVAL) + `…[+${cut} chars truncated]`

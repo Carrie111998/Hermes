@@ -46,3 +46,8 @@ test('#10: evalBounded truncation reports the omitted length', async () => {
   assert.ok(out.startsWith('x'.repeat(4000).slice(0, 10)), 'starts with the kept prefix')
   assert.ok(/\[\+1000 chars truncated\]/.test(out), 'must report how many chars were cut, got: ' + out.slice(-40))
 })
+
+test('A2 (RED): evalBounded returns "null" when the renderer eval is undefined', async () => {
+  const { evalBounded } = deps(undefined)
+  assert.equal(await evalBounded('void 0'), 'null')
+})
