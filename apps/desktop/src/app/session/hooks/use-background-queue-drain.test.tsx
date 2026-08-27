@@ -105,8 +105,9 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => {
       expect(submitText).toHaveBeenCalledWith('continue in the background', {
         attachments: [],
+        composerStorageScope: storageKey('stored-session-a'),
         fromQueue: true,
-        sessionId: 'rt-session-a',
+        sessionId: null,
         storedSessionId: 'stored-session-a'
       })
     })
@@ -140,8 +141,9 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() =>
       expect(submitText).toHaveBeenCalledWith('follow the live handoff', {
         attachments: [],
+        composerStorageScope: liveKey,
         fromQueue: true,
-        sessionId: 'rt-live',
+        sessionId: null,
         storedSessionId: 'stored-live'
       })
     )
@@ -164,12 +166,33 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => expect(submitText).toHaveBeenCalledOnce())
     expect(submitText).toHaveBeenCalledWith('local owner turn', {
       attachments: [],
+      composerStorageScope: localKey,
       fromQueue: true,
-      sessionId: 'rt-local-shared',
+      sessionId: null,
       storedSessionId: 'stored-shared'
     })
     expect(getQueuedPrompts(localKey)).toHaveLength(0)
     expect(getQueuedPrompts(foreignKey)).toHaveLength(1)
+  })
+
+  it('never trusts an ambiguous raw runtime binding for an exact owner queue', async () => {
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const ownerBKey = encodeComposerStorageScopeKey(ownerB, 'stored-shared')
+    const runtimeMap = { current: new Map([['stored-shared', 'rt-owner-a']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt(ownerBKey, { text: 'owner B background turn', attachments: [] })
+
+    render(<Harness owner={ownerB} runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(submitText).toHaveBeenCalledOnce())
+    expect(submitText).toHaveBeenCalledWith('owner B background turn', {
+      attachments: [],
+      composerStorageScope: ownerBKey,
+      fromQueue: true,
+      sessionId: null,
+      storedSessionId: 'stored-shared'
+    })
   })
 
   it('never resolves a claimed local entry by a duplicate foreign entry id', async () => {
@@ -192,8 +215,9 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => expect(submitText).toHaveBeenCalledOnce())
     expect(submitText).toHaveBeenCalledWith('local turn', {
       attachments: [],
+      composerStorageScope: localKey,
       fromQueue: true,
-      sessionId: 'rt-local-shared',
+      sessionId: null,
       storedSessionId: 'stored-shared'
     })
     expect(getQueuedPrompts(foreignKey)).toHaveLength(1)
@@ -294,6 +318,7 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => {
       expect(submitText).toHaveBeenCalledWith('resume then send', {
         attachments: [],
+        composerStorageScope: storageKey('stored-session-a'),
         fromQueue: true,
         sessionId: null,
         storedSessionId: 'stored-session-a'

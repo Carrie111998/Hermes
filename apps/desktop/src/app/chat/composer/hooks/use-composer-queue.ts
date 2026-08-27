@@ -28,6 +28,7 @@ import {
   isComposerQueueDrainExcluded
 } from '@/store/composer-queue-drain'
 import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
+import { resolveComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { notify } from '@/store/notifications'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
@@ -237,7 +238,8 @@ export function useComposerQueue({
         return false
       }
 
-      const liveEntry = getLatestQueuedPrompts(drainQueueSessionKey).find(candidate => candidate.id === entry.id)
+      const liveQueueSessionKey = resolveComposerStorageScopeKey(drainQueueSessionKey)
+      const liveEntry = getLatestQueuedPrompts(liveQueueSessionKey).find(candidate => candidate.id === entry.id)
 
       if (!liveEntry) {
         finishComposerQueueDrain(drain)
@@ -251,6 +253,7 @@ export function useComposerQueue({
         const accepted = await Promise.resolve(
           onSubmit(liveEntry.text, {
             attachments: liveEntry.attachments,
+            composerStorageScope: liveQueueSessionKey,
             ...(liveEntry.displayText ? { displayText: liveEntry.displayText } : {}),
             fromQueue: true,
             sessionId: drainRuntimeSessionId,

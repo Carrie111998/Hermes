@@ -142,7 +142,10 @@ describe('useComposerQueue park integration', () => {
     })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
-    expect(onSubmit.mock.calls[0]?.[1]?.storedSessionId).toBe('stored-1')
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({
+      composerStorageScope: qualifiedKey,
+      storedSessionId: 'stored-1'
+    })
     expect(getQueuedPrompts(qualifiedKey)).toHaveLength(0)
   })
 

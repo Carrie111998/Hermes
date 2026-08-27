@@ -48,7 +48,6 @@ const BACKGROUND_DRAIN_RETRY_MS = 750
 export function useBackgroundQueueDrain({
   enabled,
   owner,
-  runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   submitText
 }: BackgroundQueueDrainOptions) {
@@ -118,7 +117,6 @@ export function useBackgroundQueueDrain({
       void (async () => {
         let acceptedEntry: QueuedPromptEntry | null = null
         let failed = false
-        let runtimeSessionId: string | null = null
 
         try {
           // A migration can hand the lock to another qualified key before this
@@ -139,15 +137,12 @@ export function useBackgroundQueueDrain({
 
           const liveStoredSessionId = liveTarget.storedSessionId
 
-          runtimeSessionId = liveStoredSessionId
-            ? (runtimeIdByStoredSessionIdRef.current.get(liveStoredSessionId) ?? null)
-            : null
-
           const accepted = await Promise.resolve(
             submitTextRef.current(liveEntry.text, {
               attachments: liveEntry.attachments,
+              composerStorageScope: liveScopeKey,
               fromQueue: true,
-              sessionId: runtimeSessionId,
+              sessionId: null,
               storedSessionId: liveStoredSessionId
             })
           )
@@ -167,14 +162,14 @@ export function useBackgroundQueueDrain({
           if (acceptedEntry) {
             drainFailuresRef.current.delete(acceptedEntry.id)
             removeQueuedPrompt(settledKey, acceptedEntry.id)
-            resetBrowseState(runtimeSessionId)
+            resetBrowseState(null)
           } else if (failed) {
             onFail()
           }
         }
       })()
     },
-    [runtimeIdByStoredSessionIdRef, scheduleRetry, t]
+    [scheduleRetry, t]
   )
 
   useEffect(() => {
