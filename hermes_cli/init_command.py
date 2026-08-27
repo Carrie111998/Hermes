@@ -130,15 +130,68 @@ def build_init_prompt(
     return "\n".join(parts)
 
 
-def build_init_prompt_for_cwd(cwd: str | None = None, extra: str = "") -> str:
-    """Convenience wrapper used by the dispatch surfaces.
+def _resolve_session_cwd(session_key: str | None) -> str:
+    """The session's ACTIVE directory — where /init should scan and write.
 
-    Resolves ``cwd`` (defaults to the process working directory), reads an
-    existing ``AGENTS.md`` there if present, and returns the full prompt.
+    Resolution ladder (first hit wins):
+
+    1. The terminal tool's per-session cwd record — the directory this
+       session's commands actually run in. It is seeded when a surface
+       attaches a workspace to the session (desktop project picker,
+       ``project_create``/``project_switch``, gateway ``terminal.cwd``)
+       and updated after every completed command, so it tracks ``cd``.
+       Keyed by ``session_key``; when omitted, the ambient
+       ``HERMES_SESSION_KEY`` is used, and an empty key reads the
+       single-session CLI's ``"default"`` record.
+    2. ``agent.runtime_cwd.resolve_agent_cwd()`` — the session contextvar
+       pinned by gateway session binding, then ``TERMINAL_CWD``, then the
+       process cwd.
+
+    A bare ``os.getcwd()`` fallback (the previous behavior) is only right
+    for a CLI launched inside a project: on the desktop app the process
+    launches from the home directory, so /init scanned and updated the
+    HOME's AGENTS.md instead of the workspace attached to the session.
     """
     import os
 
-    resolved = os.path.abspath(cwd or os.getcwd())
+    try:
+        from gateway.session_context import get_session_env
+        from tools.terminal_tool import get_session_cwd
+
+        key = (
+            session_key
+            if session_key is not None
+            else get_session_env("HERMES_SESSION_KEY", "")
+        )
+        recorded = get_session_cwd(key)
+        if recorded and os.path.isdir(recorded):
+            return recorded
+    except Exception:
+        pass
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        return str(resolve_agent_cwd())
+    except Exception:
+        return os.getcwd()
+
+
+def build_init_prompt_for_cwd(
+    cwd: str | None = None,
+    extra: str = "",
+    session_key: str | None = None,
+) -> str:
+    """Convenience wrapper used by the dispatch surfaces.
+
+    Resolves ``cwd``, reads an existing ``AGENTS.md`` there if present, and
+    returns the full prompt. An explicit ``cwd`` wins; otherwise the
+    session's ACTIVE directory is resolved via :func:`_resolve_session_cwd`
+    (pass ``session_key`` on multi-session surfaces so the right session's
+    record is consulted).
+    """
+    import os
+
+    resolved = os.path.abspath(cwd if cwd else _resolve_session_cwd(session_key))
     existing: str | None = None
     agents_path = os.path.join(resolved, "AGENTS.md")
     try:
