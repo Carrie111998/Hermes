@@ -572,14 +572,17 @@ def test_handle_message_event_data_forwards_sender_when_admitted():
 
 
 @pytest.mark.parametrize(
-    "env_value, expected",
+    "env_value, extra, expected",
     [
-        (None, False),
-        ("true", True),
-        ("false", False),
+        (None, {}, False),
+        ("true", {}, True),
+        ("false", {}, False),
+        ("false", {"ignore_at_all": True}, True),
+        ("TRUE", {}, False),
+        ("1", {}, False),
     ],
 )
-def test_feishu_load_settings_ignore_at_all(monkeypatch, env_value, expected):
+def test_feishu_load_settings_ignore_at_all(monkeypatch, env_value, extra, expected):
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
     monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
@@ -589,7 +592,7 @@ def test_feishu_load_settings_ignore_at_all(monkeypatch, env_value, expected):
     else:
         monkeypatch.setenv("FEISHU_IGNORE_AT_ALL", env_value)
 
-    settings = FeishuAdapter._load_settings(extra={})
+    settings = FeishuAdapter._load_settings(extra=extra)
     assert settings.ignore_at_all is expected
 
 
