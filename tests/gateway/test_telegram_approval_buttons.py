@@ -175,6 +175,48 @@ class TestTelegramExecApproval:
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
+    @pytest.mark.asyncio
+    async def test_disabled_callback_rejects_without_recording_decision(self):
+        adapter = _make_adapter({"approval_callbacks_enabled": False})
+        adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
+
+        query = AsyncMock()
+        query.data = "ea:once:5"
+        query.message = MagicMock(chat_id=12345)
+        query.from_user = MagicMock(id="12345", first_name="Norbert")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_awaited_once_with(
+            text="⛔ Telegram approvals are disabled."
+        )
+        mock_resolve.assert_not_called()
+        assert adapter._approval_state[5] == "agent:main:telegram:group:12345:99"
+        query.edit_message_text.assert_not_called()
+
+    def test_gateway_config_bridges_profile_scoped_callback_gate(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "security:\n"
+            "  approval:\n"
+            "    telegram_callbacks_enabled: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        telegram = config.platforms[Platform.TELEGRAM]
+        assert telegram.extra["approval_callbacks_enabled"] is False
+
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):
