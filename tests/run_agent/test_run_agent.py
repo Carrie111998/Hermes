@@ -6668,7 +6668,7 @@ class TestAnthropicInterruptHandler:
     """_interruptible_api_call must handle Anthropic mode when interrupted."""
 
 
-    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self):
+    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self, tmp_path):
         """#67142: a non-streaming Anthropic interrupt must abort the
         request-local client from the poll thread, never close/rebuild the
         shared _anthropic_client (which raced a live SSL BIO and corrupted an
@@ -6693,6 +6693,10 @@ class TestAnthropicInterruptHandler:
             skip_memory=True,
         )
         agent.api_mode = "anthropic_messages"
+        agent.session_id = "interrupt-session"
+        agent._current_turn_id = "interrupt-turn"
+        agent._current_api_request_id = "interrupt-turn:api:1"
+        agent._llm_egress_state_dir = tmp_path / "egress"
         agent._interrupt_requested = False
         agent._anthropic_client = MagicMock()
         agent._rebuild_anthropic_client = MagicMock()
