@@ -83,7 +83,13 @@ export class ComposerPersistenceCoordinator {
     }
 
     const operation = request?.operation
-    const scopeKey = typeof operation?.scopeKey === 'string' ? operation.scopeKey.trim() : ''
+    const requestedScopeKey = typeof operation?.scopeKey === 'string' ? operation.scopeKey.trim() : ''
+
+    const reservedMigration = Object.values(nextState.migrations ?? {}).find(
+      migration => migration.fromScopeKey === requestedScopeKey
+    )
+
+    const scopeKey = reservedMigration?.toScopeKey ?? requestedScopeKey
     let result: unknown
 
     if (operation?.type === 'enqueue' && scopeKey && operation.entry) {
@@ -211,6 +217,13 @@ export class ComposerPersistenceCoordinator {
       const to = typeof operation.toScopeKey === 'string' ? operation.toScopeKey.trim() : ''
       const transactionId = typeof operation.transactionId === 'string' ? operation.transactionId.trim() : ''
       const existingMigration = transactionId ? nextState.migrations?.[transactionId] : undefined
+
+      const competingScopeReservation = Object.entries(nextState.migrations ?? {}).find(
+        ([reservedTransactionId, migration]) =>
+          reservedTransactionId !== transactionId &&
+          [migration.fromScopeKey, migration.toScopeKey].some(scopeKey => scopeKey === from || scopeKey === to)
+      )
+
       const pending = from ? (nextState.queues[from] ?? []) : []
 
       if (
@@ -218,6 +231,14 @@ export class ComposerPersistenceCoordinator {
         (existingMigration.fromScopeKey !== from || existingMigration.toScopeKey !== to)
       ) {
         throw new Error('Composer persistence transaction identity collision')
+      }
+
+      if (competingScopeReservation) {
+        if (competingScopeReservation[1].fromScopeKey === from) {
+          throw new Error('Composer persistence source is reserved by another handoff')
+        }
+
+        throw new Error('Composer persistence scope is reserved by another handoff')
       }
 
       result = existingMigration ? existingMigration.sourceQueue.length > 0 : Boolean(from && to && from !== to && pending.length)

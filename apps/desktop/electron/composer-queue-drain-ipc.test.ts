@@ -249,6 +249,112 @@ describe('composer queue drain IPC', () => {
     expect(migrated.parks).toEqual({ target: true })
   })
 
+  it('redirects a peer renderer mutation away from a source reserved for handoff', () => {
+    const ipcMain = new FakeIpcMain()
+    const migrateClient = new FakeSender(11)
+    const lateClient = new FakeSender(22)
+
+    const seed = {
+      parks: {},
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'migrated source entry' }]
+      }
+    }
+
+    registerComposerQueueDrainIpc(ipcMain)
+
+    ipcMain.send('hermes:composer-persistence:mutate', migrateClient, {
+      operation: {
+        fromScopeKey: 'source',
+        toScopeKey: 'target',
+        transactionId: 'reserved-handoff',
+        type: 'migrate'
+      },
+      seed
+    })
+
+    const lateResult = ipcMain.send('hermes:composer-persistence:mutate', lateClient, {
+      operation: {
+        entry: { attachments: [], id: 'late-entry', queuedAt: 2, text: 'late peer entry' },
+        scopeKey: 'source',
+        type: 'enqueue'
+      },
+      seed
+    }) as any
+
+    expect(lateResult.queues.source).toBeUndefined()
+    expect(lateResult.queues.target.map((entry: any) => entry.text)).toEqual([
+      'migrated source entry',
+      'late peer entry'
+    ])
+  })
+
+  it('rejects a competing handoff for a reserved source', () => {
+    const coordinator = new ComposerPersistenceCoordinator()
+
+    const seed = {
+      parks: {},
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'reserved source entry' }]
+      }
+    }
+
+    coordinator.mutate({
+      operation: {
+        fromScopeKey: 'source',
+        toScopeKey: 'first-target',
+        transactionId: 'first-handoff',
+        type: 'migrate'
+      },
+      seed
+    })
+
+    expect(() =>
+      coordinator.mutate({
+        operation: {
+          fromScopeKey: 'source',
+          toScopeKey: 'competing-target',
+          transactionId: 'competing-handoff',
+          type: 'migrate'
+        },
+        seed
+      })
+    ).toThrow('source is reserved by another handoff')
+  })
+
+  it('rejects a nested handoff through a reserved destination', () => {
+    const coordinator = new ComposerPersistenceCoordinator()
+
+    const seed = {
+      parks: {},
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'reserved source entry' }]
+      }
+    }
+
+    coordinator.mutate({
+      operation: {
+        fromScopeKey: 'source',
+        toScopeKey: 'reserved-target',
+        transactionId: 'first-handoff',
+        type: 'migrate'
+      },
+      seed
+    })
+
+    expect(() =>
+      coordinator.mutate({
+        operation: {
+          fromScopeKey: 'reserved-target',
+          toScopeKey: 'nested-target',
+          transactionId: 'nested-handoff',
+          type: 'migrate'
+        },
+        seed
+      })
+    ).toThrow('scope is reserved by another handoff')
+  })
+
   it('rolls back a committed handoff transaction without disturbing either queue', () => {
     const coordinator = new ComposerPersistenceCoordinator()
 

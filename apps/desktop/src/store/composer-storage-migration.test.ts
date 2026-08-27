@@ -156,6 +156,71 @@ describe('composer storage migration', () => {
     expect(isQueueParked(to)).toBe(false)
   })
 
+  it('retries a fenced peer mutation after alias publication fails', () => {
+    const from = key(OWNER_A, null, 15)
+    const to = key(OWNER_A, 'stored-peer-alias-failed')
+    let persisted: ComposerPersistenceState | null = null
+
+    const store = {
+      load: () => (persisted ? structuredClone(persisted) : null),
+      save: (state: ComposerPersistenceState) => {
+        persisted = structuredClone(state)
+      }
+    }
+
+    let coordinator = new ComposerPersistenceCoordinator(store)
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        composerPersistence: {
+          mutate: (request: unknown) => coordinator.mutate(request)
+        }
+      }
+    })
+
+    enqueueQueuedPrompt(to, { attachments: [], text: 'destination before handoff' })
+    enqueueQueuedPrompt(from, { attachments: [], text: 'source before handoff' })
+
+    const setItem = Storage.prototype.setItem
+    let injected = false
+
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, storageKey, value) {
+      if (!injected && storageKey.startsWith('hermes.desktop.composerStorageScopeAlias.v1:')) {
+        injected = true
+        coordinator.mutate({
+          operation: {
+            entry: { attachments: [], id: 'late-peer-entry', queuedAt: 3, text: 'late peer during handoff' },
+            scopeKey: from,
+            type: 'enqueue'
+          },
+          seed: { parks: {}, queues: {} }
+        })
+        throw new Error('injected alias publication failure after peer mutation')
+      }
+
+      return setItem.call(this, storageKey, value)
+    })
+
+    expect(() => migrateComposerStorageScope(from, to)).toThrow('Composer storage migration rollback failed')
+    expect(resolveComposerStorageScopeKey(from)).toBe(from)
+
+    vi.restoreAllMocks()
+    coordinator = new ComposerPersistenceCoordinator(store)
+    composerStorageMigrationModule._recoverComposerStorageMigrationsForTests()
+
+    expect(resolveComposerStorageScopeKey(from)).toBe(to)
+
+    const restored = coordinator.mutate({ operation: { type: 'read' }, seed: { parks: {}, queues: {} } })
+
+    expect(restored.queues[from]).toBeUndefined()
+    expect(restored.queues[to]?.map((entry: any) => entry.text)).toEqual([
+      'destination before handoff',
+      'source before handoff',
+      'late peer during handoff'
+    ])
+  })
+
   it('rolls back only source drain claims when alias publication fails', () => {
     const from = key(OWNER_A, null, 13)
     const to = key(OWNER_A, 'stored-drain-rollback')
