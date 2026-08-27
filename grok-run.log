@@ -1,1 +1,58 @@
-I'll start from the pane-shell source, the issue writeup, and the stalled PR so the restore-affordance fix matches the existing hide-only-strip-tabs intent.I'll read the issue, the stalled PR, and the pane-shell tests next so the restore path is grounded in the existing hide-only-strip-tabs contract.I'll read the pane-shell store, renderer, and existing tests next so both collapse paths can be pinned to the current hide-only-strip-tabs contract.The existing hide-grammar tests already treat strip hiding as a command, so I'll check whether the live collapse path still removes the restore handle.The strip resolver already tries to keep a handle, so I’ll trace collapse, hide, and the active-tab click path to see where that handle actually disappears.The sidebar tabs may not go through TreeGroup, so I’ll check how Sessions/Bots and docked plugin tiles actually render their headers.I've got a tight loop: hide-only chrome is not treated as stranded, and a header tap still collapses a docked tile. Next I'll pin both with failing tests, then make collapse always leave a visible restore tab.
+I'll start from the pane-shell source, the issue writeup, and the stalled PR so the restore-affordance fix matches the existing hide-only-strip-tabs intent.I'll read the issue, the stalled PR, and the pane-shell tests next so the restore path is grounded in the existing hide-only-strip-tabs contract.I'll read the pane-shell store, renderer, and existing tests next so both collapse paths can be pinned to the current hide-only-strip-tabs contract.The existing hide-grammar tests already treat strip hiding as a command, so I'll check whether the live collapse path still removes the restore handle.The strip resolver already tries to keep a handle, so I’ll trace collapse, hide, and the active-tab click path to see where that handle actually disappears.The sidebar tabs may not go through TreeGroup, so I’ll check how Sessions/Bots and docked plugin tiles actually render their headers.I've got a tight loop: hide-only chrome is not treated as stranded, and a header tap still collapses a docked tile. Next I'll pin both with failing tests, then make collapse always leave a visible restore tab.Internal error: {
+  "message": "API error (status 400 Bad Request): Request failed (HTTP 400).",
+  "http_status": 400,
+  "promptUsage": {
+    "inputTokens": 6832096,
+    "outputTokens": 59420,
+    "totalTokens": 6891516,
+    "cachedReadTokens": 6605184,
+    "cacheCreationTokens": 0,
+    "reasoningTokens": 56702,
+    "modelCalls": 40,
+    "apiDurationMs": 1052808,
+    "costUsdTicks": 10361126000,
+    "modelUsage": {
+      "grok-4.6-build": {
+        "inputTokens": 6832096,
+        "outputTokens": 59420,
+        "totalTokens": 6891516,
+        "cachedReadTokens": 6605184,
+        "cacheCreationTokens": 0,
+        "reasoningTokens": 56702,
+        "modelCalls": 40,
+        "apiDurationMs": 1052808,
+        "costUsdTicks": 10361126000
+      }
+    },
+    "numTurns": 40
+  }
+}
+Error: Internal error: {
+  "message": "API error (status 400 Bad Request): Request failed (HTTP 400).",
+  "http_status": 400,
+  "promptUsage": {
+    "inputTokens": 6832096,
+    "outputTokens": 59420,
+    "totalTokens": 6891516,
+    "cachedReadTokens": 6605184,
+    "cacheCreationTokens": 0,
+    "reasoningTokens": 56702,
+    "modelCalls": 40,
+    "apiDurationMs": 1052808,
+    "costUsdTicks": 10361126000,
+    "modelUsage": {
+      "grok-4.6-build": {
+        "inputTokens": 6832096,
+        "outputTokens": 59420,
+        "totalTokens": 6891516,
+        "cachedReadTokens": 6605184,
+        "cacheCreationTokens": 0,
+        "reasoningTokens": 56702,
+        "modelCalls": 40,
+        "apiDurationMs": 1052808,
+        "costUsdTicks": 10361126000
+      }
+    },
+    "numTurns": 40
+  }
+}
