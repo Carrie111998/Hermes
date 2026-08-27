@@ -295,7 +295,7 @@ export function setSessionArchived(id: string, archived: boolean, profile?: stri
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { archived }
+    body: { archived, ...(profile ? { profile } : {}) }
   })
 }
 
@@ -308,7 +308,7 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { pinned }
+    body: { pinned, ...(profile ? { profile } : {}) }
   })
 }
 
@@ -321,7 +321,7 @@ export function setSessionUnreadRemote(id: string, unread: boolean, profile?: st
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { unread }
+    body: { unread, ...(profile ? { profile } : {}) }
   })
 }
 

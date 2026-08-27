@@ -10,7 +10,12 @@ vi.mock('./client', () => ({
 }))
 
 const client = await import('./client')
-const { listSidebarSessions } = await import('./sessions')
+const {
+  listSidebarSessions,
+  setSessionArchived,
+  setSessionPinnedRemote,
+  setSessionUnreadRemote
+} = await import('./sessions')
 
 const hermesApi = vi.mocked(client.hermesApi)
 
@@ -39,5 +44,47 @@ describe('listSidebarSessions remote ownership', () => {
     })
 
     expect(result.recents.sessions[0]).toMatchObject({ connection_id: 'prometheus', id: 'remote-session' })
+  })
+})
+
+describe('session mutation profile propagation', () => {
+  it('setSessionArchived passes the owning profile in the body', async () => {
+    hermesApi.mockResolvedValue({ ok: true } as never)
+
+    await setSessionArchived('sess-1', true, 'worker-beta')
+
+    expect(hermesApi).toHaveBeenCalledWith(expect.objectContaining({
+      body: { archived: true, profile: 'worker-beta' }
+    }))
+  })
+
+  it('setSessionPinnedRemote passes the owning profile in the body', async () => {
+    hermesApi.mockResolvedValue({ ok: true } as never)
+
+    await setSessionPinnedRemote('sess-1', true, 'worker-beta')
+
+    expect(hermesApi).toHaveBeenCalledWith(expect.objectContaining({
+      body: { pinned: true, profile: 'worker-beta' }
+    }))
+  })
+
+  it('setSessionUnreadRemote passes the owning profile in the body', async () => {
+    hermesApi.mockResolvedValue({ ok: true } as never)
+
+    await setSessionUnreadRemote('sess-1', true, 'worker-beta')
+
+    expect(hermesApi).toHaveBeenCalledWith(expect.objectContaining({
+      body: { unread: true, profile: 'worker-beta' }
+    }))
+  })
+
+  it('omits the body profile when no owning profile is given', async () => {
+    hermesApi.mockResolvedValue({ ok: true } as never)
+
+    await setSessionArchived('sess-1', true)
+
+    expect(hermesApi).toHaveBeenCalledWith(expect.objectContaining({
+      body: { archived: true }
+    }))
   })
 })
