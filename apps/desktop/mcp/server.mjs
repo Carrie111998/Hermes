@@ -26,7 +26,8 @@ import { actTools, handleAct } from './tools/act.mjs'
 import { flowTools, handleFlow } from './tools/flows.mjs'
 import { assertTargetAttested, canon } from './guard.mjs'
 import { dispatchTool, wrapResult } from './dispatch.mjs'
-import { createCdpClient, isConnectablePage } from './cdp-client.mjs'
+import { createCdpClient } from './cdp-client.mjs'
+import { createReadTools } from './tools/read.mjs'
 
 // ---------------------------------------------------------------------------
 // Output bounds — never dump the whole DOM into an agent's context.
@@ -67,104 +68,22 @@ const cdpClient = createCdpClient({
 })
 const connect = () => cdpClient.connect()
 
-/** Evaluate with a bounded JSON result. Throws with a friendly message on failure. */
-async function evalBounded(expression) {
-  const c = await connect()
-  const out = await c.eval(expression)
-  const s = typeof out === 'string' ? out : JSON.stringify(out)
-  return s.length > MAX_EVAL ? s.slice(0, MAX_EVAL) + '…[truncated]' : s
-}
+// Read-only tool implementations live in tools/read.mjs (module-per-concern,
+// same layout as tools/act.mjs / tools/flows.mjs). server.mjs only wires them.
+const readDeps = createReadTools({
+  connect,
+  MAX_TEXT,
+  MAX_NODES,
+  MAX_EVAL,
+  MAX_CONSOLE,
+  SELECTORS,
+  consoleRing,
+  port: CFG.port,
+  allowAct: CFG.allowAct
+})
+const { evalBounded, status, inspect, query, consoleLog, screenshot } = readDeps
+const resolveSelector = (sel) => readDeps.resolveSelector(sel)
 
-/** Resolve a selector: either a SELECTORS key or a raw CSS selector. */
-const resolveSelector = sel => SELECTORS[sel] || sel
-
-// ---------------------------------------------------------------------------
-// Read-only tool implementations
-
-async function status() {
-  let alive = false
-  let targets = []
-
-  try {
-    const list = await (await fetch(`http://127.0.0.1:${CFG.port}/json/list`)).json()
-    // BUG #3 fix: use the same "is connectable" predicate as the CDP client.
-    // A page target without a webSocketDebuggerUrl is not connectable, so
-    // status() must not claim `cdpAlive:true` for it.
-    targets = list.filter(isConnectablePage).map(t => ({ url: String(t.url).slice(0, 120), title: String(t.title).slice(0, 60) }))
-    alive = targets.length > 0
-  } catch {
-    alive = false
-  }
-
-  return {
-    cdpAlive: alive,
-    port: CFG.port,
-    mode: alive ? 'dev' : 'unavailable',
-    allowAct: CFG.allowAct,
-    selectors: Object.keys(SELECTORS),
-    targets
-  }
-}
-
-async function inspect({ selector }) {
-  const sel = resolveSelector(selector)
-  return evalBounded(`(() => {
-    const el = document.querySelector(${JSON.stringify(sel)})
-    if (!el) return null
-    const cs = getComputedStyle(el)
-    const box = el.getBoundingClientRect()
-    const ownClasses = typeof el.className === 'string' ? el.className : ''
-    // Walk up a few ancestors: inherited styles are the classic "why won't it apply" trap.
-    const parents = []
-    let n = el.parentElement
-    while (n && parents.length < 5) { parents.push(n.className); n = n.parentElement }
-    return JSON.stringify({
-      tag: el.tagName.toLowerCase(),
-      id: el.id || undefined,
-      classes: ownClasses,
-      box: { x: Math.round(box.x), y: Math.round(box.y), w: Math.round(box.width), h: Math.round(box.height) },
-      visible: !!(box.width || box.height) && cs.display !== 'none' && cs.visibility !== 'hidden',
-      computed: { display: cs.display, position: cs.position, fontSize: cs.fontSize, fontWeight: cs.fontWeight, color: cs.color, background: cs.backgroundColor },
-      inheritedHint: ownClasses ? 'own classes present' : 'NO own class — value is inherited; fix the ancestor rule',
-      ancestors: parents
-    })
-  })()`)
-}
-
-async function query({ selector, limit }) {
-  const sel = resolveSelector(selector)
-  const cap = Math.min(limit || MAX_NODES, MAX_NODES)
-  return evalBounded(`(() => {
-    const els = [...document.querySelectorAll(${JSON.stringify(sel)})].slice(0, ${cap})
-    return els.map((el, i) => {
-      const b = el.getBoundingClientRect()
-      const txt = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, ${MAX_TEXT})
-      return { i, text: txt, w: Math.round(b.width), h: Math.round(b.height), visible: b.width > 0 }
-    })
-  })()`)
-}
-
-async function consoleLog({ level, sinceMs }) {
-  const cutoff = sinceMs ? Date.now() - sinceMs : 0
-  let rows = consoleRing.filter(r => r.t >= cutoff)
-  if (level) rows = rows.filter(r => r.level === level)
-  return rows.slice(-MAX_CONSOLE)
-}
-
-async function screenshot() {
-  const c = await connect()
-  const shot = await c.send('Page.captureScreenshot', { format: 'png' })
-  // Return the capture as MCP image content — never write to disk. This keeps
-  // the tool genuinely read-only: an MCP caller cannot clobber an arbitrary
-  // file (e.g. ui_screenshot({path:'/home/me/.bashrc'}) was a mutation, not a
-  // read). If a saved copy is needed, the caller persists the returned bytes.
-  return {
-    content: [
-      { type: 'image', data: shot.data, mimeType: 'image/png' },
-      { type: 'text', text: JSON.stringify({ bytes: shot.data.length }) }
-    ]
-  }
-}
 
 // ---------------------------------------------------------------------------
 
@@ -204,7 +123,7 @@ const readTools = [
     inputSchema: {
       type: 'object',
       properties: {
-        level: { type: 'string', description: 'error|warning|log|info' },
+        level: { type: 'string', description: 'error|warning|log|info|debug' },
         sinceMs: { type: 'number' }
       }
     }

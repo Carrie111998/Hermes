@@ -31,15 +31,19 @@ test('evalBounded passes through small output unchanged', async () => {
 })
 
 // --- P1-2: screenshot returns image content, never writes to disk ---
-// Verify server.mjs contains NO fs.write/mkdir in the screenshot path.
+// Verify the screenshot implementation (tools/read.mjs) contains NO fs.write
+// and still returns MCP image content; server.mjs must stay fs-free too.
 import { readFileSync } from 'node:fs'
 const serverSrc = readFileSync(new URL('./server.mjs', import.meta.url), 'utf8')
+const readSrc = readFileSync(new URL('./tools/read.mjs', import.meta.url), 'utf8')
 
-test('P1-2: server.mjs screenshot path contains no fs.writeFileSync / mkdirSync', () => {
-  assert.ok(!serverSrc.includes('fs.writeFileSync'), 'screenshot must not write to disk')
-  assert.ok(!serverSrc.includes('fs.mkdirSync'), 'screenshot must not create dirs')
-  assert.ok(serverSrc.includes("type: 'image'"), 'screenshot must return MCP image content')
-  assert.ok(!serverSrc.includes('savedTo'), 'screenshot must not return a saved path')
+test('P1-2: screenshot path contains no fs.writeFileSync / mkdirSync', () => {
+  for (const [name, src] of [['server.mjs', serverSrc], ['tools/read.mjs', readSrc]]) {
+    assert.ok(!src.includes('fs.writeFileSync'), `${name}: screenshot must not write to disk`)
+    assert.ok(!src.includes('fs.mkdirSync'), `${name}: screenshot must not create dirs`)
+    assert.ok(!src.includes('savedTo'), `${name}: screenshot must not return a saved path`)
+  }
+  assert.ok(readSrc.includes("type: 'image'"), 'screenshot must return MCP image content')
 })
 
 // --- status() reports CDP unavailable when fetch fails (no real CDP) ---
