@@ -1107,7 +1107,12 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
       `${markerClear}; marker_clear || exit 75; mkdir -p "$(dirname ${logPath})" && ` +
       `${detachedSpawn}; ` +
       `marker_clear || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 75; }; ` +
-      `lock_json=${shq(metadata)}; lock_json=\${lock_json//__PID__/$child}; ` +
+      // POSIX sh (dash on fnOS/Debian remotes) has no ${var//pat/repl} — that
+      // bashism dies with "Bad substitution" before the backend starts. Use
+      // sed for the placeholder swap instead, replacing the QUOTED placeholder
+      // so the published record carries a real JSON number pid (readLockfile
+      // requires an integer, and the reuse regex matches "pid":<digits>).
+      `lock_json=${shq(metadata)}; lock_json=$(printf '%s' "$lock_json" | sed "s/\\"__PID__\\"/$child/"); ` +
       `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
       `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
       `echo "$child"`,
