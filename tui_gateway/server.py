@@ -14957,6 +14957,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "init",
         "compress",
         "compact",
+        "stop",
     }
 )
 

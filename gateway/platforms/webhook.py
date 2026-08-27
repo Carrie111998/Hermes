@@ -130,6 +130,7 @@ DEFAULT_HOST = None
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_SOURCE_FILTER_VALUES = frozenset({"agl-b2b-account", "agl-b2b-quotes"})
 _RATE_WINDOW_SECONDS = 60.0
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
@@ -222,6 +223,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._seen_deliveries: Dict[str, float] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
+        # Direct deliveries are not "seen" until their target accepts them.
+        # Keep a separate reservation while an attempt is running so a
+        # concurrent retry cannot be mistaken for a completed delivery.
+        self._inflight_deliveries: Dict[str, tuple[float, object]] = {}
+        self._inflight_deliveries_next_prune_at: float = 0.0
 
         # Rate limiting: per-route timestamps in a fixed window.
         self._rate_counts: Dict[str, Deque[float]] = {}
@@ -462,6 +468,52 @@ class WebhookAdapter(BasePlatformAdapter):
             self._prune_seen_deliveries(now)
         return True
 
+    def _prune_inflight_deliveries(self, now: float) -> None:
+        """Discard abandoned direct-delivery reservations after the TTL."""
+        if now < self._inflight_deliveries_next_prune_at:
+            return
+        cutoff = now - self._idempotency_ttl
+        stale = [
+            delivery_id
+            for delivery_id, (reserved_at, _token) in self._inflight_deliveries.items()
+            if reserved_at < cutoff
+        ]
+        for delivery_id in stale:
+            self._inflight_deliveries.pop(delivery_id, None)
+        self._inflight_deliveries_next_prune_at = now + min(
+            60.0, max(1.0, self._idempotency_ttl / 10)
+        )
+
+    def _reserve_direct_delivery(
+        self, delivery_id: str, now: float
+    ) -> tuple[str, Optional[object]]:
+        """Atomically classify or reserve a direct delivery ID."""
+        self._prune_seen_deliveries(now)
+        self._prune_inflight_deliveries(now)
+        seen_at = self._seen_deliveries.get(delivery_id)
+        if seen_at is not None and now - seen_at < self._idempotency_ttl:
+            return "delivered", None
+        if seen_at is not None:
+            self._seen_deliveries.pop(delivery_id, None)
+        if delivery_id in self._inflight_deliveries:
+            return "in_flight", None
+        token = object()
+        self._inflight_deliveries[delivery_id] = (now, token)
+        return "reserved", token
+
+    def _release_direct_delivery(self, delivery_id: str, token: object) -> None:
+        current = self._inflight_deliveries.get(delivery_id)
+        if current is not None and current[1] is token:
+            self._inflight_deliveries.pop(delivery_id, None)
+
+    def _commit_direct_delivery(
+        self, delivery_id: str, token: object, now: float
+    ) -> None:
+        self._seen_deliveries[delivery_id] = now
+        self._release_direct_delivery(delivery_id, token)
+        if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
+            self._prune_seen_deliveries(now)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
@@ -490,10 +542,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if not isinstance(route_config, dict):
             return None
         toolsets = route_config.get("toolsets")
-        if not isinstance(toolsets, list) or not toolsets:
+        if not isinstance(toolsets, list):
             return None
-        cleaned = [str(t).strip() for t in toolsets if str(t).strip()]
-        return cleaned or None
+        return [str(t).strip() for t in toolsets if str(t).strip()]
 
     # ------------------------------------------------------------------
     # HTTP handlers
@@ -748,6 +799,31 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Cannot parse body"}, status=400
                 )
 
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Invalid payload"}, status=400)
+
+        # A source filter is a narrow route-level trust boundary, evaluated
+        # before all generic filtering and every downstream side effect. Dict
+        # filters using the existing generic {field, operator} contract must
+        # continue through route_filters_match unchanged.
+        filters_config = route_config.get("filters")
+        has_source_filter = isinstance(filters_config, dict) and (
+            not filters_config or "source" in filters_config
+        )
+        if has_source_filter:
+            source_filter = filters_config
+            if (
+                set(source_filter) != {"source"}
+                or source_filter.get("source") not in _SOURCE_FILTER_VALUES
+            ):
+                logger.warning(
+                    "[webhook] Route %s has an invalid source filter",
+                    route_name,
+                )
+                return web.json_response({"error": "Request rejected"}, status=403)
+            if payload.get("source") != source_filter["source"]:
+                return web.json_response({"error": "Request rejected"}, status=403)
+
         # Check event type filter
         event_type = (
             request.headers.get("X-GitHub-Event", "")
@@ -756,6 +832,49 @@ class WebhookAdapter(BasePlatformAdapter):
             or payload.get("type", "")
             or "unknown"
         )
+
+        # Build a stable delivery ID before any route processing. Direct
+        # delivery routes reserve it here so duplicate scripts cannot mutate
+        # state and concurrent attempts cannot report a false success.
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "webhook-id",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                ),
+            ),
+        )
+        direct_delivery_token: Optional[object] = None
+        if route_config.get("deliver_only"):
+            reservation, direct_delivery_token = self._reserve_direct_delivery(
+                delivery_id, time.time()
+            )
+            if reservation == "delivered":
+                logger.info(
+                    "[webhook] Skipping duplicate delivery %s", delivery_id
+                )
+                return web.json_response(
+                    {"status": "duplicate", "delivery_id": delivery_id},
+                    status=200,
+                )
+            if reservation == "in_flight":
+                return web.json_response(
+                    {"status": "error", "error": "Delivery in progress"},
+                    status=503,
+                )
+            # Unexpected exceptions anywhere below (including filters, script,
+            # or template rendering) must not strand the reservation.
+            request_task = asyncio.current_task()
+            if request_task is not None:
+                request_task.add_done_callback(
+                    lambda _task, delivery_id=delivery_id,
+                    token=direct_delivery_token: self._release_direct_delivery(
+                        delivery_id, token
+                    )
+                )
+
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
@@ -764,18 +883,29 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_name,
                 allowed_events,
             )
+            if direct_delivery_token is not None:
+                self._commit_direct_delivery(
+                    delivery_id, direct_delivery_token, time.time()
+                )
             return web.json_response(
                 {"status": "ignored", "event": event_type}
             )
 
+        generic_filter_config = route_config
+        if has_source_filter:
+            generic_filter_config = {k: v for k, v in route_config.items() if k != "filters"}
         if not self._route_processor.route_filters_match(
-            route_config, payload, event_type, request.headers
+            generic_filter_config, payload, event_type, request.headers
         ):
             logger.info(
                 "[webhook] filtered event=%s route=%s",
                 event_type,
                 route_name,
             )
+            if direct_delivery_token is not None:
+                self._commit_direct_delivery(
+                    delivery_id, direct_delivery_token, time.time()
+                )
             return web.json_response(
                 {
                     "status": "ignored",
@@ -798,6 +928,10 @@ class WebhookAdapter(BasePlatformAdapter):
                     event_type,
                     route_name,
                 )
+                if direct_delivery_token is not None:
+                    self._commit_direct_delivery(
+                        delivery_id, direct_delivery_token, time.time()
+                    )
                 return web.json_response(
                     {
                         "status": "ignored",
@@ -842,19 +976,12 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        if not route_config.get("deliver_only") and not self._record_delivery_id(
+            delivery_id, now
+        ):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -888,6 +1015,10 @@ class WebhookAdapter(BasePlatformAdapter):
             try:
                 result = await self._direct_deliver(prompt, delivery)
             except Exception:
+                if direct_delivery_token is not None:
+                    self._release_direct_delivery(
+                        delivery_id, direct_delivery_token
+                    )
                 logger.exception(
                     "[webhook] direct-deliver failed route=%s delivery=%s",
                     route_name,
@@ -899,6 +1030,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
             if result.success:
+                if direct_delivery_token is not None:
+                    self._commit_direct_delivery(
+                        delivery_id, direct_delivery_token, time.time()
+                    )
                 return web.json_response(
                     {
                         "status": "delivered",
@@ -916,6 +1051,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 delivery["deliver"],
                 result.error,
             )
+            if direct_delivery_token is not None:
+                self._release_direct_delivery(
+                    delivery_id, direct_delivery_token
+                )
             return web.json_response(
                 {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
                 status=502,
@@ -1086,6 +1225,24 @@ class WebhookAdapter(BasePlatformAdapter):
                 request.headers.get(name, "")
                 or request.headers.get(name.lower(), "")
                 or request.headers.get(name.upper(), "")
+            )
+
+        # Standard Webhooks / Render:
+        #   webhook-id: msg_...
+        #   webhook-timestamp: unix seconds
+        #   webhook-signature: v1,<base64-hmac> [v1,<base64-hmac> ...]
+        # Standard Webhooks uses the same signed-content and secret encoding
+        # rules as Svix, but intentionally uses vendor-neutral header names.
+        standard_id = _header("webhook-id")
+        standard_timestamp = _header("webhook-timestamp")
+        standard_signature = _header("webhook-signature")
+        if standard_id or standard_timestamp or standard_signature:
+            return self._validate_svix_signature(
+                body=body,
+                secret=secret,
+                msg_id=standard_id,
+                timestamp=standard_timestamp,
+                signature_header=standard_signature,
             )
 
         # Svix / AgentMail:

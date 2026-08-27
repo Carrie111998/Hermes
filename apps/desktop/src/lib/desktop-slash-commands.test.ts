@@ -120,10 +120,11 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/compact')).toBe(false)
   })
 
-  it('routes only stateless session commands through dedicated gateway RPCs', () => {
+  it('routes stateless session commands and /stop through dedicated gateway RPCs', () => {
     const expected = {
       '/save': 'session.save',
-      '/status': 'session.status'
+      '/status': 'session.status',
+      '/stop': 'process.stop'
     } as const
 
     for (const [name, rpcName] of Object.entries(expected)) {
@@ -142,7 +143,7 @@ describe('desktop slash command curation', () => {
   })
 
   it('keeps commands with richer CLI semantics on the slash worker', () => {
-    for (const name of ['/agents', '/steer', '/stop', '/usage']) {
+    for (const name of ['/agents', '/steer', '/usage']) {
       expect(resolveDesktopCommand(name)?.surface).toEqual({ kind: 'exec' })
     }
   })

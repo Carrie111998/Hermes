@@ -1012,7 +1012,7 @@ describe('usePromptActions exec fallback error reporting', () => {
     vi.restoreAllMocks()
   })
 
-  it('surfaces the slash.exec failure when command.dispatch only adds "not a quick/plugin/skill command"', async () => {
+  it('surfaces the slash.exec failure when command.dispatch only adds bundle-aware routing noise', async () => {
     const seeds: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string) => {
@@ -1021,7 +1021,7 @@ describe('usePromptActions exec fallback error reporting', () => {
       }
 
       if (method === 'command.dispatch') {
-        throw new Error('not a quick/plugin/skill command: debug')
+        throw new Error('not a quick/plugin/bundle/skill command: debug')
       }
 
       return {} as never
@@ -1045,7 +1045,7 @@ describe('usePromptActions exec fallback error reporting', () => {
     // the worker timeout is what actually went wrong (#44456).
     const texts = renderedSeedTexts(seeds)
     expect(texts.some(text => text.includes('slash worker timed out'))).toBe(true)
-    expect(texts.some(text => text.includes('not a quick/plugin/skill command'))).toBe(false)
+    expect(texts.some(text => text.includes('not a quick/plugin/bundle/skill command'))).toBe(false)
   })
 
   it('falls back to slash.exec when an older gateway lacks a dedicated RPC', async () => {

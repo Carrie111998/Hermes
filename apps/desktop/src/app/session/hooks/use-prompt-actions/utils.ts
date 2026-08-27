@@ -513,7 +513,7 @@ export function slashStatusText(command: string, output: string): string {
  * - `session.save`:     { file: "<absolute path>" }
  * - `session.usage`:    { calls, input, output, total, credits_lines? }
  * - `session.steer`:    { status: 'queued' | 'rejected', text }
- * - `process.stop`:     { killed: boolean }
+ * - `process.stop`:     { killed: number, delegations_interrupted?: number }
  * - `agents.list`:      { processes: [{ session_id, command, status, uptime }] }
  *
  * Any RPC whose response doesn't match these shapes falls through to a
@@ -553,11 +553,29 @@ export function renderRpcResult(response: unknown, name: string): string {
     return 'Steer rejected — agent declined input'
   }
 
-  // process.stop — { killed: number }
+  // process.stop — { killed: number, delegations_interrupted?: number }
   if ('killed' in r && typeof r.killed === 'number') {
-    return r.killed > 0
-      ? `Stopped ${r.killed} background process${r.killed === 1 ? '' : 'es'}.`
-      : 'No background processes to stop.'
+    const delegations =
+      typeof r.delegations_interrupted === 'number' ? r.delegations_interrupted : null
+
+    // Older gateways only return `killed`; keep their established output.
+    if (delegations === null) {
+      return r.killed > 0
+        ? `Stopped ${r.killed} background process${r.killed === 1 ? '' : 'es'}.`
+        : 'No background processes to stop.'
+    }
+
+    const lines: string[] = []
+
+    if (r.killed > 0) {
+      lines.push(`Stopped ${r.killed} background process${r.killed === 1 ? '' : 'es'}.`)
+    }
+
+    if (delegations > 0) {
+      lines.push(`Interrupted ${delegations} background delegation${delegations === 1 ? '' : 's'}.`)
+    }
+
+    return lines.length ? lines.join('\n') : 'No background processes or delegations to stop.'
   }
 
   // session.save — { file }

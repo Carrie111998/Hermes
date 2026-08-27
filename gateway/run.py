@@ -23128,7 +23128,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             override = None
 
-        if override and isinstance(override, list):
+        if isinstance(override, list):
             cfg = dict(user_config)
             pts = dict(cfg.get("platform_toolsets") or {})
             pts[platform_key] = [str(t) for t in override]

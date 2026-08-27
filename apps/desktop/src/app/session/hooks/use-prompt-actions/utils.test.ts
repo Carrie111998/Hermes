@@ -501,8 +501,16 @@ describe('renderRpcResult', () => {
       expect(renderRpcResult({ killed: 2 }, 'stop')).toBe('Stopped 2 background processes.')
     })
 
-    it('reports nothing-to-stop when the numeric count is zero', () => {
-      expect(renderRpcResult({ killed: 0 }, 'stop')).toBe('No background processes to stop.')
+    it('reports stopped processes and interrupted delegations together', () => {
+      expect(renderRpcResult({ killed: 2, delegations_interrupted: 1 }, 'stop')).toBe(
+        'Stopped 2 background processes.\nInterrupted 1 background delegation.'
+      )
+    })
+
+    it('reports nothing-to-stop when both numeric counts are zero', () => {
+      expect(renderRpcResult({ killed: 0, delegations_interrupted: 0 }, 'stop')).toBe(
+        'No background processes or delegations to stop.'
+      )
     })
   })
 
