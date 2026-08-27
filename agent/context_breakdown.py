@@ -16,15 +16,15 @@ _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DO
 
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
 
-# Files carved out of the conversation blob. Names come from the canonical
-# "file" toolset at runtime (``toolsets.TOOLSETS``) so this never drifts from
-# the tool registry; the frozenset is only the offline fallback.
+# Files carved out of the conversation blob. Names are resolved from the
+# canonical "file" toolset at runtime, never hand-copied — see _file_tool_names.
 _FILE_TOOLSET = "file"
-_FILE_TOOL_FALLBACK = frozenset({"read_file", "write_file", "patch", "search_files"})
 
 # The subset whose ``path`` argument names ONE file, so it can be counted.
 # ``search_files`` takes a directory (and ``patch`` in V4A mode takes no path
-# at all) — both still cost file tokens, neither is a countable file.
+# at all) — both still cost file tokens, neither is a countable file. The same
+# distinction is drawn in ``agent/context_compressor.py``'s per-tool result
+# summariser; if a file tool gains or loses a path argument, both need editing.
 _FILE_PATH_TOOL_NAMES = frozenset({"read_file", "write_file", "patch"})
 
 _CATEGORY_COLORS = {
@@ -91,14 +91,35 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
 
 
 def _file_tool_names() -> frozenset:
-    """The live "file" toolset's tool names, or the offline fallback."""
-    try:
-        from toolsets import resolve_toolset
+    """The live "file" toolset's tool names.
 
+    Resolved from the registry, falling back to the toolset's own static
+    definition — never to a hand-copied literal, which is what actually goes
+    stale when a file tool is added or renamed.
+    """
+    try:
+        from toolsets import TOOLSETS, resolve_toolset
+    except Exception:
+        return frozenset()
+
+    try:
         names = frozenset(resolve_toolset(_FILE_TOOLSET, include_registry=False) or ())
     except Exception:
-        return _FILE_TOOL_FALLBACK
-    return names or _FILE_TOOL_FALLBACK
+        names = frozenset()
+
+    if names:
+        return names
+
+    return frozenset((TOOLSETS.get(_FILE_TOOLSET) or {}).get("tools") or ())
+
+
+def _raw_arguments(call: Any) -> str:
+    """A tool call's ``arguments`` as text, for sizing without re-encoding."""
+    fn = call.get("function") if isinstance(call, dict) else None
+    raw = (fn or {}).get("arguments") if isinstance(fn, dict) else None
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw, ensure_ascii=False) if raw else ""
 
 
 def _call_arguments(call: Any) -> Dict[str, Any]:
@@ -149,7 +170,7 @@ def _file_context_stats(messages: Sequence[dict]) -> Tuple[int, int]:
         if msg.get("role") == "tool":
             result_name = str(msg.get("name") or msg.get("tool_name") or "").strip()
             call_id = str(msg.get("tool_call_id") or "")
-            claimed = result_name in names if result_name else (bool(call_id) and call_id in file_call_ids)
+            claimed = result_name in names if result_name else call_id in file_call_ids
             if claimed:
                 tokens += estimate_messages_tokens_rough([msg])
             continue
@@ -165,7 +186,10 @@ def _file_context_stats(messages: Sequence[dict]) -> Tuple[int, int]:
             if call_id:
                 file_call_ids.add(call_id)
 
-            tokens += _json_tokens(call)
+            # Size from the raw argument text rather than re-serialising the
+            # call: json.dumps would re-escape the whole payload (a write_file
+            # body can be 100KB) purely to measure it.
+            tokens += _chars_to_tokens(name) + _chars_to_tokens(_raw_arguments(call))
 
             if name in _FILE_PATH_TOOL_NAMES:
                 path = str(_call_arguments(call).get("path") or "").strip()
@@ -244,11 +268,6 @@ def compute_session_context_breakdown(
         else 0
     )
 
-    # Per-category extras, merged into the emitted dicts. Only "files" carries
-    # one today (a distinct-file count); the shape stays optional so surfaces
-    # that don't know about it keep rendering the category unchanged.
-    category_counts = {"files": file_count}
-
     return {
         "categories": [
             {
@@ -256,7 +275,9 @@ def compute_session_context_breakdown(
                 "id": category_id,
                 "label": label,
                 "tokens": tokens,
-                **({"count": category_counts[category_id]} if category_id in category_counts else {}),
+                # Optional per-category extra, so surfaces that don't know
+                # about it keep rendering the category unchanged.
+                **({"count": file_count} if category_id == "files" else {}),
             }
             for category_id, label, tokens in categories
             if tokens > 0

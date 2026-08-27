@@ -23,7 +23,7 @@ string is both an i18n hole and an unactionable bug report.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 
@@ -32,8 +32,6 @@ UNIT_PERCENT = "percent"
 UNIT_CURRENCY = "currency"
 UNIT_COUNT = "count"
 UNIT_TOKENS = "tokens"
-
-USAGE_UNITS = frozenset({UNIT_PERCENT, UNIT_CURRENCY, UNIT_COUNT, UNIT_TOKENS})
 
 # ── States ─────────────────────────────────────────────────────────────────
 # `no_usage_endpoint` is NOT an error: it is the normal answer for most of the
@@ -45,17 +43,6 @@ STATE_UNAUTHORIZED = "unauthorized"
 STATE_RATE_LIMITED = "rate_limited"
 STATE_NETWORK_ERROR = "network_error"
 STATE_PARSE_ERROR = "parse_error"
-
-USAGE_STATES = frozenset({
-    STATE_OK,
-    STATE_NOT_AUTHENTICATED,
-    STATE_NO_USAGE_ENDPOINT,
-    STATE_UNAUTHORIZED,
-    STATE_RATE_LIMITED,
-    STATE_NETWORK_ERROR,
-    STATE_PARSE_ERROR,
-})
-
 
 def to_decimal(value: Any) -> Optional[Decimal]:
     """Coerce a provider field to Decimal, or None when it isn't a number.
@@ -81,6 +68,36 @@ def to_decimal(value: Any) -> Optional[Decimal]:
         except (InvalidOperation, ValueError):
             return None
     return None
+
+
+def to_datetime(value: Any) -> Optional[datetime]:
+    """Coerce a provider timestamp to an aware datetime, or None.
+
+    Providers send ISO-8601 with a ``Z`` suffix, ISO with an offset, or epoch
+    seconds. Naive values are read as UTC — every endpoint here reports UTC.
+    Shared with the plugins (and re-exported for third-party ones) so a new
+    provider does not hand-roll a fifth copy that forgets one of those forms.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _decimal_str(value: Optional[Decimal]) -> Optional[str]:

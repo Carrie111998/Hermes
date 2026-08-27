@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import threading
 import time
 from dataclasses import replace
@@ -44,6 +43,7 @@ from agent.provider_usage_types import (
     STATE_UNAUTHORIZED,
     ProviderUsage,
     UsageWindow,
+    to_datetime,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,14 +85,20 @@ def _utc_now() -> datetime:
 # ── Detection ──────────────────────────────────────────────────────────────
 
 
-def _auth_store() -> Dict[str, Any]:
-    try:
-        from hermes_cli.auth import _load_auth_store
+def _credential_pool() -> Dict[str, Any]:
+    """The persisted pool, profile + global-root merged.
 
-        store = _load_auth_store()
+    ``read_credential_pool`` rather than the raw auth store: in profile mode a
+    provider authenticated only at global scope lives in the root ``auth.json``,
+    and reading the profile file alone makes it silently undetectable.
+    """
+    try:
+        from hermes_cli.auth import read_credential_pool
+
+        pool = read_credential_pool()
     except Exception:
         return {}
-    return store if isinstance(store, dict) else {}
+    return pool if isinstance(pool, dict) else {}
 
 
 def _registry() -> Dict[str, Any]:
@@ -109,15 +115,26 @@ def candidate_providers() -> List[str]:
     names = set(_registry().keys())
     names.update(_EXTRA_CANDIDATES)
 
-    store = _auth_store()
-    pool = store.get("credential_pool")
-    if isinstance(pool, dict):
-        names.update(str(key) for key in pool.keys())
+    names.update(str(key) for key in _credential_pool().keys())
 
     try:
         from agent.credential_pool import list_custom_pool_providers
 
         names.update(list_custom_pool_providers())
+    except Exception:
+        pass
+
+    # Custom providers configured but never yet persisted into the pool. Without
+    # this the panel and `hermes auth list` disagree about what you are signed
+    # into — the two surfaces walk the same union, so they must walk all of it.
+    try:
+        from hermes_cli.auth_commands import _get_custom_provider_entries
+
+        names.update(
+            str(entry["provider_key"])
+            for entry in _get_custom_provider_entries()
+            if entry.get("provider_key")
+        )
     except Exception:
         pass
 
@@ -161,17 +178,12 @@ def detect_providers() -> List[str]:
     seeded into the pool.
     """
     registry = _registry()
-    store = _auth_store()
-    persisted = store.get("credential_pool")
+    persisted = _credential_pool()
     # A key whose value is an EMPTY list is a provider that was seeded once
     # and has since been pruned — real state on a live machine. Treating the
     # key alone as proof would report "authenticated" for a provider with no
     # usable credential left.
-    persisted_keys = (
-        {str(key) for key, value in persisted.items() if value}
-        if isinstance(persisted, dict)
-        else set()
-    )
+    persisted_keys = {str(key) for key, value in persisted.items() if value}
 
     detected = []
     for provider in candidate_providers():
@@ -211,15 +223,14 @@ def _read_cache() -> Dict[str, Any]:
 def _write_cache(data: Dict[str, Any]) -> None:
     path = _cache_path()
     try:
+        from utils import atomic_write_text
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic: a half-written cache read by a concurrent surface would be
-        # discarded as corrupt and cost a full refetch.
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=str(path.parent), delete=False
-        ) as handle:
-            json.dump(data, handle)
-            temp = Path(handle.name)
-        temp.replace(path)
+        # The shared writer, not a bare os.replace: ~/.hermes is symlinked into
+        # a dotfiles repo on plenty of machines, and a plain rename replaces the
+        # symlink with a regular file (#16743). It also carries the EXDEV copy
+        # fallback and the Windows contended-rename retry.
+        atomic_write_text(path, json.dumps(data))
     except Exception as exc:
         logger.debug("provider usage cache write failed: %s", exc)
 
@@ -322,17 +333,15 @@ def _fetch_one(provider: str, timeout: float) -> ProviderUsage:
             fetched_at=_utc_now(),
         )
 
-    if usage.fetched_at is None:
-        usage = ProviderUsage(
-            provider=usage.provider or provider,
-            display_name=usage.display_name or display_name,
-            plan=usage.plan,
-            windows=usage.windows,
-            state=usage.state,
-            message=usage.message,
-            fetched_at=_utc_now(),
-        )
-    return usage
+    # Fill the gaps a plugin left rather than rebuilding field by field — a
+    # manual rebuild ties the display-name fallback to whether fetched_at
+    # happened to be set.
+    return replace(
+        usage,
+        provider=usage.provider or provider,
+        display_name=usage.display_name or display_name,
+        fetched_at=usage.fetched_at or _utc_now(),
+    )
 
 
 def usage_providers() -> List[str]:
@@ -348,7 +357,7 @@ def _ttl_for(provider: str) -> int:
         return 300
 
 
-def _from_payload(payload: Dict[str, Any], *, stale: bool) -> Optional[ProviderUsage]:
+def _from_payload(payload: Optional[Dict[str, Any]]) -> Optional[ProviderUsage]:
     """Rebuild a cached snapshot. Windows come back as payload dicts, so the
     surface renders identical numbers whether they were cached or just fetched."""
     if not isinstance(payload, dict) or not payload.get("provider"):
@@ -361,8 +370,7 @@ def _from_payload(payload: Dict[str, Any], *, stale: bool) -> Optional[ProviderU
             windows=tuple(_window_from_payload(item) for item in payload.get("windows") or ()),
             state=str(payload.get("state") or "ok"),
             message=payload.get("message"),
-            fetched_at=_parse_iso(payload.get("fetched_at")),
-            stale=stale,
+            fetched_at=to_datetime(payload.get("fetched_at")),
         )
     except Exception:
         return None
@@ -377,23 +385,11 @@ def _window_from_payload(payload: Dict[str, Any]) -> UsageWindow:
         used=to_decimal(payload.get("used")),
         limit=to_decimal(payload.get("limit")),
         remaining=to_decimal(payload.get("remaining")),
-        reset_at=_parse_iso(payload.get("reset_at")),
+        reset_at=to_datetime(payload.get("reset_at")),
         currency=payload.get("currency"),
         detail=payload.get("detail"),
     )
 
-
-def _parse_iso(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def collect_usage(
@@ -417,8 +413,10 @@ def collect_usage(
     to_fetch: List[str] = []
 
     for provider in names:
-        entry = cache.get(provider) if isinstance(cache.get(provider), dict) else None
-        cached = _from_payload((entry or {}).get("usage") or {}, stale=False) if entry else None
+        entry = cache.get(provider)
+        if not isinstance(entry, dict):
+            entry = None
+        cached = _from_payload(entry.get("usage")) if entry else None
 
         if refresh or cached is None:
             to_fetch.append(provider)

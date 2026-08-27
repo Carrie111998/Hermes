@@ -3,7 +3,10 @@ import { useEffect } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { Progress } from '@/components/ui/progress'
 import { useI18n } from '@/i18n'
+import { compactNumber } from '@/lib/format'
+import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $providerUsage, refreshProviderUsage } from '@/store/provider-usage'
 import type { ProviderUsageSnapshot, ProviderUsageWindow } from '@/types/hermes'
@@ -17,10 +20,6 @@ function num(value: null | string | undefined): null | number {
   const parsed = Number(value)
 
   return Number.isFinite(parsed) ? parsed : null
-}
-
-function compact(value: number): string {
-  return value >= 1000 ? `${Math.round(value / 100) / 10}k` : String(Math.round(value * 100) / 100)
 }
 
 /** The figure a window leads with, in its OWN unit — never a percentage that
@@ -42,10 +41,10 @@ function windowFigure(window: ProviderUsageWindow): string {
   }
 
   if (remaining !== null && limit !== null) {
-    return `${compact(remaining)} / ${compact(limit)}`
+    return `${compactNumber(remaining)} / ${compactNumber(limit)}`
   }
 
-  return remaining !== null ? compact(remaining) : used !== null ? compact(used) : ''
+  return remaining !== null ? compactNumber(remaining) : used !== null ? compactNumber(used) : ''
 }
 
 function ResetHint({ at }: { at: null | string | undefined }) {
@@ -63,9 +62,7 @@ function ResetHint({ at }: { at: null | string | undefined }) {
 
   return (
     <span className="shrink-0 text-[0.625rem] text-muted-foreground/55">
-      {t.shell.statusbar.accountUsagePanel.resetsAt(
-        when.toLocaleString(undefined, { day: 'numeric', hour: '2-digit', minute: '2-digit', month: 'short' })
-      )}
+      {t.shell.statusbar.accountUsagePanel.resetsAt(fmtDayTime.format(when))}
     </span>
   )
 }
@@ -77,16 +74,16 @@ function UsageBar({ percent }: { percent: null | number }) {
 
   const clamped = Math.max(0, Math.min(100, percent))
 
+  // The shared meter owns the track, the sizing, and role=progressbar with
+  // its aria values. Only the fill tone is ours, via the sanctioned override,
+  // exactly as the billing bars do it.
   return (
-    <div className="h-1 w-full overflow-hidden rounded-full bg-(--ui-stroke-tertiary)" data-slot="account-usage-bar">
-      <div
-        className={cn(
-          'h-full rounded-full transition-[width] duration-300 ease-out',
-          clamped >= 90 ? 'bg-(--ui-red)' : clamped >= 70 ? 'bg-(--ui-orange)' : 'bg-(--ui-green)'
-        )}
-        style={{ width: `${clamped}%` }}
-      />
-    </div>
+    <Progress
+      data-slot="account-usage-bar"
+      fillClassName={clamped >= 90 ? 'bg-(--ui-red)' : clamped >= 70 ? 'bg-(--ui-orange)' : 'bg-(--ui-green)'}
+      size="sm"
+      value={clamped / 100}
+    />
   )
 }
 
@@ -95,7 +92,12 @@ function ProviderCard({ snapshot }: { snapshot: ProviderUsageSnapshot }) {
   const copy = t.shell.statusbar.accountUsagePanel
 
   return (
-    <li className="flex flex-col gap-1.5" data-slot="account-usage-provider">
+    <li
+      // Cached numbers being refreshed behind the panel: dim rather than
+      // blank, so stale-while-revalidate is visible instead of invisible.
+      className={cn('flex flex-col gap-1.5', snapshot.stale && 'opacity-60')}
+      data-slot="account-usage-provider"
+    >
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate font-medium text-foreground">{snapshot.display_name}</span>
 

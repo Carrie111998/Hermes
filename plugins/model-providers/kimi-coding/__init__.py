@@ -7,7 +7,6 @@ Kimi has dual endpoints:
 This module covers the chat_completions path (/v1 endpoint).
 """
 
-from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -61,18 +60,6 @@ def _kimi_window_label(window: dict) -> str:
         return f"{seconds // 3600}h"
     return f"{max(1, seconds // 60)}m"
 
-
-def _kimi_reset(value):
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class KimiProfile(ProviderProfile):
@@ -177,6 +164,7 @@ class KimiProfile(ProviderProfile):
             UNIT_COUNT,
             ProviderUsage,
             UsageWindow,
+            to_datetime,
             to_decimal,
         )
 
@@ -208,7 +196,7 @@ class KimiProfile(ProviderProfile):
                     unit=UNIT_COUNT,
                     limit=to_decimal(detail.get("limit")),
                     remaining=to_decimal(detail.get("remaining")),
-                    reset_at=_kimi_reset(detail.get("resetTime")),
+                    reset_at=to_datetime(detail.get("resetTime")),
                 )
             )
 
@@ -220,7 +208,7 @@ class KimiProfile(ProviderProfile):
                     unit=UNIT_COUNT,
                     limit=to_decimal(rolling.get("limit")),
                     remaining=to_decimal(rolling.get("used")),
-                    reset_at=_kimi_reset(rolling.get("resetTime")),
+                    reset_at=to_datetime(rolling.get("resetTime")),
                 )
             )
 

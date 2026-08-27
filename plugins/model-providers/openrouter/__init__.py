@@ -243,13 +243,14 @@ class OpenRouterProfile(ProviderProfile):
         Wraps the fetcher that already backs ``/usage``, handing it the
         aggregator's resolved key so the plugin never touches the pool.
         """
-        from agent.account_usage import _fetch_openrouter_account_usage
+        from agent.account_usage import fetch_account_usage
         from agent.provider_usage_types import from_account_snapshot
 
         return from_account_snapshot(
-            _fetch_openrouter_account_usage(
-                base_url or getattr(credential, "base_url", None),
-                getattr(credential, "access_token", None),
+            fetch_account_usage(
+                "openrouter",
+                base_url=base_url or getattr(credential, "base_url", None),
+                api_key=getattr(credential, "access_token", None),
             ),
             provider="openrouter",
             display_name="OpenRouter",

@@ -64,13 +64,9 @@ def test_provider_numbers_are_coerced_without_guessing(raw, expected):
 # ── Detection ──────────────────────────────────────────────────────────────
 
 
-def _auth_store(pool):
-    return {"credential_pool": pool}
-
-
 def test_detection_reads_the_persisted_pool_without_seeding():
     with (
-        patch.object(provider_usage, "_auth_store", return_value=_auth_store({"kimi-coding": [{"id": "a"}]})),
+        patch.object(provider_usage, "_credential_pool", return_value={"kimi-coding": [{"id": "a"}]}),
         patch.object(provider_usage, "_registry", return_value={}),
         patch.object(provider_usage, "_has_env_credential", return_value=False),
         patch.object(provider_usage, "_has_credential_file", return_value=False),
@@ -83,7 +79,7 @@ def test_a_pruned_pool_key_is_not_evidence_of_a_credential():
     # its entries are pruned. Counting the key alone reports a logged-out
     # provider as authenticated.
     with (
-        patch.object(provider_usage, "_auth_store", return_value=_auth_store({"anthropic": []})),
+        patch.object(provider_usage, "_credential_pool", return_value={"anthropic": []}),
         patch.object(provider_usage, "_registry", return_value={}),
         patch.object(provider_usage, "_has_env_credential", return_value=False),
         patch.object(provider_usage, "_has_credential_file", return_value=False),
@@ -95,7 +91,7 @@ def test_openrouter_is_a_candidate_even_though_it_is_not_in_the_registry():
     # It is hardcoded into the pool seeder ahead of the registry lookup, so a
     # registry-only sweep drops it silently.
     with (
-        patch.object(provider_usage, "_auth_store", return_value={}),
+        patch.object(provider_usage, "_credential_pool", return_value={}),
         patch.object(provider_usage, "_registry", return_value={}),
     ):
         assert "openrouter" in provider_usage.candidate_providers()

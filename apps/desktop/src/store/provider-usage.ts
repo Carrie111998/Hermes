@@ -6,12 +6,10 @@ import { $gateway } from './gateway'
 
 export interface ProviderUsageState {
   loading: boolean
-  /** Wall-clock of the last completed fetch — drives "refreshed just now". */
-  fetchedAt: null | number
   providers: ProviderUsageSnapshot[]
 }
 
-const EMPTY: ProviderUsageState = { fetchedAt: null, loading: false, providers: [] }
+const EMPTY: ProviderUsageState = { loading: false, providers: [] }
 
 /**
  * Subscription usage for every provider this machine is authenticated with —
@@ -46,11 +44,7 @@ export async function refreshProviderUsage(options: { force?: boolean } = {}): P
         refresh: Boolean(options.force)
       })
 
-      $providerUsage.set({
-        fetchedAt: Date.now(),
-        loading: false,
-        providers: result?.providers ?? []
-      })
+      $providerUsage.set({ loading: false, providers: result?.providers ?? [] })
     } catch {
       // Fail-open, and keep whatever we already had: the panel showing
       // slightly old numbers beats it blanking on a dropped socket.

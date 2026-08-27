@@ -31,11 +31,11 @@ class AnthropicProfile(ProviderProfile):
         instead of using the aggregator's credential. A key-only login
         correctly surfaces as "no usage", not as a failure.
         """
-        from agent.account_usage import _fetch_anthropic_account_usage
+        from agent.account_usage import fetch_account_usage
         from agent.provider_usage_types import from_account_snapshot
 
         return from_account_snapshot(
-            _fetch_anthropic_account_usage(),
+            fetch_account_usage("anthropic"),
             provider="anthropic",
             display_name="Claude",
         )

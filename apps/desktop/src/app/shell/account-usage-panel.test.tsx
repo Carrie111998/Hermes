@@ -35,7 +35,7 @@ const copilot: ProviderUsageSnapshot = {
 }
 
 function seed(providers: ProviderUsageSnapshot[]) {
-  $providerUsage.set({ fetchedAt: Date.now(), loading: false, providers })
+  $providerUsage.set({ loading: false, providers })
 }
 
 afterEach(() => {

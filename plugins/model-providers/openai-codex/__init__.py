@@ -22,7 +22,7 @@ class CodexProfile(ProviderProfile):
         credential pool entirely (the hook's contract — see
         ``ProviderProfile.fetch_usage``).
         """
-        from agent.account_usage import _fetch_codex_account_usage
+        from agent.account_usage import fetch_account_usage
         from agent.provider_usage_types import from_account_snapshot
 
         token = getattr(credential, "runtime_api_key", None) or getattr(
@@ -35,7 +35,7 @@ class CodexProfile(ProviderProfile):
         )
 
         return from_account_snapshot(
-            _fetch_codex_account_usage(base_url=resolved_base, api_key=token),
+            fetch_account_usage("openai-codex", base_url=resolved_base, api_key=token),
             provider="openai-codex",
             display_name="Codex",
         )

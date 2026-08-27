@@ -112,8 +112,8 @@ export function ComposerStatusStack({ busy = false, gateway, queue, sessionId }:
 
   // Fetched here, not in the row: the card only renders when it has sections,
   // so the stack has to know whether the gauge has anything to say before it
-  // decides to open. Same read-only chars/4 RPC the statusbar gauge uses — no
-  // provider call, no prompt-cache impact.
+  // decides to open. The hook reads a shared per-session store, so N open
+  // tiles plus the statusbar collapse onto ONE backend call.
   const requestGateway = useCallback(
     <T,>(method: string, params?: Record<string, unknown>): Promise<T> =>
       gateway ? gateway.request<T>(method, params) : Promise.reject(new Error('gateway unavailable')),

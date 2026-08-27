@@ -10,7 +10,6 @@ Key quirks for the chat_completions subset:
   - GitHub Models reasoning extra_body (model-catalog gated)
 """
 
-from datetime import datetime, timezone
 from typing import Any
 
 from providers import register_provider
@@ -22,18 +21,6 @@ COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user"
 COPILOT_EDITOR_VERSION = "vscode/1.96.2"
 COPILOT_API_VERSION = "2025-04-01"
 
-
-def _copilot_reset(value):
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class CopilotProfile(ProviderProfile):
@@ -115,6 +102,7 @@ class CopilotProfile(ProviderProfile):
             UNIT_COUNT,
             ProviderUsage,
             UsageWindow,
+            to_datetime,
             to_decimal,
         )
 
@@ -135,7 +123,7 @@ class CopilotProfile(ProviderProfile):
             response.raise_for_status()
             payload = response.json() or {}
 
-        reset_at = _copilot_reset(payload.get("quota_reset_date_utc"))
+        reset_at = to_datetime(payload.get("quota_reset_date_utc"))
         snapshots = payload.get("quota_snapshots")
         windows = []
         if isinstance(snapshots, dict):
