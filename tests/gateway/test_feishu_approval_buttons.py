@@ -236,6 +236,51 @@ class TestResolveApproval:
         mock_resolve.assert_not_called()
         assert 5 in adapter._approval_state
 
+    @pytest.mark.asyncio
+    async def test_resolves_when_allowlist_matches_user_id(self):
+        """The resolver must accept the same ids the click handler accepted.
+
+        Allowlists may be configured with ``user_id`` values; if only the
+        handler matched them the click would render an approved card that never
+        unblocks the agent.
+        """
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"u_bob"}
+        adapter._approval_state[6] = {
+            "session_key": "sess-6",
+            "message_id": "msg_006",
+            "chat_id": "oc_12345",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(
+                6, "once", "Bob", open_id="ou_bob", user_id="u_bob", chat_id="oc_12345",
+            )
+
+        mock_resolve.assert_called_once_with("sess-6", "once")
+        assert 6 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_open_group_policy_does_not_authorize_resolution(self):
+        """Regression for #96045 on the resolver itself (defence in depth)."""
+        adapter = _make_adapter()
+        adapter._default_group_policy = "open"
+        adapter._group_policy = "open"
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._approval_state[7] = {
+            "session_key": "sess-7",
+            "message_id": "msg_007",
+            "chat_id": "oc_12345",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._resolve_approval(
+                7, "once", "Mallory", open_id="ou_attacker", chat_id="oc_12345",
+            )
+
+        mock_resolve.assert_not_called()
+        assert 7 in adapter._approval_state
+
 
 # ===========================================================================
 # _handle_card_action_event — non-approval card actions
@@ -402,6 +447,162 @@ class TestCardActionCallbackResponse:
         mock_submit.assert_not_called()
 
 
+    def test_open_group_policy_does_not_authorize_approval_click(self, _patch_callback_card_types):
+        """Regression for #96045 — ``policy=open`` admits chat, never approvals.
+
+        The group admission policy answers "may this person talk to the bot
+        here?". Using it as the approval gate let any group member resolve a
+        dangerous-command card once the policy was ``open``.
+        """
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._default_group_policy = "open"
+        adapter._group_policy = "open"
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._approval_state[9] = {
+            "session_key": "sess-9",
+            "message_id": "msg-9",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 9},
+            open_id="ou_attacker",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 9 in adapter._approval_state
+        mock_submit.assert_not_called()
+
+    def test_open_group_policy_does_not_authorize_update_prompt_click(self, _patch_callback_card_types):
+        """Regression for #96045 — same inversion on the update-prompt card."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._default_group_policy = "open"
+        adapter._group_policy = "open"
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._update_prompt_state[9] = {
+            "session_key": "sess-up-9",
+            "message_id": "msg_up_009",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 9},
+            open_id="ou_attacker",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        assert 9 in adapter._update_prompt_state
+        mock_submit.assert_not_called()
+
+    def test_open_group_policy_still_allows_configured_operator(self, _patch_callback_card_types):
+        """Hardening must not deny the operators who are actually allowlisted."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._default_group_policy = "open"
+        adapter._group_policy = "open"
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._approval_state[10] = {
+            "session_key": "sess-10",
+            "message_id": "msg-10",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 10},
+            open_id="ou_allowed",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is not None
+
+    def test_authorizes_operator_matched_by_user_id(self, _patch_callback_card_types):
+        """Allowlists may hold ``user_id`` values, so both ids must be matched."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"u_bob"}
+        adapter._approval_state[11] = {
+            "session_key": "sess-11",
+            "message_id": "msg-11",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 11},
+            open_id="ou_bob",
+        )
+        data.event.operator.user_id = "u_bob"
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is not None
+
+    def test_disabled_chat_rule_blocks_operator_click(self, _patch_callback_card_types):
+        """An explicitly locked channel must not resolve approvals either."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._group_rules = {
+            "oc_locked": feishu_module.FeishuGroupRule(policy="disabled"),
+        }
+        adapter._approval_state[12] = {
+            "session_key": "sess-12",
+            "message_id": "msg-12",
+            "chat_id": "oc_locked",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 12},
+            chat_id="oc_locked",
+            open_id="ou_allowed",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is None
+        assert 12 in adapter._approval_state
+        mock_submit.assert_not_called()
+
+    def test_click_allowed_when_no_operator_boundary_configured(self, _patch_callback_card_types):
+        """No admins and no allowlist is the pairing-mode/single-user default.
+
+        There is no privilege boundary to escalate across, so the click must
+        still resolve — the group *default* policy does not gate cards.
+        """
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = frozenset()
+        adapter._approval_state[13] = {
+            "session_key": "sess-13",
+            "message_id": "msg-13",
+            "chat_id": "oc_dm_1",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 13},
+            chat_id="oc_dm_1",
+            open_id="ou_solo",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is not None
+
     def test_update_prompt_chat_mismatch_returns_no_card(self, _patch_callback_card_types):
         adapter = _make_adapter()
         adapter._loop = MagicMock()
@@ -441,9 +642,32 @@ class TestResolveUpdatePrompt:
             "chat_id": "oc_12345",
         }
 
-        await adapter._resolve_update_prompt(1, "y", "Alice")
+        await adapter._resolve_update_prompt(
+            1, "y", "Alice", open_id="ou_alice", chat_id="oc_12345",
+        )
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
+
+    @pytest.mark.asyncio
+    async def test_unattributed_click_does_not_resolve(self, tmp_path, monkeypatch):
+        """An operator-less callback is unattributable and must fail closed.
+
+        ``_resolve_approval`` already refused these; the update-prompt resolver
+        used to skip its authorization check entirely when ``open_id`` was empty.
+        """
+        adapter = _make_adapter()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir()
+        adapter._update_prompt_state[1] = {
+            "session_key": "sess-up-1",
+            "message_id": "msg_up_003",
+            "chat_id": "oc_12345",
+        }
+
+        await adapter._resolve_update_prompt(1, "y", "Nobody", open_id="", chat_id="oc_12345")
+
+        assert not (tmp_path / ".hermes" / ".update_response").exists()
+        assert 1 in adapter._update_prompt_state
 
 
