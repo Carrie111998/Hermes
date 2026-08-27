@@ -1,5 +1,8 @@
-import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProfileModelPicker } from "./ProfileModelPicker";
 import {
   filterProfileModelChoices,
@@ -18,6 +21,20 @@ const choices: ProfileModelChoice[] = [
     label: "OpenAI Codex · GPT-5.6 Codex",
   },
 ];
+const scrollIntoView = vi.fn();
+
+beforeEach(() => {
+  scrollIntoView.mockReset();
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+    configurable: true,
+    value: scrollIntoView,
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("ProfileModelPicker", () => {
   it.each([
@@ -34,22 +51,78 @@ describe("ProfileModelPicker", () => {
     },
   );
 
-  it("renders every selectable row as a native button", () => {
-    const html = renderToStaticMarkup(
+  it("filters choices and selects a result", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(
       <ProfileModelPicker
         choices={choices}
         emptyLabel="No models"
         inheritLabel="Use default"
         loadingLabel="Loading models"
         selected={"nous\u0000deepseek-v4-pro"}
+        onSelect={onSelect}
+      />,
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "Search models" }), "codex");
+
+    expect(screen.queryByRole("option", { name: /DeepSeek/ })).toBeNull();
+    const result = screen.getByRole("option", { name: /GPT-5.6 Codex/ });
+    await user.click(result);
+
+    expect(onSelect).toHaveBeenCalledWith("openai-codex\u0000gpt-5.6-codex");
+  });
+
+  it("uses single-select semantics and keyboard navigation", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(
+      <ProfileModelPicker
+        choices={choices}
+        emptyLabel="No models"
+        inheritLabel="Use default"
+        loadingLabel="Loading models"
+        selected={"nous\u0000deepseek-v4-pro"}
+        onSelect={onSelect}
+      />,
+    );
+
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    const selected = screen.getByRole("option", { name: /DeepSeek/ });
+    const options = screen.getAllByRole("option");
+    expect(screen.getByRole("listbox", { name: "Models" })).toBeTruthy();
+    expect(options.every((option) => option.tagName === "BUTTON")).toBe(true);
+    expect(options.every((option) => option.getAttribute("type") === "button")).toBe(
+      true,
+    );
+    expect(selected.getAttribute("aria-selected")).toBe("true");
+    expect(selected.getAttribute("aria-pressed")).toBeNull();
+
+    await user.click(search);
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(selected);
+
+    await user.click(search);
+    await user.clear(search);
+    await user.type(search, "codex");
+    await user.keyboard("{Enter}");
+    expect(onSelect).toHaveBeenLastCalledWith(
+      "openai-codex\u0000gpt-5.6-codex",
+    );
+  });
+
+  it("scrolls the selected option into view", () => {
+    render(
+      <ProfileModelPicker
+        choices={choices}
+        emptyLabel="No models"
+        loadingLabel="Loading models"
+        selected={"openai-codex\u0000gpt-5.6-codex"}
         onSelect={() => undefined}
       />,
     );
 
-    expect(html).toContain('aria-label="Search models"');
-    expect(html).toContain("max-h-80");
-    expect(html.match(/<button/g)).toHaveLength(3);
-    expect(html.match(/type="button"/g)).toHaveLength(3);
-    expect(html).toContain('aria-pressed="true"');
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
   });
 });
