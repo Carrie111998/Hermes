@@ -44,6 +44,8 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 > iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 > ```
 > 安装完成后，可能需要重启终端，然后运行 `hermes` 开始对话。
+>
+> **Windows 通知：** 默认情况下，后台任务完成、需要确认审批、回复完成和会话结束时，Hermes 会发送 Windows toast 通知。通知默认仅在终端窗口未获得焦点时弹出，点击通知会回焦终端。可通过 `cli-config.yaml` 的 `display.notify_on_complete` 和 `display.notify_on_approval` 开关。
 
 安装后：
 

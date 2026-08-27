@@ -1649,6 +1649,12 @@ display:
   #   false: Silent (default)
   bell_on_complete: false
 
+  # Windows toast notifications from the CLI.
+  #   true:  Show toast on completion / approval prompts (default)
+  #   false: Disable Windows toast notifications
+  notify_on_complete: true
+  notify_on_approval: true
+
   # Show model reasoning/thinking before each response.
   # When enabled, a dim box shows the model's thought process above the response.
   # Toggle at runtime with /reasoning show or /reasoning hide.

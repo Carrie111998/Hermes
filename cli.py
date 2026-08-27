@@ -5070,6 +5070,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
+        # Windows toast notifications
+        self.notify_on_complete = CLI_CONFIG["display"].get("notify_on_complete", True)
+        self.notify_on_approval = CLI_CONFIG["display"].get("notify_on_approval", True)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", True)
         # reasoning_full: when reasoning display is on, print the post-response
@@ -13010,6 +13013,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 continue
             self._pending_input.put(synthetic_message)
             complete_event_delivery(event, claim)
+            if getattr(self, "notify_on_complete", True):
+                try:
+                    _task_desc = (synthetic_message or "后台任务已完成").replace("\n", " ").strip()
+                    self._fire_notification(
+                        "Hermes · 任务完成",
+                        (_task_desc or "后台任务已完成，点击查看")[:240],
+                    )
+                except Exception:
+                    pass
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -15903,6 +15915,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
 
+            if getattr(self, "notify_on_approval", True):
+                try:
+                    _need = (description or command or "").replace("\n", " ").strip()
+                    self._fire_notification(
+                        "Hermes · 需要你确认",
+                        ("需要你确认：" + _need)[:200],
+                        force=True,
+                    )
+                except Exception:
+                    pass
+
             _last_countdown_refresh = _time.monotonic()
             while True:
                 try:
@@ -16833,6 +16856,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             sys.stdout.flush()
             time.sleep(0.15)
 
+            if getattr(self, "notify_on_complete", True):
+                try:
+                    self._fire_notification("Hermes · 回复完成", "回复已完成，点击回到终端")
+                except Exception:
+                    pass
+
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
@@ -17244,6 +17273,59 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _snapshot_and_persist()
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Could not persist active CLI session before close: %s", e)
+
+    def _fire_notification(self, title: str, body: str, force: bool = False) -> None:
+        """Best-effort Windows toast notification.
+
+        Non-blocking and failure-swallowed so it can never interfere with
+        the interactive loop or shutdown.
+
+        By default (``force=False``) the toast is *suppressed* when the Hermes
+        terminal window is already the foreground window — the user is looking
+        at it, so a toast would be pure noise. Pass ``force=True`` for events
+        that demand attention regardless (e.g. an approval request the user may
+        have missed if the terminal is on another desktop).
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            if not force:
+                try:
+                    _notify_script = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        ".hermes", "scripts", "hermes_focus.py",
+                    )
+                    if os.path.exists(_notify_script):
+                        from .windows_focus import is_hermes_foreground
+                        if is_hermes_foreground(os.getpid()):
+                            return
+                except Exception:
+                    pass
+            _notify_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                ".hermes", "scripts", "hermes_notify.py",
+            )
+            if not os.path.exists(_notify_script):
+                return
+            cmd = [
+                sys.executable, _notify_script,
+                "--title", title,
+                "--body", body,
+            ]
+            if os.getpid():
+                cmd.extend(["--pid", str(os.getpid())])
+            subprocess.run(cmd, check=False)
+        except Exception:
+            pass
+
+    def _notify_session_ended(self) -> None:
+        """Best-effort Windows toast when the Hermes CLI session ends."""
+        if sys.platform != "win32":
+            return
+        try:
+            self._fire_notification("Hermes", "点击回到 Hermes")
+        except Exception:
+            pass
 
     def _print_exit_summary(self, clear_screen: bool = True):
         """Print session resume info on exit, similar to Claude Code.
