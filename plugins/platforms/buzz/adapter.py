@@ -25,11 +25,12 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            reaction_only_users: []    # acknowledge explicit tags without dispatching; allowed_users wins on overlap
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_REACTION_ONLY_USERS, BUZZ_ALLOW_ALL_USERS
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
