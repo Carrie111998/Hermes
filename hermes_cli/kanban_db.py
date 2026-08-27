@@ -8047,6 +8047,159 @@ def schedule_task(
         return True
 
 
+# ---------------------------------------------------------------------------
+# Human approval gates (Option B: scheduled-parking + gate_state)
+# ---------------------------------------------------------------------------
+#
+# A gated task parks in the EXISTING ``scheduled`` status — already documented
+# as "intentionally not dispatchable" — with ``tasks.gate_state`` set. No new
+# status is introduced, so none of the literal status guards in this module
+# change, and a downgrade to a Hermes without this slice simply sees an
+# ordinary time-parked ``scheduled`` task that ``unblock_task`` can recover.
+#
+# The gate holds because of properties this module already has:
+#   * ``claim_task`` selects ``WHERE ... status = 'ready'`` — a parked task can
+#     never be claimed, so no worker is ever spawned on one.
+#   * ``recompute_ready`` reads ``status IN ('todo', 'blocked')`` — ``scheduled``
+#     is absent, so a gated task is never auto-promoted.
+#   * ``_parents_satisfied`` requires ``status IN ('done', 'archived')`` — a
+#     gated PARENT therefore does not satisfy its children's dependencies.
+#   * nothing auto-releases on ``scheduled_at``.
+#
+# AUTHORITY NOTE: ``release_plan_gate`` currently accepts a caller-supplied
+# ``actor`` string. That is NOT yet proof of human intent — the attestation
+# broker that makes it one is a later commit in this series. Until then this
+# function must not be exposed through any model tool, and this slice must not
+# be described as delivering the approval boundary. The DB-layer guard below
+# still refuses delegated-child callers, matching every other mutator here.
+
+
+def gate_state_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the task's ``gate_state``, or ``None`` when it is not gated."""
+    row = conn.execute(
+        "SELECT gate_state FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row["gate_state"] if row else None
+
+
+def park_for_plan_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    project_id: str,
+    revision: int,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a task at the human plan gate.
+
+    Requesting a gate is not crossing one, so this is safe for a PM agent to
+    call. Returns False when the task is not in a parkable status, which makes
+    a double-park a no-op rather than an error.
+    """
+    _assert_not_delegated_child_mutation()
+    with write_txn(conn):
+        params: list[Any] = [task_id]
+        sql = """
+            UPDATE tasks
+               SET status       = 'scheduled',
+                   gate_state   = 'plan',
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL
+             WHERE id = ?
+               AND gate_state IS NULL
+               AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')
+        """
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        if conn.execute(sql, params).rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="gated", status="scheduled", summary=reason,
+        )
+        _append_event(
+            conn, task_id, "plan_awaiting_approval",
+            {"project_id": project_id, "revision": int(revision), "reason": reason},
+            run_id=run_id,
+        )
+        return True
+
+
+def release_plan_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    actor: str,
+    reason: Optional[str] = None,
+    expected_revision: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Release a task from the plan gate. The ONLY way out of ``gate_state='plan'``.
+
+    ``decision`` is ``"approved"`` or ``"rejected"``. An approval re-gates on
+    parent completion — landing in ``ready`` only when every parent is terminal,
+    otherwise ``todo`` — so releasing a gate can never jump a dependency. A
+    rejection returns the task to ``triage`` for a revised plan.
+
+    ``expected_revision`` guards against approving a plan that has since been
+    superseded: when supplied it must equal the project's current
+    ``plan_revision``, else the release fails safely and the task stays gated.
+
+    Returns ``(ok, reason_on_failure)``.
+    """
+    _assert_not_delegated_child_mutation()
+    if decision not in ("approved", "rejected"):
+        raise ValueError("decision must be 'approved' or 'rejected'")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, gate_state FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        if row["gate_state"] != "plan":
+            return False, "task is not parked at the plan gate"
+        if row["status"] != "scheduled":
+            return False, f"gated task in unexpected status {row['status']!r}"
+
+        if expected_revision is not None:
+            prow = conn.execute(
+                "SELECT p.plan_revision AS rev FROM pm_projects p "
+                "JOIN task_events e ON e.task_id = ? "
+                "WHERE p.id = json_extract(e.payload, '$.project_id') "
+                "AND e.kind = 'plan_awaiting_approval' "
+                "ORDER BY e.id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if prow is not None and int(prow["rev"]) != int(expected_revision):
+                return False, (
+                    f"stale plan: expected revision {expected_revision}, "
+                    f"project is at {prow['rev']}"
+                )
+
+        if decision == "approved":
+            landing = "ready" if _parents_satisfied(conn, task_id) else "todo"
+        else:
+            landing = "triage"
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, gate_state = NULL "
+            "WHERE id = ? AND status = 'scheduled' AND gate_state = 'plan'",
+            (landing, task_id),
+        )
+        if cur.rowcount != 1:
+            # Lost a race with a concurrent release.
+            return False, "gate was released concurrently"
+        _append_event(
+            conn, task_id,
+            "plan_approved" if decision == "approved" else "plan_rejected",
+            {"actor": actor, "reason": reason, "landing_status": landing},
+        )
+        return True, None
+
+
 # Dispatcher (one-shot pass)
 # ---------------------------------------------------------------------------
 
