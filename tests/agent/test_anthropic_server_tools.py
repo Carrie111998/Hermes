@@ -165,12 +165,60 @@ class TestReplaySanitize:
                 {"type": "text", "text": "  "},
             ],
         })
-        # non-text result rows and blank text rows are dropped; text survives
-        assert out == {"type": "text", "text": "Example — the example domain."}
+        # result rows render as "url — title" lines and text parts survive in
+        # content order; blank text rows are dropped
+        assert out == {
+            "type": "text",
+            "text": "https://example.com — Example\n\nExample — the example domain.",
+        }
+
+    def test_web_search_tool_result_documented_shape_carried_not_dropped(self):
+        # Per the Messages API the documented content is web_search_result
+        # rows ONLY (no text parts), optionally plus a
+        # web_search_tool_result_error — previously the whole block was
+        # silently dropped on this shape (#92076).
+        out = _sanitize_replay_block({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_2",
+            "content": [
+                {"type": "web_search_result", "url": "https://example.com/a",
+                 "title": "Example A", "encrypted_content": "enc", "page_age": "2026-01-01"},
+                {"type": "web_search_result", "url": "https://example.com/b"},
+                {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"},
+            ],
+        })
+        # title omitted → bare url; encrypted_content/page_age/error carry nothing
+        assert out == {
+            "type": "text",
+            "text": "https://example.com/a — Example A\n\nhttps://example.com/b",
+        }
+
+    def test_web_search_tool_result_mixed_content_carries_text_and_results(self):
+        out = _sanitize_replay_block({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_3",
+            "content": [
+                {"type": "web_search_result", "url": "https://docs.example.com",
+                 "title": "Docs"},
+                {"type": "text", "text": "Top hit summarizes the domain."},
+                {"type": "text", "text": "   "},
+                {"type": "web_search_result", "title": "row without a url is skipped"},
+            ],
+        })
+        # both kinds survive in content order; blank text and url-less rows drop
+        assert out == {
+            "type": "text",
+            "text": "https://docs.example.com — Docs\n\nTop hit summarizes the domain.",
+        }
 
     def test_bare_blocks_dropped(self):
         assert _sanitize_replay_block({"type": "server_tool_use", "id": "x"}) is None
         assert _sanitize_replay_block({"type": "web_search_tool_result"}) is None
+        # rows without a url carry nothing → block still dropped
+        assert _sanitize_replay_block({
+            "type": "web_search_tool_result",
+            "content": [{"type": "web_search_result", "title": "No URL"}],
+        }) is None
 
     def test_content_part_path_also_converted(self):
         out = _convert_content_part_to_anthropic({

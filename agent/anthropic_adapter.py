@@ -2169,8 +2169,15 @@ def _sanitize_replay_block(b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # from the fields the server tool populates — the model loses only the
         # raw result payload it already consumed, and the replay stays
         # schema-valid on endpoints that don't tolerate unknown block types.
-        # Returns None for a block with no extractable text so a bare marker
-        # is dropped rather than replayed as a blank text block (#69512).
+        # Returns None for a block with nothing to carry (no usable text
+        # parts or web_search_result rows) so a bare marker is dropped rather
+        # than replayed as a blank text block (#69512).
+        # NOTE: if #68337 (native web search/fetch) lands with overlapping
+        # branches earlier in this if-chain, this branch must be made
+        # endpoint-aware (thread base_url down from
+        # convert_messages_to_anthropic so native blocks are kept where valid
+        # and converted to the text carrier where not) or it becomes
+        # unreachable — coordinate before merging both.
         if btype == "server_tool_use":
             name = str(b.get("name") or "").strip()
             if not name:
@@ -2179,15 +2186,24 @@ def _sanitize_replay_block(b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         content = b.get("content")
         if not isinstance(content, list) or not content:
             return None
-        texts = [
-            str(part.get("text"))
-            for part in content
-            if isinstance(part, dict)
-            and part.get("type") == "text"
-            and isinstance(part.get("text"), str)
-            and part.get("text").strip()
-        ]
-        return {"type": "text", "text": "\n\n".join(texts)} if texts else None
+        # Documented shape: content is web_search_result rows ({type, url,
+        # title, encrypted_content, page_age}) with NO text parts, optionally
+        # plus a web_search_tool_result_error. Render each row as a
+        # "url — title" line (title only when present; rows without a url are
+        # skipped) alongside any usable text parts, preserving content order.
+        lines: List[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                if isinstance(part.get("text"), str) and part["text"].strip():
+                    lines.append(part["text"])
+            elif part.get("type") == "web_search_result":
+                url = part.get("url")
+                if isinstance(url, str) and url.strip():
+                    title = part.get("title")
+                    lines.append(f"{url} — {title}" if title else url)
+        return {"type": "text", "text": "\n\n".join(lines)} if lines else None
     # Unknown/unsupported block type on the input path — drop rather than risk
     # another "Extra inputs are not permitted".
     return None
