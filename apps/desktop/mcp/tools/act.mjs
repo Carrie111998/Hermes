@@ -4,6 +4,8 @@
  * DESKTOP_DEBUG_MCP_ALLOW_ACT=1.
  */
 
+import { requireSelector } from './read.mjs'
+
 async function centerOf(cdp, sel) {
   const box = await cdp.eval(`(() => {
     const el = document.querySelector(${JSON.stringify(sel)})
@@ -117,9 +119,11 @@ export async function handleAct(name, args, ctx) {
 
   switch (name) {
     case 'ui_click':
-      return click(cdp, ctx.resolveSelector(args.selector))
+      // A3: same friendly empty-selector guard the read tools use — a raw
+      // renderer SyntaxError is useless to the agent.
+      return click(cdp, requireSelector(ctx.resolveSelector(args.selector)))
     case 'ui_type':
-      return type(cdp, ctx.resolveSelector(args.selector), args.text || '')
+      return type(cdp, requireSelector(ctx.resolveSelector(args.selector)), args.text || '')
     case 'ui_press':
       return press(cdp, args.key)
     case 'ui_eval':

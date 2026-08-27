@@ -11,7 +11,7 @@
 export const resolveSelector = (sel, SELECTORS) => (SELECTORS && SELECTORS[sel]) || sel
 
 /** Friendly guard: a selector must be a non-empty, non-whitespace string. */
-function requireSelector(sel) {
+export function requireSelector(sel) {
   if (typeof sel !== 'string' || !sel.trim()) {
     throw new Error('selector required: pass a SELECTORS key (composer, threadViewport, ...) or a CSS selector')
   }

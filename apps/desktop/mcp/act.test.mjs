@@ -85,3 +85,24 @@ test('actTools schema requires correct inputs', () => {
   const press = actTools.find((t) => t.name === 'ui_press')
   assert.deepEqual(press.inputSchema.required, ['key'])
 })
+
+// --- A3: act tools share the friendly empty-selector guard ---
+
+test('A3 (RED): ui_click with empty selector rejects friendly BEFORE any CDP send', async () => {
+  const cdp = mockCdp()
+  await assert.rejects(
+    () => handleAct('ui_click', { selector: '' }, ctx(cdp)),
+    /selector required/
+  )
+  assert.equal(cdp.sends.length, 0, 'no CDP traffic may happen for a bad selector')
+  assert.equal(cdp.evals.length, 0, 'no renderer eval may happen for a bad selector')
+})
+
+test('A3 (RED): ui_type with whitespace selector — same friendly guard', async () => {
+  const cdp = mockCdp()
+  await assert.rejects(
+    () => handleAct('ui_type', { selector: '   ', text: 'x' }, ctx(cdp)),
+    /selector required/
+  )
+  assert.equal(cdp.sends.length + cdp.evals.length, 0, 'no CDP traffic for a bad selector')
+})
