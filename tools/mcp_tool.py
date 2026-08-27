@@ -114,7 +114,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -6067,7 +6067,111 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _hermes_session_call_meta() -> dict[str, Any]:
+    """Return trusted per-call Hermes session metadata for an opted-in MCP.
+
+    The model cannot supply or override this envelope: it is attached through
+    MCP's request ``_meta`` field after tool arguments have already been
+    selected. Keeping identity out of ``arguments`` lets a local bridge enforce
+    exact platform/turn authority without accepting a model-authored platform
+    or message-id claim.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return {"version": 1}
+
+    names = {
+        "platform": "HERMES_SESSION_PLATFORM",
+        "source": "HERMES_SESSION_SOURCE",
+        "chat_id": "HERMES_SESSION_CHAT_ID",
+        "message_id": "HERMES_SESSION_MESSAGE_ID",
+        "session_id": "HERMES_SESSION_ID",
+        "profile": "HERMES_SESSION_PROFILE",
+    }
+    payload: dict[str, Any] = {"version": 1}
+    for key, env_name in names.items():
+        value = str(get_session_env(env_name, "") or "")
+        if value:
+            payload[key] = value
+    if not payload.get("session_id"):
+        session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "")
+        if session_key:
+            payload["session_id"] = session_key
+    try:
+        from tools.approval import get_current_observability_context
+
+        tool_call_id = str(
+            get_current_observability_context().get("tool_call_id") or ""
+        )
+        if tool_call_id:
+            payload["tool_call_id"] = tool_call_id
+    except Exception:
+        pass
+    return payload
+
+
+def _prepare_session_capability(
+    server_name: str,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mint one package-bound capability before any MCP transport attempt."""
+
+    expected_fields = {
+        "audience", "binding", "package_digest", "package_root",
+    }
+    if not isinstance(authority, Mapping) or set(authority) != expected_fields:
+        raise PermissionError("Portable MCP capability authority is malformed")
+    audience = authority.get("audience")
+    binding = authority.get("binding")
+    granted_digest = authority.get("package_digest")
+    package_root = authority.get("package_root")
+    if not all(isinstance(value, str) and value for value in authority.values()):
+        raise PermissionError("Portable MCP capability authority is malformed")
+
+    # Re-read profile consent and re-hash the package at the moment authority
+    # is minted.  Discovery-time approval cannot survive an on-disk package
+    # replacement, and a hand-written native MCP config cannot self-authorize.
+    from hermes_cli.agent_plugins import (
+        canonical_package_digest,
+        package_has_executable_cache,
+    )
+    from hermes_cli.plugins import _trusted_portable_session_capability_bindings
+    from tools.mcp_capability import CAPABILITY_META_KEY, mint_mcp_capability
+
+    approved = _trusted_portable_session_capability_bindings().get(binding)
+    import hmac
+
+    if not isinstance(approved, str) or not hmac.compare_digest(
+        approved, granted_digest
+    ):
+        raise PermissionError("Portable MCP capability grant is absent or stale")
+    if package_has_executable_cache(package_root):
+        raise PermissionError("Portable MCP package contains executable bytecode cache")
+    actual_digest = canonical_package_digest(package_root)
+    if not hmac.compare_digest(actual_digest, granted_digest):
+        raise PermissionError("Portable MCP package changed after approval")
+
+    capability = mint_mcp_capability(
+        audience=audience,
+        binding=binding,
+        package_digest=granted_digest,
+        workflow=tool_name,
+        arguments=arguments,
+        session=_hermes_session_call_meta(),
+    )
+    return {CAPABILITY_META_KEY: capability}
+
+
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    *,
+    session_capability: Mapping[str, Any] | None = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -6106,6 +6210,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     f"approaches or ask the user to check the MCP server."
                 )
             # Cooldown elapsed → fall through as a half-open probe.
+
+        # Snapshot once per logical call, outside the coroutine that may run a
+        # second time during auth/session recovery.  Both transport attempts
+        # therefore carry a byte-identical nonce, expiry, identities and
+        # arguments digest.
+        call_meta: dict[str, Any] | None = None
+        if session_capability is not None:
+            try:
+                call_meta = _prepare_session_capability(
+                    server_name, tool_name, args, session_capability
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Refusing portable MCP capability for %s/%s: %s",
+                    server_name,
+                    tool_name,
+                    exc,
+                )
+                return tool_error("Portable MCP workflow authorization failed")
 
         server = _get_connected_server_for_call(server_name)
         if not server:
@@ -6153,6 +6276,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
+                    call_kwargs: dict[str, Any] = {}
+                    if call_meta is not None:
+                        call_kwargs["meta"] = call_meta
                     # Fast-fail (#81995): a stdio subprocess that is already
                     # dead must not own this call slot — fail immediately
                     # instead of waiting out the full tool timeout on a
@@ -6182,7 +6308,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    _call_coro = server.session.call_tool(
+                        tool_name,
+                        arguments=args,
+                        **call_kwargs,
+                    )
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
@@ -7229,7 +7359,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    session_capability=config.get("session_capability"),
                 ),
                 "check_fn": check_fn,
             }
@@ -7515,7 +7648,12 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                raw_name,
+                tool_timeout,
+                session_capability=config.get("session_capability"),
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],

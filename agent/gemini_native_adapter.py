@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 from agent.bounded_response import read_streaming_error_body
+from agent.auxiliary_context import content_log_detail as _aux_content_log_detail
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
@@ -893,7 +894,10 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError:
-                logger.debug("Non-JSON Gemini SSE line: %s", data[:200])
+                logger.debug(
+                    "Non-JSON Gemini SSE line: %s",
+                    _aux_content_log_detail(data[:200]),
+                )
                 continue
             if isinstance(payload, dict):
                 yield payload

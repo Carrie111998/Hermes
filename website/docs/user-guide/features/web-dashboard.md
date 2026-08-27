@@ -320,8 +320,9 @@ Browse, search, and toggle installed skills and toolsets, and install new ones f
 
 ### MCP
 
-Manage [MCP](./mcp) servers without the CLI. The same `mcp_servers`
-block in `config.yaml` that `hermes mcp` reads from.
+Manage [MCP](./mcp) servers without the CLI. The page combines the
+profile-owned `mcp_servers` block from `config.yaml` with MCP servers supplied
+by enabled portable Agent Plugins.
 
 **Your MCP servers:**
 
@@ -330,6 +331,9 @@ block in `config.yaml` that `hermes mcp` reads from.
 - **Test** — connect to a server, list its tools, and disconnect — verifies the connection before the agent depends on it
 - **Remove** — delete a server from the config
 - Secret-shaped env values are redacted in the list view
+- **Agent Plugin MCPs** — shown as enabled, read-only entries with their owning
+  plugin and version. Enable, disable, update, or remove those servers through
+  the Plugins page so the package and its MCP cannot drift apart.
 
 **Catalog:** browse the Nous-approved MCP servers (the bundled `optional-mcps/`
 catalog) and install any of them with one click. Entries that need API keys

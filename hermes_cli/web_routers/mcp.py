@@ -61,17 +61,63 @@ _CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 @router.get("/api/mcp/servers")
 async def list_mcp_servers(profile: Optional[str] = None):
     from hermes_cli.mcp_config import _get_mcp_servers
+    from hermes_cli.plugins import PluginManager
 
     def _read():
         with _profile_scope(profile):
-            return _get_mcp_servers()
+            configured = _get_mcp_servers()
+            try:
+                managed = PluginManager().get_enabled_portable_mcp_server_descriptors(
+                    load_config()
+                )
+            except Exception:
+                _log.exception("Portable MCP dashboard discovery failed")
+                managed = []
+            return configured, managed
 
-    servers = await asyncio.to_thread(_read)
-    return {
-        "servers": [
-            _mcp_server_summary(name, cfg) for name, cfg in sorted(servers.items())
-        ]
-    }
+    configured, managed = await asyncio.to_thread(_read)
+    summaries = []
+    for name, cfg in sorted(configured.items()):
+        summary = _mcp_server_summary(name, cfg)
+        summary.update(
+            {
+                "display_name": name,
+                "source": "profile",
+                "managed_by": None,
+                "plugin_version": None,
+                "read_only": False,
+            }
+        )
+        summaries.append(summary)
+
+    for descriptor in managed:
+        name = descriptor["name"]
+        if name in configured:
+            # Runtime loading gives an explicitly configured server priority
+            # over a portable MCP with the same internal name.
+            continue
+        plugin = descriptor["plugin"]
+        server_name = descriptor["server_name"]
+        summary = {
+            "name": name,
+            "display_name": f"{plugin} / {server_name}",
+            "transport": descriptor["transport"],
+            "url": None,
+            "command": None,
+            "args": [],
+            "env": {},
+            "auth": None,
+            "enabled": True,
+            "tools": None,
+            "source": "plugin",
+            "managed_by": plugin,
+            "plugin_version": descriptor["plugin_version"] or None,
+            "read_only": True,
+        }
+        summaries.append(summary)
+
+    summaries.sort(key=lambda item: (item["display_name"].casefold(), item["name"]))
+    return {"servers": summaries}
 
 
 @router.post("/api/mcp/servers")

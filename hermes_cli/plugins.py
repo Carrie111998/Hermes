@@ -37,6 +37,7 @@ import asyncio
 import contextvars
 import copy
 import hashlib
+import hmac
 import importlib.metadata
 import importlib.util
 import inspect
@@ -693,6 +694,42 @@ def _portable_skill_namespace(key: str) -> str:
     slug = slug.strip("-_") or "plugin"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
     return f"agent-plugin-{slug}-{digest}"
+
+
+def _trusted_portable_session_capability_bindings() -> Dict[str, str]:
+    """Return exact profile-approved ``binding -> package digest`` grants.
+
+    Legacy string entries intentionally do not grant authority: a name-only
+    grant survives arbitrary package replacement.  Object grants are accepted
+    only with the exact two-field shape ``{binding, digest}``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        plugins = (load_config() or {}).get("plugins") or {}
+    except Exception:
+        return {}
+    if not isinstance(plugins, Mapping):
+        return {}
+    raw = plugins.get("trusted_session_context") or []
+    if not isinstance(raw, list):
+        return {}
+    digest_re = re.compile(r"^sha256:[0-9a-f]{64}$")
+    result: Dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {"binding", "digest"}:
+            continue
+        binding = item.get("binding")
+        digest = item.get("digest")
+        if (
+            isinstance(binding, str)
+            and binding == binding.strip()
+            and 0 < len(binding.encode("utf-8")) <= 256
+            and isinstance(digest, str)
+            and digest_re.fullmatch(digest) is not None
+        ):
+            result[binding] = digest
+    return result
 
 
 def _display_author(value: object) -> str:
@@ -4579,22 +4616,24 @@ class PluginManager:
 
         return manifests
 
-    def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
-        """Probe enabled portable MCP packages without loading plugins.
+    def get_enabled_portable_mcp_server_descriptors(
+        self, raw_config: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Describe enabled portable MCP packages without loading plugins.
 
         The directory manifest collection is shared with full discovery, so
         native ``plugin.yaml`` precedence, source ordering, depth limits, and
         project-plugin gating cannot diverge between startup and runtime.
         """
         if _env_enabled("HERMES_SAFE_MODE"):
-            return False
+            return []
 
         plugins_config = raw_config.get("plugins")
         if not isinstance(plugins_config, dict):
-            return False
+            return []
         enabled_value = plugins_config.get("enabled")
         if not isinstance(enabled_value, list):
-            return False
+            return []
         enabled = {value for value in enabled_value if isinstance(value, str)}
         disabled_value = plugins_config.get("disabled", [])
         disabled = (
@@ -4603,16 +4642,16 @@ class PluginManager:
             else set()
         )
         if not enabled:
-            return False
+            return []
 
         winners: Dict[str, PluginManifest] = {}
         for manifest in self._collect_directory_manifests():
             winners[manifest.key or manifest.name] = manifest
 
-        for manifest in winners.values():
+        descriptors: List[Dict[str, Any]] = []
+        for lookup_key, manifest in sorted(winners.items()):
             if not manifest.portable:
                 continue
-            lookup_key = manifest.key or manifest.name
             if lookup_key in disabled or manifest.name in disabled:
                 continue
             if lookup_key not in enabled and manifest.name not in enabled:
@@ -4620,20 +4659,42 @@ class PluginManager:
             try:
                 from hermes_cli.agent_plugins import _discover_mcp
 
-                if _discover_mcp(
+                servers = _discover_mcp(
                     Path(manifest.path),
                     get_hermes_home()
                     / "plugin-data"
                     / (manifest.skill_namespace or lookup_key),
                     [],
                     create_data=False,
-                ):
-                    return True
+                )
             except (OSError, RuntimeError, ValueError):
                 # Full discovery will report component diagnostics. Startup
                 # probing should fail closed for an unreadable package.
                 continue
-        return False
+            prefix = f"{manifest.skill_namespace}__"
+            for server_name, config in sorted(servers.items()):
+                descriptors.append(
+                    {
+                        "name": f"{prefix}{server_name}",
+                        "server_name": server_name,
+                        "plugin": manifest.name,
+                        "plugin_key": lookup_key,
+                        "plugin_version": manifest.version,
+                        "transport": (
+                            "http"
+                            if config.get("url")
+                            else "stdio"
+                            if config.get("command")
+                            else "unknown"
+                        ),
+                    }
+                )
+        return descriptors
+
+    def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
+        """Probe enabled portable MCP packages without loading plugins."""
+
+        return bool(self.get_enabled_portable_mcp_server_descriptors(raw_config))
 
     # -----------------------------------------------------------------------
     # Directory scanning
@@ -5395,6 +5456,7 @@ class PluginManager:
                         skill.name,
                         exc,
                     )
+            trusted_capabilities = _trusted_portable_session_capability_bindings()
             for server_name, config in package.mcp_servers.items():
                 internal_name = f"{manifest.skill_namespace}__{server_name}"
                 if internal_name in self._portable_mcp_servers:
@@ -5404,7 +5466,32 @@ class PluginManager:
                         internal_name,
                     )
                     continue
-                self._portable_mcp_servers[internal_name] = dict(config)
+                translated = dict(config)
+                requested = bool(translated.pop("request_session_capability", False))
+                binding = f"{lookup_key}:{server_name}"
+                granted_digest = trusted_capabilities.get(binding)
+                if requested and hmac.compare_digest(
+                    granted_digest or "", package.content_digest
+                ):
+                    translated["session_capability"] = {
+                        "audience": (
+                            f"com.hermes.mcp/portable/{package.name}/{server_name}"
+                        ),
+                        "binding": binding,
+                        "package_digest": package.content_digest,
+                        "package_root": str(package.root),
+                    }
+                elif requested:
+                    logger.warning(
+                        "Agent Plugin '%s' MCP server '%s' requested trusted "
+                        "session capability but exact digest approval '%s' is absent "
+                        "(loaded digest %s)",
+                        lookup_key,
+                        server_name,
+                        binding,
+                        package.content_digest,
+                    )
+                self._portable_mcp_servers[internal_name] = translated
             loaded.enabled = True
         except Exception as exc:
             loaded.error = str(exc)

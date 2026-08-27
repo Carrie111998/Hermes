@@ -9,8 +9,10 @@ Python code.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Tuple
@@ -70,10 +72,182 @@ class AgentPluginPackage:
     description: str
     root: Path
     data_root: Path
+    content_digest: str
     manifest: Mapping[str, Any]
     skills: Tuple[AgentPluginSkill, ...]
     mcp_servers: Mapping[str, Dict[str, Any]]
     diagnostics: Tuple[AgentPluginDiagnostic, ...]
+
+
+_DIGEST_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+_DIGEST_EXCLUDED_FILES = frozenset({".DS_Store"})
+
+
+def canonical_package_digest(plugin_root: Path) -> str:
+    """Hash the exact portable package contents using a stable file framing.
+
+    VCS metadata and generated interpreter/test caches are intentionally not
+    authority-bearing.  Everything else is: replacing code, manifests,
+    documentation, or bundled assets changes the grant digest.  Symlinks and
+    special files fail closed because their meaning is installation-dependent.
+    """
+
+    root = Path(plugin_root).resolve(strict=True)
+    if not root.is_dir():
+        raise AgentPluginError("plugin root must be a directory")
+    entries: list[tuple[str, Path]] = []
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        kept_dirs: list[str] = []
+        for name in sorted(dirs):
+            path = current_path / name
+            if name in _DIGEST_EXCLUDED_DIRS:
+                continue
+            if path.is_symlink():
+                entries.append((path.relative_to(root).as_posix(), path))
+                continue
+            kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in sorted(files):
+            path = current_path / name
+            if (
+                name in _DIGEST_EXCLUDED_FILES
+                or name.endswith((".pyc", ".pyo"))
+            ):
+                continue
+            if not path.is_symlink() and not path.is_file():
+                raise AgentPluginError(
+                    "portable package digest allows regular files only"
+                )
+            relative = path.relative_to(root).as_posix()
+            entries.append((relative, path))
+
+    digest = hashlib.sha256(b"hermes-agent-plugin-package-v1\0")
+    for relative, path in sorted(entries):
+        encoded_name = relative.encode("utf-8")
+        try:
+            content = (
+                b"symlink-v1\0" + os.readlink(path).encode("utf-8")
+                if path.is_symlink()
+                else b"file-v1\0" + path.read_bytes()
+            )
+        except (OSError, UnicodeError) as exc:
+            raise AgentPluginError(
+                f"portable package file cannot be read: {relative}"
+            ) from exc
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _package_contains_symlink(root: Path) -> bool:
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in (*dirs, *files):
+            if (current_path / name).is_symlink():
+                return True
+    return False
+
+
+def package_has_executable_cache(plugin_root: Path) -> bool:
+    """Return true when Python could execute ungranted cached bytecode."""
+
+    root = Path(plugin_root).resolve(strict=True)
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        kept: list[str] = []
+        for name in dirs:
+            if name in {".git", ".hg", ".svn"}:
+                continue
+            if name == "__pycache__":
+                return True
+            kept.append(name)
+        dirs[:] = kept
+        if any(name.endswith((".pyc", ".pyo")) for name in files):
+            return True
+        # A symlink named like executable cache is authority-unsafe too.
+        if any(
+            (current_path / name).is_symlink()
+            and (name == "__pycache__" or name.endswith((".pyc", ".pyo")))
+            for name in (*dirs, *files)
+        ):
+            return True
+    return False
+
+
+def _harden_capability_launch(
+    server: Dict[str, Any], plugin_root: Path
+) -> str | None:
+    """Pin a privileged stdio launch to reviewed package or host bytes.
+
+    Returns a diagnostic message on failure. Direct Python launches are
+    rewritten away from mutable ``PATH`` resolution to the interpreter already
+    in Hermes' TCB. Other runtimes must be an executable regular file reached
+    through the package's translated ``./...`` command form and therefore be
+    included in the package digest.
+    """
+
+    command = server.get("command")
+    if not isinstance(command, str) or not command:
+        return "sessionCapability requires a pinned stdio executable"
+    command_path = Path(command)
+    python_name = re.fullmatch(
+        r"python(?:[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?",
+        command.lower(),
+    )
+    if not command_path.is_absolute() and python_name is not None:
+        args = server.get("args")
+        env = server.get("env")
+        if not (
+            isinstance(args, list)
+            and len(args) >= 4
+            and args[:3] == ["-I", "-S", "-B"]
+            and isinstance(env, Mapping)
+            and env.get("PYTHONDONTWRITEBYTECODE") == "1"
+        ):
+            return (
+                "sessionCapability Python servers require -I -S -B, an in-package "
+                "script, and PYTHONDONTWRITEBYTECODE=1"
+            )
+        script = Path(args[3])
+        if (
+            not script.is_absolute()
+            or not _inside(script, plugin_root)
+            or script.is_symlink()
+            or not script.is_file()
+        ):
+            return "sessionCapability Python script must be a regular in-package file"
+        try:
+            host_python = Path(sys.executable).resolve(strict=True)
+        except OSError:
+            return "sessionCapability host Python executable is unavailable"
+        if not host_python.is_file() or not os.access(host_python, os.X_OK):
+            return "sessionCapability host Python executable is unavailable"
+        server["command"] = str(host_python)
+        return None
+
+    if not command_path.is_absolute():
+        return "sessionCapability rejects bare ambient executables"
+    if (
+        not _inside(command_path, plugin_root)
+        or command_path.is_symlink()
+        or not command_path.is_file()
+        or not os.access(command_path, os.X_OK)
+    ):
+        return "sessionCapability executable must be a regular in-package file"
+    return None
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -531,16 +705,79 @@ def load_agent_plugin(plugin_root: Path, data_root: Path) -> AgentPluginPackage:
     root = Path(plugin_root).resolve(strict=True)
     if not root.is_dir():
         raise AgentPluginError("plugin root must be a directory")
+    content_digest = canonical_package_digest(root)
     manifest, diagnostics = _validate_manifest(root)
     resolved_data = Path(data_root).resolve(strict=False)
     skills = _discover_skills(root, diagnostics)
     mcp_servers = _discover_mcp(root, resolved_data, diagnostics)
+    # Hermes-specific request for a host-minted, call-bound capability.  The
+    # package cannot grant this privilege to itself: PluginManager separately
+    # requires a profile grant bound to this exact content digest.
+    hermes_extension = (manifest.get("extensions") or {}).get("com.hermes")
+    capability_names: set[str] = set()
+    if isinstance(hermes_extension, dict):
+        raw_capability = hermes_extension.get("sessionCapability")
+        if isinstance(raw_capability, list) and all(
+            isinstance(value, str) and value for value in raw_capability
+        ):
+            capability_names = set(raw_capability)
+        elif raw_capability is not None:
+            diagnostics.append(
+                AgentPluginDiagnostic(
+                    "manifest",
+                    "com.hermes.sessionCapability must be an array of MCP server names",
+                )
+            )
+        if "forwardSessionContext" in hermes_extension:
+            diagnostics.append(
+                AgentPluginDiagnostic(
+                    "manifest",
+                    "com.hermes.forwardSessionContext is unsupported; request sessionCapability instead",
+                )
+            )
+    for server_name in capability_names:
+        server = mcp_servers.get(server_name)
+        if server is None:
+            diagnostics.append(
+                AgentPluginDiagnostic(
+                    f"mcp:{server_name}",
+                    "sessionCapability names no valid packaged MCP server",
+                )
+            )
+            continue
+        if _package_contains_symlink(root):
+            diagnostics.append(
+                AgentPluginDiagnostic(
+                    f"mcp:{server_name}",
+                    "sessionCapability is unavailable for packages containing symlinks",
+                )
+            )
+            continue
+        if package_has_executable_cache(root):
+            diagnostics.append(
+                AgentPluginDiagnostic(
+                    f"mcp:{server_name}",
+                    "sessionCapability is unavailable while Python bytecode caches exist",
+                )
+            )
+            continue
+        launch_error = _harden_capability_launch(server, root)
+        if launch_error is not None:
+            diagnostics.append(
+                AgentPluginDiagnostic(
+                    f"mcp:{server_name}",
+                    launch_error,
+                )
+            )
+            continue
+        server["request_session_capability"] = True
     return AgentPluginPackage(
         name=manifest["name"],
         version=manifest.get("version", ""),
         description=manifest.get("description", ""),
         root=root,
         data_root=resolved_data,
+        content_digest=content_digest,
         manifest=dict(manifest),
         skills=skills,
         mcp_servers=mcp_servers,
