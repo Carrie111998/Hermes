@@ -975,6 +975,16 @@ def is_local_endpoint(base_url: str) -> bool:
     return False
 
 
+def _local_probe_transport(base_url: str):
+    """Route local metadata probes directly while retaining environment CAs."""
+    if not is_local_endpoint(base_url):
+        return None
+
+    import httpx
+
+    return httpx.HTTPTransport()
+
+
 def _localhost_to_ipv4(url: str) -> str:
     """Rewrite a ``localhost`` HOST to ``127.0.0.1`` in a probe URL.
 
@@ -1069,7 +1079,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
         with httpx.Client(
             timeout=2.0,
             headers=headers,
-            trust_env=not is_local_endpoint(server_url),
+            transport=_local_probe_transport(server_url),
         ) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
@@ -1999,7 +2009,7 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
         with httpx.Client(
             timeout=3.0,
             headers=headers,
-            trust_env=not is_local_endpoint(server_url),
+            transport=_local_probe_transport(server_url),
         ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
@@ -2061,7 +2071,7 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
         with httpx.Client(
             timeout=3.0,
             headers=headers,
-            trust_env=not is_local_endpoint(server_url),
+            transport=_local_probe_transport(server_url),
         ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
@@ -2145,7 +2155,7 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
         with httpx.Client(
             timeout=5.0,
             headers=headers,
-            trust_env=not is_local_endpoint(server_url),
+            transport=_local_probe_transport(server_url),
         ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": model})
             if resp.status_code != 200:
@@ -2334,7 +2344,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         with httpx.Client(
             timeout=3.0,
             headers=headers,
-            trust_env=not is_local_endpoint(server_url),
+            transport=_local_probe_transport(server_url),
         ) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
