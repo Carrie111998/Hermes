@@ -13,8 +13,10 @@ import logging
 import queue
 import re
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable, Deque, Iterable, Optional
 from urllib.parse import urlparse
 
@@ -28,6 +30,68 @@ class MusicResolutionError(RuntimeError):
     """A user-facing media-resolution failure."""
 
 
+_NATURAL_WAKE_RE = re.compile(
+    r"^\s*(?:hey[\s,]+)?jarvis\s*[,;:\-]?\s+(?:please\s+)?(.+?)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_NATURAL_PLAY_RE = re.compile(r"^play\s+(.+?)$", re.IGNORECASE)
+_NATURAL_CONTROL_PATTERNS = (
+    ("pause", re.compile(r"^(?:pause|hold)(?:\s+(?:the\s+)?(?:song|music|track|playback))?$", re.I)),
+    ("resume", re.compile(r"^(?:resume|continue)(?:\s+(?:the\s+)?(?:song|music|track|playback))?$", re.I)),
+    ("resume", re.compile(r"^play(?:\s+(?:the\s+)?(?:current\s+)?(?:song|music|track))?$", re.I)),
+    ("skip", re.compile(r"^(?:skip|next)(?:\s+(?:(?:the|this)\s+)?(?:song|music|track))?$", re.I)),
+    ("skip", re.compile(r"^play\s+(?:the\s+)?next(?:\s+(?:song|track))?$", re.I)),
+    ("previous", re.compile(r"^(?:previous|back)(?:\s+(?:song|track))?$", re.I)),
+    ("previous", re.compile(r"^(?:go\s+back\s+to|play)\s+(?:the\s+)?previous(?:\s+(?:song|track))?$", re.I)),
+    ("repeat", re.compile(r"^(?:repeat|loop)(?:\s+(?:(?:the|this)\s+)?(?:song|music|track))?$", re.I)),
+    ("queue", re.compile(r"^(?:show|display|list)(?:\s+(?:the\s+)?)?(?:music\s+)?queue$", re.I)),
+    ("clear", re.compile(r"^clear(?:\s+(?:the\s+)?)?(?:music\s+)?queue$", re.I)),
+)
+
+
+def _natural_music_body(text: str) -> Optional[str]:
+    match = _NATURAL_WAKE_RE.match(str(text or ""))
+    return match.group(1).strip() if match else None
+
+
+def parse_natural_music_control(text: str) -> Optional[str]:
+    """Return a deterministic playback action from an explicit Jarvis command."""
+    body = _natural_music_body(text)
+    if not body:
+        return None
+    for action, pattern in _NATURAL_CONTROL_PATTERNS:
+        if pattern.fullmatch(body):
+            return action
+    return None
+
+
+def parse_natural_play_request(text: str) -> Optional[str]:
+    """Return the media query from an explicit natural Jarvis play command."""
+    if parse_natural_music_control(text) is not None:
+        return None
+    body = _natural_music_body(text)
+    match = _NATURAL_PLAY_RE.fullmatch(body or "")
+    if not match:
+        return None
+    query = match.group(1).strip()
+    return query or None
+
+
+def discord_no_mentions():
+    import discord as discord_module
+
+    allowed_mentions_cls = discord_module.AllowedMentions
+    none_factory = getattr(allowed_mentions_cls, "none", None)
+    if callable(none_factory):
+        return none_factory()
+    return allowed_mentions_cls(
+        everyone=False,
+        roles=False,
+        users=False,
+        replied_user=False,
+    )
+
+
 class TrackResolver:
     """Turn user input into queue metadata and fresh playable stream URLs."""
 
@@ -35,17 +99,6 @@ class TrackResolver:
     TRUSTED_STREAM_HOSTS = (
         "googlevideo.com",
         "youtube.com",
-        "sndcdn.com",
-        "soundcloud.com",
-        "bcbits.com",
-        "bandcamp.com",
-        "vimeocdn.com",
-        "akamaized.net",
-        "twitchcdn.net",
-        "jtvnw.net",
-        "mixcloud.com",
-        "dmcdn.net",
-        "dailymotion.com",
     )
 
     def __init__(
@@ -151,6 +204,13 @@ class TrackResolver:
             if not isinstance(item, dict):
                 continue
             webpage_url = str(item.get("webpage_url") or item.get("url") or lookup)
+            if is_direct_url and (
+                not self._url_guard(webpage_url)
+                or not self._is_youtube_lookup(webpage_url)
+            ):
+                raise MusicResolutionError(
+                    "A playlist entry was not from a supported public media source."
+                )
             tracks.append(
                 MusicTrack(
                     title=str(item.get("title") or "Unknown track"),
@@ -169,6 +229,14 @@ class TrackResolver:
         return tracks
 
     def resolve_stream(self, track: "MusicTrack") -> str:
+        lookup_url = urlparse(track.lookup)
+        if lookup_url.scheme in {"http", "https"} and (
+            not self._url_guard(track.lookup)
+            or not self._is_youtube_lookup(track.lookup)
+        ):
+            raise MusicResolutionError(
+                "The queued media lookup is not from a supported public source."
+            )
         info = self._media_extractor(track.lookup, flat=False)
         if isinstance(info, dict) and info.get("entries"):
             info = next((item for item in info["entries"] if item), {})
@@ -205,21 +273,7 @@ class TrackResolver:
 
     @staticmethod
     def _has_supported_extractor(url: str) -> bool:
-        try:
-            from yt_dlp.extractor import gen_extractor_classes
-        except ImportError as exc:
-            raise MusicResolutionError(
-                "Music playback requires yt-dlp. Reinstall Hermes with messaging support."
-            ) from exc
-        for extractor_cls in gen_extractor_classes():
-            try:
-                if extractor_cls.suitable(url):
-                    return (
-                        str(getattr(extractor_cls, "IE_NAME", "")).lower() != "generic"
-                    )
-            except Exception:
-                continue
-        return False
+        return TrackResolver._is_youtube_lookup(url)
 
     @staticmethod
     def _extract_media(query: str, *, flat: bool) -> dict:
@@ -361,6 +415,7 @@ class MusicSession:
     history: Deque[MusicTrack] = field(default_factory=lambda: deque(maxlen=50))
     current: Optional[MusicTrack] = None
     repeat_current: bool = False
+    suppress_repeat_generation: Optional[int] = None
     playback_generation: int = 0
     last_error: Optional[str] = None
     text_channel: object = None
@@ -436,6 +491,7 @@ class BufferedAudioSource(_AudioSourceBase):
         *,
         prebuffer_frames: int = 100,
         max_buffer_frames: int = 500,
+        stall_timeout: float = 30.0,
     ) -> None:
         self.source = source
         self._prebuffer_frames = max(1, int(prebuffer_frames))
@@ -447,6 +503,8 @@ class BufferedAudioSource(_AudioSourceBase):
         self._cleanup_lock = threading.Lock()
         self._cleaned = False
         self._current_error = None
+        self._stall_timeout = max(0.1, float(stall_timeout))
+        self._last_progress_at = time.monotonic()
         self._producer = threading.Thread(
             target=self._fill,
             name="discord-music-buffer",
@@ -465,6 +523,7 @@ class BufferedAudioSource(_AudioSourceBase):
                     break
                 if len(frame) < self.FRAME_SIZE:
                     frame += b"\x00" * (self.FRAME_SIZE - len(frame))
+                self._last_progress_at = time.monotonic()
                 while not self._stop.is_set():
                     try:
                         self._frames.put(frame, timeout=0.1)
@@ -490,6 +549,12 @@ class BufferedAudioSource(_AudioSourceBase):
             return self._frames.get_nowait()
         except queue.Empty:
             if self._finished.is_set():
+                return b""
+            if time.monotonic() - self._last_progress_at >= self._stall_timeout:
+                self._current_error = MusicResolutionError(
+                    "The audio stream stalled and was stopped."
+                )
+                self._stop.set()
                 return b""
             return self.SILENCE_FRAME
 
@@ -519,6 +584,7 @@ class DiscordMusicManager:
         resolver: Optional[TrackResolver] = None,
         audio_source_factory: Optional[Callable[[str], object]] = None,
         view_factory: Optional[Callable[["DiscordMusicManager", int], object]] = None,
+        stop_reconcile_delay: float = 0.75,
     ) -> None:
         self.adapter = adapter
         self.resolver = resolver or TrackResolver()
@@ -528,6 +594,88 @@ class DiscordMusicManager:
         self._view_factory = view_factory or (
             lambda manager, guild_id: MusicControlView(manager, guild_id)
         )
+        self._stop_reconcile_delay = max(0.0, float(stop_reconcile_delay))
+
+    def _schedule_stop_reconciliation(self, guild_id: int, generation: int) -> None:
+        loop = asyncio.get_running_loop()
+        loop.call_later(
+            self._stop_reconcile_delay,
+            lambda: asyncio.create_task(
+                self._reconcile_stopped_playback(guild_id, generation)
+            ),
+        )
+
+    def _schedule_completion_watch(self, guild_id: int, generation: int) -> None:
+        """Keep watching until playback stops or the generation becomes stale."""
+        loop = asyncio.get_running_loop()
+        loop.call_later(
+            max(0.01, self._stop_reconcile_delay),
+            lambda: asyncio.create_task(
+                self._reconcile_lost_completion(guild_id, generation)
+            ),
+        )
+
+    async def _reconcile_lost_completion(
+        self, guild_id: int, generation: int
+    ) -> None:
+        async with self._locks.setdefault(guild_id, asyncio.Lock()):
+            session = self.sessions.get(guild_id)
+            if (
+                session is None
+                or session.current is None
+                or session.playback_generation != generation
+            ):
+                return
+            vc = getattr(self.adapter, "_voice_clients", {}).get(guild_id)
+            if vc is not None and (vc.is_playing() or vc.is_paused()):
+                self._schedule_completion_watch(guild_id, generation)
+                return
+            suppress_repeat = session.suppress_repeat_generation == generation
+            if suppress_repeat:
+                session.suppress_repeat_generation = None
+            self._finish_current(session, allow_repeat=not suppress_repeat)
+            await self._start_next(session)
+            await self._update_panel(session)
+
+    async def _reconcile_stopped_playback(
+        self, guild_id: int, generation: int
+    ) -> None:
+        """Advance after an explicit stop even if discord.py loses its callback."""
+        async with self._locks.setdefault(guild_id, asyncio.Lock()):
+            session = self.sessions.get(guild_id)
+            if (
+                session is None
+                or session.current is None
+                or session.playback_generation != generation
+            ):
+                return
+            vc = getattr(self.adapter, "_voice_clients", {}).get(guild_id)
+            if vc is not None and (vc.is_playing() or vc.is_paused()):
+                return
+            if session.suppress_repeat_generation == generation:
+                session.suppress_repeat_generation = None
+            self._finish_current(session, allow_repeat=False)
+            await self._start_next(session)
+            await self._update_panel(session)
+
+    @staticmethod
+    def _finish_current(
+        session: MusicSession,
+        *,
+        error=None,
+        allow_repeat: bool = True,
+    ) -> Optional[MusicTrack]:
+        finished = session.current
+        if finished is None:
+            return None
+        session.current = None
+        if error is not None:
+            return finished
+        if allow_repeat and session.repeat_current:
+            session.queue.appendleft(finished)
+        else:
+            session.history.append(finished)
+        return finished
 
     @staticmethod
     def _default_audio_source(stream_url: str):
@@ -549,6 +697,65 @@ class DiscordMusicManager:
             )
         )
 
+    async def _add_request(
+        self,
+        *,
+        guild,
+        user,
+        text_channel,
+        voice_channel,
+        query: str,
+    ) -> list[MusicTrack]:
+        guild_id = int(guild.id)
+        async with self._locks.setdefault(guild_id, asyncio.Lock()):
+            tracks = await asyncio.to_thread(
+                self.resolver.resolve,
+                query,
+                requester_id=int(user.id),
+                requester_name=str(
+                    getattr(user, "display_name", None)
+                    or getattr(user, "name", user.id)
+                ),
+            )
+            joined = await self.adapter.join_voice_channel(
+                voice_channel,
+                text_channel_id=getattr(text_channel, "id", None),
+            )
+            if not joined:
+                raise MusicResolutionError("I could not join your voice channel.")
+
+            session = self.sessions.setdefault(
+                guild_id, MusicSession(guild_id=guild_id)
+            )
+            session.text_channel = text_channel
+            session.enqueue(tracks)
+            voice_client = getattr(self.adapter, "_voice_clients", {}).get(guild_id)
+            if (
+                session.current is not None
+                and voice_client is not None
+                and voice_client.is_connected()
+                and not voice_client.is_playing()
+                and not voice_client.is_paused()
+            ):
+                logger.warning(
+                    "Recovering stale Discord music state in guild %s after a lost completion callback",
+                    guild_id,
+                )
+                suppress_repeat = (
+                    session.playback_generation
+                    == session.suppress_repeat_generation
+                )
+                if suppress_repeat:
+                    session.suppress_repeat_generation = None
+                self._finish_current(
+                    session,
+                    allow_repeat=not suppress_repeat,
+                )
+            await self._update_panel(session)
+            if session.current is None:
+                await self._start_next(session)
+            return tracks
+
     async def add(self, interaction, query: str) -> None:
         guild = getattr(interaction, "guild", None)
         if guild is None:
@@ -556,7 +763,8 @@ class DiscordMusicManager:
                 "Music playback is only available in a server.", ephemeral=True
             )
             return
-        voice_state = getattr(getattr(interaction, "user", None), "voice", None)
+        user = getattr(interaction, "user", None)
+        voice_state = getattr(user, "voice", None)
         voice_channel = getattr(voice_state, "channel", None)
         if voice_channel is None:
             await interaction.response.send_message(
@@ -565,64 +773,79 @@ class DiscordMusicManager:
             return
 
         await interaction.response.defer(ephemeral=True)
-        tracks = await asyncio.to_thread(
-            self.resolver.resolve,
-            query,
-            requester_id=int(interaction.user.id),
-            requester_name=str(
-                getattr(interaction.user, "display_name", None)
-                or getattr(interaction.user, "name", interaction.user.id)
-            ),
+        tracks = await self._add_request(
+            guild=guild,
+            user=user,
+            text_channel=interaction.channel,
+            voice_channel=voice_channel,
+            query=query,
         )
-        joined = await self.adapter.join_voice_channel(
-            voice_channel,
-            text_channel_id=getattr(interaction.channel, "id", None),
-        )
-        if not joined:
-            raise MusicResolutionError("I could not join your voice channel.")
-
-        guild_id = int(guild.id)
-        async with self._locks.setdefault(guild_id, asyncio.Lock()):
-            session = self.sessions.setdefault(
-                guild_id, MusicSession(guild_id=guild_id)
-            )
-            session.text_channel = interaction.channel
-            session.enqueue(tracks)
-            await self._update_panel(session)
-            if session.current is None:
-                await self._start_next(session)
-
         label = tracks[0].title if len(tracks) == 1 else f"{len(tracks)} tracks"
         await interaction.followup.send(
             f"Added **{label}** to the music queue.", ephemeral=True
         )
 
-    async def _update_panel(self, session: MusicSession) -> None:
-        import discord
+    async def add_message(self, message, query: str) -> None:
+        """Add a natural-language text request without a slash interaction."""
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        user = getattr(message, "author", None)
+        if guild is None or channel is None:
+            if channel is not None:
+                await channel.send("Music playback is only available in a server.")
+            return
+        voice_state = getattr(user, "voice", None)
+        voice_channel = getattr(voice_state, "channel", None)
+        if voice_channel is None:
+            await channel.send("Join a voice channel first, then ask me to play it again.")
+            return
 
-        content = session.render_queue()
-        view = self._view_factory(self, session.guild_id)
-        allowed_mentions_cls = discord.AllowedMentions
-        none_factory = getattr(allowed_mentions_cls, "none", None)
-        if callable(none_factory):
-            allowed_mentions = none_factory()
-        else:
-            # Some Discord-compatible adapters expose the constructor but not
-            # discord.py's convenience classmethod. Preserve fail-closed mention
-            # behavior across both forms.
-            allowed_mentions = allowed_mentions_cls(
-                everyone=False,
-                roles=False,
-                users=False,
-                replied_user=False,
-            )
-        if session.panel_message is None:
+        tracks = await self._add_request(
+            guild=guild,
+            user=user,
+            text_channel=channel,
+            voice_channel=voice_channel,
+            query=query,
+        )
+        label = tracks[0].title if len(tracks) == 1 else f"{len(tracks)} tracks"
+        await channel.send(
+            f"Added **{label}** to the music queue.",
+            allowed_mentions=discord_no_mentions(),
+        )
+
+    async def _update_panel(self, session: MusicSession) -> None:
+        """Best-effort queue UI refresh; panel failures never alter playback."""
+        if session.text_channel is None:
+            return
+        try:
+            content = session.render_queue()
+            view = self._view_factory(self, session.guild_id)
+            allowed_mentions = discord_no_mentions()
+            if session.panel_message is not None:
+                try:
+                    await session.panel_message.edit(
+                        content=content,
+                        view=view,
+                        allowed_mentions=allowed_mentions,
+                    )
+                    return
+                except Exception:
+                    logger.warning(
+                        "Could not edit Discord music panel in guild %s; recreating it",
+                        session.guild_id,
+                        exc_info=True,
+                    )
+                    session.panel_message = None
             session.panel_message = await session.text_channel.send(
-                content, view=view, allowed_mentions=allowed_mentions
+                content,
+                view=view,
+                allowed_mentions=allowed_mentions,
             )
-        else:
-            await session.panel_message.edit(
-                content=content, view=view, allowed_mentions=allowed_mentions
+        except Exception:
+            logger.warning(
+                "Could not publish Discord music panel in guild %s",
+                session.guild_id,
+                exc_info=True,
             )
 
     async def _start_next(self, session: MusicSession) -> None:
@@ -654,9 +877,9 @@ class DiscordMusicManager:
                 if vc is None or not vc.is_connected():
                     raise MusicResolutionError("The voice connection was lost.")
                 self.adapter._cancel_voice_timeout(session.guild_id)
-                receiver = self.adapter._voice_receivers.get(session.guild_id)
-                if receiver:
-                    receiver.pause()
+                # Keep the receiver live so spoken pause/resume/skip commands
+                # remain usable while music is playing. Discord does not feed
+                # the bot's own outbound audio back as a member stream.
                 self.adapter._voice_mixers.pop(session.guild_id, None)
                 if vc.is_playing() or vc.is_paused():
                     vc.stop()
@@ -665,11 +888,12 @@ class DiscordMusicManager:
                 generation = session.playback_generation
 
                 def _after(error):
+                    terminal_error = error or getattr(source, "_current_error", None)
                     loop.call_soon_threadsafe(
                         lambda: asyncio.create_task(
                             self._on_track_end(
                                 session.guild_id,
-                                error,
+                                terminal_error,
                                 generation=generation,
                             )
                         )
@@ -681,7 +905,7 @@ class DiscordMusicManager:
                     bitrate=192,
                     signal_type="music",
                 )
-                session.last_error = None
+                self._schedule_completion_watch(session.guild_id, generation)
                 await self._update_panel(session)
                 return
             except asyncio.CancelledError:
@@ -712,6 +936,45 @@ class DiscordMusicManager:
         else:
             await interaction.response.send_message(message, ephemeral=True)
 
+    async def control_message(self, message, action: str) -> None:
+        """Apply a natural text/voice playback command through existing controls."""
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        user = getattr(message, "author", None)
+        if guild is None or channel is None or user is None:
+            return
+
+        class _Response:
+            @staticmethod
+            def is_done() -> bool:
+                return False
+
+            @staticmethod
+            async def send_message(content: str, **_kwargs) -> None:
+                await channel.send(content, allowed_mentions=discord_no_mentions())
+
+        interaction = SimpleNamespace(
+            guild=guild,
+            channel=channel,
+            user=user,
+            response=_Response(),
+        )
+        guild_id = int(guild.id)
+        if action == "queue":
+            async with self._locks.setdefault(guild_id, asyncio.Lock()):
+                session = self.sessions.get(guild_id)
+                if session is None:
+                    await _Response.send_message("The music queue is empty.")
+                    return
+                session.text_channel = channel
+                await self._update_panel(session)
+                await _Response.send_message("The public music queue is up to date.")
+            return
+        if action == "clear":
+            await self.admin_action(interaction, guild_id, "clear")
+            return
+        await self.control(interaction, guild_id, action)
+
     async def show_queue(self, interaction, guild_id: int) -> None:
         """Acknowledge, then serialize the public panel refresh for a guild."""
         guild_id = int(guild_id)
@@ -735,6 +998,35 @@ class DiscordMusicManager:
             await interaction.response.defer(ephemeral=True)
         async with self._locks.setdefault(guild_id, asyncio.Lock()):
             session = self.sessions.get(guild_id)
+            allow_user = getattr(self.adapter, "_is_allowed_user", None)
+            guild = getattr(interaction, "guild", None)
+            user = interaction.user
+            channel = getattr(interaction, "channel", None)
+            channel_keys = None
+            channel_key_resolver = getattr(
+                self.adapter, "_discord_channel_keys_from_channel", None
+            )
+            parent_resolver = getattr(self.adapter, "_get_parent_channel_id", None)
+            if (
+                channel is not None
+                and callable(channel_key_resolver)
+                and callable(parent_resolver)
+            ):
+                channel_keys = channel_key_resolver(
+                    channel, parent_resolver(channel)
+                )
+            if callable(allow_user) and not allow_user(
+                str(user.id),
+                author=user,
+                guild=guild,
+                is_dm=False,
+                channel_ids=channel_keys,
+            ):
+                await self._reply(
+                    interaction,
+                    "You are not authorized to use music controls.",
+                )
+                return
             administrator = bool(
                 getattr(
                     getattr(interaction.user, "guild_permissions", None),
@@ -742,8 +1034,17 @@ class DiscordMusicManager:
                     False,
                 )
             )
-            if session is None or not session.can_control(
-                user_id=int(interaction.user.id), administrator=administrator
+            user_id = int(interaction.user.id)
+            owns_finished_history = bool(
+                session is not None
+                and action == "previous"
+                and session.current is None
+                and session.history
+                and session.history[-1].requester_id == user_id
+            )
+            if session is None or not (
+                session.can_control(user_id=user_id, administrator=administrator)
+                or owns_finished_history
             ):
                 await self._reply(
                     interaction,
@@ -752,23 +1053,59 @@ class DiscordMusicManager:
                 return
             vc = self.adapter._voice_clients.get(guild_id)
             if action == "skip":
-                if vc is None:
+                if vc is None or not vc.is_connected():
                     await self._reply(interaction, "The voice connection was lost.")
                     return
-                vc.stop()
+                if vc.is_playing() or vc.is_paused():
+                    generation = session.playback_generation
+                    session.suppress_repeat_generation = generation
+                    vc.stop()
+                    self._schedule_stop_reconciliation(guild_id, generation)
+                else:
+                    self._finish_current(session, allow_repeat=False)
+                    await self._start_next(session)
+                    await self._update_panel(session)
                 await self._reply(interaction, "Skipped.")
                 return
             if action == "play_pause":
-                if vc is None:
+                if vc is None or not vc.is_connected():
                     await self._reply(interaction, "The voice connection was lost.")
                     return
                 if vc.is_paused():
                     vc.resume()
                     message = "Resumed."
-                else:
+                elif vc.is_playing():
                     vc.pause()
                     message = "Paused."
+                else:
+                    message = "Nothing is playing."
                 await self._reply(interaction, message)
+                return
+            if action == "pause":
+                if vc is None or not vc.is_connected():
+                    await self._reply(interaction, "The voice connection was lost.")
+                    return
+                if vc.is_paused():
+                    await self._reply(interaction, "Music is already paused.")
+                    return
+                if not vc.is_playing():
+                    await self._reply(interaction, "Nothing is playing.")
+                    return
+                vc.pause()
+                await self._reply(interaction, "Paused.")
+                return
+            if action == "resume":
+                if vc is None or not vc.is_connected():
+                    await self._reply(interaction, "The voice connection was lost.")
+                    return
+                if vc.is_paused():
+                    vc.resume()
+                    await self._reply(interaction, "Resumed.")
+                    return
+                if vc.is_playing():
+                    await self._reply(interaction, "Music is already playing.")
+                    return
+                await self._reply(interaction, "Nothing is paused.")
                 return
             if action == "repeat":
                 session.repeat_current = not session.repeat_current
@@ -781,7 +1118,7 @@ class DiscordMusicManager:
                 if not session.history:
                     await self._reply(interaction, "There is no previous song yet.")
                     return
-                if vc is None:
+                if vc is None or not vc.is_connected():
                     await self._reply(interaction, "The voice connection was lost.")
                     return
                 interrupted = session.current
@@ -852,10 +1189,18 @@ class DiscordMusicManager:
                 await self._reply(interaction, "Music queue cleared.")
                 return
             if action == "forceskip":
-                if vc is None:
+                if vc is None or not vc.is_connected():
                     await self._reply(interaction, "The voice connection was lost.")
                     return
-                vc.stop()
+                if vc.is_playing() or vc.is_paused():
+                    generation = session.playback_generation
+                    session.suppress_repeat_generation = generation
+                    vc.stop()
+                    self._schedule_stop_reconciliation(guild_id, generation)
+                else:
+                    self._finish_current(session, allow_repeat=False)
+                    await self._start_next(session)
+                    await self._update_panel(session)
                 await self._reply(interaction, "Force-skipped.")
                 return
             await self._reply(interaction, "Unknown administrator action.")
@@ -879,12 +1224,21 @@ class DiscordMusicManager:
                 return
             if session.current is None:
                 return
-            finished = session.current
-            session.current = None
-            if session.repeat_current and error is None:
-                session.queue.appendleft(finished)
-            else:
-                session.history.append(finished)
+            suppress_repeat = (
+                generation is not None
+                and generation == session.suppress_repeat_generation
+            )
+            if suppress_repeat:
+                session.suppress_repeat_generation = None
+            if error is not None and session.current is not None:
+                session.last_error = (
+                    f"Playback failed for **{session.current.title}**."
+                )
+            self._finish_current(
+                session,
+                error=error,
+                allow_repeat=not suppress_repeat,
+            )
             await self._start_next(session)
             await self._update_panel(session)
 

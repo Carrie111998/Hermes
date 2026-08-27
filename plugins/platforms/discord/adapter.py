@@ -1087,6 +1087,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        self._voice_leaving: set[int] = set()  # guild_ids completing leave cleanup
         # Public per-guild music queues are created lazily on the first music
         # command so text-only Discord users pay no yt-dlp/import overhead.
         self._music_manager = None
@@ -1429,6 +1430,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                if await adapter_self._handle_bot_voice_state_update(
+                    member, before, after
+                ):
+                    return
                 # Only track channels where the bot is connected
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
@@ -1436,10 +1441,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 guild_id = member.guild.id
                 if guild_id not in bot_guild_ids:
                     return
-                # Ignore the bot itself
-                if member == adapter_self._client.user:
-                    return
-
                 joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
                 switched = (
@@ -4568,26 +4569,31 @@ class DiscordAdapter(BasePlatformAdapter):
         guild_id = channel.guild.id
 
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            if guild_id in getattr(self, "_voice_leaving", set()):
+                return False
+
+            def _refresh_binding() -> None:
+                if text_channel_id is not None:
+                    self._voice_text_channels[guild_id] = text_channel_id
+                if source is not None:
+                    self._voice_sources[guild_id] = source
+
             # Already connected in this guild?
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
                 if existing.channel.id == channel.id:
+                    _refresh_binding()
                     self._reset_voice_timeout(guild_id)
                     return True
                 await existing.move_to(channel)
+                _refresh_binding()
                 self._reset_voice_timeout(guild_id)
                 return True
 
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
+            _refresh_binding()
             self._reset_voice_timeout(guild_id)
-
-            # Store text-channel binding for automatic/programmatic joins
-            # so voice transcriptions can be routed without /voice join.
-            if text_channel_id is not None:
-                self._voice_text_channels[guild_id] = text_channel_id
-            if source is not None:
-                self._voice_sources[guild_id] = source
 
             # Start voice receiver (Phase 2: listen to users)
             try:
@@ -4611,10 +4617,48 @@ class DiscordAdapter(BasePlatformAdapter):
 
             return True
 
+    async def _handle_bot_voice_state_update(self, member, before, after) -> bool:
+        """Clean stale voice/music state when Discord disconnects the bot."""
+        if self._client is None or member != self._client.user:
+            return False
+        if before.channel is None or after.channel is not None:
+            return True
+        guild_id = int(member.guild.id)
+        voice_lock = self._voice_locks.setdefault(guild_id, asyncio.Lock())
+        if voice_lock.locked():
+            leaving = getattr(self, "_voice_leaving", None)
+            if leaving is None:
+                leaving = self._voice_leaving = set()
+            if guild_id not in leaving:
+                leaving.add(guild_id)
+                asyncio.create_task(self._leave_voice_channel_marked(guild_id))
+        else:
+            await self.leave_voice_channel(guild_id)
+        return True
+
+    async def _leave_voice_channel_marked(self, guild_id: int) -> None:
+        """Finish a leave whose guild marker has already been claimed."""
+        try:
+            await self._leave_voice_channel_impl(guild_id)
+        finally:
+            self._voice_leaving.discard(guild_id)
+
     async def leave_voice_channel(self, guild_id: int) -> None:
+        """Disconnect and keep new joins out until music cleanup finishes."""
+        leaving = getattr(self, "_voice_leaving", None)
+        if leaving is None:
+            leaving = self._voice_leaving = set()
+        if guild_id in leaving:
+            return
+        leaving.add(guild_id)
+        await self._leave_voice_channel_marked(guild_id)
+
+    async def _leave_voice_channel_impl(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
-        async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            # Stop voice receiver first
+        voice_lock = self._voice_locks.setdefault(guild_id, asyncio.Lock())
+        async with voice_lock:
+            # Detach the receiver first, but process its final utterance outside
+            # the non-reentrant voice lock. A spoken music request may join voice.
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
             if receiver:
@@ -4624,11 +4668,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if listen_task:
                 listen_task.cancel()
 
-            guild = self._client.get_guild(guild_id) if self._client is not None else None
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+        guild = self._client.get_guild(guild_id) if self._client is not None else None
+        for user_id, pcm_data in pending_inputs:
+            if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                await self._process_voice_input(guild_id, user_id, pcm_data)
 
+        async with voice_lock:
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
@@ -4642,13 +4687,26 @@ class DiscordAdapter(BasePlatformAdapter):
                     pass
                 await vc.disconnect()
             task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
+            current_task = asyncio.current_task()
+            if task and task is not current_task:
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
-            music_manager = getattr(self, "_music_manager", None)
-            if music_manager is not None:
-                await music_manager.on_voice_disconnected(guild_id)
+
+        # Never acquire the music lock while holding the adapter voice lock.
+        # Adds acquire those locks in the opposite order while joining.
+        music_manager = getattr(self, "_music_manager", None)
+        if music_manager is not None:
+            await music_manager.on_voice_disconnected(guild_id)
+
+    def _music_is_active(self, guild_id: int) -> bool:
+        music_manager = getattr(self, "_music_manager", None)
+        music_session = (
+            getattr(music_manager, "sessions", {}).get(guild_id)
+            if music_manager is not None
+            else None
+        )
+        return music_session is not None and music_session.current is not None
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
@@ -4660,6 +4718,13 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
+            return False
+        if self._music_is_active(guild_id):
+            logger.info(
+                "[%s] Suppressing TTS playback while music is active (guild=%d)",
+                self.name,
+                guild_id,
+            )
             return False
 
         # Playback is activity. Do not let the inactivity timer disconnect the
@@ -4766,6 +4831,12 @@ class DiscordAdapter(BasePlatformAdapter):
     def _reset_voice_timeout(self, guild_id: int) -> None:
         """Reset the auto-disconnect inactivity timer."""
         self._cancel_voice_timeout(guild_id)
+        if self._music_is_active(guild_id):
+            logger.debug(
+                "Voice inactivity timeout remains suspended for active music (guild=%d)",
+                guild_id,
+            )
+            return
         timeout = self._voice_timeout_limit()
         if timeout <= 0:
             logger.debug("Voice inactivity timeout disabled (guild=%d)", guild_id)
@@ -5852,8 +5923,103 @@ class DiscordAdapter(BasePlatformAdapter):
             self._music_manager = DiscordMusicManager(self)
         return self._music_manager
 
+    async def _maybe_handle_natural_music_message(
+        self, message, *, content: Optional[str] = None
+    ) -> bool:
+        """Route an explicit Jarvis play request without invoking the agent."""
+        from plugins.platforms.discord.music import (
+            discord_no_mentions,
+            parse_natural_music_control,
+            parse_natural_play_request,
+        )
+
+        request_text = content if content is not None else getattr(message, "content", "")
+        action = parse_natural_music_control(request_text)
+        query = parse_natural_play_request(request_text)
+        if action is None and query is None:
+            return False
+        try:
+            manager = self._get_music_manager()
+            if action is not None:
+                await manager.control_message(message, action)
+            else:
+                assert query is not None
+                await manager.add_message(message, query)
+        except Exception as exc:
+            logger.warning("[Discord] natural music request failed: %s", exc)
+            try:
+                await message.channel.send(
+                    "I couldn't complete that music request. Please try again.",
+                    allowed_mentions=discord_no_mentions(),
+                )
+            except Exception:
+                pass
+        return True
+
+    async def _maybe_handle_natural_music_voice(
+        self, guild_id: int, user_id: int, transcript: str
+    ) -> bool:
+        """Route an explicit spoken Jarvis play request to the linked queue."""
+        from types import SimpleNamespace
+
+        from plugins.platforms.discord.music import (
+            discord_no_mentions,
+            parse_natural_music_control,
+            parse_natural_play_request,
+        )
+
+        action = parse_natural_music_control(transcript)
+        query = parse_natural_play_request(transcript)
+        if action is None and query is None:
+            return False
+        guild = self._client.get_guild(int(guild_id)) if self._client else None
+        channel_id = self._voice_text_channels.get(int(guild_id))
+        channel = self._client.get_channel(channel_id) if self._client and channel_id else None
+        member = guild.get_member(int(user_id)) if guild is not None else None
+        if guild is None or channel is None or member is None:
+            logger.warning(
+                "[Discord] could not resolve context for natural voice music request "
+                "(guild=%s user=%s channel=%s)",
+                guild_id,
+                user_id,
+                channel_id,
+            )
+            return False
+        channel_keys = self._discord_channel_keys_from_channel(
+            channel,
+            self._get_parent_channel_id(channel),
+        )
+        allowed_channels = self._get_allowed_channels()
+        if (
+            allowed_channels
+            and "*" not in allowed_channels
+            and not (channel_keys & allowed_channels)
+        ):
+            return False
+        ignored_channels = self._get_ignored_channels()
+        if "*" in ignored_channels or channel_keys & ignored_channels:
+            return False
+        request = SimpleNamespace(guild=guild, channel=channel, author=member)
+        try:
+            manager = self._get_music_manager()
+            if action is not None:
+                await manager.control_message(request, action)
+            else:
+                assert query is not None
+                await manager.add_message(request, query)
+        except Exception as exc:
+            logger.warning("[Discord] natural voice music request failed: %s", exc)
+            try:
+                await channel.send(
+                    "I couldn't complete that music request. Please try again.",
+                    allowed_mentions=discord_no_mentions(),
+                )
+            except Exception:
+                pass
+        return True
+
     async def _send_music_error(self, interaction, exc: Exception) -> None:
-        message = f"Music request failed: {exc}"
+        message = "I couldn't complete that music request. Please try again."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
@@ -5862,8 +6028,26 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("[Discord] Could not deliver music error: %s", exc)
 
+    async def _check_music_slash_access(self, interaction, command: str) -> bool:
+        """Apply the command-level slash policy to native music handlers."""
+        from gateway.slash_access import policy_from_extra
+
+        scope = "dm" if isinstance(interaction.channel, discord.DMChannel) else "group"
+        policy = policy_from_extra(getattr(self.config, "extra", {}) or {}, scope)
+        user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+        if policy.can_run(user_id, command.lstrip("/")):
+            return True
+        await self._reject_slash(
+            interaction,
+            command,
+            reason="command blocked by slash access policy",
+        )
+        return False
+
     async def _handle_music_play(self, interaction, query: str) -> None:
         if not await self._check_slash_authorization(interaction, "/play"):
+            return
+        if not await self._check_music_slash_access(interaction, "/play"):
             return
         try:
             await self._get_music_manager().add(interaction, query)
@@ -5873,6 +6057,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _handle_music_queue(self, interaction) -> None:
         if not await self._check_slash_authorization(interaction, "/musicqueue"):
+            return
+        if not await self._check_music_slash_access(interaction, "/musicqueue"):
             return
         guild = getattr(interaction, "guild", None)
         if guild is None:
@@ -5886,6 +6072,8 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _handle_music_admin(self, interaction, action: str) -> None:
         command = "/forceskip" if action == "forceskip" else "/clearqueue"
         if not await self._check_slash_authorization(interaction, command):
+            return
+        if not await self._check_music_slash_access(interaction, command):
             return
         guild = getattr(interaction, "guild", None)
         if guild is None:
@@ -5960,7 +6148,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     ),
                 )
             else:
-                sent_message = await channel.send(content)
+                sent_message = await channel.send(
+                    content,
+                    allowed_mentions=getattr(discord, "AllowedMentions")(
+                        everyone=False,
+                        roles=False,
+                        users=True,
+                        replied_user=False,
+                    ),
+                )
         except Exception as exc:
             logger.warning("[Discord] /announce delivery failed: %s", exc)
             await interaction.edit_original_response(
@@ -8327,9 +8523,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
+            # An explicit wake-name music command is itself an address to the bot,
+            # so it may cross the normal @mention gate after channel authorization.
+            if not recovered and await self._maybe_handle_natural_music_message(
+                message, content=normalized_content
+            ):
+                return True
+
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
+
+        if (
+            not recovered
+            and isinstance(message.channel, discord.DMChannel)
+            and await self._maybe_handle_natural_music_message(
+                message, content=normalized_content
+            )
+        ):
+            return True
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.

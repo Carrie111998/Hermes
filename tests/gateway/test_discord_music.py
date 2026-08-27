@@ -17,6 +17,8 @@ from plugins.platforms.discord.music import (
     MusicSession,
     MusicTrack,
     TrackResolver,
+    parse_natural_music_control,
+    parse_natural_play_request,
 )
 from gateway.config import PlatformConfig
 from plugins.platforms.discord.adapter import DiscordAdapter
@@ -29,6 +31,61 @@ def _track(title: str, requester_id: int = 42) -> MusicTrack:
         lookup=f"ytsearch1:{title}",
         requester_id=requester_id,
         requester_name=f"user-{requester_id}",
+    )
+
+
+def test_natural_play_request_extracts_song_title_and_artist():
+    assert (
+        parse_natural_play_request("Hey Jarvis, play Paranoid by Rich Amiri")
+        == "Paranoid by Rich Amiri"
+    )
+
+
+def test_natural_play_request_preserves_supported_link_queries():
+    url = "https://www.youtube.com/watch?v=example"
+    assert parse_natural_play_request(f"Jarvis play {url}") == url
+
+
+def test_natural_play_request_ignores_unaddressed_play_chatter():
+    assert parse_natural_play_request("play Paranoid by Rich Amiri") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Hey Jarvis pause the song", "pause"),
+        ("Jarvis resume the music", "resume"),
+        ("Jarvis play", "resume"),
+        ("Jarvis play the current song", "resume"),
+        ("Jarvis play the next song", "skip"),
+        ("Jarvis skip this song", "skip"),
+        ("Jarvis go back to the previous song", "previous"),
+        ("Jarvis repeat this song", "repeat"),
+        ("Jarvis show the music queue", "queue"),
+        ("Jarvis clear the music queue", "clear"),
+    ],
+)
+def test_natural_music_controls_are_distinguished_from_track_requests(text, expected):
+    assert parse_natural_music_control(text) == expected
+    assert parse_natural_play_request(text) is None
+
+
+@pytest.mark.asyncio
+async def test_slash_music_errors_do_not_expose_exception_details():
+    adapter = object.__new__(DiscordAdapter)
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(
+            is_done=MagicMock(return_value=False),
+            send_message=AsyncMock(),
+        )
+    )
+
+    await adapter._send_music_error(
+        interaction, RuntimeError("@everyone signed-url backend detail")
+    )
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "I couldn't complete that music request. Please try again.", ephemeral=True
     )
 
 
@@ -286,6 +343,19 @@ def test_youtube_hls_is_limited_to_provider_controlled_manifest_host():
         resolver.resolve_stream(track)
 
 
+def test_non_youtube_multitenant_cdn_stream_is_rejected():
+    track = _track("unsafe")
+    resolver = TrackResolver(
+        media_extractor=lambda *_args, **_kwargs: {
+            "url": "https://attacker.akamaized.net/audio.mp4"
+        },
+        url_guard=lambda _url: True,
+    )
+
+    with pytest.raises(MusicResolutionError, match="trusted media host"):
+        resolver.resolve_stream(track)
+
+
 def test_ffmpeg_source_restricts_nested_network_protocols(monkeypatch):
     upstream = MagicMock()
     ffmpeg = MagicMock(return_value=upstream)
@@ -355,6 +425,32 @@ def test_buffered_audio_source_returns_silence_instead_of_blocking_on_underflow(
 
     source.cleanup()
     assert upstream.cleaned is True
+
+
+def test_buffered_audio_source_ends_a_permanently_stalled_stream():
+    release_read = threading.Event()
+
+    class StuckSource:
+        def read(self):
+            release_read.wait(timeout=2)
+            return b""
+
+        def cleanup(self):
+            release_read.set()
+
+    source = BufferedAudioSource(
+        StuckSource(),
+        prebuffer_frames=1,
+        max_buffer_frames=2,
+        stall_timeout=0.1,
+    )
+    try:
+        assert source.read() == BufferedAudioSource.SILENCE_FRAME
+        time.sleep(0.11)
+        assert source.read() == b""
+        assert "stalled" in str(source._current_error).lower()
+    finally:
+        source.cleanup()
 
 
 @pytest.mark.asyncio
@@ -511,9 +607,41 @@ def test_generic_web_urls_without_a_supported_extractor_are_rejected():
 
 def test_only_curated_streaming_hosts_are_allowed_for_ytdlp():
     assert TrackResolver._has_supported_extractor("https://www.youtube.com/watch?v=abc")
+    assert TrackResolver._has_supported_extractor("https://youtu.be/abc")
+    assert not TrackResolver._has_supported_extractor(
+        "https://soundcloud.com/artist/track"
+    )
+    assert not TrackResolver._has_supported_extractor("https://vimeo.com/123")
     assert not TrackResolver._has_supported_extractor(
         "https://www.facebook.com/watch/abc"
     )
+
+
+def test_playlist_entry_lookup_is_revalidated_before_playback():
+    extractor = MagicMock(
+        return_value={
+            "entries": [
+                {
+                    "title": "unsafe",
+                    "webpage_url": "http://127.0.0.1/private",
+                }
+            ]
+        }
+    )
+    resolver = TrackResolver(
+        media_extractor=extractor,
+        url_guard=lambda url: "127.0.0.1" not in url,
+        url_support_checker=lambda _url: True,
+    )
+
+    with pytest.raises(MusicResolutionError, match="playlist entry"):
+        resolver.resolve(
+            "https://www.youtube.com/playlist?list=abc",
+            requester_id=42,
+            requester_name="nahv",
+        )
+
+    extractor.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -598,6 +726,224 @@ async def test_add_joins_requesters_vc_starts_fifo_playback_and_updates_public_p
 
 
 @pytest.mark.asyncio
+async def test_add_message_accepts_a_song_name_without_an_interaction_or_link(monkeypatch):
+    import discord
+
+    class CompatibleAllowedMentions:
+        def __init__(self, *, everyone=True, roles=True, users=True, replied_user=True):
+            self.everyone = everyone
+            self.roles = roles
+            self.users = users
+            self.replied_user = replied_user
+
+    monkeypatch.setattr(discord, "AllowedMentions", CompatibleAllowedMentions)
+    track = _track("Paranoid — Rich Amiri")
+    resolver = MagicMock()
+    resolver.resolve.return_value = [track]
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    panel = SimpleNamespace(edit=AsyncMock())
+    text_channel = SimpleNamespace(id=99, send=AsyncMock(return_value=panel))
+    voice_channel = SimpleNamespace(id=12, guild=SimpleNamespace(id=7))
+    voice_client = MagicMock()
+    voice_client.is_connected.return_value = True
+    voice_client.is_playing.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: voice_client},
+        _voice_receivers={},
+        _voice_mixers={},
+        join_voice_channel=AsyncMock(return_value=True),
+        _cancel_voice_timeout=MagicMock(),
+    )
+    message = SimpleNamespace(
+        guild=SimpleNamespace(id=7),
+        channel=text_channel,
+        author=SimpleNamespace(
+            id=42,
+            display_name="nahv",
+            voice=SimpleNamespace(channel=voice_channel),
+        ),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+
+    await manager.add_message(message, "Paranoid by Rich Amiri")
+
+    resolver.resolve.assert_called_once_with(
+        "Paranoid by Rich Amiri",
+        requester_id=42,
+        requester_name="nahv",
+    )
+    adapter.join_voice_channel.assert_awaited_once_with(
+        voice_channel,
+        text_channel_id=99,
+    )
+    assert manager.sessions[7].current is track
+    assert text_channel.send.await_count == 2
+    ack_mentions = text_channel.send.await_args_list[1].kwargs["allowed_mentions"]
+    assert ack_mentions.everyone is False
+    assert ack_mentions.roles is False
+    assert ack_mentions.users is False
+
+
+@pytest.mark.asyncio
+async def test_add_request_waits_for_guild_lock_before_joining_voice():
+    resolver = MagicMock()
+    resolver.resolve.return_value = [_track("queued")]
+    adapter = SimpleNamespace(join_voice_channel=AsyncMock(return_value=True))
+    manager = DiscordMusicManager(adapter, resolver=resolver)
+    manager._update_panel = AsyncMock()
+    manager._start_next = AsyncMock()
+    guild = SimpleNamespace(id=7)
+    user = SimpleNamespace(id=42, display_name="nahv")
+    text_channel = SimpleNamespace(id=99)
+    voice_channel = SimpleNamespace(id=12)
+    lock = manager._locks.setdefault(7, asyncio.Lock())
+    await lock.acquire()
+
+    request = asyncio.create_task(
+        manager._add_request(
+            guild=guild,
+            user=user,
+            text_channel=text_channel,
+            voice_channel=voice_channel,
+            query="Paranoid by Rich Amiri",
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    adapter.join_voice_channel.assert_not_awaited()
+
+    lock.release()
+    await request
+    adapter.join_voice_channel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_adding_music_preserves_an_existing_paused_queue():
+    resolver = MagicMock()
+    resolver.resolve.return_value = [_track("next")]
+    vc = MagicMock()
+    vc.is_paused.return_value = True
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        join_voice_channel=AsyncMock(return_value=True),
+    )
+    manager = DiscordMusicManager(adapter, resolver=resolver)
+    manager._update_panel = AsyncMock()
+    current = _track("current")
+    manager.sessions[7] = MusicSession(guild_id=7, current=current)
+
+    await manager._add_request(
+        guild=SimpleNamespace(id=7),
+        user=SimpleNamespace(id=42, display_name="nahv"),
+        text_channel=SimpleNamespace(id=99),
+        voice_channel=SimpleNamespace(id=12),
+        query="another song",
+    )
+
+    vc.resume.assert_not_called()
+    assert manager.sessions[7].current is current
+    assert [track.title for track in manager.sessions[7].queue] == ["next"]
+
+
+@pytest.mark.asyncio
+async def test_adding_music_recovers_if_a_completion_callback_was_lost():
+    resolver = MagicMock()
+    resolver.resolve.return_value = [_track("next")]
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        join_voice_channel=AsyncMock(return_value=True),
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    stale = _track("stale")
+    manager.sessions[7] = MusicSession(guild_id=7, current=stale)
+
+    await manager._add_request(
+        guild=SimpleNamespace(id=7),
+        user=SimpleNamespace(id=42, display_name="nahv"),
+        text_channel=SimpleNamespace(id=99, send=AsyncMock()),
+        voice_channel=SimpleNamespace(id=12),
+        query="next song",
+    )
+
+    session = manager.sessions[7]
+    assert list(session.history) == [stale]
+    assert session.current.title == "next"
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lost_skip_callback_still_bypasses_repeat_when_new_music_is_added():
+    current = _track("current", 42)
+    resolver = MagicMock()
+    resolver.resolve.return_value = [_track("next", 42)]
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        join_voice_channel=AsyncMock(return_value=True),
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(
+        guild_id=7,
+        current=current,
+        repeat_current=True,
+        playback_generation=1,
+    )
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42,
+            guild_permissions=SimpleNamespace(administrator=False),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "skip")
+    vc.is_playing.return_value = False
+    await manager._add_request(
+        guild=SimpleNamespace(id=7),
+        user=SimpleNamespace(id=42, display_name="nahv"),
+        text_channel=session.text_channel,
+        voice_channel=SimpleNamespace(id=12),
+        query="next song",
+    )
+
+    assert list(session.history) == [current]
+    assert session.current is not None
+    assert session.current.title == "next"
+
+
+@pytest.mark.asyncio
 async def test_unplayable_track_is_skipped_and_next_track_starts():
     bad = _track("bad")
     good = _track("good")
@@ -626,6 +972,267 @@ async def test_unplayable_track_is_skipped_and_next_track_starts():
     await manager._start_next(session)
 
     assert session.current is good
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_panel_edit_failure_cannot_discard_a_track_that_started_playing():
+    first = _track("first")
+    second = _track("second")
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(guild_id=7, queue=deque([first, second]))
+    session.panel_message = SimpleNamespace(
+        edit=AsyncMock(side_effect=RuntimeError("deleted panel"))
+    )
+    session.text_channel = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("forbidden")))
+
+    await manager._start_next(session)
+
+    assert session.current is first
+    assert list(session.queue) == [second]
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_panel_render_failure_cannot_discard_a_track_that_started_playing():
+    first = _track("first")
+    second = _track("second")
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=MagicMock(side_effect=RuntimeError("broken controls")),
+    )
+    session = MusicSession(guild_id=7, queue=deque([first, second]))
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+
+    await manager._start_next(session)
+
+    assert session.current is first
+    assert list(session.queue) == [second]
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_track_completion_advances_to_the_next_queued_song():
+    first = _track("first")
+    second = _track("second")
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/second"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(guild_id=7, current=first, queue=deque([second]))
+    session.playback_generation = 1
+    session.panel_message = SimpleNamespace(edit=AsyncMock())
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+
+    await manager._on_track_end(7, generation=1)
+
+    assert session.current is second
+    assert list(session.history) == [first]
+    assert not session.queue
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lost_natural_completion_callback_still_advances_existing_queue():
+    first = _track("first")
+    second = _track("second")
+    resolver = MagicMock()
+    resolver.resolve_stream.side_effect = [
+        "https://cdn.example/first",
+        "https://cdn.example/second",
+    ]
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+
+    def _play(*_args, **_kwargs):
+        vc.is_playing.return_value = True
+
+    vc.play.side_effect = _play
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+        stop_reconcile_delay=0.01,
+    )
+    session = MusicSession(guild_id=7, queue=deque([first, second]))
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+
+    await manager._start_next(session)
+    vc.is_playing.return_value = False
+    await asyncio.sleep(0.05)
+
+    assert session.current is second
+    assert list(session.history) == [first]
+    assert vc.play.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_playback_failure_is_reported_and_not_added_to_history():
+    failed = _track("failed")
+    next_track = _track("next")
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(
+        guild_id=7,
+        current=failed,
+        queue=deque([next_track]),
+        playback_generation=1,
+    )
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+
+    await manager._on_track_end(
+        7,
+        error=RuntimeError("decoder stalled"),
+        generation=1,
+    )
+
+    assert session.current is next_track
+    assert failed not in session.history
+    assert session.last_error == "Playback failed for **failed**."
+    assert "decoder stalled" not in session.last_error
+
+
+@pytest.mark.asyncio
+async def test_source_terminal_error_reaches_the_completion_handler():
+    source = SimpleNamespace(
+        _current_error=RuntimeError("stream stalled"),
+        cleanup=MagicMock(),
+    )
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/current"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: source,
+        view_factory=lambda *_args: "controls",
+    )
+    track = _track("current")
+    session = MusicSession(guild_id=7, queue=deque([track]))
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+
+    await manager._start_next(session)
+    after = vc.play.call_args.kwargs["after"]
+    after(None)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert session.current is None
+    assert track not in session.history
+    assert session.last_error == "Playback failed for **current**."
+    assert "stream stalled" not in session.last_error
+
+
+@pytest.mark.asyncio
+async def test_music_playback_keeps_voice_receiver_live_for_spoken_controls():
+    receiver = SimpleNamespace(pause=MagicMock())
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={7: receiver},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(guild_id=7, queue=deque([_track("current")]))
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+
+    await manager._start_next(session)
+
+    receiver.pause.assert_not_called()
     vc.play.assert_called_once()
 
 
@@ -661,6 +1268,213 @@ async def test_skip_button_rejects_non_requester_and_allows_current_requester():
 
 
 @pytest.mark.asyncio
+async def test_panel_control_rejects_user_outside_hermes_allowlist():
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _is_allowed_user=MagicMock(return_value=False),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        view_factory=lambda *_args: "controls",
+    )
+    manager.sessions[7] = MusicSession(guild_id=7, current=_track("current", 42))
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=7),
+        user=SimpleNamespace(
+            id=99, guild_permissions=SimpleNamespace(administrator=True)
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "skip")
+
+    adapter._is_allowed_user.assert_called_once_with(
+        "99",
+        author=interaction.user,
+        guild=interaction.guild,
+        is_dm=False,
+        channel_ids=None,
+    )
+    vc.stop.assert_not_called()
+    assert "not authorized" in interaction.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_panel_control_passes_validated_channel_scope_to_authorization():
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    channel = SimpleNamespace(id=99)
+    user = SimpleNamespace(
+        id=42, guild_permissions=SimpleNamespace(administrator=False)
+    )
+    allow_user = MagicMock(
+        side_effect=lambda _uid, **kwargs: kwargs.get("channel_ids") == {"99"}
+    )
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _is_allowed_user=allow_user,
+        _discord_channel_keys_from_channel=MagicMock(return_value={"99"}),
+        _get_parent_channel_id=MagicMock(return_value=None),
+    )
+    manager = DiscordMusicManager(adapter, view_factory=lambda *_args: "controls")
+    manager.sessions[7] = MusicSession(guild_id=7, current=_track("current", 42))
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=7),
+        channel=channel,
+        user=user,
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "skip")
+
+    vc.stop.assert_called_once()
+    allow_user.assert_called_once_with(
+        "42",
+        author=user,
+        guild=interaction.guild,
+        is_dm=False,
+        channel_ids={"99"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_skip_recovers_and_advances_when_the_audio_player_is_already_stopped():
+    current = _track("current", 42)
+    next_track = _track("next", 42)
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(guild_id=7, current=current, queue=deque([next_track]))
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42,
+            guild_permissions=SimpleNamespace(administrator=False),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "skip")
+
+    assert session.current is next_track
+    assert list(session.history) == [current]
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_skip_advances_when_voice_stop_loses_its_completion_callback():
+    current = _track("current", 42)
+    next_track = _track("next", 42)
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.side_effect = [True, False, False]
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+        stop_reconcile_delay=0.01,
+    )
+    session = MusicSession(
+        guild_id=7,
+        current=current,
+        queue=deque([next_track]),
+        playback_generation=1,
+    )
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42,
+            guild_permissions=SimpleNamespace(administrator=False),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "skip")
+    await asyncio.sleep(0.05)
+
+    assert session.current is next_track
+    assert list(session.history) == [current]
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_skip_advances_instead_of_repeating_when_repeat_is_enabled():
+    current = _track("current", 42)
+    next_track = _track("next", 42)
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(
+        guild_id=7,
+        current=current,
+        queue=deque([next_track]),
+        repeat_current=True,
+        playback_generation=1,
+    )
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42,
+            guild_permissions=SimpleNamespace(administrator=False),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "skip")
+    await manager._on_track_end(7, generation=1)
+
+    assert session.current is next_track
+    assert list(session.history) == [current]
+
+
+@pytest.mark.asyncio
 async def test_play_pause_button_toggles_voice_client_state():
     vc = MagicMock()
     vc.is_paused.side_effect = [False, True]
@@ -679,6 +1493,66 @@ async def test_play_pause_button_toggles_voice_client_state():
 
     await manager.control(interaction, 7, "play_pause")
     vc.resume.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_play_pause_button_does_not_claim_it_paused_a_stopped_player():
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_paused.return_value = False
+    vc.is_playing.return_value = False
+    adapter = SimpleNamespace(_voice_clients={7: vc})
+    manager = DiscordMusicManager(adapter, view_factory=lambda *_args: "controls")
+    manager.sessions[7] = MusicSession(guild_id=7, current=_track("stale", 42))
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42,
+            guild_permissions=SimpleNamespace(administrator=False),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "play_pause")
+
+    vc.pause.assert_not_called()
+    assert "nothing is playing" in interaction.response.send_message.await_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_natural_pause_and_play_commands_are_idempotent_not_a_toggle():
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    channel = SimpleNamespace(send=AsyncMock())
+    member = SimpleNamespace(
+        id=42,
+        guild_permissions=SimpleNamespace(administrator=False),
+    )
+    message = SimpleNamespace(
+        guild=SimpleNamespace(id=7),
+        channel=channel,
+        author=member,
+    )
+    manager = DiscordMusicManager(
+        SimpleNamespace(_voice_clients={7: vc}),
+        view_factory=lambda *_args: "controls",
+    )
+    manager.sessions[7] = MusicSession(guild_id=7, current=_track("current", 42))
+
+    await manager.control_message(message, "pause")
+    vc.pause.assert_called_once_with()
+
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = True
+    await manager.control_message(message, "resume")
+    vc.resume.assert_called_once_with()
+
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    await manager.control_message(message, "resume")
+    vc.pause.assert_called_once_with()
+    assert "already playing" in channel.send.await_args.args[0].lower()
 
 
 @pytest.mark.asyncio
@@ -743,6 +1617,73 @@ async def test_previous_button_replays_history_then_returns_to_interrupted_song(
     assert list(session.queue)[0] is current
     vc.stop.assert_called_once_with()
     vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_previous_replays_finished_history_for_its_requester():
+    previous = _track("previous", 42)
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/audio"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(guild_id=7)
+    session.history.append(previous)
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42, guild_permissions=SimpleNamespace(administrator=False)
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "previous")
+
+    assert session.current is previous
+    vc.play.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_previous_preserves_queue_state_when_voice_is_disconnected():
+    previous = _track("previous", 42)
+    current = _track("current", 42)
+    vc = MagicMock()
+    vc.is_connected.return_value = False
+    manager = DiscordMusicManager(
+        SimpleNamespace(_voice_clients={7: vc}),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(guild_id=7, current=current)
+    session.history.append(previous)
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=42,
+            guild_permissions=SimpleNamespace(administrator=False),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.control(interaction, 7, "previous")
+
+    assert session.current is current
+    assert list(session.history) == [previous]
+    assert not session.queue
+    vc.stop.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -924,11 +1865,125 @@ async def test_adapter_voice_leave_notifies_music_manager():
     adapter._voice_timeout_tasks = {}
     adapter._voice_text_channels = {}
     adapter._voice_sources = {}
-    adapter._music_manager = SimpleNamespace(on_voice_disconnected=AsyncMock())
+    lock_was_held = None
+
+    async def _on_voice_disconnected(_guild_id):
+        nonlocal lock_was_held
+        lock_was_held = adapter._voice_locks[7].locked()
+
+    adapter._music_manager = SimpleNamespace(
+        on_voice_disconnected=AsyncMock(side_effect=_on_voice_disconnected)
+    )
 
     await adapter.leave_voice_channel(7)
 
     adapter._music_manager.on_voice_disconnected.assert_awaited_once_with(7)
+    assert lock_was_held is False
+
+
+@pytest.mark.asyncio
+async def test_join_is_rejected_while_voice_leave_cleanup_is_in_progress():
+    adapter = object.__new__(DiscordAdapter)
+    adapter._client = object()
+    adapter._voice_locks = {}
+    adapter._voice_leaving = {7}
+    channel = SimpleNamespace(guild=SimpleNamespace(id=7))
+
+    joined = await adapter.join_voice_channel(channel)
+
+    assert joined is False
+
+
+@pytest.mark.asyncio
+async def test_add_racing_with_leave_cannot_orphan_a_new_voice_player():
+    adapter = object.__new__(DiscordAdapter)
+    adapter._client = SimpleNamespace(get_guild=MagicMock(return_value=None))
+    adapter._voice_locks = {}
+    adapter._voice_leaving = set()
+    adapter._voice_receivers = {}
+    adapter._voice_listen_tasks = {}
+    adapter._voice_mixers = {}
+    adapter._voice_timeout_tasks = {}
+    adapter._voice_text_channels = {}
+    adapter._voice_sources = {}
+    adapter._is_allowed_user = MagicMock(return_value=True)
+
+    disconnect_started = asyncio.Event()
+    allow_disconnect = asyncio.Event()
+    old_vc = MagicMock()
+    old_vc.is_connected.return_value = True
+    old_vc.is_playing.return_value = False
+
+    async def _disconnect():
+        disconnect_started.set()
+        await allow_disconnect.wait()
+
+    old_vc.disconnect = _disconnect
+    adapter._voice_clients = {7: old_vc}
+
+    resolver = MagicMock()
+    resolver.resolve.return_value = [_track("new", 42)]
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    adapter._music_manager = manager
+    new_channel = SimpleNamespace(
+        id=12,
+        guild=SimpleNamespace(id=7),
+        connect=AsyncMock(),
+    )
+
+    leave_task = asyncio.create_task(adapter.leave_voice_channel(7))
+    await asyncio.wait_for(disconnect_started.wait(), timeout=1)
+    add_task = asyncio.create_task(
+        manager._add_request(
+            guild=SimpleNamespace(id=7),
+            user=SimpleNamespace(id=42, display_name="user-42"),
+            text_channel=SimpleNamespace(id=99),
+            voice_channel=new_channel,
+            query="new",
+        )
+    )
+    await asyncio.sleep(0)
+    allow_disconnect.set()
+
+    with pytest.raises(MusicResolutionError, match="could not join"):
+        await asyncio.wait_for(add_task, timeout=1)
+    await asyncio.wait_for(leave_task, timeout=1)
+
+    new_channel.connect.assert_not_awaited()
+    assert 7 not in adapter._voice_clients
+    assert 7 not in manager.sessions
+    assert 7 not in adapter._voice_leaving
+
+
+@pytest.mark.asyncio
+async def test_joining_an_existing_voice_connection_refreshes_its_text_binding():
+    adapter = object.__new__(DiscordAdapter)
+    adapter._client = object()
+    adapter._voice_locks = {}
+    adapter._voice_text_channels = {}
+    adapter._voice_sources = {}
+    adapter._reset_voice_timeout = MagicMock()
+    existing = SimpleNamespace(
+        channel=SimpleNamespace(id=12),
+        is_connected=lambda: True,
+    )
+    adapter._voice_clients = {7: existing}
+    channel = SimpleNamespace(id=12, guild=SimpleNamespace(id=7))
+
+    joined = await adapter.join_voice_channel(
+        channel,
+        text_channel_id=99,
+        source={"chat_id": "99"},
+    )
+
+    assert joined is True
+    assert adapter._voice_text_channels[7] == 99
+    assert adapter._voice_sources[7] == {"chat_id": "99"}
 
 
 @pytest.mark.asyncio
@@ -1044,6 +2099,52 @@ async def test_admin_action_defers_before_waiting_for_guild_lock():
     interaction.followup.send.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_force_skip_bypasses_repeat_and_advances_the_queue():
+    current = _track("current", 42)
+    next_track = _track("next", 42)
+    resolver = MagicMock()
+    resolver.resolve_stream.return_value = "https://cdn.example/next"
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    adapter = SimpleNamespace(
+        _voice_clients={7: vc},
+        _voice_receivers={},
+        _voice_mixers={},
+        _cancel_voice_timeout=MagicMock(),
+    )
+    manager = DiscordMusicManager(
+        adapter,
+        resolver=resolver,
+        audio_source_factory=lambda _url: object(),
+        view_factory=lambda *_args: "controls",
+    )
+    session = MusicSession(
+        guild_id=7,
+        current=current,
+        queue=deque([next_track]),
+        repeat_current=True,
+        playback_generation=1,
+    )
+    session.text_channel = SimpleNamespace(send=AsyncMock())
+    manager.sessions[7] = session
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=1,
+            guild_permissions=SimpleNamespace(administrator=True),
+        ),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await manager.admin_action(interaction, 7, "forceskip")
+    await manager._on_track_end(7, generation=1)
+
+    assert session.current is next_track
+    assert list(session.history) == [current]
+
+
 class _FakeTree:
     def __init__(self):
         self.commands = {}
@@ -1071,3 +2172,182 @@ def test_discord_registers_music_queue_and_admin_slash_commands():
     assert {"play", "musicqueue", "forceskip", "clearqueue"}.issubset(
         adapter._client.tree.commands
     )
+
+
+@pytest.mark.asyncio
+async def test_natural_text_play_command_routes_directly_to_music_manager():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    manager = SimpleNamespace(add_message=AsyncMock())
+    adapter._music_manager = manager
+    message = SimpleNamespace(content="Hey Jarvis play Paranoid by Rich Amiri")
+
+    handled = await adapter._maybe_handle_natural_music_message(message)
+
+    assert handled is True
+    manager.add_message.assert_awaited_once_with(
+        message, "Paranoid by Rich Amiri"
+    )
+
+
+@pytest.mark.asyncio
+async def test_natural_text_pause_routes_directly_to_music_controls():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    manager = SimpleNamespace(
+        add_message=AsyncMock(),
+        control_message=AsyncMock(),
+    )
+    adapter._music_manager = manager
+    message = SimpleNamespace(content="Hey Jarvis pause the song")
+
+    handled = await adapter._maybe_handle_natural_music_message(message)
+
+    assert handled is True
+    manager.control_message.assert_awaited_once_with(message, "pause")
+    manager.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_natural_text_music_error_disables_discord_mentions(monkeypatch):
+    import discord
+
+    class CompatibleAllowedMentions:
+        def __init__(self, *, everyone=True, roles=True, users=True, replied_user=True):
+            self.everyone = everyone
+            self.roles = roles
+            self.users = users
+            self.replied_user = replied_user
+
+    monkeypatch.setattr(discord, "AllowedMentions", CompatibleAllowedMentions)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._music_manager = SimpleNamespace(
+        add_message=AsyncMock(side_effect=RuntimeError("@everyone"))
+    )
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(
+        content="Hey Jarvis play Paranoid by Rich Amiri",
+        channel=channel,
+    )
+
+    handled = await adapter._maybe_handle_natural_music_message(message)
+
+    assert handled is True
+    mentions = channel.send.await_args.kwargs["allowed_mentions"]
+    assert "@everyone" not in channel.send.await_args.args[0]
+    assert mentions.everyone is False
+    assert mentions.roles is False
+    assert mentions.users is False
+
+
+@pytest.mark.asyncio
+async def test_natural_voice_play_command_routes_to_linked_music_queue():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    guild = SimpleNamespace(id=7)
+    member = SimpleNamespace(
+        id=42,
+        display_name="nahv",
+        voice=SimpleNamespace(channel=SimpleNamespace(id=12)),
+    )
+    guild.get_member = MagicMock(return_value=member)
+    channel = SimpleNamespace(id=99, send=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_guild=MagicMock(return_value=guild),
+        get_channel=MagicMock(return_value=channel),
+    )
+    adapter._voice_text_channels = {7: 99}
+    manager = SimpleNamespace(add_message=AsyncMock())
+    adapter._music_manager = manager
+
+    handled = await adapter._maybe_handle_natural_music_voice(
+        7, 42, "Hey Jarvis play Paranoid by Rich Amiri"
+    )
+
+    assert handled is True
+    request = manager.add_message.await_args.args[0]
+    assert request.guild is guild
+    assert request.author is member
+    assert request.channel is channel
+    assert manager.add_message.await_args.args[1] == "Paranoid by Rich Amiri"
+
+
+@pytest.mark.asyncio
+async def test_natural_voice_resume_routes_directly_to_music_controls():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    guild = SimpleNamespace(id=7)
+    member = SimpleNamespace(
+        id=42,
+        display_name="nahv",
+        voice=SimpleNamespace(channel=SimpleNamespace(id=12)),
+    )
+    guild.get_member = MagicMock(return_value=member)
+    channel = SimpleNamespace(id=99, send=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_guild=MagicMock(return_value=guild),
+        get_channel=MagicMock(return_value=channel),
+    )
+    adapter._voice_text_channels = {7: 99}
+    manager = SimpleNamespace(
+        add_message=AsyncMock(),
+        control_message=AsyncMock(),
+    )
+    adapter._music_manager = manager
+
+    handled = await adapter._maybe_handle_natural_music_voice(
+        7, 42, "Hey Jarvis play"
+    )
+
+    assert handled is True
+    request = manager.control_message.await_args.args[0]
+    assert request.guild is guild
+    assert request.author is member
+    assert request.channel is channel
+    assert manager.control_message.await_args.args[1] == "resume"
+    manager.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_natural_voice_music_respects_the_linked_channels_ignore_gate():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"ignored_channels": ["99"]},
+        )
+    )
+    guild = SimpleNamespace(id=7)
+    member = SimpleNamespace(id=42)
+    guild.get_member = MagicMock(return_value=member)
+    channel = SimpleNamespace(id=99, name="music", send=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_guild=MagicMock(return_value=guild),
+        get_channel=MagicMock(return_value=channel),
+    )
+    adapter._voice_text_channels = {7: 99}
+    manager = SimpleNamespace(
+        add_message=AsyncMock(),
+        control_message=AsyncMock(),
+    )
+    adapter._music_manager = manager
+
+    handled = await adapter._maybe_handle_natural_music_voice(
+        7, 42, "Hey Jarvis skip this song"
+    )
+
+    assert handled is False
+    manager.control_message.assert_not_awaited()
+    manager.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_natural_voice_play_falls_back_when_discord_context_is_missing():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_guild=MagicMock(return_value=None),
+        get_channel=MagicMock(return_value=None),
+    )
+    adapter._voice_text_channels = {7: 99}
+
+    handled = await adapter._maybe_handle_natural_music_voice(
+        7, 42, "Hey Jarvis play Paranoid by Rich Amiri"
+    )
+
+    assert handled is False
