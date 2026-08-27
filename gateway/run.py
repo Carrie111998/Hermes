@@ -115,6 +115,9 @@ _USER_BOUNDARY_END_REASONS = (
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_MATRIX_CODE_COMMAND_RE = re.compile(
+    r"`/([A-Za-z0-9][A-Za-z0-9_-]*)(?=[\s`])"
+)
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -1091,6 +1094,23 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
         return f"/{sanitized}" if sanitized else match.group(0)
 
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
+
+
+def _platformize_command_mentions(text: str, platform: Any) -> str:
+    """Render command mentions using syntax the target client can send.
+
+    Dispatch remains slash-based internally. Telegram receives its existing
+    name sanitization; Matrix receives bang-prefixed command tokens because
+    Element clients may reserve slash commands locally.
+    """
+    rendered = _telegramize_command_mentions(text, platform)
+    platform_value = getattr(platform, "value", platform)
+    if platform_value != "matrix":
+        return rendered
+    return _MATRIX_CODE_COMMAND_RE.sub(
+        lambda match: f"`!{match.group(1)}",
+        rendered,
+    )
 
 
 # Only auto-continue interrupted gateway turns while the interruption is fresh.

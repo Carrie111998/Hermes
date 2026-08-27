@@ -1719,17 +1719,17 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
-        from gateway.run import _telegramize_command_mentions
+        from gateway.run import _platformize_command_mentions
         from hermes_cli.slash_exec import CommandContext, execute_command
 
         reply = execute_command("help", CommandContext(surface="gateway"))
-        return _telegramize_command_mentions(
+        return _platformize_command_mentions(
             reply.text,
             getattr(getattr(event, "source", None), "platform", None),
         )
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
-        from gateway.run import _telegramize_command_mentions
+        from gateway.run import _platformize_command_mentions
         from hermes_cli.slash_exec import CommandContext, execute_command
         from gateway.config import Platform
 
@@ -1743,7 +1743,7 @@ class GatewaySlashCommandsMixin:
                 options={"page_size": page_size},
             ),
         )
-        return _telegramize_command_mentions(
+        return _platformize_command_mentions(
             reply.text,
             getattr(getattr(event, "source", None), "platform", None),
         )
