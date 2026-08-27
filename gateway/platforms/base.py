@@ -6722,8 +6722,19 @@ class BasePlatformAdapter(ABC):
                 # accepted the message but before its HTTP acknowledgement
                 # returns; leaving typing alive until the coroutine tail would
                 # then refresh the indicator indefinitely.
+                # Fire-and-forget: awaiting inline here stalls the ephemeral
+                # delete scheduling path (its detached task must be spawned
+                # while this turn still owns the loop; a 0.5s inline wait
+                # reordered the scheduler in test_ephemeral_reply). The stop
+                # still starts before the send below yields to the network.
                 if _tts_path or text_content or images or media_files or local_files:
-                    await _stop_typing_before_delivery()
+                    typing_stop_task = asyncio.create_task(
+                        _stop_typing_before_delivery()
+                    )
+                    self._background_tasks.add(typing_stop_task)
+                    typing_stop_task.add_done_callback(
+                        self._background_tasks.discard
+                    )
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
