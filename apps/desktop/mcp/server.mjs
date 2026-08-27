@@ -19,13 +19,14 @@ import {
   ListToolsRequestSchema
 } from '@modelcontextprotocol/sdk/types.js'
 
-import { CDP, SELECTORS, discoverTarget } from '../scripts/perf/lib/cdp.mjs'
+import { SELECTORS } from '../scripts/perf/lib/cdp.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { actTools, handleAct } from './tools/act.mjs'
 import { flowTools, handleFlow } from './tools/flows.mjs'
 import { assertTargetAttested, canon } from './guard.mjs'
 import { dispatchTool, wrapResult } from './dispatch.mjs'
+import { createCdpClient, isConnectablePage } from './cdp-client.mjs'
 
 // ---------------------------------------------------------------------------
 // Output bounds — never dump the whole DOM into an agent's context.
@@ -52,35 +53,19 @@ const CFG = {
 const EXPECTED_HOME = process.env.DESKTOP_DEBUG_MCP_EXPECTED_HOME || ''
 const DEFAULT_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes')
 
-let cdp = null // lazily connected CDP instance
 const consoleRing = [] // renderer console capture (bounded)
 
-async function connect() {
-  if (cdp) return cdp
-
-  try {
-    await discoverTarget({ port: CFG.port, match: CFG.match, timeoutMs: 3000 })
-  } catch {
-    throw new Error(
-      `No CDP target on :${CFG.port}. The debug port only exists for DEV runs ` +
-        '(packaged builds never open it). Either ask the user to start the dev ' +
-        "server (`cd apps/desktop && npm run dev`) or launch an isolated probe " +
-        'instance (see apps/desktop/mcp/README.md).'
-    )
-  }
-
-  cdp = await CDP.connect({ port: CFG.port, match: CFG.match })
-  cdp.on('Runtime.consoleAPICalled', p => {
-    consoleRing.push({
-      level: p.type,
-      text: p.args?.map(a => a.value ?? a.description ?? '').join(' ').slice(0, 200),
-      t: Date.now()
-    })
+// Lazily connected CDP client. Owns the connection lifecycle (discovery + open
+// + console capture + failure reset) so server.mjs stays a thin wiring layer.
+const cdpClient = createCdpClient({
+  port: CFG.port,
+  match: CFG.match,
+  onConsole: (entry) => {
+    consoleRing.push(entry)
     if (consoleRing.length > 200) consoleRing.shift()
-  })
-
-  return cdp
-}
+  }
+})
+const connect = () => cdpClient.connect()
 
 /** Evaluate with a bounded JSON result. Throws with a friendly message on failure. */
 async function evalBounded(expression) {
@@ -102,7 +87,10 @@ async function status() {
 
   try {
     const list = await (await fetch(`http://127.0.0.1:${CFG.port}/json/list`)).json()
-    targets = list.filter(t => t.type === 'page').map(t => ({ url: String(t.url).slice(0, 120), title: String(t.title).slice(0, 60) }))
+    // BUG #3 fix: use the same "is connectable" predicate as the CDP client.
+    // A page target without a webSocketDebuggerUrl is not connectable, so
+    // status() must not claim `cdpAlive:true` for it.
+    targets = list.filter(isConnectablePage).map(t => ({ url: String(t.url).slice(0, 120), title: String(t.title).slice(0, 60) }))
     alive = targets.length > 0
   } catch {
     alive = false
