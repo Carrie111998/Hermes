@@ -6707,6 +6707,82 @@ class TelegramAdapter(BasePlatformAdapter):
 
     _MODEL_PAGE_SIZE = 8
 
+    # Bedrock inference-profile IDs are ``<geo>.<vendor>.<model>``. Vendor
+    # segments get a display label so the drill-down step reads naturally;
+    # unknown vendors fall back to a capitalized segment.
+    _VENDOR_LABELS = {
+        "ai21": "AI21",
+        "amazon": "Amazon",
+        "anthropic": "Anthropic",
+        "cohere": "Cohere",
+        "deepseek": "DeepSeek",
+        "meta": "Meta",
+        "mistral": "Mistral",
+        "openai": "OpenAI",
+        "qwen": "Qwen",
+        "stability": "Stability",
+        "twelvelabs": "TwelveLabs",
+        "writer": "Writer",
+        "xai": "xAI",
+    }
+
+    @staticmethod
+    def _split_bedrock_id(model_id: str) -> tuple:
+        """Split a Bedrock inference-profile ID into (geo, vendor, model).
+
+        Returns ``("", "", short)`` for anything that is not a
+        ``<geo>.<vendor>.<model>`` triple, so non-Bedrock providers keep
+        their IDs untouched. The routing segment is matched loosely (short
+        alphabetic segment, hyphens allowed) to cover ``global.``, ``us.``,
+        ``eu.``, ``apac.`` and ``us-gov.`` without pinning a fixed list.
+        """
+        short = model_id.split("/")[-1] if "/" in model_id else model_id
+        parts = short.split(".")
+        if len(parts) >= 3 and parts[0].replace("-", "").isalpha() and len(parts[0]) <= 7:
+            return parts[0], parts[1], ".".join(parts[2:])
+        return "", "", short
+
+    def _group_models_by_vendor(self, models: list) -> list:
+        """Group Bedrock model IDs by vendor segment.
+
+        Returns a vendor-sorted list of ``{vendor, label, indices}`` dicts
+        where ``indices`` are positions in *models*, so callers can scope a
+        sub-list without ever rewriting a model ID. Returns ``[]`` when the
+        list carries no Bedrock-style IDs, which is how callers decide not
+        to insert the extra drill-down step at all.
+        """
+        groups: dict = {}
+        for i, model_id in enumerate(models):
+            _geo, vendor, _short = self._split_bedrock_id(model_id)
+            if not vendor:
+                continue
+            groups.setdefault(vendor, []).append(i)
+        return [
+            {
+                "vendor": vendor,
+                "label": self._VENDOR_LABELS.get(vendor, vendor.capitalize()),
+                "indices": indices,
+            }
+            for vendor, indices in sorted(groups.items())
+        ]
+
+    def _build_vendor_keyboard(self, models: list) -> Any:
+        """Build the vendor drill-down keyboard for a Bedrock model list."""
+        buttons: list = []
+        for group in self._group_models_by_vendor(models):
+            buttons.append(
+                InlineKeyboardButton(
+                    f"{group['label']} ({len(group['indices'])})",
+                    callback_data=f"mvd:{group['vendor']}",
+                )
+            )
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([
+            InlineKeyboardButton("◀ Back", callback_data="mb"),
+            InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
     def _build_provider_keyboard(self, providers: list, page: int = 0) -> tuple:
         """Build the paginated top-level provider keyboard, folding groups.
 
@@ -6794,15 +6870,12 @@ class TelegramAdapter(BasePlatformAdapter):
             Remove both segments only from the display label so the model
             family/version remains visible; ``model_id`` is still retained
             in picker state and is selected through the index callback
-            below. The length guard keeps degenerate two-segment IDs
-            (e.g. ``global.anthropic``) intact — a blank label would be
-            rejected by Telegram (BUTTON_TEXT_INVALID).
+            below. Degenerate IDs that are not a ``<geo>.<vendor>.<model>``
+            triple are returned untouched — a blank label would be rejected
+            by Telegram (BUTTON_TEXT_INVALID).
             """
-            short = model_id.split("/")[-1] if "/" in model_id else model_id
-            parts = short.split(".")
-            if len(parts) >= 3 and parts[0].replace("-", "").isalpha() and len(parts[0]) <= 7:
-                return ".".join(parts[2:]), parts[0]
-            return short, ""
+            geo, _vendor, short = self._split_bedrock_id(model_id)
+            return short, geo
 
         # The same model often ships behind several routing namespaces at
         # once (``us.xai.grok-4.6`` and ``global.xai.grok-4.6`` coexist in
@@ -6849,7 +6922,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
+        """Handle model picker inline keyboard callbacks (mp:/mvd:/mm:/mc:/mb:/mx:/mg:)."""
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
@@ -6875,12 +6948,37 @@ class TelegramAdapter(BasePlatformAdapter):
             models = provider.get("models", [])
             state["selected_provider"] = provider_slug
             state["selected_provider_name"] = provider.get("name", provider_slug)
+            state["full_model_list"] = models
+            state["selected_vendor"] = ""
             state["model_list"] = models
             state["model_page"] = 0
 
+            pname = provider.get("name", provider_slug)
+
+            # Bedrock lists dozens of ``<geo>.<vendor>.<model>`` inference
+            # profiles at once, which makes a flat page of buttons hard to
+            # scan. Insert a vendor drill-down step when the list is
+            # Bedrock-shaped and spans more than one vendor; other
+            # providers keep the original two-step flow untouched.
+            vendors = self._group_models_by_vendor(models)
+            if len(vendors) > 1:
+                keyboard = self._build_vendor_keyboard(models)
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}*\n\n"
+                            f"Select a model vendor:"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+                await query.answer()
+                return
+
             keyboard, page_info = self._build_model_keyboard(models, 0)
 
-            pname = provider.get("name", provider_slug)
             total = provider.get("total_models", len(models))
             shown = len(models)
             extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
@@ -7142,8 +7240,64 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             await query.answer()
 
+        elif data.startswith("mvd:"):
+            # --- Vendor selected: show that vendor's models (page 0) ---
+            vendor = data[4:]
+            full_models = state.get("full_model_list", state.get("model_list", []))
+            groups = {g["vendor"]: g for g in self._group_models_by_vendor(full_models)}
+            group = groups.get(vendor)
+            if not group:
+                await query.answer(text="Vendor not found.")
+                return
+
+            # Scope the model list to this vendor. IDs are copied verbatim,
+            # so the ``mm:<idx>`` callback still selects the exact Bedrock
+            # inference-profile ID the provider advertised.
+            scoped = [full_models[i] for i in group["indices"]]
+            state["selected_vendor"] = vendor
+            state["model_list"] = scoped
+            state["model_page"] = 0
+
+            keyboard, page_info = self._build_model_keyboard(scoped, 0)
+
+            pname = state.get("selected_provider_name", "")
+            await query.edit_message_text(
+                text=self.format_message(
+                    (
+                        f"⚙ *Model Configuration*\n\n"
+                        f"Provider: *{pname}* ▸ *{group['label']}*{page_info}\n"
+                        f"Select a model:"
+                    )
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+
         elif data == "mb":
-            # --- Back to provider list (folds groups) ---
+            # --- Back: to the vendor list when we drilled through one,
+            # otherwise to the provider list (folds groups) ---
+            if state.get("selected_vendor"):
+                full_models = state.get("full_model_list", [])
+                state["selected_vendor"] = ""
+                state["model_list"] = full_models
+                state["model_page"] = 0
+                keyboard = self._build_vendor_keyboard(full_models)
+                pname = state.get("selected_provider_name", "")
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}*\n\n"
+                            f"Select a model vendor:"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+                await query.answer()
+                return
+
             page = int(state.get("provider_page", 0) or 0)
             keyboard, provider_page_info = self._build_provider_keyboard(
                 state["providers"], page
