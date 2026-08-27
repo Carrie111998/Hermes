@@ -24,19 +24,14 @@ import {
   openGatewayForProfile
 } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
+import { normalizeProfileKey } from '@/store/profile-key'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
 import { setConnection } from '@/store/session'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
-// Canonical key for a profile: trimmed, empty → "default". Used everywhere we
-// compare a session's owning profile against the live gateway's profile.
-export function normalizeProfileKey(name: string | null | undefined): string {
-  const value = (name ?? '').trim()
-
-  return value || 'default'
-}
+export { normalizeProfileKey } from '@/store/profile-key'
 
 // Presentation-only label: the display_name from profile.yaml when set (e.g. a
 // renamed default profile), else the canonical name. Never used for

@@ -24,7 +24,7 @@ import { atom } from 'nanostores'
 import { setSessionUnreadRemote } from '@/hermes'
 import { ownerQualifiedSessionIdentity } from '@/lib/session-row-identity'
 
-import { normalizeProfileKey } from './profile'
+import { normalizeProfileKey } from './profile-key'
 import { $sessions, setSessions } from './session'
 import type { SessionOwnerRoute } from './session-request-router'
 
