@@ -57,6 +57,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
@@ -3640,7 +3641,7 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         runtime = None
 
-    if not isinstance(runtime, dict):
+    if not isinstance(runtime, Mapping):
         openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
         openai_key = _scoped_key_env("OPENAI_API_KEY")
         if not openai_base:

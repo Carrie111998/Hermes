@@ -8,6 +8,8 @@ import re
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
+from agent.runtime_bundle import ResolvedRuntime
+
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
@@ -1770,7 +1772,7 @@ def _resolve_explicit_runtime(
     return None
 
 
-def resolve_runtime_provider(
+def _resolve_runtime_provider_mapping(
     *,
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
@@ -2443,6 +2445,24 @@ def resolve_runtime_provider(
     )
     runtime["requested_provider"] = requested_provider
     return runtime
+
+
+def resolve_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> ResolvedRuntime:
+    """Resolve provider configuration into an immutable runtime value."""
+    return ResolvedRuntime.from_mapping(
+        _resolve_runtime_provider_mapping(
+            requested=requested,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
+    )
 
 
 def format_runtime_provider_error(error: Exception) -> str:
