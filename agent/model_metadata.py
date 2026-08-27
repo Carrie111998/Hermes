@@ -1066,7 +1066,11 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     result: Optional[str] = None
     try:
-        with httpx.Client(timeout=2.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=2.0,
+            headers=headers,
+            trust_env=not is_local_endpoint(server_url),
+        ) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
                 r = client.get(f"{lmstudio_url}/api/v1/models")
@@ -1992,7 +1996,11 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     headers = _auth_headers(api_key)
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=3.0,
+            headers=headers,
+            trust_env=not is_local_endpoint(server_url),
+        ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
                 return None
@@ -2050,7 +2058,11 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
     headers = _auth_headers(api_key)
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=3.0,
+            headers=headers,
+            trust_env=not is_local_endpoint(server_url),
+        ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
                 return None
@@ -2130,7 +2142,11 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
     headers = _auth_headers(api_key)
 
     try:
-        with httpx.Client(timeout=5.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=5.0,
+            headers=headers,
+            trust_env=not is_local_endpoint(server_url),
+        ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": model})
             if resp.status_code != 200:
                 return None
@@ -2315,7 +2331,11 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         server_type = None
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=3.0,
+            headers=headers,
+            trust_env=not is_local_endpoint(server_url),
+        ) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
                 resp = client.post(f"{server_url}/api/show", json={"name": model})
