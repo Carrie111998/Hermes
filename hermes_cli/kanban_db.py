@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "escalation_required", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -1419,6 +1419,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     routing_priority     TEXT,
     routing_tier         TEXT,
     route_snapshot       TEXT,
+    -- Opt-in durable quality-gate policy. NULL means disabled/not required,
+    -- preserving the historic completion path for existing tasks.
+    quality_policy_json  TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2711,6 +2714,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if _name not in cols:
             _add_column_if_missing(conn, "tasks", _name, _definition)
 
+    if "quality_policy_json" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "quality_policy_json", "quality_policy_json TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -3907,6 +3915,47 @@ def set_model_override(
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
+
+
+def set_quality_policy(
+    conn: sqlite3.Connection,
+    task_id: str,
+    policy: Optional[Mapping[str, Any]],
+) -> bool:
+    """Set an explicit per-task quality policy; ``None`` disables the gate.
+
+    This is an operator/configuration API, not a worker routing mechanism.
+    The default remains disabled/not-required for compatibility. We retain
+    only JSON-object policies so the stored value is durable and auditable.
+    """
+    if policy is not None and not isinstance(policy, Mapping):
+        raise ValueError("quality policy must be an object or None")
+    normalized = dict(policy) if policy is not None else None
+    if normalized is not None and any(
+        key in normalized and not isinstance(normalized[key], bool)
+        for key in ("enabled", "required")
+    ):
+        raise ValueError("quality policy enabled/required values must be booleans")
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")) if normalized else None
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set quality policy on archived task {task_id}")
+        conn.execute("UPDATE tasks SET quality_policy_json = ? WHERE id = ?", (encoded, task_id))
+        _append_event(conn, task_id, "quality_policy_set", {"policy": normalized})
+    return True
+
+
+def _quality_policy_required(row: sqlite3.Row) -> bool:
+    """Return true only for the explicit, opt-in required gate policy."""
+    try:
+        raw = row["quality_policy_json"]
+        policy = json.loads(raw) if raw else {}
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(policy, dict) and bool(policy.get("enabled")) and bool(policy.get("required"))
 
 
 def set_reasoning_effort(
@@ -5675,10 +5724,49 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, quality_policy_json FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Opt-in quality policies are fail-closed: only a review-owned,
+        # run-correlated quality_passed event permits this completion. The
+        # default NULL policy intentionally preserves legacy completion.
+        if prior is not None and _quality_policy_required(prior):
+            gate_run_id = expected_run_id if expected_run_id is not None else prior["current_run_id"]
+            gate = (
+                conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+                    "AND kind = 'quality_passed' ORDER BY id DESC LIMIT 1",
+                    (task_id, int(gate_run_id)),
+                ).fetchone()
+                if gate_run_id is not None
+                else None
+            )
+            if gate is None:
+                _append_event(
+                    conn, task_id, "quality_required",
+                    {"run_id": gate_run_id, "source_status": prior_status},
+                    run_id=int(gate_run_id) if gate_run_id is not None else None,
+                )
+                return False
+        # A quality pass was stored on the active review run before the
+        # explicit approval/completion call. Preserve that durable evidence
+        # when ``_end_run`` writes the final run metadata.
+        if prior is not None and prior["current_run_id"] is not None:
+            existing_run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (int(prior["current_run_id"]),),
+            ).fetchone()
+            try:
+                existing_metadata = (
+                    json.loads(existing_run["metadata"])
+                    if existing_run and existing_run["metadata"]
+                    else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                existing_metadata = {}
+            if isinstance(existing_metadata, dict) and existing_metadata.get("quality_gate"):
+                metadata = {**existing_metadata, **(metadata or {})}
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6886,7 +6974,124 @@ def request_review(
             },
             run_id=run_id,
         )
+        policy_row = conn.execute(
+            "SELECT quality_policy_json FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if policy_row is not None and _quality_policy_required(policy_row):
+            _append_event(
+                conn,
+                task_id,
+                "quality_gate_required",
+                {"source_run_id": run_id, "human_approval_required": True},
+                run_id=run_id,
+            )
     return _ret(True)
+
+
+def record_quality_gate(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    passed: bool,
+    reason: Optional[str] = None,
+    result: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Persist the review-owned quality result for an opt-in task.
+
+    The gate intentionally executes no subprocess and never changes model
+    overrides. A pass merely permits a later explicit completion; a failure
+    closes the review run, records ``quality_failed`` before
+    ``escalation_required``, and asks the router for a fresh auditable policy
+    decision using the prior route, evidence, and retry count.
+    """
+    reason = str(redact_review_value(reason or "")).strip()
+    safe_result = redact_review_value(dict(result or {}))
+    if not isinstance(safe_result, dict):
+        return False
+    if not passed and not reason:
+        return False
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id, quality_policy_json, routing_priority "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task is None or not _quality_policy_required(task):
+            return False
+        if task["status"] != "running" or task["current_run_id"] != int(run_id):
+            return False
+        claimed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, int(run_id)),
+        ).fetchone()
+        try:
+            claim_payload = json.loads(claimed["payload"]) if claimed and claimed["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            claim_payload = {}
+        if not isinstance(claim_payload, dict) or claim_payload.get("source_status") != "review":
+            return False
+        run = conn.execute(
+            "SELECT route_snapshot, attempt_number, metadata FROM task_runs "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL", (int(run_id), task_id),
+        ).fetchone()
+        if run is None:
+            return False
+        try:
+            route = json.loads(run["route_snapshot"]) if run["route_snapshot"] else {}
+        except (TypeError, json.JSONDecodeError):
+            route = {}
+        prior_model = route.get("model") if isinstance(route, dict) else None
+        try:
+            metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        gate = {"passed": bool(passed), **safe_result}
+        metadata["quality_gate"] = gate
+        if passed:
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False), int(run_id)),
+            )
+            _append_event(conn, task_id, "quality_passed", gate, run_id=int(run_id))
+            return True
+
+        try:
+            from hermes_cli.kanban_model_policy import ModelRoutingPolicy
+            decision = ModelRoutingPolicy.load().reevaluate_quality_failure(
+                priority=task["routing_priority"], prior_model=prior_model,
+                failure_reason=reason, quality_result=safe_result,
+                retry_count=int(run["attempt_number"] or 1),
+            )
+        except Exception as exc:
+            decision = {"action": "human_escalation_required", "router_error": str(exc)}
+        conn.execute(
+            "UPDATE tasks SET status = 'escalation_required', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND current_run_id = ?",
+            (task_id, int(run_id)),
+        )
+        closed_run_id = _end_run(
+            conn, task_id, outcome="quality_failed", status="quality_failed",
+            error=reason, metadata=metadata,
+        )
+        payload = {"reason": reason, "result": safe_result}
+        _append_event(conn, task_id, "quality_failed", payload, run_id=closed_run_id)
+        _append_event(
+            conn,
+            task_id,
+            "escalation_required",
+            {
+                "prior_run_id": int(run_id),
+                "prior_model": prior_model,
+                "failure_reason": reason,
+                "quality_result": safe_result,
+                "retry_count": int(run["attempt_number"] or 1),
+                "decision": decision,
+            },
+            run_id=closed_run_id,
+        )
+    return True
 
 
 def request_changes(

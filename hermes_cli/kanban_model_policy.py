@@ -98,6 +98,33 @@ class ModelRoutingPolicy:
                 return {"tier": tier, "provider": provider, "model": model}
         raise PolicyError(f"override {provider}/{model} is not an approved candidate")
 
+    def reevaluate_quality_failure(
+        self,
+        *,
+        priority: str | None,
+        prior_model: str | None,
+        failure_reason: str,
+        quality_result: Mapping[str, Any],
+        retry_count: int,
+    ) -> dict[str, Any]:
+        """Make the router-owned decision after a failed quality gate.
+
+        Quality workers supply evidence, never a replacement model.  The
+        policy is reloaded by the caller and resolves the current approved
+        route for auditability, but the default decision remains a human
+        escalation: no worker can self-upgrade, merge, deploy, or activate a
+        result merely because its own quality check failed.
+        """
+        route = self.resolve(priority=priority)
+        return {
+            "action": "human_escalation_required",
+            "route": route,
+            "prior_model": prior_model,
+            "failure_reason": failure_reason,
+            "quality_result": dict(quality_result),
+            "retry_count": int(retry_count),
+        }
+
 
 def policy_for_task(task: Any) -> tuple[ModelRoutingPolicy, dict[str, str]]:
     policy = ModelRoutingPolicy.load()
