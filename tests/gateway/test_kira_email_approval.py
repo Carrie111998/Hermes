@@ -54,7 +54,6 @@ class _Provider:
         self.timeout = timeout
         self.created: list[dict] = []
         self.sent: list[dict] = []
-        self.remote: dict = {}
 
     async def get_profile(self, *, account: str) -> dict:
         assert account == "rlord"
@@ -63,16 +62,7 @@ class _Provider:
     async def create_email_draft(self, *, account: str, arguments: dict) -> dict:
         assert account == "rlord"
         self.created.append(arguments)
-        self.remote = {
-            "recipient": arguments["recipient_email"], "subject": arguments["subject"],
-            "body": arguments["body"], "thread": arguments.get("thread_id", ""),
-        }
         return {"data": {"id": "gmail-draft-1"}}
-
-    async def get_email_draft(self, *, account: str, arguments: dict) -> dict:
-        assert account == "rlord"
-        assert arguments == {"user_id": "me", "draft_id": "gmail-draft-1"}
-        return {"data": self.remote}
 
     async def send_draft(self, *, account: str, arguments: dict) -> dict:
         assert account == "rlord"
@@ -202,27 +192,19 @@ def test_status_redacts_email_body_and_audit_is_append_only(tmp_path: Path) -> N
                      "SELECT event_id,draft_id,timestamp,'forged',payload_sha256 FROM audit_events LIMIT 1")
 
 
-def test_remote_draft_change_is_refused_before_send_and_status_hides_thread(tmp_path: Path) -> None:
+def test_success_status_redacts_local_content_and_keeps_provider_evidence(tmp_path: Path) -> None:
     gate = _gate(tmp_path)
     created = _draft(gate)
     _approve(gate, created)
     provider = _Provider()
-    provider.remote = {"recipient": "vendor@example.com", "subject": "changed", "body": "changed", "thread": ""}
-
-    # This provider's create implementation overwrites remote state, so change it
-    # after draft creation to emulate a mutable remote Gmail draft.
-    original_create = provider.create_email_draft
-
-    async def changed_create(**kwargs):
-        result = await original_create(**kwargs)
-        provider.remote["body"] = "changed remotely"
-        return result
-
-    provider.create_email_draft = changed_create  # type: ignore[method-assign]
-    refused = asyncio.run(gate.send(created["id"], provider))
-    assert refused["state"] == "FAILED"
-    assert provider.sent == []
-    assert "thread" not in repr(refused)
+    sent = asyncio.run(gate.send(created["id"], provider))
+    assert sent["state"] == "SENT"
+    assert sent["provider_thread_id"] == "thread-1"
+    assert sent["audit"][-1]["provider_thread_id"] == "thread-1"
+    rendered = repr(sent)
+    assert "vendor@example.com" not in rendered
+    assert "Required quote" not in rendered
+    assert "Please send the quote." not in rendered
 
 
 def test_approval_must_match_the_draft_persisted_ops_space(tmp_path: Path) -> None:

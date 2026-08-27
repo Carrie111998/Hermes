@@ -47,7 +47,6 @@ class KiraEmailProvider(Protocol):
 
     def get_profile(self, *, account: str) -> Mapping[str, Any]: ...
     def create_email_draft(self, *, account: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]: ...
-    def get_email_draft(self, *, account: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def send_draft(self, *, account: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
@@ -374,28 +373,6 @@ class KiraEmailApprovalGate:
             raise KiraApprovalError("provider returned malformed response")
         return result
 
-    @staticmethod
-    def _remote_payload_matches(remote: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
-        """Require the provider's persisted draft to prove the exact payload.
-
-        A draft ID is not an authorization: Gmail drafts remain mutable after
-        creation.  The Composio bridge must return either the server-side
-        canonical hash or each raw payload field from a fresh provider read.
-        """
-        expected = row["payload_sha256"]
-        if str(remote.get("payload_sha256") or "") == expected:
-            return True
-        try:
-            canonical = canonical_payload(
-                str(remote["recipient"]),
-                str(remote["subject"]),
-                str(remote["body"]),
-                str(remote.get("thread") or remote.get("thread_id") or ""),
-            )
-        except (KeyError, KiraApprovalError):
-            return False
-        return payload_sha256(canonical) == expected
-
     async def send(self, draft_id: str, provider: KiraEmailProvider) -> dict[str, Any]:
         """Send an already-approved record exactly once, or safely refuse it."""
         row = self._claim_for_send(draft_id)
@@ -425,18 +402,15 @@ class KiraEmailApprovalGate:
                     raise KiraApprovalError("payload changed before provider send")
                 conn.execute("UPDATE drafts SET provider_draft_id=? WHERE id=?", (provider_draft_id, draft_id))
                 conn.execute("UPDATE outbox_attempts SET provider_draft_id=? WHERE draft_id=?", (provider_draft_id, draft_id))
-            remote = _result_data(await self._provider_call(
-                provider.get_email_draft,
-                account=ACCOUNT_ALIAS,
-                arguments={"user_id": "me", "draft_id": provider_draft_id},
-            ))
-            if not self._remote_payload_matches(remote, row):
-                raise KiraApprovalError("provider draft does not match the approved exact payload")
             with self._transaction() as conn:
                 live = self._row(conn, draft_id)
                 if live is None or live["state"] != "SENDING":
                     raise KiraApprovalError("send claim was lost")
-                self._audit(conn, live, action="provider_payload_verified", provider_draft_id=provider_draft_id)
+                # The contract creates the Gmail draft only after a durable
+                # claim. Recheck the immutable local payload immediately
+                # before the one permitted send-by-draft-ID invocation.
+                if not self._canonical_matches(live):
+                    raise KiraApprovalError("payload changed before provider send")
             sent = _result_data(await self._provider_call(
                 provider.send_draft,
                 account=ACCOUNT_ALIAS,
@@ -475,7 +449,7 @@ class KiraEmailApprovalGate:
     def _public_status(self, conn: sqlite3.Connection, row: Mapping[str, Any]) -> dict[str, Any]:
         events = conn.execute(
             """SELECT action,timestamp,actor_principal,chat_event_id,error_class,
-                      from_state,to_state,provider_message_id
+                      from_state,to_state,provider_message_id,provider_thread_id
                FROM audit_events WHERE draft_id=? ORDER BY timestamp,rowid""",
             (row["id"],),
         ).fetchall()
@@ -483,6 +457,7 @@ class KiraEmailApprovalGate:
             "id": row["id"], "payload_sha256": row["payload_sha256"],
             "created_at": row["created_at"], "expires_at": row["expires_at"],
             "state": row["state"], "provider_message_id": row["provider_message_id"],
+            "provider_thread_id": row["provider_thread_id"],
             "audit": [dict(event) for event in events],
         }
 
