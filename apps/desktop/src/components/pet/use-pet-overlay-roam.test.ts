@@ -1,6 +1,19 @@
-import { describe, expect, it } from 'vitest'
+import { renderHook, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { clampOverlayRoamBounds, overlayGroundY, overlayRoamLedges } from './use-pet-overlay-roam'
+import {
+  clampOverlayRoamBounds,
+  overlayGroundY,
+  overlayRoamLedges,
+  usePetOverlayRoam
+} from './use-pet-overlay-roam'
+
+const originalDesktop = window.hermesDesktop
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+})
 
 describe('overlay roam geometry', () => {
   it('keeps the visible pet inside a negative-coordinate display', () => {
@@ -60,5 +73,41 @@ describe('overlay roam geometry', () => {
     )
 
     expect(ledges).toEqual([{ left: -88, right: 1048, y: 800 }])
+  })
+
+  it('replans immediately when the drag completion key changes', async () => {
+    const roamEnvironment = vi.fn(async () => ({
+      windows: [],
+      workArea: { height: 800, width: 1200, x: 0, y: 0 }
+    }))
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        petOverlay: {
+          control: vi.fn(),
+          roamEnvironment,
+          setBounds: vi.fn()
+        }
+      } as unknown as Window['hermesDesktop']
+    })
+    vi.spyOn(window, 'requestAnimationFrame').mockReturnValue(1)
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+
+    const isInteracting = () => false
+
+    const { rerender, unmount } = renderHook(
+      ({ replanKey }) =>
+        usePetOverlayRoam({ enabled: true, isInteracting, loopMs: 1100, petH: 70, petW: 64, replanKey }),
+      { initialProps: { replanKey: 0 } }
+    )
+
+    await waitFor(() => expect(roamEnvironment).toHaveBeenCalled())
+    const callsBeforeRelease = roamEnvironment.mock.calls.length
+
+    rerender({ replanKey: 1 })
+    await waitFor(() => expect(roamEnvironment.mock.calls.length).toBeGreaterThan(callsBeforeRelease))
+
+    unmount()
   })
 })

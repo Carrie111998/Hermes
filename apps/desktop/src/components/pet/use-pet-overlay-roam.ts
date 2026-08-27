@@ -23,6 +23,8 @@ interface OverlayRoamOptions {
   loopMs: number
   petH: number
   petW: number
+  /** Changing this restarts planning immediately (for example after a drag). */
+  replanKey?: number
 }
 
 interface Span {
@@ -169,7 +171,8 @@ export function usePetOverlayRoam({
   isInteracting,
   loopMs,
   petH,
-  petW
+  petW,
+  replanKey = 0
 }: OverlayRoamOptions): void {
   useEffect(() => {
     const api = window.hermesDesktop?.petOverlay
@@ -425,7 +428,6 @@ export function usePetOverlayRoam({
       window.clearTimeout(timer)
       window.cancelAnimationFrame(raf)
       signal(null)
-      remember()
     }
-  }, [enabled, isInteracting, loopMs, petH, petW])
+  }, [enabled, isInteracting, loopMs, petH, petW, replanKey])
 }

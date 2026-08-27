@@ -59,6 +59,8 @@ interface DragState {
   width: number
   height: number
   moved: boolean
+  lastX: number
+  lastY: number
 }
 
 export function PetOverlayApp() {
@@ -68,6 +70,7 @@ export function PetOverlayApp() {
   const [composerOpen, setComposerOpen] = useState(false)
   const [draft, setDraft] = useState('')
   const [roamEnabled, setRoamEnabled] = useState(false)
+  const [roamReplanKey, setRoamReplanKey] = useState(0)
   // Mirrored from the main renderer: a finish landed while you were away.
   const [unread, setUnread] = useState(false)
 
@@ -213,6 +216,8 @@ export function PetOverlayApp() {
     ;(e.target as Element).setPointerCapture?.(e.pointerId)
     dragRef.current = {
       height: window.outerHeight,
+      lastX: window.screenX,
+      lastY: window.screenY,
       moved: false,
       offX: e.screenX - window.screenX,
       offY: e.screenY - window.screenY,
@@ -233,35 +238,51 @@ export function PetOverlayApp() {
       drag.moved = true
     }
 
+    drag.lastX = e.screenX - drag.offX
+    drag.lastY = e.screenY - drag.offY
     window.hermesDesktop?.petOverlay?.setBounds({
       height: drag.height,
       width: drag.width,
-      x: e.screenX - drag.offX,
-      y: e.screenY - drag.offY
+      x: drag.lastX,
+      y: drag.lastY
+    })
+  }
+
+  const finishMovedDrag = (drag: DragState) => {
+    // A drag cancels any deferred single-click so the composer can't pop open
+    // after you reposition the pet.
+    clearTimeout(clickTimerRef.current)
+    clickTimerRef.current = undefined
+
+    // A roam beat may be sleeping or paused in its old animation. Restart it
+    // now so a pet released in mid-air immediately resolves the surface below.
+    setRoamReplanKey(key => key + 1)
+
+    // Remember the last bounds sent during the drag. Pointer-cancel events do
+    // not always carry useful screen coordinates, so these live on DragState.
+    window.hermesDesktop?.petOverlay?.control({
+      bounds: { height: drag.height, width: drag.width, x: drag.lastX, y: drag.lastY },
+      type: 'bounds'
     })
   }
 
   const onPetPointerUp = (e: React.PointerEvent) => {
     const drag = dragRef.current
     dragRef.current = null
-    ;(e.target as Element).releasePointerCapture?.(e.pointerId)
+    const target = e.target as Element
+
+    if (target.hasPointerCapture?.(e.pointerId)) {
+      target.releasePointerCapture?.(e.pointerId)
+    }
 
     if (!drag) {
       return
     }
 
     if (drag.moved) {
-      // A drag cancels any deferred single-click so the composer can't pop open
-      // after you reposition the pet.
-      clearTimeout(clickTimerRef.current)
-      clickTimerRef.current = undefined
-
-      // Remember the spot on the desktop (screen coords) so the pet reopens here
-      // next time / after a restart.
-      window.hermesDesktop?.petOverlay?.control({
-        bounds: { height: drag.height, width: drag.width, x: e.screenX - drag.offX, y: e.screenY - drag.offY },
-        type: 'bounds'
-      })
+      drag.lastX = e.screenX - drag.offX
+      drag.lastY = e.screenY - drag.offY
+      finishMovedDrag(drag)
 
       return
     }
@@ -287,6 +308,20 @@ export function PetOverlayApp() {
       clickTimerRef.current = undefined
       setComposerOpen(open => !open)
     }, DOUBLE_CLICK_MS)
+  }
+
+  const onPetPointerCancel = (e: React.PointerEvent) => {
+    const drag = dragRef.current
+    dragRef.current = null
+    const target = e.target as Element
+
+    if (target.hasPointerCapture?.(e.pointerId)) {
+      target.releasePointerCapture?.(e.pointerId)
+    }
+
+    if (drag?.moved) {
+      finishMovedDrag(drag)
+    }
   }
 
   const send = () => {
@@ -327,7 +362,8 @@ export function PetOverlayApp() {
     isInteracting,
     loopMs: info.loopMs ?? 1100,
     petH,
-    petW
+    petW,
+    replanKey: roamReplanKey
   })
 
   const walk = roamWalkRow(roamDir, info.stateRows)
@@ -435,6 +471,7 @@ export function PetOverlayApp() {
       )}
 
       <div
+        onPointerCancel={onPetPointerCancel}
         onPointerDown={onPetPointerDown}
         onPointerMove={onPetPointerMove}
         onPointerUp={onPetPointerUp}
