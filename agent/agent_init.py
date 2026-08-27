@@ -1674,6 +1674,18 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
+    # Coding-agent usage export: count this session. No-op unless
+    # monitoring.usage_export.enabled. terminal.type mirrors the dimension the
+    # dashboards group sessions by; TERM_PROGRAM is unset for non-interactive
+    # runs (cron, gateway, CI), which is itself the useful distinction.
+    try:
+        from agent.monitoring import usage_export
+        usage_export.record_session_start(
+            terminal_type=os.environ.get("TERM_PROGRAM") or "non-interactive",
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ

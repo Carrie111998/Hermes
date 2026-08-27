@@ -3021,6 +3021,25 @@ DEFAULT_CONFIG = {
                 "deployment.environment.name": "production",
             },
         },
+        # Coding-agent usage export (hermes.* token/cost metrics). Off by
+        # default: it names a real user (user_email becomes a metric dimension)
+        # and needs an operator-provided collector. Requires monitoring.export
+        # .otlp.endpoint. See agent/monitoring/usage_export.py — the collector
+        # must declare the hermes.* metric names or datapoints are dropped.
+        "usage_export": {
+            "enabled": False,
+            "export_interval_seconds": 60,
+            "service_name": "hermes-agent",
+            # Stamped as the user.email dimension so spend is attributable.
+            # Empty means "export with no user dimension".
+            "user_email": "",
+            # Optional path to a JSON credential file (access_token/token/
+            # id_token) re-read on EVERY export. Prefer this over a static
+            # headers_env value for long-lived processes: gateway session
+            # credentials expire and a once-resolved header would fail every
+            # batch after that, silently.
+            "credential_file": "",
+        },
         # OTLP destination. headers_env maps header names to ENVIRONMENT
         # VARIABLE NAMES (never secret values); values are read from the
         # environment at export time.

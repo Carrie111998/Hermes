@@ -12771,6 +12771,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("gateway health OTLP export startup failed", exc_info=True)
 
+        # Coding-agent usage export (hermes.* token/cost metrics). Separate from
+        # gateway health: that exporter reports on the gateway process, this one
+        # attributes model spend per user so it is comparable with other coding
+        # agents in a shared backend. Fail-open — a telemetry start failure must
+        # never stop the gateway from serving.
+        try:
+            from hermes_cli.config import load_config
+            from agent.monitoring import usage_export
+            if usage_export.start(load_config()):
+                logger.info("Coding-agent usage OTLP export: enabled")
+        except Exception:
+            logger.debug("usage OTLP export startup failed", exc_info=True)
+
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
         # startup or surface it inline to user messages, since the gateway
@@ -30800,7 +30813,22 @@ async def _await_thread_exit(
 
 
 def _shutdown_gateway_health_export(runner: Any) -> None:
-    """Idempotently drain and detach Gateway Health OTLP export."""
+    """Idempotently drain and detach Gateway Health + usage OTLP export."""
+    # Drain coding-agent usage metrics FIRST, and unconditionally. Without an
+    # explicit flush the final interval's tokens are lost on exit: the reader's
+    # periodic export may be up to export_interval_seconds away, and DELTA
+    # counters hold unexported increments in memory.
+    #
+    # ⚠ This must not sit below the `runtime is None` early return — usage
+    # export is configured independently of gateway health, so the common case
+    # (health disabled, usage enabled) would silently skip the final flush.
+    # shutdown() is idempotent and a no-op when the exporter never started.
+    try:
+        from agent.monitoring import usage_export
+        usage_export.shutdown()
+    except Exception:
+        logger.debug("usage OTLP export shutdown failed", exc_info=True)
+
     runtime = getattr(runner, "_gateway_health_export_runtime", None)
     if runtime is None:
         return

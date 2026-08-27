@@ -4303,6 +4303,24 @@ def run_conversation(
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
 
+                    # Coding-agent usage export (hermes.* metrics). No-op unless
+                    # monitoring.usage_export.enabled. Fail-open: telemetry must
+                    # never break a turn, so record_api_call swallows its own
+                    # errors and this guard only covers attribute access.
+                    try:
+                        from agent.monitoring import usage_export as _usage_export
+                        _usage_export.record_api_call(
+                            model=_agg_cost_model,
+                            input_tokens=canonical_usage.input_tokens,
+                            output_tokens=canonical_usage.output_tokens,
+                            cache_read_tokens=canonical_usage.cache_read_tokens,
+                            cache_write_tokens=canonical_usage.cache_write_tokens,
+                            cost_usd=cost_result.amount_usd,
+                            effort=getattr(agent, "reasoning_effort", None) or None,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
                     # sessions (gateway, cron, delegated runs) cannot lose
