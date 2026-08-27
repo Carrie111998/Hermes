@@ -818,7 +818,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     if agent._memory_store:
         if agent._memory_enabled:
-            mem_block = agent._memory_store.format_for_system_prompt("memory")
+            # Resolve project scope once at prompt-build time so the block
+            # stays byte-stable for the conversation (prefix cache).
+            project_scope = ""
+            try:
+                from tools.memory_tool import get_builtin_memory_project_scoping
+
+                if get_builtin_memory_project_scoping():
+                    from agent.runtime_cwd import resolve_project_scope
+
+                    project_scope = resolve_project_scope()
+            except Exception:
+                logger.debug(
+                    "project-scope detection failed; memory block unfiltered",
+                    exc_info=True,
+                )
+                project_scope = ""
+            mem_block = agent._memory_store.format_for_system_prompt(
+                "memory", project_scope
+            )
             if mem_block:
                 volatile_parts.append(mem_block)
         # USER.md is always included when enabled.
