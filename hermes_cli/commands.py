@@ -703,9 +703,9 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     return result
 
 
-# Telegram allows up to 100 BotCommands. Hermes ships ~50 built-in commands;
-# a 60-slot default keeps every built-in plus common skill commands visible in
-# the `/` menu while staying comfortably under Telegram's ~4KB payload limit.
+# Telegram allows up to 100 BotCommands. A 60-slot default keeps the most useful
+# built-ins and any explicitly pinned skills visible in the `/` menu while
+# staying comfortably under Telegram's ~4KB payload limit.
 # Users can tune this via platforms.telegram.extra.command_menu.max_commands.
 _DEFAULT_TELEGRAM_MENU_MAX_COMMANDS = 60
 _TELEGRAM_BOT_API_MAX_COMMANDS = 100
@@ -791,10 +791,25 @@ def _telegram_command_menu_config() -> dict[str, Any]:
     else:
         priority = []
 
+    raw_skill_priority = menu_cfg.get("skill_priority")
+    if isinstance(raw_skill_priority, list):
+        skill_priority = list(
+            _dedupe_sanitized_names(
+                tuple(
+                    item
+                    for item in raw_skill_priority
+                    if isinstance(item, str) and item.strip()
+                )
+            )
+        )
+    else:
+        skill_priority = []
+
     return {
         "max_commands": max_commands,
         "priority_mode": priority_mode,
         "priority": priority,
+        "skill_priority": skill_priority,
     }
 
 
@@ -929,10 +944,11 @@ _clamp_telegram_names = _clamp_command_names
 
 def _collect_gateway_skill_entries(
     platform: str,
-    max_slots: int,
+    max_slots: int | None,
     reserved_names: set[str],
     desc_limit: int = 100,
     sanitize_name: "Callable[[str], str] | None" = None,
+    skill_priority: tuple[str, ...] = (),
 ) -> tuple[list[tuple[str, str, str]], int]:
     """Collect plugin + skill entries for a gateway platform.
 
@@ -948,13 +964,17 @@ def _collect_gateway_skill_entries(
         platform: Platform identifier for per-platform skill filtering
             (``"telegram"``, ``"discord"``, etc.).
         max_slots: Maximum number of entries to return (remaining slots after
-            built-in/core commands).
+            built-in/core commands), or ``None`` to return every eligible
+            entry so the caller can apply a combined cap.
         reserved_names: Names already taken by built-in commands.  Mutated
             in-place as new names are added.
         desc_limit: Max description length (40 for Telegram, 100 for Discord).
         sanitize_name: Optional name transform applied before clamping, e.g.
             :func:`_sanitize_telegram_name` for Telegram.  May return an
             empty string to signal "skip this entry".
+        skill_priority: Sanitized skill command names to place ahead of the
+            ordinary alphabetical skill order. Plugins and reserved core
+            commands always retain precedence.
 
     Returns:
         ``(entries, hidden_count)`` where *entries* is a list of
@@ -1039,9 +1059,27 @@ def _collect_gateway_skill_entries(
     except Exception:
         pass
 
+    if skill_priority:
+        priority_index = {
+            name: index
+            for index, name in enumerate(skill_priority)
+        }
+        skill_triples.sort(
+            key=lambda entry: (
+                0,
+                priority_index[entry[0]],
+            )
+            if entry[0] in priority_index
+            else (1, 0)
+        )
+
     # Clamp names; cmd_key is passed through as extra payload so it survives
     # any clamp-induced renames.
     skill_triples = _clamp_command_names(skill_triples, reserved_names)
+
+    if max_slots is None:
+        all_entries.extend(skill_triples)
+        return all_entries, 0
 
     # Skills fill remaining slots — only tier that gets trimmed
     remaining = max(0, max_slots - len(all_entries))
@@ -1059,12 +1097,14 @@ def _collect_gateway_skill_entries(
 def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
     """Return Telegram menu commands capped to the Bot API limit.
 
-    Priority order (higher priority = never bumped by overflow):
-      1. Core CommandDef commands (always included)
-      2. Plugin slash commands (take precedence over skills)
-      3. Built-in skill commands (fill remaining slots, alphabetical)
+    Priority order within the retained menu:
+      1. Core CommandDef and plugin commands
+      2. Configured priority skill commands
+      3. Other built-in skill commands (alphabetical)
 
-    Skills are the only tier that gets trimmed when the cap is hit.
+    Configured priority skills reserve menu slots. When core/plugin commands
+    alone reach the cap, the lowest-priority tail of that tier stays manually
+    dispatchable but is omitted from the visible menu so pinned skills fit.
     User-installed hub skills are excluded — accessible via /skills.
     Skills disabled for the ``"telegram"`` platform (via ``hermes skills
     config``) are excluded from the menu entirely.
@@ -1075,20 +1115,37 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """
     core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
     reserved_names = {n for n, _ in core_commands}
-    all_commands = list(core_commands)
-    hidden_core_count = max(0, len(all_commands) - max_commands)
-
-    remaining_slots = max(0, max_commands - len(all_commands))
-    entries, hidden_count = _collect_gateway_skill_entries(
+    skill_priority = tuple(_telegram_command_menu_config()["skill_priority"])
+    entries, _ = _collect_gateway_skill_entries(
         platform="telegram",
-        max_slots=remaining_slots,
+        max_slots=None,
         reserved_names=reserved_names,
         desc_limit=40,
         sanitize_name=_sanitize_telegram_name,
+        skill_priority=skill_priority,
     )
-    # Drop the cmd_key — Telegram only needs (name, desc) pairs.
-    all_commands.extend((n, d) for n, d, _k in entries)
-    return all_commands[:max_commands], hidden_count + hidden_core_count
+    priority_names = set(skill_priority)
+    plugin_entries = [entry for entry in entries if not entry[2]]
+    priority_skill_entries = [
+        entry
+        for entry in entries
+        if entry[2]
+        and _sanitize_telegram_name(entry[2].lstrip("/")) in priority_names
+    ]
+    fallback_skill_entries = [
+        entry
+        for entry in entries
+        if entry[2]
+        and _sanitize_telegram_name(entry[2].lstrip("/")) not in priority_names
+    ]
+
+    reserved_entry_count = len(plugin_entries) + len(priority_skill_entries)
+    core_limit = max(0, max_commands - reserved_entry_count)
+    retained_core = core_commands[:core_limit]
+    ordered_entries = plugin_entries + priority_skill_entries + fallback_skill_entries
+    all_commands = retained_core + [(n, d) for n, d, _key in ordered_entries]
+    hidden_count = max(0, len(core_commands) + len(entries) - max_commands)
+    return all_commands[:max_commands], hidden_count
 
 
 def discord_skill_commands(

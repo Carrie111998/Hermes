@@ -81,9 +81,9 @@ Notes:
 
 ### Command menu priority and cap (Optional)
 
-Hermes registers its command menu automatically when the Telegram gateway starts. The menu is built from the central slash-command registry plus eligible plugin/skill commands, then capped so Telegram accepts the payload reliably. The default cap is 60 commands — enough to keep all built-in commands plus common skill commands visible.
+Hermes registers its command menu automatically when the Telegram gateway starts. The menu is built from the central slash-command registry plus eligible plugin/skill commands, then capped so Telegram accepts the payload reliably. The default cap is 60 commands, with high-priority commands retained first.
 
-If you have local or plugin commands that should stay visible in Telegram's `/` picker, prioritize them in `~/.hermes/config.yaml`:
+If you have local plugin or skill commands that should stay visible in Telegram's `/` picker, prioritize them in `~/.hermes/config.yaml`:
 
 ```yaml
 platforms:
@@ -94,6 +94,9 @@ platforms:
         priority_mode: prepend  # prepend | append | replace
         priority:
           - my_plugin_command
+        skill_priority:
+          - now-what
+          - remember_this
 ```
 
 `priority_mode` controls how your list combines with Hermes' built-in priority list:
@@ -101,6 +104,8 @@ platforms:
 - `prepend`: put your commands first, then Hermes defaults
 - `append`: keep Hermes defaults first, then your commands
 - `replace`: use only your list for priority ordering
+
+`skill_priority` is separate from `priority`: it pins eligible local skill commands ahead of the ordinary alphabetical skill entries. Pinned skills reserve slots when core/plugin commands already fill the cap; retained core/plugin commands remain ahead of them, while omitted commands stay available when typed or through `/commands`. Names are normalized to Telegram's format, so hyphens and underscores are equivalent. Missing skills, skills disabled for Telegram, and skills whose command names collide with core/plugin commands are ignored safely. This setting changes menu visibility only; typing the command uses the existing skill dispatch path.
 
 Telegram allows up to 100 BotCommands, but large command payloads can fail. Hermes defaults to 60 for reliability and clamps configured values to `1..100`; use `/commands` for the full command list.
 

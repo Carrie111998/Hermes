@@ -19,6 +19,7 @@ from hermes_cli.commands import (
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
+    _telegram_command_menu_config,
     discord_skill_commands,
     gateway_help_lines,
     resolve_command,
@@ -635,7 +636,245 @@ class TestDiscordSkillCmdKeyDispatch:
 
 
 class TestTelegramMenuCommands:
-    """Integration: telegram_menu_commands enforces the 32-char limit."""
+    """Integration coverage for capped Telegram command-menu construction."""
+
+    @staticmethod
+    def _fake_skills(skills_dir, names):
+        return {
+            f"/{name}": {
+                "name": name,
+                "description": f"{name} skill",
+                "skill_md_path": str(skills_dir / name / "SKILL.md"),
+                "skill_dir": str(skills_dir / name),
+            }
+            for name in names
+        }
+
+    def test_skill_priority_config_is_normalized_and_deduplicated(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority:\n"
+            "          - Please-Fix\n"
+            "          - please_fix\n"
+            "          - ' now-what '\n"
+            "          - '+++'\n"
+            "          - null\n"
+        )
+
+        assert _telegram_command_menu_config()["skill_priority"] == [
+            "please_fix",
+            "now_what",
+        ]
+
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority: now_what\n"
+        )
+        assert _telegram_command_menu_config()["skill_priority"] == []
+
+    def test_hyphenated_skill_matches_underscored_priority_under_cap(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority: [now_what]\n"
+        )
+        fake_cmds = self._fake_skills(skills_dir, ["alpha", "now-what"])
+
+        with (
+            patch("hermes_cli.commands.telegram_bot_commands", return_value=[("core", "Core")]),
+            patch("hermes_cli.plugins.get_plugin_commands", return_value={}),
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_disabled_skill_names", return_value=set()),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=2)
+
+        assert [name for name, _desc in menu] == ["core", "now_what"]
+        assert hidden == 1
+
+    def test_priority_skills_reserve_slots_when_core_commands_fill_cap(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority: [pinned-one, pinned-two]\n"
+        )
+        fake_cmds = self._fake_skills(skills_dir, ["pinned-one", "pinned-two"])
+        core_commands = [(f"core_{index}", f"Core {index}") for index in range(5)]
+
+        with (
+            patch(
+                "hermes_cli.commands.telegram_bot_commands",
+                return_value=core_commands,
+            ),
+            patch("hermes_cli.plugins.get_plugin_commands", return_value={}),
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_disabled_skill_names", return_value=set()),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=4)
+
+        assert [name for name, _desc in menu] == [
+            "core_0",
+            "core_1",
+            "pinned_one",
+            "pinned_two",
+        ]
+        assert hidden == 3
+
+    def test_missing_disabled_and_colliding_priority_skills_are_safe(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority:\n"
+            "          - missing-skill\n"
+            "          - disabled-skill\n"
+            "          - core\n"
+            "          - plugin-only\n"
+            "          - available-skill\n"
+        )
+        fake_cmds = self._fake_skills(
+            skills_dir,
+            ["available-skill", "core", "disabled-skill", "plugin-only"],
+        )
+
+        with (
+            patch(
+                "hermes_cli.commands.telegram_bot_commands",
+                return_value=[("core", "Core"), ("plugin_only", "Plugin")],
+            ),
+            patch("hermes_cli.plugins.get_plugin_commands", return_value={}),
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[]),
+            patch(
+                "agent.skill_utils.get_disabled_skill_names",
+                return_value={"disabled-skill"},
+            ),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=10)
+
+        assert [name for name, _desc in menu] == [
+            "core",
+            "plugin_only",
+            "available_skill",
+        ]
+        assert hidden == 0
+
+    def test_priority_skills_precede_alphabetical_skill_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority: [zulu]\n"
+        )
+        fake_cmds = self._fake_skills(
+            skills_dir, ["gamma", "alpha", "zulu", "beta"]
+        )
+
+        with (
+            patch("hermes_cli.commands.telegram_bot_commands", return_value=[("core", "Core")]),
+            patch("hermes_cli.plugins.get_plugin_commands", return_value={}),
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_disabled_skill_names", return_value=set()),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=5)
+
+        assert [name for name, _desc in menu] == [
+            "core",
+            "zulu",
+            "alpha",
+            "beta",
+            "gamma",
+        ]
+        assert hidden == 0
+
+    def test_hidden_count_tracks_reordered_skills_under_cap(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        skill_priority: [echo, delta]\n"
+        )
+        fake_cmds = self._fake_skills(
+            skills_dir, ["alpha", "bravo", "charlie", "delta", "echo"]
+        )
+
+        with (
+            patch(
+                "hermes_cli.commands.telegram_bot_commands",
+                return_value=[("core", "Core"), ("plugin", "Plugin")],
+            ),
+            patch("hermes_cli.plugins.get_plugin_commands", return_value={}),
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_disabled_skill_names", return_value=set()),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=4)
+
+        assert [name for name, _desc in menu] == ["core", "plugin", "echo", "delta"]
+        assert hidden == 3
 
 
 
