@@ -48,9 +48,62 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
     assert result["authority_gateway_id"] == _server_authority()
     assert "authority_epoch" in result["features"]
     assert "coordinator_fencing" in result["features"]
+    assert "desktop_compatibility_mailbox" in result["features"]
     assert "monotonic_log" in result["features"]
     assert "groups.state" in result["methods"]
     assert "groups.send" in result["methods"]
+    assert "groups.desktop.claim" in result["methods"]
+    assert "groups.desktop.renew" in result["methods"]
+    assert "groups.desktop.complete" in result["methods"]
+
+
+def test_desktop_mailbox_rpc_claim_and_complete(home):
+    from gateway.desktop_room_mailbox import default_db_path, enqueue_command
+
+    enqueue_command(
+        default_db_path(),
+        command_id="messaging:one",
+        room_id="classic-room",
+        action="send",
+        payload={"message": "hello"},
+    )
+
+    claimed = _result(
+        srv._methods["groups.desktop.claim"](
+            1,
+            {
+                "consumer_id": "desktop:test",
+                "room_ids": ["classic-room"],
+            },
+        )
+    )["commands"]
+    assert [item["command_id"] for item in claimed] == ["messaging:one"]
+
+    renewed = _result(
+        srv._methods["groups.desktop.renew"](
+            2,
+            {
+                "consumer_id": "desktop:test",
+                "command_id": "messaging:one",
+                "lease_token": claimed[0]["lease_token"],
+            },
+        )
+    )["command"]
+    assert renewed["lease_token"] == claimed[0]["lease_token"]
+
+    completed = _result(
+        srv._methods["groups.desktop.complete"](
+            3,
+            {
+                "consumer_id": "desktop:test",
+                "command_id": "messaging:one",
+                "lease_token": claimed[0]["lease_token"],
+                "success": True,
+                "result": {"thread_id": "thread-1"},
+            },
+        )
+    )["command"]
+    assert completed["state"] == "completed"
 
 
 def test_create_list_send_and_log_roundtrip(home):

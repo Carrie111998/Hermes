@@ -82,6 +82,7 @@ def _(rid, params: dict) -> dict:
             "features": [
                 "authority_epoch",
                 "coordinator_fencing",
+                "desktop_compatibility_mailbox",
                 "room_identity",
                 "monotonic_log",
                 "idempotent_send",
@@ -98,10 +99,69 @@ def _(rid, params: dict) -> dict:
                 "groups.log",
                 "groups.disband",
                 "groups.stop",
+                "groups.desktop.claim",
+                "groups.desktop.renew",
+                "groups.desktop.complete",
             ],
             "max_log_limit": MAX_LOG_LIMIT,
         },
     )
+
+
+@method("groups.desktop.claim")
+def _(rid, params: dict) -> dict:
+    """Advertise classic rooms and lease pending messaging commands."""
+
+    try:
+        from gateway.desktop_room_mailbox import claim_commands, default_db_path
+
+        commands = claim_commands(
+            default_db_path(),
+            consumer_id=params.get("consumer_id"),
+            room_ids=params.get("room_ids", []),
+            limit=params.get("limit", 8),
+        )
+        return _ok(rid, {"commands": commands})
+    except Exception as exc:
+        return _err(rid, 4130, str(exc))
+
+
+@method("groups.desktop.complete")
+def _(rid, params: dict) -> dict:
+    """Commit the outcome of one classic-room compatibility command."""
+
+    try:
+        from gateway.desktop_room_mailbox import complete_command, default_db_path
+
+        command = complete_command(
+            default_db_path(),
+            consumer_id=params.get("consumer_id"),
+            command_id=params.get("command_id"),
+            lease_token=params.get("lease_token"),
+            success=params.get("success") is True,
+            result=params.get("result", {}),
+        )
+        return _ok(rid, {"command": command})
+    except Exception as exc:
+        return _err(rid, 4131, str(exc))
+
+
+@method("groups.desktop.renew")
+def _(rid, params: dict) -> dict:
+    """Renew one live classic-room command lease while its turn settles."""
+
+    try:
+        from gateway.desktop_room_mailbox import default_db_path, renew_command
+
+        command = renew_command(
+            default_db_path(),
+            consumer_id=params.get("consumer_id"),
+            command_id=params.get("command_id"),
+            lease_token=params.get("lease_token"),
+        )
+        return _ok(rid, {"command": command})
+    except Exception as exc:
+        return _err(rid, 4132, str(exc))
 
 
 @method("groups.list")
