@@ -3151,6 +3151,12 @@ def cmd_chat(args):
         except OSError as e:
             print(f"Error: cannot enter --in directory {in_dir}: {e}")
             sys.exit(1)
+        # Pin the logical agent cwd as well as the process cwd. Without this,
+        # a configured TERMINAL_CWD can override --in for tools and opt-in MCP
+        # request metadata even though session lookup already uses _target_dir.
+        from agent.runtime_cwd import set_session_cwd
+
+        set_session_cwd(_target_dir)
         args.no_restore_cwd = True
 
     # --resume latest: keyword for "most recent session" — same resolution
