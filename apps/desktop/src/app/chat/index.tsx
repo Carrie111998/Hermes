@@ -779,14 +779,18 @@ const ChatViewContent = memo(function ChatViewContent({
       const refs = droppedFileInlineRefs(inAppRefs, currentCwd)
 
       if (refs.length) {
-        requestComposerInsert(refs.join(' '), { mode: 'inline', target: composerScope.target })
+        requestComposerInsert(refs.join(' '), {
+          mode: 'inline',
+          surfaceId: composerSurfaceId ?? undefined,
+          target: composerScope.target
+        })
       }
 
       if (osDrops.length) {
         void onAttachDroppedItems(osDrops)
       }
     },
-    [composerScope.target, currentCwd, onAttachDroppedItems]
+    [composerScope.target, composerSurfaceId, currentCwd, onAttachDroppedItems]
   )
 
   // Session drags are POINTER drags (session-drag.ts) — never native DnD.

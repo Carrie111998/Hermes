@@ -14,8 +14,19 @@ import { $connection } from '@/store/session'
 
 import { useComposerActions } from '../../hooks/use-composer-actions'
 import type { QueueEditState } from '../composer-utils'
-import { type ComposerTarget, getActiveComposer, markActiveComposer, requestComposerInsert } from '../focus'
-import { type ComposerScope, ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
+import {
+  type ComposerTarget,
+  getActiveComposer,
+  markActiveComposer,
+  requestComposerFocus,
+  requestComposerInsert
+} from '../focus'
+import {
+  type ComposerScope,
+  ComposerScopeProvider,
+  ComposerSurfaceProvider,
+  MAIN_COMPOSER_SCOPE
+} from '../scope'
 
 import { useComposerDraft } from './use-composer-draft'
 
@@ -354,6 +365,68 @@ describe('useComposerDraft — draft survives full unmount (Settings navigation,
     expect(mockComposerApi.setText).toHaveBeenCalledWith('unsent thought')
 
     remount.unmount()
+  })
+})
+
+describe('useComposerDraft — surface-exact focus and caret', () => {
+  afterEach(() => {
+    cleanup()
+    document.body.innerHTML = ''
+    markActiveComposer('main')
+    vi.useRealTimers()
+  })
+
+  it('focuses, inserts, and places the caret in only the addressed composer when targets match', () => {
+    vi.useFakeTimers()
+    let first!: ReturnType<typeof useComposerDraft>
+    let second!: ReturnType<typeof useComposerDraft>
+
+    render(
+      <>
+        <ComposerSurfaceProvider value="surface-a">
+          <ProbeHarness
+            activeQueueSessionKey="session-a"
+            onHook={hook => {
+              first = hook
+            }}
+            onLayoutSnapshot={() => undefined}
+            sessionId="session-a"
+          />
+        </ComposerSurfaceProvider>
+        <ComposerSurfaceProvider value="surface-b">
+          <ProbeHarness
+            activeQueueSessionKey="session-b"
+            onHook={hook => {
+              second = hook
+            }}
+            onLayoutSnapshot={() => undefined}
+            sessionId="session-b"
+          />
+        </ComposerSurfaceProvider>
+      </>
+    )
+
+    const firstEditor = document.createElement('div')
+    const secondEditor = document.createElement('div')
+    firstEditor.contentEditable = 'true'
+    secondEditor.contentEditable = 'true'
+    document.body.append(firstEditor, secondEditor)
+    first.editorRef.current = firstEditor
+    second.editorRef.current = secondEditor
+
+    act(() => {
+      requestComposerFocus('main', { surfaceId: 'surface-b', typeChar: 'x' })
+      vi.runAllTimers()
+      requestComposerInsert('inserted exactly once', { surfaceId: 'surface-b', target: 'main' })
+      vi.runAllTimers()
+    })
+
+    expect(first.draftRef.current).toBe('')
+    expect(firstEditor.textContent).toBe('')
+    expect(second.draftRef.current).toContain('x')
+    expect(second.draftRef.current).toContain('inserted exactly once')
+    expect(secondEditor.textContent).toContain('inserted exactly once')
+    expect(secondEditor.contains(window.getSelection()?.anchorNode ?? null)).toBe(true)
   })
 })
 

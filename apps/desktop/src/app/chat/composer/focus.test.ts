@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 
 import {
   blurComposerInput,
+  focusComposerInput,
   getActiveComposer,
   markActiveComposer,
   onComposerFocusRequest,
@@ -32,12 +33,17 @@ function mountInput(hidden = false) {
   return input
 }
 
-/** A chat surface stamp — the same `data-composer-target` ChatView hangs. */
-function mountSurface(target: string, hidden = false) {
+/** A chat surface stamp — the same identity ChatView hangs. */
+function mountSurface(target: string, hidden = false, surfaceId?: string) {
   const layer = document.createElement('div')
   layer.toggleAttribute('data-pane-hidden', hidden)
   const surface = document.createElement('div')
   surface.dataset.composerTarget = target
+
+  if (surfaceId) {
+    surface.dataset.composerSurfaceId = surfaceId
+  }
+
   layer.append(surface)
   document.body.append(layer)
 
@@ -50,6 +56,7 @@ afterEach(() => {
   // would otherwise decide the next one.
   markActiveComposer('main')
   $hoveredTreeGroup.set(null)
+  vi.useRealTimers()
 })
 
 describe('blurComposerInput', () => {
@@ -73,6 +80,66 @@ describe('blurComposerInput', () => {
     blurComposerInput()
 
     expect(document.activeElement).toBe(outside)
+  })
+})
+
+describe('surface-exact focus routing', () => {
+  it('focuses only the active surface when two visible composers share a target', async () => {
+    mountSurface('main', false, 'surface-a')
+    mountSurface('main', false, 'surface-b')
+
+    const first: string[] = []
+    const second: string[] = []
+
+    const offFirst = onComposerFocusRequest({ surfaceId: 'surface-a', target: 'main' }, detail =>
+      first.push(`${detail.surfaceId}:${detail.typeChar ?? ''}`)
+    )
+
+    const offSecond = onComposerFocusRequest({ surfaceId: 'surface-b', target: 'main' }, detail =>
+      second.push(`${detail.surfaceId}:${detail.typeChar ?? ''}`)
+    )
+
+    markActiveComposer('main', 'surface-b')
+    requestComposerFocus('active', { typeChar: 'x' })
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    offFirst()
+    offSecond()
+
+    expect(first).toEqual([])
+    expect(second).toEqual(['surface-b:x'])
+  })
+
+  it('drops a legacy target-only focus request when that target is ambiguous', async () => {
+    mountSurface('main', false, 'surface-a')
+    mountSurface('main', false, 'surface-b')
+    const first = vi.fn()
+    const second = vi.fn()
+    const offFirst = onComposerFocusRequest({ surfaceId: 'surface-a', target: 'main' }, first)
+    const offSecond = onComposerFocusRequest({ surfaceId: 'surface-b', target: 'main' }, second)
+
+    requestComposerFocus('main')
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    offFirst()
+    offSecond()
+
+    expect(first).not.toHaveBeenCalled()
+    expect(second).not.toHaveBeenCalled()
+  })
+
+  it('does not let a stale focus retry steal focus from a newly active surface', () => {
+    vi.useFakeTimers()
+    mountSurface('main', false, 'surface-a')
+    mountSurface('main', false, 'surface-b')
+    const firstInput = mountInput()
+    const secondInput = mountInput()
+
+    markActiveComposer('main', 'surface-b')
+    focusComposerInput(secondInput, { surfaceId: 'surface-b', target: 'main' })
+    markActiveComposer('main', 'surface-a')
+    firstInput.focus()
+    vi.runAllTimers()
+
+    expect(document.activeElement).toBe(firstInput)
   })
 })
 

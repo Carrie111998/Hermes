@@ -50,7 +50,7 @@ import {
 import type { EngineZone, ZoneRect } from '@/components/pane-shell/tree/zones-engine'
 import { openSessionTile, type TileDock } from '@/store/session-states'
 
-import { requestComposerInsertRefs } from './composer/focus'
+import { type ComposerAddress, requestComposerInsertRefs } from './composer/focus'
 import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './composer/inline-refs'
 
 /** A chat surface's drag-start geometry: the anchor pane id it advertises
@@ -59,6 +59,7 @@ import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './compo
 interface SurfaceSnapshot {
   anchor: string
   composerTarget: string
+  composerSurfaceId?: string
   rect: ZoneRect
 }
 
@@ -74,6 +75,7 @@ const snapRect = (el: HTMLElement): ZoneRect => {
 function snapshotSurfaces(): SurfaceSnapshot[] {
   return queryAllVisible('[data-session-anchor]').map(el => ({
     anchor: el.dataset.sessionAnchor || 'workspace',
+    composerSurfaceId: el.dataset.composerSurfaceId,
     composerTarget: el.dataset.composerTarget || 'main',
     rect: snapRect(el)
   }))
@@ -113,7 +115,7 @@ export function startSessionDrag(
   // Commit intent, updated per resolved move (the machinery flushes the final
   // move before commit, so these always match the released-at position).
   let split: { anchor: string; before?: null | string; pos: TileDock } | null = null
-  let link: null | string = null
+  let link: ComposerAddress | null = null
 
   // The drag SOURCE (sidebar row or tile tab). Captured synchronously — React
   // clears `currentTarget` after the pointerdown handler returns, but this runs
@@ -175,7 +177,9 @@ export function startSessionDrag(
 
       if (pos === 'center' && host.chat) {
         split = null
-        link = surface?.composerTarget ?? 'main'
+        link = surface
+          ? { surfaceId: surface.composerSurfaceId, target: surface.composerTarget }
+          : { target: 'main' }
       } else if (pos === 'center') {
         // A preview/page zone has no composer to link to — its center stacks
         // the session as a tab, same as dropping on the strip's tail.
@@ -203,7 +207,7 @@ export function startSessionDrag(
         revealTreePane(`session-tile:${payload.id}`)
       } else if (link) {
         // The "link to chat" drop: an @session chip in that surface's composer.
-        requestComposerInsertRefs([sessionInlineRef(payload)], { target: link })
+        requestComposerInsertRefs([sessionInlineRef(payload)], link)
       }
     }
   })

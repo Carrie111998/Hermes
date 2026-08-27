@@ -9,6 +9,7 @@ import {
   type DragEvent as ReactDragEvent,
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState
 } from 'react'
@@ -89,6 +90,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const copy = t.assistant.thread
   const aui = useAui()
   const draft = useAuiState(s => s.composer.text)
+  const editSurfaceId = useId()
   const rootRef = useRef<HTMLDivElement | null>(null)
   const editorRef = useRef<HTMLDivElement | null>(null)
   // Capture the original draft immediately before the first edit. The runtime
@@ -149,7 +151,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   useEffect(
     () => () => {
       notifyThreadEditClose()
-      releaseActiveComposer('edit')
+      releaseActiveComposer('edit', editSurfaceId)
 
       for (const id of pendingTimeoutsRef.current) {
         window.clearTimeout(id)
@@ -157,20 +159,19 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
       pendingTimeoutsRef.current.clear()
     },
-    []
+    [editSurfaceId]
   )
 
   const focusEditor = useCallback(() => {
     const editor = editorRef.current
 
-    focusComposerInput(editor)
+    markActiveComposer('edit', editSurfaceId)
+    focusComposerInput(editor, { surfaceId: editSurfaceId, target: 'edit' })
 
     if (editor) {
       placeCaretEnd(editor)
     }
-
-    markActiveComposer('edit')
-  }, [])
+  }, [editSurfaceId])
 
   const requestEditFocus = useCallback(() => {
     setFocusRequestId(id => id + 1)
@@ -237,23 +238,20 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   }, [focusEditor, focusRequestId])
 
   useEffect(() => {
-    const offFocus = onComposerFocusRequest(({ target }) => {
-      if (target === 'edit') {
-        setFocusRequestId(id => id + 1)
-      }
+    const offFocus = onComposerFocusRequest({ surfaceId: editSurfaceId, target: 'edit' }, () => {
+      setFocusRequestId(id => id + 1)
     })
 
-    const offInsert = onComposerInsertRequest(({ mode, target, text }) => {
-      if (target === 'edit') {
-        appendExternalText(text, mode)
-      }
-    })
+    const offInsert = onComposerInsertRequest(
+      { surfaceId: editSurfaceId, target: 'edit' },
+      ({ mode, text }) => appendExternalText(text, mode)
+    )
 
     return () => {
       offFocus()
       offInsert()
     }
-  }, [appendExternalText])
+  }, [appendExternalText, editSurfaceId])
 
   const syncDraftFromEditor = useCallback(
     (editor: HTMLDivElement) => {
@@ -802,7 +800,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const handleKeyUp = triggerKeyUpHandler(triggerKeyConsumedRef, refreshTrigger)
 
   return (
-    <ComposerPrimitive.Root className="contents" data-slot="aui_edit-composer-root">
+    <ComposerPrimitive.Root
+      className="contents"
+      data-composer-surface-id={editSurfaceId}
+      data-slot="aui_edit-composer-root"
+    >
       <StickyHumanMessageContainer>
         <div
           className="composer-human-message-container human-execution-message-top relative flex w-full items-start rounded-md bg-(--ui-chat-surface-background)"
@@ -859,7 +861,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               }}
               onDragOver={handleDragOver}
               onDrop={handleDrop}
-              onFocus={() => markActiveComposer('edit')}
+              onFocus={() => markActiveComposer('edit', editSurfaceId)}
               onInput={handleInput}
               onKeyDown={handleKeyDown}
               onKeyUp={handleKeyUp}

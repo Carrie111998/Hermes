@@ -33,6 +33,7 @@ import {
 } from '../composer-utils'
 import {
   type ComposerInsertMode,
+  type ComposerTarget,
   focusComposerInput,
   markActiveComposer,
   onComposerFocusRequest,
@@ -48,7 +49,7 @@ import {
   REF_RE,
   renderComposerContents
 } from '../rich-editor'
-import { useComposerScope } from '../scope'
+import { useComposerScope, useComposerSurfaceId } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerDraftArgs {
@@ -86,6 +87,7 @@ export function useComposerDraft({
   const composerRuntime = useComposerRuntime()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
+  const surfaceId = useComposerSurfaceId()
   const actionsDisabledRef = useRef(actionsDisabled)
 
   useLayoutEffect(() => {
@@ -142,9 +144,9 @@ export function useComposerDraft({
   const [focusRequestId, setFocusRequestId] = useState(0)
 
   const focusInput = useCallback(() => {
-    focusComposerInput(editorRef.current)
-    markActiveComposer(target)
-  }, [target])
+    markActiveComposer(target, surfaceId ?? undefined)
+    focusComposerInput(editorRef.current, surfaceId ? { surfaceId, target } : undefined)
+  }, [surfaceId, target])
 
   const requestMainFocus = useCallback(() => {
     setFocusRequestId(id => id + 1)
@@ -212,14 +214,16 @@ export function useComposerDraft({
   // resolving to a dead tile and every routed focus/insert request is dropped.
   // (Heal-to-visible in focus.ts covers the keep-alive-tab case where the pane
   // stays mounted behind the front tab; this covers true unmounts.)
-  useEffect(() => () => releaseActiveComposer(target), [target])
+  useEffect(() => () => releaseActiveComposer(target, surfaceId ?? undefined), [surfaceId, target])
 
   useEffect(() => {
     if (inputDisabled) {
       return undefined
     }
 
-    const offFocus = onComposerFocusRequest(({ target: requested, typeChar }) => {
+    const address = surfaceId ? { surfaceId, target } : null
+
+    const handleFocus = ({ target: requested, typeChar }: { target: ComposerTarget; typeChar?: string }) => {
       if (requested !== target) {
         return
       }
@@ -232,19 +236,22 @@ export function useComposerDraft({
       }
 
       setFocusRequestId(id => id + 1)
-    })
+    }
 
-    const offInsert = onComposerInsertRequest(({ mode, target: requested, text }) => {
+    const handleInsert = ({ mode, target: requested, text }: { mode: ComposerInsertMode; target: ComposerTarget; text: string }) => {
       if (!actionsDisabledRef.current && requested === target) {
         appendExternalText(text, mode)
       }
-    })
+    }
+
+    const offFocus = address ? onComposerFocusRequest(address, handleFocus) : onComposerFocusRequest(handleFocus)
+    const offInsert = address ? onComposerInsertRequest(address, handleInsert) : onComposerInsertRequest(handleInsert)
 
     return () => {
       offFocus()
       offInsert()
     }
-  }, [appendExternalText, inputDisabled, paintDraft, target])
+  }, [appendExternalText, inputDisabled, paintDraft, surfaceId, target])
 
   const stashAt = useCallback(
     (scope: string | null, text = draftRef.current, attachments = attachmentScope.$attachments.get()) =>
@@ -402,12 +409,16 @@ export function useComposerDraft({
   })
 
   useEffect(() => {
-    return onComposerInsertRefsRequest(({ refs, target: requested }) => {
+    const handleInsertRefs = ({ refs, target: requested }: { refs: InlineRefInput[]; target: ComposerTarget }) => {
       if (!actionsDisabledRef.current && requested === target) {
         insertInlineRefsRef.current(refs)
       }
-    })
-  }, [target])
+    }
+
+    return surfaceId
+      ? onComposerInsertRefsRequest({ surfaceId, target }, handleInsertRefs)
+      : onComposerInsertRefsRequest(handleInsertRefs)
+  }, [surfaceId, target])
 
   // Storage re-homes are explicit events, not inferred from arbitrary key
   // inequality. React runs the outgoing scope cleanup first (stashing the last

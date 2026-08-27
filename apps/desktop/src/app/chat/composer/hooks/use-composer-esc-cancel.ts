@@ -3,7 +3,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import { triggerHaptic } from '@/lib/haptics'
 import { composerFocusBlockedBySurface } from '@/lib/keybinds/composer-focus-keys'
 
-import { type ComposerTarget, getActiveComposer } from '../focus'
+import { type ComposerTarget, getActiveComposerAddress } from '../focus'
+import { useComposerSurfaceId } from '../scope'
 
 interface UseComposerEscCancelOptions {
   awaitingInput: boolean
@@ -22,6 +23,7 @@ interface UseComposerEscCancelOptions {
  * busy/awaitingInput/onCancel each press.
  */
 export function useComposerEscCancel({ awaitingInput, busy, onCancel, target }: UseComposerEscCancelOptions) {
+  const surfaceId = useComposerSurfaceId()
   // Intentional only: we bail if (a) the composer/another field already handled
   // Esc (defaultPrevented), (b) focus is in any input/textarea/contenteditable
   // (you're typing, not stopping), or (c) a dialog/popover is open — Esc must
@@ -37,9 +39,14 @@ export function useComposerEscCancel({ awaitingInput, busy, onCancel, target }: 
         return
       }
 
-      // Only the focused composer cancels — otherwise every mounted busy tile
-      // stops at once (and the winner would be mount-order arbitrary).
-      if (getActiveComposer() !== target) {
+      // Only the focused exact composer cancels — target equality is not enough
+      // when two visible panes render the same main/session scope.
+      const activeComposer = getActiveComposerAddress()
+
+      if (
+        activeComposer.target !== target ||
+        (surfaceId ? activeComposer.surfaceId !== surfaceId : Boolean(activeComposer.surfaceId))
+      ) {
         return
       }
 
@@ -60,7 +67,7 @@ export function useComposerEscCancel({ awaitingInput, busy, onCancel, target }: 
       triggerHaptic('cancel')
       void Promise.resolve(onCancel())
     },
-    [awaitingInput, busy, onCancel, target]
+    [awaitingInput, busy, onCancel, surfaceId, target]
   )
 
   useLayoutEffect(() => {

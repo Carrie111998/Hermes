@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $gateway } from '@/store/gateway'
 
-import { ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
+import { requestVoiceToggle } from '../focus'
+import { ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useComposerVoice } from './use-composer-voice'
 
@@ -76,6 +77,15 @@ function Wrapper({ children }: PropsWithChildren) {
   return <ComposerScopeProvider value={MAIN_COMPOSER_SCOPE}>{children}</ComposerScopeProvider>
 }
 
+const surfaceWrapper = (surfaceId: string) =>
+  function SurfaceWrapper({ children }: PropsWithChildren) {
+    return (
+      <ComposerScopeProvider value={MAIN_COMPOSER_SCOPE}>
+        <ComposerSurfaceProvider value={surfaceId}>{children}</ComposerSurfaceProvider>
+      </ComposerScopeProvider>
+    )
+  }
+
 function renderComposerVoice(target: 'main' | `tile:${string}`, submissionKey: string) {
   return renderHook(
     () =>
@@ -133,6 +143,39 @@ describe('useComposerVoice session-transition lifecycle', () => {
 
     expect(mocks.conversationOptions?.ownerRoute).toEqual(ownerRoute)
     expect(mocks.autoSpeakOptions?.ownerRoute).toEqual(ownerRoute)
+  })
+
+  it('toggles voice on only the addressed surface when two composers share a target', () => {
+    const renderSurface = (surfaceId: string) =>
+      renderHook(
+        () =>
+          useComposerVoice({
+            busy: false,
+            clearDraft: vi.fn(),
+            disabled: false,
+            focusInput: vi.fn(),
+            insertText: vi.fn(),
+            maxRecordingSeconds: 120,
+            onSubmit: vi.fn(async () => true),
+            onTranscribeAudio: vi.fn(async () => 'transcript'),
+            sessionId: `runtime-${surfaceId}`,
+            submissionKey: surfaceId,
+            target: 'main'
+          }),
+        { wrapper: surfaceWrapper(surfaceId) }
+      )
+
+    const first = renderSurface('surface-a')
+    const second = renderSurface('surface-b')
+
+    act(() => {
+      requestVoiceToggle('main', { surfaceId: 'surface-b' })
+    })
+
+    return waitFor(() => {
+      expect(first.result.current.voiceConversationActive).toBe(false)
+      expect(second.result.current.voiceConversationActive).toBe(true)
+    })
   })
 
   it('drops A callbacks that finish after the composer has converged on B', async () => {

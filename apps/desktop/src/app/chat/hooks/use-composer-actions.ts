@@ -3,6 +3,7 @@ import { useCallback } from 'react'
 import { requestComposerFocus, requestComposerInsert, requestComposerInsertRefs } from '@/app/chat/composer/focus'
 import { useCommittedActionScope } from '@/app/chat/composer/hooks/use-committed-action-scope'
 import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
+import { useComposerSurfaceId } from '@/app/chat/composer/scope'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { useI18n } from '@/i18n'
 import { attachmentId, contextPath, pathLabel } from '@/lib/chat-runtime'
@@ -305,6 +306,7 @@ export function useComposerActions({
 }: ComposerActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
+  const surfaceId = useComposerSurfaceId()
   const actionIsCurrent = useCommittedActionScope(composerScopeKey, false)
 
   /** Add to this scope's composer and focus it. All sidebar/picker/drop
@@ -316,18 +318,22 @@ export function useComposerActions({
       }
 
       scope.add(attachment)
-      requestComposerFocus(scope.target)
+      requestComposerFocus(scope.target, { surfaceId: surfaceId ?? undefined })
     },
-    [actionIsCurrent, scope]
+    [actionIsCurrent, scope, surfaceId]
   )
 
   const addTextToDraft = useCallback(
     (text: string) => {
       if (actionIsCurrent()) {
-        requestComposerInsert(text, { mode: 'block' })
+        requestComposerInsert(text, {
+          mode: 'block',
+          surfaceId: surfaceId ?? undefined,
+          target: scope.target
+        })
       }
     },
-    [actionIsCurrent]
+    [actionIsCurrent, scope.target, surfaceId]
   )
 
   const addTerminalSelectionAttachment = useCallback(
@@ -345,9 +351,13 @@ export function useComposerActions({
       }
 
       setComposerTerminalSelection(normalizedLabel, trimmed)
-      requestComposerInsert(refText, { mode: 'inline' })
+      requestComposerInsert(refText, {
+        mode: 'inline',
+        surfaceId: surfaceId ?? undefined,
+        target: scope.target
+      })
     },
-    [actionIsCurrent]
+    [actionIsCurrent, scope.target, surfaceId]
   )
 
   const addContextRefAttachment = useCallback(
@@ -466,12 +476,12 @@ export function useComposerActions({
         return false
       }
 
-      requestComposerInsertRefs([ref], { target: scope.target })
-      requestComposerFocus(scope.target)
+      requestComposerInsertRefs([ref], { surfaceId: surfaceId ?? undefined, target: scope.target })
+      requestComposerFocus(scope.target, { surfaceId: surfaceId ?? undefined })
 
       return true
     },
-    [actionIsCurrent, currentCwd, scope.target]
+    [actionIsCurrent, currentCwd, scope.target, surfaceId]
   )
 
   const attachContextFilePath = useCallback(

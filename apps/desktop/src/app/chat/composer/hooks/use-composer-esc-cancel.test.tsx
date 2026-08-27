@@ -1,6 +1,9 @@
 import { cleanup, fireEvent, render } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { markActiveComposer } from '../focus'
+import { ComposerSurfaceProvider } from '../scope'
+
 import { useComposerEscCancel } from './use-composer-esc-cancel'
 
 function Harness({ busy, onCancel }: { busy: boolean; onCancel: () => void }) {
@@ -12,6 +15,7 @@ function Harness({ busy, onCancel }: { busy: boolean; onCancel: () => void }) {
 afterEach(() => {
   cleanup()
   document.body.innerHTML = ''
+  markActiveComposer('main')
 })
 
 describe('useComposerEscCancel', () => {
@@ -22,6 +26,28 @@ describe('useComposerEscCancel', () => {
     fireEvent.keyDown(window, { key: 'Escape' })
 
     expect(onCancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels only the active surface when two busy composers share a target', () => {
+    const firstCancel = vi.fn()
+    const secondCancel = vi.fn()
+
+    render(
+      <>
+        <ComposerSurfaceProvider value="surface-a">
+          <Harness busy onCancel={firstCancel} />
+        </ComposerSurfaceProvider>
+        <ComposerSurfaceProvider value="surface-b">
+          <Harness busy onCancel={secondCancel} />
+        </ComposerSurfaceProvider>
+      </>
+    )
+    markActiveComposer('main', 'surface-b')
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(firstCancel).not.toHaveBeenCalled()
+    expect(secondCancel).toHaveBeenCalledOnce()
   })
 
   it('does not cancel on Esc when the turn is not busy', () => {

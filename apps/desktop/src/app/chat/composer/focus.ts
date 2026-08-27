@@ -21,26 +21,32 @@ import { RICH_INPUT_SLOT } from './rich-editor'
 export type ComposerTarget = 'edit' | 'main' | (string & {})
 export type ComposerInsertMode = 'block' | 'inline' | 'prefix'
 
-export interface FocusDetail {
+/** One mounted composer. `surfaceId` is the useId-backed ChatView token. */
+export interface ComposerAddress {
+  surfaceId?: string
   target: ComposerTarget
+}
+
+export interface ComposerSurfaceAddress extends ComposerAddress {
+  surfaceId: string
+}
+
+export interface FocusDetail extends ComposerAddress {
   /** Append after focus (type-to-focus / soft `/`). */
   typeChar?: string
 }
 
-interface InsertDetail {
+interface InsertDetail extends ComposerAddress {
   mode: ComposerInsertMode
-  target: ComposerTarget
   text: string
 }
 
-interface InsertRefsDetail {
+interface InsertRefsDetail extends ComposerAddress {
   refs: InlineRefInput[]
-  target: ComposerTarget
 }
 
-interface AttachImagesDetail {
+interface AttachImagesDetail extends ComposerAddress {
   blobs: Blob[]
-  target: ComposerTarget
 }
 
 const FOCUS_EVENT = 'hermes:composer-focus'
@@ -76,78 +82,97 @@ interface SubmitDetail {
   displayKind?: 'hidden'
 }
 
-let activeTarget: ComposerTarget = 'main'
+let activeComposer: ComposerAddress = { target: 'main' }
 
-/**
- * The chat surface currently on screen (`data-composer-target` hung off each
- * ChatView). Inactive tabs stay mounted with `data-pane-hidden`, so this uses
- * the same visibility policy as every other document-wide surface lookup.
- */
-const visibleChatTarget = (): ComposerTarget | null => {
+const surfaceAddress = (surface: HTMLElement | null): ComposerSurfaceAddress | null => {
+  const target = surface?.dataset.composerTarget
+  const surfaceId = surface?.dataset.composerSurfaceId
+
+  return target && surfaceId ? { surfaceId, target: target as ComposerTarget } : null
+}
+
+/** The first visible chat surface, used only when it is the sole fallback. */
+const visibleChatAddress = (): ComposerAddress | null => {
   if (typeof document === 'undefined') {
     return null
   }
 
-  const surface = queryVisible<HTMLElement>('[data-composer-target]')
-  const target = surface?.dataset.composerTarget
+  const surfaces = queryAllVisible<HTMLElement>('[data-composer-target]')
 
-  return target ? (target as ComposerTarget) : null
+  if (surfaces.length !== 1) {
+    return null
+  }
+
+  return surfaceAddress(surfaces[0]) ?? {
+    target: surfaces[0]?.dataset.composerTarget as ComposerTarget
+  }
 }
 
-/** True when `target` still has a live, on-screen subscriber. */
-const targetIsReachable = (target: ComposerTarget): boolean => {
+const uniqueVisibleAddress = (target: ComposerTarget): ComposerAddress | null => {
+  if (typeof document === 'undefined') {
+    return null
+  }
+
+  const surfaces = queryAllVisible<HTMLElement>(`[data-composer-target="${cssEscape(target)}"]`)
+
+  return surfaces.length === 1 ? (surfaceAddress(surfaces[0]) ?? { target }) : null
+}
+
+/** True when an exact composer claim is still live and on screen. */
+const addressIsReachable = ({ surfaceId, target }: ComposerAddress): boolean => {
   if (typeof document === 'undefined') {
     return true
   }
 
-  // The edit composer is an in-thread overlay, not a chat surface — it never
-  // stamps `data-composer-target`. While its root is mounted it still owns the
-  // bus; once it tears down the claim is dead.
   if (target === 'edit') {
-    return Boolean(document.querySelector(EDIT_COMPOSER_ROOT))
+    const root = document.querySelector<HTMLElement>(EDIT_COMPOSER_ROOT)
+
+    if (!root) {
+      return false
+    }
+
+    return !surfaceId || root.dataset.composerSurfaceId === surfaceId
   }
 
-  // Exact match on a VISIBLE surface. Background keep-alive tabs carry the same
-  // `data-composer-target` but sit under `data-pane-hidden`, so queryVisible
-  // filters them out.
-  if (queryVisible(`[data-composer-target="${cssEscape(target)}"]`)) {
+  const visible = queryAllVisible<HTMLElement>(`[data-composer-target="${cssEscape(target)}"]`)
+
+  if (surfaceId) {
+    if (visible.some(surface => surface.dataset.composerSurfaceId === surfaceId)) {
+      return true
+    }
+
+    // Before ChatView stamps the DOM (and in pure hook tests), retain the exact
+    // claim. A different visible surface is the only proof it went stale.
+    return !queryVisible('[data-composer-target]')
+  }
+
+  if (visible.length > 0) {
     return true
   }
 
   // A different chat surface is on screen → this claim is buried or gone.
-  // (A claim with zero stamped surfaces yet — first paint, pure-unit tests —
-  // keeps the marked key until the DOM contradicts it.)
-  if (queryVisible('[data-composer-target]')) {
-    return false
-  }
-
-  return true
+  // With no stamped surfaces yet (first paint / pure unit tests), retain it.
+  return !queryVisible('[data-composer-target]')
 }
 
-/**
- * The composer `'active'` should route to right now.
- *
- * The cached claim (`activeTarget`) wins while its surface is still on screen.
- * Tab stacks keep inactive panes mounted, so focusing a tile then clicking the
- * main tab leaves `activeTarget` pointing at a buried composer — with no
- * subscriber on the visible surface, every type-to-focus keystroke is
- * preventDefault'd and dropped. Heal to the visible chat surface (or main)
- * whenever the claim is off-screen or gone, and keep the cache honest so Esc /
- * voice / soft `/` agree with the keyboard path.
- */
-const resolveActive = (): ComposerTarget => {
-  if (targetIsReachable(activeTarget)) {
-    return activeTarget
+/** Resolve `'active'` without ever choosing arbitrarily between visible twins. */
+const resolveActive = (): ComposerAddress => {
+  if (addressIsReachable(activeComposer)) {
+    return activeComposer
   }
 
-  const visible = visibleChatTarget() ?? 'main'
+  activeComposer = visibleChatAddress() ?? { target: 'main' }
 
-  activeTarget = visible
-
-  return visible
+  return activeComposer
 }
 
-const resolve = (target: ComposerTarget | 'active') => (target === 'active' ? resolveActive() : target)
+const resolve = (target: ComposerTarget | 'active', surfaceId?: string): ComposerAddress => {
+  if (target === 'active') {
+    return resolveActive()
+  }
+
+  return surfaceId ? { surfaceId, target } : (uniqueVisibleAddress(target) ?? { target })
+}
 
 const dispatch = <T>(name: string, detail: T) => {
   if (typeof window === 'undefined') {
@@ -168,15 +193,15 @@ const dispatchNow = <T>(name: string, detail: T) => {
   }
 }
 
-/** Unique identity for the visible composer surface addressed by a submit. */
+/** Unique identity for the sole visible composer matching a legacy target. */
 const getVisibleComposerSurfaceId = (target: ComposerTarget): string | null => {
   if (typeof document === 'undefined') {
     return null
   }
 
-  const surface = queryVisible<HTMLElement>(`[data-composer-target="${cssEscape(target)}"]`)
+  const surfaces = queryAllVisible<HTMLElement>(`[data-composer-target="${cssEscape(target)}"]`)
 
-  return surface?.dataset.composerSurfaceId || null
+  return surfaces.length === 1 ? surfaces[0]?.dataset.composerSurfaceId || null : null
 }
 
 const composerSurfaceIsVisible = (target: ComposerTarget, surfaceId: string): boolean => {
@@ -189,64 +214,117 @@ const composerSurfaceIsVisible = (target: ComposerTarget, surfaceId: string): bo
   )
 }
 
-const subscribe = <T>(name: string, handler: (detail: T) => void) => {
+type AddressedDetail = ComposerAddress
+
+type DetailHandler<T> = (detail: T) => void
+
+/** Exact subscribers are counted so a legacy target-only request can be
+ * delivered only when that target has one possible surface. */
+const exactSubscriberCounts = new Map<string, Map<ComposerTarget, Map<string, number>>>()
+
+const adjustExactSubscriber = (name: string, address: ComposerSurfaceAddress, delta: 1 | -1) => {
+  const byTarget = exactSubscriberCounts.get(name) ?? new Map<ComposerTarget, Map<string, number>>()
+  const bySurface = byTarget.get(address.target) ?? new Map<string, number>()
+  const next = (bySurface.get(address.surfaceId) ?? 0) + delta
+
+  if (next > 0) {
+    bySurface.set(address.surfaceId, next)
+  } else {
+    bySurface.delete(address.surfaceId)
+  }
+
+  if (bySurface.size > 0) {
+    byTarget.set(address.target, bySurface)
+  } else {
+    byTarget.delete(address.target)
+  }
+
+  if (byTarget.size > 0) {
+    exactSubscriberCounts.set(name, byTarget)
+  } else {
+    exactSubscriberCounts.delete(name)
+  }
+}
+
+const requestMatches = (name: string, address: ComposerSurfaceAddress, detail: AddressedDetail): boolean => {
+  if (detail.target !== address.target) {
+    return false
+  }
+
+  if (detail.surfaceId) {
+    return detail.surfaceId === address.surfaceId
+  }
+
+  const possible = exactSubscriberCounts.get(name)?.get(address.target)
+
+  return possible?.size === 1 && possible.has(address.surfaceId)
+}
+
+const subscribe = <T extends AddressedDetail>(
+  name: string,
+  addressOrHandler: ComposerSurfaceAddress | DetailHandler<T>,
+  maybeHandler?: DetailHandler<T>
+) => {
   if (typeof window === 'undefined') {
     return () => undefined
+  }
+
+  const address = typeof addressOrHandler === 'function' ? null : addressOrHandler
+  const handler = (typeof addressOrHandler === 'function' ? addressOrHandler : maybeHandler) as DetailHandler<T>
+
+  if (address) {
+    adjustExactSubscriber(name, address, 1)
   }
 
   const listener = (event: Event) => {
     const detail = (event as CustomEvent<T>).detail
 
-    if (detail) {
+    if (detail && (!address || requestMatches(name, address, detail))) {
       handler(detail)
     }
   }
 
   window.addEventListener(name, listener)
 
-  return () => window.removeEventListener(name, listener)
+  return () => {
+    window.removeEventListener(name, listener)
+
+    if (address) {
+      adjustExactSubscriber(name, address, -1)
+    }
+  }
 }
 
-export const markActiveComposer = (target: ComposerTarget) => {
-  activeTarget = target
+export const markActiveComposer = (target: ComposerTarget, surfaceId?: string) => {
+  activeComposer = surfaceId ? { surfaceId, target } : (uniqueVisibleAddress(target) ?? { target })
 }
 
-/** Hand the routing key back when a composer unmounts, so `'active'` can never
- *  resolve to a composer that no longer has a subscriber — such a request is
- *  dispatched and then dropped by every mounted composer's target filter, and
- *  nothing re-marks the active composer on its own.
- *
- *  Guarded on identity: a composer unmounting AFTER another one claimed the key
- *  (closing a background tile, a deferred edit-close cleanup) must not steal it
- *  from the live claimant. Falls through to {@link resolveActive} when the
- *  caller's surface is buried rather than gone, so closing on a tab switch that
- *  already re-fronted another chat surfaces there immediately. */
-export const releaseActiveComposer = (target: ComposerTarget) => {
-  if (activeTarget !== target) {
+/** Hand an exact routing claim back when its composer unmounts. */
+export const releaseActiveComposer = (target: ComposerTarget, surfaceId?: string) => {
+  if (activeComposer.target !== target || (activeComposer.surfaceId && activeComposer.surfaceId !== surfaceId)) {
     return
   }
 
-  // Prefer the visible chat surface over a hard `'main'` default — releasing a
-  // closed tile while another tile is fronted should land there, not the
-  // (possibly buried) workspace tab.
-  activeTarget = visibleChatTarget() ?? 'main'
+  activeComposer = visibleChatAddress() ?? { target: 'main' }
 }
 
-/** The composer that last held focus — the target `'active'` resolves to.
- *  Used by broadcast listeners (voice, Esc-to-stop) to act on exactly one.
- *  Heals a stale claim the same way {@link requestComposerFocus} does, so Esc
- *  and type-to-focus never disagree after a tab switch left the bus pointing at
- *  a keep-alive-mounted background composer. */
-export const getActiveComposer = (): ComposerTarget => resolveActive()
+/** Backward-compatible target view of the active exact address. */
+export const getActiveComposer = (): ComposerTarget => resolveActive().target
+
+export const getActiveComposerAddress = (): ComposerAddress => resolveActive()
 
 export const requestComposerFocus = (
   target: ComposerTarget | 'active' = 'active',
-  { typeChar }: { typeChar?: string } = {}
-) => dispatch<FocusDetail>(FOCUS_EVENT, { target: resolve(target), typeChar })
+  { surfaceId, typeChar }: { surfaceId?: string; typeChar?: string } = {}
+) => dispatch<FocusDetail>(FOCUS_EVENT, { ...resolve(target, surfaceId), typeChar })
 
 export const requestComposerInsert = (
   text: string,
-  { mode = 'block', target = 'active' }: { mode?: ComposerInsertMode; target?: ComposerTarget | 'active' } = {}
+  {
+    mode = 'block',
+    surfaceId,
+    target = 'active'
+  }: { mode?: ComposerInsertMode; surfaceId?: string; target?: ComposerTarget | 'active' } = {}
 ) => {
   const trimmed = text.trim()
 
@@ -254,44 +332,48 @@ export const requestComposerInsert = (
     return
   }
 
-  dispatch<InsertDetail>(INSERT_EVENT, { mode, target: resolve(target), text: trimmed })
+  dispatch<InsertDetail>(INSERT_EVENT, { ...resolve(target, surfaceId), mode, text: trimmed })
 }
 
-export const onComposerFocusRequest = (handler: (detail: FocusDetail) => void) =>
-  subscribe<FocusDetail>(FOCUS_EVENT, handler)
+export const onComposerFocusRequest = (
+  addressOrHandler: ComposerSurfaceAddress | DetailHandler<FocusDetail>,
+  handler?: DetailHandler<FocusDetail>
+) => subscribe(FOCUS_EVENT, addressOrHandler, handler)
 
-export const onComposerInsertRequest = (handler: (detail: InsertDetail) => void) =>
-  subscribe<InsertDetail>(INSERT_EVENT, handler)
+export const onComposerInsertRequest = (
+  addressOrHandler: ComposerSurfaceAddress | DetailHandler<InsertDetail>,
+  handler?: DetailHandler<InsertDetail>
+) => subscribe(INSERT_EVENT, addressOrHandler, handler)
 
-/** Attach image blobs to a composer's attachment set — the unfocused-paste
- *  path (paste-to-focus) hands clipboard images over here. The edit composer
- *  takes no attachments (its own paste path ignores images), so a request
- *  resolving to `'edit'` is dropped by that surface's target filter. */
+/** Attach image blobs to a composer's attachment set — the unfocused-paste path. */
 export const requestComposerAttachImages = (
   blobs: Blob[],
-  { target = 'active' }: { target?: ComposerTarget | 'active' } = {}
+  { surfaceId, target = 'active' }: { surfaceId?: string; target?: ComposerTarget | 'active' } = {}
 ) => {
   if (blobs.length) {
-    dispatch<AttachImagesDetail>(ATTACH_IMAGES_EVENT, { blobs, target: resolve(target) })
+    dispatch<AttachImagesDetail>(ATTACH_IMAGES_EVENT, { ...resolve(target, surfaceId), blobs })
   }
 }
 
-export const onComposerAttachImagesRequest = (handler: (detail: AttachImagesDetail) => void) =>
-  subscribe<AttachImagesDetail>(ATTACH_IMAGES_EVENT, handler)
+export const onComposerAttachImagesRequest = (
+  addressOrHandler: ComposerSurfaceAddress | DetailHandler<AttachImagesDetail>,
+  handler?: DetailHandler<AttachImagesDetail>
+) => subscribe(ATTACH_IMAGES_EVENT, addressOrHandler, handler)
 
-/** Insert typed ref chips (carrying a display label) into a composer — the
- * structured cousin of {@link requestComposerInsert}, used for session links. */
+/** Insert typed ref chips (carrying a display label) into a composer. */
 export const requestComposerInsertRefs = (
   refs: InlineRefInput[],
-  { target = 'active' }: { target?: ComposerTarget | 'active' } = {}
+  { surfaceId, target = 'active' }: { surfaceId?: string; target?: ComposerTarget | 'active' } = {}
 ) => {
   if (refs.length) {
-    dispatch<InsertRefsDetail>(INSERT_REFS_EVENT, { refs, target: resolve(target) })
+    dispatch<InsertRefsDetail>(INSERT_REFS_EVENT, { ...resolve(target, surfaceId), refs })
   }
 }
 
-export const onComposerInsertRefsRequest = (handler: (detail: InsertRefsDetail) => void) =>
-  subscribe<InsertRefsDetail>(INSERT_REFS_EVENT, handler)
+export const onComposerInsertRefsRequest = (
+  addressOrHandler: ComposerSurfaceAddress | DetailHandler<InsertRefsDetail>,
+  handler?: DetailHandler<InsertRefsDetail>
+) => subscribe(INSERT_REFS_EVENT, addressOrHandler, handler)
 
 /** Submit a prompt through a composer as if the user typed + sent it. Lets
  * external panels (e.g. the review pane's "let the agent ship it" button) hand
@@ -310,13 +392,13 @@ export const requestComposerSubmit = (
     return false
   }
 
-  const resolvedTarget = resolve(target)
-
-  const surfaceId = requestedSurfaceId === undefined ? getVisibleComposerSurfaceId(resolvedTarget) : requestedSurfaceId
+  const resolved = resolve(target, requestedSurfaceId ?? undefined)
+  const resolvedTarget = resolved.target
+  const surfaceId = requestedSurfaceId === undefined ? (resolved.surfaceId ?? getVisibleComposerSurfaceId(resolvedTarget)) : requestedSurfaceId
 
   // Fail closed: without an exact visible surface identity, broadcasting a
   // submit could make more than one keep-alive/new-chat composer claim it.
-  if (!surfaceId || (requestedSurfaceId !== undefined && !composerSurfaceIsVisible(resolvedTarget, surfaceId))) {
+  if (!surfaceId || !composerSurfaceIsVisible(resolvedTarget, surfaceId)) {
     return false
   }
 
@@ -333,20 +415,25 @@ export const requestComposerSubmit = (
 export const onComposerSubmitRequest = (handler: (detail: SubmitDetail) => void) =>
   subscribe<SubmitDetail>(SUBMIT_EVENT, handler)
 
-/** Toggle ONE composer's voice conversation — the `composer.voice` hotkey
- *  (Ctrl+B) reaches the composer that owns voice. Defaults to the active
- *  composer so N tiles don't all flip together. */
-export const requestVoiceToggle = (target: ComposerTarget | 'active' = 'active') =>
-  dispatch<{ target: ComposerTarget }>(VOICE_TOGGLE_EVENT, { target: resolve(target) })
+/** Toggle ONE composer's voice conversation. */
+export const requestVoiceToggle = (
+  target: ComposerTarget | 'active' = 'active',
+  { surfaceId }: { surfaceId?: string } = {}
+) => dispatch<ComposerAddress>(VOICE_TOGGLE_EVENT, resolve(target, surfaceId))
 
-export const onComposerVoiceToggleRequest = (handler: (target: ComposerTarget) => void) =>
-  subscribe<{ target: ComposerTarget }>(VOICE_TOGGLE_EVENT, ({ target }) => handler(target))
+export const onComposerVoiceToggleRequest = (
+  addressOrHandler: ComposerSurfaceAddress | ((target: ComposerTarget) => void),
+  handler?: () => void
+) => {
+  if (typeof addressOrHandler === 'function') {
+    return subscribe<ComposerAddress>(VOICE_TOGGLE_EVENT, detail => addressOrHandler(detail.target))
+  }
 
-/** The chat surface inside the zone the pointer is over, if any. Mirrors the
- *  tab verbs' hover-first targeting (`tabTargetGroupId`, #74447): the model
- *  hotkey lands in the pane you're pointing at without clicking into it first.
- *  Hidden keep-alive tabs are skipped like every document-wide lookup. */
-const composerTargetInHoveredZone = (): ComposerTarget | null => {
+  return subscribe<ComposerAddress>(VOICE_TOGGLE_EVENT, addressOrHandler, () => handler?.())
+}
+
+/** The exact chat surface inside the zone the pointer is over, if any. */
+const composerAddressInHoveredZone = (): ComposerAddress | null => {
   const zone = $hoveredTreeGroup.get()
 
   if (!zone || typeof document === 'undefined') {
@@ -357,7 +444,11 @@ const composerTargetInHoveredZone = (): ComposerTarget | null => {
     el => el.closest<HTMLElement>('[data-tree-group]')?.dataset.treeGroup === zone
   )
 
-  return (surface?.dataset.composerTarget as ComposerTarget | undefined) ?? null
+  if (!surface?.dataset.composerTarget) {
+    return null
+  }
+
+  return surfaceAddress(surface) ?? { target: surface.dataset.composerTarget as ComposerTarget }
 }
 
 /** Toggle ONE composer's model menu — the `composer.modelPicker` hotkey.
@@ -370,15 +461,21 @@ export const requestModelMenuToggle = (): boolean => {
     return false
   }
 
-  dispatch<{ target: ComposerTarget }>(MODEL_MENU_EVENT, {
-    target: composerTargetInHoveredZone() ?? resolveActive()
-  })
+  dispatch<ComposerAddress>(MODEL_MENU_EVENT, composerAddressInHoveredZone() ?? resolveActive())
 
   return true
 }
 
-export const onComposerModelMenuRequest = (handler: (target: ComposerTarget) => void) =>
-  subscribe<{ target: ComposerTarget }>(MODEL_MENU_EVENT, ({ target }) => handler(target))
+export const onComposerModelMenuRequest = (
+  addressOrHandler: ComposerSurfaceAddress | ((target: ComposerTarget) => void),
+  handler?: () => void
+) => {
+  if (typeof addressOrHandler === 'function') {
+    return subscribe<ComposerAddress>(MODEL_MENU_EVENT, detail => addressOrHandler(detail.target))
+  }
+
+  return subscribe<ComposerAddress>(MODEL_MENU_EVENT, addressOrHandler, () => handler?.())
+}
 
 /**
  * Focus a composer input across React commit + browser focus restore.
@@ -388,7 +485,7 @@ export const onComposerModelMenuRequest = (handler: (target: ComposerTarget) => 
  *   - rAF:  React just committed a `renderComposerContents` swap
  *   - 0ms:  browser focus reclaim from a click target inside an external panel
  */
-export const focusComposerInput = (el: HTMLElement | null) => {
+export const focusComposerInput = (el: HTMLElement | null, address?: ComposerSurfaceAddress) => {
   if (!el) {
     return
   }
@@ -397,6 +494,16 @@ export const focusComposerInput = (el: HTMLElement | null) => {
   // layout) even on the active element, and during a session switch the DOM is
   // large and dirty — the redundant retries were measurably expensive there.
   const focus = () => {
+    if (address) {
+      const active = resolveActive()
+
+      // A click/focus on another same-target surface after the sync attempt
+      // invalidates this request's rAF/timeout retries. Never steal it back.
+      if (active.target !== address.target || active.surfaceId !== address.surfaceId) {
+        return
+      }
+    }
+
     if (document.activeElement !== el) {
       el.focus({ preventScroll: true })
     }

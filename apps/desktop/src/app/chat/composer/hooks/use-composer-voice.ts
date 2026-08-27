@@ -14,7 +14,7 @@ import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/stor
 
 import type { ComposerTarget } from '../focus'
 import { onComposerVoiceToggleRequest } from '../focus'
-import { useComposerScope } from '../scope'
+import { useComposerScope, useComposerSurfaceId } from '../scope'
 import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
@@ -73,6 +73,7 @@ export function useComposerVoice({
   const { t } = useI18n()
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
+  const surfaceId = useComposerSurfaceId()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
   const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
@@ -310,8 +311,11 @@ export function useComposerVoice({
   }, [conversation, disabled, voiceConversationActive])
 
   useEffect(
-    () => onComposerVoiceToggleRequest(toggled => toggled === target && toggleVoiceConversation()),
-    [target, toggleVoiceConversation]
+    () =>
+      surfaceId
+        ? onComposerVoiceToggleRequest({ surfaceId, target }, toggleVoiceConversation)
+        : onComposerVoiceToggleRequest(toggled => toggled === target && toggleVoiceConversation()),
+    [surfaceId, target, toggleVoiceConversation]
   )
 
   useEffect(() => {

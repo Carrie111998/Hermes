@@ -16,7 +16,7 @@ import { cn } from '@/lib/utils'
 import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
 
 import { onComposerModelMenuRequest } from './focus'
-import { useComposerScope } from './scope'
+import { useComposerScope, useComposerSurfaceId } from './scope'
 import type { ChatBarState } from './types'
 
 // `shrink` (not `shrink-0`) with a truncating label: the pill is the one
@@ -61,27 +61,30 @@ export function ModelPill({
   const runtimeId = useStore(view.$runtimeId)
   const [open, setOpen] = useState(false)
   const scope = useComposerScope()
+  const surfaceId = useComposerSurfaceId()
   const hasLiveMenu = Boolean(model.modelMenuContent)
 
   // The `composer.modelPicker` hotkey, routed to exactly one surface (the pane
   // under the pointer, else the active composer — see requestModelMenuToggle).
   // Toggles the live dropdown; with no live menu (gateway closed) it opens the
   // full picker dialog, same as clicking the pill.
-  useEffect(
-    () =>
-      onComposerModelMenuRequest(target => {
-        if (target !== scope.target || disabled) {
-          return
-        }
+  useEffect(() => {
+    const toggle = () => {
+      if (disabled) {
+        return
+      }
 
-        if (hasLiveMenu) {
-          setOpen(prev => !prev)
-        } else {
-          setModelPickerOpen(true)
-        }
-      }),
-    [scope.target, disabled, hasLiveMenu]
-  )
+      if (hasLiveMenu) {
+        setOpen(prev => !prev)
+      } else {
+        setModelPickerOpen(true)
+      }
+    }
+
+    return surfaceId
+      ? onComposerModelMenuRequest({ surfaceId, target: scope.target }, toggle)
+      : onComposerModelMenuRequest(target => target === scope.target && toggle())
+  }, [disabled, hasLiveMenu, scope.target, surfaceId])
 
   // The composer pick is sticky: a manual selection is pinned and every NEW
   // chat uses it instead of the Settings → Model default — silently, which has

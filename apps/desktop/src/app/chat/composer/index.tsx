@@ -84,7 +84,7 @@ import {
   normalizeComposerEditorDom,
   RICH_INPUT_SLOT
 } from './rich-editor'
-import { useComposerScope } from './scope'
+import { useComposerScope, useComposerSurfaceId } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
 import { SuggestionPills } from './suggestion-pills'
@@ -194,6 +194,7 @@ export function ChatBar({
   // Which live composer this instance IS (main | tile) — its attachment set,
   // focus-bus key, and awaiting-input edge. Main scope = the legacy globals.
   const scope = useComposerScope()
+  const composerSurfaceId = useComposerSurfaceId()
   const attachments = useStore(scope.attachments.$attachments)
   const compacting = useStore(useMemo(() => sessionCompacting(sessionId ?? null), [sessionId]))
   const scrolledUp = useStore($threadScrolledUp)
@@ -304,7 +305,7 @@ export function ChatBar({
       return undefined
     }
 
-    return onComposerAttachImagesRequest(({ blobs, target }) => {
+    const handleAttachImages = ({ blobs, target }: { blobs: Blob[]; target: string }) => {
       if (actionsDisabledRef.current || target !== scope.target) {
         return
       }
@@ -314,8 +315,12 @@ export function ChatBar({
       for (const blob of blobs) {
         void onAttachImageBlob(blob)
       }
-    })
-  }, [onAttachImageBlob, scope.target])
+    }
+
+    return composerSurfaceId
+      ? onComposerAttachImagesRequest({ surfaceId: composerSurfaceId, target: scope.target }, handleAttachImages)
+      : onComposerAttachImagesRequest(handleAttachImages)
+  }, [composerSurfaceId, onAttachImageBlob, scope.target])
 
   // Prior history belongs to the draft that just left — undoing into another
   // conversation's text is worse than having none.
@@ -1154,7 +1159,7 @@ export function ChatBar({
         }}
         onDragOver={actionsDisabled ? undefined : handleInputDragOver}
         onDrop={actionsDisabled ? undefined : handleInputDrop}
-        onFocus={() => markActiveComposer(scope.target)}
+        onFocus={() => markActiveComposer(scope.target, composerSurfaceId ?? undefined)}
         onInput={handleEditorInput}
         onKeyDown={handleEditorKeyDown}
         onKeyUp={handleEditorKeyUp}
