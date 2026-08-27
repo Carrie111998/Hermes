@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /**
@@ -91,6 +91,11 @@ async function readJsonSafe<T extends Record<string, unknown>>(filePath: string)
  * Abstaining is the same contract Python applies: the fingerprints are only
  * ever compared when BOTH the recorded and the live value are known, so a
  * `null` here can never turn a live gateway into a false `pid-reused`.
+ *
+ * Note on parsing: Python's own reader (`gateway/status.py`) uses a naive
+ * `split()[21]`; this module splits after the final ')' so comms containing
+ * spaces are still parsed correctly. The two diverge only for such comms,
+ * which a Python gateway's comm (a kernel-truncated basename) never is.
  */
 async function liveStartTime(pid: number): Promise<number | null> {
   try {
@@ -120,8 +125,10 @@ async function isPidAlive(
     // Signal 0 is a no-op probe — throws ESRCH if the PID doesn't exist.
     process.kill(pid, 0)
   } catch {
-    // EPERM means the process exists but belongs to another user: it is alive,
-    // yet it is not a gateway we own, so treat it as unusable for adoption.
+    // ESRCH = gone. EPERM = exists but owned by another user: it is alive,
+    // yet it cannot be our gateway, so it is unusable for adoption. (Python's
+    // `_pid_exists` reports EPERM as alive for the status view; here we
+    // classify adoption eligibility instead, so both land on 'dead'.)
     return { alive: false, reason: 'dead' }
   }
   if (recordedStart !== null) {

@@ -1,13 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 
 // Mock fs/promises before importing the module under test
 vi.mock('node:fs/promises', () => ({
-  readFile: vi.fn(),
-  stat: vi.fn()
+  readFile: vi.fn()
 }))
-
-vi.mock('node:os', () => ({}))
 
 import {
   detectLocalGatewayRunning,
@@ -15,8 +12,21 @@ import {
   type GatewayLiveness
 } from './local-gateway-detect'
 
-const mockReadFile = readFile as vi.MockedFunction<typeof readFile>
-const mockStat = stat as vi.MockedFunction<typeof stat>
+// vi.mocked() is the canonical typed cast for a module-mocked function.
+const mockReadFile = vi.mocked(readFile)
+
+/**
+ * Builds a synthetic `/proc/<pid>/stat` line. comm (field 2) is parenthesized;
+ * the module splits after the final ')' so its tail starts at field 3 (array
+ * index 2), making field 22 (starttime) the tail's index 19 -> array index 21.
+ * Fields 4..21 (array indices 3..20) are the 18 filler items before it.
+ */
+function statLine(field22: number): string {
+  const fields: string[] = ['0', '(sleep)', 'S']
+  for (let i = 3; i <= 20; i++) fields.push('0') // fields 4..21
+  fields.push(String(field22)) // field 22 = starttime (clock ticks)
+  return fields.join(' ')
+}
 
 describe('detectLocalGatewayRunning', () => {
   beforeEach(() => {
@@ -123,18 +133,62 @@ describe('detectLocalGatewayRunning', () => {
     expect(result.reason).toBe('state-running')
   })
 
-  it('returns alive=true when gateway is running with valid PID', async () => {
-    mockReadFile.mockResolvedValue(JSON.stringify({
-      gateway_state: 'running',
-      pid: process.pid, // Use our own PID as a known-live process
-      start_time: '2026-01-01T00:00:00Z',
-      updated_at: new Date().toISOString(),
-      argv: ['python', '-m', 'hermes_cli.main', 'gateway', '--port', '8642']
-    }))
+  it('adopts a live gateway whose start_time fingerprint matches (pid-reuse guard)', async () => {
+    // The fingerprint guard: recorded start_time (clock ticks, field 22) must
+    // equal the live process's field 22. A match => same process => alive.
+    const field22 = 4_567_890
+    mockReadFile.mockImplementation(async (path) => {
+      const file = String(path)
+      if (file.startsWith('/proc/')) return statLine(field22)
+      return JSON.stringify({
+        gateway_state: 'running',
+        pid: process.pid, // our own (known-live) PID
+        start_time: field22,
+        updated_at: new Date().toISOString(),
+        argv: ['python', '-m', 'hermes_cli.main', 'gateway', '--port', '8642']
+      })
+    })
     const result = await detectLocalGatewayRunning()
     expect(result.alive).toBe(true)
     expect(result.pid).toBe(process.pid)
     expect(result.port).toBe(8642)
+    expect(result.reason).toBe('state-running')
+  })
+
+  it('rejects a live PID whose start_time fingerprint differs (pid-reused)', async () => {
+    // Same PID number, different process: the recorded gateway is gone and the
+    // PID was recycled. Field 22 differs from the recorded start_time.
+    mockReadFile.mockImplementation(async (path) => {
+      const file = String(path)
+      if (file.startsWith('/proc/')) return statLine(9_999_999) // live value differs
+      return JSON.stringify({
+        gateway_state: 'running',
+        pid: process.pid, // known-live PID number...
+        start_time: 4_567_890, // ...but a different process than recorded
+        updated_at: new Date().toISOString()
+      })
+    })
+    const result = await detectLocalGatewayRunning()
+    expect(result.alive).toBe(false)
+    expect(result.reason).toBe('pid-reused')
+    expect(result.pid).toBe(process.pid)
+  })
+
+  it('abstains (adopts) when the /proc fingerprint is unreadable', async () => {
+    // No /proc (Windows/macOS) or unreadable stat => null fingerprint => the
+    // guard abstains and a live PID is accepted — never a false pid-reused.
+    mockReadFile.mockImplementation(async (path) => {
+      const file = String(path)
+      if (file.startsWith('/proc/')) throw new Error('ENOENT')
+      return JSON.stringify({
+        gateway_state: 'running',
+        pid: process.pid,
+        start_time: 4_567_890, // recorded, but the live side cannot be read
+        updated_at: new Date().toISOString()
+      })
+    })
+    const result = await detectLocalGatewayRunning()
+    expect(result.alive).toBe(true)
     expect(result.reason).toBe('state-running')
   })
 
