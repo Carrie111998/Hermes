@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -160,6 +161,36 @@ _cfg_lock = threading.Lock()
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+_RETIRED_SESSION_ID_LIMIT = 4096
+_retired_session_ids: OrderedDict[str, None] = OrderedDict()
+_retired_session_ids_lock = threading.Lock()
+
+
+def _remember_retired_session_id(sid: str) -> None:
+    sid = str(sid or "")
+    if not sid:
+        return
+    with _retired_session_ids_lock:
+        _retired_session_ids.pop(sid, None)
+        _retired_session_ids[sid] = None
+        while len(_retired_session_ids) > _RETIRED_SESSION_ID_LIMIT:
+            _retired_session_ids.popitem(last=False)
+
+
+def _forget_retired_session_id(sid: str) -> None:
+    sid = str(sid or "")
+    if not sid:
+        return
+    with _retired_session_ids_lock:
+        _retired_session_ids.pop(sid, None)
+
+
+def _was_retired_session_id(sid: str) -> bool:
+    sid = str(sid or "")
+    if not sid:
+        return False
+    with _retired_session_ids_lock:
+        return sid in _retired_session_ids
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -389,6 +420,9 @@ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 # Unlike a public session id, this object identity cannot be supplied by RPC.
 _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
     contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
+)
+_deferred_build_effect_session: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("hermes_gateway_deferred_build_effect_session", default=None)
 )
 
 # JSON-RPC method being dispatched on this thread/task. Purely diagnostic: the
@@ -1060,6 +1094,7 @@ def _pop_session_by_id(sid: str) -> dict | None:
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
     session["_sid"] = sid
+    _remember_retired_session_id(sid)
     return session
 
 
@@ -1107,7 +1142,11 @@ def _run_live_build_effect(
     with _session_lifecycle_lock(session):
         if not _session_is_live_for_commit(sid, session):
             return False
-        result = effect()
+        token = _deferred_build_effect_session.set(session)
+        try:
+            result = effect()
+        finally:
+            _deferred_build_effect_session.reset(token)
     return True if result is None else bool(result)
 
 
@@ -1152,6 +1191,25 @@ def _commit_resume_hydration(
                     session["resume_hydrating"] = False
                     session["resume_message_count"] = message_count
         return True
+
+
+def _commit_resume_failure_state(sid: str, session: dict, message: str) -> bool:
+    """Publish deferred-resume failure state before the runtime is retired."""
+    with _session_lifecycle_lock(session):
+        with _session_resume_lock:
+            with _sessions_lock:
+                if (
+                    _sessions.get(sid) is not session
+                    or session.get("_closing")
+                    or session.get("_finalized")
+                ):
+                    return False
+                session["resume_hydrating"] = False
+                session["resume_history_error"] = message
+                session["agent_error"] = message
+                session["resume_history_ready"].set()
+                session["agent_ready"].set()
+    return True
 
 
 def _close_session_by_id(
@@ -2160,25 +2218,31 @@ def write_json(obj: dict) -> bool:
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid:
+            strict_session = _deferred_build_effect_session.get()
             with _sessions_lock:
                 session = _sessions.get(sid)
-            if session is None or session.get("_closing") or session.get("_finalized"):
-                return False
-            with _session_lifecycle_lock(session):
-                with _sessions_lock:
-                    if (
-                        _sessions.get(sid) is not session
-                        or session.get("_closing")
-                        or session.get("_finalized")
-                    ):
+            if session is not None:
+                with _session_lifecycle_lock(session):
+                    with _sessions_lock:
+                        if (
+                            _sessions.get(sid) is not session
+                            or session.get("_closing")
+                            or session.get("_finalized")
+                            or (
+                                strict_session is not None
+                                and session is not strict_session
+                            )
+                        ):
+                            return False
+                        t = session.get("transport")
+                    if t is None:
                         return False
-                    t = session.get("transport")
-                if t is None:
-                    return False
-                from tui_gateway.event_replay import _stamp_event
+                    from tui_gateway.event_replay import _stamp_event
 
-                _stamp_event(obj)
-                return t.write(obj)
+                    _stamp_event(obj)
+                    return t.write(obj)
+            if strict_session is not None or _was_retired_session_id(sid):
+                return False
 
     from tui_gateway.event_replay import _stamp_event
 
@@ -8070,6 +8134,7 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        _forget_retired_session_id(sid)
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -8854,7 +8919,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             session["_auto_continue_scheduled"] = False
             return
         with session["history_lock"]:
-            if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
+            if (
+                session.get("running")
+                or session.get("_turn_cancel_requested")
+                or session.get("_closing")
+                or session.get("_finalized")
+            ):
                 # A real user prompt beat us to it — their turn wins, and its
                 # own conclusion clears the marker.
                 session["_auto_continue_scheduled"] = False
@@ -9503,6 +9573,7 @@ def _claim_or_reuse_live(
             park_for_reap = True
         with _sessions_lock:
             _sessions[sid] = record
+            _forget_retired_session_id(sid)
             _register_session_cwd(_sessions[sid])
         # A fresh runtime was minted for this stored session id: the new sid
         # has no pending reap, but a PRIOR runtime for the same stored id may
@@ -9619,40 +9690,48 @@ def _schedule_resume_hydration(
                 session["resume_history_ready"].set()
                 return
             session["resume_history_ready"].set()
-            if not _session_is_live_for_commit(sid, session):
-                return
-            _emit(
-                "session.resume_progress",
+            if not _run_live_build_effect(
                 sid,
-                {
-                    "message_count": len(display_history),
-                    "phase": "history",
-                    "status": "complete",
-                },
-            )
-            if not _session_is_live_for_commit(sid, session):
+                session,
+                lambda: _emit(
+                    "session.resume_progress",
+                    sid,
+                    {
+                        "message_count": len(display_history),
+                        "phase": "history",
+                        "status": "complete",
+                    },
+                ),
+            ):
                 return
-            _maybe_schedule_auto_continue(sid, session, stored_id)
-            if not _session_is_live_for_commit(sid, session):
+            if not _run_live_build_effect(
+                sid,
+                session,
+                lambda: _maybe_schedule_auto_continue(sid, session, stored_id),
+            ):
                 return
-            _start_agent_build(sid, session)
+            if not _run_live_build_effect(
+                sid,
+                session,
+                lambda: _start_agent_build(sid, session),
+            ):
+                return
         except Exception as exc:
-            if not _session_is_live_for_commit(sid, session):
-                return
             message = f"resume failed: {exc}"
-            session["resume_hydrating"] = False
-            session["resume_history_error"] = message
-            session["agent_error"] = message
-            session["resume_history_ready"].set()
-            session["agent_ready"].set()
-            _emit(
-                "session.resume_progress",
-                sid,
-                {"message": message, "phase": "history", "status": "failed"},
-            )
-            _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
+            if not _commit_resume_failure_state(sid, session, message):
+                return
+
+            def _emit_resume_failure() -> None:
+                _emit(
+                    "session.resume_progress",
+                    sid,
+                    {"message": message, "phase": "history", "status": "failed"},
+                )
+                _emit("error", sid, {"message": message})
+
+            if not _run_live_build_effect(sid, session, _emit_resume_failure):
+                return
+            discarded = _pop_session_by_id(sid)
             lease = (discarded or {}).get("active_session_lease")
             if lease is not None:
                 lease.release()

@@ -991,6 +991,63 @@ def test_resume_hydration_does_not_commit_after_session_claim(monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_resume_hydration_failure_claims_state_before_close(monkeypatch):
+    """Hydration errors must not mutate a runtime after teardown claims it."""
+    state_entered = threading.Event()
+    pop_done = threading.Event()
+    closing_at_write = []
+    original_setitem = dict.__setitem__
+
+    class _StateGate(dict):
+        def __setitem__(self, key, value):
+            if key == "resume_hydrating" and not state_entered.is_set():
+                state_entered.set()
+                pop_done.wait(timeout=2)
+                closing_at_write.append(self.get("_closing", False))
+            original_setitem(self, key, value)
+
+    class _DB:
+        def reopen_session(self, _stored_id):
+            return None
+
+        def get_resume_conversations(self, _stored_id):
+            raise RuntimeError("history unavailable")
+
+        def close(self):
+            return None
+
+    sid = "hydration-failure-sid"
+    session = _StateGate(
+        {
+            "agent_ready": threading.Event(),
+            "history_lock": threading.Lock(),
+            "resume_history_ready": threading.Event(),
+            "resume_hydrating": True,
+            "session_key": "hydration-failure-key",
+        }
+    )
+    server._sessions.clear()
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    def _pop():
+        assert server._pop_session_by_id(sid) is session
+        pop_done.set()
+
+    try:
+        server._schedule_resume_hydration(sid, "hydration-failure-key", _DB(), close_db=True)
+        assert state_entered.wait(timeout=2)
+        pop_thread = threading.Thread(target=_pop)
+        pop_thread.start()
+        assert session["resume_history_ready"].wait(timeout=5)
+        pop_thread.join(timeout=2)
+        assert not pop_thread.is_alive()
+        assert closing_at_write == [False]
+    finally:
+        pop_done.set()
+        server._sessions.pop(sid, None)
+
+
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
     """A profile's own terminal.cwd is read from its config.yaml."""
     project = tmp_path / "proj"
@@ -1233,15 +1290,65 @@ def test_write_json_drops_unregistered_session_frames(monkeypatch):
     out = _ChunkyStdout()
     monkeypatch.setattr(server, "_real_stdout", out)
     server._sessions.pop("claimed-sid", None)
+    token = server._deferred_build_effect_session.set({})
+
+    try:
+        assert server.write_json(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"session_id": "claimed-sid", "type": "session.info"},
+            }
+        ) is False
+        assert out.parts == []
+    finally:
+        server._deferred_build_effect_session.reset(token)
+
+
+def test_write_json_drops_event_after_runtime_is_claimed(monkeypatch):
+    """A claimed runtime id must not use the stdio fallback for late events."""
+    writes = []
+
+    class _Transport:
+        def write(self, frame):
+            writes.append(frame)
+            return True
+
+    out = _ChunkyStdout()
+    monkeypatch.setattr(server, "_real_stdout", out)
+    sid = "claimed-runtime-sid"
+    server._sessions[sid] = {"transport": _Transport()}
+    assert server._pop_session_by_id(sid) is not None
 
     assert server.write_json(
         {
             "jsonrpc": "2.0",
             "method": "event",
-            "params": {"session_id": "claimed-sid", "type": "session.info"},
+            "params": {"session_id": sid, "type": "session.info"},
         }
     ) is False
+    assert writes == []
     assert out.parts == []
+
+
+def test_retired_session_id_reuse_keeps_the_new_tombstone(monkeypatch):
+    """Reusing a runtime id must not let an old bounded entry erase its replacement."""
+    sid = "reused-runtime-sid"
+    other = "other-runtime-sid"
+    monkeypatch.setattr(server, "_RETIRED_SESSION_ID_LIMIT", 2)
+    with server._retired_session_ids_lock:
+        saved = server._retired_session_ids.copy()
+        server._retired_session_ids.clear()
+    try:
+        server._remember_retired_session_id(sid)
+        server._forget_retired_session_id(sid)
+        server._remember_retired_session_id(sid)
+        server._remember_retired_session_id(other)
+        assert server._was_retired_session_id(sid)
+    finally:
+        with server._retired_session_ids_lock:
+            server._retired_session_ids.clear()
+            server._retired_session_ids.update(saved)
 
 
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
