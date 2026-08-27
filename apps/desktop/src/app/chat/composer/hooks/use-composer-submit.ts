@@ -12,6 +12,7 @@ import {
 } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
+import { resolveComposerStorageScopeKey } from '@/store/composer-storage-migration'
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
@@ -110,7 +111,10 @@ export function useComposerSubmit({
         return
       }
 
-      const visibleScopeIsSubmitted = activeQueueSessionKeyRef.current === submittedScope
+      const restoreScope =
+        typeof submittedScope === 'string' ? resolveComposerStorageScopeKey(submittedScope) : submittedScope
+
+      const visibleScopeIsSubmitted = activeQueueSessionKeyRef.current === restoreScope
 
       const visibleDraftChanged =
         visibleScopeIsSubmitted && (draftRef.current.length > 0 || scope.attachments.$attachments.get().length > 0)
@@ -130,7 +134,7 @@ export function useComposerSubmit({
       // now — the gateway can reject well after the user has switched away,
       // and re-stashing into the currently-focused session would overwrite
       // its draft with the rejected text from a different session (#54527).
-      stashAt(submittedScope, text, submittedAttachments)
+      stashAt(restoreScope, text, submittedAttachments)
     }
 
     void Promise.resolve(

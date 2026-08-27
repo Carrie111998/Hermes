@@ -6,7 +6,6 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
-import { profileScopeKey } from '@/api/client'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
@@ -27,8 +26,9 @@ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-s
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { claimSessionDraft } from '@/store/composer'
-import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
+import { $composerNewChatGeneration } from '@/store/composer'
+import { parkQueuedPrompts } from '@/store/composer-queue'
+import { encodeComposerStorageScopeKey, legacyComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
@@ -449,6 +449,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const petOverlayActive = useStore($petOverlayActive)
   const petPresent = petActive || petOverlayActive
   const freshDraftReady = useStore($freshDraftReady)
+  const composerNewChatGeneration = useStore($composerNewChatGeneration)
   const gatewayState = useStore($gatewayState)
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
   const hydrationSyncProfile = useStore($hydrationSyncProfile)
@@ -482,24 +483,53 @@ const ChatViewContent = memo(function ChatViewContent({
     return resolveComposerSessionKey(effectiveSelectedSessionId, sessions)
   }, [isPrimary, location.pathname, selectedSessionId, sessions])
 
-  const activeOwnerScopeKey = profileScopeKey({
-    connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
-    profile: activeGatewayProfile
-  })
+  const activeComposerOwnerConnectionId = connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')
+  const activeComposerOwnerProfile = activeGatewayProfile
 
   const tileOwner = !isPrimary ? sessionOwnerRoute : undefined
 
-  const composerOwnerScopeKey = tileOwner
-    ? profileScopeKey({ connectionId: tileOwner.connectionId, profile: tileOwner.profile })
-    : activeOwnerScopeKey
+  const composerOwner = useMemo(
+    () =>
+      tileOwner
+        ? { connectionId: tileOwner.connectionId, profile: tileOwner.profile }
+        : { connectionId: activeComposerOwnerConnectionId, profile: activeComposerOwnerProfile },
+    [activeComposerOwnerConnectionId, activeComposerOwnerProfile, tileOwner]
+  )
 
-  const composerStorageScopeKey = `${composerOwnerScopeKey}\0${queueSessionKey ?? '__new__'}`
-  const selectedStorageScopeKey = `${composerOwnerScopeKey}\0${selectedSessionId ?? '__new__'}`
+  const composerOwnerScopeKey = encodeComposerStorageScopeKey(composerOwner, null)
+
+  const composerStorageScopeKey = encodeComposerStorageScopeKey(
+    composerOwner,
+    queueSessionKey,
+    queueSessionKey === null ? composerNewChatGeneration : 0
+  )
+
+  const selectedStorageScopeKey = encodeComposerStorageScopeKey(
+    composerOwner,
+    selectedSessionId,
+    selectedSessionId === null ? composerNewChatGeneration : 0
+  )
+
   const composerIdentityScopeKey = composerStorageScopeKey
 
-  const storageMigration = shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)
+  const lineageStorageMigration = shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)
+
+  const storageMigration = lineageStorageMigration
     ? ({ fromKey: selectedStorageScopeKey, kind: 'lineage', toKey: composerStorageScopeKey } as const)
     : undefined
+
+  const legacyStorageScopeKeys = useMemo(() => {
+    const keys: (string | null | undefined)[] = [
+      queueSessionKey,
+      legacyComposerStorageScopeKey(composerOwner, queueSessionKey)
+    ]
+
+    if (lineageStorageMigration) {
+      keys.push(selectedSessionId, legacyComposerStorageScopeKey(composerOwner, selectedSessionId))
+    }
+
+    return [...new Set(keys)]
+  }, [composerOwner, lineageStorageMigration, queueSessionKey, selectedSessionId])
 
   // Ownership belongs to a SURFACE generation, not to a runtime-id string.
   // Backends are free to reuse the same runtime id across profiles. Keep the
@@ -540,19 +570,6 @@ const ChatViewContent = memo(function ChatViewContent({
       }
     }
   }
-
-  // One-time compatibility bridge from legacy unqualified stores. Each raw
-  // draft is claimed exactly once; an existing qualified draft wins but still
-  // consumes the source so another profile cannot claim it later.
-  useEffect(() => {
-    claimSessionDraft(selectedSessionId, selectedStorageScopeKey)
-    migrateQueuedPrompts(selectedSessionId, selectedStorageScopeKey)
-
-    if (queueSessionKey !== selectedSessionId) {
-      claimSessionDraft(queueSessionKey, composerStorageScopeKey)
-      migrateQueuedPrompts(queueSessionKey, composerStorageScopeKey)
-    }
-  }, [composerStorageScopeKey, queueSessionKey, selectedSessionId, selectedStorageScopeKey])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any
@@ -841,6 +858,7 @@ const ChatViewContent = memo(function ChatViewContent({
               focusKey={activeSessionId}
               gateway={gateway}
               identityScopeKey={composerIdentityScopeKey}
+              legacyStorageScopeKeys={legacyStorageScopeKeys}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
               onAddContextRef={onAddContextRef}
               onAddUrl={onAddUrl}

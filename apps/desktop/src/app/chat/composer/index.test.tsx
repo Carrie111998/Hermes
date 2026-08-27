@@ -13,11 +13,17 @@ import {
   isQueueParked,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { _resetComposerQueueDrainsForTests } from '@/store/composer-queue-drain'
+import { _resetComposerStorageMigrationsForTests } from '@/store/composer-storage-migration'
+import { encodeComposerStorageScopeKey, legacyComposerStorageScopeKey } from '@/store/composer-storage-scope'
 
 import { COMPOSER_AREAS, type ComposerDraft, type ComposerMiddleware } from './contrib'
 import type { ChatBarProps } from './types'
 
 import { ChatBar } from './index'
+
+const STORAGE_OWNER = { connectionId: 'connection-a', profile: 'profile-a' }
+const storageKey = (storedSessionId: string | null) => encodeComposerStorageScopeKey(STORAGE_OWNER, storedSessionId)
 
 function props(overrides: Partial<ChatBarProps> = {}): ChatBarProps {
   return {
@@ -57,8 +63,14 @@ describe('ChatBar transition focus', () => {
     clearSessionDraft('profile-a\0root-a')
     clearSessionDraft('profile-a\0__new__')
     clearSessionDraft('profile-b\0stored-1')
+    clearSessionDraft(storageKey(null))
+    clearSessionDraft(storageKey('stored-1'))
+    clearSessionDraft(storageKey('tip-a'))
+    clearSessionDraft(storageKey('root-a'))
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    _resetComposerQueueDrainsForTests()
+    _resetComposerStorageMigrationsForTests()
   })
 
   it('keeps the real contenteditable, draft, focus, and caret while actions become fenced', () => {
@@ -301,9 +313,40 @@ describe('ChatBar transition focus', () => {
     expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe('legacy draft')
   })
 
+  it('claims a pre-codec qualified draft and queue before the canonical scope paints', () => {
+    const legacyKey = legacyComposerStorageScopeKey(STORAGE_OWNER, 'stored-1')
+    const canonicalKey = storageKey('stored-1')
+
+    stashSessionDraft(legacyKey, 'pre-codec qualified draft', [])
+    enqueueQueuedPrompt(legacyKey, { attachments: [], text: 'pre-codec queued turn' })
+
+    const view = render(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar
+            {...props({
+              busy: true,
+              legacyStorageScopeKeys: [legacyKey],
+              queueSessionKey: 'stored-1',
+              storageScopeKey: canonicalKey
+            })}
+          />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe(
+      'pre-codec qualified draft'
+    )
+    expect(takeSessionDraft(legacyKey).text).toBe('')
+    expect(takeSessionDraft(canonicalKey).text).toBe('pre-codec qualified draft')
+    expect(getQueuedPrompts(legacyKey)).toHaveLength(0)
+    expect(getQueuedPrompts(canonicalKey).map(entry => entry.text)).toEqual(['pre-codec queued turn'])
+  })
+
   it('moves the qualified New Chat composer state onto its first stored session before paint', () => {
-    const newChatKey = 'profile-a\0__new__'
-    const storedKey = 'profile-a\0stored-1'
+    const newChatKey = storageKey(null)
+    const storedKey = storageKey('stored-1')
 
     stashSessionDraft(newChatKey, 'first-session draft', [])
     enqueueQueuedPrompt(newChatKey, { attachments: [], text: 'queued before create' })
@@ -337,17 +380,17 @@ describe('ChatBar transition focus', () => {
 
     expect(view.container.querySelector('[data-slot="composer-rich-input"]')).toBe(editor)
     expect(editor.textContent).toBe('first-session draft')
-    expect(takeSessionDraft(newChatKey).text).toBe('')
+    expect(takeSessionDraft(newChatKey).text).toBe('first-session draft')
     expect(takeSessionDraft(storedKey).text).toBe('first-session draft')
-    expect(getQueuedPrompts(newChatKey)).toHaveLength(0)
+    expect(getQueuedPrompts(newChatKey).map(entry => entry.text)).toEqual(['queued before create'])
     expect(getQueuedPrompts(storedKey).map(entry => entry.text)).toEqual(['queued before create'])
-    expect(isQueueParked(newChatKey)).toBe(false)
+    expect(isQueueParked(newChatKey)).toBe(true)
     expect(isQueueParked(storedKey)).toBe(true)
   })
 
   it('moves a qualified lineage-tip draft before the root scope first takes and paints', () => {
-    const tipKey = 'profile-a\0tip-a'
-    const rootKey = 'profile-a\0root-a'
+    const tipKey = storageKey('tip-a')
+    const rootKey = storageKey('root-a')
 
     stashSessionDraft(tipKey, 'draft typed on compression tip', [])
 
@@ -369,7 +412,7 @@ describe('ChatBar transition focus', () => {
     expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe(
       'draft typed on compression tip'
     )
-    expect(takeSessionDraft(tipKey).text).toBe('')
+    expect(takeSessionDraft(tipKey).text).toBe('draft typed on compression tip')
     expect(takeSessionDraft(rootKey).text).toBe('draft typed on compression tip')
   })
 

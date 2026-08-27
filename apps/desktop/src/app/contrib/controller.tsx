@@ -2,7 +2,6 @@ import { useStore } from '@nanostores/react'
 import { atom, computed } from 'nanostores'
 import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
 
-import { profileScopeKey } from '@/api/client'
 import { SessionDraftTitle } from '@/app/chat/session-draft-title'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution, paletteToggle } from '@/app/command-palette/contrib'
@@ -47,8 +46,9 @@ import { Download, FileText, LayoutDashboard, PanelBottom, PanelTop, Terminal, U
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { TRANSCRIPT_DIRECTIVE_AREA, type TranscriptDirectiveContribution } from '@/lib/transcript-directives'
 import { setYoloEnabled } from '@/lib/yolo-session'
-import { draftTitleFor } from '@/store/composer'
+import { $composerNewChatGeneration, draftTitleFor } from '@/store/composer'
 import { pruneComposerPopoutZones } from '@/store/composer-popout'
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -136,12 +136,14 @@ const wrapWorkspaceTab = (tab: ReactElement) => <WorkspaceTabMenu>{tab}</Workspa
 export const workspaceDraftScope = (storedSessionId: null | string): string => {
   const connection = $connection.get()
 
-  const ownerScopeKey = profileScopeKey({
-    connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
-    profile: $activeGatewayProfile.get()
-  })
-
-  return `${ownerScopeKey}\0${storedSessionId ?? '__new__'}`
+  return encodeComposerStorageScopeKey(
+    {
+      connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
+      profile: $activeGatewayProfile.get()
+    },
+    storedSessionId,
+    storedSessionId === null ? $composerNewChatGeneration.get() : 0
+  )
 }
 
 /** The `@session` payload for the workspace tab — the loaded primary session,
@@ -541,6 +543,7 @@ const syncWorkspaceTitle = () => {
 $selectedStoredSessionId.listen(syncWorkspaceTitle)
 $sessions.listen(syncWorkspaceTitle)
 $activeGatewayProfile.listen(syncWorkspaceTitle)
+$composerNewChatGeneration.listen(syncWorkspaceTitle)
 $connection.listen(syncWorkspaceTitle)
 $workspaceIsPage.listen(syncWorkspaceTitle)
 

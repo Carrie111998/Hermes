@@ -62,6 +62,7 @@ interface SubmitPromptDeps {
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
   onRuntimeRecovered?: (runtimeId: string) => void
+  onSessionCreatedForSend?: (storedSessionId: string) => void
   requestGateway: GatewayRequest
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
@@ -109,6 +110,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
     getRuntimeIdForStoredSession,
     getRouteToken,
     onRuntimeRecovered,
+    onSessionCreatedForSend,
     requestGateway,
     runtimeIdByStoredSessionIdRef,
     resumeStoredSession,
@@ -299,6 +301,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       let startingStoredSessionId = routedSessionNeedsResume
         ? routedStoredSessionId
         : (selectedStoredSessionId ?? routedStoredSessionId)
+
+      const startedAsNewChat = startingStoredSessionId === null
 
       // Selection publishes independently from the durable route. Keep its
       // entry snapshot as the drift baseline instead of rewriting history to
@@ -719,6 +723,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // to the ambient socket — the fresh-chat owner loss behind #94071.
         targetStoredSessionId = selectedStoredSessionIdRef.current
 
+        if (startedAsNewChat && targetStoredSessionId) {
+          onSessionCreatedForSend?.(targetStoredSessionId)
+        }
+
         seedOptimistic(sessionId)
       }
 
@@ -904,6 +912,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       getRuntimeIdForStoredSession,
       getRouteToken,
       onRuntimeRecovered,
+      onSessionCreatedForSend,
       requestGateway,
       runtimeIdByStoredSessionIdRef,
       resumeStoredSession,

@@ -7,9 +7,14 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
-  migrateQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { _resetComposerQueueDrainsForTests } from '@/store/composer-queue-drain'
+import {
+  _resetComposerStorageMigrationsForTests,
+  migrateComposerStorageScope
+} from '@/store/composer-storage-migration'
+import { decodeComposerStorageScopeKey, encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 
 import type { QueueEditState } from '../composer-utils'
 import type { ChatBarProps } from '../types'
@@ -22,7 +27,9 @@ import { useComposerQueue } from './use-composer-queue'
 // the settle drain still flows (the regression that sank the old blanket
 // interrupt latch).
 
-const SESSION_KEY = 'stored-session-queue-hook'
+const OWNER = { connectionId: 'connection-a', profile: 'profile-a' }
+const storageKey = (storedSessionId: string | null) => encodeComposerStorageScopeKey(OWNER, storedSessionId)
+const SESSION_KEY = storageKey('stored-session-queue-hook')
 
 function renderQueueHook(
   overrides: {
@@ -69,7 +76,8 @@ function renderQueueHook(
       sessionKey?: string
     }) => {
       const activeSessionKey = sessionKey ?? overrides.sessionKey ?? SESSION_KEY
-      const durableQueueSessionKey = queueSessionKey === undefined ? activeSessionKey : queueSessionKey
+      const rawSessionKey = decodeComposerStorageScopeKey(activeSessionKey)?.storedSessionId ?? activeSessionKey
+      const durableQueueSessionKey = queueSessionKey === undefined ? rawSessionKey : queueSessionKey
 
       return useComposerQueue({
         actionsDisabled: actionsDisabled ?? overrides.actionsDisabled ?? false,
@@ -100,6 +108,8 @@ describe('useComposerQueue park integration', () => {
     window.localStorage.clear()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    _resetComposerQueueDrainsForTests()
+    _resetComposerStorageMigrationsForTests()
   })
 
   afterEach(() => {
@@ -107,6 +117,8 @@ describe('useComposerQueue park integration', () => {
     vi.restoreAllMocks()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    _resetComposerQueueDrainsForTests()
+    _resetComposerStorageMigrationsForTests()
   })
 
   it('auto-drains an unparked queue once idle', async () => {
@@ -119,18 +131,19 @@ describe('useComposerQueue park integration', () => {
   })
 
   it('keeps a profile-qualified queue local while submitting the raw stored id', async () => {
-    const storageKey = 'profile-a\0stored-1'
-    enqueueQueuedPrompt(storageKey, { attachments: [], text: 'profile A queue' })
+    const qualifiedKey = storageKey('stored-1')
+
+    enqueueQueuedPrompt(qualifiedKey, { attachments: [], text: 'profile A queue' })
 
     const { onSubmit } = renderQueueHook({
       queueSessionKey: 'stored-1',
-      sessionKey: storageKey,
+      sessionKey: qualifiedKey,
       submitScopeKey: 'stored-1'
     })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
     expect(onSubmit.mock.calls[0]?.[1]?.storedSessionId).toBe('stored-1')
-    expect(getQueuedPrompts(storageKey)).toHaveLength(0)
+    expect(getQueuedPrompts(qualifiedKey)).toHaveLength(0)
   })
 
   it('holds every queued action while route and active session disagree', async () => {
@@ -180,8 +193,8 @@ describe('useComposerQueue park integration', () => {
   })
 
   it('drains B after an in-flight A drain settles without requiring another B event', async () => {
-    const sessionA = 'session-a'
-    const sessionB = 'session-b'
+    const sessionA = storageKey('session-a')
+    const sessionB = storageKey('session-b')
     let settleA: ((accepted: boolean) => void) | undefined
 
     const pendingA = new Promise<boolean>(resolve => {
@@ -207,8 +220,8 @@ describe('useComposerQueue park integration', () => {
   })
 
   it('does not submit an in-flight entry twice when its runtime-derived queue key migrates', async () => {
-    const sessionA = 'runtime-a'
-    const sessionB = 'runtime-b'
+    const sessionA = storageKey('runtime-a')
+    const sessionB = storageKey('runtime-b')
     let settle: ((accepted: boolean) => void) | undefined
 
     const pending = new Promise<boolean>(resolve => {
@@ -233,8 +246,8 @@ describe('useComposerQueue park integration', () => {
   })
 
   it('hands an in-flight qualified tip drain lock and removal target to the lineage root', async () => {
-    const tipKey = 'profile-a\0tip-a'
-    const rootKey = 'profile-a\0root-a'
+    const tipKey = storageKey('tip-a')
+    const rootKey = storageKey('root-a')
     let settle: ((accepted: boolean) => void) | undefined
 
     const pending = new Promise<boolean>(resolve => {
@@ -255,7 +268,7 @@ describe('useComposerQueue park integration', () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
 
     act(() => {
-      migrateQueuedPrompts(tipKey, rootKey)
+      migrateComposerStorageScope(tipKey, rootKey)
       hook.rerender({ busy: false, queueSessionKey: 'root-a', sessionKey: rootKey })
     })
 
@@ -268,8 +281,8 @@ describe('useComposerQueue park integration', () => {
   })
 
   it('retries A automatically after a stale A drain rejects across A to B to A', async () => {
-    const sessionA = 'session-a'
-    const sessionB = 'session-b'
+    const sessionA = storageKey('session-a')
+    const sessionB = storageKey('session-b')
     let rejectFirst: ((accepted: boolean) => void) | undefined
 
     const firstPending = new Promise<boolean>(resolve => {
@@ -285,8 +298,8 @@ describe('useComposerQueue park integration', () => {
     const { hook } = renderQueueHook({ onSubmit, sessionKey: sessionA })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
-    hook.rerender({ busy: false, queueSessionKey: sessionB, sessionKey: sessionB })
-    hook.rerender({ busy: false, queueSessionKey: sessionA, sessionKey: sessionA })
+    hook.rerender({ busy: false, queueSessionKey: 'session-b', sessionKey: sessionB })
+    hook.rerender({ busy: false, queueSessionKey: 'session-a', sessionKey: sessionA })
 
     await act(async () => rejectFirst?.(false))
 

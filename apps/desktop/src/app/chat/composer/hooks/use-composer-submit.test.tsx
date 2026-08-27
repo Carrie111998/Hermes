@@ -5,6 +5,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { $clarifyRequests } from '@/store/clarify'
 import { clearSessionDraft, type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+import {
+  _resetComposerStorageMigrationsForTests,
+  migrateComposerStorageScope
+} from '@/store/composer-storage-migration'
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -156,6 +161,7 @@ describe('useComposerSubmit rejection restoration', () => {
     cleanup()
     vi.restoreAllMocks()
     clearSessionDraft('session-a')
+    _resetComposerStorageMigrationsForTests()
   })
 
   it('stashes a rejected A submission without overwriting the visible B draft', async () => {
@@ -180,6 +186,36 @@ describe('useComposerSubmit rejection restoration', () => {
 
     expect(stashAt).toHaveBeenCalledWith('session-a', 'draft from A', [])
     expect(loadIntoComposer).not.toHaveBeenCalled()
+  })
+
+  it('restores a rejected New Chat submission into its explicit created-session handoff', async () => {
+    const owner = { connectionId: 'connection-a', profile: 'profile-a' }
+    const newChatScope = encodeComposerStorageScopeKey(owner, null)
+    const createdScope = encodeComposerStorageScopeKey(owner, 'stored-created')
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const { activeQueueSessionKeyRef, hook, loadIntoComposer, onSubmit, stashAt } = renderSubmitHook({
+      sessionKey: newChatScope,
+      submitScopeKey: null
+    })
+
+    onSubmit.mockImplementationOnce(() => pending)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('fresh rejected draft')
+      expect(migrateComposerStorageScope(newChatScope, createdScope)).toBe(true)
+      activeQueueSessionKeyRef.current = createdScope
+    })
+
+    await act(async () => settle?.(false))
+
+    expect(loadIntoComposer).toHaveBeenCalledWith('fresh rejected draft', [])
+    expect(stashAt).toHaveBeenCalledWith(createdScope, 'fresh rejected draft', [])
+    expect(stashAt).not.toHaveBeenCalledWith(newChatScope, 'fresh rejected draft', [])
   })
 
   it('does not repaint an older rejected A payload over a newer A draft after A → B → A', async () => {

@@ -94,6 +94,7 @@ export function ChatBar({
   focusKey,
   gateway,
   identityScopeKey,
+  legacyStorageScopeKeys,
   maxRecordingSeconds = 120,
   queueSessionKey,
   sessionId,
@@ -280,6 +281,7 @@ export function ChatBar({
     focusKey,
     inputDisabled,
     legacyScopeKey: storageScopeKey === undefined ? undefined : submitScopeKey,
+    legacyStorageScopeKeys,
     queueEditRef,
     sessionId,
     storageMigration

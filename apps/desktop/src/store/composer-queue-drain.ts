@@ -1,4 +1,4 @@
-import { decodeComposerStorageScopeKey } from './composer-storage-scope'
+import { decodeComposerStorageScopeKey, resolveComposerStorageScopeKey } from './composer-storage-scope'
 
 export interface ComposerQueueDrainHandle {
   readonly id: number
@@ -14,18 +14,24 @@ const activeByHandle = new Map<number, ActiveDrain>()
 const handleByEntry = new Map<string, number>()
 const handleByScope = new Map<string, number>()
 
-const canonicalScope = (scopeKey: string): boolean => decodeComposerStorageScopeKey(scopeKey)?.format === 'canonical'
+const canonicalScope = (scopeKey: string): string | null => {
+  const resolved = resolveComposerStorageScopeKey(scopeKey)
+
+  return decodeComposerStorageScopeKey(resolved)?.format === 'canonical' ? resolved : null
+}
 
 /** Atomically claim one qualified queue scope + entry across every drainer. */
 export function beginComposerQueueDrain(scopeKey: string, entryId: string): ComposerQueueDrainHandle | null {
-  if (!canonicalScope(scopeKey) || !entryId.trim() || handleByScope.has(scopeKey) || handleByEntry.has(entryId)) {
+  const canonicalKey = canonicalScope(scopeKey)
+
+  if (!canonicalKey || !entryId.trim() || handleByScope.has(canonicalKey) || handleByEntry.has(entryId)) {
     return null
   }
 
   const handle = { id: nextDrainId++ }
 
-  activeByHandle.set(handle.id, { entryId, scopeKey })
-  handleByScope.set(scopeKey, handle.id)
+  activeByHandle.set(handle.id, { entryId, scopeKey: canonicalKey })
+  handleByScope.set(canonicalKey, handle.id)
   handleByEntry.set(entryId, handle.id)
 
   return handle
@@ -33,7 +39,9 @@ export function beginComposerQueueDrain(scopeKey: string, entryId: string): Comp
 
 /** Shared visible/background exclusion query. beginComposerQueueDrain is the atomic form. */
 export function isComposerQueueDrainExcluded(scopeKey: string, entryId: string): boolean {
-  return !canonicalScope(scopeKey) || handleByScope.has(scopeKey) || handleByEntry.has(entryId)
+  const canonicalKey = canonicalScope(scopeKey)
+
+  return !canonicalKey || handleByScope.has(canonicalKey) || handleByEntry.has(entryId)
 }
 
 /**
@@ -42,21 +50,24 @@ export function isComposerQueueDrainExcluded(scopeKey: string, entryId: string):
  * observes the destination key. Returns the number of moved claims.
  */
 export function handoffComposerQueueDrains(fromScopeKey: string, toScopeKey: string): number {
-  if (!canonicalScope(fromScopeKey) || !canonicalScope(toScopeKey)) {
+  const from = canonicalScope(fromScopeKey)
+  const to = canonicalScope(toScopeKey)
+
+  if (!from || !to) {
     return 0
   }
 
-  const handleId = handleByScope.get(fromScopeKey)
+  const handleId = handleByScope.get(from)
 
   if (handleId === undefined) {
     return 0
   }
 
-  if (fromScopeKey === toScopeKey) {
+  if (from === to) {
     return 1
   }
 
-  const targetHolder = handleByScope.get(toScopeKey)
+  const targetHolder = handleByScope.get(to)
 
   if (targetHolder !== undefined && targetHolder !== handleId) {
     return 0
@@ -70,9 +81,9 @@ export function handoffComposerQueueDrains(fromScopeKey: string, toScopeKey: str
 
   // Claim the target before releasing the source: no visible/background
   // contender can enter between the two qualified identities.
-  handleByScope.set(toScopeKey, handleId)
-  handleByScope.delete(fromScopeKey)
-  active.scopeKey = toScopeKey
+  handleByScope.set(to, handleId)
+  handleByScope.delete(from)
+  active.scopeKey = to
 
   return 1
 }

@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 
 import type { ComposerAttachment } from './composer'
+import { resolveComposerStorageScopeKey } from './composer-storage-scope'
 
 export interface QueuedPromptEntry {
   id: string
@@ -108,7 +109,7 @@ const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
 const sidOf = (key: string | null | undefined): null | string => {
   const trimmed = key?.trim()
 
-  return trimmed ? trimmed : null
+  return trimmed ? resolveComposerStorageScopeKey(trimmed) : null
 }
 
 const queueFor = (sid: string) => $queuedPromptsBySession.get()[sid] ?? []

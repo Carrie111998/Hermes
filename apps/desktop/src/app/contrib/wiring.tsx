@@ -42,7 +42,9 @@ import { activateWakeIndicator } from '@/lib/wake-indicator'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
-import { requestVoiceConversationStart } from '@/store/composer'
+import { $composerNewChatGeneration, requestVoiceConversationStart } from '@/store/composer'
+import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
@@ -73,7 +75,9 @@ import {
   $sessionResumeRequest,
   $sessions,
   forgetSessionOwnerHintsForSession,
+  getSessionOwnerHint,
   requestSessionResume,
+  resolveComposerSessionKey,
   sessionMatchesStoredId,
   sessionOwnerRouteFromRow,
   sessionPinId,
@@ -229,10 +233,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const sessions = useStore($sessions)
   const activeConnectionId = useStore($activeConnectionId)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+
   const backgroundQueueOwner = useMemo(
     () => ({ connectionId: activeConnectionId?.trim() || 'local', profile: activeGatewayProfile }),
     [activeConnectionId, activeGatewayProfile]
   )
+
   const profileScope = useStore($profileScope)
   const boot = useStore($desktopBoot)
 
@@ -623,6 +629,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const handleSkinCommand = useSkinCommand()
 
+  const handleSessionCreatedForSend = useCallback((storedSessionId: string) => {
+    const owner = getSessionOwnerHint(storedSessionId)
+
+    if (!owner) {
+      return
+    }
+
+    const durableSessionId = resolveComposerSessionKey(storedSessionId, $sessions.get()) ?? storedSessionId
+    const storageOwner = { connectionId: owner.connectionId, profile: owner.profile }
+
+    migrateComposerStorageScope(
+      encodeComposerStorageScopeKey(storageOwner, null, $composerNewChatGeneration.get()),
+      encodeComposerStorageScopeKey(storageOwner, durableSessionId)
+    )
+  }, [])
+
   const {
     cancelRun,
     editMessage,
@@ -644,6 +666,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     getRouteToken,
     handleSkinCommand,
     openMemoryGraph: openStarmap,
+    onSessionCreatedForSend: handleSessionCreatedForSend,
     refreshSessions,
     requestGateway,
     resumeStoredSession: resumeSession,

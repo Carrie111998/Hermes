@@ -15,7 +15,6 @@ import {
   claimSessionDraft,
   type ComposerAttachment,
   type ComposerDraftSyncMode,
-  migrateSessionDraft,
   onComposerDraftSyncRequest,
   reloadPersistedDrafts,
   stashSessionDraft,
@@ -23,6 +22,7 @@ import {
 } from '@/store/composer'
 import { isBrowsingHistory } from '@/store/composer-input-history'
 import { migrateQueuedPrompts } from '@/store/composer-queue'
+import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
 import { clearDraftSuggestions, sampleComposerDraft } from '@/store/composer-suggestions'
 
 import {
@@ -57,6 +57,7 @@ interface UseComposerDraftArgs {
   focusKey: ChatBarProps['focusKey']
   inputDisabled: boolean
   legacyScopeKey?: string | null
+  legacyStorageScopeKeys?: readonly (string | null | undefined)[]
   queueEditRef: RefObject<QueueEditState | null>
   sessionId: string | null | undefined
   storageMigration?: ChatBarProps['storageMigration']
@@ -78,6 +79,7 @@ export function useComposerDraft({
   focusKey,
   inputDisabled,
   legacyScopeKey,
+  legacyStorageScopeKeys,
   queueEditRef,
   sessionId,
   storageMigration
@@ -412,12 +414,20 @@ export function useComposerDraft({
   const migrationToKey = storageMigration?.toKey
 
   useLayoutEffect(() => {
+    for (const legacyKey of legacyStorageScopeKeys ?? []) {
+      if (legacyKey !== undefined && legacyKey !== activeQueueSessionKey) {
+        claimSessionDraft(legacyKey, activeQueueSessionKey)
+        migrateQueuedPrompts(legacyKey, activeQueueSessionKey)
+      }
+    }
+  }, [activeQueueSessionKey, legacyStorageScopeKeys])
+
+  useLayoutEffect(() => {
     if (!migrationFromKey || !migrationToKey || migrationToKey !== activeQueueSessionKey) {
       return
     }
 
-    migrateSessionDraft(migrationFromKey, migrationToKey)
-    migrateQueuedPrompts(migrationFromKey, migrationToKey)
+    migrateComposerStorageScope(migrationFromKey, migrationToKey)
   }, [activeQueueSessionKey, migrationFromKey, migrationToKey])
 
   // Per-thread draft swap — the composer's only session coupling. Lifecycle

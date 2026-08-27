@@ -115,6 +115,7 @@ function Harness({
   onUpdateState,
   onReady,
   onSeedState,
+  onSessionCreatedForSend,
   openMemoryGraph,
   refreshSessions,
   requestGateway,
@@ -140,6 +141,7 @@ function Harness({
   ) => void
   onReady: (handle: HarnessHandle) => void
   onSeedState?: (state: Record<string, unknown>) => void
+  onSessionCreatedForSend?: (storedSessionId: string) => void
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
@@ -196,6 +198,7 @@ function Harness({
     getRouteToken: getRouteToken ?? (() => 'token'),
     handleSkinCommand: () => '',
     openMemoryGraph: openMemoryGraph ?? (() => undefined),
+    onSessionCreatedForSend,
     refreshSessions,
     requestGateway,
     resumeStoredSession: resumeStoredSession ?? (() => undefined),
@@ -247,6 +250,44 @@ function Harness({
 
   return null
 }
+
+describe('usePromptActions fresh-session composer handoff', () => {
+  it('emits the stored id only after the first send actually creates and binds a session', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const onSessionCreatedForSend = vi.fn()
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = 'runtime-created'
+      selectedStoredSessionIdRef.current = 'stored-created'
+
+      return 'runtime-created'
+    })
+
+    const requestGateway = vi.fn(async () => ({ accepted: true }) as never)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={next => (handle = next)}
+        onSessionCreatedForSend={onSessionCreatedForSend}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+
+    await expect(handle!.submitText('first prompt')).resolves.toBe(true)
+
+    expect(createBackendSessionForSend).toHaveBeenCalledOnce()
+    expect(onSessionCreatedForSend).toHaveBeenCalledOnce()
+    expect(onSessionCreatedForSend).toHaveBeenCalledWith('stored-created')
+  })
+})
 
 describe('usePromptActions /title', () => {
   beforeEach(() => {

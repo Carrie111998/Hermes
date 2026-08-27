@@ -54,6 +54,8 @@ export interface ChatBarProps {
   queueSessionKey?: string | null
   /** Profile-qualified local draft/attachment/queue key. Never sent to the backend. */
   storageScopeKey?: string | null
+  /** One-time raw/pre-codec aliases proven to belong to storageScopeKey. */
+  legacyStorageScopeKeys?: readonly (string | null | undefined)[]
   /** Explicit same-owner New Chat or lineage storage handoff. */
   storageMigration?: ComposerStorageMigration
   sessionId?: string | null

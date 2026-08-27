@@ -19,7 +19,6 @@ import { useQueryClient } from '@tanstack/react-query'
 import { atom, computed } from 'nanostores'
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 
-import { profileScopeKey } from '@/api/client'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
 import { blobToDataUrl } from '@/app/session/hooks/use-prompt-actions/utils'
@@ -37,6 +36,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
@@ -468,14 +468,12 @@ export function sessionTileDraftScope(
 ): string {
   const connection = $connection.get()
 
-  const ownerScopeKey = ownerRoute
-    ? profileScopeKey(ownerRoute)
-    : profileScopeKey({
-        connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
-        profile: $activeGatewayProfile.get()
-      })
+  const owner = ownerRoute ?? {
+    connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
+    profile: $activeGatewayProfile.get()
+  }
 
-  return `${ownerScopeKey}\0${storedSessionId}`
+  return encodeComposerStorageScopeKey(owner, storedSessionId)
 }
 
 /** The `@session` link payload for a tile tab drag — id + owning profile + title.

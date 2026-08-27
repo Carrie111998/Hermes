@@ -21,6 +21,12 @@ import {
   unparkQueuedPrompts,
   updateQueuedPrompt
 } from '@/store/composer-queue'
+import {
+  beginComposerQueueDrain,
+  finishComposerQueueDrain,
+  isComposerQueueDrainExcluded
+} from '@/store/composer-queue-drain'
+import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
 import { notify } from '@/store/notifications'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
@@ -99,7 +105,6 @@ export function useComposerQueue({
   const editingQueuedPrompt = queueEdit ? (queuedPrompts.find(entry => entry.id === queueEdit.entryId) ?? null) : null
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
-  const drainingQueueEntriesRef = useRef(new Map<string, { sessionKey: string }>())
   const drainFailuresRef = useRef(new Map<string, number>())
   const [autoDrainRetryEpoch, setAutoDrainRetryEpoch] = useState(0)
 
@@ -217,15 +222,13 @@ export function useComposerQueue({
         return false
       }
 
-      const alreadyDraining = [...drainingQueueEntriesRef.current].some(
-        ([entryId, drain]) => entryId === entry.id || drain.sessionKey === drainQueueSessionKey
-      )
+      const drain = beginComposerQueueDrain(drainQueueSessionKey, entry.id)
 
-      if (alreadyDraining) {
+      if (!drain) {
         return false
       }
 
-      drainingQueueEntriesRef.current.set(entry.id, { sessionKey: drainQueueSessionKey })
+      let drainFinished = false
 
       try {
         const accepted = await Promise.resolve(
@@ -242,7 +245,9 @@ export function useComposerQueue({
           return false
         }
 
-        const settledQueueSessionKey = drainingQueueEntriesRef.current.get(entry.id)?.sessionKey ?? drainQueueSessionKey
+        const settledQueueSessionKey = finishComposerQueueDrain(drain) ?? drainQueueSessionKey
+
+        drainFinished = true
 
         drainFailuresRef.current.delete(entry.id)
         removeQueuedPrompt(settledQueueSessionKey, entry.id)
@@ -255,7 +260,9 @@ export function useComposerQueue({
 
         return true
       } finally {
-        drainingQueueEntriesRef.current.delete(entry.id)
+        if (!drainFinished) {
+          finishComposerQueueDrain(drain)
+        }
       }
     },
     [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId, submitScopeKey]
@@ -346,19 +353,17 @@ export function useComposerQueue({
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
   // drain lock serializes sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (
-      actionsDisabled ||
-      busy ||
-      queueParked ||
-      !activeQueueSessionKey ||
-      [...drainingQueueEntriesRef.current.values()].some(drain => drain.sessionKey === activeQueueSessionKey)
-    ) {
+    if (actionsDisabled || busy || queueParked || !activeQueueSessionKey) {
       return
     }
 
     const entry = pickDrainHead(queuedPrompts)
 
-    if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+    if (
+      !entry ||
+      isComposerQueueDrainExcluded(activeQueueSessionKey, entry.id) ||
+      (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS
+    ) {
       return
     }
 
@@ -403,19 +408,8 @@ export function useComposerQueue({
     }
 
     if (queueSessionKey === undefined) {
-      migrateQueuedPrompts(prev, activeQueueSessionKey)
-    }
-
-    // A parent-level explicit lineage migration can move the entry before this
-    // hook observes the key change. Hand off only when the exact in-flight id is
-    // now present at the destination and absent at the source; arbitrary A → B
-    // navigation therefore cannot retarget a lock or its eventual removal.
-    const destinationEntryIds = new Set(getQueuedPrompts(activeQueueSessionKey).map(entry => entry.id))
-    const sourceEntryIds = new Set(getQueuedPrompts(prev).map(entry => entry.id))
-
-    for (const [entryId, drain] of drainingQueueEntriesRef.current) {
-      if (drain.sessionKey === prev && destinationEntryIds.has(entryId) && !sourceEntryIds.has(entryId)) {
-        drainingQueueEntriesRef.current.set(entryId, { sessionKey: activeQueueSessionKey })
+      if (!migrateComposerStorageScope(prev, activeQueueSessionKey)) {
+        migrateQueuedPrompts(prev, activeQueueSessionKey)
       }
     }
   }, [activeQueueSessionKey, queueSessionKey])

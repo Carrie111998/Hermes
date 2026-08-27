@@ -2,9 +2,11 @@ import { profileScopeKey } from '@/api/client'
 
 import type { SessionOwnerRoute } from './session-request-router'
 
-const CANONICAL_PREFIX = 'hermes-composer-scope:v1:'
+const CANONICAL_PREFIX = 'hermes-composer-scope:v2:'
 const LEGACY_SEPARATOR = '\0'
 const LEGACY_NEW_CHAT = '__new__'
+const MAX_ALIAS_DEPTH = 64
+const composerStorageScopeAliases = new Map<string, string>()
 
 export type ComposerStorageOwner = Pick<SessionOwnerRoute, 'connectionId' | 'profile'>
 
@@ -18,6 +20,8 @@ export interface ComposerStorageScope {
   owner: NormalizedComposerStorageOwner
   /** Raw durable/lineage-root id. Null is the New Chat identity. */
   storedSessionId: string | null
+  /** Distinguishes successive New Chat drafts for the same owner. */
+  newChatGeneration: number
 }
 
 interface DecodeComposerStorageScopeOptions {
@@ -48,18 +52,25 @@ function validStoredSessionId(storedSessionId: unknown): storedSessionId is stri
  */
 export function encodeComposerStorageScopeKey(
   owner: ComposerStorageOwner,
-  storedSessionId: string | null
+  storedSessionId: string | null,
+  newChatGeneration = 0
 ): string {
   if (!validStoredSessionId(storedSessionId)) {
     throw new Error('Composer storage scope requires a stored session id or null')
   }
 
   const normalizedOwner = normalizeComposerStorageOwner(owner)
+  const normalizedGeneration = storedSessionId === null ? newChatGeneration : 0
+
+  if (!Number.isSafeInteger(normalizedGeneration) || normalizedGeneration < 0) {
+    throw new Error('Composer New Chat generation must be a non-negative integer')
+  }
 
   return `${CANONICAL_PREFIX}${JSON.stringify([
     normalizedOwner.connectionId,
     normalizedOwner.profile,
-    storedSessionId
+    storedSessionId,
+    normalizedGeneration
   ])}`
 }
 
@@ -68,10 +79,7 @@ export function encodeComposerStorageScopeKey(
  * migration worker can find and re-home old entries; never pass its output to a
  * drain/RPC path.
  */
-export function legacyComposerStorageScopeKey(
-  owner: ComposerStorageOwner,
-  storedSessionId: string | null
-): string {
+export function legacyComposerStorageScopeKey(owner: ComposerStorageOwner, storedSessionId: string | null): string {
   if (!validStoredSessionId(storedSessionId)) {
     throw new Error('Composer storage scope requires a stored session id or null')
   }
@@ -92,25 +100,28 @@ function decodeCanonical(key: string): ComposerStorageScope | null {
 
     if (
       !Array.isArray(payload) ||
-      payload.length !== 3 ||
+      payload.length !== 4 ||
       typeof payload[0] !== 'string' ||
       typeof payload[1] !== 'string' ||
-      !validStoredSessionId(payload[2])
+      !validStoredSessionId(payload[2]) ||
+      !Number.isSafeInteger(payload[3]) ||
+      (payload[3] as number) < 0
     ) {
       return null
     }
 
     const owner = normalizeComposerStorageOwner({ connectionId: payload[0], profile: payload[1] })
     const storedSessionId = payload[2]
+    const newChatGeneration = storedSessionId === null ? (payload[3] as number) : 0
 
     // Reject alternate spellings instead of silently normalizing an untrusted
     // key into a backend target. Only encodeComposerStorageScopeKey output is a
     // canonical drainable identity.
-    if (encodeComposerStorageScopeKey(owner, storedSessionId) !== key) {
+    if (encodeComposerStorageScopeKey(owner, storedSessionId, newChatGeneration) !== key) {
       return null
     }
 
-    return { format: 'canonical', owner, storedSessionId }
+    return { format: 'canonical', newChatGeneration, owner, storedSessionId }
   } catch {
     return null
   }
@@ -132,6 +143,7 @@ function decodeLegacy(key: string, ownerInput: ComposerStorageOwner): ComposerSt
 
   return {
     format: 'legacy',
+    newChatGeneration: 0,
     owner,
     storedSessionId: identity === LEGACY_NEW_CHAT ? null : identity
   }
@@ -152,4 +164,37 @@ export function decodeComposerStorageScopeKey(
   }
 
   return decodeLegacy(key, options.legacyOwner)
+}
+
+/** Follow an explicit same-owner storage handoff to its latest key. */
+export function resolveComposerStorageScopeKey(scopeKey: string): string {
+  let current = scopeKey
+  const seen = new Set<string>()
+
+  for (let depth = 0; depth < MAX_ALIAS_DEPTH; depth += 1) {
+    if (seen.has(current)) {
+      return scopeKey
+    }
+
+    seen.add(current)
+    const next = composerStorageScopeAliases.get(current)
+
+    if (!next) {
+      return current
+    }
+
+    current = next
+  }
+
+  return scopeKey
+}
+
+/** @internal — callers must validate exact same-owner canonical scopes first. */
+export function registerComposerStorageScopeAlias(fromScopeKey: string, toScopeKey: string): void {
+  composerStorageScopeAliases.set(fromScopeKey, resolveComposerStorageScopeKey(toScopeKey))
+}
+
+/** @internal */
+export function _resetComposerStorageScopeAliasesForTests(): void {
+  composerStorageScopeAliases.clear()
 }

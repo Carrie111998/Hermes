@@ -2,6 +2,9 @@ import { atom } from 'nanostores'
 
 import { deriveDraftTitle } from '@/lib/draft-title'
 import { triggerHaptic } from '@/lib/haptics'
+import { persistentAtom } from '@/lib/persisted'
+
+import { resolveComposerStorageScopeKey } from './composer-storage-scope'
 
 export interface ComposerAttachment {
   id: string
@@ -31,6 +34,22 @@ export type ComposerAttachmentPatch = Partial<Omit<ComposerAttachment, 'id' | 'o
 export const $composerDraft = atom('')
 export const $composerAttachments = atom<ComposerAttachment[]>([])
 export const $composerTerminalSelections = atom<Record<string, string>>({})
+export const $composerNewChatGeneration = persistentAtom('hermes.desktop.composerNewChatGeneration', 0, {
+  decode: raw => {
+    const value = Number(raw)
+
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0
+  },
+  encode: value => String(value)
+})
+
+export const advanceComposerNewChatGeneration = (): number => {
+  const next = $composerNewChatGeneration.get() + 1
+
+  $composerNewChatGeneration.set(next)
+
+  return next
+}
 
 // Latched because opening a fresh session may remount the main composer before
 // it can start voice. Session-tile composers deliberately never consume this.
@@ -183,7 +202,11 @@ export interface SessionDraft {
   text: string
 }
 
-const draftKey = (scope: string | null | undefined) => scope?.trim() || NEW_SESSION_DRAFT_KEY
+const draftKey = (scope: string | null | undefined) => {
+  const trimmed = scope?.trim()
+
+  return trimmed ? resolveComposerStorageScopeKey(trimmed) : NEW_SESSION_DRAFT_KEY
+}
 
 const cloneDraft = (draft: SessionDraft): SessionDraft => ({
   attachments: draft.attachments.map(attachment => ({ ...attachment })),

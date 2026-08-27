@@ -14,6 +14,7 @@ describe('composer storage scope codec', () => {
 
     expect(decodeComposerStorageScopeKey(key)).toEqual({
       format: 'canonical',
+      newChatGeneration: 0,
       owner: { connectionId: 'source-a', profile: 'omar' },
       storedSessionId: 'stored::shared\0-looking'
     })
@@ -24,6 +25,7 @@ describe('composer storage scope codec', () => {
 
     expect(decodeComposerStorageScopeKey(key)).toEqual({
       format: 'canonical',
+      newChatGeneration: 0,
       owner: { connectionId: 'local', profile: 'default' },
       storedSessionId: null
     })
@@ -42,6 +44,7 @@ describe('composer storage scope codec', () => {
     expect(decodeComposerStorageScopeKey(legacy)).toBeNull()
     expect(decodeComposerStorageScopeKey(legacy, { legacyOwner: remoteOwner })).toEqual({
       format: 'legacy',
+      newChatGeneration: 0,
       owner: { connectionId: 'source-a', profile: 'omar' },
       storedSessionId: 'stored-a'
     })
@@ -58,5 +61,18 @@ describe('composer storage scope codec', () => {
       format: 'legacy',
       storedSessionId: null
     })
+  })
+
+  it('round-trips New Chat generations but ignores them for stored sessions', () => {
+    const owner = { connectionId: 'local', profile: 'default' }
+    const newChat = encodeComposerStorageScopeKey(owner, null, 7)
+
+    expect(decodeComposerStorageScopeKey(newChat)).toMatchObject({
+      newChatGeneration: 7,
+      storedSessionId: null
+    })
+    expect(encodeComposerStorageScopeKey(owner, 'stored-a', 7)).toBe(
+      encodeComposerStorageScopeKey(owner, 'stored-a', 0)
+    )
   })
 })
