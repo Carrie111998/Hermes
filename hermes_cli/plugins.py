@@ -344,7 +344,7 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: board: str | None, profile_name: str, dry_run: bool,
     #   outcome: "ok" | "skipped_locked" | "idle",
     #   result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed,
-    #     promoted, reconciled_orphans, crashed, stale, timed_out,
+    #     promoted, reconciled_orphans, cleaned_terminal, crashed, stale, timed_out,
     #     auto_blocked, rate_limited, auto_assigned_default,
     #     respawn_guarded, skipped_per_profile_capped, skipped_unassigned,
     #     skipped_nonspawnable, skipped_locked).

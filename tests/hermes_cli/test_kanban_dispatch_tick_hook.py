@@ -61,6 +61,15 @@ def test_active_tick_fires_hook_with_outcome_ok(
     result = ok_events[-1]["result"]
     assert any(row[0] == tid for row in result.spawned)
 
+
+def test_cleanup_only_tick_is_reported_as_active(captured_ticks):
+    result = kb.DispatchResult(cleaned_terminal=["t_ended"])
+
+    kb._fire_dispatch_tick_hook(result, board="default")
+
+    assert captured_ticks[-1]["outcome"] == "ok"
+    assert captured_ticks[-1]["result"].cleaned_terminal == ["t_ended"]
+
 def test_tick_hook_fires_after_dispatch_lock_released(kanban_home):
     """The #56066 sweeper finding, as a contract: subscribers run OUTSIDE
     the single-writer critical section. From the callback, acquiring the

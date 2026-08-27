@@ -1456,31 +1456,107 @@ def _wait_for_oneshot_background_completions(cli) -> None:
         )
 
 
+def _kanban_worker_run_is_terminal() -> bool:
+    """Return whether this dispatcher-owned process's exact run has ended."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not raw_run_id:
+        return False
+    try:
+        run_id = int(raw_run_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        with _kb.connect_closing() as conn:
+            row = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+        return bool(row and row["ended_at"] is not None)
+    except Exception:
+        logger.debug("kanban terminal-run probe failed", exc_info=True)
+        return False
+
+
+def _shutdown_terminal_kanban_worker() -> None:
+    """Drain descendants, flush diagnostics, then hard-exit a terminal worker."""
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.kill_all(
+            source="kanban_terminal_handoff",
+            consume_output=True,
+        )
+    except Exception:
+        logger.debug("kanban tracked-process shutdown failed", exc_info=True)
+    try:
+        from agent.deadline import terminate_process_tree
+
+        terminate_process_tree(
+            os.getpid(),
+            grace_seconds=1.5,
+            include_parent=False,
+        )
+    except Exception:
+        logger.debug("kanban descendant shutdown failed", exc_info=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        logging.shutdown()
+    finally:
+        # Python waits for non-daemon threads during normal shutdown. A durable
+        # Kanban handoff must not linger for those threads after its descendants
+        # were explicitly drained.
+        os._exit(0)
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
+    terminal_kanban_handoff = _kanban_worker_run_is_terminal()
     try:
-        # Linger (bounded) for background processes the turn spawned with
-        # notify_on_complete=true BEFORE any teardown. The one-shot parent
-        # owns those children's stdout pipes; exiting now kills the delivery
-        # a few seconds later. Bot Mode handoff replies dispatched from a
-        # short-lived `hermes -p <bot> chat -Q` recipient (message_agent /
-        # bot_relay spawns) are exactly this shape and were silently
-        # destroyed on parent exit (#90879).
         try:
-            _wait_for_oneshot_background_completions(cli)
-        except Exception:
-            logger.debug("one-shot background completion wait failed", exc_info=True)
-        # Durable flush FIRST: memory-provider shutdown inside _run_cleanup
-        # can issue aux-LLM calls, and nothing after it may fail in a way
-        # that loses the turn (#88583).
-        try:
-            _flush_one_shot_session_store(cli)
-        except Exception:
-            logger.debug("one-shot session store flush failed", exc_info=True)
-        _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+            # Normal one-shot queries linger for notify_on_complete background work.
+            # A terminal Kanban run has already committed its durable handoff and
+            # must instead stop its processes immediately; the default linger is
+            # 600 seconds and was the direct source of orphan-looking workers.
+            if terminal_kanban_handoff:
+                try:
+                    from tools.process_registry import process_registry
+
+                    process_registry.kill_all(
+                        source="kanban_terminal_handoff",
+                        consume_output=True,
+                    )
+                except Exception:
+                    logger.debug(
+                        "kanban tracked-process shutdown failed", exc_info=True
+                    )
+            else:
+                try:
+                    _wait_for_oneshot_background_completions(cli)
+                except Exception:
+                    logger.debug(
+                        "one-shot background completion wait failed", exc_info=True
+                    )
+            # Durable flush FIRST: memory-provider shutdown inside _run_cleanup
+            # can issue aux-LLM calls, and nothing after it may fail in a way
+            # that loses the turn (#88583).
+            try:
+                _flush_one_shot_session_store(cli)
+            except Exception:
+                logger.debug("one-shot session store flush failed", exc_info=True)
+            _notify_single_query_session_finalize(cli)
+            _run_cleanup(notify_session_finalize=False)
+        finally:
+            cli._release_active_session()
     finally:
-        cli._release_active_session()
+        # A terminal run has already committed its durable handoff. Even if a
+        # notifier, cleanup hook, or lease release raises, do not fall back to
+        # Python's unbounded non-daemon-thread shutdown path.
+        if terminal_kanban_handoff:
+            _shutdown_terminal_kanban_worker()
 
 
 def _reset_terminal_input_modes_on_exit() -> None:

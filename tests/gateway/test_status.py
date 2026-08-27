@@ -13,6 +13,23 @@ from gateway import status
 
 
 class TestGatewayPidState:
+    def test_proc_start_time_parser_handles_spaces_and_parentheses_in_comm(self):
+        suffix = ["S", *(str(field) for field in range(4, 23))]
+        raw = f"123 (worker name ) with spaces) {' '.join(suffix)}"
+
+        assert status._parse_linux_proc_start_time(raw) == 22
+
+    def test_durable_process_identity_keeps_sub_centisecond_precision(self):
+        first = 1_800_000_000.001
+        second = 1_800_000_000.004
+
+        # The compatibility PID-file representation collides; the durable
+        # worker token must not.
+        assert int(round(first * 100)) == int(round(second * 100))
+        assert status._process_create_time_token(first) != (
+            status._process_create_time_token(second)
+        )
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

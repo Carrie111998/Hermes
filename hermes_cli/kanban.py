@@ -1739,6 +1739,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "error": r.error,
                     "metadata": r.metadata,
                     "worker_pid": r.worker_pid,
+                    "worker_start_time": r.worker_start_time,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
                 }
@@ -2671,6 +2672,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
+            "cleaned_terminal": res.cleaned_terminal,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
             "stale": res.stale,
@@ -2690,6 +2692,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
+    print(f"Cleaned terminal workers: {len(res.cleaned_terminal)}")
+    if res.cleaned_terminal:
+        print(f"  {', '.join(res.cleaned_terminal)}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
@@ -3023,7 +3028,9 @@ def _cmd_runs(args: argparse.Namespace) -> int:
                 "outcome": r.outcome, "started_at": r.started_at,
                 "ended_at": r.ended_at, "summary": r.summary,
                 "error": r.error, "metadata": r.metadata,
-                "worker_pid": r.worker_pid, "step_key": r.step_key,
+                "worker_pid": r.worker_pid,
+                "worker_start_time": r.worker_start_time,
+                "step_key": r.step_key,
             } for r in runs
         ], indent=2, ensure_ascii=False))
         return 0

@@ -87,6 +87,13 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
         assert "delivery_metadata" in lei
+        run_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        assert "worker_start_time" in run_cols
+        # The runtime cleanup query must remain valid after the canonical
+        # drift-rebuild pass (regression: the rebuild spec dropped this column).
+        assert kb.cleanup_terminal_workers(conn) == []
 
         # Data preserved across the rebuild.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2

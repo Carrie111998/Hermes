@@ -29,6 +29,7 @@ from agent.deadline import (
     DeadlineExpired,
     clamp_timeout,
     kill_process_tree,
+    terminate_process_tree,
     resolve_timeout,
     run_bounded_async,
     run_bounded_sync,
@@ -453,6 +454,134 @@ class TestKillProcessTree:
         finally:
             if proc.poll() is None:
                 proc.kill()
+
+
+class TestTerminateProcessTreeIdentity:
+    def test_binds_process_before_final_identity_check(self, monkeypatch):
+        import psutil
+        from gateway import status as gateway_status
+
+        calls = []
+
+        class FakeProcess:
+            pid = 424_242
+
+            def create_time(self):
+                calls.append("bind")
+                return 1_800_000_000.001
+
+            def terminate(self):
+                calls.append("terminate")
+
+        parent = FakeProcess()
+
+        def _open(pid):
+            assert pid == parent.pid
+            calls.append("open")
+            return parent
+
+        def _identity(pid, *, process=None):
+            assert pid == parent.pid
+            assert process is parent
+            calls.append("identity")
+            # Simulate PID reuse between the durable record and handle bind.
+            return 888_456
+
+        monkeypatch.setattr(psutil, "Process", _open)
+        monkeypatch.setattr(gateway_status, "get_process_identity", _identity)
+
+        result = terminate_process_tree(parent.pid, expected_start_time=777_123)
+
+        assert calls == ["open", "bind", "identity"]
+        assert result["identity_mismatch"] is True
+        assert result["termination_attempted"] is False
+
+    def test_windows_kills_only_identity_bound_handles(self, monkeypatch):
+        import psutil
+        from gateway import status as gateway_status
+
+        killed = []
+
+        class FakeProcess:
+            def __init__(self, pid, created, children=()):
+                self.pid = pid
+                self._created = created
+                self._children = list(children)
+                self._alive = True
+
+            def create_time(self):
+                return self._created
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return list(self._children)
+
+            def is_running(self):
+                return self._alive
+
+            def status(self):
+                return "running"
+
+            def kill(self):
+                killed.append(self.pid)
+                self._alive = False
+
+            def wait(self, timeout=0):
+                assert self._alive is False
+                return 0
+
+        child = FakeProcess(424_243, 1_800_000_000.002)
+        parent = FakeProcess(424_242, 1_800_000_000.001, [child])
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(psutil, "Process", lambda pid: parent)
+        monkeypatch.setattr(
+            gateway_status,
+            "get_process_identity",
+            lambda pid, *, process=None: 777_123,
+        )
+        monkeypatch.setattr(
+            "agent.deadline.subprocess.run",
+            lambda *a, **k: pytest.fail("identity-bound cleanup must not use taskkill"),
+        )
+
+        result = terminate_process_tree(
+            parent.pid,
+            expected_start_time=777_123,
+            grace_seconds=0,
+        )
+
+        assert killed == [parent.pid, child.pid]
+        assert result["identity_verified"] is True
+        assert result["sigkill"] is True
+        assert result["terminated"] is True
+        assert result["reaped"] is True
+
+    def test_unavailable_fingerprint_fails_closed_for_live_pid(self, monkeypatch):
+        from gateway import status as gateway_status
+
+        monkeypatch.setattr(gateway_status, "get_process_start_time", lambda _pid: None)
+        monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: True)
+
+        result = terminate_process_tree(424_242, expected_start_time=777_123)
+
+        assert result["identity_unavailable"] is True
+        assert result["termination_attempted"] is False
+        assert result["terminated"] is False
+        assert result["still_alive"] is True
+
+    def test_unavailable_fingerprint_accepts_confirmed_exit(self, monkeypatch):
+        from gateway import status as gateway_status
+
+        monkeypatch.setattr(gateway_status, "get_process_start_time", lambda _pid: None)
+        monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: False)
+
+        result = terminate_process_tree(424_242, expected_start_time=777_123)
+
+        assert result["identity_unavailable"] is False
+        assert result["termination_attempted"] is False
+        assert result["terminated"] is True
+        assert result["reaped"] is True
 
 
 # ---------------------------------------------------------------------------

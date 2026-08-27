@@ -457,6 +457,36 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         assert next_review is not None
 
 
+def test_dashboard_direct_reclaim_holds_legacy_live_worker_claim(
+    client, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy live worker", assignee="builder")
+        claimed = kb.claim_task(conn, task_id, claimer=kb._claimer_id())
+        assert claimed is not None
+        monkeypatch.setattr(kb, "_worker_start_time", lambda _pid: None)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        kb._set_worker_pid(conn, task_id, 424242)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "ready"},
+    )
+    assert response.status_code == 200, response.text
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert task.claim_lock is not None
+        assert task.worker_pid == 424242
+        assert task.worker_start_time is None
+        assert kb.claim_task(conn, task_id) is None
+        run = kb.latest_run(conn, task_id)
+        assert run is not None and run.outcome == "reclaimed"
+        assert run.claim_lock == task.claim_lock
+        assert run.worker_pid == task.worker_pid
+
+
 # ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
@@ -513,6 +543,7 @@ def test_dispatch_dry_run(client):
     body = r.json()
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
+    assert body["cleaned_terminal"] == []
 
 
 # ---------------------------------------------------------------------------

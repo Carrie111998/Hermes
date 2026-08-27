@@ -113,7 +113,14 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
             side.close()
         assert "descendant_invalidated" in kinds
         kills.append((pid, claim_lock))
-        return {"terminated": True}
+        return {
+            "host_local": True,
+            "identity_verified": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "still_alive": False,
+            "reaped": True,
+        }
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
 
@@ -130,6 +137,46 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     assert child.current_run_id is None
     run = kb.latest_run(conn, child_id)
     assert run is not None and run.outcome == "reclaimed"
+
+
+def test_running_descendant_survivor_keeps_claim_and_blocks_duplicate_spawn(
+    conn, monkeypatch,
+):
+    parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    child_id = kb.create_task(
+        conn, title="running child", assignee="builder", parents=[parent_id],
+    )
+    claimed = kb.claim_task(conn, child_id, claimer=kb._claimer_id())
+    assert claimed is not None
+    monkeypatch.setattr(kb, "_worker_start_time", lambda _pid: None)
+    kb._set_worker_pid(conn, child_id, 424242)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: {
+            "host_local": True,
+            "identity_verified": False,
+            "identity_unavailable": True,
+            "termination_attempted": False,
+            "terminated": False,
+            "still_alive": True,
+            "reaped": False,
+        },
+    )
+
+    _reopen_parent_directly(conn, parent_id)
+    kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+
+    child = kb.get_task(conn, child_id)
+    assert child is not None and child.status == "todo"
+    assert child.claim_lock is not None
+    assert child.worker_pid == 424242
+    assert kb.claim_task(conn, child_id) is None
+    run = kb.latest_run(conn, child_id)
+    assert run is not None and run.ended_at is not None
+    assert run.claim_lock == child.claim_lock
+    assert run.worker_pid == child.worker_pid
 
 
 def test_counter_reset_on_invalidated_descendants(conn):

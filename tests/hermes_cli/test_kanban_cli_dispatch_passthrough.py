@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -92,5 +93,36 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     assert captured.get("max_spawn") == 2, (
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_cli_dispatch_reports_terminal_cleanup(
+    isolated_kanban_home, monkeypatch, capsys, json_mode
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kw: kanban_db.DispatchResult(
+            cleaned_terminal=["t_ended"]
+        ),
+    )
+
+    args = argparse.Namespace(
+        dry_run=False,
+        max=None,
+        failure_limit=2,
+        json=json_mode,
+    )
+    assert kb_cli._cmd_dispatch(args) == 0
+    output = capsys.readouterr().out
+    if json_mode:
+        assert json.loads(output)["cleaned_terminal"] == ["t_ended"]
+    else:
+        assert "Cleaned terminal workers: 1" in output
+        assert "t_ended" in output
 
 

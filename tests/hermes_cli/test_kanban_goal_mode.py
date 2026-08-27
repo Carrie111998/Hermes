@@ -81,8 +81,13 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
     kb.init_db()
     with kb.connect() as conn:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        run_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")
+        }
         assert "goal_mode" in cols
         assert "goal_max_turns" in cols
+        assert "worker_start_time" in cols
+        assert "worker_start_time" in run_cols
         task = kb.get_task(conn, "legacy1")
     # Existing row keeps the safe default.
     assert task.goal_mode is False

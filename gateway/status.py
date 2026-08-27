@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -343,6 +344,22 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
     return _get_lock_dir() / f"{scope}-{_scope_hash(identity)}.lock"
 
 
+def _parse_linux_proc_start_time(raw_stat: str) -> Optional[int]:
+    """Parse field 22 from ``/proc/<pid>/stat`` without splitting ``comm``.
+
+    Field 2 is parenthesized and may itself contain spaces or ``)``. The last
+    closing parenthesis terminates it; the remaining tokens begin at field 3.
+    """
+    comm_end = raw_stat.rfind(")")
+    if comm_end < 0:
+        return None
+    trailing_fields = raw_stat[comm_end + 1 :].split()
+    try:
+        return int(trailing_fields[19])  # field 22 relative to field 3
+    except (IndexError, ValueError):
+        return None
+
+
 def _get_process_start_time(pid: int) -> Optional[int]:
     """Return a stable per-process start-time fingerprint, or None.
 
@@ -364,8 +381,12 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
-    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        parsed = _parse_linux_proc_start_time(
+            stat_path.read_text(encoding="utf-8")
+        )
+        if parsed is not None:
+            return parsed
+    except (FileNotFoundError, PermissionError, OSError):
         pass
 
     # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
@@ -381,6 +402,49 @@ def _get_process_start_time(pid: int) -> Optional[int]:
 def get_process_start_time(pid: int) -> Optional[int]:
     """Public wrapper for retrieving a process start time when available."""
     return _get_process_start_time(pid)
+
+
+def _process_create_time_token(create_time: float) -> int:
+    """Encode a psutil creation timestamp without lossy decimal rounding.
+
+    ``psutil.Process.create_time()`` is a float on macOS and Windows.  The
+    historical status helper rounds it to centiseconds for compatibility with
+    existing PID files, but that is too coarse for durable worker identities:
+    two process incarnations can otherwise compare equal during rapid PID
+    reuse.  The IEEE-754 bit pattern is stable across repeated reads and fits
+    in SQLite's signed INTEGER range for positive epoch timestamps.
+    """
+    return int.from_bytes(struct.pack("!d", float(create_time)), "big")
+
+
+def get_process_identity(pid: int, *, process=None) -> Optional[int]:
+    """Return a non-lossy process-birth token for durable ownership records.
+
+    Linux keeps the kernel ``/proc`` start ticks used by
+    :func:`get_process_start_time`; callers pair those boot-relative ticks with
+    a boot/incarnation token.  On macOS and Windows, preserve psutil's complete
+    creation-time value rather than quantizing it to centiseconds.  Supplying
+    an already-open ``process`` lets a caller bind a psutil process handle
+    before the final identity comparison and retain that identity through
+    signaling.
+    """
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        parsed = _parse_linux_proc_start_time(
+            stat_path.read_text(encoding="utf-8")
+        )
+        if parsed is not None:
+            return parsed
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+
+    try:
+        import psutil  # type: ignore
+
+        proc = process if process is not None else psutil.Process(pid)
+        return _process_create_time_token(proc.create_time())
+    except Exception:
+        return None
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:

@@ -84,6 +84,7 @@ __all__ = [
     "run_bounded_async",
     "run_bounded_sync",
     "kill_process_tree",
+    "terminate_process_tree",
 ]
 
 # Upper bound for any timeout handed to platform wait primitives.
@@ -648,6 +649,219 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
         except Exception:
             continue
     return signalled
+
+
+def terminate_process_tree(
+    pid: int,
+    *,
+    expected_start_time: Optional[int] = None,
+    grace_seconds: float = 5.0,
+    include_parent: bool = True,
+) -> dict[str, Any]:
+    """Terminate one identity-bound process tree with bounded escalation.
+
+    This is the lifecycle counterpart to :func:`kill_process_tree`: callers
+    that own a durable PID record pass the process start-time fingerprint
+    captured at spawn.  A recycled PID is treated as the original process
+    already being gone and is never signalled.  The root and descendants are
+    bound to identity-aware ``psutil.Process`` handles before the final
+    fingerprint check. POSIX sends SIGTERM, waits ``grace_seconds``, then
+    SIGKILLs every survivor. Windows hard-kills the same bound handles rather
+    than routing through PID-only ``taskkill``, which could target a recycled
+    PID after verification.
+
+    ``include_parent=False`` is for a process performing its own final cleanup:
+    descendants are drained but the caller stays alive long enough to flush
+    durable state before it exits itself.
+    """
+    result: dict[str, Any] = {
+        "identity_verified": False,
+        "identity_mismatch": False,
+        "identity_unavailable": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "still_alive": False,
+        "sigkill": False,
+        "reaped": False,
+        "target_count": 0,
+    }
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return result
+    if pid <= 0:
+        return result
+
+    try:
+        import psutil
+
+        parent = psutil.Process(pid)
+        # Force psutil to cache the root's creation time now. Its signal,
+        # liveness, and wait methods can then reject a later PID incarnation.
+        parent.create_time()
+    except Exception:
+        try:
+            from gateway.status import _pid_exists
+
+            pid_exists = bool(_pid_exists(pid))
+        except Exception:
+            pid_exists = expected_start_time is not None
+        if pid_exists and expected_start_time is not None:
+            result.update(identity_unavailable=True, still_alive=True)
+        else:
+            result.update(terminated=True, still_alive=False, reaped=True)
+        return result
+
+    if expected_start_time is not None:
+        try:
+            from gateway.status import get_process_identity
+
+            live_start = get_process_identity(pid, process=parent)
+        except Exception:
+            live_start = None
+        if live_start is None:
+            try:
+                alive = bool(parent.is_running())
+            except Exception:
+                alive = False
+            if alive:
+                result.update(identity_unavailable=True, still_alive=True)
+            else:
+                result.update(terminated=True, reaped=True)
+            return result
+        if live_start != int(expected_start_time):
+            result.update(
+                identity_mismatch=True,
+                terminated=True,
+                still_alive=False,
+                reaped=True,
+            )
+            return result
+        result["identity_verified"] = True
+
+    def _alive(proc) -> bool:
+        try:
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except Exception:
+            return False
+
+    try:
+        targets = parent.children(recursive=True)
+    except Exception:
+        targets = []
+    if include_parent:
+        targets.append(parent)
+    # Dedupe while preserving psutil's children-before-parent order.
+    unique = []
+    seen: set[tuple[int, float]] = set()
+    for proc in targets:
+        try:
+            key = (int(proc.pid), float(proc.create_time()))
+        except Exception:
+            continue
+        if key not in seen:
+            seen.add(key)
+            unique.append(proc)
+    targets = unique
+    result["target_count"] = len(targets)
+    if not targets:
+        result.update(terminated=True, still_alive=False, reaped=True)
+        return result
+
+    result["termination_attempted"] = True
+    signal_targets = targets
+    if include_parent:
+        # Stop the writer first so it cannot react to a child shutdown by
+        # launching another helper outside the original descendant snapshot.
+        signal_targets = [parent] + [proc for proc in targets if proc != parent]
+    if sys.platform == "win32":
+        # Windows has no graceful tree signal. Kill each identity-bound handle;
+        # never fall back to taskkill /PID after the final identity check.
+        result["sigkill"] = True
+        for proc in signal_targets:
+            try:
+                if _alive(proc):
+                    proc.kill()
+            except Exception:
+                continue
+        deadline = time.monotonic() + max(float(grace_seconds), 0.0)
+        while time.monotonic() < deadline:
+            if not any(_alive(proc) for proc in targets):
+                break
+            time.sleep(0.05)
+        survivors = [proc for proc in targets if _alive(proc)]
+        for proc in targets:
+            if _alive(proc):
+                continue
+            try:
+                proc.wait(timeout=0)
+            except Exception:
+                pass
+        result.update(
+            terminated=not survivors,
+            still_alive=bool(survivors),
+            reaped=not survivors,
+            survivor_pids=[int(proc.pid) for proc in survivors],
+        )
+        return result
+
+    for proc in signal_targets:
+        try:
+            if _alive(proc):
+                proc.terminate()
+        except Exception:
+            continue
+
+    deadline = time.monotonic() + max(float(grace_seconds), 0.0)
+    while time.monotonic() < deadline:
+        if not any(_alive(proc) for proc in targets):
+            break
+        time.sleep(0.05)
+
+    # A still-live root may have forked between the first snapshot and TERM.
+    # Fold any such descendants into the escalation set before SIGKILL.
+    if include_parent and _alive(parent):
+        try:
+            for proc in parent.children(recursive=True):
+                key = (int(proc.pid), float(proc.create_time()))
+                if key not in seen:
+                    seen.add(key)
+                    targets.append(proc)
+        except Exception:
+            pass
+    result["target_count"] = len(targets)
+    survivors = [proc for proc in targets if _alive(proc)]
+    if survivors:
+        result["sigkill"] = True
+        for proc in survivors:
+            try:
+                proc.kill()
+            except Exception:
+                continue
+        kill_deadline = time.monotonic() + 1.0
+        while time.monotonic() < kill_deadline:
+            if not any(_alive(proc) for proc in survivors):
+                break
+            time.sleep(0.02)
+
+    survivors = [proc for proc in targets if _alive(proc)]
+    # Reap direct children when this process is their parent.  Process.wait()
+    # is identity-aware and returns immediately for zombies/already-gone rows;
+    # failures simply mean init/the real parent owns the reap.
+    for proc in targets:
+        if _alive(proc):
+            continue
+        try:
+            proc.wait(timeout=0)
+        except Exception:
+            pass
+    result.update(
+        terminated=not survivors,
+        still_alive=bool(survivors),
+        reaped=not survivors,
+        survivor_pids=[int(proc.pid) for proc in survivors],
+    )
+    return result
 
 
 class SuspectableBackend:
