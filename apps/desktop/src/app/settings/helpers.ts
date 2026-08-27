@@ -1,7 +1,14 @@
 import { asText, normalize } from '@/lib/text'
 import type { ConfigFieldSchema, HermesConfigRecord, ToolsetInfo } from '@/types/hermes'
 
-import { BUILTIN_PERSONALITIES, ENUM_OPTIONS, PROVIDER_GROUPS, SECTIONS } from './constants'
+import {
+  BUILTIN_PERSONALITIES,
+  ENUM_OPTIONS,
+  getLocalizedProviderGroups,
+  getProviderGroups,
+  PROVIDER_GROUPS,
+  SECTIONS
+} from './constants'
 
 // Canonical implementations live in @/lib/text; re-exported here so the many
 // settings/capabilities call sites keep their import path.
@@ -49,6 +56,31 @@ export const providerMeta = (name: string) =>
   PROVIDER_GROUPS.find(g => g.name === name)
 
 export const providerPriority = (name: string) => providerMeta(name)?.priority ?? 99
+
+export const providerGroupForLocale = (key: string, locale?: string | null) => {
+  const groups = getProviderGroups(locale)
+  let best: (typeof groups)[number] | undefined
+  for (const candidate of groups) {
+    if (!key.startsWith(candidate.prefix)) continue
+    if (!best || candidate.prefix.length > best.prefix.length) best = candidate
+  }
+  return best?.name ?? 'Other'
+}
+
+export const providerMetaForLocale = (name: string, locale?: string | null) => {
+  const groups = getProviderGroups(locale)
+  return groups.find(g => g.name === name && (g.description || g.docsUrl)) ?? groups.find(g => g.name === name)
+}
+
+export const providerPriorityForLocale = (name: string, locale?: string | null) =>
+  providerMetaForLocale(name, locale)?.priority ?? 99
+
+export const providerMetaLocalized = (name: string) => {
+  const groups = getLocalizedProviderGroups()
+  return groups.find(g => g.name === name && (g.description || g.docsUrl)) ?? groups.find(g => g.name === name)
+}
+
+export const providerPriorityLocalized = (name: string) => providerMetaLocalized(name)?.priority ?? 99
 
 const POLLUTING_PATH_PARTS = new Set(['__proto__', 'constructor', 'prototype'])
 

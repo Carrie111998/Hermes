@@ -183,7 +183,7 @@ export function QuickEntryApp() {
             value={state.target}
           >
             <option value={QUICK_TARGET_CURRENT}>Current chat</option>
-            <option value={QUICK_TARGET_NEW}>New session</option>
+            <option value={QUICK_TARGET_NEW}>Новая сессия</option>
             {state.sessions.map(session => (
               <option key={session.id} value={session.id}>
                 {session.title}

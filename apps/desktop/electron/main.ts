@@ -6490,11 +6490,35 @@ function sendWindowStateChanged(nextIsFullscreen?: boolean, target = mainWindow)
   webContents.send('hermes:window-state-changed', state)
 }
 
+function isRussianMenuLocale(): boolean {
+  try {
+    const locale = (app.getLocale && app.getLocale()) || ''
+    if (locale.toLowerCase().startsWith('ru')) return true
+    // Fallback: check display.language in config
+    try {
+      const cfg = (() => {
+        const home = process.env.HERMES_HOME || `${process.env.HOME || ''}/.hermes`
+        const fs = require('fs')
+        const yaml = require('js-yaml')
+        const p = `${home}/config.yaml`
+        if (fs.existsSync(p)) {
+          const t = yaml.load(fs.readFileSync(p, 'utf8'))
+          return t?.display?.language
+        }
+        return null
+      })()
+      if (typeof cfg === 'string' && cfg.toLowerCase().startsWith('ru')) return true
+    } catch {}
+  } catch {}
+  return false
+}
+
 function buildApplicationMenu() {
   const template = []
+  const isRu = isRussianMenuLocale()
 
   const checkForUpdatesItem = {
-    label: 'Check for Updates…',
+    label: isRu ? 'Проверить обновления…' : 'Check for Updates…',
     click: () => sendOpenUpdatesRequested()
   }
 
@@ -6502,7 +6526,7 @@ function buildApplicationMenu() {
     template.push({
       label: APP_NAME,
       submenu: [
-        { label: `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
+        { label: isRu ? `О ${APP_NAME}` : `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
         checkForUpdatesItem,
         { type: 'separator' },
         { role: 'services' },
@@ -6517,16 +6541,16 @@ function buildApplicationMenu() {
   }
 
   template.push({
-    label: 'File',
+    label: isRu ? 'Файл' : 'File',
     submenu: [
       // No accelerator: ⌘⇧N is a rebindable renderer keybind (session.newWindow);
       // a menu accelerator would fight the rebind panel and (on macOS) be
       // swallowed before the renderer sees it. Here purely for discoverability.
-      { click: () => createInstanceWindow(), label: 'New Window' },
+      { click: () => createInstanceWindow(), label: isRu ? 'Новое окно' : 'New Window' },
       // Same no-accelerator rationale: ⌘O is the rebindable renderer keybind
       // (workspace.openFolder). Clicking runs the same open-folder-as-project
       // flow through the renderer.
-      { click: () => sendOpenFolderRequested(), label: 'Open Folder…' },
+      { click: () => sendOpenFolderRequested(), label: isRu ? 'Открыть папку…' : 'Open Folder…' },
       { type: 'separator' },
       IS_MAC
         ? {
@@ -6537,13 +6561,13 @@ function buildApplicationMenu() {
             // renderer's close-active-tab. Clicking the item still closes the tab
             // (or window) via the same request.
             click: () => sendClosePreviewRequested(),
-            label: 'Close'
+            label: isRu ? 'Закрыть' : 'Close'
           }
         : { role: 'quit' }
     ]
   })
   template.push({
-    label: 'Edit',
+    label: isRu ? 'Правка' : 'Edit',
     submenu: [
       { role: 'undo' },
       { role: 'redo' },
@@ -6562,7 +6586,7 @@ function buildApplicationMenu() {
     ]
   })
   template.push({
-    label: 'View',
+    label: isRu ? 'Вид' : 'View',
     submenu: [
       // Not `role: 'reload'`: that hard-reloads the RENDERER (every pane, the
       // whole shell) and a focused in-app browser needs ⌘R to mean "reload
@@ -6572,23 +6596,23 @@ function buildApplicationMenu() {
       // No accelerator: ⌘R is claimed in `installPreviewShortcut`, which works
       // on every platform (this menu exists only on macOS). Declaring it here
       // too would fire the item and the input hook for one keypress.
-      { click: () => sendPreviewNavCommand('reload'), label: 'Reload' },
+      { click: () => sendPreviewNavCommand('reload'), label: isRu ? 'Перезагрузить' : 'Reload' },
       { role: 'forceReload' },
       {
-        label: 'Toggle Developer Tools',
+        label: isRu ? 'Переключить инструменты разработчика' : 'Toggle Developer Tools',
         accelerator: process.platform === 'darwin' ? 'Alt+Cmd+I' : 'Ctrl+Shift+I',
         click: (_menuItem, browserWindow) => toggleDevTools(browserWindow || mainWindow)
       },
       { type: 'separator' },
       {
-        label: 'Actual Size',
+        label: isRu ? 'Фактический размер' : 'Actual Size',
         accelerator: 'CommandOrControl+0',
         click: () => {
           setAndPersistZoomLevel(mainWindow, DEFAULT_ZOOM_LEVEL)
         }
       },
       {
-        label: 'Zoom In',
+        label: isRu ? 'Увеличить' : 'Zoom In',
         accelerator: 'CommandOrControl+Plus',
         click: () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -6597,7 +6621,7 @@ function buildApplicationMenu() {
         }
       },
       {
-        label: 'Zoom Out',
+        label: isRu ? 'Уменьшить' : 'Zoom Out',
         accelerator: 'CommandOrControl+-',
         click: () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -6610,13 +6634,13 @@ function buildApplicationMenu() {
     ]
   })
   template.push({
-    label: 'Window',
+    label: isRu ? 'Окно' : 'Window',
     submenu: IS_MAC
       ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
       : [{ role: 'minimize' }, { role: 'close' }]
   })
   template.push({
-    label: 'Help',
+    label: isRu ? 'Справка' : 'Help',
     role: 'help',
     submenu: [checkForUpdatesItem]
   })

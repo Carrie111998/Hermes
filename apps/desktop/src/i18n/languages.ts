@@ -34,6 +34,12 @@ export const LOCALE_OPTIONS = [
     name: 'العربية',
     englishName: 'Arabic',
     configValue: 'ar'
+  },
+  {
+    id: 'ru',
+    name: 'Русский',
+    englishName: 'Russian',
+    configValue: 'ru'
   }
 ] as const satisfies readonly { configValue: string; englishName: string; id: Locale; name: string }[]
 
@@ -72,6 +78,13 @@ const LOCALE_ALIASES: Record<string, Locale> = {
   'ja-jp': 'ja',
   ja_jp: 'ja',
   ar: 'ar',
+  ru: 'ru',
+  'ru-ru': 'ru',
+  ru_ru: 'ru',
+  'ru-by': 'ru',
+  ru_by: 'ru',
+  russian: 'ru',
+  русский: 'ru',
   'ar-sa': 'ar',
   ar_sa: 'ar',
   'ar-ae': 'ar',
