@@ -6098,10 +6098,7 @@ def _resolve_server_lazy(name: str, config: dict) -> bool:
     return _parse_boolish(config.get("lazy", False), default=False)
 
 
-def _ensure_lazy_server_connected(
-    server_name: str,
-    registry_key: Optional[str] = None,
-) -> bool:
+def _ensure_lazy_server_connected(server_name: str) -> bool:
     """Connect a lazily-registered MCP server on demand (sync, blocks caller).
 
     Composes with the existing connect machinery: respects the per-server
@@ -6111,9 +6108,7 @@ def _ensure_lazy_server_connected(
     session is available afterwards.
     """
     with _lock:
-        rk = registry_key
-        if rk is None:
-            rk, _err = _oauth_call_target(server_name)
+        rk, _err = _oauth_call_target(server_name)
         if rk is None:
             return False
         server = _servers.get(rk)
@@ -6204,7 +6199,7 @@ def _get_connected_server_for_call(
     if is_lazy and (server is None or server.session is None):
         if rk is None:
             return None
-        _ensure_lazy_server_connected(server_name, rk)
+        _ensure_lazy_server_connected(server_name)
         with _lock:
             server = _servers.get(rk)
         return server
