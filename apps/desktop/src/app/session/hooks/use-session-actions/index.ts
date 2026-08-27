@@ -98,10 +98,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
-import {
-  requestForSessionProfile,
-  type SessionOwnerScope
-} from '@/store/session-request-router'
+import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import {
   $sessionTiles,
   closeSessionTile,
@@ -128,6 +125,7 @@ import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, Usag
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
+import { sessionRuntimeStateMatchesOwner } from '../../session-state-cache'
 import { sessionContextDrift } from '../session-context-drift'
 import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
 
@@ -164,7 +162,12 @@ interface SessionActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   creatingSessionRef: MutableRefObject<boolean>
-  ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
+  ensureSessionState: (
+    sessionId: string,
+    storedSessionId?: string | null,
+    ownerProfile?: string,
+    ownerConnectionId?: null | string
+  ) => ClientSessionState
   getRouteToken: () => string
   getRoutedStoredSessionId: () => null | string
   navigate: NavigateFunction
@@ -180,7 +183,9 @@ interface SessionActionsOptions {
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    ownerProfile?: string,
+    ownerConnectionId?: null | string
   ) => ClientSessionState
 }
 
@@ -347,9 +352,11 @@ export function useSessionActions({
 
     const selectedStoredSessionId = selectedStoredSessionIdRef.current
     const routedStoredSessionId = getRoutedStoredSessionId()
+    const installedRuntimeState = sessionStateByRuntimeIdRef.current.get(storedIdRotation.runtimeSessionId)
 
     if (
       activeSessionIdRef.current !== storedIdRotation.runtimeSessionId ||
+      !sessionRuntimeStateMatchesOwner(installedRuntimeState, storedIdRotation) ||
       normalizeProfileKey(selectedProfileRef.current) !== storedIdRotation.profile ||
       selectedStoredSessionId !== storedIdRotation.previousStoredSessionId ||
       (routedStoredSessionId !== null && routedStoredSessionId !== storedIdRotation.previousStoredSessionId)
@@ -393,6 +400,7 @@ export function useSessionActions({
     navigate,
     selectedProfileRef,
     selectedStoredSessionIdRef,
+    sessionStateByRuntimeIdRef,
     storedIdRotation
   ])
 
@@ -609,7 +617,8 @@ export function useSessionActions({
         resetViewSync()
         activeSessionIdRef.current = created.session_id
         selectedStoredSessionIdRef.current = stored
-        ensureSessionState(created.session_id, stored)
+        const runtimeProfile = normalizeProfileKey(typeof params.profile === 'string' ? params.profile : null)
+        ensureSessionState(created.session_id, stored, runtimeProfile, capturedRoute?.connectionId)
 
         if (stored) {
           createdThisRun.add(stored)
@@ -633,13 +642,14 @@ export function useSessionActions({
         setSessionStartedAt(Date.now())
         const yoloArmed = $yoloActive.get()
         const runtimeInfo = applyRuntimeInfo(created.info)
-        const runtimeProfile = normalizeProfileKey(typeof params.profile === 'string' ? params.profile : null)
         selectedProfileRef.current = runtimeProfile
 
         updateSessionState(
           created.session_id,
           state => ({ ...state, profile: runtimeProfile, ...(runtimeInfo ?? {}) }),
-          stored
+          stored,
+          runtimeProfile,
+          capturedRoute?.connectionId
         )
 
         // User may have armed YOLO on the new-chat draft before the runtime
@@ -792,7 +802,9 @@ export function useSessionActions({
         updateSessionState(
           created.session_id,
           state => ({ ...state, profile: runtimeProfile, ...(runtimeInfo ?? {}) }),
-          stored
+          stored,
+          runtimeProfile,
+          capturedRoute?.connectionId
         )
 
         openSessionTile(stored, dir, undefined, undefined, workspaceScope)
@@ -1239,7 +1251,9 @@ export function useSessionActions({
                   adoptedRunningTurn: state.adoptedRunningTurn || running,
                   turnStartedAt: running ? (activatedTurnStartedAt ?? state.turnStartedAt ?? Date.now()) : null
                 }),
-                storedSessionId
+                storedSessionId,
+                resumeOwnerProfile ?? undefined,
+                resolvedConnectionId || undefined
               )
 
               busyRef.current = running
@@ -1356,7 +1370,9 @@ export function useSessionActions({
                       }
                     : {})
                 }),
-                storedSessionId
+                storedSessionId,
+                resumeOwnerProfile ?? undefined,
+                resolvedConnectionId || undefined
               )
 
               syncSessionStateToView(cachedRuntimeId, activatedState)
@@ -1753,7 +1769,9 @@ export function useSessionActions({
                 }
               : {})
           }),
-          storedSessionId
+          storedSessionId,
+          resumeOwnerProfile ?? undefined,
+          resolvedConnectionId || undefined
         )
 
         // updateSessionState stages its view sync through requestAnimationFrame.

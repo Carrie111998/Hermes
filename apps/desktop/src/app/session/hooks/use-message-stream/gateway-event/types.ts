@@ -39,7 +39,8 @@ export interface GatewayEventDeps {
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
     storedSessionId?: string | null,
-    ownerProfile?: string
+    ownerProfile?: string,
+    ownerConnectionId?: null | string
   ) => ClientSessionState
   upsertToolCall: (
     sessionId: string,

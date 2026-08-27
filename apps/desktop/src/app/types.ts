@@ -173,6 +173,9 @@ export interface SidebarNavItem {
 
 export interface ClientSessionState {
   storedSessionId: string | null
+  /** Registry connection that owns this runtime. Null preserves the legacy
+   * untagged-primary path; compare it only when both sides are authoritative. */
+  connectionId: string | null
   /** Profile namespace that owns this runtime. Stored ids are only unique
    *  inside a profile, so a warm runtime is not safe to activate without it. */
   profile: string | null

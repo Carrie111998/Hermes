@@ -23,6 +23,7 @@ export function createClientSessionState(
 ): ClientSessionState {
   return {
     storedSessionId,
+    connectionId: null,
     profile: null,
     messages,
     branch: '',

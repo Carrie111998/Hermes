@@ -1,3 +1,4 @@
+import { sessionRuntimeStateMatchesOwner } from '@/app/session/session-state-cache'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -83,7 +84,7 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
  * (overlap window during a manual switch) refuses the adoption.
  */
 function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, eventProfile: string): boolean {
-  const { deps, explicitSid, isActiveEvent, payload } = ctx
+  const { deps, event, explicitSid, isActiveEvent, payload } = ctx
 
   if (!explicitSid || isActiveEvent || typeof payload?.stored_session_id !== 'string') {
     return false
@@ -98,7 +99,11 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, eventProfile:
   const activeId = $activeSessionId.get()
   const oldState = activeId ? deps.sessionStateByRuntimeIdRef.current.get(activeId) : undefined
 
-  if (normalizeProfileKey(oldState?.profile ?? deps.activeGatewayProfile) !== eventProfile) {
+  if (
+    oldState?.profile
+      ? !sessionRuntimeStateMatchesOwner(oldState, { connectionId: event.connectionId, profile: eventProfile })
+      : normalizeProfileKey(deps.activeGatewayProfile) !== eventProfile
+  ) {
     return false
   }
 
@@ -137,7 +142,13 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // profile happens to mint the foreground runtime id, its session.info must
     // not rewrite that state's owner, rotate its stored id, or trigger any
     // foreground-only side effect/navigation.
-    if (installedState?.profile && normalizeProfileKey(installedState.profile) !== eventProfile) {
+    if (
+      installedState?.profile &&
+      !sessionRuntimeStateMatchesOwner(installedState, {
+        connectionId: event.connectionId,
+        profile: eventProfile
+      })
+    ) {
       return true
     }
 
@@ -251,7 +262,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           cwd: statePatch.cwd ?? state.cwd
         }),
         payload?.stored_session_id || undefined,
-        eventProfile
+        eventProfile,
+        event.connectionId
       )
     }
 
@@ -371,7 +383,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           }
         },
         payload?.stored_session_id || undefined,
-        eventProfile
+        eventProfile,
+        event.connectionId
       )
 
       if (recoveredWithoutPayload) {

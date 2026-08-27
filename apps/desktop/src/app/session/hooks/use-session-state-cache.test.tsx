@@ -60,6 +60,7 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     })
 
     expect($activeSessionStoredIdRotation.get()).toEqual({
+      connectionId: null,
       nextStoredSessionId: 'stored-A-next',
       previousStoredSessionId: 'stored-A',
       profile: 'default',

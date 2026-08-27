@@ -348,6 +348,7 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   if (previous?.storedSessionId && next.storedSessionId && previous.storedSessionId !== next.storedSessionId) {
     if (runtimeId === $activeSessionId.get()) {
       setActiveSessionStoredIdRotation({
+        connectionId: next.connectionId,
         nextStoredSessionId: next.storedSessionId,
         previousStoredSessionId: previous.storedSessionId,
         profile: normalizeProfileKey(next.profile),

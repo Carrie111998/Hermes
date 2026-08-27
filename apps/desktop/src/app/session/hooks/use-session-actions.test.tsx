@@ -239,18 +239,28 @@ describe('connection-qualified session deletion', () => {
 
 function StoredIdRotationHarness({
   activeSessionIdRef,
+  connectionId,
   getRoutedStoredSessionId,
   navigate,
   selectedStoredSessionProfileRef,
   selectedStoredSessionIdRef
 }: {
   activeSessionIdRef: MutableRefObject<string | null>
+  connectionId?: string
   getRoutedStoredSessionId: () => null | string
   navigate: (to: string, options?: { replace?: boolean }) => void
   selectedStoredSessionProfileRef?: MutableRefObject<string | null>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+  const installedState = createClientSessionState(selectedStoredSessionIdRef.current)
+  installedState.connectionId = connectionId ?? null
+  installedState.profile = selectedStoredSessionProfileRef?.current || 'default'
+  const stateMap = new Map<string, ClientSessionState>()
+
+  if (activeSessionIdRef.current) {
+    stateMap.set(activeSessionIdRef.current, installedState)
+  }
 
   useSessionActions({
     activeSessionId: activeSessionIdRef.current,
@@ -267,7 +277,7 @@ function StoredIdRotationHarness({
     selectedStoredSessionId: selectedStoredSessionIdRef.current,
     selectedStoredSessionIdRef,
     selectedStoredSessionProfileRef,
-    sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
+    sessionStateByRuntimeIdRef: ref(stateMap),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
   })
@@ -301,6 +311,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         profile: 'default',
@@ -322,10 +333,7 @@ describe('active stored-session id rotation routing', () => {
     const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'meta' }
     const navigate = vi.fn()
 
-    setSessions([
-      storedSession({ id: sharedId, profile: 'default' }),
-      storedSession({ id: sharedId, profile: 'meta' })
-    ])
+    setSessions([storedSession({ id: sharedId, profile: 'default' }), storedSession({ id: sharedId, profile: 'meta' })])
     setSelectedStoredSessionId(sharedId)
     render(
       <StoredIdRotationHarness
@@ -339,6 +347,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: nextId,
         previousStoredSessionId: sharedId,
         profile: 'meta',
@@ -370,6 +379,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'meta-next',
         previousStoredSessionId: 'stored-shared',
         profile: 'meta',
@@ -380,6 +390,39 @@ describe('active stored-session id rotation routing', () => {
     await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
     expect(selectedStoredSessionIdRef.current).toBe('stored-shared')
     expect($selectedStoredSessionId.get()).toBe('stored-shared')
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stored-id rotation whose connection no longer owns the runtime', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-shared' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-shared' }
+    const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'default' }
+    const navigate = vi.fn()
+
+    setSelectedStoredSessionId('stored-shared')
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        connectionId="gateway-a"
+        getRoutedStoredSessionId={() => 'stored-shared'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        selectedStoredSessionProfileRef={selectedStoredSessionProfileRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        connectionId: 'gateway-b',
+        nextStoredSessionId: 'foreign-next',
+        previousStoredSessionId: 'stored-shared',
+        profile: 'default',
+        runtimeSessionId: 'runtime-shared'
+      })
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect(selectedStoredSessionIdRef.current).toBe('stored-shared')
     expect(navigate).not.toHaveBeenCalled()
   })
 
@@ -407,6 +450,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
         profile: 'default',
@@ -450,6 +494,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
         profile: 'default',
@@ -485,6 +530,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         profile: 'default',
@@ -515,6 +561,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         profile: 'default',
@@ -545,6 +592,7 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
         profile: 'default',
@@ -1450,6 +1498,7 @@ describe('resumeSession failure recovery', () => {
             awaitingResponse: false,
             branch: '',
             busy: false,
+            connectionId: null,
             cwd: '',
             fast: false,
             interimBoundaryPending: false,

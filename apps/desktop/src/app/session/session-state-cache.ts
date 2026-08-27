@@ -1,11 +1,37 @@
+import { registryBackendScopeKey } from '@hermes/shared'
+
 import type { ClientSessionState } from '../types'
 
 export const DEFAULT_WARM_SESSION_TRANSCRIPT_COUNT = 24
 export const DEFAULT_WARM_SESSION_TRANSCRIPT_BYTES = 32 * 1024 * 1024
 
 export interface SessionStateOwner {
+  connectionId?: null | string
   profile: string
   storedSessionId: string
+}
+
+export type RuntimeSessionStateOwner = Pick<SessionStateOwner, 'connectionId' | 'profile'>
+
+/** Runtime ids are source-local. Preserve legacy untagged-primary behavior,
+ * but compare the composite registry scope whenever both sides name a source. */
+export function sessionRuntimeStateMatchesOwner(
+  state: ClientSessionState | undefined,
+  owner: RuntimeSessionStateOwner
+): state is ClientSessionState {
+  if (!state?.profile || state.profile !== owner.profile) {
+    return false
+  }
+
+  const stateConnectionId = state.connectionId?.trim() || null
+  const ownerConnectionId = owner.connectionId?.trim() || null
+
+  return (
+    !stateConnectionId ||
+    !ownerConnectionId ||
+    registryBackendScopeKey(stateConnectionId, state.profile) ===
+      registryBackendScopeKey(ownerConnectionId, owner.profile)
+  )
 }
 
 /** Fail closed: unknown profile provenance never aliases the default owner. */
@@ -13,7 +39,7 @@ export function sessionStateMatchesOwner(
   state: ClientSessionState | undefined,
   owner: SessionStateOwner
 ): state is ClientSessionState {
-  return state?.profile === owner.profile && state.storedSessionId === owner.storedSessionId
+  return sessionRuntimeStateMatchesOwner(state, owner) && state.storedSessionId === owner.storedSessionId
 }
 
 interface SessionStateCacheLimits {
