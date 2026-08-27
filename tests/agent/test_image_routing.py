@@ -79,6 +79,27 @@ class TestDecideImageInputMode:
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
             assert decide_image_input_mode("anthropic", "claude-sonnet-4", None) == "native"
 
+    def test_opencode_vision_exp_model_attaches_native_without_catalog(self):
+        """#96066: deepseek-v4-flash-vision-exp on opencode-go must route
+        user-attached images as native pixels (``auto`` mode) even when the
+        models.dev registry has no entry for the exp model — the OpenCode
+        ``*-vision*`` fallback in models_dev fills the gap."""
+        with patch("agent.models_dev.fetch_models_dev", return_value={}):
+            assert (
+                decide_image_input_mode(
+                    "opencode-go", "deepseek-v4-flash-vision-exp", {}
+                )
+                == "native"
+            )
+
+    def test_opencode_text_model_stays_text_without_catalog(self):
+        """No vision marker → no fallback → unknown model routes to text."""
+        with patch("agent.models_dev.fetch_models_dev", return_value={}):
+            assert (
+                decide_image_input_mode("opencode-go", "deepseek-v4-flash", {})
+                == "text"
+            )
+
 
 
 

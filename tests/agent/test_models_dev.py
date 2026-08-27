@@ -1305,3 +1305,63 @@ class TestModelOverrides:
         assert info is not None
         assert "image" in info.input_modalities
         assert info.attachment is True
+
+
+# ---------------------------------------------------------------------------
+# OpenCode-family vision fallback (no models.dev entry) — #96066
+# ---------------------------------------------------------------------------
+
+
+class TestOpencodeVisionFallback:
+    """OpenCode ``*-vision*`` models stay vision-capable without catalog data.
+
+    ``deepseek-v4-flash-vision-exp`` on opencode-go is a VL model, but exp
+    previews routinely reach the OpenCode relay before models.dev picks them
+    up. With an empty/stale registry the catalog lookup misses and
+    ``image_input_mode: auto`` would route images through the text
+    vision_analyze path instead of native pixels (#96066). A ``-vision``
+    slug token is an unambiguous marker for this family, so fill the gap.
+    """
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_opencode_go_vision_exp_model_is_vision_capable(self, _mock):
+        caps = get_model_capabilities("opencode-go", "deepseek-v4-flash-vision-exp")
+        assert caps is not None
+        assert caps.supports_vision is True
+        assert caps.supports_tools is True
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_opencode_zen_family_gets_the_same_fallback(self, _mock):
+        caps = get_model_capabilities("opencode-zen", "deepseek-v4-flash-vision-exp")
+        assert caps is not None
+        assert caps.supports_vision is True
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_opencode_model_without_vision_marker_stays_unknown(self, _mock):
+        caps = get_model_capabilities("opencode-go", "deepseek-v4-flash")
+        assert caps is None
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_vision_marker_ignored_for_non_opencode_providers(self, _mock):
+        caps = get_model_capabilities("deepseek", "deepseek-v4-flash-vision-exp")
+        assert caps is None
+
+    def test_catalog_entry_still_authoritative_when_present(self):
+        """The fallback is fill-gap only — a catalog entry (even one that
+        declares no vision) must win over the name heuristic."""
+        registry = {
+            "opencode-go": {
+                "id": "opencode-go",
+                "models": {
+                    "deepseek-v4-flash-vision-exp": {
+                        "id": "deepseek-v4-flash-vision-exp",
+                        "limit": {"context": 1000000, "output": 16384},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("opencode-go", "deepseek-v4-flash-vision-exp")
+        assert caps is not None
+        assert caps.supports_vision is False
+        assert caps.context_window == 1000000

@@ -1198,7 +1198,7 @@ def get_model_capabilities(
 
     # If no catalog entry and no override, we can't resolve capabilities.
     if entry is None and override is None:
-        return None
+        return _opencode_vision_fallback(provider, model)
 
     # Start from catalog entry (if found), else use defaults.
     if entry is not None:
@@ -1263,6 +1263,41 @@ def get_model_capabilities(
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,
+    )
+
+
+def _opencode_vision_fallback(provider: str, model: str) -> Optional[ModelCapabilities]:
+    """Vision-capable stub for OpenCode-family models absent from models.dev.
+
+    OpenCode Zen/Go resell vendor models, and experimental previews (e.g.
+    ``deepseek-v4-flash-vision-exp``, issue #96066) routinely reach the
+    relay before models.dev picks them up. With an empty or stale registry
+    those models resolve to ``None`` here, so ``image_input_mode: auto``
+    treats them as text-only and routes user-attached images through the
+    lossy ``vision_analyze`` describe path instead of native pixels. A
+    ``-vision`` slug token is an unambiguous vision marker for this family,
+    so fill the catalog gap deterministically rather than depending on
+    registry freshness.
+
+    Only fires on a complete catalog miss (no entry, no override), matching
+    the ``model_overrides._default`` fill-gap semantics. Returns None for
+    non-OpenCode providers and for models without the marker, so unknown
+    models keep their current "unknown" behavior elsewhere.
+    """
+    from hermes_cli.models import opencode_provider_family
+
+    if opencode_provider_family(provider) is None:
+        return None
+    bare = str(model or "").strip().rsplit("/", 1)[-1]
+    if "-vision" not in bare.lower():
+        return None
+    return ModelCapabilities(
+        supports_tools=True,
+        supports_vision=True,
+        supports_reasoning=False,
+        context_window=200000,
+        max_output_tokens=8192,
+        model_family="opencode",
     )
 
 

@@ -7866,6 +7866,40 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _opencode_family_for_runtime(provider: str, base_url: str) -> Optional[str]:
+    """Resolve an OpenCode family for a runtime pair, or None.
+
+    Composes ``hermes_cli.models.opencode_provider_family`` (provider-name
+    membership) with the opencode.ai hostname check, so custom providers
+    whose name does not extend the family slug (e.g. ``my-oc-proxy`` pointed
+    at ``https://opencode.ai/zen/go/v1``) still get family treatment — the
+    same dual detection ``hermes_cli.runtime_provider`` uses for custom
+    family providers (#85589). Family membership decides whether persisted
+    session ``api_mode``/``base_url`` overrides may be honored in
+    ``_make_agent`` (#96066).
+    """
+    from hermes_cli.models import opencode_provider_family
+
+    family = opencode_provider_family(provider)
+    if family is not None:
+        return family
+    if _host_is_opencode_ai(base_url):
+        lower = str(base_url or "").lower()
+        return "opencode-go" if "/zen/go" in lower else "opencode-zen"
+    return None
+
+
+def _host_is_opencode_ai(url: str) -> bool:
+    """True when *url* is hosted on opencode.ai (exact host or subdomain)."""
+    try:
+        from utils import base_url_hostname
+
+        host = (base_url_hostname(url) or "").lower()
+    except Exception:
+        return False
+    return host == "opencode.ai" or host.endswith(".opencode.ai")
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -7983,12 +8017,47 @@ def _make_agent(
             # The switch already resolved concrete credentials/endpoint; honor
             # persisted overrides only while using that original runtime. They
             # must not leak into a different fallback provider/model pair.
+            # Snapshot the freshly-resolved endpoint BEFORE overrides so the
+            # OpenCode family guard below can recover it when a persisted
+            # base_url is stale (#96066).
+            _fresh_base_url = runtime.get("base_url")
             if override_base_url:
                 runtime["base_url"] = override_base_url
             if override_api_key:
                 runtime["api_key"] = override_api_key
             if override_api_mode:
                 runtime["api_mode"] = override_api_mode
+            # OpenCode Zen/Go serve different models behind different API
+            # surfaces, and api_mode is ALWAYS re-derived from the target
+            # model on the primary runtime paths (#16878, #85589). A stale
+            # persisted api_mode/base_url from an earlier anthropic-wire
+            # model (e.g. minimax on Go) must not override the model-derived
+            # route here — with an empty or default base_url the Anthropic
+            # SDK then targets api.anthropic.com with the opencode-go key,
+            # surfacing as "HTTP 401: Invalid Anthropic API Key" (#96066).
+            # Re-derive the family route and keep a persisted base_url only
+            # when it is actually an opencode.ai endpoint.
+            _oc_family = _opencode_family_for_runtime(
+                str(requested_provider or ""),
+                str(_fresh_base_url or ""),
+            )
+            if _oc_family is not None:
+                from hermes_cli.models import (
+                    normalize_opencode_base_url,
+                    opencode_model_api_mode,
+                )
+
+                runtime["api_mode"] = opencode_model_api_mode(_oc_family, model)
+                _oc_base = (
+                    override_base_url
+                    if _host_is_opencode_ai(override_base_url)
+                    else _fresh_base_url
+                )
+                runtime["base_url"] = normalize_opencode_base_url(
+                    _oc_family,
+                    runtime["api_mode"],
+                    str(_oc_base or ""),
+                )
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
