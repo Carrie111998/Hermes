@@ -190,6 +190,26 @@ class TestSessionResetPolicy:
         assert restored.idle_minutes == 1440
         assert restored.bg_process_max_age_hours == 24
 
+    def test_day_of_week_roundtrip(self):
+        policy = SessionResetPolicy(mode="daily", at_hour=4, day_of_week="sunday")
+        d = policy.to_dict()
+        restored = SessionResetPolicy.from_dict(d)
+        assert restored.day_of_week == "sunday"
+
+    def test_day_of_week_default_none(self):
+        policy = SessionResetPolicy()
+        assert policy.day_of_week is None
+        d = policy.to_dict()
+        assert "day_of_week" not in d
+
+    def test_day_of_week_ignores_invalid(self):
+        restored = SessionResetPolicy.from_dict({"day_of_week": "funday"})
+        assert restored.day_of_week is None
+
+    def test_day_of_week_null_becomes_none(self):
+        restored = SessionResetPolicy.from_dict({"day_of_week": None})
+        assert restored.day_of_week is None
+
 
 class TestStreamingConfig:
 

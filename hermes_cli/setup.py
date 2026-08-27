@@ -1928,9 +1928,24 @@ def setup_agent_settings(config: dict):
                 config["session_reset"]["at_hour"] = hour_val
         except ValueError:
             pass
-        print_success(
-            f"Sessions reset after {config['session_reset'].get('idle_minutes', 1440)} min idle or daily at {config['session_reset'].get('at_hour', 4)}:00"
-        )
+        current_dow = current_policy.get("day_of_week", "")
+        dow_str = prompt("  Day of week (or blank for every day)", str(current_dow))
+        if dow_str.strip():
+            dow_lower = dow_str.strip().lower()
+            if dow_lower in {"monday","tuesday","wednesday","thursday","friday","saturday","sunday"}:
+                config["session_reset"]["day_of_week"] = dow_lower
+            else:
+                print_warning(f"Unknown day '{dow_str}', ignoring.")
+        else:
+            config["session_reset"].pop("day_of_week", None)
+        if config["session_reset"].get("day_of_week"):
+            print_success(
+                f"Sessions reset after {config['session_reset'].get('idle_minutes', 1440)} min idle or weekly on {config['session_reset']['day_of_week']} at {config['session_reset'].get('at_hour', 4)}:00"
+            )
+        else:
+            print_success(
+                f"Sessions reset after {config['session_reset'].get('idle_minutes', 1440)} min idle or daily at {config['session_reset'].get('at_hour', 4)}:00"
+            )
     elif reset_idx == 1:  # Idle only
         config["session_reset"]["mode"] = "idle"
         idle_str = prompt("  Inactivity timeout (minutes)", str(current_idle))
@@ -1952,9 +1967,24 @@ def setup_agent_settings(config: dict):
                 config["session_reset"]["at_hour"] = hour_val
         except ValueError:
             pass
-        print_success(
-            f"Sessions reset daily at {config['session_reset'].get('at_hour', 4)}:00"
-        )
+        current_dow = current_policy.get("day_of_week", "")
+        dow_str = prompt("  Day of week (or blank for every day)", str(current_dow))
+        if dow_str.strip():
+            dow_lower = dow_str.strip().lower()
+            if dow_lower in {"monday","tuesday","wednesday","thursday","friday","saturday","sunday"}:
+                config["session_reset"]["day_of_week"] = dow_lower
+            else:
+                print_warning(f"Unknown day '{dow_str}', ignoring.")
+        else:
+            config["session_reset"].pop("day_of_week", None)
+        if config["session_reset"].get("day_of_week"):
+            print_success(
+                f"Sessions reset weekly on {config['session_reset']['day_of_week']} at {config['session_reset'].get('at_hour', 4)}:00"
+            )
+        else:
+            print_success(
+                f"Sessions reset daily at {config['session_reset'].get('at_hour', 4)}:00"
+            )
     elif reset_idx == 3:  # None
         config["session_reset"]["mode"] = "none"
         print_info(
