@@ -2,9 +2,7 @@ name: PR 91079 upstream commit-object authority probe
 
 on:
   pull_request:
-    types: [synchronize]
-    paths:
-      - '.github/workflows/pr91079-materialize-patch.yml'
+    types: [synchronize, edited]
 
 permissions:
   contents: write
