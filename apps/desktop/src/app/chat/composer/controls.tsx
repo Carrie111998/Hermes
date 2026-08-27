@@ -83,7 +83,11 @@ export function ComposerControls({
   // same reason — same controls, same state, different budget. Below that
   // even the menu goes: at `minimal` the row is the send button and nothing
   // else, which is the one thing that must survive every width.
-  const foldedVoice = hudMode || foldVoice
+  // The Android shell is touch-first even when its unfolded CSS width would
+  // otherwise fit desktop controls. Keep one Voice door plus Send instead of a
+  // stack of mic/speaker/wake controls competing with the composer.
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
+  const foldedVoice = hudMode || foldVoice || mobileRenderer
 
   const voiceControls = foldedVoice ? (
     <VoiceMenu
@@ -147,6 +151,8 @@ export function ComposerControls({
           label={
             showStop ? (
               <TipKeybindLabel actionId="composer.send" text={c.stop} />
+            ) : mobileRenderer ? (
+              c.send
             ) : (
               <TipKeybindLabel actionId="composer.send" text={c.send} />
             )
@@ -155,6 +161,7 @@ export function ComposerControls({
           <Button
             aria-label={showStop ? c.stop : c.send}
             className={PRIMARY_ICON_BTN}
+            data-composer-send=""
             disabled={disabled || !canSubmit}
             type="submit"
           >

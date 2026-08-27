@@ -89,6 +89,7 @@ export function OverlayView({
       // leak into the hidden composer (and the overlay's own bare-key shortcuts,
       // e.g. star map's Space, keep working).
       data-overlay-surface=""
+      data-overlay-view=""
       onClick={event => {
         if (event.target === event.currentTarget) {
           closeOverlay()
@@ -144,7 +145,7 @@ export function OverlayView({
         {/* Sibling of the card, not a child: the card clips its own overflow
             (rounded corners), and the badge deliberately straddles the top
             border — half above, half below. */}
-        {edgeBadge && <div className="absolute left-1/2 top-0 z-20 -translate-x-1/2 -translate-y-1/2">{edgeBadge}</div>}
+        {edgeBadge && <div className="absolute left-1/2 top-0 z-20 -translate-x-1/2 -translate-y-1/2" data-overlay-edge-badge="">{edgeBadge}</div>}
       </div>
     </div>
   )

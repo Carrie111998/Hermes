@@ -23,6 +23,7 @@ import {
   generatedImageEchoSources,
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
+import { notificationOutcomeSummary } from '@/lib/notification-outcome'
 import { parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notifyError } from '@/store/notifications'
@@ -773,7 +774,7 @@ export function useMessageStream({
       }
 
       dispatchNativeNotification({
-        body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
+        body: notificationOutcomeSummary(text) || translateNow('notifications.native.turnDoneBody'),
         kind: 'turnDone',
         sessionId,
         title: translateNow('notifications.native.turnDoneTitle')

@@ -272,6 +272,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
           titlebarToolClusterClass,
           'left-(--titlebar-controls-left) top-(--titlebar-controls-top) translate-y-(--titlebar-controls-y-nudge)'
         )}
+        data-titlebar-cluster
       >
         {leftToolbarTools
           .filter(tool => !tool.hidden)
@@ -295,6 +296,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
             titlebarToolClusterClass,
             'top-[calc(var(--titlebar-controls-top)+var(--right-rail-top-inset,0px))] right-[calc(var(--titlebar-tools-right)+var(--shell-preview-toolbar-gap,0))]'
           )}
+          data-titlebar-cluster
         >
           {visiblePaneTools.map(tool => (
             <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
@@ -305,6 +307,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       <div
         aria-label={t.shell.appControls}
         className={cn(titlebarToolClusterClass, 'right-(--titlebar-tools-right) top-(--titlebar-controls-top)')}
+        data-titlebar-cluster
       >
         {visibleSystemTools.map(tool => (
           <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
@@ -333,6 +336,7 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
         <Button asChild className={className} size="icon-titlebar" variant="ghost">
           <a
             aria-label={tool.label}
+            data-titlebar-tool={tool.id}
             href={tool.href}
             onPointerDown={event => event.stopPropagation()}
             rel="noreferrer"
@@ -351,6 +355,7 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
         aria-label={tool.label}
         aria-pressed={tool.active ?? undefined}
         className={className}
+        data-titlebar-tool={tool.id}
         disabled={tool.disabled}
         onClick={event => {
           if (tool.to) {

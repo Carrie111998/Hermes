@@ -122,6 +122,9 @@ export function useComposerDraft({
   queueEditStateRef.current = queueEditRef.current
 
   const [focusRequestId, setFocusRequestId] = useState(0)
+  // Touch users choose the composer explicitly. Auto-focus is desirable on
+  // Desktop, but it opens Android's IME behind boot/onboarding overlays.
+  const allowAutomaticFocus = typeof document === 'undefined' || !document.documentElement.hasAttribute('data-hermes-mobile')
 
   const focusInput = useCallback(() => {
     focusComposerInput(editorRef.current)
@@ -182,10 +185,10 @@ export function useComposerDraft({
   )
 
   useEffect(() => {
-    if (!inputDisabled) {
+    if (allowAutomaticFocus && !inputDisabled) {
       focusInput()
     }
-  }, [focusInput, focusKey, focusRequestId, inputDisabled])
+  }, [allowAutomaticFocus, focusInput, focusKey, focusRequestId, inputDisabled])
 
   // The mirror of the `markActiveComposer` above: give the key back when this
   // composer goes away (a session tile closing, a pane unmounting). Covers both

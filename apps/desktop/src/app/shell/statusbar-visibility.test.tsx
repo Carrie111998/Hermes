@@ -18,6 +18,7 @@ beforeAll(() => {
 
 afterEach(() => {
   cleanup()
+  document.documentElement.removeAttribute('data-hermes-mobile')
   $statusbarHiddenIds.set([...STATUSBAR_HIDDEN_BY_DEFAULT])
   $statusbarVisible.set(true)
 })
@@ -114,6 +115,27 @@ describe('statusbar item visibility', () => {
 
     expect($statusbarHiddenIds.get()).not.toContain('session-timer')
     expect(within(statusbar).getByText('Session timer')).toBeTruthy()
+  })
+})
+
+describe('mobile statusbar navigation', () => {
+  it('keeps every visible action reachable through an explicit More control instead of a clipped strip', async () => {
+    document.documentElement.setAttribute('data-hermes-mobile', '')
+    $statusbarHiddenIds.set([])
+
+    const statusbar = bar([
+      item('gateway-health', 'Gateway'),
+      item('agents', 'Agents'),
+      item('cron', 'Cron'),
+      item('webhooks', 'Webhooks')
+    ])
+
+    expect(within(statusbar).queryByText('Cron')).toBeNull()
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More status and actions' }), { button: 0, pointerType: 'mouse' })
+
+    expect(await screen.findByText('Cron')).toBeTruthy()
+    expect(screen.getByText('Webhooks')).toBeTruthy()
+    expect(screen.getByText('Agents')).toBeTruthy()
   })
 })
 

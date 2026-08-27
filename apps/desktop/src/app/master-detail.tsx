@@ -75,10 +75,19 @@ export function MasterDetail({
   resizeId?: string
   split?: 'rail' | 'wide'
 }) {
+  const { t } = useI18n()
   const gridRef = useRef<HTMLDivElement>(null)
   // Unconditional hook (rules of hooks) — the '' atom is inert when no id.
   const override = useStore($paneWidthOverride(resizeId ?? ''))
   const [dragging, setDragging] = useState(false)
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
+  const [mobileView, setMobileView] = useState<'browse' | 'detail'>('browse')
+
+  useEffect(() => {
+    if (!mobileRenderer) {
+      setMobileView('browse')
+    }
+  }, [mobileRenderer])
 
   const startSplitDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const grid = gridRef.current
@@ -112,6 +121,45 @@ export function MasterDetail({
   // With a sash the detail side gets a relative wrapper so the seam handle can
   // sit on the boundary itself (junction-owned, like the shell's sashes).
   const [list, ...rest] = Children.toArray(children)
+
+  // A desktop side-by-side master-detail surface must not turn into two tiny
+  // stacked panes on a phone. The mobile renderer starts in the browse list;
+  // selecting a marked row opens the inspector, whose Back control returns to
+  // that list. Both sections remain mounted so selection and edited form state
+  // survive navigation.
+  if (mobileRenderer) {
+    return (
+      <div
+        className="flex h-full min-h-0 flex-col"
+        data-mobile-master-detail=""
+        data-mobile-master-detail-view={mobileView}
+        data-testid="mobile-master-detail"
+      >
+        <div
+          className="min-h-0 flex-1"
+          data-master-detail-list=""
+          hidden={mobileView !== 'browse'}
+          onClickCapture={event => {
+            if ((event.target as Element).closest('[data-master-detail-select]')) {
+              setMobileView('detail')
+            }
+          }}
+        >
+          {list}
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col" data-master-detail-detail="" hidden={mobileView !== 'detail'}>
+          <div className="flex h-11 shrink-0 items-center border-b border-(--ui-stroke-secondary) px-2">
+            <Button className="min-h-11 gap-1.5" onClick={() => setMobileView('browse')} size="sm" variant="ghost">
+              <Codicon name="chevron-left" size="1rem" />
+              {t.common.back}
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1">{rest}</div>
+          {pane}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -153,7 +201,7 @@ export function MasterDetail({
 
 export function ListColumn({ children, header }: { children: ReactNode; header?: ReactNode }) {
   return (
-    <aside className="flex min-h-0 flex-col p-2">
+    <aside className="flex h-full min-h-0 flex-col p-2">
       {header}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]">{children}</div>
     </aside>
@@ -173,7 +221,7 @@ export function DetailColumn({
   footer?: ReactNode
 }) {
   return (
-    <main className="flex min-h-0 flex-col overflow-hidden">
+    <main className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]">
         <div className="mx-auto max-w-2xl space-y-5 px-5 py-4">{children}</div>
       </div>
@@ -461,6 +509,7 @@ export function CapRow({
     >
       <RowButton
         className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md pl-2 pr-1.5 text-left"
+        data-master-detail-select=""
         onClick={onSelect}
       >
         <span className="min-w-0 flex-1">

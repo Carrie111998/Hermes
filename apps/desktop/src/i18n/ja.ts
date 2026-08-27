@@ -2108,6 +2108,7 @@ export const ja = defineLocale({
     folder: 'フォルダー…',
     images: '画像…',
     pasteImage: '画像を貼り付け',
+    capturePhoto: '写真を撮る',
     url: 'URL…',
     promptSnippets: 'プロンプトスニペット…',
     tipPre: 'ヒント: ',

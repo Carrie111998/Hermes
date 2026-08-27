@@ -15,6 +15,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Tip, TipKeybindLabel, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { ContribRender } from '@/contrib/react/boundary'
 import { useI18n } from '@/i18n'
+import { MoreHorizontal } from '@/lib/icons'
 import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
 import { cn } from '@/lib/utils'
 import {
@@ -29,6 +30,11 @@ import {
 // trigger). The 'text' variant intentionally omits hover/transition/disabled.
 const STATUSBAR_ACTION_CLASS =
   'inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-default disabled:opacity-45'
+
+// Phone status bars keep the command center and connection health glanceable;
+// every other action lives behind an explicit More control instead of a hidden
+// horizontal strip that users must discover by accident.
+const MOBILE_STATUSBAR_PRIMARY_IDS = new Set(['command-center', 'gateway-switcher', 'gateway-health'])
 
 export interface StatusbarMenuItem {
   id: string
@@ -92,9 +98,23 @@ interface StatusbarControlsProps extends ComponentProps<'footer'> {
 export function StatusbarControls({ className, leftItems = [], items = [], ...props }: StatusbarControlsProps) {
   const navigate = useNavigate()
   const hiddenIds = useStore($statusbarHiddenIds)
+  const { t } = useI18n()
 
   const visible = (item: StatusbarItem) =>
     !item.hidden && (item.lockedVisible || !item.toggleLabel || !hiddenIds.includes(item.id))
+
+  const visibleLeftItems = leftItems.filter(visible)
+  const visibleRightItems = items.filter(visible)
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
+  const mobileItems = [...visibleLeftItems, ...visibleRightItems]
+
+  const mobilePrimaryItems = mobileRenderer
+    ? mobileItems.filter(item => MOBILE_STATUSBAR_PRIMARY_IDS.has(item.id))
+    : visibleLeftItems
+
+  const mobileOverflowItems = mobileRenderer
+    ? mobileItems.filter(item => !MOBILE_STATUSBAR_PRIMARY_IDS.has(item.id))
+    : []
 
   return (
     <ContextMenu>
@@ -104,27 +124,77 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
             'flex h-5 shrink-0 items-stretch justify-between gap-2 bg-(--ui-sidebar-surface-background) px-1 py-0 text-(--ui-text-tertiary) [-webkit-app-region:no-drag]',
             className
           )}
+          data-mobile-statusbar={mobileRenderer ? '' : undefined}
           data-slot="statusbar"
+          data-statusbar=""
           {...props}
         >
-          {/* `overflow-x-clip` (not `overflow-x-auto`) so a wide status item — for
-              example "Connecting…" on a fresh/untitled session — can't paint a
-              horizontal scrollbar across the bottom of the window. Items already
-              `truncate` their labels, so clipping is the right behavior. */}
-          <div className="flex min-w-0 items-stretch gap-0.5 overflow-x-clip">
-            {leftItems.filter(visible).map(item => (
-              <StatusbarItemView item={item} key={`left:${item.id}`} navigate={navigate} />
-            ))}
-          </div>
-          <div className="flex min-w-0 items-stretch gap-0.5 overflow-x-clip">
-            {items.filter(visible).map(item => (
-              <StatusbarItemView item={item} key={`right:${item.id}`} navigate={navigate} />
-            ))}
-          </div>
+          {mobileRenderer ? (
+            <>
+              <div className="flex min-w-0 items-stretch gap-0.5 overflow-hidden" data-statusbar-mobile-primary="">
+                {mobilePrimaryItems.map(item => (
+                  <StatusbarItemView item={item} key={`mobile-primary:${item.id}`} navigate={navigate} />
+                ))}
+              </div>
+              <MobileStatusbarMore items={mobileOverflowItems} label={t.shell.statusbar.moreActions} navigate={navigate} />
+            </>
+          ) : (
+            <>
+              {/* `overflow-x-clip` (not `overflow-x-auto`) so a wide status item — for
+                  example "Connecting…" on a fresh/untitled session — can't paint a
+                  horizontal scrollbar across the bottom of the window. Items already
+                  `truncate` their labels, so clipping is the right behavior. */}
+              <div className="flex min-w-0 items-stretch gap-0.5 overflow-x-clip">
+                {visibleLeftItems.map(item => (
+                  <StatusbarItemView item={item} key={`left:${item.id}`} navigate={navigate} />
+                ))}
+              </div>
+              <div className="flex min-w-0 items-stretch gap-0.5 overflow-x-clip">
+                {visibleRightItems.map(item => (
+                  <StatusbarItemView item={item} key={`right:${item.id}`} navigate={navigate} />
+                ))}
+              </div>
+            </>
+          )}
         </footer>
       </ContextMenuTrigger>
       <StatusbarVisibilityMenu hiddenIds={hiddenIds} items={items} leftItems={leftItems} />
     </ContextMenu>
+  )
+}
+
+function MobileStatusbarMore({
+  items,
+  label,
+  navigate
+}: {
+  items: readonly StatusbarItem[]
+  label: string
+  navigate: ReturnType<typeof useNavigate>
+}) {
+  if (items.length === 0) {return null}
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button aria-label={label} className="mobile-statusbar-more" data-statusbar-more="" type="button">
+          <MoreHorizontal className="size-5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="w-[min(22rem,calc(100vw-1rem))] p-1"
+        data-mobile-statusbar-more=""
+        side="top"
+        sideOffset={8}
+      >
+        <div className="grid gap-1">
+          {items.map(item => (
+            <StatusbarItemView item={item} key={`mobile-more:${item.id}`} navigate={navigate} />
+          ))}
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
@@ -249,7 +319,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
     // way profile-switcher.tsx stacks Popover/ContextMenu/Tooltip triggers.
     const trigger = (
       <DropdownMenuTrigger asChild>
-        <button className={cn(STATUSBAR_ACTION_CLASS, item.className)} disabled={item.disabled} type="button">
+        <button className={cn(STATUSBAR_ACTION_CLASS, item.className)} data-statusbar-id={item.id} disabled={item.disabled} type="button">
           {content}
         </button>
       </DropdownMenuTrigger>
@@ -323,6 +393,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
             'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
             item.className
           )}
+          data-statusbar-id={item.id}
         >
           {content}
         </div>
@@ -333,7 +404,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
   if (item.href || item.variant === 'link') {
     return (
       <Tip label={tooltipLabel}>
-        <a className={cn(STATUSBAR_ACTION_CLASS, item.className)} href={item.href} rel="noreferrer" target="_blank">
+        <a className={cn(STATUSBAR_ACTION_CLASS, item.className)} data-statusbar-id={item.id} href={item.href} rel="noreferrer" target="_blank">
           {content}
         </a>
       </Tip>
@@ -344,6 +415,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
     <Tip label={tooltipLabel}>
       <button
         className={cn(STATUSBAR_ACTION_CLASS, item.className)}
+        data-statusbar-id={item.id}
         disabled={item.disabled}
         onClick={event => {
           if (item.to) {

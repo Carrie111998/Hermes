@@ -12,7 +12,7 @@ import { contributesToWorkspace } from '@/components/pane-shell/workspace-scope'
 import { registry } from '@/contrib/registry'
 import { $previewTabs, closeRightRail, noteBrowserPage, openPreview } from '@/store/preview'
 
-import { browserTabExternalUrl, browserTabLabel, watchPreviewTiles } from './preview-tile'
+import { browserTabExternalUrl, browserTabLabel, shouldMirrorPreviewTiles, watchPreviewTiles } from './preview-tile'
 
 beforeAll(() => {
   watchPreviewTiles()
@@ -20,6 +20,21 @@ beforeAll(() => {
 
 afterEach(() => {
   closeRightRail()
+})
+
+describe('preview tile surface selection', () => {
+  it('leaves preview tabs to the full-screen mobile surface instead of recreating a desktop rail', () => {
+    const nativeMobileDocument = {
+      documentElement: { hasAttribute: (name: string) => name === 'data-hermes-mobile' }
+    } as unknown as Document
+
+    const desktopDocument = {
+      documentElement: { hasAttribute: () => false }
+    } as unknown as Document
+
+    expect(shouldMirrorPreviewTiles(nativeMobileDocument)).toBe(false)
+    expect(shouldMirrorPreviewTiles(desktopDocument)).toBe(true)
+  })
 })
 
 // By prefix, not by a literal id: a Browser tab's id is minted per tab now

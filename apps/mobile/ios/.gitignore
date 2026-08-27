@@ -1,0 +1,19 @@
+App/build
+App/Pods
+App/output
+App/App/public
+DerivedData
+xcuserdata
+
+# Cordova plugins for Capacitor
+capacitor-cordova-ios-plugins
+
+# Generated Config files
+App/App/capacitor.config.json
+App/App/config.xml
+
+# Signing and push-service credentials remain local to the release pipeline.
+GoogleService-Info.plist
+*.mobileprovision
+*.p12
+AuthKey_*.p8

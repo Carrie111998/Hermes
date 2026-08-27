@@ -557,6 +557,12 @@ export function useComposerActions({
     }
   }, [attachImagePath, copy.attachImages, currentCwd, t.composer.images])
 
+  const captureImage = useCallback(async () => {
+    const image = await window.hermesDesktop?.capturePhoto?.()
+
+    return image ? attachImageBlob(image) : false
+  }, [attachImageBlob])
+
   const pasteClipboardImage = useCallback(
     async ({ silent = false }: { silent?: boolean } = {}) => {
       try {
@@ -732,6 +738,7 @@ export function useComposerActions({
     attachImageBlob,
     attachImagePath,
     attachPrCommentUrl,
+    captureImage,
     insertContextPathInlineRef,
     pasteClipboardImage,
     pickContextPaths,

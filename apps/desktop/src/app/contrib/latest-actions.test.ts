@@ -89,12 +89,14 @@ describe('latestActions adapters', () => {
     const chat = makeChatActions()
     chat.onDismissError = undefined
     chat.onRestoreToMessage = undefined
+    chat.onCapturePhoto = undefined
     chat.onTranscribeAudio = undefined
 
     const adaptedChat = latestChatActions(chat)
 
     expect(adaptedChat.onDismissError).toBeUndefined()
     expect(adaptedChat.onRestoreToMessage).toBeUndefined()
+    expect(adaptedChat.onCapturePhoto).toBeUndefined()
     expect(adaptedChat.onTranscribeAudio).toBeUndefined()
 
     const sidebar = makeSidebarActions()

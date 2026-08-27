@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { blobDedupeKey, detectTrigger, extractClipboardImageBlobs } from './text-utils'
+import { blobDedupeKey, detectTrigger, extractClipboardFiles, extractClipboardImageBlobs, mobileComposerKeepsEnterAsNewline } from './text-utils'
 
 describe('detectTrigger', () => {
   it('detects a bare slash trigger with an empty query', () => {
@@ -170,6 +170,14 @@ describe('detectTrigger', () => {
   })
 })
 
+describe('mobileComposerKeepsEnterAsNewline', () => {
+  it('reserves every Enter-key variant for writing on mobile while preserving Desktop submit behavior', () => {
+    expect(mobileComposerKeepsEnterAsNewline(true, 'Enter')).toBe(true)
+    expect(mobileComposerKeepsEnterAsNewline(true, 'a')).toBe(false)
+    expect(mobileComposerKeepsEnterAsNewline(false, 'Enter')).toBe(false)
+  })
+})
+
 describe('extractClipboardImageBlobs', () => {
   it('dedupes the same image exposed on both items and files', () => {
     const image = new File([new Uint8Array([1, 2, 3])], 'paste.png', {
@@ -252,6 +260,29 @@ describe('extractClipboardImageBlobs', () => {
     } as unknown as DataTransfer
 
     expect(extractClipboardImageBlobs(clipboard)).toEqual([])
+  })
+})
+
+describe('extractClipboardFiles', () => {
+  it('keeps pasted video and document files while leaving images to the image attachment path', () => {
+    const image = new File(['image'], 'photo.png', { type: 'image/png', lastModified: 1 })
+    const video = new File(['video'], 'clip.mp4', { type: 'video/mp4', lastModified: 2 })
+    const document = new File(['notes'], 'notes.txt', { type: 'text/plain', lastModified: 3 })
+
+    const clipboard = {
+      files: {
+        length: 3,
+        item: (index: number) => [image, video, document][index] ?? null
+      },
+      getData: () => '',
+      items: [
+        { kind: 'file', type: image.type, getAsFile: () => image },
+        { kind: 'file', type: video.type, getAsFile: () => video },
+        { kind: 'file', type: document.type, getAsFile: () => document }
+      ]
+    } as unknown as DataTransfer
+
+    expect(extractClipboardFiles(clipboard)).toEqual([video, document])
   })
 })
 

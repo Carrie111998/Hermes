@@ -88,7 +88,7 @@ export function PanelBody({ children, className }: { children: ReactNode; classN
         // Side-by-side master/detail on a wide card; once it narrows (same
         // threshold the other overlays collapse at) stack the list above the
         // detail so the detail keeps full width instead of being squished.
-        'flex min-h-0 flex-1 flex-col gap-4 overflow-hidden min-[47.5rem]:flex-row min-[47.5rem]:gap-5',
+        'flex min-h-0 flex-1 flex-col gap-4 overflow-hidden min-[64rem]:flex-row min-[64rem]:gap-5',
         className
       )}
     >
@@ -125,7 +125,7 @@ export function PanelList({
   return (
     // Full-width and height-capped when stacked (narrow); a fixed 13rem rail
     // beside the detail when wide.
-    <div className={cn('flex w-full shrink-0 flex-col max-[47.5rem]:max-h-[40%] min-[47.5rem]:w-52', className)}>
+    <div className={cn('flex w-full shrink-0 flex-col max-[64rem]:max-h-[40%] min-[64rem]:w-52', className)}>
       {onSearchChange ? (
         <SearchField
           aria-label={searchLabel ?? searchPlaceholder ?? ''}

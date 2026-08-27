@@ -15,7 +15,7 @@ import {
 import { Kbd } from '@/components/ui/kbd'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
-import { Clipboard, FileText, FolderOpen, type IconComponent, ImageIcon, Link, MessageSquareText } from '@/lib/icons'
+import { Camera, Clipboard, FileText, FolderOpen, type IconComponent, ImageIcon, Link, MessageSquareText } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import { useComposerAttachmentProviders } from './contrib'
@@ -29,6 +29,7 @@ export function ContextMenu({
   onInsertText,
   onOpenUrlDialog,
   onPasteClipboardImage,
+  onCapturePhoto,
   onPickFiles,
   onPickFolders,
   onPickImages
@@ -43,6 +44,7 @@ export function ContextMenu({
   // `composer.attachments` contributions — plugin/core-registered rows that
   // extend this menu through the same registry as every other surface.
   const attachmentProviders = useComposerAttachmentProviders()
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
 
   return (
     <>
@@ -71,12 +73,19 @@ export function ContextMenu({
           <ContextMenuItem disabled={!onPickFiles} icon={FileText} onSelect={onPickFiles}>
             {c.files}
           </ContextMenuItem>
-          <ContextMenuItem disabled={!onPickFolders} icon={FolderOpen} onSelect={onPickFolders}>
-            {c.folder}
-          </ContextMenuItem>
+          {!mobileRenderer && (
+            <ContextMenuItem disabled={!onPickFolders} icon={FolderOpen} onSelect={onPickFolders}>
+              {c.folder}
+            </ContextMenuItem>
+          )}
           <ContextMenuItem disabled={!onPickImages} icon={ImageIcon} onSelect={onPickImages}>
             {c.images}
           </ContextMenuItem>
+          {mobileRenderer && onCapturePhoto && (
+            <ContextMenuItem icon={Camera} onSelect={() => void onCapturePhoto()}>
+              {c.capturePhoto}
+            </ContextMenuItem>
+          )}
           <ContextMenuItem
             disabled={!onPasteClipboardImage}
             icon={Clipboard}
@@ -188,6 +197,7 @@ interface ContextMenuProps {
   onInsertText: (text: string) => void
   onOpenUrlDialog: () => void
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void
+  onCapturePhoto?: () => Promise<boolean> | void
   onPickFiles?: () => void
   onPickFolders?: () => void
   onPickImages?: () => void

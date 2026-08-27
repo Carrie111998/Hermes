@@ -5,7 +5,7 @@ import { $desktopOnboarding, type DesktopOnboardingState, type OnboardingContext
 import { makeOAuthProvider } from '@/test/oauth-provider'
 import type { OAuthProvider } from '@/types/hermes'
 
-import { Picker } from '.'
+import { ApiKeyForm, Picker } from '.'
 
 function setProviders(providers: OAuthProvider[]) {
   $desktopOnboarding.set({
@@ -31,6 +31,8 @@ afterEach(() => {
   } catch {
     // jsdom localStorage should always be present; ignore if not.
   }
+
+  document.documentElement.removeAttribute('data-hermes-mobile')
 
   $desktopOnboarding.set({
     configured: null,
@@ -117,5 +119,20 @@ describe('onboarding Picker', () => {
     render(<Picker ctx={ctx} />)
 
     expect(screen.queryByRole('button', { name: "I'll choose a provider later" })).toBeNull()
+  })
+})
+
+describe('onboarding ApiKeyForm', () => {
+  it('does not auto-focus a key field in the mobile renderer', () => {
+    document.documentElement.setAttribute('data-hermes-mobile', '')
+    render(
+      <ApiKeyForm
+        canGoBack={false}
+        onBack={() => undefined}
+        onSave={async () => ({ ok: true })}
+      />
+    )
+
+    expect(screen.getByPlaceholderText('Paste API key')).not.toBe(document.activeElement)
   })
 })

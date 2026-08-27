@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Hermes Mobile is a remote client for a private TLS-enabled gateway.
+  Cleartext HTTP/WebSocket traffic is deliberately denied. This avoids silently
+  sending gateway credentials over an insecure network path.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

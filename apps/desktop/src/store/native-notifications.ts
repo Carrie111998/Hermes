@@ -31,6 +31,8 @@ const ATTENTION_KINDS = new Set<NativeNotificationKind>(['approval', 'input'])
 
 export interface NativeNotificationPrefs {
   enabled: boolean
+  /** Epoch milliseconds. While in the future, no native notification can fire. */
+  silencedUntil: number
   kinds: Record<NativeNotificationKind, boolean>
 }
 
@@ -38,6 +40,7 @@ const STORAGE_KEY = 'hermes:native-notifications'
 
 const DEFAULT_PREFS: NativeNotificationPrefs = {
   enabled: true,
+  silencedUntil: 0,
   kinds: {
     approval: true,
     backgroundDone: true,
@@ -70,6 +73,7 @@ function readPrefs(): NativeNotificationPrefs {
 
     return {
       enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_PREFS.enabled,
+      silencedUntil: typeof parsed.silencedUntil === 'number' && Number.isFinite(parsed.silencedUntil) ? parsed.silencedUntil : 0,
       kinds
     }
   } catch {
@@ -91,6 +95,21 @@ export function setNativeNotifyEnabled(enabled: boolean) {
 export function setNativeNotifyKind(kind: NativeNotificationKind, on: boolean) {
   const prev = $nativeNotifyPrefs.get()
   writePrefs({ ...prev, kinds: { ...prev.kinds, [kind]: on } })
+}
+
+/** Temporarily quiet native notifications without disabling the user's saved
+ * per-kind preferences. A new app launch naturally re-evaluates the timestamp. */
+export function silenceNativeNotificationsFor(durationMs: number, now = Date.now()) {
+  const until = now + Math.max(0, durationMs)
+  writePrefs({ ...$nativeNotifyPrefs.get(), silencedUntil: until })
+}
+
+export function resumeNativeNotifications() {
+  writePrefs({ ...$nativeNotifyPrefs.get(), silencedUntil: 0 })
+}
+
+export function nativeNotificationsSilenced(now = Date.now()): boolean {
+  return $nativeNotifyPrefs.get().silencedUntil > now
 }
 
 // De-dupe replayed events for the same kind+session. Self-evicting: entries
@@ -191,7 +210,7 @@ export interface NativeNotificationInput {
 export function dispatchNativeNotification(input: NativeNotificationInput): boolean {
   const prefs = $nativeNotifyPrefs.get()
 
-  if (!prefs.enabled || !prefs.kinds[input.kind]) {
+  if (!prefs.enabled || prefs.silencedUntil > Date.now() || !prefs.kinds[input.kind]) {
     return false
   }
 
@@ -388,6 +407,10 @@ export async function sendTestNativeNotification(title: string, body: string): P
   }
 
   try {
+    if (bridge.requestNotificationPermission && !(await bridge.requestNotificationPermission())) {
+      return false
+    }
+
     return await bridge.notify({ body, kind: 'turnDone', title })
   } catch {
     return false

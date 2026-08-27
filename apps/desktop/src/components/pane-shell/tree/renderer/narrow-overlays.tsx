@@ -7,7 +7,7 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PaneTab, PaneTabLabel, PaneTabStrip } from '@/components/ui/pane-tab'
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
@@ -28,11 +28,31 @@ export function NarrowOverlays() {
   const panes = useContributions('panes')
   const hiddenPanes = useStore($hiddenTreePanes)
   const [reveal, setReveal] = useState<{ id: string; pinned: boolean } | null>(null)
+  const overlayRef = useRef<HTMLDivElement>(null)
+  const revealRef = useRef(reveal)
+  revealRef.current = reveal
+
+  const closeReveal = useCallback(() => {
+    const current = revealRef.current
+
+    if (!current) {return}
+    // The Android bridge maps this close intent back to its drawer store; on a
+    // desktop the same event only closes this visual overlay.
+    window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: current.id, mode: 'close' } }))
+  }, [])
 
   // Own an Escape layer only while something is revealed, so Escape closes the
   // overlay only when it's the top layer (never under a dialog / edit mode).
   const revealActive = reveal !== null
   useEffect(() => (revealActive ? pushEscapeLayer(ESCAPE_PRIORITY.narrowOverlay) : undefined), [revealActive])
+  useEffect(() => {
+    if (!revealActive) {return}
+
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    window.requestAnimationFrame(() => overlayRef.current?.focus())
+
+    return () => previous?.focus()
+  }, [revealActive])
 
   const inTree = useMemo(() => new Set(tree ? allPaneIds(tree) : []), [tree])
 
@@ -89,7 +109,7 @@ export function NarrowOverlays() {
       }
 
       event.preventDefault()
-      setReveal(null)
+      closeReveal()
     }
 
     window.addEventListener(PANE_TOGGLE_REVEAL_EVENT, onToggle)
@@ -99,7 +119,7 @@ export function NarrowOverlays() {
       window.removeEventListener(PANE_TOGGLE_REVEAL_EVENT, onToggle)
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [narrow])
+  }, [closeReveal, narrow])
 
   if (!narrow || collapsibles.length === 0) {
     return null
@@ -108,6 +128,7 @@ export function NarrowOverlays() {
   const sideOf = (c: Contribution) => (paneChrome(c).placement === 'left' ? 'left' : 'right')
   const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
   const sides = [...new Set(collapsibles.map(sideOf))]
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
 
   // The revealed pane's ZONE-mates that also left the grid (the sessions zone
   // stacks SESSIONS | BOTS): the overlay mirrors the zone's tab strip so a
@@ -142,23 +163,49 @@ export function NarrowOverlays() {
         />
       ))}
 
+      {revealed && mobileRenderer && (
+        <button
+          aria-label={`Close ${revealed.title ?? revealed.id}`}
+          className="absolute inset-0 z-30 cursor-default"
+          data-narrow-pane-scrim=""
+          onClick={closeReveal}
+          type="button"
+        />
+      )}
       {revealed && (
         <div
+          // Floats OVER the layout, so under glass its surface must mask the
+          // panes beneath it — a see-through overlay reads as text bleeding
+          // through text. Contract: `[data-glass-opaque]` in styles.css.
+          aria-label={revealed.title ?? revealed.id}
+          aria-modal="true"
           className={cn(
             'absolute inset-y-0 z-40 flex flex-col overflow-hidden bg-(--ui-sidebar-surface-background) shadow-2xl',
             sideOf(revealed) === 'left'
               ? 'left-0 border-r border-(--ui-stroke-secondary)'
               : 'right-0 border-l border-(--ui-stroke-secondary)'
           )}
-          // Floats OVER the layout, so under glass its surface must mask the
-          // panes beneath it — a see-through overlay reads as text bleeding
-          // through text. Contract: `[data-glass-opaque]` in styles.css.
           data-glass-opaque=""
-          onMouseLeave={() => setReveal(current => (current?.pinned ? current : null))}
+          data-narrow-pane-overlay=""
+          data-narrow-pane-side={sideOf(revealed)}
+          onMouseLeave={() => {
+            if (!revealRef.current?.pinned) {closeReveal()}
+          }}
+          ref={overlayRef}
+          role="dialog"
           // Match the pane's docked width (sessions ~237px, files its rail
           // width) instead of a fat fixed 20rem — capped for tiny screens.
           style={{ width: `min(${(revealed.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)` }}
+          tabIndex={-1}
         >
+          <button
+            aria-label={`Close ${revealed.title ?? revealed.id}`}
+            className="absolute right-1 top-1 z-10 grid size-11 place-items-center rounded-md text-lg hover:bg-(--chrome-action-hover)"
+            onClick={closeReveal}
+            type="button"
+          >
+            ×
+          </button>
           {/* Zone-mates share the overlay through the zone's own tab strip
               (SESSIONS | BOTS) — a lone pane keeps the stripless form. */}
           {zonePanes.length > 1 && (

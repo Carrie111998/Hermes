@@ -1,0 +1,769 @@
+/*
+ * theme-fallback.css — structural + mobile-ergonomics CSS only.
+ *
+ * Colors/tokens are owned by the desktop ThemeProvider (themes/context), which
+ * paints the real desktop skin onto :root — so we DON'T pin --dt-* here.
+ * This file handles layout + device safe areas (status bar / nav bar / notch).
+ */
+
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--dt-background, #0d2f86);
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/*
+ * The Android/iOS WebView draws edge-to-edge (viewport-fit=cover), so the app
+ * would slide under the status bar and the gesture/nav bar. Inset the whole app
+ * by the device safe areas. The inset strips show the themed background so the
+ * status-bar and nav-bar regions blend with the app.
+ *
+ * The vendored AppShell root is `h-screen` (100vh) — full viewport, ignoring the
+ * padding. We pin #root to the visual viewport with safe-area padding and force
+ * its child (the shell, or a connect screen) to fill the PADDED box instead of
+ * 100vh, so nothing renders under the system bars.
+ */
+#root {
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  /* Inset the whole app by the status-bar height so NOTHING (chat title, message
+     list, etc.) renders behind the clock/battery — the app visually stops at the
+     status bar. The fixed titlebar clusters get the same inset below. */
+  padding-top: env(safe-area-inset-top);
+  /* Bottom = nav-bar inset. When the keyboard opens the WebView shrinks above
+     it natively (Chromium edge-to-edge), so no manual lift is needed here. */
+  padding-bottom: var(--mobile-system-bottom-inset);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  /* The safe-area strips (status bar on top, nav bar on bottom) show this
+     background, so they read as a clean themed band rather than bare white. */
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  overflow: hidden;
+}
+
+#root > [data-mobile-root-shell] {
+  position: relative;
+  height: 100% !important;
+  max-height: 100%;
+  min-height: 0;
+}
+
+/* Desktop chat docks the composer at `bottom:0` inside a 100vh shell. Lift
+   only the docked phone composer into the same opaque system lane as #root;
+   keyboard resize still owns the open-keyboard position. */
+:root[data-hermes-mobile] [data-slot='composer-dock']:not([data-popped-out]) {
+  bottom: var(--mobile-system-bottom-inset) !important;
+}
+
+/*
+ * The titlebar clusters (settings gear, sidebar toggles, swap, etc.) are
+ * position:fixed (viewport-relative), so #root's top inset doesn't move them —
+ * add the same status-bar inset here so they land in the chat's titlebar row
+ * (which is now inset by #root) instead of behind the clock/battery.
+ * (env(safe-area-inset-top) is real thanks to the SafeArea plugin; 0 in a plain
+ * browser, so this is a no-op in dev.)
+ */
+[data-titlebar-cluster] {
+  top: calc(var(--titlebar-controls-top, 0px) + env(safe-area-inset-top)) !important;
+}
+
+/* The Electron clusters remain mounted for the shared Desktop renderer but are
+   never a mobile navigation surface. Mobile owns one compact toolbar and one
+   overflow sheet; leaving the inherited clusters interactive would duplicate
+   controls and reintroduce floating tap zones. */
+[data-titlebar-cluster] {
+  display: none !important;
+}
+
+/* Phone chrome uses 44px hit boxes. Keep only gateway-essential titlebar actions
+   visible so the enlarged targets never collide on a 360px screen. */
+:root {
+  --titlebar-control-size: 2.75rem;
+  --titlebar-control-height: 2.75rem;
+  --composer-control-size: 2.75rem;
+  --composer-control-primary-size: 2.75rem;
+  --composer-control-gap: 0.375rem;
+  /* A phone must never inherit the desktop chat's rigid minimum pane width. */
+  --chat-min-width: 0px;
+  /* Fold gesture/nav bars can report zero through older WebView safe-area
+     bridges. Keep a deliberate opaque 20px minimum clear lane so the composer
+     never rests under Android Home/Back/Recents controls. */
+  --mobile-system-bottom-inset: max(env(safe-area-inset-bottom), 1.25rem);
+  --mobile-conversation-text-scale: 1;
+}
+
+/* Text comfort is deliberately separate from density. It adjusts reading text
+   and line metrics, not the phone's fixed 44px controls or safe-area math. */
+:root[data-hermes-mobile] {
+  --conversation-text-font-size: calc(0.8125rem * var(--mobile-conversation-text-scale));
+  --conversation-caption-font-size: calc(0.75rem * var(--mobile-conversation-text-scale));
+  --conversation-tool-font-size: calc(0.6875rem * var(--mobile-conversation-text-scale));
+  --conversation-line-height: calc(1.125rem * var(--mobile-conversation-text-scale));
+  --conversation-caption-line-height: calc(1rem * var(--mobile-conversation-text-scale));
+}
+[data-titlebar-tool='layout'],
+[data-titlebar-tool='hud'],
+[data-titlebar-tool='haptics'],
+[data-titlebar-tool='sidebar'],
+[data-titlebar-tool='flip-panes'],
+[data-titlebar-tool='right-sidebar'] {
+  display: none !important;
+}
+[data-titlebar-cluster] .codicon {
+  font-size: 1rem !important;
+}
+
+/* A collapsed pane must be a true off-canvas drawer, never a second docked rail
+   that squeezes the chat below its readable width. */
+:root[data-hermes-mobile] [data-narrow-pane-scrim] {
+  z-index: 90 !important;
+  border: 0;
+  background: rgb(0 0 0 / 0.38);
+}
+[data-narrow-pane-overlay] {
+  width: min(17rem, calc(100vw - 1rem)) !important;
+  max-width: calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem);
+  z-index: 100 !important;
+}
+@media (prefers-reduced-motion: no-preference) {
+  [data-narrow-pane-overlay] {
+    will-change: transform, opacity;
+    animation: mobile-drawer-enter-right 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  [data-narrow-pane-overlay][data-narrow-pane-side='left'] {
+    animation-name: mobile-drawer-enter-left;
+  }
+}
+@keyframes mobile-drawer-enter-left {
+  from { opacity: 0.01; transform: translateX(-0.875rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes mobile-drawer-enter-right {
+  from { opacity: 0.01; transform: translateX(0.875rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* Safe-area helpers usable from any screen. */
+.safe-t {
+  padding-top: env(safe-area-inset-top);
+}
+.safe-b {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/*
+ * Mobile bottom status bar. Rather than HIDING controls the phone can't fit
+ * (YOLO, background agents, cron, terminal, session timer) — which makes the app
+ * feel like a stripped-down port — keep them all and let the bar scroll
+ * horizontally (see the [data-statusbar] rule below). Only the client-version is
+ * dropped: it's redundant with the backend version already shown.
+ */
+[data-statusbar-id='version-client'] {
+  display: none !important;
+}
+
+/* Gateway: show ONLY the colored status icon — hide the "Gateway" label and the
+   "ready/checking" status text (both rendered as <span> inside the item). */
+[data-statusbar-id='gateway-health'] span {
+  display: none !important;
+}
+
+[data-mobile-master-detail] [hidden] {
+  display: none !important;
+}
+[data-mobile-master-detail] [data-master-detail-list],
+[data-mobile-master-detail] [data-master-detail-detail] {
+  min-height: 0;
+}
+[data-mobile-master-detail] [data-master-detail-select] {
+  min-height: 2.75rem;
+}
+
+/* Motion audit: lists/details, status actions, and filter controls all get
+   touch feedback or an entry transition; passive text and scroll content stay
+   still. The user can disable every motion treatment through reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  [data-mobile-master-detail] [data-master-detail-select],
+  [data-mobile-master-detail] [data-master-detail-detail] > div:first-child button,
+  .mobile-statusbar-more,
+  [data-mobile-statusbar-more] [data-statusbar-id],
+  [data-page-filters] > * {
+    transition: background-color 150ms ease, color 150ms ease, transform 150ms ease;
+  }
+  [data-mobile-master-detail] [data-master-detail-select]:active,
+  [data-mobile-master-detail] [data-master-detail-detail] > div:first-child button:active,
+  .mobile-statusbar-more:active,
+  [data-mobile-statusbar-more] [data-statusbar-id]:active {
+    transform: scale(0.98);
+  }
+  [data-mobile-master-detail][data-mobile-master-detail-view='browse'] [data-master-detail-list],
+  [data-mobile-master-detail][data-mobile-master-detail-view='detail'] [data-master-detail-detail] {
+    animation: mobile-detail-enter 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+}
+@keyframes mobile-detail-enter {
+  from { opacity: 0.01; transform: translateX(0.375rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-mobile-connect-brand],
+  [data-mobile-connect-card],
+  [data-mobile-connect-error] {
+    animation: mobile-connect-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  [data-mobile-connect-card] {
+    animation-delay: 40ms;
+  }
+  [data-mobile-connect-error] {
+    animation-delay: 80ms;
+  }
+}
+@keyframes mobile-connect-enter {
+  from { opacity: 0.01; transform: translateY(0.375rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* The desktop intro wordmark intentionally fills broad windows. On a Fold it
+   should stay recognisable without becoming a billboard that crowds the first
+   useful task affordance below it. */
+[data-slot='aui_intro'] .fit-text {
+  --fit-max: clamp(2.75rem, 7vw, 4.5rem);
+}
+
+/* Bottom actions retain full 44px targets. The old horizontal strip made an
+   off-screen action effectively invisible; a compact primary cluster plus More
+   keeps the full Desktop status surface reachable without relying on swiping. */
+[data-statusbar][data-mobile-statusbar] {
+  height: 2.75rem !important;
+  justify-content: space-between !important;
+  overflow: visible;
+}
+[data-statusbar-mobile-primary] {
+  min-width: 0;
+}
+[data-statusbar][data-mobile-statusbar] [data-statusbar-id] {
+  min-width: 2.75rem;
+}
+.mobile-statusbar-more {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0.5rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-statusbar-more:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+[data-mobile-statusbar-more] [data-statusbar-id] {
+  width: 100%;
+  min-height: 2.75rem;
+  justify-content: flex-start;
+  border-radius: 0.5rem;
+  font-size: 0.875rem !important;
+}
+[data-mobile-statusbar-more] [data-statusbar-id] span {
+  display: inline !important;
+}
+[data-statusbar]::-webkit-scrollbar {
+  display: none;
+}
+[data-statusbar] > * {
+  overflow: visible !important;
+  flex: 0 0 auto;
+}
+[data-statusbar] [data-statusbar-id] {
+  font-size: 0.8125rem !important;
+  padding-left: 0.5rem !important;
+  padding-right: 0.5rem !important;
+}
+[data-statusbar] [data-statusbar-id] .codicon {
+  font-size: 0.95rem !important;
+}
+
+/* Boot-failure recovery: the local-install actions (repair the installer, switch
+   to the bundled LOCAL gateway, open desktop logs) don't exist on the remote-only
+   mobile client — the bridge stubs them all. Hide them so only Retry (which
+   reloads and reconnects to the remote gateway) remains. */
+[data-boot-action='repair'],
+[data-boot-action='local'],
+[data-boot-action='logs'] {
+  display: none !important;
+}
+
+/* Keyboard-shortcut keycaps (the "Ctrl N" next to New session, etc.) mean nothing
+   on a touchscreen — hide them everywhere on mobile. */
+[data-slot='kbd-group'],
+[data-slot='kbd'] {
+  display: none !important;
+}
+
+/* The titlebar "keyboard shortcuts" (⌨) button is the only entry point to the
+   keybinds panel — and shortcuts are meaningless on a touchscreen. Hide it so the
+   panel can't be opened on mobile. */
+[data-titlebar-tool='keybinds'] {
+  display: none !important;
+}
+
+/* Page filter chips (e.g. Skills' ~20 category chips) wrap into a dense wall on a
+   phone. Make the row a single horizontal-scroll strip — one swipeable line of
+   tappable chips instead of a cramped block. */
+[data-page-filters] {
+  flex-wrap: nowrap !important;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+[data-page-filters]::-webkit-scrollbar {
+  display: none;
+}
+[data-page-filters] > * {
+  flex: 0 0 auto;
+}
+
+/*
+ * Overlay screens (Settings / Skills / Profiles …). Upstream ships its own
+ * responsive master-detail for these now (a category dropdown bar + full-width
+ * content on narrow viewports — see overlays/overlay-split-layout.tsx), so the
+ * only mobile tweak here is insetting the overlay CARD into the safe area.
+ */
+@media (max-width: 64rem) {
+  /* Inset the whole overlay CARD (Settings/Skills/Profiles) into the safe area so
+     the panel stops at the status bar / nav bar like the rest of the app, instead
+     of sliding under the clock/battery. With the card inset, its inner panels use
+     their normal desktop titlebar clearance — no extra env() needed below. */
+  [data-overlay-view] {
+    padding-top: calc(env(safe-area-inset-top) + 0.5rem) !important;
+    padding-bottom: calc(env(safe-area-inset-bottom) + 0.5rem) !important;
+    padding-left: calc(env(safe-area-inset-left) + 0.5rem) !important;
+    padding-right: calc(env(safe-area-inset-right) + 0.5rem) !important;
+  }
+
+  /* Settings search is a desktop edge badge. The compact nav owns mobile
+     section selection, so leaving this second control floating creates an
+     awkward, overlapping search affordance. */
+  [data-overlay-edge-badge] {
+    display: none;
+  }
+
+  /* The compact nav is the one mobile section selector. The desktop floating
+     search pill duplicates it visually and has no stable place beside the
+     close/import/export actions, so it stays out of the touch layout. */
+  [data-overlay-compact-nav] [data-tab-dropdown-trigger],
+  [data-overlay-nav-actions] > button {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
+  }
+  [data-overlay-compact-nav] [data-tab-dropdown-trigger] {
+    padding-inline: 0.75rem;
+  }
+  [data-overlay-view] [role='menuitem'] {
+    min-height: 2.75rem;
+  }
+}
+
+/* An unfolded Fold can exceed the desktop 64rem breakpoint while remaining a
+   touch-only renderer. The early mobile marker forces the same compact overlay
+   selector and touch targets at every native-mobile width. */
+:root[data-hermes-mobile] [data-overlay-split-layout] {
+  grid-template-columns: minmax(0, 1fr) !important;
+  grid-template-rows: auto minmax(0, 1fr) !important;
+}
+:root[data-hermes-mobile] [data-overlay-split-layout] > aside[data-tour='overlay-nav'] {
+  display: none !important;
+}
+:root[data-hermes-mobile] [data-overlay-compact-nav] {
+  display: flex !important;
+}
+:root[data-hermes-mobile] [data-overlay-split-layout] > main {
+  padding-top: 0.3333rem !important;
+}
+:root[data-hermes-mobile] [data-overlay-split-layout] [data-tour^='nav-'] {
+  height: 2.75rem !important;
+  min-height: 2.75rem !important;
+}
+
+/* One real mobile toolbar replaces the three direct fixed buttons that were
+   accidentally stretched by #root's old full-height child rule. */
+.mobile-top-toolbar {
+  position: absolute;
+  z-index: 60;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  height: 3.25rem;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem calc(env(safe-area-inset-right) + 0.5rem) 0.25rem calc(env(safe-area-inset-left) + 0.5rem);
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.3));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+}
+.mobile-top-toolbar-center {
+  min-width: 0;
+  flex: 1;
+}
+.mobile-toolbar-button {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-toolbar-button:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+[data-drawer-open] .mobile-top-toolbar,
+html:has([data-overlay-surface]) .mobile-top-toolbar {
+  display: none !important;
+}
+.mobile-toolbar-scrim {
+  position: absolute;
+  z-index: 80;
+  inset: 0;
+  border: 0;
+  background: rgb(0 0 0 / 0.42);
+}
+.mobile-toolbar-menu {
+  position: absolute;
+  z-index: 90;
+  top: calc(3.25rem + 0.375rem);
+  right: calc(env(safe-area-inset-right) + 0.5rem);
+  left: auto;
+  display: flex;
+  width: min(23rem, calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem));
+  max-height: calc(100% - 4.125rem);
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
+  border-radius: 1rem;
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  box-shadow: 0 1.25rem 3rem rgb(0 0 0 / 0.28);
+  transform-origin: top right;
+}
+.mobile-toolbar-menu header {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: 1rem 0.25rem;
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.3));
+  color: var(--ui-text-primary, currentColor);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.mobile-toolbar-menu header button {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  place-items: center;
+  border-radius: 0.75rem;
+}
+.mobile-toolbar-menu-scroll {
+  min-height: 0;
+  overflow: auto;
+  padding: 0.5rem;
+}
+.mobile-toolbar-menu [role='group'] {
+  display: grid;
+  gap: 0.125rem;
+}
+.mobile-toolbar-menu [role='group'] + [role='group'] {
+  margin-top: 0.75rem;
+}
+.mobile-toolbar-menu p {
+  margin: 0.5rem 0.75rem 0.25rem;
+  color: var(--ui-text-tertiary, currentColor);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mobile-toolbar-menu [role='group'] > button {
+  min-height: 2.75rem;
+  padding-inline: 0.75rem;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+  text-align: left;
+}
+.mobile-toolbar-menu [role='group'] > button:active,
+.mobile-toolbar-menu header button:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mobile-toolbar-button {
+    transition: background-color 160ms ease, transform 160ms ease;
+  }
+  .mobile-toolbar-menu [role='group'] > button,
+  .mobile-toolbar-menu header button {
+    transition: background-color 150ms ease, transform 150ms ease;
+  }
+  .mobile-toolbar-button:active {
+    transform: scale(0.94);
+  }
+  .mobile-toolbar-menu [role='group'] > button:active,
+  .mobile-toolbar-menu header button:active {
+    transform: scale(0.98);
+  }
+  .mobile-toolbar-scrim {
+    animation: mobile-scrim-enter 160ms ease-out both;
+  }
+  .mobile-toolbar-menu {
+    animation: mobile-toolbar-menu-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+}
+@keyframes mobile-toolbar-menu-enter {
+  from { opacity: 0.01; transform: translateY(-0.5rem) scale(0.98); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes mobile-scrim-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Full-screen preview home for Browser, PDF, Markdown, source, images, and
+   generated artifacts. It owns preview tabs on mobile instead of rebuilding a
+   desktop side rail beside chat. */
+.mobile-preview-overlay {
+  position: absolute;
+  z-index: 120;
+  inset: 0;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ui-chat-surface-background, var(--dt-background, #0d2f86));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-header {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.3));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+}
+.mobile-preview-tabs {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 0.25rem;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding-inline: calc(env(safe-area-inset-left) + 0.5rem) 0.25rem;
+  scrollbar-width: none;
+}
+.mobile-preview-tabs::-webkit-scrollbar {
+  display: none;
+}
+.mobile-preview-tab {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  border-radius: 0.75rem;
+}
+.mobile-preview-tab [role='tab'] {
+  min-width: 5rem;
+  max-width: min(13rem, 48vw);
+  height: 2.75rem;
+  padding: 0.75rem 2.5rem 0.75rem 0.75rem;
+  overflow: hidden;
+  border-radius: 0.75rem;
+  color: var(--ui-text-tertiary, currentColor);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mobile-preview-tab [role='tab'][aria-selected='true'] {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-tab > button[aria-label^='Close'] {
+  display: grid;
+  width: 2.25rem;
+  height: 2.75rem;
+  margin-left: -2.25rem;
+  place-items: center;
+  border-radius: 0.75rem;
+  color: var(--ui-text-tertiary, currentColor);
+}
+.mobile-preview-new-tab,
+.mobile-preview-close {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-close {
+  margin-right: calc(env(safe-area-inset-right) + 0.5rem);
+}
+.mobile-preview-content {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.mobile-preview-url {
+  width: 100%;
+}
+.mobile-preview-browserbar {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem calc(env(safe-area-inset-right) + 0.5rem) 0.25rem calc(env(safe-area-inset-left) + 0.5rem);
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.25));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+}
+.mobile-preview-browserbar button {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-browserbar .mobile-preview-open-external {
+  display: flex;
+  width: auto;
+  min-width: 2.75rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding-inline: 0.5rem;
+  font-size: 0.75rem;
+}
+.mobile-preview-browserbar input {
+  min-width: 0;
+  height: 2.75rem;
+  flex: 1;
+  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.45));
+  border-radius: 0.75rem;
+  background: var(--ui-chat-surface-background, var(--dt-background, #0d2f86));
+  color: var(--ui-text-primary, currentColor);
+  padding-inline: 0.75rem;
+}
+.mobile-preview-webpage {
+  width: min(100%, calc(100% / var(--mobile-preview-zoom)));
+  min-height: 0;
+  max-height: 100%;
+  aspect-ratio: var(--mobile-preview-aspect);
+  border: 0;
+  background: white;
+  transform: scale(var(--mobile-preview-zoom));
+  transform-origin: center;
+}
+.mobile-preview-controls {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: center;
+  gap: 0.25rem;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.25));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  padding: 0.25rem 0.5rem;
+}
+.mobile-preview-controls button {
+  min-width: 2.75rem;
+  min-height: 2.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--ui-text-tertiary, currentColor);
+  font-size: 0.75rem;
+}
+.mobile-preview-controls button[aria-pressed='true'] {
+  border-color: var(--ui-stroke-secondary, rgb(148 163 184 / 0.45));
+  background: var(--chrome-action-hover, rgb(148 163 184 / 0.14));
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-preview-controls span {
+  min-width: 2.5rem;
+  color: var(--ui-text-tertiary, currentColor);
+  font-size: 0.75rem;
+  text-align: center;
+}
+.mobile-preview-viewport {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  background: color-mix(in srgb, var(--dt-background, #0d2f86) 88%, black);
+}
+.mobile-preview-unavailable {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  place-items: center;
+  align-content: center;
+  gap: 0.75rem;
+  padding: 2rem;
+  text-align: center;
+}
+.mobile-preview-unavailable p {
+  max-width: 22rem;
+  margin: 0;
+  color: var(--ui-text-tertiary, currentColor);
+  line-height: 1.5;
+}
+
+/* Motion is limited to navigation/state changes: no ambient animation, no
+   animated body copy, and a complete reduced-motion opt-out. */
+@media (prefers-reduced-motion: no-preference) {
+  .mobile-preview-overlay {
+    animation: mobile-preview-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .mobile-preview-tab [role='tab'],
+  .mobile-preview-tab > button,
+  .mobile-preview-new-tab,
+  .mobile-preview-close,
+  .mobile-preview-browserbar button,
+  .mobile-preview-browserbar input {
+    transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease, transform 150ms ease;
+  }
+  .mobile-preview-tab > button:active,
+  .mobile-preview-new-tab:active,
+  .mobile-preview-close:active,
+  .mobile-preview-browserbar button:active {
+    background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+    transform: scale(0.95);
+  }
+  .mobile-preview-browserbar input:focus {
+    border-color: var(--dt-ring, currentColor);
+  }
+  .mobile-preview-url,
+  .mobile-preview-content > aside {
+    animation: mobile-preview-content-enter 150ms ease-out both;
+  }
+}
+@keyframes mobile-preview-enter {
+  from { opacity: 0.01; transform: translateY(0.375rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes mobile-preview-content-enter {
+  from { opacity: 0.01; transform: translateX(0.25rem); }
+  to { opacity: 1; transform: translateX(0); }
+}

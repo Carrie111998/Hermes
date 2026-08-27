@@ -1901,6 +1901,7 @@ export const ar = defineLocale({
     folder: 'مجلد',
     images: 'صور',
     pasteImage: 'لصق صورة',
+    capturePhoto: 'التقط صورة',
     url: 'رابط',
     promptSnippets: 'مقتطفات جاهزة',
     tipPre: 'نصيحة: اكتب ',

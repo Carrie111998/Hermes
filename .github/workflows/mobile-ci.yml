@@ -1,0 +1,44 @@
+# .github/workflows/mobile-ci.yml
+name: Mobile CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# apps/mobile reuses the desktop renderer by importing apps/desktop/src directly
+# (and apps/shared), so a desktop-side refactor can silently break the mobile
+# build with no error anywhere else. This job is the guard: typecheck + a real
+# Vite build of apps/mobile against the current source on every push/PR.
+#
+# Note: this job validates the actual Android compilation path too. A mobile shell
+# that only typechecks/bundles can still fail on manifest, plugin, Java/Kotlin, or
+# Android SDK integration before it ever reaches a phone.
+jobs:
+  mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - run: npm ci
+      - run: npm run --prefix apps/desktop typecheck
+      - run: npm run --prefix apps/mobile typecheck
+      - run: npm run --prefix apps/mobile test
+      - run: npm run --prefix apps/mobile build
+      - run: |
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          cd apps/mobile
+          npx cap sync android --deployment
+          cd android && ./gradlew assembleDebug --no-daemon

@@ -2063,6 +2063,7 @@ export interface Translations {
     folder: string
     images: string
     pasteImage: string
+    capturePhoto: string
     url: string
     promptSnippets: string
     tipPre: string
@@ -2463,6 +2464,7 @@ export interface Translations {
       gatewayRestarting: string
       gatewayTitle: string
       customizeTitle: string
+      moreActions: string
       hideStatusbar: string
       resetStatusbar: string
       toggleApprovalMode: string

@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/AppTheme">
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density"
+            android:name=".MainActivity"
+            android:label="@string/title_activity_main"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:launchMode="singleTask"
+            android:grantUriPermissions="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Explicit share-sheet entry points. URI grants apply only to the
+                 item Steven chose to share; Hermes requests no media/storage
+                 library permission and the native bridge caps each item. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".HermesWidgetProvider"
+            android:exported="false"
+            android:label="Hermes">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/hermes_widget_info" />
+        </receiver>
+
+        <!-- Visible only while an already connected remote session is backgrounded.
+             It stops when the user dismisses the app task; it is not a boot daemon. -->
+        <service
+            android:name=".ActiveSessionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+
+    <!-- Permissions -->
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Visible active-session service while a connected remote session is
+         backgrounded. It is not started at boot and stops on task dismissal. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- The notification plugin declares these for delayed/reboot scheduling;
+         Hermes only posts immediate foreground notifications, so keep the
+         permission footprint minimal. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" tools:node="remove" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" tools:node="remove" />
+    <!-- Steven explicitly requested first-connection media onboarding. Android 13+
+         grants visual media (photos/videos) separately; older Android releases use
+         the legacy read grant. This is still not MANAGE_EXTERNAL_STORAGE. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Camera is requested as part of the user-approved first-connection
+         capability flow and is then used only after Capture photo is tapped. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Voice input (getUserMedia in the WebView). Capacitor's WebChromeClient
+         requests the runtime grant when the chat starts a voice session. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Required by the WifiManager.WifiLock acquired in MainActivity to keep the
+         gateway WebSocket alive under Wi-Fi power-save. Without this the lock
+         throws (silently, via the catch) and the stability fix never engages. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Opens Android's own first-connection battery-optimization decision.
+         It improves resume reliability but does not create a hidden service. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+</manifest>

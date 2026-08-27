@@ -2040,6 +2040,7 @@ export const zhHant = defineLocale({
     folder: '資料夾…',
     images: '圖片…',
     pasteImage: '貼上圖片',
+    capturePhoto: '拍攝照片',
     url: 'URL…',
     promptSnippets: '提示詞片段…',
     tipPre: '提示：輸入 ',

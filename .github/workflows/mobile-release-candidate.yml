@@ -1,0 +1,67 @@
+name: Mobile Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Release version name recorded with this candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  android-release-candidate:
+    # Release signing must be configured as GitHub Actions secrets in the
+    # canonical upstream repository. This workflow deliberately does not fall
+    # back to a public debug certificate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - run: npm ci
+      - run: npm run --prefix apps/desktop typecheck
+      - run: npm run --prefix apps/mobile typecheck
+      - run: npm run --prefix apps/mobile test
+      - run: npm run --prefix apps/mobile build
+      - name: Build signed Android App Bundle
+        env:
+          KEYSTORE_BASE64: ${{ secrets.HERMES_MOBILE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.HERMES_MOBILE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.HERMES_MOBILE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.HERMES_MOBILE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            test -n "${!name}" || { echo "Missing required mobile release-signing secret: $name" >&2; exit 1; }
+          done
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          keystore="$RUNNER_TEMP/hermes-mobile-upload.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          cd apps/mobile
+          npx cap sync android --deployment
+          cd android
+          ./gradlew bundleRelease --no-daemon \
+            -PhermesMobileStoreFile="$keystore" \
+            -PhermesMobileStorePassword="$KEYSTORE_PASSWORD" \
+            -PhermesMobileKeyAlias="$KEY_ALIAS" \
+            -PhermesMobileKeyPassword="$KEY_PASSWORD"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hermes-mobile-${{ inputs.version_name }}-aab
+          path: apps/mobile/android/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+          retention-days: 14

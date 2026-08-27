@@ -16,19 +16,24 @@ import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { isEditableTarget } from '@/lib/keybinds/combo'
 import { composerFocusBlockedBySurface } from '@/lib/keybinds/composer-focus-keys'
 
-import { requestComposerAttachImages, requestComposerFocus, requestComposerInsert } from './focus'
+import { requestComposerAttachFiles, requestComposerAttachImages, requestComposerFocus, requestComposerInsert } from './focus'
 import { pathifyRefs } from './path-refs'
-import { extractClipboardImageBlobs } from './text-utils'
+import { extractClipboardFiles, extractClipboardImageBlobs } from './text-utils'
 import { linkifyUrls } from './url-refs'
 
 /** Route clipboard contents to the active composer. True when it carried
  *  something a composer can take (the caller should swallow the event). */
 export function routeClipboardToComposer(clipboard: DataTransfer): boolean {
   const blobs = extractClipboardImageBlobs(clipboard)
+  const files = extractClipboardFiles(clipboard)
   const text = sanitizeComposerInput(clipboard.getData('text').trim())
 
   if (blobs.length > 0) {
     requestComposerAttachImages(blobs)
+  }
+
+  if (files.length > 0) {
+    requestComposerAttachFiles(files)
   }
 
   // A bare `data:` URL IS the image attached above — not text to insert.
@@ -40,8 +45,9 @@ export function routeClipboardToComposer(clipboard: DataTransfer): boolean {
     return true
   }
 
-  if (blobs.length > 0) {
-    // Image-only paste: pull focus so the attach lands somewhere visible.
+  if (blobs.length > 0 || files.length > 0) {
+    // Attachment-only paste: pull focus so the pending files land somewhere
+    // visible. The receiving composer gives each mobile file an opaque handle.
     requestComposerFocus('active')
 
     return true
