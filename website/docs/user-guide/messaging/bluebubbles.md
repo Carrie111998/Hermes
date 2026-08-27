@@ -151,7 +151,7 @@ Some features require the BlueBubbles [Private API helper](https://docs.bluebubb
 - Read receipts
 - Creating new chats by address
 
-When Private API is enabled and the helper is connected, outbound text, attachments and new chats are also sent through the Private API. This keeps sends working when the macOS user running BlueBubbles is not the active GUI login (fast user switching, a headless Mac mini), where the server's default AppleScript send path cannot reach Messages.app.
+When Private API is enabled and the helper is connected, outbound text, attachments and new chats are also sent through the Private API. This keeps sends working when the macOS user running BlueBubbles is not the active GUI login (fast user switching, a headless Mac mini), where the server's default AppleScript send path cannot reach Messages.app. The check is made per request, so a long reply that is split into several chunks re-evaluates it for each chunk: if the helper disconnects mid-message, the remaining chunks fall back to the AppleScript path instead of failing — one visible message can therefore be delivered by both mechanisms.
 
 Without the Private API, basic text messaging and media still work.
 

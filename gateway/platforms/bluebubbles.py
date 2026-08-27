@@ -13,9 +13,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections import OrderedDict
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -520,7 +520,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         payload = {
             "addresses": [address],
             "message": message,
-            "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+            "tempGuid": f"temp-{time.time_ns()}",
         }
         if self._use_private_api_send():
             payload["method"] = "private-api"
@@ -578,7 +578,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
             payload: Dict[str, Any] = {
                 "chatGuid": guid,
-                "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+                "tempGuid": f"temp-{time.time_ns()}",
                 "message": chunk,
             }
             if self._use_private_api_send():
