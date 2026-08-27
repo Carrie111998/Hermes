@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
+from gateway.config import Platform
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +484,32 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         assert kb.list_notify_subs(conn) == []
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.SLACK])
+async def test_gateway_create_does_not_autosubscribe_non_telegram_roots(kanban_home, platform):
+    """Gateway slash creates retain output but never auto-subscribe non-Telegram chats."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    source = SimpleNamespace(
+        platform=platform,
+        chat_id="channel-42",
+        thread_id="thread-7",
+        user_id="u1",
+    )
+    event = SimpleNamespace(
+        text='/kanban create "non telegram root" --assignee alice',
+        source=source,
+    )
+
+    out = await GatewayRunner._handle_kanban_command(runner, event)
+
+    assert "subscribed" not in out.lower()
+    with kb.connect() as conn:
+        assert len(kb.list_tasks(conn)) == 1
+        assert kb.list_notify_subs(conn) == []
 
 
 @pytest.mark.asyncio
