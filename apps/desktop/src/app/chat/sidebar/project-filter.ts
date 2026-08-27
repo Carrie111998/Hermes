@@ -28,5 +28,6 @@ export function resolveLiveProjectFilter(
   }
 
   const liveIds = new Set(tree.map(project => project.id))
+
   return projectFilter.filter(id => liveIds.has(id))
 }
