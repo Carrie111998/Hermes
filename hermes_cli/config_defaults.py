@@ -137,6 +137,9 @@ DEFAULT_CONFIG = {
         # transport-layer failures (timeout/overloaded) before the agent
         # switches to the fallback model.  Lower to 1 for fast failover on
         # flaky primaries; raise to tolerate longer provider hiccups.
+        # 0 disables transport-failure fallback entirely (rate-limit and
+        # billing failover still applies); negative values are invalid
+        # and fall back to the default.
         "transport_fallback_threshold": 2,
         # Empty-response retry guard (NS-503).  The empty-retry loop
         # re-sends the full conversation input at full price on every
