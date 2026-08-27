@@ -38,10 +38,6 @@ class MissingRequesterIdentity(RuntimeError):
     """Raised in ``per_user`` mode when no trusted bound principal exists."""
 
 
-class McpOAuthScopeMismatch(RuntimeError):
-    """Raised when a connection's captured scope differs from the request scope."""
-
-
 @dataclass(frozen=True, slots=True)
 class McpOAuthPrincipal:
     """Immutable requester identity for MCP OAuth isolation."""
@@ -70,29 +66,25 @@ class McpOAuthScope:
     mode: Literal["shared", "per_user"]
     principal: Optional[McpOAuthPrincipal] = None
 
-    def persistence_key(self) -> str:
-        if self.mode == IDENTITY_MODE_SHARED or self.principal is None:
-            return IDENTITY_MODE_SHARED
-        return self.principal.persistence_key()
+    def __post_init__(self) -> None:
+        if self.mode == IDENTITY_MODE_SHARED:
+            if self.principal is not None:
+                object.__setattr__(self, "principal", None)
+            return
+        if self.principal is None:
+            raise MissingRequesterIdentity(
+                "per_user MCP OAuth scope requires a bound requester principal."
+            )
 
-    def log_fingerprint(self) -> str:
-        """Opaque identifier safe for operational logs."""
-        key = self.persistence_key()
-        if key == IDENTITY_MODE_SHARED:
+    def persistence_key(self) -> str:
+        if self.mode == IDENTITY_MODE_SHARED:
             return IDENTITY_MODE_SHARED
-        return key[:18]
+        # ``__post_init__`` requires a principal in per_user mode.
+        assert self.principal is not None
+        return self.principal.persistence_key()
 
 
 SHARED_SCOPE = McpOAuthScope(mode="shared", principal=None)
-
-
-@dataclass(frozen=True, slots=True)
-class McpConnectionKey:
-    server_name: str
-    oauth_scope: McpOAuthScope
-
-    def registry_token(self) -> str:
-        return connection_registry_token(self.server_name, self.oauth_scope)
 
 
 def parse_identity_mode(value: Any, *, explicit: bool = True) -> str:
@@ -160,21 +152,6 @@ def principal_from_bound_fields(
     )
 
 
-def principal_from_bound_session() -> Optional[McpOAuthPrincipal]:
-    """Build a principal from the bound-only session getter. Never env fallback."""
-    from gateway.session_context import get_bound_session_principal
-
-    bound = get_bound_session_principal()
-    if bound is None:
-        return None
-    try:
-        return principal_from_bound_fields(
-            bound.platform, bound.scope_id, bound.user_id
-        )
-    except MissingRequesterIdentity:
-        return None
-
-
 def resolve_mcp_oauth_scope(
     *,
     identity_mode: Optional[str] = None,
@@ -201,7 +178,13 @@ def resolve_mcp_oauth_scope(
 
     resolved = principal
     if resolved is None:
-        resolved = principal_from_bound_session()
+        from gateway.session_context import get_bound_session_principal
+
+        bound = get_bound_session_principal()
+        if bound is not None:
+            resolved = principal_from_bound_fields(
+                bound.platform, bound.scope_id, bound.user_id
+            )
     if resolved is None:
         raise MissingRequesterIdentity(
             "MCP OAuth requires an authenticated requester identity in "
@@ -217,6 +200,19 @@ def connection_registry_token(server_name: str, scope: McpOAuthScope) -> str:
     if scope.mode == IDENTITY_MODE_SHARED:
         return server_name
     return f"{server_name}{REGISTRY_SEPARATOR}{scope.persistence_key()}"
+
+
+def registry_key_prefix(server_name: str) -> str:
+    return f"{server_name}{REGISTRY_SEPARATOR}"
+
+
+def is_registry_key_for_server(key: str, server_name: str) -> bool:
+    """True if ``key`` is the bare name or a per-user token for that server.
+
+    Status/discovery aggregation only. Credential paths must use
+    :func:`connection_registry_token` for an exact match.
+    """
+    return key == server_name or key.startswith(registry_key_prefix(server_name))
 
 
 def schema_cache_entry_key(
@@ -236,4 +232,4 @@ def schema_cache_entry_key(
         return server_name
     if (cache_scope or "").lower() == "public":
         return server_name
-    return f"{server_name}{REGISTRY_SEPARATOR}{scope.persistence_key()}"
+    return connection_registry_token(server_name, scope)

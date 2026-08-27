@@ -3926,7 +3926,6 @@ class MCPServerTask:
         """
         from hermes_constants import get_hermes_home
         from tools.mcp_oauth_identity import (
-            SHARED_SCOPE,
             connection_registry_token,
             resolve_mcp_oauth_scope,
             server_uses_oauth,
@@ -3938,8 +3937,6 @@ class MCPServerTask:
             _oauth_protected_servers.add(self.name)
         self._oauth_scope = resolve_mcp_oauth_scope(uses_oauth=uses_oauth)
         self._registry_key = connection_registry_token(self.name, self._oauth_scope)
-        if self._oauth_scope is SHARED_SCOPE:
-            self._registry_key = self.name
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -4597,17 +4594,15 @@ def _mcp_server_uses_oauth(server_name: str, *, server=None, config=None) -> boo
     return bool(lazy is not None and server_uses_oauth(lazy))
 
 
-def _mcp_registry_key_or_none(
+def _oauth_call_target(
     server_name: str,
     *,
-    server=None,
     config=None,
-    oauth_scope=None,
-):
-    """Return ``(registry_key, scope)`` or ``(None, None)`` if identity is missing.
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(registry_key, error_json)``. Error is set iff the key is missing.
 
-    Shared mode and non-OAuth servers keep the historical bare server name
-    so existing callers that index ``_servers[name]`` still work.
+    Per-user OAuth without a bound principal fails closed. Shared and
+    non-OAuth always resolve to a key (the bare server name).
     """
     from tools.mcp_oauth_identity import (
         MissingRequesterIdentity,
@@ -4615,43 +4610,17 @@ def _mcp_registry_key_or_none(
         resolve_mcp_oauth_scope,
     )
 
-    captured = oauth_scope
-    if captured is None and server is not None:
-        captured = getattr(server, "_oauth_scope", None)
     try:
-        if captured is not None:
-            scope = captured
-        else:
-            uses = _mcp_server_uses_oauth(
-                server_name, server=server, config=config
-            )
-            scope = resolve_mcp_oauth_scope(uses_oauth=uses)
-        return connection_registry_token(server_name, scope), scope
+        uses = _mcp_server_uses_oauth(server_name, config=config)
+        scope = resolve_mcp_oauth_scope(uses_oauth=uses)
     except MissingRequesterIdentity:
-        return None, None
-
-
-def _mcp_live_key(server_name: str, *, server=None, config=None) -> str:
-    """Registry token for this requester, or the bare name when unscoped."""
-    rk, _scope = _mcp_registry_key_or_none(
-        server_name, server=server, config=config
-    )
-    return rk if rk is not None else server_name
-
-
-def _mcp_missing_identity_error(server_name: str):
-    """JSON error when per_user OAuth has no bound requester; else None."""
-    if not _mcp_server_uses_oauth(server_name):
-        return None
-    rk, _scope = _mcp_registry_key_or_none(server_name)
-    if rk is not None:
-        return None
-    return tool_error(
-        "MCP OAuth requires an authenticated requester identity in "
-        "per_user mode. Direct CLI, TUI, desktop, and cron paths "
-        "without a bound gateway principal cannot use a shared "
-        f"credential as a fallback. Server '{server_name}' was not called."
-    )
+        return None, tool_error(
+            "MCP OAuth requires an authenticated requester identity in "
+            "per_user mode. Direct CLI, TUI, desktop, and cron paths "
+            "without a bound gateway principal cannot use a shared "
+            f"credential as a fallback. Server '{server_name}' was not called."
+        )
+    return connection_registry_token(server_name, scope), None
 
 
 def _task_registry_key(server) -> str:
@@ -4663,13 +4632,11 @@ def _any_live_named(server_name: str) -> bool:
 
     Used for tool-name aggregation and status, not credential selection.
     """
-    from tools.mcp_oauth_identity import REGISTRY_SEPARATOR
+    from tools.mcp_oauth_identity import is_registry_key_for_server
 
-    if server_name in _servers:
-        return True
-    prefix = f"{server_name}{REGISTRY_SEPARATOR}"
     return any(
-        k.startswith(prefix) or getattr(srv, "name", None) == server_name
+        is_registry_key_for_server(k, server_name)
+        or getattr(srv, "name", None) == server_name
         for k, srv in _servers.items()
     )
 
@@ -4677,36 +4644,28 @@ def _any_live_named(server_name: str) -> bool:
 def _find_named_in_map(mapping, server_name: str):
     """Prefer the current requester's entry; else any key for this server.
 
-    Credential-bearing call paths must use ``_mcp_live_key`` instead.
+    Credential-bearing call paths must use ``_oauth_call_target`` instead.
     This helper is for status/banner aggregation only.
     """
+    from tools.mcp_oauth_identity import is_registry_key_for_server
+
     if not isinstance(mapping, dict):
         return None
-    rk, _scope = _mcp_registry_key_or_none(server_name)
+    rk, _err = _oauth_call_target(server_name)
     if rk is not None and rk in mapping:
         return mapping[rk]
-    hit = mapping.get(server_name)
-    if hit is not None:
-        return hit
-    from tools.mcp_oauth_identity import REGISTRY_SEPARATOR
-
-    prefix = f"{server_name}{REGISTRY_SEPARATOR}"
     for key, value in mapping.items():
-        if key.startswith(prefix) or getattr(value, "name", None) == server_name:
+        if is_registry_key_for_server(key, server_name):
+            return value
+        if getattr(value, "name", None) == server_name:
             return value
     return None
 
 
 def _name_in_keyed_set(container, server_name: str) -> bool:
-    if server_name in container:
-        return True
-    rk, _scope = _mcp_registry_key_or_none(server_name)
-    if rk is not None and rk in container:
-        return True
-    from tools.mcp_oauth_identity import REGISTRY_SEPARATOR
+    from tools.mcp_oauth_identity import is_registry_key_for_server
 
-    prefix = f"{server_name}{REGISTRY_SEPARATOR}"
-    return any(k.startswith(prefix) for k in container)
+    return any(is_registry_key_for_server(k, server_name) for k in container)
 
 
 def _maybe_pop_lazy(server_name: str):
@@ -4947,7 +4906,9 @@ def reconnect_mcp_server(server_name: str) -> bool:
     Looks up the current requester's connection only. There is no
     "any connection named X" fallback.
     """
-    rk = _mcp_live_key(server_name)
+    rk, _err = _oauth_call_target(server_name)
+    if rk is None:
+        return False
     with _lock:
         server = _servers.get(rk)
     if server is None:
@@ -5167,11 +5128,19 @@ def _handle_auth_error_and_retry(
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
 
-    rk = _mcp_live_key(server_name)
+    rk, identity_error = _oauth_call_target(server_name)
+    if rk is None:
+        return identity_error
     with _lock:
         srv = _servers.get(rk)
-    captured_scope = getattr(srv, "_oauth_scope", None) if srv is not None else None
-    captured_home = getattr(srv, "_hermes_home", None) if srv is not None else None
+    if srv is None:
+        # Exact-key miss: do not recover against ambient/shared credentials.
+        return None
+    captured_scope = getattr(srv, "_oauth_scope", None)
+    if captured_scope is None:
+        from tools.mcp_oauth_identity import SHARED_SCOPE
+        captured_scope = SHARED_SCOPE
+    captured_home = getattr(srv, "_hermes_home", None)
 
     async def _recover():
         return await manager.handle_401(
@@ -5376,7 +5345,9 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
-    rk = _mcp_live_key(server_name)
+    rk, _err = _oauth_call_target(server_name)
+    if rk is None:
+        return None
     with _lock:
         srv = _servers.get(rk)
     if srv is None or not hasattr(srv, "_reconnect_event"):
@@ -6127,7 +6098,10 @@ def _resolve_server_lazy(name: str, config: dict) -> bool:
     return _parse_boolish(config.get("lazy", False), default=False)
 
 
-def _ensure_lazy_server_connected(server_name: str) -> bool:
+def _ensure_lazy_server_connected(
+    server_name: str,
+    registry_key: Optional[str] = None,
+) -> bool:
     """Connect a lazily-registered MCP server on demand (sync, blocks caller).
 
     Composes with the existing connect machinery: respects the per-server
@@ -6137,7 +6111,9 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     session is available afterwards.
     """
     with _lock:
-        rk, _scope = _mcp_registry_key_or_none(server_name)
+        rk = registry_key
+        if rk is None:
+            rk, _err = _oauth_call_target(server_name)
         if rk is None:
             return False
         server = _servers.get(rk)
@@ -6200,15 +6176,23 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     return server is not None and server.session is not None
 
 
-def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
+def _get_connected_server_for_call(
+    server_name: str,
+    registry_key: Optional[str] = None,
+) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state.
 
     Also the single first-use connect point for lazy (schema-cache
     registered) servers, so raw tool calls AND the resource/prompt utility
     handlers all trigger the deferred spawn (#56832).
+
+    Pass ``registry_key`` when the caller already resolved the fail-closed
+    target so this lookup does not re-read identity config.
     """
     with _lock:
-        rk, _scope = _mcp_registry_key_or_none(server_name)
+        rk = registry_key
+        if rk is None:
+            rk, _err = _oauth_call_target(server_name)
         if rk is None:
             # per_user OAuth without a bound principal: do not pick any
             # live connection. The handler surfaces a fail-closed error.
@@ -6220,7 +6204,7 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     if is_lazy and (server is None or server.session is None):
         if rk is None:
             return None
-        _ensure_lazy_server_connected(server_name)
+        _ensure_lazy_server_connected(server_name, rk)
         with _lock:
             server = _servers.get(rk)
         return server
@@ -6312,10 +6296,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if gate_error is not None:
             return gate_error
 
-        identity_error = _mcp_missing_identity_error(server_name)
+        rk, identity_error = _oauth_call_target(server_name)
         if identity_error is not None:
             return identity_error
-        rk = _mcp_live_key(server_name)
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -6341,7 +6324,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 )
             # Cooldown elapsed → fall through as a half-open probe.
 
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, rk)
         if not server:
             _bump_server_error(rk)
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -6635,10 +6618,10 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        identity_error = _mcp_missing_identity_error(server_name)
+        rk, identity_error = _oauth_call_target(server_name)
         if identity_error is not None:
             return identity_error
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, rk)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -6697,10 +6680,10 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        identity_error = _mcp_missing_identity_error(server_name)
+        rk, identity_error = _oauth_call_target(server_name)
         if identity_error is not None:
             return identity_error
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, rk)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -6761,10 +6744,10 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        identity_error = _mcp_missing_identity_error(server_name)
+        rk, identity_error = _oauth_call_target(server_name)
         if identity_error is not None:
             return identity_error
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, rk)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -6825,10 +6808,10 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        identity_error = _mcp_missing_identity_error(server_name)
+        rk, identity_error = _oauth_call_target(server_name)
         if identity_error is not None:
             return identity_error
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, rk)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -6894,7 +6877,7 @@ def _make_check_fn(server_name: str):
 
     def _check() -> bool:
         with _lock:
-            rk, _scope = _mcp_registry_key_or_none(server_name)
+            rk, _err = _oauth_call_target(server_name)
             if rk is not None:
                 server = _servers.get(rk)
                 if server is not None and (
@@ -7866,22 +7849,14 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     return registered_names
 
 
-def _stash_per_user_oauth_without_principal(servers: Dict[str, dict]) -> tuple:
-    """Defer OAuth connects when per_user mode has no bound requester.
+def _stash_per_user_oauth_without_principal(deferred: Dict[str, dict]) -> tuple:
+    """Register unscoped cache tools for OAuth servers lacking a principal.
 
-    Returns ``(lazy_tool_count, lazy_server_count)``. Does not pick a shared
-    human credential at process start. Tool names may still be registered
-    from the unscoped schema cache.
+    ``deferred`` is already the fail-closed set (per_user OAuth, no bound
+    requester). Does not re-resolve identity. Returns
+    ``(lazy_tool_count, lazy_server_count)``.
     """
-    from tools.mcp_oauth_identity import (
-        IDENTITY_MODE_PER_USER,
-        MissingRequesterIdentity,
-        configured_identity_mode,
-        resolve_mcp_oauth_scope,
-        server_uses_oauth,
-    )
-
-    if configured_identity_mode() != IDENTITY_MODE_PER_USER:
+    if not deferred:
         return 0, 0
 
     try:
@@ -7892,16 +7867,7 @@ def _stash_per_user_oauth_without_principal(servers: Dict[str, dict]) -> tuple:
 
     tools = 0
     count = 0
-    for name, cfg in servers.items():
-        if not _parse_boolish(cfg.get("enabled", True), default=True):
-            continue
-        if not server_uses_oauth(cfg):
-            continue
-        try:
-            resolve_mcp_oauth_scope(uses_oauth=True)
-            continue
-        except MissingRequesterIdentity:
-            pass
+    for name, cfg in deferred.items():
         already_lazy = name in _lazy_server_configs
         with _lock:
             _lazy_server_configs.setdefault(name, dict(cfg))
@@ -7964,21 +7930,25 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # duplicate subprocess spawns when ``discover_mcp_tools()`` is called
     # from multiple entry-points before the first batch finishes (#58862).
     connecting_by_name: Dict[str, str] = {}
+    deferred_oauth: Dict[str, dict] = {}
     with _lock:
         connecting = set(_server_connecting)
         for srv_name, srv_cfg in servers.items():
             if server_uses_oauth(srv_cfg):
                 _oauth_protected_servers.add(srv_name)
         new_servers: Dict[str, dict] = {}
+        resolved_keys: Dict[str, str] = {}
         for k, v in servers.items():
             if not _parse_boolish(v.get("enabled", True), default=True):
                 continue
-            if k in _lazy_server_configs:
-                continue
-            rk, _scope = _mcp_registry_key_or_none(k, config=v)
+            rk, _err = _oauth_call_target(k, config=v)
             if rk is None:
                 # per_user OAuth without a bound principal: never eager-connect
                 # with a shared token. Stashed as lazy below.
+                deferred_oauth[k] = v
+                continue
+            resolved_keys[k] = rk
+            if k in _lazy_server_configs:
                 continue
             if rk in _servers or rk in connecting:
                 continue
@@ -7993,10 +7963,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         # (#50170). Wake them now so their tools come back promptly.
         # Exact requester key only — do not wake Bob's connection for Alice.
         stale_cached = []
-        for k, v in servers.items():
-            rk, _scope = _mcp_registry_key_or_none(k, config=v)
-            if rk is None:
-                continue
+        for k, rk in resolved_keys.items():
             srv = _servers.get(rk)
             if srv is not None and getattr(srv, "session", None) is None:
                 stale_cached.append(srv)
@@ -8016,7 +7983,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     lazy_registered = 0
     lazy_server_count = 0
     oauth_lazy_tools, oauth_lazy_servers = _stash_per_user_oauth_without_principal(
-        servers
+        deferred_oauth
     )
     lazy_registered += oauth_lazy_tools
     lazy_server_count += oauth_lazy_servers

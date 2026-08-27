@@ -17,11 +17,14 @@ from tools.mcp_oauth_identity import (
     SHARED_SCOPE,
     InvalidMcpOAuthIdentityModeError,
     McpOAuthPrincipal,
+    McpOAuthScope,
     MissingRequesterIdentity,
     configured_identity_mode,
     connection_registry_token,
+    is_registry_key_for_server,
     parse_identity_mode,
     principal_from_bound_fields,
+    registry_key_prefix,
     resolve_mcp_oauth_scope,
     schema_cache_entry_key,
     server_uses_oauth,
@@ -232,3 +235,24 @@ class TestRegistryAndCacheKeys:
         assert not server_uses_oauth({"command": "npx"})
         assert not server_uses_oauth({"auth": "header"})
         assert not server_uses_oauth(None)
+
+    def test_per_user_scope_requires_principal(self):
+        with pytest.raises(MissingRequesterIdentity):
+            McpOAuthScope(mode="per_user", principal=None)
+
+    def test_shared_scope_strips_principal(self):
+        scope = McpOAuthScope(mode="shared", principal=_principal())
+        assert scope.principal is None
+        assert scope.persistence_key() == "shared"
+
+    def test_registry_key_prefix_match(self):
+        alice = resolve_mcp_oauth_scope(
+            identity_mode="per_user", principal=_principal(user_id="U-a")
+        )
+        token = connection_registry_token("github", alice)
+        assert token.startswith(registry_key_prefix("github"))
+        assert is_registry_key_for_server("github", "github")
+        assert is_registry_key_for_server(token, "github")
+        assert not is_registry_key_for_server(token, "gitlab")
+        assert not is_registry_key_for_server("github-extra", "github")
+        assert schema_cache_entry_key("github", alice) == token

@@ -58,9 +58,10 @@ import webbrowser
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 from hermes_constants import secure_parent_dir
+from tools.mcp_oauth_identity import McpOAuthScope, PERSISTENCE_KEY_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -475,7 +476,7 @@ class HermesTokenStorage:
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
-        oauth_scope: Any = None,
+        oauth_scope: Optional[McpOAuthScope] = None,
     ):
         from hermes_constants import get_hermes_home
         from tools.mcp_oauth_identity import resolve_mcp_oauth_scope
@@ -1306,7 +1307,7 @@ def remove_oauth_tokens(
     server_name: str,
     *,
     hermes_home: str | Path | None = None,
-    oauth_scope: Any = None,
+    oauth_scope: Optional[McpOAuthScope] = None,
     all_identities: bool = False,
 ) -> None:
     """Delete stored OAuth tokens and client info for a server.
@@ -1339,7 +1340,7 @@ def _remove_oauth_tokens_all_identities(
     by_user = base / "by-user"
     if by_user.is_dir():
         for ns in by_user.iterdir():
-            if not ns.is_dir() or not ns.name.startswith("u-v1-"):
+            if not ns.is_dir() or not ns.name.startswith(PERSISTENCE_KEY_PREFIX):
                 continue
             for suffix in suffixes:
                 (ns / f"{safe}{suffix}").unlink(missing_ok=True)

@@ -215,6 +215,17 @@ class TestPerUserManager:
             "github", tmp_path, oauth_scope=_alice_scope()
         ) != manager._key("github", tmp_path, oauth_scope=_bob_scope())
 
+    def test_key_without_scope_stays_shared(self, tmp_path):
+        from tools.mcp_oauth_manager import MCPOAuthManager
+
+        manager = MCPOAuthManager()
+        assert manager._key("github", tmp_path) == manager._key(
+            "github", tmp_path, oauth_scope=SHARED_SCOPE
+        )
+        assert manager._key("github", tmp_path) != manager._key(
+            "github", tmp_path, oauth_scope=_alice_scope()
+        )
+
     def test_alice_remove_does_not_evict_bob(self, tmp_path, monkeypatch):
         pytest.importorskip("mcp.client.auth.oauth2")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -369,7 +380,7 @@ class TestPerUserRuntimeRegistry:
         try:
             reset_session_vars()
             assert mcp._get_connected_server_for_call("github") is None
-            err = mcp._mcp_missing_identity_error("github")
+            err = mcp._oauth_call_target("github")[1]
             assert err is not None
             assert "per_user" in err
         finally:
