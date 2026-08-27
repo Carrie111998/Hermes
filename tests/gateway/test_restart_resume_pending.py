@@ -860,6 +860,59 @@ class TestStuckLoopEscalation:
         assert second.session_id != entry.session_id
         assert second.auto_reset_reason == "suspended"
 
+    @pytest.mark.asyncio
+    async def test_startup_auto_resume_attempts_eventually_suspend_after_sigkill(
+        self, tmp_path, monkeypatch
+    ):
+        """Crash-left resumes must be bounded even without graceful shutdown.
+
+        A SIGKILL never reaches ``stop()`` and therefore cannot increment the
+        shutdown-time restart counter.  Each actual startup auto-resume attempt
+        must persist an attempt itself so a long-running hang (whose restart
+        interval exceeds the global loop guard window) is eventually retired.
+        """
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        # Model the reported >1h hang: every inter-boot gap exceeds the global
+        # guard's 300s chain window, so that process-wide breaker never trips.
+        monkeypatch.setattr(
+            "gateway.restart_loop_guard.check_and_record", lambda *_a, **_k: False
+        )
+        source = make_restart_source(chat_id="sigkill-loop")
+        pending_entry = SessionEntry(
+            session_key="agent:main:telegram:dm:sigkill-loop",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+        )
+
+        for _attempt in range(GatewayRunner._STUCK_LOOP_THRESHOLD):
+            runner, adapter = make_restart_runner()
+            runner.session_store._entries = {pending_entry.session_key: pending_entry}
+            adapter.handle_message = AsyncMock()
+
+            assert runner._suspend_stuck_loop_sessions() == 0
+            assert runner._schedule_resume_pending_sessions() == 1
+            await asyncio.sleep(0)
+
+        final_runner, final_adapter = make_restart_runner()
+        final_runner.session_store._entries = {
+            pending_entry.session_key: pending_entry
+        }
+        final_adapter.handle_message = AsyncMock()
+
+        assert final_runner._suspend_stuck_loop_sessions() == 1
+        assert pending_entry.suspended is True
+        assert final_runner._schedule_resume_pending_sessions() == 0
+        final_adapter.handle_message.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_auto_resume_sets_sentinel_before_task_execution():

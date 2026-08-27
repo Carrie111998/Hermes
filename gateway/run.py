@@ -11370,8 +11370,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Increment restart-failure counters for sessions active at shutdown.
 
         Persists to a JSON file so counters survive across restarts.
-        Sessions NOT in active_session_keys are removed (they completed
-        successfully, so the loop is broken).
+        Existing counts survive while their session is still resume-pending;
+        successful turns clear their own count in
+        ``_clear_restart_failure_count``.  This matters when an unrelated
+        active session triggers a graceful shutdown while a prior startup
+        resume attempt is pending: rewriting only ``active_session_keys``
+        would otherwise erase that prior failure.
         """
         import json
 
@@ -11381,17 +11385,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             counts = {}
 
-        # Increment active sessions, remove inactive ones (loop broken)
-        new_counts = {}
+        # Retain unresolved startup-resume attempts. Successful turns already
+        # remove their count explicitly, so absence from this shutdown's
+        # active snapshot is not proof that a pending recovery succeeded.
+        new_counts = {
+            key: value
+            for key, value in counts.items()
+            if (
+                (entry := self.session_store._entries.get(key)) is not None
+                and entry.resume_pending
+                and not entry.suspended
+            )
+        }
         for key in active_session_keys:
             new_counts[key] = counts.get(key, 0) + 1
-        # Keep any entries that are still above 0 even if not active now
-        # (they might become active again next restart)
 
         try:
             atomic_json_write(path, new_counts, indent=None)
         except Exception:
             pass
+
+    def _record_startup_resume_attempt(self, session_key: str) -> None:
+        """Persist one synthetic startup-resume attempt for ``session_key``.
+
+        Unlike the shutdown counter, this runs before dispatch and therefore
+        survives SIGKILL.  A successful turn uses the existing clear path;
+        repeated crash-left attempts reach ``_STUCK_LOOP_THRESHOLD`` and are
+        suspended by ``_suspend_stuck_loop_sessions`` on the next boot.
+        """
+        import json
+
+        path = _hermes_home / self._STUCK_LOOP_FILE
+        try:
+            counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            counts = {}
+
+        previous = counts.get(session_key, 0)
+        if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
+            previous = 0
+        counts[session_key] = previous + 1
+        try:
+            atomic_json_write(path, counts, indent=None)
+        except Exception:
+            logger.debug(
+                "Failed to persist startup auto-resume attempt for %s",
+                session_key,
+                exc_info=True,
+            )
 
     def _suspend_stuck_loop_sessions(self) -> int:
         """Suspend sessions that have been active across too many restarts.
@@ -11434,9 +11475,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        # Clear the file — counters start fresh after suspension
+        # Remove only suspended rows. Other sessions may still be accumulating
+        # independent startup-resume failures and must keep their progress.
         try:
-            path.unlink(missing_ok=True)
+            remaining = {k: v for k, v in counts.items() if k not in stuck_keys}
+            if remaining:
+                atomic_json_write(path, remaining, indent=None)
+            else:
+                path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -12439,6 +12485,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     entry.session_key, exc,
                 )
                 continue
+
+            # Count the attempt before task creation. A hard kill can prevent
+            # every shutdown/finally path from running, so shutdown-only
+            # accounting cannot bound this retry class. Successful completion
+            # clears this same counter in _handle_message_with_agent.
+            self._record_startup_resume_attempt(entry.session_key)
 
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
