@@ -15,6 +15,23 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _attest(project_id="p1", revision=1, body="the plan", decision="approved"):
+    """A real broker-produced attestation via a stub TTY (fresh nonce each call)."""
+    from hermes_cli import approval_broker as ab
+
+    class _TTY:
+        name = "/dev/tty"
+        def write(self, s): pass
+        def flush(self): pass
+        def readline(self): return ab.CONFIRM_PHRASES[decision] + chr(10)
+        def close(self): pass
+
+    return ab.for_plan_decision(
+        project_id=project_id, revision=revision, plan_body=body,
+        decision=decision, _tty_opener=lambda: _TTY(),
+    )
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = kb.connect(db_path=tmp_path / "kanban.db")
@@ -27,6 +44,11 @@ def _gated(conn, title="work"):
     conn.execute(
         "INSERT INTO pm_projects (id, slug, name, plan_revision, archived, created_at)"
         " VALUES ('p1','s','n',1,0,1)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 1, 'the plan', 1, ?)", (tid,)
     )
     assert kb.park_for_plan_approval(conn, tid, project_id="p1", revision=1) is True
     return tid
@@ -107,6 +129,11 @@ def test_parent_completion_does_not_release_a_gated_child(conn):
         "INSERT INTO pm_projects (id, slug, name, plan_revision, archived, created_at)"
         " VALUES ('p1','s','n',1,0,1)"
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 1, 'the plan', 1, ?)", (child,)
+    )
     kb.park_for_plan_approval(conn, child, project_id="p1", revision=1)
     kb.complete_task(conn, parent, result="done")
     kb.recompute_ready(conn)
@@ -135,10 +162,10 @@ def test_reconcile_and_crash_sweeps_do_not_release_a_gate(conn):
 def test_only_release_plan_gate_lets_it_out(conn):
     tid = _gated(conn)
     assert kb.unblock_task(conn, tid) is False
-    assert kb.promote_task(conn, tid, actor="r")[0] is False
+    assert kb.promote_task(conn, tid, actor="rick")[0] is False
     assert kb.claim_task(conn, tid) is None
     assert kb.gate_state_of(conn, tid) == "plan"
-    ok, why = kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    ok, why = kb.release_plan_gate(conn, tid, attestation=_attest())
     assert ok is True and why is None
     assert kb.gate_state_of(conn, tid) is None
     assert kb.get_task(conn, tid).status == "ready"
@@ -146,7 +173,7 @@ def test_only_release_plan_gate_lets_it_out(conn):
 
 def test_after_release_the_ordinary_paths_work_again(conn):
     tid = _gated(conn)
-    kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    kb.release_plan_gate(conn, tid, attestation=_attest())
     kb.schedule_task(conn, tid, reason="later")
     assert kb.unblock_task(conn, tid) is True
 
@@ -166,6 +193,11 @@ def _gated_parent_with_child(conn):
     conn.execute(
         "INSERT INTO pm_projects (id, slug, name, plan_revision, archived, created_at)"
         " VALUES ('p1','s','n',1,0,1)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 1, 'the plan', 1, ?)", (parent,)
     )
     assert kb.park_for_plan_approval(conn, parent, project_id="p1", revision=1) is True
     return parent, child
@@ -370,6 +402,11 @@ def test_a_gated_childs_edges_remain_editable_and_release_nothing(conn):
     conn.execute(
         "INSERT INTO pm_projects (id, slug, name, plan_revision, archived, created_at)"
         " VALUES ('p1','s','n',1,0,1)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 1, 'the plan', 1, ?)", (child,)
     )
     kb.park_for_plan_approval(conn, child, project_id="p1", revision=1)
     assert kb.unlink_tasks(conn, other, child) is True

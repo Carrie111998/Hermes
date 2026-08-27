@@ -8123,6 +8123,41 @@ def schedule_task(
 # still refuses delegated-child callers, matching every other mutator here.
 
 
+def _audit_gate_refusal(
+    conn: sqlite3.Connection, task_id: str, reason: str
+) -> None:
+    """Record a refused gate release in its own transaction.
+
+    Separate from the release txn on purpose: a post-write failure rolls that
+    transaction back, which would take the audit row with it. Never records the
+    attestation nonce — events are user-facing and the nonce is single-use
+    secret material.
+    """
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "gate_release_refused",
+                {"via": "release_plan_gate", "reason": reason},
+            )
+    except Exception:
+        # Auditing must never turn a refusal into an exception for the caller.
+        pass
+
+
+class _GateReleaseAborted(Exception):
+    """Internal: abort a gate release so ``write_txn`` rolls the whole thing back.
+
+    Returning ``False`` from inside ``write_txn`` COMMITS the transaction. Any
+    failure discovered after a write must therefore raise, not return, or the
+    partial state becomes durable — which is exactly how a replayed attestation
+    once released a gate while reporting that it had refused it.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def gate_state_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return the task's ``gate_state``, or ``None`` when it is not gated."""
     row = conn.execute(
@@ -8183,109 +8218,271 @@ def park_for_plan_approval(
 
     Requesting a gate is not crossing one, so this is safe for a PM agent to
     call. Returns False when the task is not in a parkable status, which makes
-    a double-park a no-op rather than an error.
+    a double-park a no-op rather than an error, and False when the plan is
+    already bound to a different task.
     """
     _assert_not_delegated_child_mutation()
-    with write_txn(conn):
-        params: list[Any] = [task_id]
-        sql = """
-            UPDATE tasks
-               SET status       = 'scheduled',
-                   gate_state   = 'plan',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
-             WHERE id = ?
-               AND gate_state IS NULL
-               AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')
-        """
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params.append(int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        run_id = _end_run(
-            conn, task_id,
-            outcome="gated", status="scheduled", summary=reason,
-        )
-        _append_event(
-            conn, task_id, "plan_awaiting_approval",
-            {"project_id": project_id, "revision": int(revision), "reason": reason},
-            run_id=run_id,
-        )
-        return True
+    try:
+        with write_txn(conn):
+            params: list[Any] = [task_id]
+            sql = """
+                UPDATE tasks
+                   SET status       = 'scheduled',
+                       gate_state   = 'plan',
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND gate_state IS NULL
+                   AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')
+            """
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            if conn.execute(sql, params).rowcount != 1:
+                raise _GateReleaseAborted("task is not in a parkable state")
+
+            # Bind the plan row to this task at park time so the release
+            # boundary has an authoritative link to verify. Adopt-or-refuse: an
+            # unbound plan is claimed, a plan already bound elsewhere is refused
+            # rather than silently re-pointed. The release path enforces the
+            # match again independently — this is convenience, not the boundary.
+            prow = conn.execute(
+                "SELECT id, root_task_id FROM pm_plans "
+                "WHERE project_id = ? AND revision = ?",
+                (project_id, int(revision)),
+            ).fetchone()
+            if prow is not None:
+                if not prow["root_task_id"]:
+                    conn.execute(
+                        "UPDATE pm_plans SET root_task_id = ? "
+                        "WHERE id = ? AND root_task_id IS NULL",
+                        (task_id, prow["id"]),
+                    )
+                elif prow["root_task_id"] != task_id:
+                    raise _GateReleaseAborted(
+                        "plan is already bound to a different root task"
+                    )
+
+            run_id = _end_run(
+                conn, task_id,
+                outcome="gated", status="scheduled", summary=reason,
+            )
+            _append_event(
+                conn, task_id, "plan_awaiting_approval",
+                {"project_id": project_id, "revision": int(revision),
+                 "reason": reason},
+                run_id=run_id,
+            )
+    except _GateReleaseAborted:
+        return False
+    return True
 
 
 def release_plan_gate(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    decision: str,
-    actor: str,
+    attestation,
     reason: Optional[str] = None,
-    expected_revision: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Release a task from the plan gate. The ONLY way out of ``gate_state='plan'``.
 
-    ``decision`` is ``"approved"`` or ``"rejected"``. An approval re-gates on
-    parent completion — landing in ``ready`` only when every parent is terminal,
-    otherwise ``todo`` — so releasing a gate can never jump a dependency. A
-    rejection returns the task to ``triage`` for a revised plan.
+    Requires an ``approval_broker.Attestation``, which carries the decision the
+    human actually confirmed. There is no ``decision`` parameter and no
+    ``expected_revision`` parameter: both were caller-supplied, and an
+    authoritative check must never be optional or overridable.
 
-    ``expected_revision`` guards against approving a plan that has since been
-    superseded: when supplied it must equal the project's current
-    ``plan_revision``, else the release fails safely and the task stays gated.
+    EVERYTHING is re-derived from the database inside the transaction and
+    compared to the attestation before any write:
 
-    Returns ``(ok, reason_on_failure)``.
+      * the project and revision come from the task's own latest
+        ``plan_awaiting_approval`` event, not from the caller;
+      * the plan text comes from the immutable ``pm_plans`` row;
+      * the expected subject and binding hash are recomputed from those;
+      * the project's current ``plan_revision`` must still equal the gated
+        revision, so a superseded plan is always refused.
+
+    An attestation for another project, another revision, or a plan whose body
+    has since changed therefore cannot release this gate.
+
+    On success, in one transaction: ``pm_approvals`` row inserted,
+    ``pm_plans`` CAS-updated with the decision, task gate released, event
+    appended. Every failure after the first write raises so the whole release
+    rolls back; the refusal is then audited in its own transaction.
     """
     _assert_not_delegated_child_mutation()
-    if decision not in ("approved", "rejected"):
-        raise ValueError("decision must be 'approved' or 'rejected'")
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, gate_state FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if row is None:
-            return False, "task not found"
-        if row["gate_state"] != "plan":
-            return False, "task is not parked at the plan gate"
-        if row["status"] != "scheduled":
-            return False, f"gated task in unexpected status {row['status']!r}"
 
-        if expected_revision is not None:
-            prow = conn.execute(
-                "SELECT p.plan_revision AS rev FROM pm_projects p "
-                "JOIN task_events e ON e.task_id = ? "
-                "WHERE p.id = json_extract(e.payload, '$.project_id') "
-                "AND e.kind = 'plan_awaiting_approval' "
-                "ORDER BY e.id DESC LIMIT 1",
-                (task_id,),
+    from hermes_cli import approval_broker as _ab
+
+    if not isinstance(attestation, _ab.Attestation):
+        raise TypeError(
+            "release_plan_gate requires an approval_broker.Attestation; "
+            "a caller-supplied actor string is not evidence of human approval"
+        )
+    decision = attestation.decision
+    if decision not in ("approved", "rejected"):
+        raise ValueError("attestation carries an unknown decision")
+    try:
+        with write_txn(conn):
+            # One authoritative clock reading, taken AFTER the write lock is
+            # held, and used for the expiry check and every timestamp written
+            # below. Checking expiry before the lock let an attestation be
+            # valid at the check, wait behind another writer, expire, and still
+            # authorise the transaction.
+            now = int(time.time())
+            if attestation.expired(now=now):
+                raise _GateReleaseAborted("attestation expired")
+
+            row = conn.execute(
+                "SELECT status, gate_state FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
-            if prow is not None and int(prow["rev"]) != int(expected_revision):
-                return False, (
-                    f"stale plan: expected revision {expected_revision}, "
-                    f"project is at {prow['rev']}"
+            if row is None:
+                raise _GateReleaseAborted("task not found")
+            if row["gate_state"] != "plan":
+                raise _GateReleaseAborted("task is not parked at the plan gate")
+            if row["status"] != "scheduled":
+                raise _GateReleaseAborted(
+                    f"gated task in unexpected status {row['status']!r}"
                 )
 
-        if decision == "approved":
-            landing = "ready" if _parents_satisfied(conn, task_id) else "todo"
-        else:
-            landing = "triage"
+            # --- authoritative project + revision, from the task's own event --
+            ev = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'plan_awaiting_approval' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if ev is None or not ev["payload"]:
+                raise _GateReleaseAborted("no plan_awaiting_approval event for this gate")
+            try:
+                payload = json.loads(ev["payload"])
+                project_id = str(payload["project_id"])
+                revision = int(payload["revision"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                raise _GateReleaseAborted("gate event payload is malformed")
+            if not project_id:
+                raise _GateReleaseAborted("gate event names no project")
 
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, gate_state = NULL "
-            "WHERE id = ? AND status = 'scheduled' AND gate_state = 'plan'",
-            (landing, task_id),
-        )
-        if cur.rowcount != 1:
-            # Lost a race with a concurrent release.
-            return False, "gate was released concurrently"
-        _append_event(
-            conn, task_id,
-            "plan_approved" if decision == "approved" else "plan_rejected",
-            {"actor": actor, "reason": reason, "landing_status": landing},
-        )
-        return True, None
+            proj = conn.execute(
+                "SELECT plan_revision FROM pm_projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if proj is None:
+                raise _GateReleaseAborted(f"project {project_id} not found")
+            # Always enforced, never optional: a superseded plan cannot be
+            # approved even if the caller says nothing about revisions.
+            if int(proj["plan_revision"]) != revision:
+                raise _GateReleaseAborted(
+                    f"stale plan: gate is revision {revision}, project is at "
+                    f"{proj['plan_revision']}"
+                )
+
+            plan = conn.execute(
+                "SELECT id, body, root_task_id, approved_at, rejected_at "
+                "FROM pm_plans WHERE project_id = ? AND revision = ?",
+                (project_id, revision),
+            ).fetchone()
+            if plan is None:
+                raise _GateReleaseAborted(
+                    f"no plan row for {project_id} revision {revision}"
+                )
+            # An ABSENT binding is not a satisfied binding. `if x and x != y`
+            # made NULL mean "skip verification", which let an arbitrary task
+            # be parked against a valid project/revision and approved. For an
+            # artifact-bound approval the authoritative task link must be
+            # present AND match.
+            if not plan["root_task_id"]:
+                raise _GateReleaseAborted(
+                    "plan has no root task binding; refusing to approve an "
+                    "unbound plan"
+                )
+            if plan["root_task_id"] != task_id:
+                raise _GateReleaseAborted(
+                    "plan is bound to a different root task"
+                )
+            if plan["approved_at"] is not None or plan["rejected_at"] is not None:
+                raise _GateReleaseAborted("plan already has a decision")
+
+            # --- the binding check the attestation exists for -----------------
+            expected_subject = _ab.plan_subject(project_id, revision)
+            expected_hash = _ab.plan_binding_hash(
+                project_id, revision, plan["body"] or ""
+            )
+            if attestation.subject != expected_subject:
+                raise _GateReleaseAborted(
+                    "attestation is for a different plan "
+                    f"({attestation.subject!r} != {expected_subject!r})"
+                )
+            if attestation.binding_hash != expected_hash:
+                raise _GateReleaseAborted(
+                    "plan text changed since the attestation was issued"
+                )
+
+            # --- writes begin here; every failure below must RAISE ------------
+            af = attestation.audit_fields()
+            try:
+                conn.execute(
+                    "INSERT INTO pm_approvals "
+                    "(subject, binding_hash, decision, reason, operator_display, "
+                    " os_user, os_uid, host_id, tty_path, surface, nonce, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        af["subject"], af["binding_hash"], decision, reason,
+                        af["operator_display"], af["os_user"], af["os_uid"],
+                        af["host_id"], af["tty_path"], af["surface"], af["nonce"],
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise _GateReleaseAborted("attestation already used")
+
+            if decision == "approved":
+                plan_cur = conn.execute(
+                    "UPDATE pm_plans SET approved_at = ?, approved_by = ? "
+                    "WHERE id = ? AND approved_at IS NULL AND rejected_at IS NULL",
+                    (now, af["operator_display"], plan["id"]),
+                )
+            else:
+                plan_cur = conn.execute(
+                    "UPDATE pm_plans SET rejected_at = ?, reject_reason = ? "
+                    "WHERE id = ? AND approved_at IS NULL AND rejected_at IS NULL",
+                    (now, reason, plan["id"]),
+                )
+            if plan_cur.rowcount != 1:
+                raise _GateReleaseAborted("plan decision was recorded concurrently")
+
+            landing = (
+                ("ready" if _parents_satisfied(conn, task_id) else "todo")
+                if decision == "approved" else "triage"
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, gate_state = NULL "
+                "WHERE id = ? AND status = 'scheduled' AND gate_state = 'plan'",
+                (landing, task_id),
+            )
+            if cur.rowcount != 1:
+                raise _GateReleaseAborted("gate was released concurrently")
+
+            _append_event(
+                conn, task_id,
+                "plan_approved" if decision == "approved" else "plan_rejected",
+                {
+                    "operator": af["operator_display"],
+                    "surface": af["surface"],
+                    "subject": af["subject"],
+                    "project_id": project_id,
+                    "revision": revision,
+                    "reason": reason,
+                    "landing_status": landing,
+                },
+            )
+    except _GateReleaseAborted as exc:
+        # The transaction rolled back, taking any audit row with it, so the
+        # refusal is recorded in its own transaction. The nonce is deliberately
+        # NOT included: events are user-facing and a nonce is single-use secret
+        # material.
+        _audit_gate_refusal(conn, task_id, exc.reason)
+        return False, exc.reason
+    return True, None
 
 
 # Dispatcher (one-shot pass)

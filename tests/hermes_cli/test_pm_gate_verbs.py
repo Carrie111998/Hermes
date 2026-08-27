@@ -10,6 +10,23 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _attest(project_id="p1", revision=1, body="the plan", decision="approved"):
+    """A real broker-produced attestation via a stub TTY (fresh nonce each call)."""
+    from hermes_cli import approval_broker as ab
+
+    class _TTY:
+        name = "/dev/tty"
+        def write(self, s): pass
+        def flush(self): pass
+        def readline(self): return ab.CONFIRM_PHRASES[decision] + chr(10)
+        def close(self): pass
+
+    return ab.for_plan_decision(
+        project_id=project_id, revision=revision, plan_body=body,
+        decision=decision, _tty_opener=lambda: _TTY(),
+    )
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = kb.connect(db_path=tmp_path / "kanban.db")
@@ -22,6 +39,11 @@ def _gated(conn, title="work"):
     conn.execute(
         "INSERT INTO pm_projects (id, slug, name, plan_revision, archived, created_at)"
         " VALUES ('p1','s','n',1,0,1)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 1, 'the plan', 1, ?)", (tid,)
     )
     assert kb.park_for_plan_approval(conn, tid, project_id="p1", revision=1) is True
     return tid
@@ -88,7 +110,7 @@ def test_gated_parent_does_not_satisfy_a_child(conn):
 
 def test_approve_releases_to_ready_when_parents_are_satisfied(conn):
     tid = _gated(conn)
-    ok, why = kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    ok, why = kb.release_plan_gate(conn, tid, attestation=_attest())
     assert ok is True and why is None
     assert kb.get_task(conn, tid).status == "ready"
     assert kb.gate_state_of(conn, tid) is None
@@ -102,8 +124,13 @@ def test_approve_lands_in_todo_while_a_parent_is_open(conn):
         "INSERT INTO pm_projects (id, slug, name, plan_revision, archived, created_at)"
         " VALUES ('p1','s','n',1,0,1)"
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 1, 'the plan', 1, ?)", (child,)
+    )
     kb.park_for_plan_approval(conn, child, project_id="p1", revision=1)
-    ok, _ = kb.release_plan_gate(conn, child, decision="approved", actor="rick")
+    ok, _ = kb.release_plan_gate(conn, child, attestation=_attest())
     assert ok is True
     assert kb.get_task(conn, child).status == "todo"
 
@@ -111,7 +138,7 @@ def test_approve_lands_in_todo_while_a_parent_is_open(conn):
 def test_reject_returns_the_task_to_triage(conn):
     tid = _gated(conn)
     ok, why = kb.release_plan_gate(
-        conn, tid, decision="rejected", actor="rick", reason="scope too wide"
+        conn, tid, attestation=_attest(decision="rejected"), reason="scope too wide"
     )
     assert ok is True and why is None
     assert kb.get_task(conn, tid).status == "triage"
@@ -120,56 +147,56 @@ def test_reject_returns_the_task_to_triage(conn):
 
 def test_release_records_the_decision_event(conn):
     tid = _gated(conn)
-    kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    kb.release_plan_gate(conn, tid, attestation=_attest())
     kinds = [e.kind for e in kb.list_events(conn, tid)]
     assert "plan_approved" in kinds
 
 
 def test_release_refuses_an_ungated_task(conn):
     tid = kb.create_task(conn, title="t", assignee="a")
-    ok, why = kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    ok, why = kb.release_plan_gate(conn, tid, attestation=_attest())
     assert ok is False and "not parked" in why
 
 
 def test_release_refuses_a_missing_task(conn):
-    ok, why = kb.release_plan_gate(conn, "t_nope", decision="approved", actor="rick")
+    ok, why = kb.release_plan_gate(conn, "t_nope", attestation=_attest())
     assert ok is False and "not found" in why
 
 
-def test_release_rejects_an_unknown_decision(conn):
-    tid = _gated(conn)
+def test_an_unknown_decision_is_refused_at_the_broker(conn):
+    """The decision now lives on the attestation, so it is validated at mint."""
+    from hermes_cli import approval_broker as ab
     with pytest.raises(ValueError):
-        kb.release_plan_gate(conn, tid, decision="maybe", actor="rick")
+        ab.for_plan_decision(project_id="p1", revision=1, plan_body="b",
+                             decision="maybe")
 
 
 def test_second_release_fails_safely(conn):
     tid = _gated(conn)
-    assert kb.release_plan_gate(conn, tid, decision="approved", actor="rick")[0] is True
-    ok, why = kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    assert kb.release_plan_gate(conn, tid, attestation=_attest())[0] is True
+    ok, why = kb.release_plan_gate(conn, tid, attestation=_attest())
     assert ok is False and why is not None
     assert kb.get_task(conn, tid).status == "ready"
 
 
 def test_stale_plan_revision_fails_safely_and_stays_gated(conn):
+    """Now enforced automatically — the caller cannot opt out."""
     tid = _gated(conn)
+    a = _attest()
     conn.execute("UPDATE pm_projects SET plan_revision = 2 WHERE id = 'p1'")
-    ok, why = kb.release_plan_gate(
-        conn, tid, decision="approved", actor="rick", expected_revision=1
-    )
+    ok, why = kb.release_plan_gate(conn, tid, attestation=a)
     assert ok is False and "stale plan" in why
     assert kb.gate_state_of(conn, tid) == "plan"
     assert kb.get_task(conn, tid).status == "scheduled"
 
 
+
 def test_matching_revision_is_accepted(conn):
     tid = _gated(conn)
-    ok, why = kb.release_plan_gate(
-        conn, tid, decision="approved", actor="rick", expected_revision=1
-    )
+    ok, why = kb.release_plan_gate(conn, tid, attestation=_attest())
     assert ok is True and why is None
 
 
-# --- ordinary scheduled tasks are unaffected -----------------------------
 
 def test_ordinary_scheduled_task_still_behaves_normally(conn):
     tid = kb.create_task(conn, title="t", assignee="a")
@@ -183,9 +210,15 @@ def test_ordinary_scheduled_task_still_behaves_normally(conn):
 def test_gate_transitions_do_not_touch_failure_counters(conn):
     tid = _gated(conn)
     before = kb.get_task(conn, tid)
-    kb.release_plan_gate(conn, tid, decision="rejected", actor="rick")
+    kb.release_plan_gate(conn, tid, attestation=_attest(decision="rejected"))
+    conn.execute("UPDATE pm_projects SET plan_revision = 2 WHERE id='p1'")
+    conn.execute(
+        "INSERT INTO pm_plans "
+        "(project_id, revision, body, proposed_at, root_task_id)"
+        " VALUES ('p1', 2, 'revised plan', 2, ?)", (tid,)
+    )
     kb.park_for_plan_approval(conn, tid, project_id="p1", revision=2)
-    kb.release_plan_gate(conn, tid, decision="approved", actor="rick")
+    kb.release_plan_gate(conn, tid, attestation=_attest(revision=2, body="revised plan"))
     after = kb.get_task(conn, tid)
     assert after.consecutive_failures == before.consecutive_failures == 0
     assert after.block_recurrences == before.block_recurrences == 0
