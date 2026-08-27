@@ -882,7 +882,18 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                     source = (row or {}).get("source", "")
                     _tui_owns_lifecycle = not _is_gateway_owned_source(source)
                     if _tui_owns_lifecycle:
-                        db.end_session(session_id, end_reason)
+                        # Keep-open is for an existing durable row only.
+                        # A missing row cannot be gateway-owned (#60609) and
+                        # still gets the pre-existing end_session reap.
+                        if row is not None and end_reason in _KEEP_OPEN_END_REASONS:
+                            logger.info(
+                                "leaving session open through process teardown "
+                                "sid=%s reason=%s",
+                                session_id,
+                                end_reason,
+                            )
+                        else:
+                            db.end_session(session_id, end_reason)
         except Exception:
             pass
 
@@ -937,6 +948,15 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 # silently vanishing rather than being reclaimed. ``tui_close`` and friends are
 # deliberately absent: the client initiated those and already knows.
 _RECLAIM_END_REASONS = frozenset({"idle_timeout", "lru_evict", "ws_orphan_reap"})
+
+# Process-exit teardown is not a conversation end. atexit ``_shutdown_sessions``
+# used to ``end_session(..., "tui_shutdown")`` for every live Desktop chat when
+# the backend bounced (profile switch, ``hermes serve`` reload, WS 1012). Those
+# rows then vanished from the user's session list — ``tui_shutdown`` was not
+# recoverable, and a raced persist left ``min_messages=1`` listings empty
+# (#95868). Persist still runs in ``_finalize_session``; skip the durable close
+# so the next process can resume.
+_KEEP_OPEN_END_REASONS = frozenset({"tui_shutdown"})
 
 
 def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
@@ -1385,6 +1405,11 @@ def _close_sessions_for_transport(
     the single WS-disconnect teardown entry point — there is no second
     independent reap loop in ``handle_ws``.
 
+    ``end_reason="ws_service_restart"`` (WS 1001/1012) parks without arming
+    the orphan reap: the backend is bouncing and atexit ``_shutdown_sessions``
+    will persist in-memory state. Reaping here raced process exit and ended
+    durable Desktop chats that the next process should resume (#95868).
+
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
@@ -1433,10 +1458,11 @@ def _close_sessions_for_transport(
                 session["transport"] = _detached_ws_transport
                 session.pop("_client_gone_interrupt_requested", None)
             detached += 1
-            try:
-                _schedule_ws_orphan_reap(sid)
-            except Exception:
-                pass
+            if end_reason != "ws_service_restart":
+                try:
+                    _schedule_ws_orphan_reap(sid)
+                except Exception:
+                    pass
     return reaped, detached
 
 

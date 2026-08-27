@@ -694,7 +694,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            db.delete_session(sid, reason="api.sessions.delete")
             return {"ok": True}
         finally:
             db.close()

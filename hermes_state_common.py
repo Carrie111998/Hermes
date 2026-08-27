@@ -221,6 +221,12 @@ _RECOVERABLE_END_REASONS = (
     # row was closed at the next boot instead. Same accident class as
     # ws_orphan_reap — kept distinct for forensics — and equally resumable.
     "startup_orphan_reap",
+    # Process-exit teardown of the TUI/desktop gateway (atexit
+    # ``_shutdown_sessions``): a backend bounce, profile switch, or WS 1012
+    # service restart is the same accident class as ``ws_orphan_reap``.
+    # Current code no longer stamps this on populated rows (#95868), but
+    # rows ended by older builds stay resumable.
+    "tui_shutdown",
 )
 _RECOVERABLE_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RECOVERABLE_END_REASONS)
 

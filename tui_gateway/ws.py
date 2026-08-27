@@ -43,6 +43,12 @@ _log = logging.getLogger(__name__)
 _WS_WRITE_TIMEOUT_S = 10.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
 
+# RFC 6455 close codes that mean the *server* is going away, not that the user
+# dropped the chat. 1001 Going Away / 1012 Service Restart fire on profile
+# switch, ``hermes serve`` reload, and uvicorn worker recycle. Those sessions
+# must be parked for resume, not orphan-reaped (#95868).
+_WS_SERVICE_RESTART_CODES = frozenset({1001, 1012})
+
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
 # emits hundreds of these in a burst, and each one is a loop wakeup competing
@@ -288,6 +294,23 @@ def _ws_peer_label(ws: Any) -> str:
     return f"{host}:{port}" if port is not None else host
 
 
+def teardown_end_reason_for_ws_close(close_code) -> str:
+    """Map a WebSocket close code to the transport-teardown ``end_reason``.
+
+    1001 (Going Away) and 1012 (Service Restart) mean the backend is bouncing.
+    Park those sessions without arming the WS-orphan reap so atexit persist
+    plus the next process's ``session.resume`` can recover them (#95868).
+    Any other / missing code keeps the normal disconnect→reap path.
+    """
+    try:
+        code = int(close_code)
+    except (TypeError, ValueError):
+        return "ws_disconnect"
+    if code in _WS_SERVICE_RESTART_CODES:
+        return "ws_service_restart"
+    return "ws_disconnect"
+
+
 def _disable_nagle(ws: Any) -> None:
     """Disable Nagle so streamed JSON-RPC frames go out individually.
 
@@ -339,6 +362,7 @@ async def handle_ws(
     dispatch_crashes = 0
     send_failures = 0
     disconnect_reason = "not_connected"
+    ws_close_code = None
 
     try:
         if subprotocol:
@@ -412,9 +436,10 @@ async def handle_ws(
             try:
                 raw = await ws.receive_text()
             except _WebSocketDisconnect as exc:
+                ws_close_code = getattr(exc, "code", None)
                 disconnect_reason = (
                     "client_disconnect("
-                    f"code={getattr(exc, 'code', None)},"
+                    f"code={ws_close_code},"
                     f"reason={getattr(exc, 'reason', None)})"
                 )
                 break
@@ -565,7 +590,7 @@ async def handle_ws(
                 reaped_sessions, detached_sessions = await asyncio.to_thread(
                     server._close_sessions_for_transport,
                     transport,
-                    end_reason="ws_disconnect",
+                    end_reason=teardown_end_reason_for_ws_close(ws_close_code),
                 )
             except Exception:
                 _log.exception("ws transport teardown failed peer=%s", peer)

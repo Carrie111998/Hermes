@@ -12952,6 +12952,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         sessions_dir: Optional[Path] = None,
         expected_delete_ids: Optional[List[str]] = None,
+        *,
+        reason: str = "",
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -12968,18 +12970,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         inside the write transaction on purpose (TOCTOU guard); the cost is
         accepted for correctness. Returns True if the session was found and
         deleted.
+
+        ``reason`` is an audit tag (``session.delete``, ``api.sessions.delete``,
+        …) logged with the id and whether the row had messages, so a silent
+        hard-delete is greppable after the fact (#95868).
         """
         removed_delegate_ids: List[str] = []
         expected_ids = (
             set(expected_delete_ids) if expected_delete_ids is not None else None
         )
+        stats: Dict[str, Any] = {"messages": None, "title_set": False}
 
         def _do(conn):
             cursor = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+                "SELECT title, "
+                "(SELECT COUNT(*) FROM messages WHERE session_id = sessions.id) "
+                "FROM sessions WHERE id = ? LIMIT 1",
+                (session_id,),
             )
-            if cursor.fetchone() is None:
+            row = cursor.fetchone()
+            if row is None:
                 return False
+            stats["title_set"] = bool(row[0])
+            stats["messages"] = int(row[1] or 0)
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -13001,6 +13014,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         deleted = self._execute_write(_do)
         if deleted:
+            logger.info(
+                "delete_session id=%s reason=%s messages=%s title=%s",
+                session_id,
+                reason or "-",
+                stats["messages"],
+                "set" if stats["title_set"] else "null",
+            )
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
             self._remove_session_files(sessions_dir, session_id)
@@ -13010,6 +13030,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        *,
+        reason: str = "",
     ) -> bool:
         """Delete *session_id* only when it never gained resumable content.
 
@@ -13024,6 +13046,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         children (delegate subagent runs) are preserved — a parent that
         spawned work is not "empty" even if its own transcript never
         flushed. Returns True if the session was deleted.
+
+        ``reason`` is an audit tag logged when a row is actually removed
+        (#95868).
         """
         def _do(conn):
             cursor = conn.execute(
@@ -13047,6 +13072,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         deleted = self._execute_write(_do)
         if deleted:
+            logger.info(
+                "delete_session_if_empty id=%s reason=%s",
+                session_id,
+                reason or "-",
+            )
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
 
