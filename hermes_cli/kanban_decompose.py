@@ -468,4 +468,25 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-        return [row.id for row in rows if not kb.has_block_loop_hold(conn, row.id)]
+        task_ids = [row.id for row in rows]
+        if not task_ids:
+            return []
+        # Resolve every durable hold in one query rather than issuing one
+        # latest-event SELECT per triage row on each decomposer tick.
+        held = {
+            row["task_id"]
+            for row in conn.execute(
+                """
+                SELECT e.task_id
+                FROM task_events e
+                JOIN (
+                    SELECT task_id, MAX(id) AS latest_id
+                    FROM task_events
+                    WHERE kind IN ('block_loop_detected', 'block_loop_recovered')
+                    GROUP BY task_id
+                ) latest ON latest.latest_id = e.id
+                WHERE e.kind = 'block_loop_detected'
+                """
+            ).fetchall()
+        }
+        return [task_id for task_id in task_ids if task_id not in held]
