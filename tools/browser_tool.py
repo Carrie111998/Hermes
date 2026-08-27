@@ -1108,6 +1108,196 @@ def _is_headed_mode() -> bool:
     return _cached_headed_mode
 
 
+# ---------------------------------------------------------------------------
+# Issue #94827 — headed browser on a host with no display server.
+#
+# Symptom: ``browser.headed: true`` set in config.yaml, ``DISPLAY``/``WAYLAND_DISPLAY``
+# configured in the profile .env, but the spawned Chromium still crashes with
+# "Missing X server or $DISPLAY / The platform failed to initialize. Exiting."
+#
+# Two layered mitigations:
+#
+# 1. **Pre-launch probe (Xvfb auto-fallback on Linux):** when headed + no display
+#    env is visible, attempt to spin up a headless ``Xvfb`` server so the user
+#    does not have to know that "headed" on a server is actually a virtual X
+#    session. This is opt-in via the existing ``browser.headed`` flag — the user
+#    asked for headed, we make it work.
+# 2. **Post-mortem actionable error:** if the browser still crashes with the
+#    canonical "Missing X server" pattern, replace the raw Chromium message with
+#    a copy that names the env vars, suggests Xvfb, and explains the
+#    headed-vs-headless distinction. The user knows what to fix.
+# ---------------------------------------------------------------------------
+
+_MISSING_X_SERVER_PATTERNS: tuple[str, ...] = (
+    "missing x server",
+    "the platform failed to initialize",
+)
+
+
+def _has_display_env() -> bool:
+    """Return True if the current process sees a usable display identifier."""
+    return bool(
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("XAUTHORITY")
+    )
+
+
+def _is_missing_x_server_error(stderr_text: str) -> bool:
+    """Detect Chromium's "no display server" crash signature.
+
+    Chromium emits one of two near-identical banners depending on build:
+    ``Missing X server or $DISPLAY`` (X11 path) and
+    ``The platform failed to initialize. Exiting.`` (ozone/Wayland path).
+    A blank stderr or unrelated error must NOT match — those go through the
+    existing ``returncode != 0`` branch with the original stderr.
+    """
+    if not stderr_text:
+        return False
+    lowered = stderr_text.lower()
+    return any(needle in lowered for needle in _MISSING_X_SERVER_PATTERNS)
+
+
+def _format_missing_display_error(*, headed: bool, platform_name: str) -> str:
+    """Operator-facing message for the headed + no display case.
+
+    Always mentions the env vars that unblock headed mode (DISPLAY,
+    WAYLAND_DISPLAY) and points at Xvfb as the automatic fallback on Linux.
+    For headless mode we still emit a hint so the user understands why the
+    crash happened and how to switch to a virtual display if they actually
+    want a visible window.
+    """
+    if headed and platform_name.startswith("linux"):
+        return (
+            "Headed browser requested but no display server is reachable.\n"
+            "  - DISPLAY and WAYLAND_DISPLAY are both unset, so Chromium cannot "
+            "open a window.\n"
+            "  - On Linux, set DISPLAY=:0 (X11 / Xwayland) or WAYLAND_DISPLAY=wayland-0 "
+            "(native Wayland) before launching Hermes, e.g. by exporting it in "
+            "~/.hermes/profiles/<profile>/.env and starting a new shell.\n"
+            "  - Or install Xvfb (`apt install xvfb` / `pacman -S xorg-server-xvfb`) "
+            "and Hermes will auto-start a virtual display when headed is requested "
+            "on a headless host.\n"
+            "  - Set `browser.headed: false` in config.yaml if you do not need a "
+            "visible window — headless mode does not require any display server."
+        )
+    if platform_name.startswith("linux"):
+        return (
+            "Browser failed to reach a display server.\n"
+            "  - DISPLAY and WAYLAND_DISPLAY are both unset. Headless mode on Linux "
+            "should still work without them; if you are seeing this, your "
+            "environment is non-standard.\n"
+            "  - Install Xvfb (`apt install xvfb`) or set DISPLAY=:0 to provide a "
+            "display target."
+        )
+    return (
+        "Browser failed to reach a display server and DISPLAY/WAYLAND_DISPLAY "
+        "are unset. On Linux, install Xvfb or export DISPLAY=:0 before launching "
+        "Hermes; on macOS / Windows headed mode should 'just work' — please file "
+        "a bug if you are seeing this message."
+    )
+
+
+def _xvfb_parse_display(stdout_bytes: bytes) -> Optional[str]:
+    """Pull ``$DISPLAY`` style value (e.g. ``:99``) out of ``Xvfb -fp`` banner.
+
+    Xvfb prints ``Initializing built-in extension XINERAMA`` and similar lines
+    on stdout; the $DISPLAY we want is whatever we passed via ``-displayfd``
+    or the synthetic value we picked.  We accept either the bare colon form
+    or ``host:N`` and normalise to ``:N`` for env-var use.
+    """
+    if not stdout_bytes:
+        return None
+    text = stdout_bytes.decode("utf-8", errors="replace")
+    # Cheap heuristic: look for an explicit ":NN" we wrote into stdout ourselves
+    # via the ``-displayfd`` file-descriptor trick — the helper that returns
+    # this value just writes the number, so any " :NN " line works.
+    import re
+
+    match = re.search(r":(\d+)", text)
+    if match:
+        return f":{match.group(1)}"
+    return None
+
+
+def _try_start_xvfb() -> tuple[bool, Optional[str]]:
+    """Best-effort start of an Xvfb display for headed mode on a headless host.
+
+    Returns ``(True, ":NN")`` when Xvfb was found and started, otherwise
+    ``(False, None)``.  Never raises: this is a graceful fallback, not a
+    hard dependency.  Only runs on Linux — macOS and Windows always have a
+    real display attached to the user session.
+    """
+    if not sys.platform.startswith("linux"):
+        return False, None
+    xvfb_bin = shutil.which("Xvfb")
+    if not xvfb_bin:
+        return False, None
+
+    # Find a free display number.  Xvfb's default range starts at :99 on most
+    # distros; pick one explicitly and let Xvfb bind it.
+    display = ":99"
+    try:
+        # ``-screen 0 1280x720x24`` matches the default size agent-browser picks
+        # for headless Chromium; ``-nolisten tcp`` keeps it local; ``-dpi 96``
+        # avoids HiDPI oddities inside the virtual framebuffer.
+        proc = subprocess.Popen(
+            [
+                xvfb_bin,
+                display,
+                "-screen",
+                "0",
+                "1280x720x24",
+                "-nolisten",
+                "tcp",
+                "-dpi",
+                "96",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # Detach into its own process group so a Hermes-side cleanup does
+            # not kill Xvfb when the browser subprocess exits cleanly.
+            start_new_session=True,
+        )
+        # Give Xvfb a moment to bind the socket.  We do not poll $DISPLAY via
+        # the file descriptor trick — start_new_session + a brief wait is
+        # enough for the common case and avoids the fd-leak plumbing.
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            # Xvfb is still running and healthy — that is the success path.
+            return True, display
+        # Xvfb exited: treat as failure and surface stderr for diagnostics.
+        _stdout, stderr = proc.communicate(timeout=1)
+        logger.debug(
+            "Xvfb exited prematurely (rc=%s); stderr=%s",
+            proc.returncode,
+            (stderr or b"").decode("utf-8", errors="replace")[:300],
+        )
+        return False, None
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Could not start Xvfb for headed fallback: %s", exc)
+        return False, None
+
+
+def _prepare_headed_env() -> dict:
+    """Return a base env dict for a headed browser subprocess.
+
+    If headed mode is on AND no display env is visible, attempt to spin up
+    Xvfb automatically on Linux.  The returned dict is intended to be merged
+    into ``browser_env`` (the agent-browser subprocess env) right before
+    Popen so the spawned Chromium inherits a usable ``$DISPLAY``.
+    """
+    if not _is_headed_mode():
+        return {}
+    if _has_display_env():
+        return {}
+    ok, display = _try_start_xvfb()
+    if ok and display:
+        return {"DISPLAY": display}
+    return {}
+
+
 def _should_inject_engine(engine: str) -> bool:
     """Return True when the engine flag should be added to agent-browser commands.
 
@@ -3278,6 +3468,21 @@ def _run_browser_command(
         browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
 
+        # Issue #94827 — headed mode without a display server. If headed is
+        # requested and no DISPLAY / WAYLAND_DISPLAY / XAUTHORITY is visible
+        # in the parent, attempt to spin up Xvfb automatically on Linux so the
+        # spawned Chromium can actually open a window.  On every other platform
+        # the user already has a display attached and this no-ops.
+        headed_env_overrides = _prepare_headed_env()
+        if headed_env_overrides:
+            for _k, _v in headed_env_overrides.items():
+                browser_env[_k] = _v
+            logger.info(
+                "headed browser without DISPLAY/WAYLAND_DISPLAY: "
+                "auto-started virtual display %s",
+                headed_env_overrides.get("DISPLAY"),
+            )
+
         # Tell the agent-browser daemon to self-terminate after being idle
         # for our configured inactivity timeout.  This is the daemon-side
         # counterpart to our Python-side _cleanup_inactive_browser_sessions
@@ -3441,6 +3646,15 @@ def _run_browser_command(
             elif returncode != 0:
                 # Check for errors
                 error_msg = stderr.strip() if stderr else f"Command failed with code {returncode}"
+                # Issue #94827 — replace the raw Chromium "Missing X server" /
+                # "platform failed to initialize" crash with an actionable hint
+                # that names the env vars, suggests Xvfb, and explains the
+                # headed-vs-headless distinction.
+                if _is_missing_x_server_error(stderr or ""):
+                    error_msg = _format_missing_display_error(
+                        headed=_is_headed_mode(),
+                        platform_name=sys.platform,
+                    )
                 logger.warning("browser '%s' failed (rc=%s): %s", command, returncode, error_msg[:300])
                 result = {"success": False, "error": error_msg}
             else:
