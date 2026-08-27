@@ -439,4 +439,37 @@ describe('ChatView render isolation', () => {
 
     expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
   })
+
+  it('accepts a reused runtime id only after the owner generation turns over', () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <ChatView {...chatViewProps()} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    act(() => $activeGatewayProfile.set('profile-b'))
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('true')
+
+    // The route/profile handoff retires A's runtime generation before B can
+    // publish. B is allowed to reuse the same backend runtime id.
+    act(() => $activeSessionId.set(null))
+
+    act(() => {
+      $sessionStates.set({
+        'runtime-1': {
+          ...createClientSessionState('stored-1'),
+          messages: [assistantMessage('assistant-b', 'Profile B reused the id')]
+        }
+      })
+      $activeSessionId.set('runtime-1')
+    })
+
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
+  })
 })

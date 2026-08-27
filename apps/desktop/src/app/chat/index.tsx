@@ -49,6 +49,7 @@ import {
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { $focusedStoredSessionId, $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
@@ -84,6 +85,8 @@ import { advanceTranscriptWindow, type TranscriptWindowState } from './transcrip
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
+  /** Exact owner carried by a tile; never re-derived from an ambiguous stored id. */
+  sessionOwnerRoute?: SessionOwnerRoute
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
   onCancel: () => Promise<void> | void
@@ -204,6 +207,7 @@ interface ChatRuntimeBoundaryProps {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+  ownerRoute?: SessionOwnerRoute
   /** Route points at an unloaded session — render empty until resume swaps in
    *  the new transcript, so the previous session's messages don't linger. */
   suppressMessages: boolean
@@ -252,6 +256,7 @@ function ChatRuntimeBoundary({
   onEdit,
   onReload,
   onThreadMessagesChange,
+  ownerRoute: authoritativeOwnerRoute,
   suppressMessages
 }: ChatRuntimeBoundaryProps) {
   const view = useSessionView()
@@ -291,9 +296,11 @@ function ChatRuntimeBoundary({
   const transcriptTailStates = useStore($transcriptTailBySessionId)
   const connectionId = connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')
 
-  const ownerRoute = storedId
-    ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
-    : undefined
+  const ownerRoute =
+    authoritativeOwnerRoute ??
+    (storedId
+      ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
+      : undefined)
 
   const tailProfile = ownerRoute
     ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
@@ -398,6 +405,7 @@ const ChatViewContent = memo(function ChatViewContent({
   onReload,
   onRestoreToMessage,
   onRetryResume,
+  sessionOwnerRoute,
   onTranscribeAudio,
   onDismissError
 }: ChatViewProps) {
@@ -479,7 +487,7 @@ const ChatViewContent = memo(function ChatViewContent({
     profile: activeGatewayProfile
   })
 
-  const tileOwner = !isPrimary && storedId ? getSessionOwnerHint(storedId) : undefined
+  const tileOwner = !isPrimary ? sessionOwnerRoute : undefined
 
   const composerOwnerScopeKey = tileOwner
     ? profileScopeKey({ connectionId: tileOwner.connectionId, profile: tileOwner.profile })
@@ -493,10 +501,44 @@ const ChatViewContent = memo(function ChatViewContent({
     ? ({ fromKey: selectedStorageScopeKey, kind: 'lineage', toKey: composerStorageScopeKey } as const)
     : undefined
 
-  const runtimeOwnerScopeByIdRef = useRef(new Map<string, string>())
+  // Ownership belongs to a SURFACE generation, not to a runtime-id string.
+  // Backends are free to reuse the same runtime id across profiles. Keep the
+  // outgoing generation pinned while its runtime is still present (the action
+  // fence), retire it when the runtime clears, and let the next publication —
+  // even under the same id — claim the current route/profile generation.
+  const ownerGenerationRef = useRef({ generation: 0, ownerScopeKey: composerOwnerScopeKey, route: location.pathname })
 
-  if (isPrimary && activeSessionId && !runtimeOwnerScopeByIdRef.current.has(activeSessionId)) {
-    runtimeOwnerScopeByIdRef.current.set(activeSessionId, composerOwnerScopeKey)
+  if (
+    ownerGenerationRef.current.ownerScopeKey !== composerOwnerScopeKey ||
+    ownerGenerationRef.current.route !== location.pathname
+  ) {
+    ownerGenerationRef.current = {
+      generation: ownerGenerationRef.current.generation + 1,
+      ownerScopeKey: composerOwnerScopeKey,
+      route: location.pathname
+    }
+  }
+
+  const runtimeOwnerRef = useRef<{
+    generation: number
+    runtimeId: string
+    storedSessionId: null | string
+  } | null>(null)
+
+  if (isPrimary) {
+    if (!activeSessionId) {
+      runtimeOwnerRef.current = null
+    } else if (
+      !runtimeOwnerRef.current ||
+      runtimeOwnerRef.current.runtimeId !== activeSessionId ||
+      (activeRuntimeStoredId !== null && runtimeOwnerRef.current.storedSessionId !== activeRuntimeStoredId)
+    ) {
+      runtimeOwnerRef.current = {
+        generation: ownerGenerationRef.current.generation,
+        runtimeId: activeSessionId,
+        storedSessionId: activeRuntimeStoredId
+      }
+    }
   }
 
   // One-time compatibility bridge from legacy unqualified stores. Each raw
@@ -540,12 +582,13 @@ const ChatViewContent = memo(function ChatViewContent({
         isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
       : false
 
-  const activeRuntimeOwnerScope = activeSessionId ? runtimeOwnerScopeByIdRef.current.get(activeSessionId) : undefined
+  const activeRuntimeOwnerGeneration = runtimeOwnerRef.current?.generation
 
   const activeRuntimeOwnerMismatch =
     isPrimary &&
     isRoutedSessionView &&
-    Boolean(activeRuntimeOwnerScope && activeRuntimeOwnerScope !== composerOwnerScopeKey)
+    activeRuntimeOwnerGeneration !== undefined &&
+    activeRuntimeOwnerGeneration !== ownerGenerationRef.current.generation
 
   const newChatRouteHasStaleSession =
     isPrimary && isNewChatRoute(location.pathname) && Boolean(selectedSessionId || activeSessionId)
@@ -723,6 +766,7 @@ const ChatViewContent = memo(function ChatViewContent({
         onEdit={onEdit}
         onReload={onReload}
         onThreadMessagesChange={onThreadMessagesChange}
+        ownerRoute={sessionOwnerRoute}
         suppressMessages={sessionTransitioning}
       >
         <div

@@ -10,4 +10,8 @@ describe('SessionTilePane owner-scoped listing', () => {
     expect(source).toContain('void resolveStoredSession(storedSessionId, ownerRoute)')
     expect(source).not.toMatch(/void resolveStoredSession\(storedSessionId\)\s*\n/)
   })
+
+  it('passes that exact route through to ChatView', () => {
+    expect(source).toContain('sessionOwnerRoute={ownerRoute}')
+  })
 })

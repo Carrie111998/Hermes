@@ -19,6 +19,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { atom, computed } from 'nanostores'
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 
+import { profileScopeKey } from '@/api/client'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
 import { blobToDataUrl } from '@/app/session/hooks/use-prompt-actions/utils'
@@ -41,13 +42,14 @@ import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { sessionAwaitingInput } from '@/store/prompts'
 import {
+  $connection,
   $gatewayState,
   $selectedStoredSessionId,
   $sessions,
   sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
-import { requestForSessionProfile } from '@/store/session-request-router'
+import { requestForSessionProfile, type SessionOwnerRoute } from '@/store/session-request-router'
 import {
   $sessionStates,
   $sessionTileDelegateRevision,
@@ -147,17 +149,18 @@ const tileTranscribeAudio = async (audio: Blob) => {
 }
 
 function TileChat({
+  ownerRoute,
   runtimeId,
   storedSessionId,
   view
 }: {
+  ownerRoute?: SessionOwnerRoute
   runtimeId: string
   storedSessionId: string
   view: SessionView
 }) {
   const { gateway, requestGateway } = useGatewayRequest()
   const queryClient = useQueryClient()
-  const ownerRoute = sessionTileOwnerRoute(storedSessionId)
 
   const requestTileGateway = useCallback(
     <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> =>
@@ -269,6 +272,7 @@ function TileChat({
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
           onTranscribeAudio={tileTranscribeAudio}
+          sessionOwnerRoute={ownerRoute}
         />
       </ComposerScopeProvider>
     </SessionViewProvider>
@@ -420,7 +424,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     )
   }
 
-  return <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+  return <TileChat ownerRoute={ownerRoute} runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
 }
 
 // ---------------------------------------------------------------------------
@@ -456,14 +460,40 @@ function tileTitle(storedSessionId: string): string {
   return stored ? sessionTitle(stored) : explicit || NEW_SESSION_TITLE
 }
 
+/** The exact draft key ChatView gives this tile's composer. Owner route wins;
+ * only legacy tiles without one use the ambient route. */
+export function sessionTileDraftScope(
+  storedSessionId: string,
+  ownerRoute: SessionOwnerRoute | undefined = sessionTileOwnerRoute(storedSessionId)
+): string {
+  const connection = $connection.get()
+
+  const ownerScopeKey = ownerRoute
+    ? profileScopeKey(ownerRoute)
+    : profileScopeKey({
+        connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
+        profile: $activeGatewayProfile.get()
+      })
+
+  return `${ownerScopeKey}\0${storedSessionId}`
+}
+
 /** The `@session` link payload for a tile tab drag — id + owning profile + title.
  *  Resolved at drag time, so an unsent tab drags under its draft name. */
-function tileDragPayload(storedSessionId: string): SessionDragPayload {
+export function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
-  const explicit = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.workspaceTabTitle
-  const title = stored ? sessionTitle(stored) : explicit || draftTitleFor(storedSessionId) || NEW_SESSION_TITLE
+  const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+  const explicit = tile?.workspaceTabTitle
 
-  return { id: storedSessionId, profile: stored?.profile ?? '', title }
+  const title = stored
+    ? sessionTitle(stored)
+    : explicit || draftTitleFor(sessionTileDraftScope(storedSessionId, tile?.ownerRoute)) || NEW_SESSION_TITLE
+
+  return {
+    id: storedSessionId,
+    profile: stored?.profile ?? tile?.ownerRoute?.targetProfile ?? tile?.ownerRoute?.profile ?? '',
+    title
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +700,7 @@ export const watchSessionTiles = paneMirror<SessionTile>({
   tabTitle: storedSessionId =>
     tileStoredRow(storedSessionId) ||
     $sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId && tile.workspaceTabTitle) ? null : (
-      <SessionDraftTitle scope={storedSessionId} />
+      <SessionDraftTitle scope={sessionTileDraftScope(storedSessionId)} />
     ),
   render: storedSessionId => <SessionTilePane storedSessionId={storedSessionId} />,
   tabWrap: (storedSessionId, tab) => (

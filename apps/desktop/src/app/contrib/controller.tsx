@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { atom, computed } from 'nanostores'
 import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
 
+import { profileScopeKey } from '@/api/client'
 import { SessionDraftTitle } from '@/app/chat/session-draft-title'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution, paletteToggle } from '@/app/command-palette/contrib'
@@ -46,6 +47,7 @@ import { Download, FileText, LayoutDashboard, PanelBottom, PanelTop, Terminal, U
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { TRANSCRIPT_DIRECTIVE_AREA, type TranscriptDirectiveContribution } from '@/lib/transcript-directives'
 import { setYoloEnabled } from '@/lib/yolo-session'
+import { draftTitleFor } from '@/store/composer'
 import { pruneComposerPopoutZones } from '@/store/composer-popout'
 import {
   $fileBrowserOpen,
@@ -59,6 +61,7 @@ import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH
 } from '@/store/layout'
+import { $activeGatewayProfile } from '@/store/profile'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import {
   $reviewOpen,
@@ -68,7 +71,14 @@ import {
   openReview,
   REVIEW_PANE_ID
 } from '@/store/review'
-import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
+import {
+  $connection,
+  $currentCwd,
+  $selectedStoredSessionId,
+  $sessions,
+  $yoloActive,
+  sessionMatchesStoredId
+} from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { watchUnreadWriteGuard } from '@/store/session-unread-remote'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
@@ -123,6 +133,17 @@ const idle = (node: ReactElement) => <IdleMount>{node}</IdleMount>
 // the loaded primary session; no menu on a fresh draft).
 const wrapWorkspaceTab = (tab: ReactElement) => <WorkspaceTabMenu>{tab}</WorkspaceTabMenu>
 
+export const workspaceDraftScope = (storedSessionId: null | string): string => {
+  const connection = $connection.get()
+
+  const ownerScopeKey = profileScopeKey({
+    connectionId: connection?.connectionId || (connection?.mode === 'local' ? 'local' : ''),
+    profile: $activeGatewayProfile.get()
+  })
+
+  return `${ownerScopeKey}\0${storedSessionId ?? '__new__'}`
+}
+
 /** The `@session` payload for the workspace tab — the loaded primary session,
  *  or null on a fresh draft / full-page view (nothing to link). */
 const workspaceDragPayload = (): SessionDragPayload | null => {
@@ -134,7 +155,11 @@ const workspaceDragPayload = (): SessionDragPayload | null => {
 
   const stored = $sessions.get().find(s => sessionMatchesStoredId(s, selected))
 
-  return { id: selected, profile: stored?.profile ?? '', title: stored ? storedSessionTitle(stored) : '' }
+  return {
+    id: selected,
+    profile: stored?.profile ?? $activeGatewayProfile.get(),
+    title: stored ? storedSessionTitle(stored) : draftTitleFor(workspaceDraftScope(selected)) || NEW_SESSION_TITLE
+  }
 }
 
 // The main tab drags like a session tile — drop it on a composer to link the
@@ -500,7 +525,7 @@ const syncWorkspaceTitle = () => {
       // A draft's name lives in its composer, not in any session row, so the
       // label subscribes to it directly — typing renames the tab without
       // re-registering the pane.
-      tabTitle: stored ? undefined : () => <SessionDraftTitle scope={selected} />,
+      tabTitle: stored ? undefined : () => <SessionDraftTitle scope={workspaceDraftScope(selected)} />,
       // Pages aren't tab-able: the main zone's bar stands down while one shows.
       headerVeto: $workspaceIsPage.get(),
       placement: 'main',
@@ -515,6 +540,8 @@ const syncWorkspaceTitle = () => {
 
 $selectedStoredSessionId.listen(syncWorkspaceTitle)
 $sessions.listen(syncWorkspaceTitle)
+$activeGatewayProfile.listen(syncWorkspaceTitle)
+$connection.listen(syncWorkspaceTitle)
 $workspaceIsPage.listen(syncWorkspaceTitle)
 
 // Layout reset collapses every session tile into main as a tab (after the
