@@ -221,7 +221,6 @@ export const zh: Translations = {
     failedTitle: '上传失败',
     failedHint:
       '您也可以在终端运行 `hermes debug share --nous`，或运行 `hermes debug share --local` 在不上传的情况下查看报告。',
-    handoffLead: '在以下位置继续讨论:',
     links: {
       github: 'GitHub Issues',
       portal: 'Nous Portal 支持',
@@ -2468,8 +2467,7 @@ export const zh: Translations = {
       finishedUnread: '已完成 — 未读',
       backgroundRunning: '后台任务运行中',
       draftSession: '草稿 — 尚未发送',
-      handoffOrigin: platform => `从 ${platform} 转接`,
-      ownedByProfile: profile => `配置档：${profile}`,
+        ownedByProfile: profile => `配置档：${profile}`,
       renamed: '已重命名',
       renameFailed: '重命名失败',
       renameTitle: '重命名会话',

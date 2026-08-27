@@ -139,7 +139,6 @@ interface SlashCommandDeps {
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   handleSkinCommand: (arg: string) => string
-  handoffSession: (
     platform: string,
     options?: { onProgress?: (state: string) => void; sessionId?: string }
   ) => Promise<{ ok: boolean; error?: string }>

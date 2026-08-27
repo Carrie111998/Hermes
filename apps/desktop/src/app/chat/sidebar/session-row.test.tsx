@@ -31,7 +31,6 @@ vi.mock('@/i18n', () => ({
           ageNow: 'now',
           backgroundRunning: 'Running in background',
           finishedUnread: 'Finished',
-          handoffOrigin: (platform: string) => `Started on ${platform}`,
           messageCount: (count: number) => `${count} messages`,
           needsInput: 'Needs input',
           sessionActions: 'Session actions',
@@ -72,7 +71,6 @@ vi.mock('@/lib/chat-runtime', async importOriginal => {
 })
 vi.mock('@/lib/haptics', () => ({ triggerHaptic: vi.fn() }))
 vi.mock('@/lib/session-source', () => ({
-  handoffOriginSource: (state?: string, platform?: string) => (state && platform ? platform : null),
   sessionSourceLabel: (source: string) => source
 }))
 vi.mock('@/lib/time', async importOriginal => {
@@ -122,7 +120,6 @@ vi.mock('@/store/windows', async importOriginal => {
 
 // SessionActionsMenu open behavior is covered in session-actions-menu.test.tsx
 // against the real component. Stub it here so this file stays focused on the
-// row chrome (handoff avatar tip, etc.).
 vi.mock('./session-actions-menu', () => ({
   SessionActionsMenu: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   SessionContextMenu: ({ children }: { children: React.ReactNode }) => <>{children}</>
@@ -134,8 +131,6 @@ vi.mock('./use-profile-prewarm', () => ({
 
 function makeSession(overrides: Partial<SessionInfo> & { title: string }): SessionInfo {
   return {
-    handoff_platform: null,
-    handoff_state: null,
     id: 's1',
     last_active: 0,
     profile: 'default',
@@ -151,7 +146,6 @@ const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"
 // avatar on its own. `inline-grid` is PlatformAvatar's own layout class in both
 // of its branches — brand glyph and first-letter fallback — and the row passes
 // it no display class that tailwind-merge could drop it for.
-const handoffAvatar = (container: HTMLElement) =>
   container.querySelector<HTMLElement>('span[aria-hidden="true"].inline-grid')
 
 const noop = vi.fn()
@@ -362,7 +356,6 @@ describe('SidebarSessionRow', () => {
     expect(tipTrigger(age)).toBeTruthy()
   })
 
-  it('does not render a handoff avatar for a locally-started session', () => {
     const { container } = render(
       <SidebarSessionRow
         isPinned={false}
@@ -377,10 +370,8 @@ describe('SidebarSessionRow', () => {
       />
     )
 
-    expect(handoffAvatar(container)).toBeNull()
   })
 
-  it('wraps the handoff platform avatar in a Tip for a session started on another platform', () => {
     const { container } = render(
       <SidebarSessionRow
         isPinned={false}
@@ -391,8 +382,6 @@ describe('SidebarSessionRow', () => {
         onResume={noop}
         onToggleUnread={noop}
         session={makeSession({
-          handoff_platform: 'telegram',
-          handoff_state: 'active',
           title: 'Continued from Telegram'
         })}
         unread={false}
@@ -405,7 +394,6 @@ describe('SidebarSessionRow', () => {
     // than text content, and confirm its tooltip trigger actually attaches to
     // it — proving the real forwardRef/...rest path works, not a mock that
     // fakes it.
-    const avatar = handoffAvatar(container)
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
   })

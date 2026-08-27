@@ -264,7 +264,6 @@ export interface Translations {
     doneDescription: string
     failedTitle: string
     failedHint: string
-    handoffLead: string
     links: {
       discord: string
       github: string
@@ -1949,8 +1948,7 @@ export interface Translations {
       finishedUnread: string
       backgroundRunning: string
       draftSession: string
-      handoffOrigin: (platform: string) => string
-      ownedByProfile: (profile: string) => string
+        ownedByProfile: (profile: string) => string
       renamed: string
       renameFailed: string
       renameTitle: string

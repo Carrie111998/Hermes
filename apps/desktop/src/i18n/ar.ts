@@ -16,7 +16,6 @@ export const ar = defineLocale({
     failedTitle: 'فشل الرفع',
     failedHint:
       'يمكنك أيضاً تشغيل `hermes debug share --nous` من الطرفية، أو `hermes debug share --local` لعرض التقرير دون رفعه.',
-    handoffLead: 'تابع النقاش في:',
     links: {
       github: 'GitHub Issues',
       portal: 'دعم بوابة Nous',
@@ -1796,8 +1795,7 @@ export const ar = defineLocale({
       openInSplit: 'فتح في تقسيم',
       ownedByProfile: profile => `مملوكة للملف الشخصي ${profile}`,
       untitledChat: id => `محادثة ${id}`,
-      handoffOrigin: platform => `قادمة من ${platform}`,
-      renamed: 'تمت إعادة التسمية',
+        renamed: 'تمت إعادة التسمية',
       renameFailed: 'فشلت إعادة التسمية',
       renameTitle: 'إعادة تسمية الجلسة',
       renameDesc: '',

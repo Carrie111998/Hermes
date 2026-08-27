@@ -221,7 +221,6 @@ export const zhHant = defineLocale({
     failedTitle: '上傳失敗',
     failedHint:
       '您也可以在終端機執行 `hermes debug share --nous`，或執行 `hermes debug share --local` 在不上傳的情況下檢視報告。',
-    handoffLead: '在以下位置繼續討論:',
     links: {
       github: 'GitHub Issues',
       portal: 'Nous Portal 支援',
@@ -1898,8 +1897,7 @@ export const zhHant = defineLocale({
       finishedUnread: '已完成 — 未讀',
       backgroundRunning: '背景任務執行中',
       draftSession: '草稿 — 尚未傳送',
-      handoffOrigin: platform => `從 ${platform} 轉接`,
-      ownedByProfile: profile => `設定檔：${profile}`,
+        ownedByProfile: profile => `設定檔：${profile}`,
       renamed: '已重新命名',
       renameFailed: '重新命名失敗',
       renameTitle: '重新命名工作階段',

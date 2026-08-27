@@ -81,11 +81,6 @@ import {
   withSessionNotFoundResume
 } from './utils'
 
-interface HandoffResult {
-  ok: boolean
-  error?: string
-}
-
 const WINDOWS_ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/
 const POSIX_ABSOLUTE_PATH_RE = /^\/(?!\/)/
 

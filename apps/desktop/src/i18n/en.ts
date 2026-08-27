@@ -228,7 +228,6 @@ export const en: Translations = {
     failedTitle: 'Upload failed',
     failedHint:
       'You can also run `hermes debug share --nous` from a terminal, or `hermes debug share --local` to print the report without uploading.',
-    handoffLead: 'Pick up the discussion in:',
     links: {
       github: 'GitHub Issues',
       portal: 'Nous Portal Support',
@@ -2288,8 +2287,7 @@ export const en: Translations = {
       finishedUnread: 'Finished — unread',
       backgroundRunning: 'Background task running',
       draftSession: 'Draft — nothing sent yet',
-      handoffOrigin: platform => `Handed off from ${platform}`,
-      ownedByProfile: profile => `Profile: ${profile}`,
+        ownedByProfile: profile => `Profile: ${profile}`,
       renamed: 'Renamed',
       renameFailed: 'Rename failed',
       renameTitle: 'Rename session',

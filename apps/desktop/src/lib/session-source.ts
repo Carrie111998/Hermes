@@ -91,22 +91,6 @@ export function normalizeSessionSource(source: null | string | undefined): strin
  * from a real messaging platform, otherwise null. After a handoff the live
  * source is local, so this is what drives the row's origin-platform badge.
  */
-export function handoffOriginSource(
-  handoffState: null | string | undefined,
-  handoffPlatform: null | string | undefined
-): string | null {
-  if (handoffState !== 'completed') {
-    return null
-  }
-
-  const id = normalizeSessionSource(handoffPlatform)
-
-  if (!id || LOCAL_SOURCE_IDS.has(id)) {
-    return null
-  }
-
-  return id
-}
 
 export function sessionSourceLabel(source: null | string | undefined): string | null {
   const id = normalizeSessionSource(source)

@@ -229,7 +229,6 @@ export const ja = defineLocale({
     failedTitle: 'アップロードに失敗しました',
     failedHint:
       'ターミナルから `hermes debug share --nous` を実行するか、`hermes debug share --local` でアップロードせずにレポートを表示することもできます。',
-    handoffLead: '続きは次の場所で:',
     links: {
       github: 'GitHub Issues',
       portal: 'Nous Portal サポート',
@@ -1965,8 +1964,7 @@ export const ja = defineLocale({
       finishedUnread: '完了 — 未読',
       backgroundRunning: 'バックグラウンドタスク実行中',
       draftSession: '下書き — 未送信',
-      handoffOrigin: platform => `${platform} から引き継ぎ`,
-      ownedByProfile: profile => `プロファイル: ${profile}`,
+        ownedByProfile: profile => `プロファイル: ${profile}`,
       renamed: '名前を変更しました',
       renameFailed: '名前の変更に失敗しました',
       renameTitle: 'セッションの名前を変更',
