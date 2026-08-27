@@ -1138,7 +1138,7 @@ Environment state persists: activate a virtualenv or export variables once per s
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
 Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
-PTY: set pty=true for interactive CLIs (they hang without it); local backend only.
+PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
 
 # Global state for environment lifecycle management
@@ -4118,7 +4118,7 @@ TERMINAL_SCHEMA = {
             },
             "pty": {
                 "type": "boolean",
-                "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Local backend only. Default: false.",
+                "description": "With background=true: run in a pseudo-terminal for interactive CLI tools (Codex, Claude Code, Python REPL). Local backend only. Default: false.",
                 "default": False
             },
             "notify": {
@@ -4155,6 +4155,22 @@ def _handle_terminal(args, **kw):
     notify = args.get("notify")
     notify_on_complete = args.get("notify_on_complete", False)
     watch_patterns = args.get("watch_patterns")
+    # Background-only modifiers on a foreground call were silently ignored;
+    # fail with the corrected call instead (poka-yoke, no schema cost).
+    if not args.get("background", False):
+        if notify or watch_patterns or notify_on_complete:
+            return tool_error(
+                "notify only applies to background commands (foreground "
+                "results return directly). Either drop notify, or run as "
+                "terminal(command=..., background=true, notify=...)."
+            )
+        if args.get("pty", False):
+            return tool_error(
+                "pty requires background=true (a PTY session is interacted "
+                "with via process(action='write'/'submit'), which needs a "
+                "tracked background process). Retry as terminal(command=..., "
+                "background=true, pty=true)."
+            )
     if notify is not None:
         if isinstance(notify, bool):
             notify_on_complete = notify

@@ -283,16 +283,27 @@ class TestTerminalToolSchema:
         assert array_alts and array_alts[0]["items"] == {"type": "string"}
 
     def test_handler_passes_watch_patterns(self):
-        """_handle_terminal passes watch_patterns to terminal_tool."""
+        """_handle_terminal passes legacy watch_patterns through to
+        terminal_tool (background call — foreground+watch now errors)."""
         from tools.terminal_tool import _handle_terminal
         with patch("tools.terminal_tool.terminal_tool") as mock_tt:
             mock_tt.return_value = json.dumps({"output": "ok", "exit_code": 0})
             _handle_terminal(
-                {"command": "echo hi", "watch_patterns": ["ERR"]},
+                {"command": "echo hi", "background": True, "watch_patterns": ["ERR"]},
                 task_id="t1",
             )
             _, kwargs = mock_tt.call_args
             assert kwargs.get("watch_patterns") == ["ERR"]
+
+    def test_foreground_watch_patterns_rejected_with_teaching_error(self):
+        """Background-only modifiers on a foreground call fail loud with the
+        corrected call shape instead of being silently ignored."""
+        from tools.terminal_tool import _handle_terminal
+        result = json.loads(
+            _handle_terminal({"command": "echo hi", "watch_patterns": ["ERR"]}, task_id="t1")
+        )
+        assert "error" in result
+        assert "background=true" in result["error"]
 
 
 # =========================================================================
