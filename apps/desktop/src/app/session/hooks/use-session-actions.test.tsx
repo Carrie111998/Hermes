@@ -1982,6 +1982,96 @@ describe('branchStoredSession desktop source tagging', () => {
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
+  it.each(['removed', 'rebound'] as const)(
+    'fails closed when an offscreen target is %s while its source reconnects',
+    async mutation => {
+      const recovery = deferred<void>()
+
+      const tileMessages: ClientSessionState['messages'] = [
+        { id: 'tile-q', role: 'user', parts: [{ type: 'text', text: 'tile question' }] }
+      ]
+
+      const tileState = {
+        ...createClientSessionState('tile-stored', tileMessages),
+        cwd: '/tile/workspace'
+      }
+
+      const sessionStateByRuntimeIdRef = {
+        current: new Map<string, ClientSessionState>([['tile-runtime', tileState]])
+      }
+
+      const dispatched = vi.fn(async (_method: string, _params?: Record<string, unknown>) => ({}) as never)
+
+      const release = vi.fn()
+
+      const bindGatewayRequestForOwner = vi.fn((): GatewayRequestLease => ({
+        request: (async (
+          method: string,
+          params?: Record<string, unknown>,
+          _timeoutMs?: number,
+          _signal?: AbortSignal,
+          isStillValid?: () => boolean
+        ) => {
+          await recovery.promise
+
+          if (isStillValid && !isStillValid()) {
+            throw new Error('Hermes source session unavailable')
+          }
+
+          return dispatched(method, params)
+        }) as GatewayRequestLease['request'],
+        release
+      }))
+
+      $sessionTiles.set([
+        {
+          ownerRoute: { connectionId: 'source-a', profile: 'work' },
+          runtimeId: 'tile-runtime',
+          storedSessionId: 'tile-stored'
+        }
+      ])
+
+      let branchCurrentSession: ((messageId?: string, targetSessionId?: string) => Promise<boolean>) | null = null
+      render(
+        <BranchHarness
+          activeSessionId="foreground-runtime"
+          bindGatewayRequestForOwner={bindGatewayRequestForOwner}
+          onCurrentReady={branch => (branchCurrentSession = branch)}
+          onReady={() => undefined}
+          requestGateway={vi.fn(async () => ({}) as never)}
+          sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+        />
+      )
+      await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+      const result = branchCurrentSession!(undefined, 'tile-runtime')
+      await waitFor(() => expect(bindGatewayRequestForOwner).toHaveBeenCalledWith('source-a', 'work'))
+
+      if (mutation === 'removed') {
+        sessionStateByRuntimeIdRef.current.delete('tile-runtime')
+        $sessionTiles.set([])
+      } else {
+        sessionStateByRuntimeIdRef.current.set('tile-runtime', {
+          ...createClientSessionState('other-stored', tileMessages),
+          cwd: '/other/workspace'
+        })
+        $sessionTiles.set([
+          {
+            ownerRoute: { connectionId: 'source-b', profile: 'work' },
+            runtimeId: 'tile-runtime',
+            storedSessionId: 'other-stored'
+          }
+        ])
+      }
+
+      recovery.resolve()
+
+      await expect(result).resolves.toBe(false)
+      expect(dispatched).not.toHaveBeenCalled()
+      expect(release).toHaveBeenCalledOnce()
+    }
+  )
+
   it('uses the leased source requester and applies a delayed runtime response only to its owner profile', async () => {
     const branchRpc = deferred<{
       info: { approval_mode: 'off'; cwd: string }
@@ -2066,10 +2156,16 @@ describe('branchStoredSession desktop source tagging', () => {
 
     expect(bindGatewayRequestForOwner).toHaveBeenCalledWith('source-a', 'work')
     await waitFor(() =>
-      expect(leasedSourceRequest).toHaveBeenCalledWith('session.branch', {
-        session_id: 'tile-runtime',
-        count: 2
-      })
+      expect(leasedSourceRequest).toHaveBeenCalledWith(
+        'session.branch',
+        {
+          session_id: 'tile-runtime',
+          count: 2
+        },
+        undefined,
+        undefined,
+        expect.any(Function)
+      )
     )
 
     activeGatewayRequest = switchedGatewayRequest

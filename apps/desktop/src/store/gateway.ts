@@ -34,7 +34,8 @@ export type GatewayRequester = <T>(
   method: string,
   params?: Record<string, unknown>,
   timeoutMs?: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  isStillValid?: () => boolean
 ) => Promise<T>
 
 export interface GatewayRequestLease {
@@ -1576,8 +1577,17 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
         return
       }
 
-      const connection = await desktop.getConnection(key)
-      const wsUrl = await resolveGatewayWsUrl(desktop, connection)
+      const connection = await withTimeout(
+        desktop.getConnection(key),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        'Timed out reconnecting to Hermes backend'
+      )
+
+      const wsUrl = await withTimeout(
+        resolveGatewayWsUrl(desktop, connection),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        'Timed out re-minting the gateway WebSocket URL'
+      )
 
       if (stillRegistered()) {
         await gateway.connect(wsUrl)
@@ -1599,8 +1609,14 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
   }
 
   return {
-    request: async <T>(method: string, params = {}, timeoutMs?: number, signal?: AbortSignal): Promise<T> => {
-      if (!stillRegistered()) {
+    request: async <T>(
+      method: string,
+      params = {},
+      timeoutMs?: number,
+      signal?: AbortSignal,
+      isStillValid?: () => boolean
+    ): Promise<T> => {
+      if (!stillRegistered() || (isStillValid && !isStillValid())) {
         throw new Error('Hermes source gateway unavailable')
       }
 
@@ -1621,6 +1637,14 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
 
           throw reconnectError
         }
+      }
+
+      // Recovery can yield for an IPC descriptor lookup and a fresh OAuth
+      // ticket. The command owner may disappear or rebind during either await;
+      // validate at the last pre-send boundary so a non-idempotent mutation is
+      // never dispatched for a stale runtime.
+      if (!stillRegistered() || (isStillValid && !isStillValid())) {
+        throw new Error('Hermes source gateway unavailable')
       }
 
       return timeoutMs !== undefined || signal !== undefined

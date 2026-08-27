@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { RECONNECT_ATTEMPT_TIMEOUT_MS } from '@/lib/with-timeout'
+
 // Regression suite for #89622: clicking a profile in the rail did nothing.
 // The live-work pruner (pruneSecondaryGateways) disposed the switch target's
 // secondary entry while its socket was still dialing — the target is not yet
@@ -61,7 +63,9 @@ const {
 function installDesktop(): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
     getConnection: vi.fn(async (profile: null | string) =>
-      profile ? { port: 5151, profile, token: 'secondary-token' } : { port: 4242, token: 'primary-token' }
+      profile
+        ? { port: 5151, profile, token: 'secondary-token', wsUrl: 'ws://127.0.0.1:5151/ws' }
+        : { port: 4242, token: 'primary-token', wsUrl: 'ws://127.0.0.1:4242/ws' }
     ),
     getConnectionFor: vi.fn(async ({ profile }: { connectionId: string; profile: string }) => ({
       port: 6161,
@@ -75,6 +79,9 @@ function installDesktop(): void {
 
 function makePrimary() {
   return {
+    connect: vi.fn(async function (this: { connectionState: string }) {
+      this.connectionState = 'open'
+    }),
     connectionState: 'open',
     request: vi.fn(async (method: string, params: Record<string, unknown>) => ({ method, params }))
   }
@@ -151,6 +158,53 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     await expect(lease.request('session.branch', { session_id: 'runtime-bot' })).rejects.toBe(outcomeUnknown)
     expect(gateway.request).toHaveBeenCalledOnce()
     expect(gateway.connect).toHaveBeenCalledOnce()
+    lease.release()
+  })
+
+  it('bounds a wedged primary descriptor lookup and permits a later recovery attempt', async () => {
+    vi.useFakeTimers()
+    const primary = makePrimary()
+    const desktop = window.hermesDesktop
+    vi.mocked(desktop.getConnection).mockImplementationOnce(() => new Promise(() => undefined))
+    primary.connectionState = 'closed'
+    setPrimaryGateway(primary as never, 'default')
+    const firstLease = acquireGatewayRequestLease(primary as never, 'default')
+    const firstRequest = firstLease.request('session.branch', { session_id: 'runtime-primary' })
+    const firstRejection = expect(firstRequest).rejects.toThrow('Timed out reconnecting to Hermes backend')
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await firstRejection
+    firstLease.release()
+
+    const secondLease = acquireGatewayRequestLease(primary as never, 'default')
+    await expect(secondLease.request('session.branch', { session_id: 'runtime-primary' })).resolves.toEqual({
+      method: 'session.branch',
+      params: { session_id: 'runtime-primary' }
+    })
+    expect(desktop.getConnection).toHaveBeenCalledTimes(2)
+    secondLease.release()
+  })
+
+  it('bounds a wedged primary WebSocket URL refresh before dispatch', async () => {
+    vi.useFakeTimers()
+    const primary = makePrimary()
+    const desktop = window.hermesDesktop
+    vi.mocked(desktop.getConnection).mockResolvedValue({
+      authMode: 'oauth',
+      profile: 'default',
+      wsUrl: 'wss://gateway.invalid/ws'
+    } as never)
+    desktop.getGatewayWsUrl = vi.fn(() => new Promise<string>(() => undefined))
+    primary.connectionState = 'closed'
+    setPrimaryGateway(primary as never, 'default')
+    const lease = acquireGatewayRequestLease(primary as never, 'default')
+    const request = lease.request('session.branch', { session_id: 'runtime-primary' })
+    const rejection = expect(request).rejects.toThrow('Timed out re-minting the gateway WebSocket URL')
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await rejection
+    expect(primary.connect).not.toHaveBeenCalled()
+    expect(primary.request).not.toHaveBeenCalled()
     lease.release()
   })
 

@@ -1913,7 +1913,8 @@ export function useSessionActions({
       sourceRequest?: GatewayRequester,
       uiIntent?: BranchUiIntent,
       branchCount?: number,
-      sourceOwnerRoute?: SessionOwnerRoute
+      sourceOwnerRoute?: SessionOwnerRoute,
+      sourceStillValid?: () => boolean
     ): Promise<boolean> => {
       creatingSessionRef.current = true
 
@@ -1939,10 +1940,16 @@ export function useSessionActions({
             throw new Error('Hermes gateway unavailable')
           }
 
-          branched = await sourceRequest<SessionCreateResponse>('session.branch', {
-            session_id: sourceSessionId,
-            ...(branchCount !== undefined ? { count: branchCount } : {})
-          })
+          branched = await sourceRequest<SessionCreateResponse>(
+            'session.branch',
+            {
+              session_id: sourceSessionId,
+              ...(branchCount !== undefined ? { count: branchCount } : {})
+            },
+            undefined,
+            undefined,
+            sourceStillValid
+          )
         } else {
           branched = await requestGateway<SessionCreateResponse>('session.create', {
             cols: 96,
@@ -2111,6 +2118,7 @@ export function useSessionActions({
       const uiIntent = captureBranchUiIntent()
       let sourceLease: GatewayRequestLease | null = null
       let sourceOwnerRoute: SessionOwnerRoute | undefined
+      let sourceStillValid: (() => boolean) | undefined
 
       // Pin transport, source profile, and UI intent before profile resolution
       // yields. The command lease keeps a background source registered across
@@ -2142,6 +2150,24 @@ export function useSessionActions({
           profile = normalizeProfileKey(owner.profile)
           sourceOwnerRoute = owner
           sourceLease = bindGatewayRequestForOwner(owner.connectionId, profile)
+          const targetTile = $sessionTiles.get().find(tile => tile.storedSessionId === parentStoredId)
+
+          sourceStillValid = () => {
+            const currentState = sessionStateByRuntimeIdRef.current.get(sessionId)
+            const currentTile = $sessionTiles.get().find(tile => tile.storedSessionId === parentStoredId)
+            const currentOwner = parentStoredId ? sessionTileOwnerRoute(parentStoredId) : undefined
+
+            return (
+              currentState === targetState &&
+              currentState?.storedSessionId === parentStoredId &&
+              Boolean(targetTile && currentTile) &&
+              currentTile?.runtimeId === targetTile?.runtimeId &&
+              currentOwner?.connectionId === owner.connectionId &&
+              normalizeProfileKey(currentOwner?.profile) === profile &&
+              currentOwner?.mode === owner.mode &&
+              currentOwner?.targetProfile === owner.targetProfile
+            )
+          }
         }
 
         // The live atom may be a compacted model projection. Read the durable
@@ -2191,6 +2217,10 @@ export function useSessionActions({
 
         clearNotifications()
 
+        if (sourceStillValid && !sourceStillValid()) {
+          throw new Error('Hermes tile source session unavailable')
+        }
+
         return await forkBranch(
           branchMessages,
           sessionId,
@@ -2200,7 +2230,8 @@ export function useSessionActions({
           sourceLease.request,
           uiIntent,
           messageId || !isForeground ? branchMessages.length : undefined,
-          sourceOwnerRoute
+          sourceOwnerRoute,
+          sourceStillValid
         )
       } catch (err) {
         notifyError(err, copy.branchFailed)
