@@ -19,8 +19,14 @@ export function resolveLiveProjectFilter(
   projectFilter: readonly string[],
   tree: readonly { id: string }[] | null | undefined
 ): readonly string[] {
-  if (!projectFilter.length) return projectFilter
-  if (!tree || !tree.length) return []
+  if (!projectFilter.length) {
+    return projectFilter
+  }
+
+  if (!tree || !tree.length) {
+    return []
+  }
+
   const liveIds = new Set(tree.map(project => project.id))
   return projectFilter.filter(id => liveIds.has(id))
 }

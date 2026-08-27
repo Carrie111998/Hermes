@@ -146,8 +146,8 @@ import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
-import { resolveLiveProjectFilter } from './project-filter'
 import { SidebarLoadMoreRow } from './load-more-row'
+import { resolveLiveProjectFilter } from './project-filter'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
@@ -429,6 +429,7 @@ export function ChatSidebar({
     () => resolveLiveProjectFilter(persistedProjectFilter, projectTree),
     [persistedProjectFilter, projectTree]
   )
+
   const projectTreeLoading = useStore($projectTreeLoading)
   const removedSessionIds = useStore($removedSessionIds)
   const reposScanning = useStore($reposScanning)
