@@ -3520,6 +3520,28 @@ def _runtime_main_value(field: str) -> Any:
         if value:
             return value
     return ""
+def _sanitize_url_for_logging(url: str) -> str:
+    """Return a base URL that is safe to include in a diagnostic log."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return "<url-redacted>"
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        return urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
+    except Exception:
+        return "<url-redacted>"
+
+
+def _runtime_route_identity(runtime: Optional[Dict[str, Any]]) -> tuple[str, str, str, str]:
+    """Return the session-scoped identity used to suppress duplicate logs."""
+    if not isinstance(runtime, dict):
+        return ("", "", "", "")
+    return tuple(
+        str(runtime.get(field) or "")
+        for field in ("session_id", "provider", "model", "base_url")
+    )
 
 
 def set_runtime_main(
@@ -3547,6 +3569,7 @@ def set_runtime_main(
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
     global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+    previous_runtime = _RUNTIME_MAIN_CONTEXT.get()
     runtime = {
         "provider": (provider or "").strip().lower(),
         "requested_provider": (requested_provider or "").strip().lower(),
@@ -3562,6 +3585,19 @@ def set_runtime_main(
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
     }
+    # Log only when this context's session route changes. The previous value is
+    # context-local, so concurrent gateway sessions cannot suppress each
+    # other's first route diagnostic.
+    if _runtime_route_identity(previous_runtime) != _runtime_route_identity(runtime):
+        safe_url = _sanitize_url_for_logging(runtime["base_url"])
+        location = f" at {safe_url}" if safe_url else ""
+        logger.info(
+            "Runtime: main route set to %s/%s%s",
+            runtime["provider"] or "unknown",
+            runtime["model"] or "unknown",
+            location,
+        )
+
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
@@ -3601,7 +3637,6 @@ def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
         yield runtime
     finally:
         _RUNTIME_MAIN_CONTEXT.reset(token)
-
 
 def clear_runtime_main() -> None:
     """Clear the runtime override in the current context."""
@@ -7523,6 +7558,10 @@ def resolve_vision_provider_client(
                 continue  # already tried above
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:
+                logger.info(
+                    "Vision auto-detect: using %s (%s) [aggregator fallback]",
+                    candidate, default_model or resolved_model,
+                )
                 return _finalize(candidate, sync_client, default_model)
 
         logger.debug("Auxiliary vision client: none available")
@@ -8260,25 +8299,39 @@ def _resolve_task_provider_model(
     if base_url and _preserve_provider_with_base_url(provider):
         return provider, resolved_model, base_url, api_key, resolved_api_mode
     if base_url:
+        logger.info("Auxiliary %s: route resolved — custom/%s [explicit base_url override]",
+                     task or "call", resolved_model or "default")
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
     if provider:
+        logger.info("Auxiliary %s: route resolved — %s/%s [explicit provider arg]",
+                     task or "call", provider, resolved_model or "default")
         return provider, resolved_model, base_url, api_key, resolved_api_mode
 
     if task:
         # Config.yaml is the primary source for per-task overrides.
         if cfg_base_url and cfg_api_key:
             # Both base_url and api_key explicitly set → custom endpoint.
+            logger.info("Auxiliary %s: route resolved — custom/%s [config: base_url + api_key]",
+                         task, resolved_model or "default")
             return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
         if cfg_base_url and cfg_provider and cfg_provider != "auto":
             # base_url set without api_key but with a known provider — use
             # the provider so it can resolve credentials from env vars
             # (e.g. OPENROUTER_API_KEY) instead of locking into "custom".
+            logger.info("Auxiliary %s: route resolved — %s/%s [config: base_url with provider]",
+                         task, cfg_provider, resolved_model or "default")
             return cfg_provider, resolved_model, cfg_base_url, None, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
+            logger.info("Auxiliary %s: route resolved — %s/%s [config: per-task provider]",
+                         task, cfg_provider, resolved_model or "default")
             return cfg_provider, resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
 
+        logger.info("Auxiliary %s: route resolved — auto/%s [no override — using auto-detection]",
+                     task, resolved_model or "default")
         return "auto", resolved_model, None, None, resolved_api_mode
 
+    logger.info("Auxiliary: route resolved — auto/%s [no task, no override — using auto-detection]",
+                 resolved_model or "default")
     return "auto", resolved_model, None, None, resolved_api_mode
 
 
