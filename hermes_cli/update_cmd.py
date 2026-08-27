@@ -1456,6 +1456,27 @@ def _update_complete_message(pre_version: str | None) -> str:
     if post_version:
         return f"✓ Update complete! (v{post_version})"
     return "✓ Update complete!"
+ 
+ 
+def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
+    """Delete the WAL / shared-memory / rollback-journal files next to *db_path*.
+
+    Call this immediately before overwriting a database file with a snapshot
+    image. Quick snapshots are produced by ``backup._safe_copy_db`` through
+    ``sqlite3.backup()``, so the image is already checkpointed and owns no WAL —
+    which is exactly why ``backup._EXCLUDED_SUFFIXES`` refuses to ship sidecars
+    inside a snapshot. Copying the image over the destination replaces only the
+    main database file, so any ``-wal`` / ``-shm`` left behind by the *old*
+    database (a crashed writer, or a second Hermes process the updater's drain
+    did not stop) survives and is replayed over the fresh image on the next
+    open. The result passes ``PRAGMA integrity_check`` while serving the old
+    database's contents, and the first checkpoint folds it in permanently.
+
+    Removing them is safe here specifically: they belong to a database the
+    caller has already declared corrupt and is about to discard.
+    """
+    for suffix in ("-wal", "-shm", "-journal"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
 
 def _print_update_summary(
@@ -1493,6 +1514,43 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
         path.write_text("0" if ok else "1", encoding="utf-8")
     except OSError:
         pass
+
+
+def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
+    """Replace *state_path* with the snapshot image at *snap_state*.
+
+    Shared by both post-update auto-restore paths (the ZIP update and the git
+    pull). The destination's stale sidecars are cleared before the copy, so the
+    restored image cannot be silently overwritten by the corrupt database's WAL
+    replay — see :func:`_clear_stale_sqlite_sidecars`.
+
+    Refuses (returns ``False``) while another process still holds the database
+    or its sidecars open: copying a snapshot over a live writer's inode makes
+    the writer's page cache and WAL index disagree with the file bytes, and
+    its next checkpoint writes pages at offsets that no longer mean what it
+    thinks — the #90950 page-1 clobber. ``None`` (scan unavailable) proceeds:
+    the updater has already drained gateways, and refusing on "unknown" would
+    disable auto-restore on every non-Linux host.
+
+    Returns ``True`` when the restored file passes an integrity check. Raises
+    ``OSError`` if the copy itself fails, which callers already report.
+    """
+    from hermes_cli.backup import _foreign_db_holder_pids, verify_sqlite_integrity
+
+    holders = _foreign_db_holder_pids(state_path)
+    if holders:
+        print(
+            f"  ✗ Auto-restore refused: process(es) {holders} still hold "
+            "state.db or its WAL open. Stop them (hermes gateway stop), "
+            "then restore manually with /snapshot restore."
+        )
+        return False
+    _clear_stale_sqlite_sidecars(state_path)
+    shutil.copy2(snap_state, state_path)
+    restored = verify_sqlite_integrity(
+        state_path, check_header=True, run_pragma=True
+    )
+    return bool(restored.get("valid"))
 
 
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
@@ -1876,15 +1934,9 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                             )
                             if _snap_ok.get("valid"):
                                 try:
-                                    import shutil as _shutil
-
-                                    _shutil.copy2(_snap_state, _state_path)
-                                    _restored_ok = verify_sqlite_integrity(
-                                        _state_path,
-                                        check_header=True,
-                                        run_pragma=True,
-                                    )
-                                    if _restored_ok.get("valid"):
+                                    if _restore_state_db_from_snapshot(
+                                        _state_path, _snap_state
+                                    ):
                                         print(
                                             "  ✓ Auto-restored from snapshot "
                                             f"{_snap_dir.name}"
@@ -2578,6 +2630,65 @@ def _format_concurrent_instances_message(
     lines.append("  confirmed those processes will not write to the venv.")
     return "\n".join(lines)
 
+
+def _classify_concurrent_instance(pid: int) -> str:
+    """Return ``"gateway"`` when ``pid``'s command line is a gateway runtime.
+
+    Delegates to ``_is_pausable_gateway`` — the same canonical
+    ``gateway run`` matcher (``gateway.status.looks_like_gateway_command_line``,
+    shlex-tokenized, profile-selector aware) used by the Desktop preflight
+    exemption and the venv-holder guard fallback — so a PID classified as
+    ``"gateway"`` here is exactly the set the pause/kill+restart machinery
+    downstream will stop. That symmetry is what lets the pre-update
+    concurrent gate skip the abort for gateway-only matches: the gateway is
+    going to be stopped by ``_pause_windows_gateways_for_update()`` moments
+    later anyway, so refusing the update just to make the user kill it
+    manually is friction without benefit.
+
+    Returns ``"non-gateway"`` when the cmdline doesn't match, and
+    ``"unknown"`` when psutil can't read it (process gone, access denied,
+    psutil missing). The gate treats ``"unknown"`` as non-gateway — we'd
+    rather block an update we could have completed than proceed against a
+    process we couldn't positively identify as a gateway.
+    """
+    try:
+        import psutil  # noqa: PLC0415
+    except Exception:
+        return "unknown"
+
+    try:
+        proc = psutil.Process(int(pid))
+        cmdline_list = proc.cmdline()
+    except Exception:
+        return "unknown"
+
+    from hermes_cli._scan_venv_blockers import _is_pausable_gateway  # noqa: PLC0415
+
+    cmdline = " ".join(cmdline_list or [])
+    if _is_pausable_gateway(cmdline):
+        return "gateway"
+    return "non-gateway"
+
+
+def _filter_non_gateway_concurrent_instances(
+    matches: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Return only the concurrent-instance matches that are NOT the gateway.
+
+    Used by the pre-update concurrent gate to decide whether to abort
+    ``hermes update``. If every concurrent instance is a gateway, the pause
+    machinery (``_pause_windows_gateways_for_update``) and the post-update
+    kill+restart block handle it — the update proceeds. If anything else (a
+    TUI shell, a Hermes Desktop backend child, an unrelated ``hermes`` REPL)
+    is in the list, the gate still aborts with the existing message, since
+    those have no pause machinery downstream.
+    """
+    non_gateway: list[tuple[int, str]] = []
+    for pid, name in matches:
+        if _classify_concurrent_instance(pid) != "gateway":
+            non_gateway.append((pid, name))
+    return non_gateway
+
 def _upgrade_pip_before_lazy_refresh(
     install_cmd_prefix: list[str],
     *,
@@ -3260,24 +3371,19 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     Installs that can't honor non-default branches (e.g. Docker) surface a
     one-line notice instead of silently dropping the flag.
     """
-    from hermes_cli.config import (
-        detect_install_method,
-        is_nix_install_method,
-        recommended_update_command_for_method,
+    # Shared admission gate (#91277 Phase 3): same marker-first decision as
+    # the apply path, so --check can never report git state for an install
+    # whose real update mechanism is an image pull.
+    from hermes_cli.update_contract import (
+        evaluate_update_admission,
+        record_refusal_receipt,
     )
-    method = detect_install_method(_m().PROJECT_ROOT)
-    if method == "docker":
-        # Docker can't ``git fetch`` from within the container.  Surface the
-        # same long-form ``docker pull`` guidance ``hermes update`` (apply
-        # path) uses — telling the user to "reinstall via curl" or that
-        # ".git is missing" would point them at the wrong remediation.
-        from hermes_cli.config import format_docker_update_message
-        print(format_docker_update_message())
-        sys.exit(1)
 
-    if is_nix_install_method(method) or method == "apt":
-        print(recommended_update_command_for_method(method))
-        sys.exit(1)
+    refusal = evaluate_update_admission(_m().PROJECT_ROOT)
+    if refusal is not None:
+        print(refusal.message)
+        record_refusal_receipt(refusal)
+        sys.exit(2)
 
     git_dir = _m().PROJECT_ROOT / ".git"
     if not git_dir.exists():
@@ -4502,6 +4608,113 @@ def _leftover_pausable_gateway_pids(
     return pids
 
 
+def _ledger_manual_serve_holders(
+    matches: list[tuple[int, str, str]],
+) -> list[dict]:
+    """Ledger entries for venv holders that are MANUAL serve/dashboard backends.
+
+    Positive identity only (#63206): the process self-registered in the spawn
+    ledger with purpose serve/dashboard, its (pid, create_time) still matches
+    a live process, and its recorded spawner is NOT alive (a Desktop-owned
+    backend keeps its live Electron spawner and must keep the refusal — the
+    app would respawn what we kill; a PowerShell-launched serve has no live
+    Hermes spawner). Returns the full ledger entries so the relauncher can
+    rebuild the launch command from structured host/port/profile instead of
+    parsing argv.
+    """
+    try:
+        from hermes_cli.process_identity import ledger_entries, spawner_is_dead
+    except Exception:
+        return []
+    holder_pids = {int(pid) for pid, _name, _cmd in matches}
+    out: list[dict] = []
+    for entry in ledger_entries():
+        if entry.get("purpose") not in ("serve", "dashboard"):
+            continue
+        pid = entry.get("pid")
+        if not isinstance(pid, int) or pid not in holder_pids:
+            continue
+        if spawner_is_dead(entry) is False:
+            continue  # live Desktop supervisor owns it — keep refusing
+        out.append(entry)
+    return out
+
+
+def _serve_relaunch_commands(entries: list[dict]) -> list[list[str]]:
+    """Rebuild launch commands for stopped serves from structured identity.
+
+    Uses the ledger's host/port/profile fields — never argv parsing (a
+    joined argv string cannot round-trip Windows paths with spaces). Entries
+    without a recorded port are skipped; the caller prints the manual hint
+    for those.
+    """
+    commands: list[list[str]] = []
+    hermes = None
+    try:
+        scripts_dir = _m()._venv_scripts_dir()
+        if scripts_dir is not None:
+            for name in ("hermes.exe", "hermes"):
+                candidate = scripts_dir / name
+                if candidate.is_file():
+                    hermes = str(candidate)
+                    break
+    except Exception:
+        hermes = None
+    if hermes is None:
+        hermes = "hermes"
+    for entry in entries:
+        port = entry.get("port")
+        if not isinstance(port, int) or port <= 0:
+            continue
+        cmd = [hermes]
+        profile = str(entry.get("profile") or "")
+        if profile and profile != "default":
+            cmd += ["--profile", profile]
+        cmd.append(str(entry.get("purpose")))
+        host = str(entry.get("host") or "")
+        if host:
+            cmd += ["--host", host]
+        cmd += ["--port", str(port)]
+        commands.append(cmd)
+    return commands
+
+
+def _relaunch_stopped_serves(token: dict) -> None:
+    """Idempotent atexit relaunch of manual serves stopped by the venv guard.
+
+    Mirrors the gateway resume token contract: `pending` flips False on the
+    first invocation so the explicit call and the atexit registration cannot
+    double-spawn (#63206).
+    """
+    if not token.get("pending"):
+        return
+    token["pending"] = False
+    entries = token.get("entries") or []
+    if not entries:
+        return
+    commands = _serve_relaunch_commands(entries)
+    skipped = len(entries) - len(commands)
+    failed: list = []
+    if commands:
+        print("  ⟲ Relaunching stopped serve/dashboard backend(s)")
+        failed = _m()._respawn_dashboard_processes(commands)
+    if skipped or failed:
+        print(
+            "  ⚠ Some stopped backends could not be relaunched automatically; "
+            "restart them manually (hermes serve --host <ip> --port <port>)."
+        )
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "serve_relaunch",
+            not failed and not skipped,
+            f"relaunched={len(commands) - len(failed)} failed={len(failed)} skipped={skipped}",
+        )
+    except Exception:
+        pass
+
+
 def _orphaned_desktop_backend_pids(
     matches: list[tuple[int, str, str]],
 ) -> list[int] | None:
@@ -4898,6 +5111,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
 
     profiles: dict[str, int] = {}
     mapped_pids = []
+    socket_acks: list[dict] = []
     for pid in running_pids:
         proc = profile_processes.get(pid)
         if proc is None:
@@ -4905,6 +5119,23 @@ def _pause_windows_gateways_for_update() -> dict | None:
         profiles[str(proc.profile)] = int(pid)
         mapped_pids.append(int(pid))
         _write_update_planned_stop_marker(Path(proc.path), int(pid))
+        # Socket-first pause (#92091 step 2): ask the gateway to drain and
+        # exit itself instead of relying on the marker poll + force-kill
+        # ladder. A positive ACK means the gateway is running its own
+        # graceful restart path (same drain as SIGUSR1/service restarts) and
+        # will release its venv handles on the way out. No answer (older
+        # gateway, no socket) → the marker watcher / force-kill fallback
+        # below behaves exactly as before this verb existed.
+        try:
+            from gateway.control_socket import pause_gateway_for_update
+
+            ack = pause_gateway_for_update(Path(proc.path))
+            if ack and (ack.get("pausing") or ack.get("already_stopping")):
+                socket_acks.append(ack)
+        except Exception as exc:
+            logger.debug(
+                "Socket pause unavailable for gateway %s: %s", pid, exc
+            )
 
     # Resolve each mapped worker's venv-side launcher BEFORE draining: the
     # drain stops tracking a PID exactly when it dies, so a gracefully
@@ -4925,6 +5156,23 @@ def _pause_windows_gateways_for_update() -> dict | None:
         drain_timeout = max(float(_get_restart_drain_timeout()), 1.0)
     except Exception:
         drain_timeout = 10.0
+    if socket_acks:
+        # A socket-paused gateway drains its ACTIVE TURN before exiting; give
+        # it the budget it declared (plus teardown grace) rather than only
+        # the local default, so a mid-turn gateway isn't force-killed at the
+        # end of a too-short wait — the exact outcome the verb exists to
+        # prevent.
+        try:
+            declared = max(
+                float(a.get("drain_timeout") or 0.0) for a in socket_acks
+            )
+            drain_timeout = max(drain_timeout, declared + 10.0)
+        except Exception:
+            pass
+        print(
+            f"  → {len(socket_acks)} gateway(s) ACKed socket pause; "
+            f"waiting up to {int(drain_timeout)}s for graceful exit"
+        )
     survivors = _m()._wait_for_windows_update_gateway_exit(
         mapped_pids,
         timeout=drain_timeout,
@@ -5140,6 +5388,85 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+def _restart_launchd_gateway_after_update(
+    *, supervision_verify: bool = True
+) -> tuple[list, list]:
+    """Restart the invoking profile's launchd gateway after an update.
+
+    #74973 (salvage #75021 by @jeff-mettel): the restart used to be gated on
+    ``launchctl list <label>`` exiting 0. A *booted-out* job — plist present,
+    definition deregistered from launchd (crashed helper, manual bootout,
+    failed prior update) — fails that check, so the whole branch silently
+    skipped: no restart, no message, ``KeepAlive`` unable to revive a
+    definition launchd no longer knows, and the update still printed
+    "Update complete!". ``launchctl list`` is also session-scoped and can
+    exit non-zero while the job is alive in its gui/user domain, so it is
+    not a reliable classifier at all.
+
+    The fix performs NO list-based classification: when the plist exists,
+    ``launchd_restart()`` always runs — it drains a live PID, kickstarts
+    with ``-k``, and owns the bootout/bootstrap/kickstart ladder for the
+    genuinely unloaded state. Every failure path is loud and names the
+    manual recovery command.
+
+    Returns ``(restarted_labels, failed_labels)``. With
+    ``supervision_verify`` (the update path), success additionally requires
+    launchd reporting a fresh supervised PID (#88848 — "the call returned"
+    is not "the gateway is supervised").
+    """
+    from hermes_cli.gateway import (
+        get_launchd_label,
+        get_launchd_plist_path,
+        launchd_restart,
+        wait_for_launchd_gateway_supervision,
+    )
+
+    current_label = get_launchd_label()
+    try:
+        if not get_launchd_plist_path().exists():
+            return [], []  # not a launchd install — nothing to do or warn
+        try:
+            launchd_restart()
+        except subprocess.CalledProcessError as e:
+            stderr = (getattr(e, "stderr", "") or "").strip()
+            print(
+                f"  ⚠ Gateway restart failed: {stderr}\n"
+                "    The gateway may be DOWN on pre-update code. "
+                "Recover manually: hermes gateway restart"
+            )
+            return [], [current_label]
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        # A plist exists, so a gateway is SUPPOSED to be supervised here —
+        # a broken/missing/wedged launchctl is not proof nothing needs
+        # restarting. The old code `pass`ed here (#74973's second silent
+        # variant); count it and tell the operator.
+        print(
+            "  ⚠ Could not restart the gateway "
+            f"({e.__class__.__name__}: {e}).\n"
+            "    Recover manually: hermes gateway restart"
+        )
+        return [], [current_label]
+
+    if not supervision_verify:
+        return [current_label], []
+
+    # launchd_restart() returning is only "restart REQUESTED" — the
+    # self-restart branch hands work to the running gateway, a plist reload
+    # to a detached helper; both asynchronous. A helper that dies before its
+    # first bootstrap (#88848), or a bootstrap that exits 0 without
+    # registering (measured on macOS 26.6.1), otherwise reaches "Update
+    # complete!" with nothing supervising the gateway. Verified
+    # domain-agnostically (a domain locate fails on macOS-26 hosts whose
+    # per-user domains reject service management).
+    if wait_for_launchd_gateway_supervision(label=current_label):
+        return [current_label], []
+    print(
+        f"  ✗ {current_label} restarted but launchd is not supervising it.\n"
+        "    Check logs, then: hermes gateway restart"
+    )
+    return [], [current_label]
+
+
 def _restart_macos_launchd_gateways(
     restarted_services: list,
     failed_or_stale_units: list,
@@ -5175,54 +5502,12 @@ def _restart_macos_launchd_gateways(
     )
 
     # --- Current profile: unchanged single-service path ---------------------
-    # Gate order and predicate mirror the pre-fleet inline block exactly:
-    # plist first (no plist → zero launchctl calls), then the domain-agnostic
-    # `launchctl list` registration check — NOT a domain locate, which fails
-    # on macOS-26 hosts whose per-user domains reject service management
-    # even though launchd_restart() owns that fallback. Gate errors skip
-    # silently (best-effort, as before); only launchd_restart() itself
-    # failing counts toward the incomplete-update warning.
+    _restarted, _failed = _restart_launchd_gateway_after_update(
+        supervision_verify=True
+    )
+    restarted_services.extend(_restarted)
+    failed_or_stale_units.extend(_failed)
     current_label = get_launchd_label()
-    try:
-        if get_launchd_plist_path().exists() and _launchd_service_registered(
-            current_label
-        ):
-            try:
-                launchd_restart()
-            except subprocess.CalledProcessError as e:
-                stderr = (getattr(e, "stderr", "") or "").strip()
-                print(f"  ⚠ Gateway restart failed: {stderr}")
-                failed_or_stale_units.append(current_label)
-            else:
-                # Siblings below are only counted as restarted once launchd
-                # reports a fresh supervised pid; the invoking profile was
-                # counted on "launchd_restart() did not raise" alone. That is
-                # not the same claim: launchd_restart() returns as soon as the
-                # restart has been REQUESTED -- the self-restart branch hands
-                # the work to the running gateway and returns immediately, and
-                # a plist reload is handed to a detached helper. Both are
-                # asynchronous, so a helper that dies before its first
-                # bootstrap (#88848), or a `launchctl bootstrap` that exits 0
-                # without registering (measured on macOS 26.6.1), both reached
-                # "Update complete!" with nothing supervising the gateway.
-                #
-                # Verified domain-agnostically, NOT via
-                # _wait_for_launchd_service_pid: that needs an explicit domain,
-                # and the gate above deliberately avoids a domain locate
-                # because it fails on macOS-26 hosts whose per-user domains
-                # reject service management even though launchd_restart() owns
-                # that fallback.
-                if wait_for_launchd_gateway_supervision(label=current_label):
-                    restarted_services.append(current_label)
-                else:
-                    failed_or_stale_units.append(current_label)
-                    print(
-                        f"  ✗ {current_label} restarted but launchd is not "
-                        "supervising it.\n"
-                        "    Check logs, then: hermes gateway restart"
-                    )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
 
     # --- Sibling profiles ---------------------------------------------------
     for label in launchd_gateway_labels_for_install():
@@ -5468,6 +5753,20 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
                 profile,
                 exc,
             )
+
+    # Surface the outcome on the token (#91277 Phase 2 plan-vs-execution
+    # reconciliation): the git-based update path's fleet reconciliation
+    # cross-checks every planned runtime against restarted_services /
+    # relaunched_profiles / externally_supervised_profiles / killed_pids —
+    # bookkeeping this Windows-specific pause/resume never fed, so a
+    # correctly-paused-and-relaunched Windows gateway was reported
+    # "unaccounted" (loud warning + exit 1) even though the restart
+    # succeeded. The caller merges this into the shared
+    # relaunched_profiles list before reconciliation runs. A profile whose
+    # relaunch genuinely failed is deliberately left off this list — it
+    # must still surface as unaccounted so the user is told to restart it
+    # manually (Windows has no watcher to recover a failed relaunch).
+    token["relaunched_profiles"] = relaunched
 
     # Respawn unmapped gateways (no profile→PID-file mapping, e.g. a Scheduled
     # Task) by replaying the argv we snapshotted before force-killing them.
@@ -5831,13 +6130,30 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # open. Continuing would result in a string of WinError 32 warnings and
     # then either a deferred-rename leftover or a failed git-pull fast path
     # that silently falls back to the slower ZIP route. See issue #26670.
+    #
+    # Exception (#37039): when every concurrent instance is a gateway
+    # runtime, the pause machinery a few lines below
+    # (``_pause_windows_gateways_for_update``) stops it before any file
+    # mutation, and the post-update restart phase brings it back. Aborting
+    # just to make the user run the same kill manually is friction without
+    # benefit. Anything not positively identified as a gateway (TUI shell,
+    # Desktop backend child, unreadable cmdline) still aborts exactly as
+    # before.
     if _m()._is_windows() and not getattr(args, "force", False):
         scripts_dir = _m()._venv_scripts_dir()
         if scripts_dir is not None:
             concurrent = _m()._detect_concurrent_hermes_instances(scripts_dir)
             if concurrent:
-                print(_format_concurrent_instances_message(concurrent, scripts_dir))
-                sys.exit(2)
+                non_gateway = _m()._filter_non_gateway_concurrent_instances(
+                    concurrent
+                )
+                if non_gateway:
+                    print(
+                        _format_concurrent_instances_message(
+                            non_gateway, scripts_dir
+                        )
+                    )
+                    sys.exit(2)
 
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
@@ -5933,6 +6249,49 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "process(es) still hold the venv; stopping their trees"
                 )
                 _m()._stop_process_trees(_orphan_backends)
+                _time.sleep(1.0)
+                _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
+            # Manual serve/dashboard rung (#63206): a network-bound
+            # `hermes serve --host <ip>` powering a REMOTE Desktop holds the
+            # venv and used to dead-end the update with exit 2 — the user's
+            # only option was killing the backend by hand, and nothing ever
+            # brought it back (the remote client's endpoint stayed dead).
+            # Positive ledger identity only: self-registered serve/dashboard
+            # whose recorded spawner is not alive (Desktop-owned backends
+            # keep the refusal — the app respawns what we kill). Stop them,
+            # and register an idempotent atexit relaunch built from the
+            # ledger's structured host/port/profile so the endpoint comes
+            # back on the SAME bind after the update — success or failure.
+            _serve_entries = _m()._ledger_manual_serve_holders(_venv_holders)
+            if _serve_entries:
+                print(
+                    f"  ⚠ {len(_serve_entries)} manual serve/dashboard "
+                    "backend(s) hold the venv; stopping them for the update "
+                    "(they will be relaunched on their recorded endpoints)"
+                )
+                _m()._stop_process_trees(
+                    [int(e["pid"]) for e in _serve_entries]
+                )
+                _serve_resume_token = {
+                    "pending": True,
+                    "entries": _serve_entries,
+                }
+                try:
+                    from hermes_cli.update_receipt import record_step
+
+                    record_step(
+                        "serve_pause",
+                        True,
+                        f"stopped={len(_serve_entries)}",
+                    )
+                except Exception:
+                    pass
+                import atexit as _serve_atexit
+
+                _serve_atexit.register(
+                    _m()._relaunch_stopped_serves, _serve_resume_token
+                )
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
@@ -6898,6 +7257,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
         print(f"✓ Code updated!{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
 
+        # ── macOS TCC stale-grant notice (#86385) ──────────────────────
+        # Locally-built desktop bundles are re-signed on every update. With the
+        # post-#73681 identifier-pinned DR, new grants survive rebuilds — but a
+        # grant made to a pre-fix binary stays stale: the System Settings toggle
+        # shows ON while macOS re-prompts on every capture, and the modern prompt
+        # has no Allow button, so users loop. One line of guidance after update
+        # tells affected users how to complete the one-time re-grant.
+        if sys.platform == "darwin" and had_desktop_app_before_update:
+            print()
+            print(
+                "  ℹ macOS: if Hermes re-prompts for permissions you already "
+                "granted (toggle shows ON), the stored grant is stale — run "
+                "`tccutil reset ScreenCapture com.nousresearch.hermes` (repeat "
+                "per affected service), toggle it ON in System Settings, then "
+                "fully quit & relaunch once."
+            )
+
+        # NOTE: the macOS TCC interpreter anchor that used to refresh here
+        # (#95131/#95478) is REVERTED: the anchored real-file copy could not
+        # load libpython (LC_RPATH resolved into venv/lib/), bricking every
+        # hermes command on real Macs (#95425), and re-pointed aliases lost
+        # the stdlib (#95541). `hermes doctor` now heals already-anchored
+        # venvs back to symlinks. Re-land requires a dylib-complete design
+        # verified on macOS hardware first.
+
         # ── Post-update state.db integrity guard (#68474) ─────────────────
         # Verify that state.db survived the update intact.  If the live file
         # is now corrupted (zeroed, missing header, integrity failure),
@@ -6937,15 +7321,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             )
                             if _snap_ok.get("valid"):
                                 try:
-                                    import shutil as _shutil
-
-                                    _shutil.copy2(_snap_state, _state_path)
-                                    _restored_ok = verify_sqlite_integrity(
-                                        _state_path,
-                                        check_header=True,
-                                        run_pragma=True,
-                                    )
-                                    if _restored_ok.get("valid"):
+                                    if _restore_state_db_from_snapshot(
+                                        _state_path, _snap_state
+                                    ):
                                         print(
                                             "  ✓ Auto-restored from pre-update "
                                             f"snapshot ({_pre_snap_id})"
@@ -7409,7 +7787,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # An indeterminate check (offline, rate-limited, old
                 # driver) keeps the installed version — `hermes update`
                 # must stay fast; `hermes computer-use install --upgrade`
-                # remains the force path.
+                # remains the force path. Windows also defers confirmed
+                # updates and contract repairs to that explicit command
+                # because the upstream installer may prompt for console/UAC
+                # consent that this hidden updater cannot provide.
                 install_cua_driver(
                     upgrade=True,
                     require_confirmed_update=True,
@@ -8245,6 +8626,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 pass
 
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        if _windows_gateway_resume:
+            # Feed Windows's own pause/resume outcome into the same
+            # relaunched_profiles bookkeeping the systemd/launchd restart
+            # phase populates, so the #91277 Phase 2 reconciliation below
+            # does not report a correctly-relaunched Windows gateway as
+            # "unaccounted" (a runtime the plan saw but no bookkeeping
+            # mentions — the reconciliation's blind-spot tripwire). A
+            # profile whose relaunch genuinely failed is intentionally
+            # left out of the token's list, so it still surfaces there.
+            # Best-effort: the restart-phase try/except above may have
+            # raised before relaunched_profiles was initialized, so this
+            # must never itself abort the update.
+            try:
+                for _win_profile in _windows_gateway_resume.get("relaunched_profiles") or []:
+                    if _win_profile not in relaunched_profiles:
+                        relaunched_profiles.append(_win_profile)
+            except Exception as _win_reconcile_exc:
+                logger.debug(
+                    "Could not merge Windows relaunch outcome into fleet "
+                    "reconciliation bookkeeping: %s",
+                    _win_reconcile_exc,
+                )
 
         # Warn if legacy Hermes gateway unit files are still installed.
         # When both hermes.service (from a pre-rename install) and the
@@ -8303,19 +8706,75 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print_fleet_version_matrix,
             )
 
-            # A brief settle window: freshly restarted gateways need a
-            # moment to rewrite gateway_state.json with their new identity.
+            # Cross-platform "we expected fleet rows" signal (#93406). The
+            # old (restarted_services or killed_pids) condition never fires
+            # on Windows: the pause/resume phase populates neither list, so
+            # a healthy resumed gateway yielded zero rows and exit 0.
+            _fleet_rows_expected = _m()._fleet_probe_expected_runtimes(
+                _pre_update_plan,
+                _pre_restart_gateway_pids,
+                _windows_gateway_resume,
+                restarted_services,
+                killed_pids,
+            )
+            # A brief settle window: freshly restarted/resumed gateways need
+            # a moment to rewrite gateway_state.json with their new identity.
             # Skipped when the restart phase touched nothing (no gateways
             # were running) — nothing to settle.
-            if restarted_services or killed_pids:
-                _time.sleep(2.0)
-            # Pass the pre-restart PID snapshot so a gateway the restart
-            # phase stopped WITHOUT a verified replacement shows as a DOWN
-            # row (exit 1) instead of silently producing no row at all.
-            _fleet_snapshot = collect_fleet_versions(
-                pre_restart_pids=_pre_restart_gateway_pids
-            )
+            #
+            # On Windows the resume path relaunches the gateway DETACHED, and
+            # that process must boot before it stamps gateway_state.json or
+            # answers the control socket (a Telegram gateway reconnects its
+            # polling loop — ~10s).  A single 2s sleep therefore races the
+            # gateway's own startup and reports "no rows" (exit 1) for a
+            # healthy resume, which then triggers a full retry that re-kills
+            # the gateway the first attempt just started.  Poll a bounded
+            # window for the resumed gateway to publish its identity instead.
+            _fleet_snapshot = []
+            if _fleet_rows_expected:
+                _fleet_deadline = _time.monotonic() + 30.0
+                while True:
+                    _time.sleep(2.0)
+                    # Pass the pre-restart PID snapshot so a gateway the
+                    # restart phase stopped WITHOUT a verified replacement
+                    # shows as a DOWN row (exit 1) instead of silently
+                    # producing no row at all.
+                    _fleet_snapshot = collect_fleet_versions(
+                        pre_restart_pids=_pre_restart_gateway_pids
+                    )
+                    # A "down" row here is the stale pre-restart record of a
+                    # gateway whose detached replacement is still booting —
+                    # not a confirmed failure.  Keep polling until every
+                    # resumed gateway has published (no "down" rows remain)
+                    # or the deadline passes, so a slow second gateway can't
+                    # be misread as down and re-trigger the retry loop.
+                    if _fleet_snapshot and not any(
+                        row.get("state") == "down" for row in _fleet_snapshot
+                    ):
+                        break
+                    if _time.monotonic() >= _fleet_deadline:
+                        break
+            else:
+                _fleet_snapshot = collect_fleet_versions(
+                    pre_restart_pids=_pre_restart_gateway_pids
+                )
             if print_fleet_version_matrix(_fleet_snapshot):
+                gateway_fleet_restart_incomplete = True
+            elif not _fleet_snapshot and _fleet_rows_expected:
+                # Fleet probe returned zero rows even though at least one
+                # gateway runtime was (or may have been) live pre-update —
+                # POSIX restart bookkeeping, the pre-restart PID snapshot,
+                # the pre-update plan inventory, or the Windows pause/resume
+                # token all count as that signal.  Every failure path inside
+                # collect_fleet_versions() is swallowed via logger.debug(),
+                # so an empty list is indistinguishable from a healthy fleet
+                # in the current output.  Treat it as verification failure
+                # so the receipt records "partial" and the exit code is 1
+                # (#93406).
+                print(
+                    "\n⚠ Fleet version check returned no rows even though"
+                    " gateway runtimes were expected — verification incomplete."
+                )
                 gateway_fleet_restart_incomplete = True
         except Exception as _fleet_exc:
             logger.debug("Fleet version verification failed: %s", _fleet_exc)
@@ -8432,6 +8891,61 @@ def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:
         return True
     # surviving == []: safe only if we know nothing was running beforehand.
     return pre_restart_pids is None or bool(pre_restart_pids)
+
+
+def _fleet_probe_expected_runtimes(
+    pre_update_plan,
+    pre_restart_pids,
+    windows_resume_token,
+    restarted_services,
+    killed_pids,
+) -> bool:
+    """Whether the post-update fleet probe should have produced rows.
+
+    The zero-rows fail-open (#93406): ``collect_fleet_versions()`` swallows
+    every probe failure via ``logger.debug()`` and ``print_fleet_version_matrix([])``
+    early-returns ``False``, so an empty snapshot reads as \"healthy fleet\" and
+    the update exits 0.  An empty snapshot is only proof-of-safety when NOTHING
+    says a gateway existed before the update.  Any of these signals means at
+    least one runtime was (or may have been) live pre-update, so zero rows is
+    verification failure, not health:
+
+    * ``restarted_services`` / ``killed_pids`` — the POSIX restart phase
+      touched live gateways.
+    * ``pre_restart_pids`` non-empty, or ``None`` (pre-state unreadable —
+      cannot prove nothing was running; same contract as
+      ``_restart_phase_failure_is_incomplete``, #78574).
+    * the pre-update plan inventoried ≥1 runtime.
+    * the Windows pause/resume token carries paused ``profiles`` or
+      ``unmapped`` entries — ``_pause_windows_gateways_for_update`` /
+      ``_resume_windows_gateways_after_update`` populate NEITHER
+      ``restarted_services`` NOR ``killed_pids``, which is exactly why the
+      original ``(restarted_services or killed_pids)`` guard never fires on
+      Windows.
+
+    The same condition gates the 2.0s settle sleep: a freshly resumed Windows
+    gateway needs the settle window to rewrite ``gateway_state.json`` just
+    like a systemd-restarted one.
+
+    Note this keys ONLY on zero-rows-despite-expected-runtimes.  A non-empty
+    snapshot — including rows in ``unknown`` state — is still judged solely by
+    ``print_fleet_version_matrix``.
+    """
+    if restarted_services or killed_pids:
+        return True
+    if pre_restart_pids is None or pre_restart_pids:
+        return True
+    try:
+        if pre_update_plan is not None and pre_update_plan.runtimes:
+            return True
+    except Exception:
+        pass
+    if isinstance(windows_resume_token, dict) and (
+        windows_resume_token.get("profiles")
+        or windows_resume_token.get("unmapped")
+    ):
+        return True
+    return False
 
 
 def _print_items(items, label, key, fallback_key=None):
