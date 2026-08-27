@@ -296,14 +296,16 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
         try:
             from hermes_cli.profiles import profiles_to_serve
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
-                start_kwargs["profile_homes"] = profile_homes
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
-                )
+            initial_profile_homes = list(profiles_to_serve(multiplex=True))
+            # The primary backend outlives profile create/delete operations.
+            # Pass a resolver even when only the default exists so every tick
+            # sees the current roster rather than a startup snapshot.
+            start_kwargs["profile_homes"] = lambda: profiles_to_serve(multiplex=True)
+            _log.info(
+                "Desktop cron scheduler will tick %d profile(s): %s",
+                len(initial_profile_homes),
+                [name for name, _home in initial_profile_homes],
+            )
         except Exception:
             # Fail open to the single-store ticker — the active profile's
             # jobs must keep firing even if profile enumeration breaks.

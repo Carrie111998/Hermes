@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -650,15 +651,27 @@ class InProcessCronScheduler(CronScheduler):
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
         logger = logging.getLogger("cron.scheduler_provider")
+
+        def current_profile_homes():
+            entries = profile_homes() if callable(profile_homes) else profile_homes
+            return list(entries)
+
+        try:
+            initial_profile_homes = current_profile_homes()
+        except BaseException as e:
+            logger.error("Cron profile membership error: %s", e, exc_info=True)
+            initial_profile_homes = []
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
-            len(profile_homes),
-            [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+            len(initial_profile_homes),
+            [p[0] if isinstance(p, tuple) else p for p in initial_profile_homes],
         )
 
         # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
+        for entry in initial_profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
+            if not Path(home).resolve().is_dir():
+                continue
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
@@ -677,12 +690,17 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             _tick_error = None
+            cycle_homes = {}
             try:
+                for entry in current_profile_homes():
+                    home = entry[1] if isinstance(entry, tuple) else entry
+                    identity = Path(home).resolve()
+                    if identity.is_dir():
+                        cycle_homes[identity] = home
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    for entry in profile_homes:
-                        home = entry[1] if isinstance(entry, tuple) else entry
+                    for home in cycle_homes.values():
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
@@ -703,9 +721,29 @@ class InProcessCronScheduler(CronScheduler):
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             else:
                 _tick_error = None
-            # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
-                home = entry[1] if isinstance(entry, tuple) else entry
+            # Refresh membership after ticking too: deletion can happen during
+            # a cycle, and heartbeat writes must not recreate a removed home.
+            heartbeat_homes = []
+            if cycle_homes:
+                try:
+                    refreshed_homes = {
+                        Path(entry[1] if isinstance(entry, tuple) else entry).resolve():
+                        entry[1] if isinstance(entry, tuple) else entry
+                        for entry in current_profile_homes()
+                    }
+                except BaseException as e:
+                    logger.error("Cron profile membership error: %s", e, exc_info=True)
+                    if _tick_error is None:
+                        consecutive_failures = _note_tick_failure(e, consecutive_failures)
+                    _tick_error = f"{type(e).__name__}: {e}"
+                    ok = False
+                else:
+                    heartbeat_homes = [
+                        refreshed_homes[identity]
+                        for identity in cycle_homes
+                        if identity in refreshed_homes and identity.is_dir()
+                    ]
+            for home in heartbeat_homes:
                 home_token = set_hermes_home_override(str(home))
                 try:
                     with use_cron_store(home):

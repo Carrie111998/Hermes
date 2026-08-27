@@ -16,8 +16,10 @@ is set. We patch `cron.scheduler.tick` (both tickers import it locally as
 `cron_tick`, so the module-attribute patch is observed) and assert the loop
 drives it and stops promptly.
 """
+import shutil
 import threading
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -638,5 +640,68 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
+
+
+def test_multiplex_ticker_refreshes_profile_membership_each_cycle(tmp_path):
+    """Deleted homes stay absent and later-created profiles start ticking."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / "default"
+    bot_home = tmp_path / "profiles" / "bot"
+    for home in (default_home, bot_home):
+        (home / "cron").mkdir(parents=True)
+
+    deleted = threading.Event()
+    deletion_observed = threading.Event()
+
+    def profile_homes():
+        homes = [("default", default_home)]
+        if deleted.is_set():
+            deletion_observed.set()
+        elif bot_home.is_dir():
+            homes.append(("bot", bot_home))
+        return homes
+
+    ticked: list[Path] = []
+
+    def tracking_tick(*_args, **_kwargs):
+        ticked.append(get_hermes_home().resolve())
+        return 0
+
+    stop = threading.Event()
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=tracking_tick):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={"interval": 0.01, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        thread.start()
+
+        assert _wait_until(lambda: bot_home.resolve() in ticked)
+        bot_ticks_before_delete = ticked.count(bot_home.resolve())
+        default_ticks_before_delete = ticked.count(default_home.resolve())
+
+        deleted.set()
+        assert deletion_observed.wait(timeout=5)
+        shutil.rmtree(bot_home)
+        assert _wait_until(
+            lambda: ticked.count(default_home.resolve()) >= default_ticks_before_delete + 3
+        )
+        assert not bot_home.exists()
+        assert ticked.count(bot_home.resolve()) == bot_ticks_before_delete
+
+        (bot_home / "cron").mkdir(parents=True)
+        deleted.clear()
+        assert _wait_until(
+            lambda: ticked.count(bot_home.resolve()) > bot_ticks_before_delete
+        )
+
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
 
 

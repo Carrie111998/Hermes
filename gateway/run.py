@@ -31628,7 +31628,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
+                cron_start_kwargs["profile_homes"] = (
+                    lambda: _multiplex_profile_homes(runner.config)
+                )
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
