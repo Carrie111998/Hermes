@@ -279,6 +279,8 @@ class TestWeixinChunkDelivery:
         [
             {"errcode": -14, "errmsg": "session timeout"},
             {"ret": -2, "errmsg": "prepare failed"},
+            {"ret": -2, "errmsg": "unknown error"},
+            {"ret": -2, "msg": "prepare failed"},
         ],
     )
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
