@@ -3635,14 +3635,23 @@ def delegate_task(
     message: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    # Added after all pre-existing positional parameters to preserve callers
+    # that pass them positionally. These are model-facing spawn overrides.
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, model, and provider)
+      - Batch:  provide tasks array [{goal, context, role}, ...] plus optional
+                top-level model and provider overrides
+
+    Optional model/provider values override the configured
+    delegation.model/delegation.provider values for every child in this call.
+    Omit either value to preserve that axis's configured or inherited behavior.
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3672,6 +3681,16 @@ def delegate_task(
         return tool_error(
             f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
         )
+
+    for param_name, value in (("model", model), ("provider", provider)):
+        if value is not None and not isinstance(value, str):
+            return tool_error(
+                f"delegate_task '{param_name}' must be a string, got {type(value).__name__}."
+            )
+        if isinstance(value, str) and not value.strip():
+            return tool_error(
+                f"delegate_task '{param_name}' must not be empty; omit it to use the configured default."
+            )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -3723,7 +3742,15 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
+    # Resolve delegation credentials (provider:model pair). Per-spawn values
+    # intentionally win over the global delegation defaults, but each axis is
+    # independent: a model-only override keeps the configured provider, and a
+    # provider-only override keeps the configured/inherited model.
+    effective_delegation_cfg = dict(credentials_cfg if credentials_cfg else cfg)
+    if model is not None:
+        effective_delegation_cfg["model"] = model.strip()
+    if provider is not None:
+        effective_delegation_cfg["provider"] = provider.strip()
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
@@ -3736,7 +3763,7 @@ def delegate_task(
     # without touching the global delegation pin.
     try:
         creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
+            effective_delegation_cfg, parent_agent
         )
     except ValueError as exc:
         return tool_error(str(exc))
@@ -4798,6 +4825,20 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional per-spawn model override. Omit to use the "
+                    "delegation.model config value or inherit the parent model."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional per-spawn provider override. Omit to use the "
+                    "delegation.provider config value or inherit the parent provider."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4948,6 +4989,8 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        model=args.get("model"),
+        provider=args.get("provider"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

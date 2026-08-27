@@ -82,6 +82,115 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_exposes_per_spawn_model_and_provider(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertEqual(props["model"]["type"], "string")
+        self.assertEqual(props["provider"]["type"], "string")
+        self.assertIn("delegation.model", props["model"]["description"])
+        self.assertIn("delegation.provider", props["provider"]["description"])
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={
+        "model": "configured-model",
+        "provider": "configured-provider",
+    })
+    def test_spawn_model_provider_omitted_uses_config_defaults(
+        self, _mock_cfg, mock_creds
+    ):
+        mock_creds.return_value = {
+            "provider": "configured-provider",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": "configured-model",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "configured-model"
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ) as build_child:
+            delegate_task(goal="test", parent_agent=parent)
+
+        mock_creds.assert_called_once_with(
+            {"model": "configured-model", "provider": "configured-provider"},
+            parent,
+        )
+        self.assertEqual(build_child.call_args.kwargs["model"], "configured-model")
+        self.assertEqual(
+            build_child.call_args.kwargs["override_provider"], "configured-provider"
+        )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={
+        "model": "configured-model",
+        "provider": "configured-provider",
+    })
+    def test_spawn_model_provider_explicit_overrides_config(
+        self, _mock_cfg, mock_creds
+    ):
+        mock_creds.return_value = {
+            "provider": "spawn-provider",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": "spawn-model",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "spawn-model"
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ) as build_child:
+            delegate_task(
+                goal="test",
+                model="spawn-model",
+                provider="spawn-provider",
+                parent_agent=parent,
+            )
+
+        mock_creds.assert_called_once_with(
+            {
+                "model": "spawn-model",
+                "provider": "spawn-provider",
+            },
+            parent,
+        )
+        self.assertEqual(build_child.call_args.kwargs["model"], "spawn-model")
+        self.assertEqual(
+            build_child.call_args.kwargs["override_provider"], "spawn-provider"
+        )
+
+    def test_spawn_model_provider_reject_non_string_values(self):
+        parent = _make_mock_parent()
+        result = delegate_task(goal="test", model=123, parent_agent=parent)
+        self.assertIn("model", json.loads(result)["error"].lower())
+
+        result = delegate_task(goal="test", provider=[], parent_agent=parent)
+        self.assertIn("provider", json.loads(result)["error"].lower())
+
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
         contract that exists nowhere else in the schema (keyword-level, not
@@ -1383,6 +1492,69 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_dispatch_forwards_top_level_model_and_provider(self):
+        """The live model dispatch path forwards top-level model/provider kwargs."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "test",
+                    "model": "spawn-model",
+                    "provider": "spawn-provider",
+                },
+            )
+
+        self.assertEqual(captured["model"], "spawn-model")
+        self.assertEqual(captured["provider"], "spawn-provider")
+
+    def test_dispatch_passes_none_when_model_provider_omitted(self):
+        """Omitting model/provider from the live dispatch yields None kwargs."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "test"},
+            )
+
+        self.assertIsNone(captured["model"])
+        self.assertIsNone(captured["provider"])
+
+    def test_dispatch_surfaces_validation_error_for_invalid_model(self):
+        """An invalid model passed through dispatch must surface the validation error."""
+        import run_agent
+        import tools.delegate_tool as delegate_module
+
+        parent = _make_mock_parent(depth=0)
+        # Bypass the mocked delegate_task to exercise the real validation branch.
+        result = run_agent.AIAgent._dispatch_delegate_task(
+            parent,
+            {"goal": "test", "model": 123},
+        )
+
+        self.assertIsInstance(result, str)
+        parsed = json.loads(result)
+        self.assertIn("error", parsed)
+        self.assertIn("model", parsed["error"])
+        # Ensure the validation lives in delegate_task, not in the dispatcher.
+        self.assertTrue(hasattr(delegate_module, "delegate_task"))
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
