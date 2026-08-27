@@ -325,6 +325,7 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { guardRendererBootAcrossUpdate, shouldQuiesceForExternalUpdate } from './renderer-update-overlap'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -2125,6 +2126,7 @@ function directoryExists(filePath) {
 // marker's own age ceiling; covers a stuck-but-alive updater).
 const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
 const UPDATE_WAIT_POLL_MS = 1000
+const EXTERNAL_UPDATE_RENDERER_POLL_MS = 500
 // How long the desktop lingers on the "updating, don't reopen" overlay after
 // spawning the detached updater, before it quits to release the venv shim. The
 // old 600ms was long enough to register the child process but far too short for
@@ -2146,6 +2148,167 @@ function updateGateDeps() {
     hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)),
     isUpdateInFlight: () => updateInFlight
   }
+}
+
+let rendererBootHeldForUpdate = false
+let externalUpdateRendererMonitor: NodeJS.Timeout | null = null
+let externalUpdateRendererQuiescing = false
+
+function surfaceDetachedUpdateResult() {
+  try {
+    const result = readAndConsumeHandoffResult(HERMES_HOME)
+
+    if (result && result.ok && result.manual) {
+      rememberLog(`[updates] detached update finished with manual action (branch ${result.branch}): ${result.message}`)
+      dialog.showMessageBox({
+        type: 'warning',
+        title: 'Hermes update',
+        message: 'The update finished, but needs one more step',
+        detail: result.message
+      })
+    } else if (result && result.ok) {
+      rememberLog(`[updates] detached update finished OK (branch ${result.branch})`)
+    } else if (result) {
+      rememberLog(`[updates] detached update FAILED (exit ${result.exitCode}): ${result.message}`)
+      dialog.showErrorBox(
+        'Hermes update did not finish',
+        `${result.message}\n\nDetails: ${path.join(HERMES_HOME, 'logs', 'desktop-update-handoff.log')}`
+      )
+    }
+  } catch (err) {
+    rememberLog(`[updates] could not read hand-off result: ${err.message}`)
+  }
+}
+
+async function guardRendererBootForUpdateOverlap() {
+  if (DEV_SERVER) {
+    surfaceDetachedUpdateResult()
+
+    return false
+  }
+
+  rendererBootHeldForUpdate = true
+  let announced = false
+
+  const action = await guardRendererBootAcrossUpdate(updateGateDeps(), {
+    onWaitTick: reason => {
+      if (!announced) {
+        announced = true
+        rememberLog(`[updates] renderer boot parked behind active update (${reason})`)
+      }
+    },
+    pollMs: UPDATE_WAIT_POLL_MS,
+    timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+  })
+
+  if (action === 'continue') {
+    rendererBootHeldForUpdate = false
+    surfaceDetachedUpdateResult()
+
+    return false
+  }
+
+  if (action === 'abort') {
+    rememberLog('[updates] renderer boot aborted: update marker remained live through the wait timeout')
+    dialog.showErrorBox(
+      'Hermes update is still running',
+      'Hermes did not load the Desktop interface because its application files are still being updated. ' +
+        'Wait for the update to finish, then reopen Hermes.'
+    )
+    flushDesktopLogBufferSync()
+    app.exit(1)
+
+    return true
+  }
+
+  rememberLog('[updates] overlapping update finished; relaunching before loading the renderer')
+
+  try {
+    app.relaunch()
+  } catch (error) {
+    rememberLog(`[updates] post-update renderer relaunch failed: ${error?.message || error}`)
+    dialog.showErrorBox(
+      'Hermes could not relaunch after updating',
+      'The update finished, but Hermes could not safely reload its Desktop files. Quit Hermes completely and reopen it.'
+    )
+    flushDesktopLogBufferSync()
+    app.exit(1)
+
+    return true
+  }
+
+  flushDesktopLogBufferSync()
+  app.exit(0)
+
+  return true
+}
+
+function stopExternalUpdateRendererMonitor() {
+  if (externalUpdateRendererMonitor) {
+    clearInterval(externalUpdateRendererMonitor)
+    externalUpdateRendererMonitor = null
+  }
+}
+
+async function quiesceRendererForBundleUpdate({ relaunch }: { relaunch: boolean }) {
+  externalUpdateRendererQuiescing = true
+  rendererBootHeldForUpdate = true
+  stopExternalUpdateRendererMonitor()
+
+  let relaunchScheduled = !relaunch
+
+  if (relaunch) {
+    try {
+      app.relaunch()
+      relaunchScheduled = true
+    } catch (error) {
+      rememberLog(`[updates] renderer relaunch scheduling failed: ${error?.message || error}`)
+    }
+  }
+
+  // Destroy Chromium before waiting on backend shutdown. The updater owns the
+  // packaged files now, so even a visually idle renderer must not issue another
+  // lazy-chunk request against the bundle generation being replaced.
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.destroy()
+    }
+  }
+
+  if (relaunch && !relaunchScheduled) {
+    dialog.showErrorBox(
+      'Hermes paused for an update',
+      'Hermes closed its Desktop interface before the application files changed, but could not schedule a relaunch. ' +
+        'Wait for the update to finish, then reopen Hermes.'
+    )
+  }
+
+  flushDesktopLogBufferSync()
+  await exitAfterBackendShutdown(relaunchScheduled ? 0 : 1)
+}
+
+function startExternalUpdateRendererMonitor() {
+  if (!IS_MAC || DEV_SERVER || externalUpdateRendererMonitor) {
+    return
+  }
+
+  externalUpdateRendererMonitor = setInterval(() => {
+    const markerLive = Boolean(readLiveUpdateMarker(HERMES_HOME))
+
+    if (
+      !shouldQuiesceForExternalUpdate({
+        alreadyQuiescing: externalUpdateRendererQuiescing,
+        isQuittingForHandoff,
+        markerLive,
+        updateInFlight
+      })
+    ) {
+      return
+    }
+
+    rememberLog('[updates] external update detected; quiescing the live renderer before its bundle changes')
+    void quiesceRendererForBundleUpdate({ relaunch: true })
+  }, EXTERNAL_UPDATE_RENDERER_POLL_MS)
 }
 
 // Block until no live update is in progress (or we hit the wait timeout).
@@ -2177,41 +2340,27 @@ async function waitForUpdateToFinish() {
   // update gate — success gets a log line, failure gets a real dialog
   // (previously a failed detached update was indistinguishable from
   // "nothing happened").
-  try {
-    const result = readAndConsumeHandoffResult(HERMES_HOME)
-
-    if (result && result.ok && result.manual) {
-      // Update landed but the user must act (reopen/reinstall/sandbox). On
-      // machines with no shim browser and no notifier this dialog is the
-      // FIRST time the message is visible — it must not be a log line.
-      rememberLog(`[updates] detached update finished with manual action (branch ${result.branch}): ${result.message}`)
-      dialog.showMessageBox({
-        type: 'warning',
-        title: 'Hermes update',
-        message: 'The update finished, but needs one more step',
-        detail: result.message
-      })
-    } else if (result && result.ok) {
-      rememberLog(`[updates] detached update finished OK (branch ${result.branch})`)
-    } else if (result) {
-      rememberLog(`[updates] detached update FAILED (exit ${result.exitCode}): ${result.message}`)
-      dialog.showErrorBox(
-        'Hermes update did not finish',
-        `${result.message}\n\nDetails: ${path.join(HERMES_HOME, 'logs', 'desktop-update-handoff.log')}`
-      )
-    }
-  } catch (err) {
-    rememberLog(`[updates] could not read hand-off result: ${err.message}`)
-  }
+  surfaceDetachedUpdateResult()
 
   if (outcome === 'clear') {
     return false
   }
 
   if (outcome === 'timeout') {
-    rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
-  } else {
-    rememberLog('[updates] update finished; proceeding with backend start')
+    rememberLog('[updates] update remained live through the backend wait timeout; refusing to resume the renderer')
+    dialog.showErrorBox(
+      'Hermes update is still running',
+      'Hermes closed its Desktop interface because its application files are still being updated. ' +
+        'Wait for the update to finish, then reopen Hermes.'
+    )
+    await quiesceRendererForBundleUpdate({ relaunch: false })
+
+    return true
+  }
+
+  if (outcome === 'finished') {
+    rememberLog('[updates] update finished after renderer startup; relaunching with one consistent bundle generation')
+    await quiesceRendererForBundleUpdate({ relaunch: true })
   }
 
   return true
@@ -17298,6 +17447,12 @@ if (!isPrimaryInstance) {
       handleDeepLink(url)
     }
 
+    if (rendererBootHeldForUpdate) {
+      rememberLog('[updates] suppressing second-instance window while renderer boot is parked behind an update')
+
+      return
+    }
+
     ensureMainWindow(mainWindow, {
       isReady: app.isReady(),
       createWindow,
@@ -17315,10 +17470,14 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()
+
+  if (await guardRendererBootForUpdateOverlap()) {
+    return
+  }
 
   const systemCa = installWindowsSystemCaTrust(tls)
 
@@ -17391,6 +17550,7 @@ app.whenReady().then(() => {
   // captured by the original transaction before removing the journal entry.
   void resumeManagedSshRecoveries()
   createWindow()
+  startExternalUpdateRendererMonitor()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
@@ -17400,6 +17560,12 @@ app.whenReady().then(() => {
   }
 
   app.on('activate', () => {
+    if (rendererBootHeldForUpdate) {
+      rememberLog('[updates] suppressing Dock activation while renderer boot is parked behind an update')
+
+      return
+    }
+
     // Recreate the primary window if it's gone. Guard on mainWindow directly
     // (not just total window count) so a dock click still restores the main
     // window when only secondary session windows remain open.
@@ -17485,6 +17651,8 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
+
+  stopExternalUpdateRendererMonitor()
 
   // A detached remote updater can outlive this Electron process. Do not tear
   // down its SSH observer/restore transaction at the generic SSH shutdown
