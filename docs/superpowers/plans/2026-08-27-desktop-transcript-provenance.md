@@ -457,6 +457,8 @@ Expected: one local commit containing cold-path proof minting and its positive/n
 - Inspect: `apps/desktop/src/app/session/session-state-cache.ts`
 - Inspect: `apps/desktop/src/app/session/hooks/use-gateway-message-handler.ts`
 - Inspect: `apps/desktop/src/app/session/hooks/use-message-stream.ts`
+- Modify: `apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts`
+- Modify: `apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx`
 - Modify only the narrow writer(s) proven to replace a persisted base with a runtime-only projection.
 - Add tests beside the writer's existing tests.
 
@@ -482,14 +484,23 @@ Record the classification in the implementation evidence; do not broaden the cod
 
 Seed a state with valid proof, invoke the existing writer/event path that replaces messages from runtime/model projection, and assert `transcriptProvenance` becomes absent. Do not fabricate a new production API solely to satisfy this test.
 
+The audit found one such boundary: successful manual `/compress` in `use-prompt-actions/slash.ts` replaces the whole visible transcript with `session.compress` response messages. Extend the existing `/compress` test harness state with optional seed provenance, then run:
+
+```powershell
+npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-prompt-actions/index.test.tsx -t "clears persisted transcript provenance when manual compression replaces the transcript"
+```
+
+Expected RED: the response messages replace the transcript, but the previously seeded `transcriptProvenance` remains present.
+
 - [ ] **Step 3: Clear proof at the narrow replacement boundary**
 
-Use an explicit `transcriptProvenance: undefined` or `withoutTranscriptProvenance` at the proven runtime-only replacement. Preserve proof for append/delta/enrichment operations that retain the same persisted display base.
+Use an explicit `transcriptProvenance: undefined` in the `/compress` replacement updater. Preserve proof for append/delta/enrichment operations that retain the same persisted display base.
 
 - [ ] **Step 4: Run writer-focused tests plus session actions**
 
 ```powershell
 npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-session-actions.test.tsx
+npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-prompt-actions/index.test.tsx -t "usePromptActions /compress"
 ```
 
 Also run the exact existing test file(s) owning any modified stream/gateway writer. Expected: all focused files pass.
