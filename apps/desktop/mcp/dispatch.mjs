@@ -40,6 +40,13 @@ export async function dispatchTool(name, args = {}, deps) {
 
   let out
 
+  // Preflight diagnostic: deliberately NO connect()/attestation — its whole
+  // job is reporting unavailability (cdpAlive:false must be reachable). This
+  // is the ONLY tool that bypasses the gate; everything else stays attested.
+  if (name === 'desktop_ui_status') {
+    return wrapResult(await status())
+  }
+
   if (readTools.some((t) => t.name === name)) {
     const live = await connect()
     await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })

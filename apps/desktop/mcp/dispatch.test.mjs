@@ -63,3 +63,28 @@ test('dispatch: ui_inspect returns JSON-stringified text block (current behavior
 test('dispatch: unknown tool throws', async () => {
   await assert.rejects(() => dispatchTool('nope', {}, baseDeps()), /unknown tool/)
 })
+
+// --- status preflight (should-fix, review round 3) ---
+
+test('status preflight: reports cdpAlive:false when CDP is down — connect never called', async () => {
+  let connectCalls = 0
+  const deps = baseDeps({
+    connect: async () => { connectCalls++; throw new Error('No CDP target on :9222') },
+    status: async () => ({ cdpAlive: false, mode: 'unavailable', allowAct: false })
+  })
+
+  const out = await dispatchTool('desktop_ui_status', {}, deps)
+  assert.equal(connectCalls, 0, 'status must not require a connection')
+  assert.ok(!out.isError, 'preflight must not be an error')
+  const parsed = JSON.parse(out.content[0].text)
+  assert.equal(parsed.cdpAlive, false)
+  assert.equal(parsed.mode, 'unavailable')
+})
+
+test('boundary intact: ui_inspect under the same dead-CDP deps still refuses', async () => {
+  const deps = baseDeps({
+    connect: async () => { throw new Error('No CDP target on :9222') }
+  })
+
+  await assert.rejects(() => dispatchTool('ui_inspect', { selector: 'div' }, deps), /No CDP target/)
+})
