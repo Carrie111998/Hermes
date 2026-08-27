@@ -2264,6 +2264,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return room name and type (dm/group)."""
+        if not self._strict_room_policy_allows(chat_id):
+            return {
+                "name": chat_id,
+                "type": "group",
+                "chat_id": chat_id,
+                "allowed": False,
+            }
         identity = await self._resolve_room_identity(chat_id)
         chat_type = "dm" if identity.chat_type == "dm" else "group"
         return {"name": identity.display_name, "type": chat_type}
@@ -3207,6 +3214,13 @@ class MatrixAdapter(BasePlatformAdapter):
         allowed_rooms = getattr(self, "_allowed_room_ids", set())
         return not allowed_rooms or room_id in allowed_rooms
 
+    def _strict_room_policy_active(self) -> bool:
+        """Return whether a non-empty allowlist is the complete room authority."""
+        return bool(
+            getattr(self, "_allowed_rooms_apply_to_dms", False)
+            and getattr(self, "_allowed_room_ids", set())
+        )
+
     def _strict_room_policy_allows(self, room_id: str) -> bool:
         """Fail closed for direct room operations when strict policy is active.
 
@@ -3216,8 +3230,7 @@ class MatrixAdapter(BasePlatformAdapter):
         disabled, or with an empty list, historical behavior is unchanged.
         """
         allowed = not (
-            getattr(self, "_allowed_rooms_apply_to_dms", False)
-            and getattr(self, "_allowed_room_ids", set())
+            self._strict_room_policy_active()
             and room_id not in self._allowed_room_ids
         )
         if not allowed:
@@ -3234,10 +3247,7 @@ class MatrixAdapter(BasePlatformAdapter):
         personal chats still work when operators use a room allowlist for
         project rooms.
         """
-        if (
-            getattr(self, "_allowed_rooms_apply_to_dms", False)
-            and getattr(self, "_allowed_room_ids", set())
-        ):
+        if self._strict_room_policy_active():
             return self._strict_room_policy_allows(room_id)
         if self._is_allowed_matrix_room(room_id):
             return True
@@ -4464,6 +4474,13 @@ class MatrixAdapter(BasePlatformAdapter):
         preset: str = "private_chat",
     ) -> Optional[str]:
         """Create a new Matrix room."""
+        # A newly allocated room ID cannot be present in a fixed preconfigured
+        # allowlist. Keep strict mode closed rather than silently widening it.
+        if self._strict_room_policy_active():
+            logger.warning(
+                "Matrix: room creation is disabled while the strict room allowlist is active"
+            )
+            return None
         if not self._client:
             return None
         if preset == "public_chat" and os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower() not in (

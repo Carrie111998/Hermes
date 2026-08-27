@@ -294,6 +294,71 @@ async def test_strict_outbound_room_guard_blocks_every_direct_room_sink():
 
 
 @pytest.mark.asyncio
+async def test_strict_policy_disables_room_creation_before_client_call():
+    adapter = _make_adapter()
+    adapter._client.create_room = AsyncMock(return_value="!new:example.org")
+
+    result = await adapter.create_room(name="escape")
+
+    assert result is None
+    adapter._client.create_room.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_policy_blocks_unlisted_chat_info_before_state_lookup():
+    adapter = _make_adapter()
+    adapter._resolve_room_identity = AsyncMock(
+        side_effect=AssertionError("unlisted room metadata was queried")
+    )
+
+    result = await adapter.get_chat_info(OTHER_ROOM)
+
+    assert result == {
+        "name": OTHER_ROOM,
+        "type": "group",
+        "chat_id": OTHER_ROOM,
+        "allowed": False,
+    }
+    adapter._resolve_room_identity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_policy_resolves_allowlisted_chat_info():
+    adapter = _make_adapter()
+    adapter._resolve_room_identity = AsyncMock(
+        return_value=SimpleNamespace(chat_type="group", display_name="Allowed room")
+    )
+
+    result = await adapter.get_chat_info(ALLOWED_ROOM)
+
+    assert result == {"name": "Allowed room", "type": "group"}
+    adapter._resolve_room_identity.assert_awaited_once_with(ALLOWED_ROOM)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("strict", "allowed_rooms"),
+    [(False, [ALLOWED_ROOM]), (True, [])],
+)
+async def test_room_management_preserves_default_and_empty_list_behavior(
+    strict, allowed_rooms
+):
+    adapter = _make_adapter(strict=strict, allowed_rooms=allowed_rooms)
+    adapter._client.create_room = AsyncMock(return_value="!new:example.org")
+    adapter._resolve_room_identity = AsyncMock(
+        return_value=SimpleNamespace(chat_type="dm", display_name="Other room")
+    )
+
+    created = await adapter.create_room(name="still allowed")
+    info = await adapter.get_chat_info(OTHER_ROOM)
+
+    assert created == "!new:example.org"
+    assert info == {"name": "Other room", "type": "dm"}
+    adapter._client.create_room.assert_awaited_once()
+    adapter._resolve_room_identity.assert_awaited_once_with(OTHER_ROOM)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("strict", "allowed_rooms"),
     [(False, [ALLOWED_ROOM]), (True, [])],

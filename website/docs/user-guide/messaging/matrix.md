@@ -109,7 +109,10 @@ An empty `allowed_rooms` list keeps the existing unrestricted-room behavior.
 This option is available only in `config.yaml`; it does not have an
 environment-variable equivalent. Enabling it does not automatically leave
 rooms the account had already joined, so audit existing memberships before
-using the setting as a confinement boundary.
+using the setting as a confinement boundary. Room creation is disabled while
+this strict boundary is active because a server-assigned room ID cannot be
+pre-authorized. Operators can still leave existing rooms for remediation through
+another Matrix client or administrative tooling.
 
 Or via environment variables:
 
