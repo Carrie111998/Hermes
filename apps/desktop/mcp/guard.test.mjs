@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import os from 'node:os'
 import { assertTargetAttested, canon } from './guard.mjs'
 
 // Fake CDP whose Runtime.evaluate returns the given descriptor dataRoot.
@@ -44,7 +45,7 @@ test('P1-1: refuses when declared sandbox != realized target home (attacker lies
         expectedHome: '/tmp/fake-sandbox',
         defaultHome: '/real/home'
       }),
-    /does not match declared/
+    /protected operator home/
   )
 })
 
@@ -62,6 +63,18 @@ test('P1-1: incident shape — target fell back to real home → refused', async
   await assert.rejects(
     () =>
       assertTargetAttested(fakeCdp('/Users/me/.hermes'), {
+        expectedHome: '/tmp/sandbox',
+        defaultHome: '/Users/me/.hermes'
+      }),
+    /protected operator home/
+  )
+})
+
+test('P1-1: mismatch with a NON-protected realized home still reports identity mismatch', async () => {
+  // Neither side is the operator home; the plain identity check handles it.
+  await assert.rejects(
+    () =>
+      assertTargetAttested(fakeCdp('/other/sandbox'), {
         expectedHome: '/tmp/sandbox',
         defaultHome: '/Users/me/.hermes'
       }),
@@ -147,3 +160,39 @@ test('EDGE: macOS /tmp symlink — both declared and descriptor use lexical reso
   )
 })
 
+
+// --- Protected-home refusal (P1, review round 3) ---
+
+test('REFUSED: expected == realized == the protected operator home', async () => {
+  // Caller and target AGREE on ~/.hermes — still forbidden: the debug MCP
+  // never acts on the operator's real profile, agreement is not permission.
+  const cdp = fakeCdp('/Users/tester/.hermes')
+  await assert.rejects(
+    () => assertTargetAttested(cdp, { expectedHome: '/Users/tester/.hermes', defaultHome: '/Users/tester/.hermes' }),
+    /protected operator home/
+  )
+})
+
+test('REFUSED: realized is the OS default ~/.hermes even when defaultHome is unset', async () => {
+  // Server in a container may have no HERMES_HOME env; the literal ~/.hermes
+  // of the OS user is still protected.
+  const cdp = fakeCdp(os.homedir() + '/.hermes')
+  await assert.rejects(
+    () => assertTargetAttested(cdp, { expectedHome: os.homedir() + '/.hermes', defaultHome: '' }),
+    /protected operator home/
+  )
+})
+
+test('allowed: isolated realized/expected exact match, defaultHome differs', async () => {
+  const cdp = fakeCdp('/tmp/hermes-p1-home')
+  await assert.doesNotReject(
+    () => assertTargetAttested(cdp, { expectedHome: '/tmp/hermes-p1-home', defaultHome: '/Users/tester/.hermes' })
+  )
+})
+
+test('protected check runs AFTER descriptor presence (no descriptor still refuses first)', async () => {
+  await assert.rejects(
+    () => assertTargetAttested(fakeCdp(null), { expectedHome: '/tmp/sb', defaultHome: '/Users/tester/.hermes' }),
+    /no debug-instance descriptor/
+  )
+})

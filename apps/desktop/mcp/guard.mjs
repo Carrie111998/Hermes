@@ -15,6 +15,7 @@
  */
 
 import path from 'node:path'
+import os from 'node:os'
 
 export function canon(p) {
   try {
@@ -63,6 +64,23 @@ export async function assertTargetAttested(cdp, opts) {
         '(__DEBUG_MCP_INSTANCE__). Cannot prove it is the isolated sandbox you ' +
         'declared. Check that the desktop instance was launched in dev mode with ' +
         'the CDP port open and DESKTOP_DEBUG_MCP_EXPECTED_HOME matching its home.'
+    )
+  }
+
+  // Isolation policy, separate from identity: even when caller and target
+  // agree, the protected operator home is never an acceptable debug target.
+  // Protected = the server's own default home (HERMES_HOME env or ~/.hermes)
+  // plus the literal ~/.hermes of the OS user (covers a containerized server
+  // with no HERMES_HOME env).
+  const PROTECTED = new Set(
+    [opts.defaultHome, path.join(os.homedir(), '.hermes')].filter(Boolean).map(canon)
+  )
+  if (PROTECTED.has(canon(realized))) {
+    throw new Error(
+      `REFUSED: the target's realized home (${realized}) is the protected ` +
+        "operator home. The debug MCP server never acts on a desktop instance " +
+        'running against the operator\'s real profile — launch an isolated ' +
+        'sandbox instead (e.g. HERMES_HOME=/tmp/your-sandbox-home).'
     )
   }
 
