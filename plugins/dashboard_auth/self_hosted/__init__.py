@@ -184,6 +184,8 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        authorization_params: Dict[str, str] | None = None,
+        allowed_emails: list[str] | None = None,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -202,6 +204,29 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # provisioned-but-blank secret can't flip us into a broken confidential
         # mode that sends an empty client_secret. Non-empty ⇒ confidential.
         self._client_secret = (client_secret or "").strip()
+        reserved_params = {
+            "response_type", "client_id", "redirect_uri", "scope", "state",
+            "code_challenge", "code_challenge_method",
+        }
+        self._authorization_params: Dict[str, str] = {}
+        for key, value in (authorization_params or {}).items():
+            normalized_key = str(key).strip()
+            normalized_value = str(value).strip()
+            if not normalized_key or not normalized_value:
+                raise ValueError(
+                    "authorization_params keys and values must be non-empty"
+                )
+            if normalized_key in reserved_params:
+                raise ValueError(
+                    "authorization_params cannot override reserved parameter "
+                    f"{normalized_key!r}"
+                )
+            self._authorization_params[normalized_key] = normalized_value
+        self._allowed_emails = {
+            str(email).strip().casefold()
+            for email in (allowed_emails or [])
+            if str(email).strip()
+        }
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -232,6 +257,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
+        params.update(self._authorization_params)
         redirect_url = (
             f"{disco['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
         )
@@ -680,6 +706,11 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             raise ProviderError("ID token missing 'sub' (user_id) claim")
 
         email = str(claims.get("email", "") or "")
+        if self._allowed_emails:
+            if claims.get("email_verified") is not True:
+                raise ProviderError("OIDC identity email is not verified")
+            if email.casefold() not in self._allowed_emails:
+                raise ProviderError("OIDC identity email is not allowed")
         # Standard OIDC display claims, in preference order.
         display_name = str(
             claims.get("name")
@@ -822,6 +853,24 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    raw_authorization_params = oidc_cfg.get("authorization_params", {})
+    raw_allowed_emails = oidc_cfg.get("allowed_emails", [])
+    if not isinstance(raw_authorization_params, dict):
+        LAST_SKIP_REASON = (
+            "dashboard.oauth.self_hosted.authorization_params must be a mapping"
+        )
+        logger.warning("dashboard-auth-self-hosted: %s", LAST_SKIP_REASON)
+        return
+    if not isinstance(raw_allowed_emails, list):
+        LAST_SKIP_REASON = (
+            "dashboard.oauth.self_hosted.allowed_emails must be a list"
+        )
+        logger.warning("dashboard-auth-self-hosted: %s", LAST_SKIP_REASON)
+        return
+    authorization_params = {
+        str(key): str(value) for key, value in raw_authorization_params.items()
+    }
+    allowed_emails = [str(value) for value in raw_allowed_emails]
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -842,6 +891,8 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            authorization_params=authorization_params,
+            allowed_emails=allowed_emails,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
@@ -853,10 +904,12 @@ def register(ctx) -> None:
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
         "dashboard-auth-self-hosted: registered provider "
-        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s)",
+        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s, "
+        "email_allowlist=%s)",
         issuer,
         client_id,
         scopes,
         # Log only whether a secret is present, never the secret itself.
         bool(client_secret),
+        bool(allowed_emails),
     )
