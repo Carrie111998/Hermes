@@ -9,14 +9,25 @@ import { join } from 'node:path'
  * Uses the same liveness contract as `gateway/status.py`:
  * - `gateway_state.json` must have `gateway_state: "running"`
  * - `pid` must be a live OS process (PID-reuse guarded by `start_time`)
- * - `updated_at` must be fresh (< 2 min old)
+ *
+ * Liveness keys off the PID alone. Staleness of `updated_at` is only a signal
+ * *together with a dead PID*: `hermes_cli/gateway.py` only flags a record when
+ * it is stale AND its recorded process is gone ("the file is contradicting
+ * reality" — likely an ungraceful shutdown). A live PID whose start_time
+ * fingerprint still matches wins regardless of `updated_at` age; staleness can
+ * never overrule a live process. Gating adoption on freshness alone therefore
+ * wrongly rejected running gateways (bug #91564: Desktop spawned a duplicate
+ * serve next to a still-live `gateway run`).
+ *
+ * `updated_at` is kept for that one classification: it can only ever *explain*
+ * a dead PID (stale => record outlived an ungraceful kill), never overrule a
+ * live one.
  *
  * Pure detection — no side effects, no spawn, no network. Safe to call on every
  * boot.
  */
 
 const RUNTIME_STATUS_FILENAME = 'gateway_state.json'
-const PID_FILENAME = 'gateway.pid'
 /** Matches `gateway/status.py:_RUNTIME_STATUS_STALE_TTL_S` */
 const STALE_TTL_MS = 120_000
 
@@ -50,11 +61,6 @@ type GatewayStateRecord = {
   argv?: unknown
 }
 
-type PidRecord = {
-  pid?: unknown
-  start_time?: unknown
-}
-
 function hermesHome(): string | null {
   const home = process.env.HERMES_HOME
   if (home && home.trim()) return home.trim()
@@ -73,31 +79,69 @@ async function readJsonSafe<T extends Record<string, unknown>>(filePath: string)
   }
 }
 
-async function isPidAlive(pid: number, expectedStart: string | null): Promise<{ alive: boolean; reason: 'alive' | 'dead' | 'reused' }> {
+/**
+ * Live start-time fingerprint for `pid`, or `null` when it can't be read.
+ *
+ * Mirrors `gateway/status.py:_get_process_start_time`'s FIRST source only:
+ * field 22 of `/proc/<pid>/stat` (start time in clock ticks). Python's second
+ * source is `psutil.Process().create_time()`, which has no dependency-free
+ * Node equivalent, so on platforms without `/proc` (Windows, macOS) this
+ * returns `null` and the reuse guard abstains rather than guessing.
+ *
+ * Abstaining is the same contract Python applies: the fingerprints are only
+ * ever compared when BOTH the recorded and the live value are known, so a
+ * `null` here can never turn a live gateway into a false `pid-reused`.
+ */
+async function liveStartTime(pid: number): Promise<number | null> {
+  try {
+    const raw = await readFile(`/proc/${pid}/stat`, 'utf8')
+    // Field 22 (1-indexed) is starttime. comm (field 2) is parenthesized and
+    // may contain spaces, so split after the final ')' instead of naively.
+    const tail = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/)
+    // After comm, the remaining fields start at 3, so starttime is index 19.
+    const value = Number(tail[19])
+    return Number.isFinite(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether `pid` is a live process that is still the one the record described.
+ *
+ * `reused` is only ever returned on a POSITIVE mismatch (both fingerprints
+ * known and different) — an unreadable fingerprint abstains.
+ */
+async function isPidAlive(
+  pid: number,
+  recordedStart: number | null
+): Promise<{ alive: boolean; reason: 'alive' | 'dead' | 'reused' }> {
   try {
     // Signal 0 is a no-op probe — throws ESRCH if the PID doesn't exist.
     process.kill(pid, 0)
   } catch {
+    // EPERM means the process exists but belongs to another user: it is alive,
+    // yet it is not a gateway we own, so treat it as unusable for adoption.
     return { alive: false, reason: 'dead' }
   }
-  // PID exists but could be a reused number. Verify start_time fingerprint.
-  if (expectedStart !== null && expectedStart !== undefined) {
-    try {
-      const statPath = `/proc/${pid}/stat`
-      const statInfo = await stat(statPath).catch(() => null)
-      // On Linux, stat mtime of /proc/<pid>/stat approximates process start.
-      // Fallback: read /proc/<pid>/stat field 22 (starttime) if available.
-      if (statInfo) {
-        // We can't cheaply parse starttime from JS without reading /proc/<pid>/stat,
-        // but the recorded start_time from gateway_state.json is an ISO string or
-        // unix-epoch seconds. Compare with a best-effort OS probe.
-        void statInfo
-      }
-    } catch {
-      // Ignore — PID liveness check is best-effort; start_time guard is the backup.
+  if (recordedStart !== null) {
+    const current = await liveStartTime(pid)
+    if (current !== null && current !== recordedStart) {
+      return { alive: false, reason: 'reused' }
     }
   }
   return { alive: true, reason: 'alive' }
+}
+
+/** Recorded `start_time` as a number, or `null` when absent/unusable. */
+function recordedStartTime(record: GatewayStateRecord): number | null {
+  const raw = record.start_time
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
 }
 
 function isoTsToMs(iso: string): number {
@@ -134,14 +178,21 @@ export async function detectLocalGatewayRunning(): Promise<GatewayLiveness> {
   }
   const pid = pidRaw
 
-  const updatedAtMs = isoTsToMs(String(record.updated_at || ''))
-  if (!Number.isNaN(updatedAtMs) && Date.now() - updatedAtMs > STALE_TTL_MS) {
-    return { alive: false, pid, port: null, reason: 'state-stale' }
-  }
-
-  const live = await isPidAlive(pid, record.start_time ? String(record.start_time) : null)
+  // PID liveness decides adoption. `updated_at` is NOT consulted here: an idle
+  // gateway legitimately keeps a timestamp older than the TTL, so gating on it
+  // rejected exactly the healthy gateways this module is meant to adopt.
+  const live = await isPidAlive(pid, recordedStartTime(record))
   if (!live.alive) {
-    return { alive: false, pid, port: null, reason: live.reason === 'dead' ? 'pid-dead' : 'pid-reused' }
+    if (live.reason === 'reused') {
+      return { alive: false, pid, port: null, reason: 'pid-reused' }
+    }
+    // The PID is gone. A record ALSO past its freshness TTL is the signature of
+    // an ungraceful kill whose shutdown handler never ran (same reading as
+    // `hermes_cli/gateway.py`'s stale-state warning), which is worth
+    // distinguishing in logs from a clean, freshly-recorded exit.
+    const updatedAtMs = isoTsToMs(String(record.updated_at || ''))
+    const stale = Number.isNaN(updatedAtMs) || Date.now() - updatedAtMs > STALE_TTL_MS
+    return { alive: false, pid, port: null, reason: stale ? 'state-stale' : 'pid-dead' }
   }
 
   const port = extractGatewayPort(record)

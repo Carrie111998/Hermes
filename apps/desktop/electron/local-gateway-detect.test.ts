@@ -74,17 +74,53 @@ describe('detectLocalGatewayRunning', () => {
     expect(result.reason).toBe('pid-missing')
   })
 
-  it('returns state-stale when updated_at is older than 2 minutes', async () => {
+  it('returns state-stale when PID is gone and the record is stale (ungraceful kill)', async () => {
+    // #91564 regression guard: liveness keys off the PID alone; `updated_at`
+    // only classifies a DEAD pid. A dead pid + a record past the TTL is the
+    // signature of an ungraceful kill (shutdown handler never ran).
     const stale = new Date(Date.now() - 180_000).toISOString()
+    const deadPid = 9_999_999 // well above pid_max — guaranteed ESRCH from kill(2)
     mockReadFile.mockResolvedValue(JSON.stringify({
       gateway_state: 'running',
-      pid: 1234,
+      pid: deadPid,
       updated_at: stale
     }))
     const result = await detectLocalGatewayRunning()
     expect(result.alive).toBe(false)
     expect(result.reason).toBe('state-stale')
-    expect(result.pid).toBe(1234)
+    expect(result.pid).toBe(deadPid)
+  })
+
+  it('returns pid-dead when PID is gone but the record is fresh', async () => {
+    const deadPid = 9_999_999
+    mockReadFile.mockResolvedValue(JSON.stringify({
+      gateway_state: 'running',
+      pid: deadPid,
+      updated_at: new Date().toISOString()
+    }))
+    const result = await detectLocalGatewayRunning()
+    expect(result.alive).toBe(false)
+    expect(result.reason).toBe('pid-dead')
+    expect(result.pid).toBe(deadPid)
+  })
+
+  it('adopts a live gateway even when updated_at is stale (idle gateway, #91564)', async () => {
+    // THIS is the regression the moved guard exists to fix: a healthy *idle*
+    // gateway never advances `updated_at` (only rewritten on state transitions
+    // and platform events), so gating adoption on freshness wrongly declared
+    // it dead and spawned the duplicate serve. A live PID must win.
+    const stale = new Date(Date.now() - 30 * 60_000).toISOString()
+    mockReadFile.mockResolvedValue(JSON.stringify({
+      gateway_state: 'running',
+      pid: process.pid, // our own (known-live) PID
+      updated_at: stale,
+      argv: ['python', '-m', 'hermes_cli.main', 'gateway', '--port', '9011']
+    }))
+    const result = await detectLocalGatewayRunning()
+    expect(result.alive).toBe(true)
+    expect(result.pid).toBe(process.pid)
+    expect(result.port).toBe(9011)
+    expect(result.reason).toBe('state-running')
   })
 
   it('returns alive=true when gateway is running with valid PID', async () => {
