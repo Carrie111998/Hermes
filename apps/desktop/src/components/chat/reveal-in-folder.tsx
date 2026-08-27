@@ -18,7 +18,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { $connection } from '@/store/session'
 
 /**
- * Right-click menu over a transcript file affordance ("Open …" fallback link,
+ * Right-click menu over a transcript file affordance (filename download link,
  * inline image) offering Reveal-in-file-manager + Copy Path — the same two
  * local actions the file trees offer. Local gateway only: on a remote
  * connection the file lives on the gateway machine, and reveal silently
@@ -67,7 +67,11 @@ export function RevealInFolderTrigger({ children, path }: { children: ReactNode;
       </ContextMenu>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <button aria-label={t.fileMenu.actions} className="mt-0.5 shrink-0 text-muted-foreground hover:text-foreground" type="button">
+          <button
+            aria-label={t.fileMenu.actions}
+            className="mt-0.5 shrink-0 text-muted-foreground hover:text-foreground"
+            type="button"
+          >
             <Codicon name="kebab-vertical" size="0.875rem" />
           </button>
         </DropdownMenuTrigger>

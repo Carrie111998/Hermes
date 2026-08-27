@@ -48,7 +48,8 @@ export function registerFsIpc({
       // A local WSL backend reports POSIX paths. Translate only after rejecting
       // attacker-controlled UNC input; the bridge may intentionally produce a
       // trusted local `\\wsl.localhost` path for Explorer to open.
-      const accessibleTarget = process.platform === 'win32' && target.startsWith('/') ? wslPosixToWindowsAccessible(target) : target
+      const accessibleTarget =
+        process.platform === 'win32' && target.startsWith('/') ? wslPosixToWindowsAccessible(target) : target
       shell.showItemInFolder(accessibleTarget)
 
       return true

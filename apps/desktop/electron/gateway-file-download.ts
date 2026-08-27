@@ -15,6 +15,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 
+import { isUnsafeRevealPath } from './reveal-path-guard'
+
 // Minimal shape of the response objects we consume. Both Node's
 // http.IncomingMessage and Electron net's IncomingMessage satisfy it.
 export interface ReadableLike {
@@ -333,7 +335,7 @@ export function filenameFromContentDisposition(value: unknown): string {
 export function gatewayFilePath(rawPath: unknown): string {
   const value = String(rawPath || '').trim()
 
-  if (!value) {
+  if (!value || isUnsafeRevealPath(value)) {
     return ''
   }
 
@@ -342,10 +344,21 @@ export function gatewayFilePath(rawPath: unknown): string {
   }
 
   try {
-    return decodeURIComponent(new URL(value).pathname)
+    const normalized = normalizeGatewayFilePath(decodeURIComponent(new URL(value).pathname))
+
+    return isUnsafeRevealPath(normalized) ? '' : normalized
   } catch {
-    return value.replace(/^file:\/\//i, '')
+    const normalized = normalizeGatewayFilePath(value.replace(/^file:\/\//i, ''))
+
+    return isUnsafeRevealPath(normalized) ? '' : normalized
   }
+}
+
+function normalizeGatewayFilePath(value: string): string {
+  // WHATWG file URLs represent a Windows drive path as `/C:/...`. The gateway
+  // expects the native drive form; leaving the leading slash produces an
+  // invalid `\C:\...` path on Windows.
+  return /^\/[a-z]:[\\/]/i.test(value) ? value.slice(1) : value
 }
 
 // True when an error thrown by a transport wrapper represents an HTTP 404, used

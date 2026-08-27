@@ -7,24 +7,26 @@ import { ZoomableImage } from '../chat/zoomable-image'
 
 import { MarkdownTextContent } from './markdown-text'
 
-// Regression: a MEDIA-delivered non-media file (pdf, zip, ...) renders as an
-// "Open <name>" fallback link. Right-clicking it must offer
+// Regression: a MEDIA-delivered non-media file (pdf, zip, ...) renders as a
+// filename download link. Right-clicking it must offer
 // reveal-in-file-manager + Copy Path — the transcript's "where is that file?"
 // door — so the user can find the artifact on disk without re-asking the agent.
 describe('MEDIA file fallback link context menu', () => {
   const revealPath = vi.fn().mockResolvedValue(undefined)
+  const saveGatewayFile = vi.fn().mockResolvedValue({ path: '/tmp/saved-report.pdf', saved: true })
   const writeText = vi.fn().mockResolvedValue(undefined)
   let originalDesktop: typeof window.hermesDesktop
   let originalClipboard: PropertyDescriptor | undefined
 
   beforeEach(() => {
     revealPath.mockClear()
+    saveGatewayFile.mockClear()
     writeText.mockClear()
     originalDesktop = window.hermesDesktop
     originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { revealPath }
+      value: { revealPath, saveGatewayFile }
     })
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
 
@@ -44,10 +46,10 @@ describe('MEDIA file fallback link context menu', () => {
     }
   })
 
-  it('right-clicking the "Open <file>" fallback link reveals it in the file manager', async () => {
+  it('right-clicking the filename download link reveals it in the file manager', async () => {
     render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
 
-    const link = await screen.findByText('Open report.pdf')
+    const link = await screen.findByRole('link', { name: 'report.pdf' })
 
     // The fallback anchor must be wrapped in a Radix context-menu trigger.
     await waitFor(() => expect(link.closest('[data-hermes-context-menu-trigger]')).not.toBeNull())
@@ -62,13 +64,41 @@ describe('MEDIA file fallback link context menu', () => {
     await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/tmp/report.pdf'))
   })
 
-  it('renders bare children after switching to a remote connection', async () => {
-    $connection.set({ mode: 'remote' } as never)
+  it('downloads a local file instead of opening it in its associated app', async () => {
     render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
 
-    const link = await screen.findByText('Open report.pdf')
+    const link = await screen.findByRole('link', { name: 'report.pdf' })
+
+    expect(link.getAttribute('download')).toBe('report.pdf')
+    fireEvent.click(link)
+
+    await waitFor(() =>
+      expect(saveGatewayFile).toHaveBeenCalledWith({
+        connectionId: undefined,
+        path: '/tmp/report.pdf',
+        profile: undefined,
+        suggestedName: 'report.pdf'
+      })
+    )
+  })
+
+  it('keeps the filename downloadable while hiding local actions on a remote connection', async () => {
+    $connection.set({ connectionId: 'remote-work-connection', mode: 'remote', profile: 'remote-work' } as never)
+    render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
+
+    const link = await screen.findByRole('link', { name: 'report.pdf' })
     expect(link.closest('[data-hermes-context-menu-trigger]')).toBeNull()
     expect(screen.queryByRole('button', { name: 'File actions' })).toBeNull()
+
+    fireEvent.click(link)
+    await waitFor(() =>
+      expect(saveGatewayFile).toHaveBeenCalledWith({
+        connectionId: 'remote-work-connection',
+        path: '/tmp/report.pdf',
+        profile: 'remote-work',
+        suggestedName: 'report.pdf'
+      })
+    )
   })
 
   it('copies the artifact path from the keyboard-accessible actions menu', async () => {
@@ -88,11 +118,13 @@ describe('MEDIA file fallback link context menu', () => {
   ])('does not reveal a transcript-controlled %s path', async (_kind, mediaPath) => {
     render(<MarkdownTextContent isRunning={false} text={`Done: [report.pdf](#media:${mediaPath})`} />)
 
-    const link = await screen.findByText('Open report.pdf')
+    const link = await screen.findByRole('link', { name: 'report.pdf' })
+    fireEvent.click(link)
     fireEvent.contextMenu(link)
     fireEvent.click(await screen.findByRole('menuitem', { name: /Open Containing Folder|Reveal in/i }))
 
     expect(revealPath).not.toHaveBeenCalled()
+    expect(saveGatewayFile).not.toHaveBeenCalled()
   })
 
   it('does not add transcript file actions to images without a local reveal path', () => {

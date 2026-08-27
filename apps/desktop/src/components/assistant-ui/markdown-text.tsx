@@ -11,6 +11,7 @@ import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
+import { FileDownloadLink } from '@/components/chat/file-download-link'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { RevealInFolderTrigger } from '@/components/chat/reveal-in-folder'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
@@ -144,11 +145,22 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
   )
 }
 
-function MediaAttachment({ path }: { path: string }) {
+function FileAttachment({ path }: { path: string }) {
+  const name = mediaName(path)
+
+  return (
+    <span className="wrap-anywhere">
+      <RevealInFolderTrigger path={path}>
+        <FileDownloadLink path={path}>{name}</FileDownloadLink>
+      </RevealInFolderTrigger>
+    </span>
+  )
+}
+
+function PlayableMediaAttachment({ kind, path }: { kind: 'audio' | 'image' | 'video'; path: string }) {
   const [src, setSrc] = useState('')
   const [failed, setFailed] = useState(false)
   const { open, openFailed } = useOpenMediaFile(path)
-  const kind = mediaKind(path)
   const name = mediaName(path)
 
   useEffect(() => {
@@ -157,14 +169,6 @@ function MediaAttachment({ path }: { path: string }) {
 
     setFailed(false)
     setSrc('')
-
-    if (kind === 'file') {
-      setFailed(true)
-
-      return () => {
-        cancelled = true
-      }
-    }
 
     void resolveMediaPlaybackSrc(path)
       .then(value => {
@@ -243,6 +247,12 @@ function MediaAttachment({ path }: { path: string }) {
       {openFailed && <OpenMediaFailedNote name={name} />}
     </span>
   )
+}
+
+function MediaAttachment({ path }: { path: string }) {
+  const kind = mediaKind(path)
+
+  return kind === 'file' ? <FileAttachment path={path} /> : <PlayableMediaAttachment kind={kind} path={path} />
 }
 
 function childrenToText(children: unknown): string {
@@ -377,7 +387,13 @@ export function MarkdownImage(props: ComponentProps<'img'> & { rawSrc?: string }
   return <MarkdownImageContent localPath={localPath} {...imgProps} />
 }
 
-function MarkdownImageContent({ className, src, alt, localPath, ...props }: ComponentProps<'img'> & { localPath?: string }) {
+function MarkdownImageContent({
+  className,
+  src,
+  alt,
+  localPath,
+  ...props
+}: ComponentProps<'img'> & { localPath?: string }) {
   const rawSrc = typeof src === 'string' ? src : ''
   const [resolvedSrc, setResolvedSrc] = useState(() => (rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : ''))
   const [failed, setFailed] = useState(false)

@@ -3,5 +3,9 @@
  * Windows accepts either separator for UNC paths, so normalize first.
  */
 export function isUnsafeRevealPath(value: string): boolean {
-  return /^(?:\\\\|\/\/)/.test(String(value || '').trim().replace(/\//g, '\\'))
+  return /^(?:\\\\|\/\/)/.test(
+    String(value || '')
+      .trim()
+      .replace(/\//g, '\\')
+  )
 }

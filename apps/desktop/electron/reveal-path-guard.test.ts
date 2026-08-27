@@ -5,7 +5,12 @@ import { test } from 'vitest'
 import { isUnsafeRevealPath } from './reveal-path-guard'
 
 test('rejects slash and backslash network/device paths', () => {
-  for (const value of ['\\\\server\\share\\report.pdf', '//server/share/report.pdf', '\\\\?\\C:\\secret.txt', '\\\\.\\pipe\\name']) {
+  for (const value of [
+    '\\\\server\\share\\report.pdf',
+    '//server/share/report.pdf',
+    '\\\\?\\C:\\secret.txt',
+    '\\\\.\\pipe\\name'
+  ]) {
     assert.equal(isUnsafeRevealPath(value), true, value)
   }
 })

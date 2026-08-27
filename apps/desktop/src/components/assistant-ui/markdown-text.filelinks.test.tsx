@@ -20,7 +20,8 @@ describe('MarkdownLink filesystem hrefs', () => {
 
     // PreviewAttachment paints the filename + an Open preview button —
     // that's the view-time door, not a dead <a>.
-    await screen.findByText('report.md')
+    const filename = await screen.findByRole('link', { name: 'report.md' })
+    expect(filename.getAttribute('download')).toBe('report.md')
     expect(screen.getByRole('button', { name: 'Open preview' })).toBeTruthy()
     expect(document.querySelector('a[href="/home/user/report.md"]')).toBeNull()
   })
@@ -30,8 +31,8 @@ describe('MarkdownLink filesystem hrefs', () => {
       <MarkdownTextContent isRunning={false} text={'See [notes](file:///srv/data/notes.txt) and [todo](~/todo.md)'} />
     )
 
-    await screen.findByText('notes.txt')
-    await screen.findByText('todo.md')
+    expect(await screen.findByRole('link', { name: 'notes.txt' })).toBeTruthy()
+    expect(await screen.findByRole('link', { name: 'todo.md' })).toBeTruthy()
     expect(screen.getAllByRole('button', { name: 'Open preview' })).toHaveLength(2)
   })
 
