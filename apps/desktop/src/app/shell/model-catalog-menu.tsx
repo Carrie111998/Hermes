@@ -25,6 +25,7 @@ import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
+import { $pinnedModels, pinnedModelKey, togglePinnedModel } from '@/store/model-pins'
 import {
   $visibleModels,
   collapseModelFamilies,
@@ -112,6 +113,12 @@ interface ProviderGroup {
   provider: ModelOptionProvider
 }
 
+/** A model family the user pinned to the top of the catalog. */
+interface PinnedRow {
+  family: ModelFamily
+  provider: ModelOptionProvider
+}
+
 /**
  * THE model catalog menu: searchable, provider-grouped, `-fast` families
  * collapsed to one row, per-row hover submenu for thinking/effort/fast, full
@@ -180,12 +187,54 @@ export function ModelCatalogMenu({
     [visibleModels, pickerProviders]
   )
 
+  const pinnedModels = useStore($pinnedModels)
+
+  const pinnedSet = useMemo(() => new Set(pinnedModels), [pinnedModels])
+
+  // Resolve pins against the fetched catalog in PIN ORDER (first pinned =
+  // first shown). Pins whose provider/model the catalog no longer carries are
+  // skipped — the stored preference survives re-auths and model list churn.
+  const pinnedRows = useMemo<PinnedRow[]>(() => {
+    const rows: PinnedRow[] = []
+
+    for (const key of pinnedModels) {
+      const [slug, model] = splitPinnedKey(key)
+
+      if (!slug || !model) {
+        continue
+      }
+
+      const provider = pickerProviders.find(entry => entry.slug === slug)
+
+      if (!provider) {
+        continue
+      }
+
+      const family = collapseModelFamilies(provider.models ?? []).find(
+        entry => entry.id === model || entry.fastId === model
+      )
+
+      if (family) {
+        rows.push({ family, provider })
+      }
+    }
+
+    return rows
+  }, [pinnedModels, pickerProviders])
+
   const groups = useMemo(
-    () => groupModels(pickerProviders, search, { model: current.model, provider: current.provider }, shownKeys),
-    [pickerProviders, search, current.model, current.provider, shownKeys]
+    () =>
+      groupModels(pickerProviders, search, { model: current.model, provider: current.provider }, shownKeys, pinnedSet),
+    [pickerProviders, search, current.model, current.provider, shownKeys, pinnedSet]
   )
 
   const q = normalize(search)
+
+  // Pins respect search like everything else; unfiltered they always show.
+  const shownPinnedRows = useMemo(
+    () => (q ? pinnedRows.filter(row => matchesFamily(row.provider, row.family, q)) : pinnedRows),
+    [pinnedRows, q]
+  )
 
   // Presets are searchable rows like everything else — an unfiltered preset
   // sitting under zero model matches would otherwise become the "first match"
@@ -235,6 +284,14 @@ export function ModelCatalogMenu({
 
   const kbRows = useMemo<KbRow[]>(
     () => [
+      ...shownPinnedRows.map(
+        ({ family, provider }): KbRow => ({
+          family,
+          key: `${provider.slug}:${family.id}`,
+          kind: 'family',
+          provider
+        })
+      ),
       ...groups.flatMap(group =>
         collapsedProviders.includes(group.provider.slug) && !search
           ? []
@@ -247,7 +304,7 @@ export function ModelCatalogMenu({
       ),
       ...shownMoaPresets.map((preset): KbRow => ({ key: `moa:${preset}`, kind: 'moa', preset }))
     ],
-    [groups, collapsedProviders, search, shownMoaPresets]
+    [shownPinnedRows, groups, collapsedProviders, search, shownMoaPresets]
   )
 
   const [kbOverride, setKbOverride] = useState<null | number>(null)
@@ -319,6 +376,98 @@ export function ModelCatalogMenu({
   // Rows are hover-selectable, so they go inert with the pointer.
   const quietRows = pointerQuiet && 'pointer-events-none'
 
+  // ONE row renderer for both the pinned section and the provider groups, so a
+  // pinned row is the same row — same label, same submenu, same keyboard key —
+  // just lifted to the top. Two copies of this markup is how the sections
+  // would drift apart.
+  const renderFamilyRow = (family: ModelFamily, provider: ModelOptionProvider) => {
+    // The active id may be the base or its -fast sibling; either
+    // way this one family row represents both.
+    const activeId =
+      isCurrentProvider(provider, current.provider) && (current.model === family.id || current.model === family.fastId)
+        ? current.model
+        : null
+
+    const isCurrent = activeId !== null
+    const name = modelDisplayParts(family.id).name
+    const caps = provider.capabilities?.[family.id]
+
+    // Effective settings for this row: the live choice when it's
+    // the active model, otherwise its remembered preset. Row
+    // label AND submenu read from these so they never disagree.
+    const preset = controller.presetFor(provider.slug, family.id)
+    const effEffort = isCurrent ? current.effort : (preset.effort ?? '')
+    const effFast = isCurrent ? current.fast : (preset.fast ?? false)
+
+    const fastControl: FastControl = resolveFastControl(
+      activeId ?? family.id,
+      provider.models ?? [],
+      caps?.fast ?? false,
+      effFast
+    )
+
+    const meta = [
+      fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
+      (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null
+    ]
+      .filter(Boolean)
+      .join(' ')
+
+    // Clicking the row commits the model and closes; the edit
+    // submenu (reasoning/fast) is reached by HOVER, so you can
+    // tweak those without the click dismissing everything.
+    const activate = () => {
+      if (!isCurrent) {
+        void selectFamily(family, provider)
+      }
+
+      closeMenu()
+    }
+
+    const rowKey = `${provider.slug}:${family.id}`
+
+    return (
+      <DropdownMenuSub key={rowKey}>
+        <DropdownMenuSubTrigger
+          hideChevron
+          onClick={activate}
+          onKeyDown={event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              activate()
+            }
+          }}
+          {...kbRowProps(rowKey)}
+        >
+          <span className="min-w-0 flex-1 truncate">
+            <HighlightMatches query={search} text={name} />
+            {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
+          </span>
+          {isCurrent ? <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" /> : null}
+        </DropdownMenuSubTrigger>
+        <ModelEditSubmenu
+          canDisableReasoning={caps?.can_disable_reasoning}
+          defaultEffort={defaultEffort}
+          effort={effEffort}
+          fastControl={fastControl}
+          isActive={isCurrent}
+          isPinned={pinnedSet.has(pinnedModelKey(provider.slug, family.id))}
+          model={family.id}
+          onSelectModel={nextModel => controller.select(nextModel, provider.slug)}
+          onSetOptions={patch =>
+            controller.setOptions(patch, {
+              isActive: isCurrent,
+              model: family.id,
+              provider: provider.slug
+            })
+          }
+          onTogglePin={() => togglePinnedModel(provider.slug, family.id)}
+          provider={provider.slug}
+          reasoning={caps?.reasoning ?? true}
+        />
+      </DropdownMenuSub>
+    )
+  }
+
   return (
     <>
       <DropdownMenuSearch
@@ -363,12 +512,21 @@ export function ModelCatalogMenu({
         <DropdownMenuItem className={dropdownMenuRow} disabled>
           {error}
         </DropdownMenuItem>
-      ) : groups.length === 0 && moaPresets.length === 0 ? (
+      ) : groups.length === 0 && shownPinnedRows.length === 0 && moaPresets.length === 0 ? (
         <DropdownMenuItem className={dropdownMenuRow} disabled>
           {copy.noModels}
         </DropdownMenuItem>
       ) : (
         <div className={cn('max-h-[max(150px,30dvh)] overflow-y-auto py-0.5', quietRows)} ref={listRef}>
+          {shownPinnedRows.length > 0 ? (
+            <DropdownMenuGroup className="py-0.5">
+              <DropdownMenuLabel className="flex w-full items-center gap-1 px-2 pb-0.5 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)">
+                <Codicon name="pinned" size="0.625rem" />
+                {copy.pinnedSection}
+              </DropdownMenuLabel>
+              {shownPinnedRows.map(({ family, provider }) => renderFamilyRow(family, provider))}
+            </DropdownMenuGroup>
+          ) : null}
           {groups.map(group => {
             const slug = group.provider.slug
 
@@ -395,93 +553,7 @@ export function ModelCatalogMenu({
                     size="0.625rem"
                   />
                 </DropdownMenuItem>
-                {!collapsed &&
-                  group.families.map(family => {
-                    // The active id may be the base or its -fast sibling; either
-                    // way this one family row represents both.
-                    const activeId =
-                      isCurrentProvider(group.provider, current.provider) &&
-                      (current.model === family.id || current.model === family.fastId)
-                        ? current.model
-                        : null
-
-                    const isCurrent = activeId !== null
-                    const name = modelDisplayParts(family.id).name
-                    const caps = group.provider.capabilities?.[family.id]
-
-                    // Effective settings for this row: the live choice when it's
-                    // the active model, otherwise its remembered preset. Row
-                    // label AND submenu read from these so they never disagree.
-                    const preset = controller.presetFor(group.provider.slug, family.id)
-                    const effEffort = isCurrent ? current.effort : (preset.effort ?? '')
-                    const effFast = isCurrent ? current.fast : (preset.fast ?? false)
-
-                    const fastControl: FastControl = resolveFastControl(
-                      activeId ?? family.id,
-                      group.provider.models ?? [],
-                      caps?.fast ?? false,
-                      effFast
-                    )
-
-                    const meta = [
-                      fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
-                      (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null
-                    ]
-                      .filter(Boolean)
-                      .join(' ')
-
-                    // Clicking the row commits the model and closes; the edit
-                    // submenu (reasoning/fast) is reached by HOVER, so you can
-                    // tweak those without the click dismissing everything.
-                    const activate = () => {
-                      if (!isCurrent) {
-                        void selectFamily(family, group.provider)
-                      }
-
-                      closeMenu()
-                    }
-
-                    return (
-                      <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
-                        <DropdownMenuSubTrigger
-                          hideChevron
-                          onClick={activate}
-                          onKeyDown={event => {
-                            if (event.key === 'Enter' || event.key === ' ') {
-                              activate()
-                            }
-                          }}
-                          {...kbRowProps(`${group.provider.slug}:${family.id}`)}
-                        >
-                          <span className="min-w-0 flex-1 truncate">
-                            <HighlightMatches query={search} text={name} />
-                            {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
-                          </span>
-                          {isCurrent ? (
-                            <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" />
-                          ) : null}
-                        </DropdownMenuSubTrigger>
-                        <ModelEditSubmenu
-                          canDisableReasoning={caps?.can_disable_reasoning}
-                          defaultEffort={defaultEffort}
-                          effort={effEffort}
-                          fastControl={fastControl}
-                          isActive={isCurrent}
-                          model={family.id}
-                          onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
-                          onSetOptions={patch =>
-                            controller.setOptions(patch, {
-                              isActive: isCurrent,
-                              model: family.id,
-                              provider: group.provider.slug
-                            })
-                          }
-                          provider={group.provider.slug}
-                          reasoning={caps?.reasoning ?? true}
-                        />
-                      </DropdownMenuSub>
-                    )
-                  })}
+                {!collapsed && group.families.map(family => renderFamilyRow(family, group.provider))}
               </DropdownMenuGroup>
             )
           })}
@@ -536,6 +608,23 @@ export function ModelCatalogMenu({
 /** Re-exported so callers building a footer row match the catalog's rows. */
 export { dropdownMenuRow }
 
+/** Split a stored `provider::model` pin key. Returns empty strings for a
+ *  malformed entry so a corrupt localStorage value can't crash the menu. */
+function splitPinnedKey(key: string): [string, string] {
+  const index = key.indexOf('::')
+
+  return index === -1 ? ['', ''] : [key.slice(0, index), key.slice(index + 2)]
+}
+
+/** Whether a family matches the (already normalized) search query. Shared by
+ *  the pinned section and the provider groups so one query can never show a
+ *  model in one section and hide it in the other. */
+function matchesFamily(provider: ModelOptionProvider, family: ModelFamily, q: string): boolean {
+  return `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)}`
+    .toLowerCase()
+    .includes(q)
+}
+
 // Collapsed we show the user's chosen models (or the curated default); typing
 // spans every available model so anything is reachable past the cut. A search
 // is itself a narrowing action, so we do NOT cap per-provider matches.
@@ -543,7 +632,8 @@ function groupModels(
   providers: ModelOptionProvider[],
   search: string,
   current: { model: string; provider: string },
-  visible: Set<string> | null
+  visible: Set<string> | null,
+  pinned: Set<string>
 ): ProviderGroup[] {
   const q = normalize(search)
   const groups: ProviderGroup[] = []
@@ -555,10 +645,7 @@ function groupModels(
       continue
     }
 
-    const matches = (family: ModelFamily) =>
-      `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)}`
-        .toLowerCase()
-        .includes(q)
+    const matches = (family: ModelFamily) => matchesFamily(provider, family, q)
 
     let shown: Set<string>
 
@@ -582,7 +669,13 @@ function groupModels(
         ? allFamilies.find(family => family.id === current.model || family.fastId === current.model)?.id
         : undefined
 
-    const families = allFamilies.filter(family => shown.has(family.id) || family.id === activeId)
+    // A pinned model is rendered ONCE, in the pinned section — including when
+    // it is the active model. Leaving it in its provider group too would give
+    // the row two identical keyboard entries and two check marks.
+    const families = allFamilies.filter(
+      family =>
+        (shown.has(family.id) || family.id === activeId) && !pinned.has(pinnedModelKey(provider.slug, family.id))
+    )
 
     if (families.length > 0) {
       groups.push({ families, provider })

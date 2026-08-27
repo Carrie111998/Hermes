@@ -2211,13 +2211,16 @@ export const ar = defineLocale({
       noModels: 'لا توجد نماذج',
       editModels: 'تحرير النماذج',
       refreshModels: 'تحديث النماذج',
-      fast: 'سريع'
+      fast: 'سريع',
+      pinnedSection: 'مثبَّت'
     },
     modelOptions: {
       noOptions: 'لا توجد خيارات لهذا النموذج',
       options: 'الخيارات',
       thinking: 'التفكير',
       fast: 'سريع',
+      pinModel: 'تثبيت في الأعلى',
+      unpinModel: 'إلغاء التثبيت',
       effort: 'الجهد',
       minimal: 'أدنى',
       low: 'منخفض',

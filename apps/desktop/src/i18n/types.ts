@@ -2388,12 +2388,15 @@ export interface Translations {
       editModels: string
       refreshModels: string
       fast: string
+      pinnedSection: string
     }
     modelOptions: {
       noOptions: string
       options: string
       thinking: string
       fast: string
+      pinModel: string
+      unpinModel: string
       effort: string
       minimal: string
       low: string

@@ -2823,13 +2823,16 @@ export const en: Translations = {
       noModels: 'No models found',
       editModels: 'Edit Models…',
       refreshModels: 'Refresh Models',
-      fast: 'Fast'
+      fast: 'Fast',
+      pinnedSection: 'Pinned'
     },
     modelOptions: {
       noOptions: 'No options for this model',
       options: 'Options',
       thinking: 'Thinking',
       fast: 'Fast',
+      pinModel: 'Pin to top',
+      unpinModel: 'Unpin',
       effort: 'Effort',
       minimal: 'Minimal',
       low: 'Low',
