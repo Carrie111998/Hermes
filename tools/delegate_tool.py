@@ -1640,15 +1640,15 @@ def _build_child_agent(
     import uuid as _uuid
 
     # ── Role resolution ─────────────────────────────────────────────────
-    # Honor the caller's role only when BOTH the kill switch and the
-    # child's depth allow it.  This is the single point where role
-    # degrades to 'leaf' — keeps the rule predictable.  Callers pass
-    # the normalised role (_normalize_role ran in delegate_task) so
-    # we only deal with 'leaf' or 'orchestrator' here.
+    # Depth-derived, not caller-declared: a child may delegate iff the
+    # kill switch is on and depth budget remains below max_spawn_depth.
+    # The legacy `role` arg no longer participates (it asked the caller
+    # to guess a fact the config already knows); it is still accepted and
+    # normalised for wire compat, but capability comes from depth alone.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
-    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    effective_role = "orchestrator" if orchestrator_ok else "leaf"
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -4648,6 +4648,34 @@ def _build_top_level_description() -> str:
     top-level text stays static and duplication-free. If you add text
     here, check it is not already stated in a parameter description.
     """
+    try:
+        orchestration_available = _get_max_spawn_depth() >= 2 and _get_orchestrator_enabled()
+    except Exception:
+        orchestration_available = False
+
+    # The child-restrictions rule renders per config: on nesting-enabled
+    # installs the orchestrator clause is load-bearing; on depth-1/disabled
+    # installs (the default) it would describe an unreachable state — the
+    # role param already explains that 'orchestrator' is inert there.
+    # send_message is deliberately not named: it's gateway-internal
+    # vocabulary most sessions never see. The list below is the fail-safe
+    # superset; model_tools session-filters it to the tools the session
+    # actually has, dropping the whole line when none apply.
+    # Delegation capability is depth-derived (no role param): mention
+    # recursion only where it's actually available.
+    if orchestration_available:
+        restrictions_rule = (
+            "- Children cannot call clarify, memory, or cronjob.\n"
+            "- Children can themselves delegate while depth remains "
+            f"(max_spawn_depth={_get_max_spawn_depth()}); the runtime "
+            "derives this from depth automatically.\n"
+        )
+    else:
+        restrictions_rule = (
+            "- Children cannot call delegate_task, clarify, memory, or "
+            "cronjob.\n"
+        )
+
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
@@ -4656,12 +4684,9 @@ def _build_top_level_description() -> str:
         "Runs in the background: dispatch returns immediately with live "
         "transcript paths, and the completed result (one consolidated message "
         "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "poll; continue other work. While children run, `action` "
+        "(list/steer/stop) controls them live — steer when a transcript shows "
+        "a child drifting.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4669,7 +4694,7 @@ def _build_top_level_description() -> str:
         "- A single tool call -> call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot ask questions\n"
         "- Durable work that must survive this session -> cronjob or "
-        "terminal(background=True, notify_on_complete=True); /stop, /new, or "
+        "terminal(background=True, notify=True); /stop, /new, or "
         "process exit discards running subagents.\n\n"
         "RULES:\n"
         "- Children know nothing of this conversation: pass everything needed "
@@ -4679,14 +4704,10 @@ def _build_top_level_description() -> str:
         "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
         "For external side effects (uploads, remote writes, publishing), "
         "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
-        "memory, send_message, or cronjob; orchestrators regain only "
-        "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "yourself before telling the user the operation succeeded.\n"
+        + restrictions_rule +
+        "- Children inherit the parent model unless pinned via "
+        "delegation.provider / delegation.model in config.yaml."
     )
 
 
@@ -4705,39 +4726,23 @@ def _build_tasks_param_description() -> str:
 
 
 def _build_role_param_description() -> str:
-    """Compose the 'role' parameter description with current spawn-depth limit."""
+    """Legacy helper — the `role` param is no longer advertised.
+
+    Delegation capability is depth-derived (see the role-resolution block in
+    _build_child_agent): a child may itself delegate iff
+    delegation.orchestrator_enabled and its depth < max_spawn_depth. The
+    handler still accepts role for wire compat (old transcripts, kanban
+    dispatcher) but ignores it. Kept because external callers import this
+    symbol; returns the depth story for any such use.
+    """
     try:
         max_depth = _get_max_spawn_depth()
     except Exception:
         max_depth = MAX_DEPTH
-    try:
-        orchestrator_on = _get_orchestrator_enabled()
-    except Exception:
-        orchestrator_on = True
-
-    if max_depth >= 2 and orchestrator_on:
-        nesting_note = (
-            f"Nesting IS enabled for this user (max_spawn_depth={max_depth}): "
-            f"orchestrator children can themselves delegate up to {max_depth - 1} "
-            "more level(s) deep."
-        )
-    elif max_depth >= 2 and not orchestrator_on:
-        nesting_note = (
-            "Nesting is currently disabled "
-            "(delegation.orchestrator_enabled=false); 'orchestrator' is "
-            "silently forced to 'leaf'."
-        )
-    else:
-        nesting_note = (
-            f"Nesting is OFF for this user (max_spawn_depth={max_depth}); "
-            "'orchestrator' is silently forced to 'leaf'. Raise "
-            "delegation.max_spawn_depth in config.yaml to enable."
-        )
-
     return (
-        "Role of the child agent. 'leaf' (default) = focused "
-        "worker, cannot delegate further. 'orchestrator' = can "
-        f"use delegate_task to spawn its own workers. {nesting_note}"
+        "Legacy parameter, ignored: whether a child can delegate is derived "
+        f"from delegation config (max_spawn_depth={max_depth}), not declared "
+        "by the caller."
     )
 
 
@@ -4756,7 +4761,6 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
-    overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
     return {
         "description": _build_top_level_description(),
@@ -4786,16 +4790,16 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "What the subagent should accomplish. Be specific and "
-                    "self-contained -- the subagent knows nothing about your "
-                    "conversation history."
+                    "self-contained — the subagent knows nothing about your "
+                    "conversation history. (Same field per-task in tasks[].)"
                 ),
             },
             "context": {
                 "type": "string",
                 "description": (
-                    "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
-                    "specific you are, the better the subagent performs."
+                    "Background the subagent needs: file paths, error "
+                    "messages, constraints. The more specific, the better it "
+                    "performs. (Same field per-task in tasks[].)"
                 ),
             },
             "tasks": {
@@ -4803,92 +4807,64 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "goal": {"type": "string", "description": "Task goal"},
-                        "context": {
-                            "type": "string",
-                            "description": "Task-specific context",
-                        },
-                        "role": {
-                            "type": "string",
-                            "enum": ["leaf", "orchestrator"],
-                            "description": "Per-task role override. See top-level 'role' for semantics.",
-                        },
-                        "output_schema": {
-                            "type": "object",
-                            "description": (
-                                "Optional JSON Schema the subagent's final "
-                                "answer must validate against. The child is "
-                                "told the contract up front; the parent "
-                                "validates the final answer and allows one "
-                                "bounded correction retry. The result entry "
-                                "gains schema_valid (and schema_errors on "
-                                "final failure). Keep schemas forgiving: "
-                                "require only fields you will actually read."
-                            ),
-                        },
+                        "goal": {"type": "string"},
+                        "context": {"type": "string"},
+                        "output_schema": {"type": "object"},
                     },
                     "required": ["goal"],
                 },
                 # No maxItems — the runtime limit is configurable via
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
-                "description": "(rebuilt at get_definitions() time)",
-            },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
+                # Item fields carry no sub-descriptions: goal/context/
+                # output_schema have identical semantics to the top-level
+                # params of the same name, taught once there.
+                # NOTE: the handler also accepts a per-task `role` — legacy,
+                # ignored: delegation capability is depth-derived, not
+                # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
             "output_schema": {
                 "type": "object",
                 "description": (
-                    "Optional JSON Schema for the single-goal form — the "
-                    "subagent's final answer must validate against it "
-                    "(same semantics as tasks[].output_schema)."
+                    "Optional JSON Schema the subagent's final answer must "
+                    "validate against (told to the child up front; parent "
+                    "validates with one bounded correction retry; result "
+                    "gains schema_valid, plus schema_errors on failure). "
+                    "Keep it forgiving — require only fields you will read. "
+                    "Same semantics per-task via tasks[].output_schema."
                 ),
             },
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
-            },
+            # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
+            # ignored: top-level delegations always run in the background.
+            # Deliberately unadvertised (old transcripts/callers only); do not
+            # re-add to the schema.
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],
                 "description": (
-                    "Default 'spawn' (omit for normal delegation). Live "
-                    "orchestration of running subagents: 'list' shows this "
-                    "conversation's live children (ids, goals, status, "
-                    "transcript paths); 'steer' queues course-correction text "
-                    "into one child (requires subagent_id + message) without "
-                    "stopping it; 'stop' ends one child early (requires "
-                    "subagent_id) — its partial result still returns as a "
-                    "completion message. Control actions return immediately; "
-                    "goal/tasks are ignored when action is not 'spawn'."
+                    "Default 'spawn'. Live control of running children: "
+                    "'list' = ids/goals/status/transcripts; 'steer' = queue "
+                    "course-correction text into one child (subagent_id + "
+                    "message) without stopping it; 'stop' = end one child "
+                    "early (subagent_id; partial result still returns). "
+                    "Control actions return immediately; goal/tasks are "
+                    "ignored unless spawning."
                 ),
             },
             "subagent_id": {
                 "type": "string",
                 "description": (
-                    "Target for action='steer'/'stop'. Ids are returned in the "
-                    "spawn dispatch response (subagent_ids) and by "
-                    "action='list'."
+                    "Target for action='steer'/'stop' (ids from the spawn "
+                    "response or action='list')."
                 ),
             },
             "message": {
                 "type": "string",
                 "description": (
-                    "For action='steer': the course correction. Be directive "
-                    "and specific — the child sees it appended to its next "
-                    "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
-                    "and return early results\")."
+                    "For action='steer': the course correction, appended to "
+                    "the child's next tool result mid-run. Be directive and "
+                    "specific."
                 ),
             },
         },
