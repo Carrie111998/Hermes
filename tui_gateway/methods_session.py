@@ -1702,6 +1702,66 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, usage)
 
 
+@method("session.model_usage")
+def _(rid, params: dict) -> dict:
+    """Return persisted token/cost counters split by live model route."""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    with _session_db(session) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        rows = db.get_session_model_usage(session["session_key"])
+
+    routes = []
+    totals = {
+        "calls": 0,
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "total": 0,
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+    }
+    for row in rows:
+        input_tokens = int(row.get("input_tokens") or 0)
+        output_tokens = int(row.get("output_tokens") or 0)
+        route = {
+            "model": row.get("model") or "unknown",
+            "provider": row.get("billing_provider") or "",
+            "billing_mode": row.get("billing_mode") or "",
+            "calls": int(row.get("api_call_count") or 0),
+            "input": input_tokens,
+            "output": output_tokens,
+            "cache_read": int(row.get("cache_read_tokens") or 0),
+            "cache_write": int(row.get("cache_write_tokens") or 0),
+            "reasoning": int(row.get("reasoning_tokens") or 0),
+            "total": input_tokens + output_tokens,
+            "estimated_cost_usd": float(row.get("estimated_cost_usd") or 0.0),
+            "actual_cost_usd": float(row.get("actual_cost_usd") or 0.0),
+            "cost_status": row.get("cost_status") or "",
+            "cost_source": row.get("cost_source") or "",
+            "last_seen": float(row.get("last_seen") or 0.0),
+        }
+        routes.append(route)
+        for source, target in (
+            ("calls", "calls"),
+            ("input", "input"),
+            ("output", "output"),
+            ("cache_read", "cache_read"),
+            ("cache_write", "cache_write"),
+            ("reasoning", "reasoning"),
+            ("total", "total"),
+            ("estimated_cost_usd", "estimated_cost_usd"),
+            ("actual_cost_usd", "actual_cost_usd"),
+        ):
+            totals[target] += route[source]
+
+    return _ok(rid, {"routes": routes, "totals": totals})
+
+
 @method("session.context_breakdown")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
