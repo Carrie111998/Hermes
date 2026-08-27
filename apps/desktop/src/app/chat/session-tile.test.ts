@@ -4,9 +4,13 @@ import { clearSessionDraft, stashSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { $connection, $sessions } from '@/store/session'
-import { $sessionTiles } from '@/store/session-states'
+import {
+  $sessionTiles,
+  sessionTileOwnerGeneration,
+  setSessionTileWorkspaceScope
+} from '@/store/session-states'
 
-import { sessionTileDraftScope, sessionTileResumeFailure, tileDragPayload } from './session-tile'
+import { commitSessionTileResume, sessionTileDraftScope, sessionTileResumeFailure, tileDragPayload } from './session-tile'
 
 afterEach(() => {
   $activeGatewayProfile.set('default')
@@ -29,6 +33,24 @@ describe('sessionTileResumeFailure', () => {
 
   it('does not overwrite a tile that rebound while the lookup was pending', () => {
     expect(sessionTileResumeFailure('session not found', true, false)).toBeUndefined()
+  })
+})
+
+describe('tile resume owner generation', () => {
+  it('rejects owner A resume result after the tile is re-homed to owner B', () => {
+    const storedSessionId = 'shared-owner-id'
+    const ownerA = { connectionId: 'source-a', profile: 'default' }
+    const ownerB = { connectionId: 'source-b', profile: 'default' }
+
+    $sessionTiles.set([{ ownerRoute: ownerA, storedSessionId }])
+    const ownerGeneration = sessionTileOwnerGeneration(storedSessionId)
+
+    expect(
+      setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' })
+    ).toBe(true)
+    expect(commitSessionTileResume(storedSessionId, ownerGeneration, 'runtime-from-owner-a')).toBe(false)
+    expect($sessionTiles.get()[0]).toMatchObject({ ownerRoute: ownerB })
+    expect($sessionTiles.get()[0]?.runtimeId).toBeUndefined()
   })
 })
 

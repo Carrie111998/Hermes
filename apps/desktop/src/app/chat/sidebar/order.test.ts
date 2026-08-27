@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { SidebarListRow } from '@/lib/session-date-groups'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -168,6 +169,23 @@ describe('reorderableRowIds', () => {
   it('lists root session ids in render order, skipping dividers and branches', () => {
     const rows = [session('a'), session('branch', '├─ '), divider('yesterday'), session('b')]
 
-    expect(reorderableRowIds(rows)).toEqual(['a', 'b'])
+    expect(reorderableRowIds(rows)).toEqual(
+      rows.flatMap(row =>
+        row.kind === 'session' && !row.entry.branchStem ? [sessionRowIdentity(row.entry.session)] : []
+      )
+    )
+  })
+
+  it('keeps same-profile duplicate ids from different owners sortable independently', () => {
+    const duplicate = (connection_id: string): SidebarListRow => ({
+      entry: { session: { connection_id, id: 'shared', profile: 'worker' } as SessionInfo },
+      kind: 'session'
+    })
+
+    const rows = [duplicate('source-a'), duplicate('source-b')]
+    const rowIds = reorderableRowIds(rows)
+
+    expect(rowIds).toHaveLength(2)
+    expect(new Set(rowIds).size).toBe(2)
   })
 })

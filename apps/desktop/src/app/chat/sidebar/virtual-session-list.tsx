@@ -8,6 +8,7 @@ import { type FC, useEffect, useRef } from 'react'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
@@ -35,6 +36,7 @@ interface SessionRowCommonProps {
 
 export interface VirtualSessionListProps {
   activeSessionId: null | string
+  activeSessionIdentity?: null | string
   /** Render every session row as the three-line inbox card. */
   card?: boolean
   className?: string
@@ -61,6 +63,7 @@ const OVERSCAN_ROWS = 12
 
 export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   activeSessionId,
+  activeSessionIdentity,
   card = false,
   className,
   dividerAction,
@@ -94,7 +97,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     getItemKey: index => {
       const row = listRows[index]
 
-      return row ? (row.kind === 'divider' ? row.key : row.entry.session.id) : index
+      return row ? (row.kind === 'divider' ? row.key : sessionRowIdentity(row.entry.session)) : index
     },
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
@@ -143,7 +146,9 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       branchStem,
       card,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
+      isSelected: activeSessionIdentity
+        ? sessionRowIdentity(session) === activeSessionIdentity
+        : session.id === activeSessionId,
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
@@ -155,9 +160,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       unread: session.unread === true
     }
 
-    // Key by (profile, id): twins with the same stored id in two profiles are
-    // distinct rows (#92454) — a bare-id key misattributes rendered state.
-    const rowKey = `${session.profile ?? ''}::${session.id}`
+    const rowKey = sessionRowIdentity(session)
 
     return reorderable ? (
       <div data-index={virtualItem.index} key={rowKey} ref={virtualizer.measureElement} style={itemStyle}>
@@ -206,7 +209,9 @@ interface VirtualSortableRowProps {
 }
 
 function VirtualSortableRow({ rowProps, session }: VirtualSortableRowProps) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    id: sessionRowIdentity(session)
+  })
 
   return (
     <SidebarSessionRow

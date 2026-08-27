@@ -16,6 +16,7 @@ import {
   type SidebarListRow,
   toSessionRows
 } from '@/lib/session-date-groups'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
@@ -99,6 +100,7 @@ interface SidebarSessionsSectionProps {
   onToggle: () => void
   sessions: SessionInfo[]
   activeSessionId: null | string
+  activeSessionIdentity?: null | string
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
@@ -177,6 +179,7 @@ export function SidebarSessionsSection({
   onToggle,
   sessions,
   activeSessionId,
+  activeSessionIdentity,
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
@@ -253,7 +256,9 @@ export function SidebarSessionsSection({
         branchStem,
         card,
         isPinned: pinned,
-        isSelected: session.id === activeSessionId,
+        isSelected: activeSessionIdentity
+          ? sessionRowIdentity(session) === activeSessionIdentity
+          : session.id === activeSessionId,
         onArchive: () => onArchiveSession(session.id),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
         onDelete: () => onDeleteSession(session.id),
@@ -266,17 +271,17 @@ export function SidebarSessionsSection({
         unread: session.unread === true
       }
 
-      // Key by (profile, id): twins with the same stored id in two profiles
-      // are distinct rows (#92454) — a bare-id key makes React misattribute
-      // one twin's rendered state to the other.
+      const rowIdentity = sessionRowIdentity(session)
+
       return draggable && !branchStem ? (
-        <SortableSidebarSessionRow key={`${session.profile ?? ''}::${session.id}`} {...rowProps} />
+        <SortableSidebarSessionRow key={rowIdentity} {...rowProps} />
       ) : (
-        <SidebarSessionRow key={`${session.profile ?? ''}::${session.id}`} {...rowProps} />
+        <SidebarSessionRow key={rowIdentity} {...rowProps} />
       )
     },
     [
       activeSessionId,
+      activeSessionIdentity,
       card,
       onArchiveSession,
       onBranchSession,
@@ -460,6 +465,7 @@ export function SidebarSessionsSection({
     const virtual = (
       <VirtualSessionList
         activeSessionId={activeSessionId}
+        {...(activeSessionIdentity !== undefined ? { activeSessionIdentity } : {})}
         card={card}
         className={contentClassName}
         dividerAction={dividerAction}
@@ -534,7 +540,7 @@ interface SortableSessionRowProps {
 }
 
 function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
+  return <SidebarSessionRow {...props} {...useSortableBindings(sessionRowIdentity(props.session))} />
 }
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {

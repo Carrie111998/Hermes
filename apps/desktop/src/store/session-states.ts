@@ -31,6 +31,7 @@ import {
 } from '@/components/pane-shell/tree/store'
 import { $workspaceMode, resolveRememberedActivePane, workspaceScopeKey } from '@/components/pane-shell/workspace-scope'
 import type { WorkspaceMode } from '@/contrib/types'
+import { sessionRowIdentityForOwner } from '@/lib/session-row-identity'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
 import type { SessionInfo } from '@/types/hermes'
@@ -40,7 +41,10 @@ import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait
 import {
   $activeSessionId,
   $connection,
+  $cronSessions,
   $lastReadAtBySessionId,
+  $messagingSessions,
+  $primarySessionOwnerIntent,
   $selectedStoredSessionId,
   $sessions,
   clearReadBaseline,
@@ -726,6 +730,9 @@ export interface SessionTile {
   workspaceOwnerKey?: string
   /** Credential-free exact route used to resume this tab after relaunch. */
   ownerRoute?: SessionOwnerRoute
+  /** Runtime-only epoch for the exact owner route. Async resume results may
+   *  bind only while the epoch they captured is still current. */
+  ownerGeneration?: number
   /** Stable title for hidden relationship chats absent from the Sessions list. */
   workspaceTabTitle?: string
 }
@@ -917,6 +924,28 @@ if (!isSecondaryWindow() && !isBrowserWindow()) {
 
 export function patchSessionTile(storedSessionId: string, patch: Partial<SessionTile>) {
   saveTiles($sessionTiles.get().map(t => (t.storedSessionId === storedSessionId ? { ...t, ...patch } : t)))
+}
+
+export function sessionTileOwnerGeneration(storedSessionId: string): number {
+  return $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.ownerGeneration ?? 0
+}
+
+/** Apply an async owner-scoped result only to the tile generation that started
+ * it. Re-homing the same durable id must make every old owner's result stale. */
+export function patchSessionTileForOwnerGeneration(
+  storedSessionId: string,
+  ownerGeneration: number,
+  patch: Partial<SessionTile>
+): boolean {
+  const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+
+  if (!tile || (tile.ownerGeneration ?? 0) !== ownerGeneration) {
+    return false
+  }
+
+  patchSessionTile(storedSessionId, patch)
+
+  return true
 }
 
 export function sessionTileOwnerRoute(storedSessionId: string): SessionOwnerRoute | undefined {
@@ -1127,6 +1156,7 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
 
   const ownerChanged =
     tile?.ownerRoute?.connectionId !== ownerRoute?.connectionId ||
+    tile?.ownerRoute?.mode !== ownerRoute?.mode ||
     tile?.ownerRoute?.profile !== ownerRoute?.profile ||
     tile?.ownerRoute?.targetProfile !== ownerRoute?.targetProfile
 
@@ -1135,6 +1165,7 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
     ((tile.workspaceMode ?? 'sessions') === scope.workspaceMode &&
       tile.workspaceOwnerKey === workspaceOwnerKey &&
       tile.ownerRoute?.connectionId === ownerRoute?.connectionId &&
+      tile.ownerRoute?.mode === ownerRoute?.mode &&
       tile.ownerRoute?.profile === ownerRoute?.profile &&
       tile.ownerRoute?.targetProfile === ownerRoute?.targetProfile &&
       tile.workspaceTabTitle === workspaceTabTitle)
@@ -1145,6 +1176,7 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
   patchSessionTile(storedSessionId, {
     ...(ownerChanged ? { error: undefined, runtimeId: undefined } : {}),
     ownerRoute,
+    ownerGeneration: ownerChanged ? (tile.ownerGeneration ?? 0) + 1 : tile.ownerGeneration,
     workspaceMode: scope.workspaceMode,
     workspaceOwnerKey,
     workspaceTabTitle
@@ -1251,6 +1283,12 @@ export function unbindTileRuntime(runtimeId: string) {
 // store's pane closers.
 // ---------------------------------------------------------------------------
 
+export interface SessionTileResumeOptions {
+  ownerGeneration?: number
+  ownerRoute?: SessionOwnerRoute
+  refreshTranscript?: boolean
+}
+
 export interface SessionTileDelegate {
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
   archiveSession(storedSessionId: string): Promise<void>
@@ -1270,11 +1308,10 @@ export interface SessionTileDelegate {
    *  right pane" bug). Bindings re-record from live post-reconnect events. */
   invalidateRuntimeBindings?(preserveStoredSessionIds?: ReadonlySet<string>): void
   /** Bind a live runtime id for a stored session (resume without touching
-   *  the main view). Returns the runtime id, or throws.
-   *  `refreshTranscript` forces a REST merge even when a warm cached
-   *  transcript already exists — reopen-after-idle must not paint the
-   *  snapshot that was current when the panel last had a socket. */
-  resumeTile(storedSessionId: string, options?: { refreshTranscript?: boolean }): Promise<string>
+   *  the main view). Returns the runtime id, or throws. `refreshTranscript`
+   *  forces a REST merge even when a warm cached transcript already exists;
+   *  owner generation/route keep async results bound to the exact tile. */
+  resumeTile(storedSessionId: string, options?: SessionTileResumeOptions): Promise<string>
   /** Retire one runtime's busy/awaiting claim through the wiring cache
    *  (updateSessionState), so cache, focused view, busyRef, and tile mirrors
    *  settle together. Returns false when the cache holds no busy state for
@@ -1870,6 +1907,43 @@ export const $focusedStoredSessionId = computed(
   }
 )
 
+/** Exact rendered-row identity of the focused surface. The pane id carries
+ * only a durable session id, so its tile/primary owner route supplies the
+ * connection qualifier needed when two sources expose the same profile+id. */
+export const $focusedSessionRowIdentity = computed(
+  [
+    $activeTreeGroup,
+    $layoutTree,
+    $selectedStoredSessionId,
+    $primarySessionOwnerIntent,
+    $sessionTiles,
+    $sessions,
+    $cronSessions,
+    $messagingSessions
+  ],
+  (groupId, tree, selected, primaryOwnerIntent, tiles, sessions, cronSessions, messagingSessions) => {
+    const active = groupId && tree ? findGroup(tree, groupId)?.active : undefined
+    const tileStoredId = active?.startsWith(TILE_PANE_PREFIX) ? active.slice(TILE_PANE_PREFIX.length) : null
+    const storedSessionId = tileStoredId ?? selected
+
+    if (!storedSessionId) {
+      return null
+    }
+
+    const ownerRoute = tileStoredId
+      ? tiles.find(tile => tile.storedSessionId === tileStoredId)?.ownerRoute
+      : primaryOwnerIntent?.storedSessionId === storedSessionId
+        ? primaryOwnerIntent.ownerRoute
+        : getSessionOwnerHint(storedSessionId)
+
+    return sessionRowIdentityForOwner(
+      [...sessions, ...cronSessions, ...messagingSessions],
+      storedSessionId,
+      ownerRoute
+    )
+  }
+)
+
 /** Every session currently OPEN as a surface: the primary's selection plus
  *  every tile's stored id. The sidebar highlights all of them (the focused one
  *  at full strength, the rest dimmed) so a multi-pane workspace shows which
@@ -1877,6 +1951,39 @@ export const $focusedStoredSessionId = computed(
 export const $openStoredSessionIds = computed(
   [$selectedStoredSessionId, $sessionTiles],
   (selected, tiles) => new Set([...(selected ? [selected] : []), ...tiles.map(t => t.storedSessionId)])
+)
+
+/** Open surfaces keyed by the same owner-qualified row identity React and DnD
+ * use. A bare stored id cannot distinguish duplicate rows on two connections. */
+export const $openSessionRowIdentities = computed(
+  [$selectedStoredSessionId, $primarySessionOwnerIntent, $sessionTiles, $sessions, $cronSessions, $messagingSessions],
+  (selected, primaryOwnerIntent, tiles, sessions, cronSessions, messagingSessions) => {
+    const rows = [...sessions, ...cronSessions, ...messagingSessions]
+    const identities = new Set<string>()
+
+    const add = (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => {
+      const identity = sessionRowIdentityForOwner(rows, storedSessionId, ownerRoute)
+
+      if (identity) {
+        identities.add(identity)
+      }
+    }
+
+    if (selected) {
+      const ownerRoute =
+        primaryOwnerIntent?.storedSessionId === selected
+          ? primaryOwnerIntent.ownerRoute
+          : getSessionOwnerHint(selected)
+
+      add(selected, ownerRoute)
+    }
+
+    for (const tile of tiles) {
+      add(tile.storedSessionId, tile.ownerRoute)
+    }
+
+    return identities
+  }
 )
 
 /** Live runtime id of the focused session (a tile's bound runtime, else the

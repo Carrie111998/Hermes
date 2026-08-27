@@ -6,6 +6,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
+import { sessionRowIdentity, sessionRowLiveIdentity } from '@/lib/session-row-identity'
 import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
@@ -514,21 +515,13 @@ export function mergeSessionPage(
 ): SessionInfo[] {
   const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
 
-  // Rows are identified by (profile, id), never bare id: two profiles can
-  // hold sessions with the SAME stored id (restored backups, copied
-  // state.dbs, cross-profile imports — #92454). Keyed by bare id, the twins
-  // collapse into one sidebar row whose title/preview carry can stitch one
-  // profile's content onto the other profile's route — the user clicks a row
-  // previewing profile A and the resume dials profile B. Same-profile rows
-  // (including untagged ones, which normalize together) keep the exact
-  // carry behavior below.
-  // (Local normalize: importing @/store/profile here would be circular —
-  // same '' → 'default' rule as normalizeProfileKey.)
-  const profileKeyOf = (session: SessionInfo) => (session.profile ?? '').trim() || 'default'
-  const identity = (session: SessionInfo) => `${profileKeyOf(session)}::${session.id}`
-
-  const lineageIdentity = (session: SessionInfo) =>
-    `${profileKeyOf(session)}::${session._lineage_root_id ?? session.id}`
+  // Page metadata carries only within one exact rendered-row owner. Two
+  // registry connections can expose the same normalized profile and stored id;
+  // omitting connection_id here lets A's title/last_active contaminate B's row.
+  // The shared identity is also what React, sortable, virtual, selected and
+  // open-row state use, so the merge cannot disagree with the rendered list.
+  const identity = sessionRowLiveIdentity
+  const lineageIdentity = sessionRowIdentity
 
   // Carry a known title onto a row that arrives title-less, so a freshly
   // submitted session (e.g. a branch draft) holds its placeholder instead of

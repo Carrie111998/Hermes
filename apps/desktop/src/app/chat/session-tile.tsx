@@ -56,6 +56,7 @@ import {
   $sessionTiles,
   closeSessionTile,
   patchSessionTile,
+  patchSessionTileForOwnerGeneration,
   type SessionTile,
   sessionTileDelegate,
   sessionTileOwnerRoute
@@ -97,6 +98,17 @@ export function sessionTileResumeFailure(
   }
 
   return 'Session unavailable — you can retry resuming it.'
+}
+
+export function commitSessionTileResume(
+  storedSessionId: string,
+  ownerGeneration: number,
+  runtimeId: string
+): boolean {
+  return patchSessionTileForOwnerGeneration(storedSessionId, ownerGeneration, {
+    error: undefined,
+    runtimeId
+  })
 }
 
 /** The tile's SessionView: the same atom shape the primary chat renders
@@ -287,7 +299,8 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const runtimeId = tile?.runtimeId ?? null
   const gatewayOpen = useStore($gatewayState) === 'open'
   const delegateRevision = useStore($sessionTileDelegateRevision)
-  const resumingRef = useRef(false)
+  const ownerGeneration = tile?.ownerGeneration ?? 0
+  const resumingOwnerGenerationRef = useRef<number | null>(null)
   const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
 
   const storedSessionStillExists = useCallback(
@@ -348,7 +361,12 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   // latched every restored tile into the error card.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (!gatewayOpen || runtimeId || tile?.error || resumingRef.current) {
+    if (
+      !gatewayOpen ||
+      runtimeId ||
+      tile?.error ||
+      resumingOwnerGenerationRef.current === ownerGeneration
+    ) {
       return
     }
 
@@ -358,16 +376,16 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
       return
     }
 
-    resumingRef.current = true
+    resumingOwnerGenerationRef.current = ownerGeneration
 
     delegate
-      .resumeTile(storedSessionId)
-      .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
+      .resumeTile(storedSessionId, { ownerGeneration, ownerRoute })
+      .then(id => commitSessionTileResume(storedSessionId, ownerGeneration, id))
       .catch(async (err: unknown) => {
         const message = err instanceof Error ? err.message : String(err)
 
         if (!/session not found|\b404\b/i.test(message)) {
-          patchSessionTile(storedSessionId, { error: message })
+          patchSessionTileForOwnerGeneration(storedSessionId, ownerGeneration, { error: message })
 
           return
         }
@@ -378,17 +396,27 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         // retried by the user, but must never be deleted on an inconclusive
         // reconnect-time lookup.
         const durableSession = await resolveStoredSession(storedSessionId, ownerRoute).catch(() => undefined)
-        const current = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+
+        const current = $sessionTiles
+          .get()
+          .find(
+            candidate =>
+              candidate.storedSessionId === storedSessionId &&
+              (candidate.ownerGeneration ?? 0) === ownerGeneration
+          )
+
         const error = sessionTileResumeFailure(message, Boolean(durableSession), Boolean(current && !current.runtimeId))
 
         if (error) {
-          patchSessionTile(storedSessionId, { error })
+          patchSessionTileForOwnerGeneration(storedSessionId, ownerGeneration, { error })
         }
       })
       .finally(() => {
-        resumingRef.current = false
+        if (resumingOwnerGenerationRef.current === ownerGeneration) {
+          resumingOwnerGenerationRef.current = null
+        }
       })
-  }, [delegateRevision, gatewayOpen, ownerRoute, runtimeId, storedSessionId, tile?.error])
+  }, [delegateRevision, gatewayOpen, ownerGeneration, ownerRoute, runtimeId, storedSessionId, tile?.error])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it

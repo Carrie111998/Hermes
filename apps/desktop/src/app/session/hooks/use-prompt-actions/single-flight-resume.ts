@@ -1,5 +1,5 @@
 /**
- * Single-flight guard for `session.resume`, keyed by STORED session id.
+ * Single-flight guard for `session.resume`, keyed by durable resume identity.
  *
  * After sleep/wake or a reconnect, many independent surfaces discover the same
  * dead runtime at once — submit recovery, slash/rewind recovery, tile resumes,
@@ -8,15 +8,18 @@
  * the losers become orphans for the reaper (#91276 storm).
  *
  * Module-level so EVERY call site in the window shares one in-flight promise
- * per stored id, no matter which hook instance it lives in. All participating
+ * per owner-qualified stored id, no matter which hook instance it lives in.
+ * Legacy/single-owner callers pass the bare stored id; callers that can see
+ * duplicate ids across connections pass their shared owner-qualified row key.
+ * All participating
  * callers resolve to a `session.resume`-shaped response (an object carrying
  * `session_id`); joiners receive whatever the winning call returns.
  */
 
-const _inFlightResumeByStoredSessionId = new Map<string, Promise<unknown>>()
+const _inFlightResumeByIdentity = new Map<string, Promise<unknown>>()
 
-export function singleFlightSessionResume<T>(storedSessionId: string, run: () => Promise<T>): Promise<T> {
-  const existing = _inFlightResumeByStoredSessionId.get(storedSessionId)
+export function singleFlightSessionResume<T>(resumeIdentity: string, run: () => Promise<T>): Promise<T> {
+  const existing = _inFlightResumeByIdentity.get(resumeIdentity)
 
   if (existing) {
     return existing as Promise<T>
@@ -28,12 +31,12 @@ export function singleFlightSessionResume<T>(storedSessionId: string, run: () =>
   const flight = Promise.resolve()
     .then(run)
     .finally(() => {
-      if (_inFlightResumeByStoredSessionId.get(storedSessionId) === flight) {
-        _inFlightResumeByStoredSessionId.delete(storedSessionId)
+      if (_inFlightResumeByIdentity.get(resumeIdentity) === flight) {
+        _inFlightResumeByIdentity.delete(resumeIdentity)
       }
     })
 
-  _inFlightResumeByStoredSessionId.set(storedSessionId, flight)
+  _inFlightResumeByIdentity.set(resumeIdentity, flight)
 
   return flight
 }
@@ -77,6 +80,6 @@ export function takeRecoveredRuntime(storedSessionId: string, deadRuntimeId?: nu
 
 /** Test seam: reset all module-level single-flight/recovery state. */
 export function clearSingleFlightSessionResumeState(): void {
-  _inFlightResumeByStoredSessionId.clear()
+  _inFlightResumeByIdentity.clear()
   _recoveredRuntimeByStoredSessionId.clear()
 }

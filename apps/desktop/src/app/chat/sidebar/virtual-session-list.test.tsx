@@ -3,6 +3,7 @@ import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SidebarListRow } from '@/lib/session-date-groups'
+import type { SessionInfo } from '@/types/hermes'
 
 import { VirtualSessionList } from './virtual-session-list'
 
@@ -16,9 +17,28 @@ const virtualizer = {
   measureElement: vi.fn()
 }
 
-vi.mock('@dnd-kit/sortable', () => ({ useSortable: vi.fn() }))
+const virtualizerOptions = vi.hoisted(() => ({ current: null as null | { getItemKey: (index: number) => unknown } }))
+
+const useSortable = vi.hoisted(() =>
+  vi.fn((_options: { id: string }) => ({
+    attributes: {},
+    isDragging: false,
+    listeners: {},
+    setNodeRef: vi.fn(),
+    transform: null,
+    transition: ''
+  }))
+)
+
+vi.mock('@dnd-kit/sortable', () => ({ useSortable }))
 vi.mock('@dnd-kit/utilities', () => ({ CSS: { Transform: { toString: vi.fn() } } }))
-vi.mock('@tanstack/react-virtual', () => ({ useVirtualizer: () => virtualizer }))
+vi.mock('@tanstack/react-virtual', () => ({
+  useVirtualizer: (options: { getItemKey: (index: number) => unknown }) => {
+    virtualizerOptions.current = options
+
+    return virtualizer
+  }
+}))
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -55,6 +75,37 @@ const rows: SidebarListRow[] = [
 const noop = () => {}
 
 describe('VirtualSessionList', () => {
+  it('uses distinct owner-qualified virtual and sortable ids for duplicate rows', () => {
+    const sessionRow = (connection_id: string): SidebarListRow => ({
+      entry: { session: { connection_id, id: 'shared', profile: 'worker' } as SessionInfo },
+      kind: 'session'
+    })
+
+    const duplicateRows = [sessionRow('source-a'), sessionRow('source-b')]
+
+    useSortable.mockClear()
+    render(
+      <VirtualSessionList
+        activeSessionId={null}
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        pinned={false}
+        rows={duplicateRows}
+        sortable
+      />
+    )
+
+    const virtualIds = duplicateRows.map((_, index) => virtualizerOptions.current?.getItemKey(index))
+    const sortableIds = useSortable.mock.calls.map(call => call[0].id)
+
+    expect(new Set(virtualIds).size).toBe(2)
+    expect(new Set(sortableIds).size).toBe(2)
+    expect(sortableIds).toEqual(virtualIds)
+  })
+
   it('positions measured rows independently within a total-size spacer', () => {
     const { getByTestId } = render(
       <VirtualSessionList

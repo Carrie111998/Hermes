@@ -3,6 +3,7 @@ import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import type { VirtualSessionListProps } from './virtual-session-list'
@@ -37,8 +38,10 @@ vi.mock('./virtual-session-list', () => ({
 }))
 
 vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({ session }: { session: SessionInfo }) => (
-    <div data-testid={`session-row-${session.id}`}>{session.id}</div>
+  SidebarSessionRow: ({ isSelected, session }: { isSelected: boolean; session: SessionInfo }) => (
+    <div data-selected={isSelected ? 'true' : 'false'} data-testid={`session-row-${session.connection_id}-${session.id}`}>
+      {session.id}
+    </div>
   )
 }))
 
@@ -60,6 +63,36 @@ function generateSessions(count: number): SessionInfo[] {
 const noop = () => {}
 
 describe('SidebarSessionsSection memoization & virtualizer stability', () => {
+  it('selects only the owner-qualified row when same-profile ids collide', () => {
+    const ownerA = makeSession('shared')
+    ownerA.connection_id = 'source-a'
+    ownerA.profile = 'worker'
+    const ownerB = makeSession('shared')
+    ownerB.connection_id = 'source-b'
+    ownerB.profile = 'worker'
+
+    const { getByTestId } = render(
+      <SidebarSessionsSection
+        activeSessionId="shared"
+        activeSessionIdentity={sessionRowIdentity(ownerB)}
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open
+        pinned={false}
+        sessions={[ownerA, ownerB]}
+      />
+    )
+
+    expect(getByTestId('session-row-source-a-shared').getAttribute('data-selected')).toBe('false')
+    expect(getByTestId('session-row-source-b-shared').getAttribute('data-selected')).toBe('true')
+  })
+
   it('memoizes flatRows and passes the exact same rows array reference across parent re-renders', () => {
     mockVirtualListPropsHistory.length = 0
 

@@ -8,10 +8,13 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import { $sessions } from '@/store/session'
 import type * as SessionStore from '@/store/session'
-import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
+import { $sessionTiles, clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 import type * as WindowsStore from '@/store/windows'
+
+import { startSessionDrag } from '../session-drag'
 
 import { SidebarSessionRow } from './session-row'
 
@@ -233,6 +236,56 @@ describe('SidebarSessionRow running arc', () => {
 describe('SidebarSessionRow', () => {
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('drags the exact row owner into the Sessions workspace', () => {
+    const session = makeSession({
+      connection_id: 'source-b',
+      id: 'duplicate-id',
+      profile: 'worker',
+      title: 'Owner B session'
+    })
+
+    renderRow(session)
+    fireEvent.pointerDown(screen.getByText('Owner B session'))
+
+    expect(startSessionDrag).toHaveBeenCalledWith(
+      {
+        id: 'duplicate-id',
+        profile: 'worker',
+        title: 'Owner B session',
+        workspaceScope: {
+          ownerRoute: {
+            connectionId: 'source-b',
+            profile: 'worker',
+            targetProfile: 'worker'
+          },
+          workspaceMode: 'sessions'
+        }
+      },
+      expect.anything()
+    )
+  })
+
+  it('marks only the exact open owner when same-profile ids collide', () => {
+    const sessionA = makeSession({ connection_id: 'source-a', id: 'duplicate-id', profile: 'worker', title: 'Owner A' })
+    const sessionB = makeSession({ connection_id: 'source-b', id: 'duplicate-id', profile: 'worker', title: 'Owner B' })
+
+    $sessions.set([sessionA, sessionB])
+    $sessionTiles.set([
+      {
+        ownerRoute: { connectionId: 'source-b', profile: 'worker' },
+        storedSessionId: 'duplicate-id'
+      }
+    ])
+    const ownerA = renderRow(sessionA)
+    const ownerB = renderRow(sessionB)
+
+    expect(ownerA.container.querySelector('.bg-\\(--ui-row-open-background\\)')).toBeNull()
+    expect(ownerB.container.querySelector('.bg-\\(--ui-row-open-background\\)')).not.toBeNull()
+
+    $sessionTiles.set([])
+    $sessions.set([])
   })
 
   it('keeps an aria-label on the kebab without wrapping it in a Tip', () => {

@@ -27,6 +27,7 @@ import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/he
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
@@ -127,7 +128,12 @@ import {
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
-import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
+import {
+  $focusedSessionRowIdentity,
+  $focusedStoredSessionId,
+  $workingSessionIds,
+  type SplitDir
+} from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
@@ -378,6 +384,7 @@ export function ChatSidebar({
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
   const selectedSessionId = useStore($focusedStoredSessionId)
+  const selectedSessionIdentity = useStore($focusedSessionRowIdentity)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
@@ -471,6 +478,7 @@ export function ChatSidebar({
   }, [])
 
   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
+  const activeSidebarSessionIdentity = currentView === 'chat' ? selectedSessionIdentity : null
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -558,6 +566,17 @@ export function ChatSidebar({
   // AND messaging, since all three can be pinned (see session-index.ts).
   const sessionByAnyId = useMemo(
     () => buildSessionByAnyId(visibleSessions, visibleCronSessions, visibleMessagingSessions),
+    [visibleSessions, visibleCronSessions, visibleMessagingSessions]
+  )
+
+  const sessionByRowIdentity = useMemo(
+    () =>
+      new Map(
+        [...visibleSessions, ...visibleCronSessions, ...visibleMessagingSessions].map(session => [
+          sessionRowIdentity(session),
+          session
+        ])
+      ),
     [visibleSessions, visibleCronSessions, visibleMessagingSessions]
   )
 
@@ -683,7 +702,7 @@ export function ChatSidebar({
 
   useEffect(() => {
     const next = resolveManualSessionOrderIds(
-      unpinnedAgentSessions.map(s => s.id),
+      unpinnedAgentSessions.map(sessionRowIdentity),
       agentOrderIds,
       agentOrderManual
     )
@@ -1443,12 +1462,12 @@ export function ChatSidebar({
   // it over the default sort, so stale/new ids reconcile on the next render.
   const reorderProjects = (ids: string[]) => setSidebarProjectOrderIds(ids)
 
-  // Sortable rows carry live session ids; the pinned store is keyed by durable
-  // (lineage-root) ids, so translate before persisting the new order.
+  // Sortable rows carry owner-qualified identities; the pinned store is keyed
+  // by durable lineage-root ids, so translate before persisting the new order.
   const reorderPinned = (ids: string[]) =>
     setPinnedSessionOrder(
       ids.map(id => {
-        const session = sessionByAnyId.get(id)
+        const session = sessionByRowIdentity.get(id)
 
         return session ? sessionPinId(session) : id
       })
@@ -1602,6 +1621,7 @@ export function ChatSidebar({
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
+                activeSessionIdentity={activeSidebarSessionIdentity}
                 contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
                 emptyState={
                   searchPending ? (
@@ -1631,6 +1651,7 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
+                activeSessionIdentity={activeSidebarSessionIdentity}
                 contentClassName="flex flex-col gap-px rounded-lg pb-2 pt-1"
                 dndSensors={dndSensors}
                 emptyState={<SidebarPinnedEmptyState />}
@@ -1656,6 +1677,7 @@ export function ChatSidebar({
               <SidebarSessionsSection
                 activeProjectId={activeProjectId}
                 activeSessionId={activeSidebarSessionId}
+                activeSessionIdentity={activeSidebarSessionIdentity}
                 // Inbox style is a render variant, not a grouping — it rides
                 // whichever view is active: flat recents, project lanes, and
                 // the overview previews all render the same card.
@@ -1852,6 +1874,7 @@ export function ChatSidebar({
                 return (
                   <SidebarSessionsSection
                     activeSessionId={activeSidebarSessionId}
+                    activeSessionIdentity={activeSidebarSessionIdentity}
                     contentClassName={cn('flex max-h-56 flex-col gap-px pb-1.75', GROUP_BODY)}
                     emptyState={null}
                     footer={

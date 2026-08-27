@@ -21,6 +21,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { middleClickHandlers } from '@/lib/middle-click'
 import { displayModelName } from '@/lib/model-status-label'
 import { sessionProjectLabel } from '@/lib/session-project-label'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
@@ -31,7 +32,7 @@ import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
 import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
 import { $sessionListDensity } from '@/store/session-list-density'
-import { $openStoredSessionIds } from '@/store/session-states'
+import { $openSessionRowIdentities } from '@/store/session-states'
 import { sessionCostUsd } from '@/store/sidebar-archive'
 import { $todoProgressBySession } from '@/store/todos'
 
@@ -191,7 +192,13 @@ function SidebarSessionRowImpl({
   // Open in a pane, but not the focused one. A selector rather than a prop:
   // it reaches all four row render paths at once, the set only changes when a
   // tile opens or closes, and the boolean bails every unaffected row out.
-  const openUnfocused = useStoreSelector($openStoredSessionIds, open => !isSelected && open.has(session.id))
+  const rowIdentity = sessionRowIdentity(session)
+
+  const openUnfocused = useStoreSelector(
+    $openSessionRowIdentities,
+    open => !isSelected && open.has(rowIdentity)
+  )
+
   const totalTokens = session.input_tokens + session.output_tokens
   const cost = sessionCostUsd(session)
 
@@ -402,7 +409,15 @@ function SidebarSessionRowImpl({
           // no macOS snap-back, Esc aborts instantly). Sub-threshold releases
           // stay ordinary clicks, so resume / pin / open-in-window are
           // untouched.
-          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
+          startSessionDrag(
+            {
+              id: session.id,
+              profile: session.profile || 'default',
+              title,
+              workspaceScope: { ownerRoute, workspaceMode: 'sessions' }
+            },
+            event
+          )
           dragHandleProps?.onPointerDown?.(event)
         }}
         // Hovering a row from another profile (the all-profiles view) telegraphs

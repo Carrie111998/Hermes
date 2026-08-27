@@ -8,6 +8,7 @@ import {
 } from '@/hermes'
 import { translateNow } from '@/i18n/runtime'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { ownerQualifiedSessionIdentity } from '@/lib/session-row-identity'
 import { notify } from '@/store/notifications'
 import {
   isReadOnlyRuntimeId,
@@ -17,7 +18,12 @@ import {
 import { knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
-import { publishSessionState, sessionTileOwnerRoute, setSessionTileDelegate } from '@/store/session-states'
+import {
+  publishSessionState,
+  sessionTileOwnerGeneration,
+  sessionTileOwnerRoute,
+  setSessionTileDelegate
+} from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -77,6 +83,8 @@ export function useSessionTileDelegate({
   updateSessionState
 }: SessionTileDelegateParams): void {
   useEffect(() => {
+    const ownerIdentityByRuntimeId = new Map<string, string>()
+
     // A tile's runtime binding can die the same way the foreground's does
     // (sleep/wake, backend restart). The cache maps stored -> runtime, so walk
     // it backwards to find the durable id this runtime belongs to.
@@ -203,9 +211,19 @@ export function useSessionTileDelegate({
         )
       },
       resumeTile: async (storedSessionId, options) => {
+        const ownerGeneration = options?.ownerGeneration
+        const capturedOwnerRoute = options?.ownerRoute
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
         const refreshTranscript = options?.refreshTranscript === true
+
+        const capturedOwnerIdentity = capturedOwnerRoute
+          ? ownerQualifiedSessionIdentity(
+              capturedOwnerRoute.connectionId,
+              capturedOwnerRoute.profile,
+              storedSessionId
+            )
+          : null
 
         // Warm path: reuse a live binding — but only when it still carries a
         // transcript (or is mid-turn, where messages legitimately stream in).
@@ -222,7 +240,8 @@ export function useSessionTileDelegate({
           existing &&
           cached?.storedSessionId === storedSessionId &&
           (cached.busy || cached.messages.length > 0) &&
-          !refreshTranscript
+          !refreshTranscript &&
+          (!capturedOwnerIdentity || ownerIdentityByRuntimeId.get(existing) === capturedOwnerIdentity)
         ) {
           publishSessionState(existing, cached)
 
@@ -234,7 +253,12 @@ export function useSessionTileDelegate({
         // reading messages) without a profile lets the gateway fall back to the
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
-        const owner = await ownerForStoredSession(storedSessionId)
+        const owner = capturedOwnerRoute ?? (await ownerForStoredSession(storedSessionId))
+
+        const ownerIdentity =
+          owner && typeof owner === 'object'
+            ? ownerQualifiedSessionIdentity(owner.connectionId, owner.profile, storedSessionId)
+            : ownerQualifiedSessionIdentity('local', owner, storedSessionId)
 
         const restScope =
           owner && typeof owner === 'object'
@@ -266,7 +290,7 @@ export function useSessionTileDelegate({
           () => {
             assertSessionOwnerResolved(owner, { method: 'session.resume', sessionId: storedSessionId })
 
-            return singleFlightSessionResume(storedSessionId, () =>
+            return singleFlightSessionResume(ownerIdentity, () =>
               requestForSessionProfile<SessionResumeResponse>(owner, requestGateway, 'session.resume', {
                 session_id: storedSessionId,
                 cols: 96,
@@ -318,6 +342,17 @@ export function useSessionTileDelegate({
         if (!runtimeId) {
           throw new Error('resume returned no session id')
         }
+
+        // The session.resume RPC may finish after the same durable tile was
+        // re-homed. Do not publish owner A into owner B's cache/binding.
+        if (
+          ownerGeneration !== undefined &&
+          sessionTileOwnerGeneration(storedSessionId) !== ownerGeneration
+        ) {
+          return runtimeId
+        }
+
+        ownerIdentityByRuntimeId.set(runtimeId, ownerIdentity)
 
         const info = resumed?.info
 

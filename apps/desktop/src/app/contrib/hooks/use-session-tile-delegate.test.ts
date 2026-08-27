@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { setSessionOwnerHint, setSessions } from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
+import {
+  $sessionTiles,
+  sessionTileDelegate,
+  sessionTileOwnerGeneration,
+  setSessionTileWorkspaceScope
+} from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import { useSessionTileDelegate } from './use-session-tile-delegate'
@@ -64,11 +69,15 @@ function renderTile(
 describe('useSessionTileDelegate resumeTile', () => {
   beforeEach(() => {
     setSessions([])
+    $sessionTiles.set([])
     vi.mocked(getLatestSessionMessages).mockClear()
+    vi.mocked(requestGatewayForAgent).mockReset()
+    vi.mocked(requestGatewayForProfile).mockReset()
   })
 
   afterEach(() => {
     setSessions([])
+    $sessionTiles.set([])
   })
 
   it('carries the owning profile into a cold tile resume so it cannot fork profiles', async () => {
@@ -178,6 +187,68 @@ describe('useSessionTileDelegate resumeTile', () => {
       profile: 'backend-oxcoder'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('does not publish owner A after the tile is re-homed to owner B', async () => {
+    const storedSessionId = 'stored-rehome'
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    let finishOwnerA!: (value: { session_id: string }) => void
+
+    $sessionTiles.set([{ ownerRoute: ownerA, storedSessionId }])
+    const generationA = sessionTileOwnerGeneration(storedSessionId)
+    const updateSessionState = vi.fn()
+
+    vi.mocked(requestGatewayForAgent).mockReturnValueOnce(
+      new Promise(resolve => {
+        finishOwnerA = resolve
+      })
+    )
+    renderTile(vi.fn(), { updateSessionState })
+    const resumed = sessionTileDelegate()!.resumeTile(storedSessionId, {
+      ownerGeneration: generationA,
+      ownerRoute: ownerA
+    })
+
+    setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' })
+    finishOwnerA({ session_id: 'runtime-owner-a' })
+
+    await expect(resumed).resolves.toBe('runtime-owner-a')
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect($sessionTiles.get()[0]).toMatchObject({ ownerRoute: ownerB })
+  })
+
+  it('starts a distinct owner B resume while owner A has the same stored id in flight', async () => {
+    const storedSessionId = 'stored-owner-twin'
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const updateSessionState = vi.fn()
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(
+      async connectionId =>
+        ({
+          session_id: connectionId === 'source-a' ? 'runtime-owner-a' : 'runtime-owner-b'
+        }) as never
+    )
+    $sessionTiles.set([{ ownerRoute: ownerA, storedSessionId }])
+    renderTile(vi.fn(), { updateSessionState })
+
+    const resumedA = sessionTileDelegate()!.resumeTile(
+      storedSessionId,
+      { ownerGeneration: sessionTileOwnerGeneration(storedSessionId), ownerRoute: ownerA }
+    )
+
+    setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' })
+
+    const resumedB = sessionTileDelegate()!.resumeTile(
+      storedSessionId,
+      { ownerGeneration: sessionTileOwnerGeneration(storedSessionId), ownerRoute: ownerB }
+    )
+
+    await expect(Promise.all([resumedA, resumedB])).resolves.toEqual(['runtime-owner-a', 'runtime-owner-b'])
+    expect(requestGatewayForAgent).toHaveBeenCalledTimes(2)
+    expect(updateSessionState).toHaveBeenCalledTimes(1)
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-owner-b', expect.any(Function), storedSessionId)
   })
 
   it('reuses a warm binding that still carries a transcript', async () => {

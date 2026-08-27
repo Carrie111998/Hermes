@@ -1,4 +1,5 @@
 import type { SidebarListRow } from '@/lib/session-date-groups'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 
 /**
  * Fold ids absent from the persisted order back in, on the side they belong.
@@ -171,7 +172,7 @@ export function orderRowsWithinGroups(rows: SidebarListRow[], orderIds: string[]
   // (and every divider) exactly where it is.
   const flushGroup = () => {
     const ranked = cluster
-      .map((rows_, index) => ({ index, rank: rank.get(clusterId(rows_)) }))
+      .map((rows_, index) => ({ index, rank: clusterRank(rows_, rank) }))
       .filter((entry): entry is { index: number; rank: number } => entry.rank !== undefined)
 
     const slots = ranked.map(entry => entry.index)
@@ -215,14 +216,28 @@ export function orderRowsWithinGroups(rows: SidebarListRow[], orderIds: string[]
   return reordered ? out : rows
 }
 
-/** A cluster's identity: its root row's session id. */
+/** A cluster's identity: its owner-qualified, lineage-stable root row. */
 function clusterId(rows: SidebarListRow[]): string {
   const root = rows[0]
 
-  return root.kind === 'session' ? root.entry.session.id : ''
+  return root.kind === 'session' ? sessionRowIdentity(root.entry.session) : ''
+}
+
+function clusterRank(rows: SidebarListRow[], rank: ReadonlyMap<string, number>): number | undefined {
+  const root = rows[0]
+
+  if (root.kind !== 'session') {
+    return undefined
+  }
+
+  // Bare ids are a persisted pre-owner-identity format. They remain readable
+  // until the next reorder writes qualified ids.
+  return rank.get(clusterId(rows)) ?? rank.get(root.entry.session.id)
 }
 
 /** The reorderable ids of a rendered row list: root sessions, in render order. */
 export function reorderableRowIds(rows: SidebarListRow[]): string[] {
-  return rows.flatMap(row => (row.kind === 'session' && !row.entry.branchStem ? [row.entry.session.id] : []))
+  return rows.flatMap(row =>
+    row.kind === 'session' && !row.entry.branchStem ? [sessionRowIdentity(row.entry.session)] : []
+  )
 }

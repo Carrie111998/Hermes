@@ -400,6 +400,16 @@ describe('mergeSessionPage', () => {
     expect(quiet?.last_active).toBe(10)
   })
 
+  it('never carries title metadata across same-profile ids owned by different connections', () => {
+    const previous = [
+      session({ connection_id: 'source-a', id: 'shared', profile: 'worker', title: 'Owner A title' })
+    ]
+
+    const incoming = [session({ connection_id: 'source-b', id: 'shared', profile: 'worker', title: null })]
+
+    expect(mergeSessionPage(previous, incoming, [])[0]?.title).toBeNull()
+  })
+
   it('a kept twin in another profile survives the incoming page dedupe (#92454)', () => {
     // The incoming page carries only ONE profile's copy; the other profile's
     // twin was in the previous list and pinned via keep. Bare-id dedupe
