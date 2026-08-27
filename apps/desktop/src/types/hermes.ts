@@ -433,6 +433,11 @@ export interface ModelCapabilities {
   can_disable_reasoning?: boolean
   fast: boolean
   reasoning: boolean
+  /** User-declared reasoning-effort levels this model accepts (from config
+   *  ``providers.<name>.models.<id>.supported_efforts``). When present, the
+   *  effort radio should be restricted to these; absent means no restriction
+   *  known — show the full ladder. */
+  supported_efforts?: string[]
 }
 
 export interface ModelOptionsResponse {

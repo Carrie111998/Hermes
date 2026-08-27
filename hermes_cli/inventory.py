@@ -269,7 +269,7 @@ def build_models_payload(
     if pricing:
         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier)
     if capabilities:
-        _apply_capabilities(rows)
+        _apply_capabilities(rows, ctx)
     if featured:
         _apply_featured(rows)
     _apply_custom_aliases(rows)
@@ -428,7 +428,7 @@ def _reasoning_catalog_reader(slug: str):
     return None
 
 
-def _apply_capabilities(rows: list[dict]) -> None:
+def _apply_capabilities(rows: list[dict], ctx: ConfigContext | None = None) -> None:
     """Attach a ``{model: {fast, reasoning, ...}}`` map to each provider row.
 
     `fast` mirrors ``model_supports_fast_mode`` (the same gate the runtime
@@ -437,19 +437,16 @@ def _apply_capabilities(rows: list[dict]) -> None:
     no-op on models that ignore it, whereas hiding it from a capable-but-
     uncatalogued model is the worse failure.
 
-    Aggregators that publish per-model reasoning detail add
-    `can_disable_reasoning`, False on reasoning-mandatory routes whose upstream
-    answers a disable with HTTP 400. Omitted when the catalog doesn't say,
-    which the UI reads as "no restriction known". Such a catalog also overrides
-    `reasoning` itself when it reports a route that takes no reasoning
-    parameter — a definitive negative from the provider actually serving the
-    model outranks the models.dev inference.
-
-    The catalog's `supported_efforts` list is deliberately NOT forwarded: it
-    under-reports. The Portal accepts and honors levels a route doesn't
-    advertise (``z-ai/glm-5.3`` publishes ``max, high, low`` yet serves
-    ``minimal`` at its lowest thinking), so filtering the picker by that list
-    would hide levels that demonstrably work.
+    User-defined providers may declare a per-model ``supported_efforts`` list
+    in config (``providers.<name>.models.<id>.supported_efforts``); when
+    present it is forwarded so pickers can show only the levels that route
+    actually accepts. The models.dev catalog's own ``supported_efforts`` is
+    deliberately NOT forwarded: it under-reports. The Portal accepts and
+    honors levels a route doesn't advertise (``z-ai/glm-5.3`` publishes
+    ``max, high, low`` yet serves ``minimal`` at its lowest thinking), so
+    filtering the picker by that list would hide levels that demonstrably
+    work. A user's explicit declaration overrides that caution — they are
+    asserting what their endpoint accepts.
     """
     from hermes_cli.models import model_supports_fast_mode
 
@@ -458,10 +455,27 @@ def _apply_capabilities(rows: list[dict]) -> None:
     except Exception:
         get_model_capabilities = None  # type: ignore[assignment]
 
+    # Per-provider per-model metadata declared in config (user-defined
+    # providers only): ``providers.<name>.models.<id>.supported_efforts``.
+    # `getattr` (not direct attribute access) so a ctx-like object that
+    # lacks user_providers fails locally for this feature instead of
+    # blowing up the whole models payload.
+    user_model_meta: dict[str, dict] = {}
+    if ctx is not None:
+        for pname, pcfg in (getattr(ctx, "user_providers", None) or {}).items():
+            if not isinstance(pcfg, dict):
+                continue
+            mcfg = pcfg.get("models")
+            if isinstance(mcfg, dict):
+                user_model_meta[str(pname).strip().lower()] = mcfg
+
     for row in rows:
         slug = row.get("slug") or ""
         caps: dict[str, dict[str, Any]] = {}
         read_reasoning_catalog = _reasoning_catalog_reader(slug.lower())
+
+        # Config-declared per-model metadata for this provider row.
+        row_meta = user_model_meta.get(str(slug).strip().lower(), {})
 
         for model in row.get("models") or []:
             reasoning = True
@@ -477,6 +491,18 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+
+            # User-declared effort levels for this model, if any. Forwarded so
+            # pickers can restrict the effort radio to what the route accepts.
+            # Dedupe (dict.fromkeys preserves order) and lower-case so the wire
+            # stays clean and case-insensitive.
+            model_cfg = row_meta.get(model)
+            if isinstance(model_cfg, dict):
+                declared = model_cfg.get("supported_efforts")
+                if isinstance(declared, (list, tuple)) and declared:
+                    entry["supported_efforts"] = list(
+                        dict.fromkeys(str(v).strip().lower() for v in declared)
+                    )
 
             if reasoning and read_reasoning_catalog is not None:
                 try:

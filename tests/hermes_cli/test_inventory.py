@@ -657,5 +657,101 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
         inventory._apply_featured(rows)
 
 
+# ─── _apply_capabilities user-declared supported_efforts ───────────────
 
 
+def _caps_row(slug="volc", models=None):
+    return {
+        "slug": slug,
+        "name": slug,
+        "models": models or ["glm-5-2", "other", "unknown"],
+        "total_models": 3,
+        "is_user_defined": True,
+    }
+
+
+def _caps_ctx(user_providers=None):
+    return ConfigContext(
+        current_provider="volc",
+        current_model="glm-5-2",
+        current_base_url="",
+        user_providers=user_providers or {},
+        custom_providers=[],
+    )
+
+
+def test_apply_capabilities_forwards_user_declared_supported_efforts():
+    """Config-declared supported_efforts are forwarded, lower-cased and
+    deduped; models without a declaration get no supported_efforts key."""
+    from hermes_cli.inventory import _apply_capabilities
+
+    ctx = _caps_ctx({
+        "volc": {
+            "name": "Volc",
+            "models": {
+                "glm-5-2": {"supported_efforts": ["High", "max", "HIGH"]},
+                "other": {},
+            },
+        }
+    })
+    rows = [_caps_row()]
+    _apply_capabilities(rows, ctx)
+
+    caps = rows[0]["capabilities"]
+    assert caps["glm-5-2"]["supported_efforts"] == ["high", "max"]
+    assert "supported_efforts" not in caps["other"]
+    assert "supported_efforts" not in caps["unknown"]
+
+
+def test_apply_capabilities_empty_or_absent_declaration_not_forwarded():
+    """Empty list / missing key must not emit supported_efforts."""
+    from hermes_cli.inventory import _apply_capabilities
+
+    ctx = _caps_ctx({
+        "volc": {
+            "models": {
+                "glm-5-2": {"supported_efforts": []},
+                "other": {},
+            },
+        }
+    })
+    rows = [_caps_row()]
+    _apply_capabilities(rows, ctx)
+
+    caps = rows[0]["capabilities"]
+    assert "supported_efforts" not in caps["glm-5-2"]
+    assert "supported_efforts" not in caps["other"]
+
+
+def test_apply_capabilities_catalog_supported_efforts_not_forwarded():
+    """The models.dev catalog's own supported_efforts must NOT leak through
+    — only an explicit user declaration forwards a restriction."""
+    from hermes_cli.inventory import _apply_capabilities
+
+    ctx = _caps_ctx({})  # no user declarations at all
+    rows = [_caps_row()]
+    _apply_capabilities(rows, ctx)
+
+    caps = rows[0]["capabilities"]
+    for model in rows[0]["models"]:
+        assert "supported_efforts" not in caps[model]
+    # reasoning still reported for every model.
+    assert all(caps[m]["reasoning"] for m in rows[0]["models"])
+
+
+def test_apply_capabilities_survives_ctx_without_user_providers():
+    """A ctx-like object missing user_providers must not blow up the whole
+    payload — the feature degrades to 'no declarations' (review #4)."""
+    from hermes_cli.inventory import _apply_capabilities
+
+    class _BareCtx:
+        current_provider = "volc"
+        current_model = "glm-5-2"
+        current_base_url = ""
+
+    rows = [_caps_row()]
+    _apply_capabilities(rows, _BareCtx())
+
+    caps = rows[0]["capabilities"]
+    for model in rows[0]["models"]:
+        assert "supported_efforts" not in caps[model]
