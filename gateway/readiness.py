@@ -14,6 +14,8 @@ from hermes_constants import get_hermes_home
 
 
 _DISK_DEGRADED_PERCENT = 90.0
+_MAX_PID = (1 << 31) - 1
+_MAX_START_TIME = (1 << 63) - 1
 
 
 def _check(status: str, detail: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -22,6 +24,18 @@ def _check(status: str, detail: str | None = None, **extra: Any) -> dict[str, An
         result["detail"] = detail
     result.update(extra)
     return result
+
+
+def _valid_writer_identity(pid: Any, start_time: Any) -> bool:
+    """Return True only for a complete, non-boolean process fingerprint."""
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and 0 < pid <= _MAX_PID
+        and isinstance(start_time, int)
+        and not isinstance(start_time, bool)
+        and 0 < start_time <= _MAX_START_TIME
+    )
 
 
 def _probe_state_db(home: Path) -> dict[str, Any]:
@@ -73,17 +87,64 @@ def _probe_gateway(runtime_status: dict[str, Any]) -> dict[str, Any]:
     platforms = runtime_status.get("platforms")
     connected = 0
     configured = 0
+    unhealthy = 0
     if isinstance(platforms, dict):
-        configured = len(platforms)
-        connected = sum(
-            1
-            for value in platforms.values()
-            if isinstance(value, dict)
-            and str(value.get("state") or value.get("status") or "").lower()
-            in {"connected", "running", "ok"}
+        process_pid = runtime_status.get("pid")
+        process_start = runtime_status.get("start_time")
+        runtime_has_any_identity = process_pid is not None or process_start is not None
+        runtime_has_writer_identity = _valid_writer_identity(
+            process_pid, process_start
         )
-    status = "ok" if state in {"running", "draining"} else "degraded"
-    return _check(status, state=state, connected_platforms=connected, platforms=configured)
+        for value in platforms.values():
+            if not isinstance(value, dict):
+                continue
+            # Runtime files can outlive a process. A provenance stamp is usable
+            # only as the complete, exact writer identity pair. Unstamped
+            # legacy entries retain their historical behavior only when the
+            # enclosing runtime record also lacks a complete identity.
+            writer_pid = value.get("writer_pid")
+            writer_start = value.get("writer_start_time")
+            has_any_writer_provenance = (
+                writer_pid is not None or writer_start is not None
+            )
+            has_complete_writer_provenance = _valid_writer_identity(
+                writer_pid, writer_start
+            )
+            if runtime_has_writer_identity and not (
+                has_complete_writer_provenance
+                and writer_pid is not None
+                and writer_start is not None
+                and writer_pid == process_pid
+                and writer_start == process_start
+            ):
+                continue
+            # Legacy compatibility is available only when BOTH the enclosing
+            # runtime and the platform entry are entirely unstamped. A partial
+            # or malformed enclosing fingerprint cannot prove current ownership.
+            if not runtime_has_writer_identity and (
+                runtime_has_any_identity or has_any_writer_provenance
+            ):
+                continue
+            configured += 1
+            platform_state = str(
+                value.get("state") or value.get("status") or ""
+            ).lower()
+            if platform_state in {"connected", "running", "ok"}:
+                connected += 1
+            elif platform_state in {"retrying", "fatal", "paused"}:
+                unhealthy += 1
+    status = (
+        "ok"
+        if state in {"running", "draining"} and unhealthy == 0
+        else "degraded"
+    )
+    return _check(
+        status,
+        state=state,
+        connected_platforms=connected,
+        unhealthy_platforms=unhealthy,
+        platforms=configured,
+    )
 
 
 def _probe_session_store(

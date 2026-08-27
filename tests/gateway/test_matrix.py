@@ -320,6 +320,15 @@ def _make_adapter():
     return adapter
 
 
+async def _keep_sync_loop_running(consumer_started=None, consumer_published=None):
+    """Test double for the long-lived Matrix consumer task."""
+    if consumer_started is not None:
+        consumer_started.set_result(True)
+    if consumer_published is not None:
+        await consumer_published.wait()
+    await asyncio.Event().wait()
+
+
 # ---------------------------------------------------------------------------
 # Typing indicator
 # ---------------------------------------------------------------------------
@@ -974,13 +983,148 @@ class TestMatrixAccessTokenAuth:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         assert await adapter.connect() is True
 
         mock_client.whoami.assert_awaited_once()
         assert adapter._user_id == "@bot:example.org"
 
         await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_initial_sync_exception_fails_connect_without_false_connected_state(self):
+        """A failed initial sync must not start a nominally connected consumer."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+            },
+        )
+        adapter = MatrixAdapter(config)
+        # A reconnect failure must clear state published by the prior connection.
+        adapter._mark_connected()
+        fake_mautrix_mods = _make_fake_mautrix()
+
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.crypto = None
+        mock_client.whoami = AsyncMock(
+            return_value=MagicMock(user_id="@bot:example.org", device_id="DEV123")
+        )
+        mock_client.sync = AsyncMock(side_effect=RuntimeError("initial sync failed"))
+        mock_client.add_event_handler = MagicMock()
+        mock_client.api = MagicMock()
+        mock_client.api.token = "syt_test_access_token"
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(
+            return_value=mock_client
+        )
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            result = await adapter.connect()
+
+        assert result is False
+        assert adapter.is_connected is False
+        assert adapter._sync_task is None
+
+    @pytest.mark.asyncio
+    async def test_initial_sync_error_object_fails_connect(self):
+        """A non-dict initial sync result must not publish connected state."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_access_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                },
+            )
+        )
+        fake_mautrix_mods = _make_fake_mautrix()
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.crypto = None
+        mock_client.whoami = AsyncMock(
+            return_value=MagicMock(user_id="@bot:example.org", device_id="DEV123")
+        )
+        mock_client.sync = AsyncMock(
+            return_value=types.SimpleNamespace(message="M_UNKNOWN_TOKEN")
+        )
+        mock_client.add_event_handler = MagicMock()
+        mock_client.api = MagicMock()
+        mock_client.api.token = "syt_test_access_token"
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(
+            return_value=mock_client
+        )
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            result = await adapter.connect()
+
+        assert result is False
+        assert adapter.is_connected is False
+        assert adapter._sync_task is None
+
+    @pytest.mark.asyncio
+    async def test_sync_consumer_that_exits_during_handoff_fails_connect(self):
+        """connect() must reject a consumer that dies before connected state."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_access_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                },
+            )
+        )
+        fake_mautrix_mods = _make_fake_mautrix()
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.crypto = None
+        mock_client.whoami = AsyncMock(
+            return_value=MagicMock(user_id="@bot:example.org", device_id="DEV123")
+        )
+        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.sync_store = MagicMock()
+        mock_client.sync_store.put_next_batch = AsyncMock()
+        mock_client.add_event_handler = MagicMock()
+        mock_client.handle_sync = MagicMock(return_value=[])
+        mock_client.api = MagicMock()
+        mock_client.api.token = "syt_test_access_token"
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(
+            return_value=mock_client
+        )
+
+        with patch.dict("sys.modules", fake_mautrix_mods), patch.object(
+            adapter, "_refresh_dm_cache", AsyncMock()
+        ), patch.object(
+            adapter,
+            "_sync_loop",
+            AsyncMock(
+                side_effect=lambda started, _published: started.set_result(False)
+            ),
+        ):
+            result = await adapter.connect()
+
+        assert result is False
+        assert adapter.is_connected is False
+        assert adapter._sync_task is None
 
 
 class TestDeviceKeyReVerification:
@@ -1052,7 +1196,7 @@ class TestMatrixE2EEHardFail:
         import plugins.platforms.matrix.adapter as matrix_mod
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=False):
             with patch.dict("sys.modules", fake_mautrix_mods):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                     result = await adapter.connect()
 
         assert result is False
@@ -1100,7 +1244,7 @@ class TestMatrixE2EEHardFail:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=False):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(matrix_mod, "_create_matrix_session", return_value=MagicMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         result = await adapter.connect()
 
         assert result is True
@@ -1191,7 +1335,7 @@ class TestMatrixDeviceId:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         assert await adapter.connect() is True
 
         # The configured device_id is retained on the adapter.
@@ -1241,7 +1385,7 @@ class TestMatrixPasswordLoginDeviceId:
 
         with patch.dict("sys.modules", fake_mautrix_mods):
             with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                     assert await adapter.connect() is True
 
         mock_client.login.assert_awaited_once()
@@ -1413,7 +1557,7 @@ class TestMatrixSyncLoop:
         import plugins.platforms.matrix.adapter as matrix_mod
         with patch.dict("sys.modules", fake_mautrix_mods):
             with patch.object(matrix_mod, "_create_matrix_session", return_value=MagicMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                     assert await adapter.connect() is True
 
         assert len(captured) == 1
@@ -1493,6 +1637,9 @@ class TestMatrixDiagnostics:
         adapter._last_sync_ts = time.time() - 7
         adapter._max_media_bytes = 123
         adapter._client = MagicMock()
+        adapter._sync_task = MagicMock()
+        adapter._sync_task.done.return_value = False
+        adapter._running = True
 
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             diagnostics = adapter.get_diagnostics()
@@ -1503,6 +1650,7 @@ class TestMatrixDiagnostics:
         assert diagnostics["auth"]["device_id_present"] is True
         assert diagnostics["auth"]["device_id_preview"] == "***"
         assert diagnostics["sync"]["connected"] is True
+        assert diagnostics["sync"]["consumer_running"] is True
         assert diagnostics["sync"]["joined_room_count"] == 2
         assert diagnostics["sync"]["last_sync_age_seconds"] >= 0
         assert diagnostics["e2ee"]["recovery_key_configured"] is True
@@ -1572,7 +1720,7 @@ class TestMatrixDiagnostics:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         assert await adapter.connect() is True
 
         mock_olm.generate_recovery_key.assert_not_called()
@@ -1694,7 +1842,7 @@ class TestMatrixEncryptedEventHandler:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         assert await adapter.connect() is True
 
         # Verify inbound event handlers were registered as sync-awaited
@@ -2684,7 +2832,7 @@ class TestDeviceIdNoneResolution:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         result = await adapter.connect()
 
         assert result is True
@@ -2734,17 +2882,15 @@ class TestMatrixReconnectDisconnect:
     """connect() must disconnect existing client before reconnecting."""
 
     @pytest.mark.asyncio
-    async def test_connect_calls_disconnect_when_client_already_set(self):
-        """When self._client is set, connect() should call disconnect() first."""
+    async def test_connect_tears_down_existing_client_before_reconnecting(self):
+        """A reconnect closes the old generation before publishing the new one."""
         adapter = _make_adapter()
 
         adapter._client = MagicMock()
         adapter._client.api = MagicMock()
         adapter._client.api.session = MagicMock()
-        adapter._client.api.session.close = AsyncMock()
+        old_close = adapter._client.api.session.close = AsyncMock()
         adapter._client.whoami = AsyncMock()
-
-        adapter.disconnect = AsyncMock()
 
         fake_mautrix_mods = _make_fake_mautrix()
 
@@ -2769,12 +2915,16 @@ class TestMatrixReconnectDisconnect:
         fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
 
         import plugins.platforms.matrix.adapter as matrix_mod
-        with patch.dict("sys.modules", fake_mautrix_mods):
+        with patch.dict("sys.modules", fake_mautrix_mods), patch.object(
+            matrix_mod, "_create_matrix_session", return_value=MagicMock()
+        ):
             with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                     await adapter.connect()
 
-        adapter.disconnect.assert_awaited_once()
+        old_close.assert_awaited_once()
+        assert adapter._client is mock_client
+        await adapter.disconnect()
 
 
 class TestDeviceIdRecoveryOnReconnect:
@@ -2838,7 +2988,7 @@ class TestDeviceIdRecoveryOnReconnect:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         await adapter.connect()
 
         assert adapter._device_id_unverified is True
@@ -2886,7 +3036,7 @@ class TestDeviceIdRecoveryOnReconnect:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             with patch.dict("sys.modules", fake_mautrix_mods):
                 with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)):
                         result = await adapter.connect()
 
         assert result is True
@@ -3086,7 +3236,7 @@ class TestCryptoStoreResetOnDeviceChange:
         ), patch.dict("sys.modules", fake_mautrix_mods), patch.object(
             adapter, "_refresh_dm_cache", AsyncMock()
         ), patch.object(
-            adapter, "_sync_loop", AsyncMock(return_value=None)
+            adapter, "_sync_loop", AsyncMock(side_effect=_keep_sync_loop_running)
         ), patch.object(
             adapter, "_verify_device_keys_on_server", AsyncMock(return_value=True)
         ):
