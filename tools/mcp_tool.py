@@ -1094,6 +1094,84 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     return sys.executable, watchdog_args
 
 
+# Markers we recognize as "this server is designed to exit after one
+# JSON-RPC exchange, so wrapping it in a long-lived supervisor reduces
+# spawn-count from N-per-conversation to 1". Keep this list narrow — every
+# auto-detected marker should be a server the Hermes team has actually
+# triaged as one-shot, not a guess at MCP wire semantics.
+_ONESHOT_SERVER_MARKERS = ("--liftoff-only",)
+
+
+def _is_one_shot_stdio_server(config: dict) -> bool:
+    """True when this stdio server is designed to exit per request.
+
+    Two paths to a yes:
+
+    1. Explicit ``one_shot_supervisor: true`` on the server config — for
+       operators who run their own one-shot wrapper, custom shells, or
+       a fork of codegraph that uses a different argv marker.
+    2. Auto-detected when ``args`` contain a known one-shot marker.
+       Today the only canonical marker is codegraph's ``--liftoff-only``
+       flag (Direct mode in @colbymchenry/codegraph 1.0.1+, see #96036).
+       Adding more entries to ``_ONESHOT_SERVER_MARKERS`` is the right
+       path for new one-shot servers; do NOT broaden this to "any
+       argv-shaped thing" — false positives would re-wrap long-lived
+       servers and silently break them (#96036 follow-up).
+    """
+    if not isinstance(config, dict):
+        return False
+    # Kill switch: explicit ``one_shot_supervisor: false`` opts out of
+    # auto-detection even when ``--liftoff-only`` is present in args.
+    # Operators with their own custom wrapper or who want the old
+    # per-call spawn behavior get an escape hatch without forking
+    # hermes.
+    explicit_off = config.get("one_shot_supervisor", None)
+    if explicit_off is not None and not _parse_boolish(
+        explicit_off, default=False
+    ):
+        return False
+    if _parse_boolish(config.get("one_shot_supervisor", False), default=False):
+        return True
+    args = config.get("args")
+    if not isinstance(args, (list, tuple)):
+        return False
+    for arg in args:
+        if isinstance(arg, str) and arg in _ONESHOT_SERVER_MARKERS:
+            return True
+    return False
+
+
+def _wrap_command_with_one_shot_supervisor(
+    command: str, args: list, *, label: str = "mcp-one-shot"
+) -> tuple[str, list]:
+    """Wrap a stdio MCP server command in the one-shot supervisor.
+
+    The supervisor is a long-lived stdio relay that spawns the inner
+    command *per* JSON-RPC exchange but presents a single stable
+    process to hermes. Without this wrap, codegraph with
+    ``--liftoff-only`` (the canonical #96036 reproducer) spawns a fresh
+    Node process on every tool call — visible as one extra Hermes
+    session window per call on Windows and a measurable per-call cost
+    even on POSIX.
+
+    The wrap is opt-in: callers must run ``_is_one_shot_stdio_server``
+    first. Returning ``(command, args)`` unchanged here would be a
+    silent no-op for long-lived MCP servers, so we never auto-apply.
+    """
+    supervisor_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "mcp_one_shot_supervisor.py",
+    )
+    supervisor_args = [
+        supervisor_script,
+        "--inner-cmd", command,
+        "--label", label,
+    ]
+    for arg in args:
+        supervisor_args.extend(["--inner-arg", arg])
+    return sys.executable, supervisor_args
+
+
 # ---------------------------------------------------------------------------
 # MCP ImageContent block → Hermes MEDIA tag
 # ---------------------------------------------------------------------------
@@ -3228,6 +3306,21 @@ class MCPServerTask:
         if malware_error:
             raise ValueError(
                 f"MCP server '{self.name}': {malware_error}"
+            )
+
+        # Wrap the real command in the one-shot supervisor when the server
+        # is designed to exit per JSON-RPC exchange (codegraph
+        # --liftoff-only, explicit ``one_shot_supervisor: true``, ...). The
+        # supervisor presents a stable long-lived stdio relay to hermes
+        # while internally spawning the inner server per request; without
+        # this, each hermes tool call would re-spawn a fresh node process
+        # and a fresh Hermes session window (#96036). Applied BEFORE the
+        # watchdog so the watchdog supervises the supervisor (and
+        # therefore its inner server) — not the inner server directly,
+        # which would race with the supervisor's own reaping logic.
+        if _is_one_shot_stdio_server(config):
+            command, args = _wrap_command_with_one_shot_supervisor(
+                command, args, label=f"mcp-{self.name}"
             )
 
         # Wrap the real command in a parent-death watchdog supervisor so an
