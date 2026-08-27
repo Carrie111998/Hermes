@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent import redact as secret_redaction
 from hermes_cli.dispatch_confinement import PreflightRefusal
 
 MODE_OPEN = "open"
@@ -96,29 +97,11 @@ SECRET_FILENAMES = (
 )
 SECRET_DIRNAMES = (".vercel", ".next", ".aws", ".ssh", ".gnupg")
 
-_CREDENTIAL_PATTERNS = (
-    # OpenAI, Anthropic and OpenRouter. The generic sk- form is retained for
-    # older provider keys, but requires a token boundary and substantial body;
-    # raw substring matching made ordinary words such as "task-id" a key.
-    re.compile(rb"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}"),
-    # GitHub classic / OAuth / fine-grained PATs.
-    re.compile(rb"(?<![A-Za-z0-9_-])(?:ghp_|gho_)[A-Za-z0-9]{20,}"),
-    re.compile(rb"(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}"),
-    # AWS access-key id, Slack tokens, Google API keys, and Upstage-style keys.
-    re.compile(rb"(?<![A-Za-z0-9_-])AKIA[0-9A-Z]{16}(?![0-9A-Z])"),
-    re.compile(rb"(?<![A-Za-z0-9_-])(?:xoxb-|xoxp-)[A-Za-z0-9-]{20,}"),
-    re.compile(rb"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{20,}"),
-    re.compile(rb"(?<![A-Za-z0-9_-])up_[A-Za-z0-9_-]{20,}"),
-)
 _CREDENTIAL_FILENAME_RE = re.compile(
     r"(?:^|[._-])(?:api[_-]?key|key|token|secret|credentials?|auth|oauth|"
     r"authorization)(?:[._-]|$)",
     re.IGNORECASE,
 )
-_TEXT_LIKE_SUFFIXES = {
-    ".cfg", ".conf", ".env", ".ini", ".json", ".jsonl", ".md",
-    ".properties", ".sh", ".toml", ".txt", ".yaml", ".yml", ".zsh",
-}
 _RUNTIME_DB_ENDINGS = (
     ".db", ".db-journal", ".db-shm", ".db-wal",
     ".sqlite", ".sqlite-journal", ".sqlite-shm", ".sqlite-wal",
@@ -130,6 +113,25 @@ _SPACE = " "
 GUARD_PROBE_PUSH = "git push origin main"
 GUARD_PROBE_VERCEL = "vercel --prod"
 GUARD_PROBE_CODE = "import subprocess; subprocess.run(['git', 'push'])"
+
+
+def _runtime_database_has_live_connection(path: Path) -> bool:
+    """Whether *path* belongs to a SQLite family open in this process.
+
+    Opening and closing either the main database or a WAL/SHM sidecar while a
+    SQLite connection is live can cancel process-wide POSIX locks. Exact-byte
+    digest inspection must therefore defer for that live family; a dormant
+    ``stolen.db`` remains digest-eligible.
+    """
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    path_text = str(path)
+    lower = path_text.lower()
+    for sidecar in ("-journal", "-shm", "-wal"):
+        if lower.endswith(sidecar):
+            path_text = path_text[:-len(sidecar)]
+            break
+    return has_live_connection(path_text)
 
 
 @dataclass(frozen=True)
@@ -603,11 +605,19 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
                           strict: bool = True) -> List[str]:
     """Report PATHS carrying credential-shaped material. Never values.
 
-    Eligible local files ARE read, in binary, for prefix and digest detection.
-    Matched credential values are never returned, logged, or placed in a refusal
-    message: the caller learns *where* to look, never *what* is there. An
-    eligible file that cannot be read is reported as a finding under ``strict``
-    — inability to inspect is not evidence of cleanliness.
+    Every non-runtime, non-binary local file is eligible regardless of suffix,
+    including logs, rotations, backups, source files, and extensionless config.
+    Provider shapes come from Hermes' canonical, plugin-extensible redaction
+    matcher so this boundary cannot drift onto its own shorter provider list.
+    SQLite runtime files are excluded from text matching, but an explicitly
+    configured forbidden digest is checked before that exclusion whenever the
+    database family is not already open in this process; lock safety takes
+    precedence over byte-inspecting a live SQLite file.
+
+    Matched values are never returned, logged, or placed in a refusal message:
+    the caller learns *where* to look, never *what* is there. A file that should
+    be inspected but cannot be read is a finding under ``strict`` — inability
+    to inspect is not evidence of cleanliness.
     """
     findings: List[str] = []
     root = Path(home)
@@ -617,22 +627,40 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
         for fname in filenames:
             fpath = Path(dirpath) / fname
             lower_name = fname.lower()
+            relative_parts = fpath.relative_to(root).parts
+            # Start-barrier coordination files are deliberately ephemeral and
+            # may be unlinked by a worker during this walk. They carry only a
+            # random handshake token and are not configuration or log content.
+            if relative_parts[:2] == ("run", "barriers"):
+                continue
+            runtime_database = lower_name.endswith(_RUNTIME_DB_ENDINGS)
+            credential_named = bool(_CREDENTIAL_FILENAME_RE.search(lower_name))
+
+            if forbidden_sha256 and not (
+                runtime_database and _runtime_database_has_live_connection(fpath)
+            ):
+                try:
+                    digest = hashlib.sha256()
+                    with fpath.open("rb") as stream:
+                        for block in iter(lambda: stream.read(1_048_576), b""):
+                            digest.update(block)
+                except OSError as exc:
+                    if strict:
+                        findings.append(f"{fpath} (unreadable: {exc.strerror})")
+                    continue
+                if digest.hexdigest() in forbidden_sha256:
+                    findings.append(f"{fpath} (matches a forbidden key digest)")
+                    continue
+
             # Hermes' own SQLite databases contain arbitrary task text and
             # binary pages. They are runtime state, not credential stores; raw
-            # substring scanning produced universal false positives in
-            # "task-id" and WAL content. Known credential stores remain
-            # separate eligible files (for example auth.json / .env).
-            if lower_name.endswith(_RUNTIME_DB_ENDINGS):
+            # text matching produced universal false positives in task and WAL
+            # content. A configured forbidden digest was already checked.
+            if runtime_database:
                 continue
-            credential_named = bool(_CREDENTIAL_FILENAME_RE.search(lower_name))
-            text_like = (
-                fpath.suffix.lower() in _TEXT_LIKE_SUFFIXES
-                or lower_name.startswith(".env")
-                or credential_named
-            )
             try:
                 if fpath.stat().st_size > 1_000_000:
-                    if strict and text_like:
+                    if strict:
                         findings.append(
                             f"{fpath} (eligible file exceeds credential scan limit)"
                         )
@@ -642,12 +670,14 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
                 if strict:
                     findings.append(f"{fpath} (unreadable: {exc.strerror})")
                 continue
-            if forbidden_sha256:
-                if hashlib.sha256(blob).hexdigest() in forbidden_sha256:
-                    findings.append(f"{fpath} (matches a forbidden key digest)")
-                    continue
-            if text_like and any(pattern.search(blob)
-                                 for pattern in _CREDENTIAL_PATTERNS):
+            # NUL content is the exclusion-shaped binary test. Unknown suffixes
+            # remain eligible; only content that is plainly binary is skipped.
+            if b"\x00" in blob[:8192]:
+                if credential_named and blob.strip(b"\x00"):
+                    findings.append(f"{fpath} (credential-shaped filename)")
+                continue
+            text = blob.decode("utf-8", errors="ignore")
+            if secret_redaction._PREFIX_RE.search(text):
                 findings.append(f"{fpath} (contains provider key material)")
             elif credential_named and blob.strip():
                 findings.append(f"{fpath} (credential-shaped filename)")

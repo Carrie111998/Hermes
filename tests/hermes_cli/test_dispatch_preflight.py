@@ -929,10 +929,11 @@ def test_release_failure_terminates_the_acknowledged_worker(
 
 
 @pytest.mark.live_system_guard_bypass
-def test_real_board_database_does_not_block_a_compliant_sandbox_dispatch(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("log_contains_key", [False, True])
+def test_real_board_assertion_eight_handles_runtime_db_and_unredacted_log(
+    tmp_path, monkeypatch, log_contains_key
 ):
-    """Assertion 8 must be reachable with Hermes' own live kanban.db present."""
+    """A runtime DB passes, but provider material in a real log refuses."""
     from hermes_cli import workspace_policy as wp
 
     home = tmp_path / "hermes-home"
@@ -972,6 +973,11 @@ def test_real_board_database_does_not_block_a_compliant_sandbox_dispatch(
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly", lambda *a, **k: config
     )
+    secret = "glpat-EXAMPLENOTREAL1234567890"
+    if log_contains_key:
+        logs = home / "logs"
+        logs.mkdir()
+        (logs / "agent.log").write_text(f"provider response key={secret}\n")
 
     processes = []
 
@@ -1002,8 +1008,21 @@ def test_real_board_database_does_not_block_a_compliant_sandbox_dispatch(
         conn.commit()
 
         result = kb.dispatch_once(conn, spawn_fn=None)
+        if log_contains_key:
+            assert result.spawned == []
+            events = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "ORDER BY id", (tid,),
+            ).fetchall()
+            assert "confinement_violation" in [row["kind"] for row in events]
+            assert "spawn_failed" in [row["kind"] for row in events]
+            assert all(secret not in row["payload"] for row in events)
+            assert processes
+            processes[0].wait(timeout=10)
+            assert processes[0].returncode is not None
+            return
+
         assert tid in [task_id for task_id, _assignee, _path in result.spawned], result
-        assert result.refused_confinement == []
 
         run = conn.execute(
             "SELECT observed_cwd FROM task_runs WHERE task_id = ?", (tid,)
@@ -1016,6 +1035,11 @@ def test_real_board_database_does_not_block_a_compliant_sandbox_dispatch(
         ).fetchone()
         assert event is not None
         assert json.loads(event["payload"])["contract_satisfied"] is True
+        violation = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'confinement_violation' LIMIT 1", (tid,),
+        ).fetchone()
+        assert violation is None
 
         assert processes
         processes[0].wait(timeout=10)

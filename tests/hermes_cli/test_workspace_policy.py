@@ -455,6 +455,7 @@ def test_ordinary_runtime_text_is_not_credential_material(tmp_path):
         "group_id: 12\n"
         "setup_hooks: true\n"
         "backup_dir: /tmp\n"
+        "up_stream_configuration_value: 1\n"
     )
     (home / "settings.yaml").write_text(ordinary)
     (home / "keyboard.md").write_text("ordinary keyboard instructions")
@@ -487,6 +488,26 @@ def test_realistic_long_provider_key_shape_is_detected(tmp_path):
     (home / "settings.yaml").write_text(f"api_key: {secret}\n")
     findings = wp.scan_for_key_material(str(home))
     assert findings
+    assert all(secret not in finding for finding in findings)
+
+
+@pytest.mark.parametrize(("relative_name", "secret"), [
+    ("logs/agent.log", "glpat-EXAMPLENOTREAL1234567890"),
+    ("logs/gateway.log.1", "sk_live_EXAMPLENOTREAL1234567890"),
+    ("worker.py", "hf_EXAMPLENOTREAL1234567890"),
+    ("prod.env.bak", "gsk_EXAMPLENOTREAL1234567890"),
+    ("config", "npm_EXAMPLENOTREAL1234567890"),
+])
+def test_provider_keys_are_detected_without_a_suffix_allowlist(
+    tmp_path, relative_name, secret
+):
+    home = tmp_path / "h"
+    target = home / relative_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"provider_key={secret}\n")
+    findings = wp.scan_for_key_material(str(home))
+    assert findings
+    assert str(target) in findings[0]
     assert all(secret not in finding for finding in findings)
 
 
@@ -527,6 +548,46 @@ def test_a_forbidden_digest_matches_without_revealing_the_key(tmp_path):
     assert wp.scan_for_key_material(str(home)) == []
     findings = wp.scan_for_key_material(str(home), forbidden_sha256=(digest,))
     assert findings and "forbidden key digest" in findings[0]
+
+
+def test_a_forbidden_digest_is_checked_before_database_exclusion(tmp_path):
+    import hashlib
+    home = tmp_path / "h"
+    home.mkdir()
+    blob = b"opaque-forbidden-material-without-a-provider-prefix"
+    stolen = home / "stolen.db"
+    stolen.write_bytes(blob)
+    digest = hashlib.sha256(blob).hexdigest()
+    findings = wp.scan_for_key_material(str(home), forbidden_sha256=(digest,))
+    assert findings and str(stolen) in findings[0]
+    assert "forbidden key digest" in findings[0]
+
+
+def test_forbidden_digest_scan_does_not_byte_open_a_live_database(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    home = tmp_path / "h"
+    home.mkdir()
+    database = home / "kanban.db"
+    conn = connect_tracked(database)
+    conn.execute("CREATE TABLE evidence (value TEXT)")
+    conn.commit()
+    original_open = type(database).open
+
+    def _guarded_open(path, *args, **kwargs):
+        if path == database:
+            raise AssertionError("live SQLite database was byte-opened")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(database), "open", _guarded_open)
+    try:
+        assert wp.scan_for_key_material(
+            str(home), forbidden_sha256=("0" * 64,)
+        ) == []
+    finally:
+        conn.close()
 
 
 def test_a_hermes_home_outside_the_sandbox_is_refused(tmp_path):
