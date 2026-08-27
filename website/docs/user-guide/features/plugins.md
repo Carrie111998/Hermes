@@ -792,6 +792,10 @@ else:
 |-------|---------|
 | `accepted` | `True` only when the event reached the stored session's adapter. The result object is falsy otherwise. |
 | `reason` | `adopted`, `unknown_session`, `unauthorized`, `no_adapter`, `gateway_draining`, `internal_error`, `not_scheduled`, `injection_denied`, `no_gateway`, `invalid_request`, `unsupported`, `cancelled`, `timeout`, or `cli_queued`. |
+| `settled` | `False` only for `timeout` — the dispatch is still in flight and may yet be adopted. |
+| `indeterminate` | `not settled`. The outcome is unknown, not negative. |
+| `refused` | `True` for a *settled* denial: the event will never reach the session. |
+| `safe_to_retry` | `True` only when re-issuing the injection cannot duplicate a delivered wake. |
 | `session_id` | The host's id for the session that received the message. Set on `adopted`. |
 | `session_key` | The key that was resolved. |
 | `correlation_id` | Echo of the tag you supplied, if any. |
@@ -799,6 +803,23 @@ else:
 - `correlation_id` is an opaque bounded tag (printable, ≤128 characters). It is stamped onto the dispatched event's metadata as `hermes_plugin_injection_id` and echoed in the result so you can prove *this* event reached *that* session. It is never routing information — the platform, chat, thread, and user always come from the stored session.
 - `handle.result(...)` blocks and is only valid off the gateway loop; awaiting is the correct call on it. `handle.cancel()` cancels a pending dispatch, after which the result reads `cancelled`.
 - Both paths return a result object rather than raising, including on timeout and internal failure.
+
+:::danger A timeout is *unknown*, not *denied*
+`handle.result(timeout=...)` running out of patience does **not** cancel the dispatch. It returns `accepted=False, reason="timeout", settled=False` and the wake may still land a moment later.
+
+Check `refused` — not just falsiness — before reporting failure, and check `safe_to_retry` before re-sending. **`correlation_id` is metadata, not a durable idempotency key: nothing on this path deduplicates on it, so two injections carrying the same id both reach the session.** The reconciliation path is the *same handle*: poll `handle.settled` or call `handle.result(...)` again to learn the eventual outcome.
+
+```python
+result = handle.result(timeout=5)
+if result.accepted:
+    respond(200, {"status": "adopted", "session_id": result.session_id})
+elif result.refused:
+    respond(409, {"status": result.reason})
+else:
+    # Indeterminate. Do not re-inject; reconcile through this handle.
+    respond(202, {"status": "pending", "correlation_id": result.correlation_id})
+```
+:::
 - In CLI mode there is no gateway dispatch stage, so an awaited handle resolves immediately to `cli_queued`.
 - The default (`await_dispatch=False`) call is unchanged and still returns a plain `bool`.
 
@@ -814,8 +835,8 @@ if identity["session_key"] != expected_session_key:
 
 `ctx.call_context` returns a fresh `dict[str, str]` with `profile`, `session_key`, `session_id`, `platform`, `source`, `chat_id`, `chat_type`, `chat_name`, `thread_id`, `user_id`, `user_name`, `scope_id`, and `message_id`.
 
-- Values are bound per asyncio task by the gateway, so two concurrent sessions in one process never read each other's identity.
-- Every field is `""` when no session is bound — a plain CLI run, a cron job, or a test.
+- Values are bound per asyncio task by the gateway, so two concurrent sessions in one process never read each other's identity. This includes `profile`: a multiplexed gateway serves several profiles from one process, so `profile` is the *session's* profile, not the process's.
+- Every field is `""` when no session is bound — a plain CLI run, a cron job, or a test. `profile` then falls back to the active process profile.
 - The returned mapping is a copy; mutating it changes nothing.
 
 :::warning

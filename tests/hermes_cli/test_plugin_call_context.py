@@ -56,10 +56,31 @@ def test_call_context_exposes_host_bound_session_identity(bound_session):
     assert ctx["user_name"] == "tester"
     assert ctx["scope_id"] == "guild-9"
     assert ctx["message_id"] == "m-3"
+    # Profile is session identity, not process identity.
+    assert ctx["profile"] == "agent-management"
 
 
-def test_call_context_reports_the_active_profile(monkeypatch, tmp_path):
+def test_bound_profile_wins_over_the_process_profile(
+    monkeypatch, tmp_path, bound_session
+):
+    """A multiplexed gateway serves several profiles from one process.
+
+    Reading the process profile while a session is bound would hand a plugin the
+    right chat and the wrong policy domain.
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = _context()
+
+    assert ctx.call_context["profile"] == "agent-management"
+    assert ctx.call_context["profile"] != ctx.profile_name
+
+
+def test_call_context_falls_back_to_the_process_profile_when_unbound(
+    monkeypatch, tmp_path
+):
+    """Compatibility path: plain CLI, cron, and tests bind no session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
     assert _context().call_context["profile"] == _context().profile_name
 
 
@@ -126,4 +147,52 @@ async def test_call_context_is_task_local_across_concurrent_sessions():
     assert seen == {
         "a": "agent:main:telegram:dm:1",
         "b": "agent:main:telegram:dm:2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_call_context_profile_is_task_local_across_concurrent_sessions():
+    """Two profiles multiplexed in one process must not read each other's.
+
+    The failure this pins is a qualified-identity break at the policy boundary:
+    a plugin trusting ``call_context`` gets the right session key and the wrong
+    profile, so it authorizes against the wrong domain.
+    """
+    ctx = _context()
+    seen: dict[str, tuple[str, str]] = {}
+    first_bound = asyncio.Event()
+
+    async def _turn(name, *, profile, session_key, wait_for=None, release=None):
+        tokens = set_session_vars(
+            session_key=session_key, session_id=name, profile=profile
+        )
+        try:
+            if release is not None:
+                release.set()
+            if wait_for is not None:
+                await wait_for.wait()
+            await asyncio.sleep(0)
+            snapshot = ctx.call_context
+            seen[name] = (snapshot["profile"], snapshot["session_key"])
+        finally:
+            clear_session_vars(tokens)
+
+    await asyncio.gather(
+        _turn(
+            "a",
+            profile="agent-management",
+            session_key="agent:main:telegram:dm:1",
+            wait_for=first_bound,
+        ),
+        _turn(
+            "b",
+            profile="research",
+            session_key="agent:main:telegram:dm:2",
+            release=first_bound,
+        ),
+    )
+
+    assert seen == {
+        "a": ("agent-management", "agent:main:telegram:dm:1"),
+        "b": ("research", "agent:main:telegram:dm:2"),
     }

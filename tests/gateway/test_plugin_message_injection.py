@@ -438,7 +438,7 @@ def test_scheduler_uses_threadsafe_bridge_outside_gateway_loop():
         future.set_result(True)
         return future
 
-    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_submit) as submit:
+    with patch("gateway.plugin_injection.safe_schedule_threadsafe", side_effect=_submit) as submit:
         assert (
             runner._schedule_plugin_message_injection(
                 session_key="key",
@@ -464,8 +464,8 @@ def test_scheduler_ignores_threadsafe_future_cancellation():
         return future
 
     with (
-        patch("gateway.run.safe_schedule_threadsafe", side_effect=_submit),
-        patch("gateway.run.logger.warning") as warning,
+        patch("gateway.plugin_injection.safe_schedule_threadsafe", side_effect=_submit),
+        patch("gateway.plugin_injection.logger.warning") as warning,
     ):
         assert (
             runner._schedule_plugin_message_injection(
@@ -530,7 +530,7 @@ def test_scheduler_rejects_submission_failure():
         coro.close()
         return None
 
-    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_reject):
+    with patch("gateway.plugin_injection.safe_schedule_threadsafe", side_effect=_reject):
         assert (
             runner._schedule_plugin_message_injection(
                 session_key="key",

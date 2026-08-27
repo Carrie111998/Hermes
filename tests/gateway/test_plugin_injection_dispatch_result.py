@@ -79,9 +79,9 @@ def _grant_injection(tmp_path, monkeypatch) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {"plugins": {"entries": {"wake-plugin": {"allow_gateway_injection": True}}}}
-        )
+        yaml.safe_dump({
+            "plugins": {"entries": {"wake-plugin": {"allow_gateway_injection": True}}}
+        })
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
@@ -521,9 +521,7 @@ async def test_context_await_dispatch_requires_a_session_key(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["", "x" * 129, "line\nbreak", "tab\tstop"])
-async def test_context_rejects_an_unbounded_correlation_id(
-    tmp_path, monkeypatch, bad
-):
+async def test_context_rejects_an_unbounded_correlation_id(tmp_path, monkeypatch, bad):
     _grant_injection(tmp_path, monkeypatch)
     result = await _context(PluginManager()).inject_message(
         "read the ledger",
@@ -575,3 +573,141 @@ def test_resolved_handle_is_readable_without_a_loop():
     )
     assert handle.result(timeout=0).reason == "no_gateway"
     assert isinstance(handle._future, concurrent.futures.Future)
+
+
+# ---------------------------------------------------------------------------
+# Settlement: timeout is indeterminate, not a refusal
+# ---------------------------------------------------------------------------
+
+
+def test_blocking_result_timeout_is_indeterminate_and_reconciles_to_adoption():
+    """A read that gives up must not be readable as a denial.
+
+    The caller stops waiting; the host does not stop working. The same handle is
+    the reconciliation path to the eventual outcome -- re-injecting instead would
+    deliver the wake twice.
+    """
+    entry = _entry()
+    ready = threading.Event()
+    release = threading.Event()
+    reached_adapter = threading.Event()
+    holder: dict = {}
+
+    async def _blocked(_event):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, release.wait, 5)
+        reached_adapter.set()
+
+    async def _serve():
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        holder["runner"] = _runner(
+            entry, SimpleNamespace(handle_message=_blocked), loop=loop
+        )
+        holder["stop"] = lambda: loop.call_soon_threadsafe(stop.set)
+        ready.set()
+        await stop.wait()
+
+    thread = threading.Thread(target=lambda: asyncio.run(_serve()), daemon=True)
+    thread.start()
+    assert ready.wait(5)
+
+    handle = holder["runner"]._schedule_plugin_message_injection(
+        session_key=SESSION_KEY,
+        content="wake up",
+        plugin_id="wake-plugin",
+        await_dispatch=True,
+        correlation_id="evt-indeterminate",
+    )
+    try:
+        pending = handle.result(timeout=0.2)
+
+        # Falsy, but explicitly NOT a decided outcome.
+        assert bool(pending) is False
+        assert pending.reason == "timeout"
+        assert pending.settled is False
+        assert pending.indeterminate is True
+        assert pending.refused is False
+        # The whole point: a caller must not answer "failed, retry" here.
+        assert pending.safe_to_retry is False
+        assert handle.settled is False
+        assert not reached_adapter.is_set()
+
+        # The dispatch was never cancelled by the timeout; it still lands.
+        release.set()
+        final = handle.result(timeout=5)
+    finally:
+        release.set()
+        holder["stop"]()
+        thread.join(timeout=5)
+
+    assert reached_adapter.is_set()
+    assert final.accepted is True
+    assert final.reason == "adopted"
+    assert final.settled is True
+    assert final.correlation_id == "evt-indeterminate"
+
+
+def test_terminal_refusals_stay_terminal():
+    """Every non-timeout outcome remains a settled fact callers can act on."""
+    refusal = GatewayInjectionResult(False, "unknown_session")
+    assert refusal.settled is True
+    assert refusal.refused is True
+    assert refusal.indeterminate is False
+    assert refusal.safe_to_retry is True
+
+    adopted = GatewayInjectionResult(True, "adopted")
+    assert adopted.refused is False
+    assert adopted.safe_to_retry is False
+
+    # A dispatch that blew up may already have reached the adapter.
+    crashed = GatewayInjectionResult(False, "internal_error")
+    assert crashed.refused is True
+    assert crashed.safe_to_retry is False
+
+
+@pytest.mark.asyncio
+async def test_correlation_id_is_metadata_not_idempotent_admission():
+    """The tag identifies an event; it never deduplicates one.
+
+    Nothing on this path stores correlation ids, so two injections carrying the
+    same id both reach the session. Retry safety comes from
+    ``GatewayInjectionResult.safe_to_retry``, not from the tag.
+    """
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(_entry(), adapter)
+
+    for _ in range(2):
+        result = await runner._dispatch_plugin_message_injection(
+            session_key=SESSION_KEY,
+            content="wake up",
+            plugin_id="wake-plugin",
+            correlation_id="evt-duplicate",
+        )
+        assert result.reason == "adopted"
+
+    assert adapter.handle_message.await_count == 2
+    ids = {
+        call.args[0].metadata["hermes_plugin_injection_id"]
+        for call in adapter.handle_message.await_args_list
+    }
+    assert ids == {"evt-duplicate"}
+
+
+def test_every_declared_reason_is_classified():
+    """No reason may be silently unclassified as settled or indeterminate."""
+    from hermes_cli.plugin_injection import (
+        GATEWAY_INJECTION_REASONS,
+        INDETERMINATE_REASONS,
+    )
+
+    assert INDETERMINATE_REASONS <= set(GATEWAY_INJECTION_REASONS)
+    # Only an unfinished observation is indeterminate; everything else decided.
+    assert INDETERMINATE_REASONS == {"timeout"}
+    for reason in GATEWAY_INJECTION_REASONS:
+        result = GatewayInjectionResult(
+            reason in ("adopted", "cli_queued"),
+            reason,
+            settled=reason not in INDETERMINATE_REASONS,
+        )
+        assert result.settled is not result.indeterminate

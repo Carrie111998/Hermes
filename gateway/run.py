@@ -19346,95 +19346,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await_dispatch: bool = False,
         correlation_id: str | None = None,
     ):
-        """Schedule a plugin-triggered turn on the live gateway loop.
+        """Delegate to :mod:`gateway.plugin_injection`."""
+        from gateway.plugin_injection import schedule_injection
 
-        Returns ``True``/``False`` for the scheduling outcome by default. With
-        ``await_dispatch=True`` it returns a ``GatewayInjectionHandle`` that
-        resolves to what dispatch itself decided, so a caller can tell adoption
-        apart from a silent drop.
-        """
-        from hermes_cli.plugins import GatewayInjectionHandle, GatewayInjectionResult
-
-        def _refused(reason: str):
-            if not await_dispatch:
-                return False
-            return GatewayInjectionHandle.resolved(
-                GatewayInjectionResult(
-                    False,
-                    reason,
-                    session_key=session_key,
-                    correlation_id=correlation_id,
-                )
-            )
-
-        loop = getattr(self, "_gateway_loop", None)
-        if not getattr(self, "_running", False) or loop is None or loop.is_closed():
-            return _refused("gateway_draining")
-
-        coro = self._dispatch_plugin_message_injection(
+        return schedule_injection(
+            self,
             session_key=session_key,
             content=content,
             plugin_id=plugin_id,
+            await_dispatch=await_dispatch,
             correlation_id=correlation_id,
         )
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-
-        if current_loop is loop:
-            try:
-                future = loop.create_task(coro)
-            except Exception:
-                coro.close()
-                logger.warning(
-                    "Plugin message injection scheduling failed",
-                    exc_info=True,
-                )
-                return _refused("not_scheduled")
-            self._background_tasks.add(future)
-            future.add_done_callback(self._background_tasks.discard)
-        else:
-            future = safe_schedule_threadsafe(
-                coro,
-                loop,
-                logger=logger,
-                log_message="Plugin message injection scheduling failed",
-                log_level=logging.WARNING,
-            )
-            if future is None:
-                return _refused("not_scheduled")
-
-        def _log_result(completed) -> None:
-            try:
-                result = completed.result()
-            except (asyncio.CancelledError, concurrent.futures.CancelledError):
-                return
-            except Exception:
-                logger.warning(
-                    "Plugin message injection failed: plugin=%s session=%s",
-                    plugin_id,
-                    session_key,
-                    exc_info=True,
-                )
-                return
-            if not result:
-                logger.warning(
-                    "Plugin message injection was not routed: plugin=%s session=%s "
-                    "reason=%s",
-                    plugin_id,
-                    session_key,
-                    getattr(result, "reason", "unknown"),
-                )
-
-        future.add_done_callback(_log_result)
-        if await_dispatch:
-            return GatewayInjectionHandle(
-                future,
-                correlation_id=correlation_id,
-                session_key=session_key,
-            )
-        return True
 
     async def _dispatch_plugin_message_injection(
         self,
@@ -19444,87 +19366,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         plugin_id: str,
         correlation_id: str | None = None,
     ):
-        """Route a plugin-triggered turn through the session's live adapter.
+        """Delegate to :mod:`gateway.plugin_injection`."""
+        from gateway.plugin_injection import dispatch_injection
 
-        Returns a ``GatewayInjectionResult``. It is falsy for every refusal, so
-        callers that only cared about the boolean still read correctly.
-        """
-        from hermes_cli.plugins import GatewayInjectionResult
-
-        def _refused(reason: str) -> "GatewayInjectionResult":
-            return GatewayInjectionResult(
-                False,
-                reason,
-                session_key=session_key,
-                correlation_id=correlation_id,
-            )
-
-        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
-            return _refused("gateway_draining")
-
-        entry = await self.async_session_store.lookup_by_session_key(session_key)
-        if entry is None or entry.origin is None:
-            return _refused("unknown_session")
-        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
-            return _refused("gateway_draining")
-
-        source = dataclasses.replace(entry.origin)
-        try:
-            if not self._is_user_authorized(
-                source,
-                allow_adapter_delegation=False,
-            ):
-                logger.warning(
-                    "Plugin message injection denied by current gateway authorization: "
-                    "plugin=%s session=%s",
-                    plugin_id,
-                    session_key,
-                )
-                return _refused("unauthorized")
-        except Exception:
-            logger.warning(
-                "Plugin message injection authorization check failed: "
-                "plugin=%s session=%s",
-                plugin_id,
-                session_key,
-                exc_info=True,
-            )
-            return _refused("unauthorized")
-
-        adapter = self._adapter_for_source(source)
-        if adapter is None:
-            return _refused("no_adapter")
-
-        metadata = {
-            "hermes_plugin_id": plugin_id,
-            "hermes_plugin_injection": True,
-            "gateway_session_key": session_key,
-            "gateway_session_id": entry.session_id,
-            "gateway_session_strict": True,
-        }
-        if correlation_id is not None:
-            metadata["hermes_plugin_injection_id"] = correlation_id
-
-        event = MessageEvent(
-            text=content,
-            message_type=MessageType.TEXT,
-            source=source,
-            internal=True,
-            allow_gateway_control=False,
-            metadata=metadata,
-        )
-        await adapter.handle_message(event)
-        logger.info(
-            "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
-            plugin_id,
-            session_key,
-            entry.session_id,
-        )
-        return GatewayInjectionResult(
-            True,
-            "adopted",
-            session_id=entry.session_id,
+        return await dispatch_injection(
+            self,
             session_key=session_key,
+            content=content,
+            plugin_id=plugin_id,
             correlation_id=correlation_id,
         )
 
