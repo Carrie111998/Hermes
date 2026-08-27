@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -749,3 +750,175 @@ class TestOAuthClassificationReload:
             assert not mcp._oauth_protected_servers
         finally:
             mcp._oauth_protected_servers.discard("github")
+
+
+class TestScopedMcpReload:
+    def test_reload_shutdown_keys_spares_other_principal(self):
+        from tools.mcp_tool import _reload_shutdown_keys
+
+        alice_key = connection_registry_token("github", _alice_scope())
+        bob_key = connection_registry_token("github", _bob_scope())
+        retired_key = connection_registry_token("retired", _bob_scope())
+        servers = {
+            alice_key: SimpleNamespace(name="github", _oauth_scope=_alice_scope()),
+            bob_key: SimpleNamespace(name="github", _oauth_scope=_bob_scope()),
+            "filesystem": SimpleNamespace(name="filesystem", _oauth_scope=None),
+            retired_key: SimpleNamespace(name="retired", _oauth_scope=_bob_scope()),
+        }
+        keys = _reload_shutdown_keys(
+            {"github", "filesystem"}, servers, _alice_scope()
+        )
+        assert keys is not None
+        assert alice_key in keys
+        assert "filesystem" in keys
+        assert retired_key in keys
+        assert bob_key not in keys
+
+    def test_reload_shutdown_keys_full_wipe_when_unbound(self):
+        from tools.mcp_tool import _reload_shutdown_keys
+
+        servers = {
+            connection_registry_token("github", _bob_scope()): SimpleNamespace(
+                name="github", _oauth_scope=_bob_scope()
+            )
+        }
+        assert _reload_shutdown_keys({"github"}, servers, None) is None
+
+    def test_shutdown_with_only_lazy_templates_deregisters_tools(self):
+        import tools.mcp_tool as mcp
+        from tools.mcp_tool import mcp_prefixed_tool_name
+        from tools.registry import registry
+
+        _cleanup_github_runtime(mcp)
+        tool_name = mcp_prefixed_tool_name("github", "search")
+        registry.register(
+            name=tool_name,
+            toolset="mcp-github",
+            schema={
+                "name": tool_name,
+                "description": "search",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kw: "{}",
+        )
+        mcp._lazy_server_configs["github"] = _github_oauth_cfg()
+        mcp._lazy_server_tool_names["github"] = [tool_name]
+        mcp._oauth_protected_servers.add("github")
+        try:
+            with patch.object(mcp, "_stop_mcp_loop"):
+                mcp.shutdown_mcp_servers()
+            assert registry.get_toolset_for_tool(tool_name) is None
+            assert "github" not in mcp._lazy_server_configs
+            assert "github" not in mcp._lazy_server_tool_names
+            assert "github" not in mcp._oauth_protected_servers
+        finally:
+            registry.deregister(tool_name)
+            _cleanup_github_runtime(mcp)
+
+    def test_alice_reload_leaves_bob_connected_and_purges_removed_lazy(self):
+        import tools.mcp_tool as mcp
+        from hermes_constants import get_hermes_home
+        from tools.mcp_tool import mcp_prefixed_tool_name
+        from tools.registry import registry
+
+        _write_per_user_config(get_hermes_home())
+        _bind("slack", "T1", "U-alice")
+        _cleanup_github_runtime(mcp)
+
+        alice_key = connection_registry_token("github", _alice_scope())
+        bob_key = connection_registry_token("github", _bob_scope())
+        alice = mcp.MCPServerTask("github")
+        bob = mcp.MCPServerTask("github")
+        alice._oauth_scope = _alice_scope()
+        bob._oauth_scope = _bob_scope()
+        alice._registry_key = alice_key
+        bob._registry_key = bob_key
+        mcp._servers[alice_key] = alice
+        mcp._servers[bob_key] = bob
+
+        gone_tool = mcp_prefixed_tool_name("retired", "x")
+        registry.register(
+            name=gone_tool,
+            toolset="mcp-retired",
+            schema={
+                "name": gone_tool,
+                "description": "x",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kw: "{}",
+        )
+        mcp._lazy_server_configs["retired"] = {"url": "https://gone.example/mcp"}
+        mcp._lazy_server_tool_names["retired"] = [gone_tool]
+        mcp._lazy_server_configs["github"] = _github_oauth_cfg()
+        mcp._lazy_server_tool_names["github"] = [
+            mcp_prefixed_tool_name("github", "search")
+        ]
+        try:
+            with patch.object(
+                mcp, "_load_mcp_config", return_value={"github": _github_oauth_cfg()}
+            ), patch.object(mcp, "_close_mcp_tasks"), patch.object(
+                mcp, "_stop_mcp_loop"
+            ):
+                mcp.reload_mcp_connections()
+            assert bob_key in mcp._servers
+            assert alice_key not in mcp._servers
+            assert "retired" not in mcp._lazy_server_configs
+            assert "retired" not in mcp._lazy_server_tool_names
+            assert "github" in mcp._lazy_server_configs
+            assert registry.get_toolset_for_tool(gone_tool) is None
+        finally:
+            registry.deregister(gone_tool)
+            mcp._lazy_server_configs.pop("retired", None)
+            mcp._lazy_server_tool_names.pop("retired", None)
+            mcp._servers.pop(alice_key, None)
+            mcp._servers.pop(bob_key, None)
+            _cleanup_github_runtime(mcp)
+
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_tool_still_advertised_by_sibling(self):
+        import tools.mcp_tool as mcp
+        from tools.mcp_tool import mcp_prefixed_tool_name
+        from tools.registry import registry
+
+        tool_name = mcp_prefixed_tool_name("github", "search")
+        new_name = mcp_prefixed_tool_name("github", "other")
+        alice_key = connection_registry_token("github", _alice_scope())
+        bob_key = connection_registry_token("github", _bob_scope())
+        registry.register(
+            name=tool_name,
+            toolset="mcp-github",
+            schema={
+                "name": tool_name,
+                "description": "search",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kw: "{}",
+        )
+        alice = mcp.MCPServerTask("github")
+        bob = mcp.MCPServerTask("github")
+        alice._registered_tool_names = [tool_name]
+        bob._registered_tool_names = [tool_name]
+        alice._config = {}
+        alice.session = SimpleNamespace(
+            list_tools=AsyncMock(
+                return_value=SimpleNamespace(
+                    tools=[SimpleNamespace(name="other", description="o", inputSchema=None)]
+                )
+            )
+        )
+        mcp._servers[alice_key] = alice
+        mcp._servers[bob_key] = bob
+        try:
+            await alice._refresh_tools()
+            assert registry.get_toolset_for_tool(tool_name) == "mcp-github"
+            assert new_name in registry.get_all_tool_names()
+            assert tool_name not in alice._registered_tool_names
+            assert tool_name in bob._registered_tool_names
+        finally:
+            mcp._servers.pop(alice_key, None)
+            mcp._servers.pop(bob_key, None)
+            for name in list(getattr(alice, "_registered_tool_names", []) or []):
+                registry.deregister(name)
+            registry.deregister(tool_name)
+            registry.deregister(new_name)
+            _cleanup_github_runtime(mcp)

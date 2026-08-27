@@ -2801,10 +2801,16 @@ class MCPServerTask:
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
             }
+            keep = _mcp_tool_names_held_elsewhere(
+                self.name, self, include_lazy=False
+            )
             for tool_name in stale_tool_names:
                 # Never let one server's refresh remove a colliding name that
-                # is currently owned by another server.
+                # is currently owned by another server, or a tool another
+                # principal's live connection still advertises.
                 if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                    continue
+                if tool_name in keep:
                     continue
                 registry.deregister(tool_name)
                 _forget_mcp_tool_server(tool_name)
@@ -2823,6 +2829,8 @@ class MCPServerTask:
             registered_name_set = set(registered_names)
             for tool_name in old_tool_names - registered_name_set:
                 if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                    continue
+                if tool_name in keep:
                     continue
                 registry.deregister(tool_name)
                 _forget_mcp_tool_server(tool_name)
@@ -4477,23 +4485,7 @@ class MCPServerTask:
         if not mine:
             return
 
-        # Tool names are process-global. Alice exhausting her reconnect
-        # budget must not yank a name Bob's live connection (or the
-        # cache-backed lazy template) still serves.
-        from tools.mcp_oauth_identity import is_registry_key_for_server
-
-        logical = self.name
-        keep = set(_lazy_server_tool_names.get(logical) or [])
-        for key, other in list(_servers.items()):
-            if other is self:
-                continue
-            if not (
-                is_registry_key_for_server(key, logical)
-                or getattr(other, "name", None) == logical
-            ):
-                continue
-            keep.update(getattr(other, "_registered_tool_names", None) or [])
-
+        keep = _mcp_tool_names_held_elsewhere(self.name, self, include_lazy=True)
         for tool_name in mine:
             if tool_name in keep:
                 continue
@@ -4707,6 +4699,76 @@ def _maybe_pop_lazy(server_name: str):
     names = _lazy_server_tool_names.pop(server_name, None) or []
     _lazy_server_configs.pop(server_name, None)
     return fingerprint, names
+
+
+def _mcp_tool_names_held_elsewhere(
+    logical_name: str,
+    holder,
+    *,
+    include_lazy: bool,
+) -> set:
+    """Registry names still served by a peer connection (and optionally cache).
+
+    ``include_lazy`` is for connection teardown: cache-backed names must stay
+    registered so first-use can reconnect. Live ``tools/list_changed`` refresh
+    must NOT keep a name solely because the cache still lists it — the live
+    sibling's ``_registered_tool_names`` is the ownership signal.
+    """
+    from tools.mcp_oauth_identity import is_registry_key_for_server
+
+    keep: set = set()
+    if include_lazy:
+        keep.update(_lazy_server_tool_names.get(logical_name) or [])
+    for key, other in list(_servers.items()):
+        if other is holder:
+            continue
+        if not (
+            is_registry_key_for_server(key, logical_name)
+            or getattr(other, "name", None) == logical_name
+        ):
+            continue
+        keep.update(getattr(other, "_registered_tool_names", None) or [])
+    return keep
+
+
+def _logical_mcp_server_name(key: str, server) -> str:
+    return getattr(server, "name", None) or str(key).split("\x1f", 1)[0]
+
+
+def _reload_shutdown_keys(
+    configured_names: set,
+    servers: dict,
+    requester_scope,
+) -> Optional[set]:
+    """Return registry keys a /reload-mcp pass may close, or None for a full wipe.
+
+    ``None`` means every live connection plus lazy templates (shared mode,
+    unbound CLI/TUI, process exit). A set means close only those keys:
+    this requester's per-user OAuth connections, process-level (non-OAuth)
+    connections, and every identity of a server no longer in config.
+    Other principals' OAuth sessions are omitted.
+    """
+    from tools.mcp_oauth_identity import (
+        IDENTITY_MODE_PER_USER,
+        connection_registry_token,
+    )
+
+    if requester_scope is None or getattr(requester_scope, "mode", None) != IDENTITY_MODE_PER_USER:
+        return None
+    recycle: set = set()
+    for key, srv in servers.items():
+        logical = _logical_mcp_server_name(key, srv)
+        if logical not in configured_names:
+            recycle.add(key)
+            continue
+        scope = getattr(srv, "_oauth_scope", None)
+        if scope is None or getattr(scope, "mode", None) != IDENTITY_MODE_PER_USER:
+            recycle.add(key)
+            continue
+        expected = connection_registry_token(logical, requester_scope)
+        if key == expected:
+            recycle.add(key)
+    return recycle
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -6185,9 +6247,18 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     if phantom_names:
         from tools.registry import registry
 
+        keep = _mcp_tool_names_held_elsewhere(
+            server_name, server, include_lazy=False
+        )
+        dropped = []
         for tool_name in phantom_names:
+            if tool_name in keep:
+                continue
             registry.deregister(tool_name)
             _forget_mcp_tool_server(tool_name)
+            dropped.append(tool_name)
+        phantom_names = dropped
+    if phantom_names:
         logger.info(
             "MCP server '%s': deregistered %d phantom cached tool(s) not "
             "served live (stale schema-cache fingerprint %s): %s",
@@ -8680,50 +8751,57 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 
-def shutdown_mcp_servers():
-    """Close all MCP server connections and stop the background loop.
+def _purge_lazy_mcp_templates(logical_names: Optional[set] = None) -> None:
+    """Drop cache-backed templates and deregister names no live peer still owns.
 
-    Each server Task is signalled to exit its ``async with`` block so that
-    the anyio cancel-scope cleanup happens in the same Task that opened it.
-    All servers are shut down in parallel via ``asyncio.gather``.
+    ``None`` purges every lazy server. A set purges only those logical names
+    (servers deleted from config.yaml).
     """
-    with _lock:
-        servers_snapshot = list(_servers.values())
-        # Auth classification is rebuilt on the next register/discover pass.
-        # Clearing here so a reload that drops ``auth: oauth`` (or removes
-        # the server) cannot keep serving requester-scoped connections.
-        _oauth_protected_servers.clear()
+    from tools.registry import registry
 
-    # Fast path: nothing to shut down. The connect-cooldown maps can still
-    # be populated here — a server that failed to connect is never recorded
-    # in ``_servers`` (that is the very premise of the #50394 cooldown), so
-    # "no live servers" is the MOST likely state in which stale backoff
-    # entries exist. Clear them so a post-shutdown restart re-attempts every
-    # configured server immediately.
-    if not servers_snapshot:
-        with _lock:
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
-        _stop_mcp_loop()
+    with _lock:
+        if logical_names is None:
+            targets = list(dict.fromkeys(
+                list(_lazy_server_configs)
+                + list(_lazy_server_tool_names)
+                + list(_lazy_server_fingerprints)
+            ))
+        else:
+            targets = list(logical_names)
+        names_by_server = {
+            name: list(_lazy_server_tool_names.pop(name, None) or [])
+            for name in targets
+        }
+        for name in targets:
+            _lazy_server_configs.pop(name, None)
+            _lazy_server_fingerprints.pop(name, None)
+            _oauth_protected_servers.discard(name)
+        live_held: set = set()
+        for srv in _servers.values():
+            live_held.update(getattr(srv, "_registered_tool_names", None) or [])
+    for tool_names in names_by_server.values():
+        for tool_name in tool_names:
+            if tool_name in live_held:
+                continue
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
+
+
+def _close_mcp_tasks(servers: list) -> None:
+    """Signal each task to exit its transport context. Does not clear ``_servers``."""
+    if not servers:
         return
 
     async def _shutdown():
         results = await asyncio.gather(
-            *(server.shutdown() for server in servers_snapshot),
+            *(server.shutdown() for server in servers),
             return_exceptions=True,
         )
-        for server, result in zip(servers_snapshot, results):
+        for server, result in zip(servers, results):
             if isinstance(result, Exception):
                 logger.debug(
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
-        with _lock:
-            _servers.clear()
-            # Drop connect-retry cooldowns too: a full shutdown/restart
-            # should re-attempt every server immediately, not honour a
-            # stale per-server backoff from before the restart (#50394).
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -8740,15 +8818,121 @@ def shutdown_mcp_servers():
             except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
 
-    # Unconditional final sweep: whether the async ``_shutdown`` ran,
-    # timed out, or was never scheduled (loop already stopped), a full
-    # shutdown must leave no stale connect-cooldown state behind — the
-    # next start should re-attempt every server immediately (#50394).
+
+def _pop_mcp_server_keys(keys) -> None:
     with _lock:
+        for key in keys:
+            _servers.pop(key, None)
+            _server_connecting.discard(key)
+            _server_connect_errors.pop(key, None)
+            _server_connect_retry_after.pop(key, None)
+            _server_connect_failures.pop(key, None)
+
+
+def shutdown_mcp_servers():
+    """Close all MCP server connections and stop the background loop.
+
+    Each server Task is signalled to exit its ``async with`` block so that
+    the anyio cancel-scope cleanup happens in the same Task that opened it.
+    All servers are shut down in parallel via ``asyncio.gather``.
+
+    Also purges cache-backed lazy templates so a server deleted from
+    config.yaml cannot remain callable after ``/reload-mcp``.
+    """
+    with _lock:
+        servers_snapshot = list(_servers.values())
+        keys_snapshot = list(_servers.keys())
+        # Auth classification is rebuilt on the next register/discover pass.
+        # Clearing here so a reload that drops ``auth: oauth`` (or removes
+        # the server) cannot keep serving requester-scoped connections.
+        _oauth_protected_servers.clear()
+
+    # Fast path: nothing to shut down. The connect-cooldown maps can still
+    # be populated here — a server that failed to connect is never recorded
+    # in ``_servers`` (that is the very premise of the #50394 cooldown), so
+    # "no live servers" is the MOST likely state in which stale backoff
+    # entries exist. Clear them so a post-shutdown restart re-attempts every
+    # configured server immediately. Lazy templates must still be purged:
+    # a cache-only OAuth server has no live task.
+    if not servers_snapshot:
+        with _lock:
+            _server_connect_retry_after.clear()
+            _server_connect_failures.clear()
+        _purge_lazy_mcp_templates()
+        _stop_mcp_loop()
+        return
+
+    _close_mcp_tasks(servers_snapshot)
+    _pop_mcp_server_keys(keys_snapshot)
+    with _lock:
+        _servers.clear()
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
-
+    _purge_lazy_mcp_templates()
     _stop_mcp_loop()
+
+
+def reload_mcp_connections() -> None:
+    """Shutdown policy for ``/reload-mcp``.
+
+    Shared mode and unbound callers take the full ``shutdown_mcp_servers``
+    path. In ``per_user`` with a bound requester, other principals' OAuth
+    sessions stay up; this requester's OAuth connections, process-level
+    (non-OAuth) connections, and every identity of a server no longer in
+    config.yaml are recycled.
+    """
+    from tools.mcp_oauth_identity import (
+        IDENTITY_MODE_PER_USER,
+        configured_identity_mode,
+        principal_from_bound_fields,
+        resolve_mcp_oauth_scope,
+    )
+
+    configured = set(_load_mcp_config() or {})
+    requester_scope = None
+    if configured_identity_mode() == IDENTITY_MODE_PER_USER:
+        try:
+            from gateway.session_context import get_bound_session_principal
+
+            bound = get_bound_session_principal()
+        except Exception:
+            bound = None
+        if bound is not None:
+            try:
+                requester_scope = resolve_mcp_oauth_scope(
+                    identity_mode=IDENTITY_MODE_PER_USER,
+                    principal=principal_from_bound_fields(
+                        bound.platform, bound.scope_id, bound.user_id
+                    ),
+                    uses_oauth=True,
+                )
+            except Exception:
+                requester_scope = None
+
+    with _lock:
+        live = dict(_servers)
+        lazy_names = set(_lazy_server_configs)
+    keys = _reload_shutdown_keys(configured, live, requester_scope)
+    if keys is None:
+        shutdown_mcp_servers()
+        return
+
+    to_close = [live[k] for k in keys if k in live]
+    _close_mcp_tasks(to_close)
+    _pop_mcp_server_keys(keys)
+    removed = {
+        _logical_mcp_server_name(k, live[k])
+        for k in keys
+        if k in live and _logical_mcp_server_name(k, live[k]) not in configured
+    }
+    removed.update(name for name in lazy_names if name not in configured)
+    if removed:
+        _purge_lazy_mcp_templates(removed)
+    if not _servers:
+        with _lock:
+            _server_connect_retry_after.clear()
+            _server_connect_failures.clear()
+        _stop_mcp_loop()
 
 
 def _kill_orphaned_mcp_children(

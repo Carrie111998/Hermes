@@ -23904,23 +23904,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     async def _execute_mcp_reload(self, event: MessageEvent) -> str:
-        """Actually disconnect, reconnect, and notify MCP tool changes.
+        """Recycle MCP connections, reconnect, and notify tool changes.
 
         Split out from ``_handle_reload_mcp_command`` so the confirmation
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
+
+        Uses ``reload_mcp_connections`` so a ``per_user`` requester cannot
+        tear down another principal's live OAuth session.
         """
         loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import reload_mcp_connections, discover_mcp_tools, _servers, _lock
 
             # Capture old server names before shutdown
             with _lock:
                 old_servers = set(_servers.keys())
 
-            # Read new config before shutting down, so we know what will be added/removed
-            # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            # Recycle connections under the /reload-mcp policy: full wipe in
+            # shared/unbound mode; in per_user, other principals' OAuth
+            # sessions stay up (Alice must not disconnect Bob).
+            await loop.run_in_executor(None, reload_mcp_connections)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
             new_tools = await loop.run_in_executor(None, discover_mcp_tools)

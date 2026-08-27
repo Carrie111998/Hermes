@@ -14166,13 +14166,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._reload_mcp()
 
     def _reload_mcp(self):
-        """Reload MCP servers: disconnect all, re-read config.yaml, reconnect.
+        """Reload MCP servers: recycle connections, re-read config.yaml, reconnect.
 
-        After reconnecting, refreshes the agent's tool list so the model
-        sees the updated tools on the next turn.
+        Unbound CLI/TUI (and shared mode) disconnect every live server.
+        A bound ``per_user`` gateway request leaves other principals'
+        OAuth sessions up. After reconnecting, refreshes the agent's tool
+        list so the model sees the updated tools on the next turn.
         """
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import reload_mcp_connections, discover_mcp_tools, _servers, _lock
 
             # Capture old server names
             with _lock:
@@ -14181,8 +14183,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not self._command_running:
                 print("🔄 Reloading MCP servers...")
 
-            # Shutdown existing connections
-            shutdown_mcp_servers()
+            reload_mcp_connections()
 
             # Reconnect (reads config.yaml fresh)
             new_tools = discover_mcp_tools()
