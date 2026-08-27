@@ -21570,6 +21570,31 @@ def main(
                         ):
                             cli.session_id = cli.agent.session_id
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        # A dispatched Kanban worker has one durable run id. Persist
+                        # the finalizer's absolute session totals against that exact
+                        # row before process exit; an unavailable usage report remains
+                        # explicit rather than being fabricated as zero.
+                        if isinstance(result, dict) and os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_KANBAN_RUN_ID"):
+                            try:
+                                from hermes_cli.kanban_db import RunAccounting, connect_closing, record_run_accounting
+                                with connect_closing() as _kanban_conn:
+                                    record_run_accounting(
+                                        _kanban_conn,
+                                        task_id=os.environ["HERMES_KANBAN_TASK"],
+                                        run_id=int(os.environ["HERMES_KANBAN_RUN_ID"]),
+                                        accounting=RunAccounting(
+                                            provider=result.get("provider"), model=result.get("model"),
+                                            service_tier=result.get("service_tier"),
+                                            input_tokens=result.get("input_tokens"), output_tokens=result.get("output_tokens"),
+                                            cache_read_tokens=result.get("cache_read_tokens"),
+                                            cache_write_tokens=result.get("cache_write_tokens"),
+                                            reasoning_tokens=result.get("reasoning_tokens"),
+                                            actual_cost_usd=result.get("actual_cost_usd"),
+                                            usage_status="reported" if result.get("total_tokens") is not None else "unavailable",
+                                        ),
+                                    )
+                            except Exception:
+                                logger.exception("failed to persist Kanban run accounting")
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout
