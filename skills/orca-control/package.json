@@ -1,0 +1,32 @@
+{
+  "name": "orca-control-skill",
+  "version": "1.0.0",
+  "description": "Manage, orchestrate, inspect, and automate the Orca IDE and Multi-Agent Runtime Server.",
+  "main": "SKILL.md",
+  "author": {
+    "name": "Rafa Martins",
+    "email": "rafacpti@gmail.com",
+    "url": "https://github.com/rafacpti23"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rafacpti23/orca-control-skill.git"
+  },
+  "keywords": [
+    "hermes-skill",
+    "clawhub-skill",
+    "orca",
+    "multi-agent",
+    "orchestration",
+    "devops",
+    "worktrees",
+    "terminals",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "clawhub": {
+    "category": "devops",
+    "entry": "SKILL.md",
+    "platforms": ["linux"]
+  }
+}
