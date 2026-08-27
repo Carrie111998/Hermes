@@ -26,6 +26,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
+from contextvars import ContextVar
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -97,6 +98,10 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
     "non_conversational_history",
 })
+_DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT = ContextVar(
+    "discord_image_download_budget",
+    default=None,
+)
 _DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DISCORD_IMAGE_MAX_REDIRECTS = 10
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
@@ -181,6 +186,7 @@ async def _read_url_image_with_redirect_guard(
     *,
     timeout: Any,
     request_kwargs: Dict[str, Any],
+    download_budget: Any = None,
 ) -> Tuple[int, bytes, Dict[str, str]]:
     """Read an image URL while re-checking every redirect target for SSRF."""
     current_url = url
@@ -209,10 +215,25 @@ async def _read_url_image_with_redirect_guard(
                 continue
 
             return status, await _read_response_bytes_bounded(
-                resp, _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES
+                resp,
+                _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
+                download_budget=download_budget,
             ), headers
 
     raise ValueError("Too many image URL redirects")
+
+
+def _discord_image_extension_from_bytes(data: bytes) -> Optional[str]:
+    """Return the supported image extension based on the body magic bytes."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
 
 
 def _create_discord_image_http_client(proxy_url: Optional[str] = None) -> Any:
@@ -4051,6 +4072,21 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         return SendResult(success=True, message_id=str(msg.id))
 
+    async def _send_multiple_images_via_base_with_budget(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]],
+        human_delay: float,
+        download_budget: Any,
+    ) -> None:
+        """Run the per-image fallback without escaping the batch budget."""
+        token = _DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT.set(download_budget)
+        try:
+            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+        finally:
+            _DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT.reset(token)
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -4072,12 +4108,22 @@ class DiscordAdapter(BasePlatformAdapter):
         if not images:
             return
 
+        image_download_budget = _DiscordImageDownloadBudget(
+            _DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES
+        )
+
         try:
             import discord as _discord_mod
             import io as _io
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await self._send_multiple_images_via_base_with_budget(
+                chat_id,
+                images,
+                metadata,
+                human_delay,
+                image_download_budget,
+            )
             return
 
         try:
@@ -4089,7 +4135,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await self._send_multiple_images_via_base_with_budget(
+                chat_id,
+                images,
+                metadata,
+                human_delay,
+                image_download_budget,
+            )
             return
 
         CHUNK = 10
@@ -4127,6 +4179,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                 image_url,
                                 timeout=30.0,
                                 request_kwargs={},
+                                download_budget=image_download_budget,
                             )
                             if status != 200:
                                 logger.warning(
@@ -4134,14 +4187,9 @@ class DiscordAdapter(BasePlatformAdapter):
                                     self.name, status, image_url[:80],
                                 )
                                 continue
-                            ct = headers.get("content-type", "image/png")
-                            ext = "png"
-                            if "jpeg" in ct or "jpg" in ct:
-                                ext = "jpg"
-                            elif "gif" in ct:
-                                ext = "gif"
-                            elif "webp" in ct:
-                                ext = "webp"
+                            ext = _discord_image_extension_from_bytes(data)
+                            if ext is None:
+                                raise ValueError("Downloaded response is not a supported image")
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
@@ -4171,7 +4219,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name, chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                await self._send_multiple_images_via_base_with_budget(
+                    chat_id,
+                    chunk,
+                    metadata,
+                    human_delay,
+                    image_download_budget,
+                )
             finally:
                 if image_http_client is not None:
                     try:
@@ -5439,25 +5493,21 @@ class DiscordAdapter(BasePlatformAdapter):
             # (Discord renders attachments inline, unlike plain URLs)
             from gateway.platforms.base import resolve_proxy_url
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            download_budget = _DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT.get()
             async with _create_discord_image_http_client(_proxy) as client:
-                status, image_data, headers = await _read_url_image_with_redirect_guard(
+                status, image_data, _headers = await _read_url_image_with_redirect_guard(
                     client,
                     image_url,
                     timeout=30.0,
                     request_kwargs={},
+                    download_budget=download_budget,
                 )
                 if status != 200:
                     raise Exception(f"Failed to download image: HTTP {status}")
 
-                # Determine filename from URL or content type
-                content_type = headers.get("content-type", "image/png")
-                ext = "png"
-                if "jpeg" in content_type or "jpg" in content_type:
-                    ext = "jpg"
-                elif "gif" in content_type:
-                    ext = "gif"
-                elif "webp" in content_type:
-                    ext = "webp"
+                ext = _discord_image_extension_from_bytes(image_data)
+                if ext is None:
+                    raise ValueError("Downloaded response is not a supported image")
 
                 import io
                 file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
@@ -5518,15 +5568,33 @@ class DiscordAdapter(BasePlatformAdapter):
             # (Discord renders .gif attachments as auto-playing animations inline)
             from gateway.platforms.base import resolve_proxy_url
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            download_budget = _DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT.get()
             async with _create_discord_image_http_client(_proxy) as client:
                 status, animation_data, _headers = await _read_url_image_with_redirect_guard(
                     client,
                     animation_url,
                     timeout=30.0,
                     request_kwargs={},
+                    download_budget=download_budget,
                 )
                 if status != 200:
                     raise Exception(f"Failed to download animation: HTTP {status}")
+
+                ext = _discord_image_extension_from_bytes(animation_data)
+                if ext != "gif":
+                    logger.warning(
+                        "[%s] Downloaded animation response is not a GIF: %s",
+                        self.name,
+                        animation_url[:80],
+                    )
+                    return await BasePlatformAdapter.send_image(
+                        self,
+                        chat_id,
+                        animation_url,
+                        caption,
+                        reply_to,
+                        metadata=metadata,
+                    )
 
                 import io
                 file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
@@ -5550,7 +5618,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name,
                 exc_info=True,
             )
-            return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
+            return await BasePlatformAdapter.send_image(
+                self,
+                chat_id,
+                animation_url,
+                caption,
+                reply_to,
+                metadata=metadata,
+            )
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send animation attachment, falling back to URL: %s",
@@ -5558,7 +5633,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
+            return await BasePlatformAdapter.send_image(
+                self,
+                chat_id,
+                animation_url,
+                caption,
+                reply_to,
+                metadata=metadata,
+            )
 
     async def send_video(
         self,
@@ -9879,13 +9961,54 @@ _DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES = 1 * 1024 * 1024
 _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # generous limit for images/animations
+_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
+
+
+class _DiscordImageDownloadBudget:
+    """Track remote response bytes across one outbound image batch."""
+
+    def __init__(self, limit_bytes: int):
+        self.limit_bytes = limit_bytes
+        self.bytes_read = 0
+
+    def _raise_exhausted(self, detail: str = "") -> None:
+        suffix = f" ({detail})" if detail else ""
+        raise ValueError(
+            f"Cumulative image response body exceeded {self.limit_bytes} bytes{suffix}"
+        )
+
+    def check_response(self, declared_length: Optional[int]) -> None:
+        """Reject a response that cannot fit without consuming its iterator."""
+        if self.bytes_read >= self.limit_bytes:
+            self._raise_exhausted()
+        if (
+            declared_length is not None
+            and declared_length > self.limit_bytes - self.bytes_read
+        ):
+            # The body was not read, so leave cumulative accounting unchanged.
+            self._raise_exhausted(f"{declared_length} bytes declared")
+
+    def account(self, byte_count: int) -> None:
+        """Account a streamed chunk before callers can retain or upload it."""
+        if byte_count <= 0:
+            return
+        if self.bytes_read >= self.limit_bytes:
+            self._raise_exhausted()
+        self.bytes_read += byte_count
+        if self.bytes_read > self.limit_bytes:
+            self._raise_exhausted(f"{self.bytes_read} bytes read")
 
 
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
     _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
 
 
-async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
+async def _read_response_bytes_bounded(
+    resp: Any,
+    limit_bytes: int,
+    *,
+    download_budget: Any = None,
+) -> bytes:
     """Read an httpx streaming response body with an aggregate byte limit."""
     headers = getattr(resp, "headers", {}) or {}
     declared_length = None
@@ -9922,9 +10045,22 @@ async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
             f"({declared_length} bytes declared)"
         )
 
+    if download_budget is not None:
+        try:
+            download_budget.check_response(declared_length)
+        except ValueError:
+            await close_response()
+            raise
+
     chunks = []
     total_bytes = 0
     async for chunk in resp.aiter_bytes():
+        if download_budget is not None:
+            try:
+                download_budget.account(len(chunk))
+            except ValueError:
+                await close_response()
+                raise
         total_bytes += len(chunk)
         if total_bytes > limit_bytes:
             await close_response()

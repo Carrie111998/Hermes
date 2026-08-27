@@ -8,7 +8,9 @@ in the Discord adapter that were left unbounded.
 import asyncio
 import socket
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,7 +19,10 @@ from plugins.platforms.discord.adapter import (
     _create_discord_image_http_client,
     _read_response_bytes_bounded,
     _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
+    DiscordAdapter,
 )
+from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
 from tools.url_safety import (
     SSRFConnectionBlocked,
     _reset_allow_private_cache,
@@ -143,6 +148,173 @@ def _read_url_image(response: _FakeResponse) -> tuple[int, bytes, dict[str, str]
     assert request_kwargs["timeout"] is timeout
     assert request_kwargs["follow_redirects"] is False
     return result
+
+
+class _ImageBodyResponse:
+    status_code = 200
+
+    def __init__(self, body: bytes, headers: dict[str, str] | None = None):
+        self.headers = headers or {}
+        self.body = body
+
+    async def __aenter__(self) -> "_ImageBodyResponse":
+        return self
+
+    async def __aexit__(self, *_args: object) -> bool:
+        return False
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        yield self.body
+
+
+class _ImageBodyClient:
+    def __init__(self, response: _ImageBodyResponse):
+        self.response = response
+
+    def stream(self, method: str, url: str, **kwargs: Any) -> _ImageBodyResponse:
+        assert method == "GET"
+        assert kwargs["follow_redirects"] is False
+        return self.response
+
+    async def __aenter__(self) -> "_ImageBodyClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> bool:
+        return False
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _make_send_image_adapter(client: _ImageBodyClient, *, forum: bool = False):
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id="sent")),
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=channel),
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+    adapter._is_forum_parent = MagicMock(return_value=forum)
+    return adapter, channel
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "extension"),
+    [
+        (b"\x89PNG\r\n\x1a\npng-body", "png"),
+        (b"\xff\xd8\xff\xe0jpeg-body", "jpg"),
+        (b"GIF87agif-body", "gif"),
+        (b"GIF89agif-body", "gif"),
+        (b"RIFF\x00\x00\x00\x00WEBPwebp-body", "webp"),
+    ],
+)
+async def test_send_image_uses_image_magic_bytes_for_filename(
+    monkeypatch, body: bytes, extension: str
+):
+    response = _ImageBodyResponse(body, {"Content-Type": "image/png"})
+    client = _ImageBodyClient(response)
+    adapter, channel = _make_send_image_adapter(client)
+    file_cls = MagicMock()
+
+    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        discord_adapter,
+        "_create_discord_image_http_client",
+        lambda _proxy: client,
+    )
+    monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+
+    result = await adapter.send_image("123", "https://cdn.example.test/asset.png")
+
+    assert result.success
+    assert file_cls.call_args.kwargs["filename"] == f"image.{extension}"
+    channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"<html>not an image</html>", b'{"error":"nope"}'])
+async def test_send_image_does_not_upload_non_image_bytes_despite_image_content_type(
+    monkeypatch, body: bytes
+):
+    response = _ImageBodyResponse(body, {"Content-Type": "image/png"})
+    client = _ImageBodyClient(response)
+    adapter, channel = _make_send_image_adapter(client)
+    file_cls = MagicMock()
+
+    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        discord_adapter,
+        "_create_discord_image_http_client",
+        lambda _proxy: client,
+    )
+    monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+
+    result = await adapter.send_image("123", "https://cdn.example.test/asset.png")
+
+    assert result.success
+    file_cls.assert_not_called()
+    assert all(
+        "file" not in call.kwargs and "files" not in call.kwargs
+        for call in channel.send.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_animation_requires_gif_magic(monkeypatch):
+    response = _ImageBodyResponse(
+        b"\x89PNG\r\n\x1a\nnot-a-gif",
+        {"Content-Type": "image/gif"},
+    )
+    client = _ImageBodyClient(response)
+    adapter, channel = _make_send_image_adapter(client)
+    file_cls = MagicMock()
+
+    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        discord_adapter,
+        "_create_discord_image_http_client",
+        lambda _proxy: client,
+    )
+    monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+
+    result = await adapter.send_animation("123", "https://cdn.example.test/asset.gif")
+
+    assert result.success
+    file_cls.assert_not_called()
+    assert all(
+        "file" not in call.kwargs and "files" not in call.kwargs
+        for call in channel.send.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_forum_starter_does_not_receive_invalid_image_body(monkeypatch):
+    response = _ImageBodyResponse(
+        b"<html>not an image</html>",
+        {"Content-Type": "image/jpeg"},
+    )
+    client = _ImageBodyClient(response)
+    adapter, _channel = _make_send_image_adapter(client, forum=True)
+    adapter.send = AsyncMock(return_value=SendResult(success=True))
+    adapter._forum_post_file = AsyncMock()
+    file_cls = MagicMock()
+
+    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        discord_adapter,
+        "_create_discord_image_http_client",
+        lambda _proxy: client,
+    )
+    monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+
+    result = await adapter.send_image("123", "https://cdn.example.test/asset.jpg")
+
+    assert result.success
+    file_cls.assert_not_called()
+    adapter._forum_post_file.assert_not_awaited()
+    adapter.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
