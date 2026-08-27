@@ -617,7 +617,7 @@ def _resolve_cua_driver_app_path(driver_cmd: str) -> Optional[str]:
 # suffixed identifier ("com.trycua.driver.evil") or a different non-empty
 # team is an impostor bundle, not a variant.
 _CUA_DRIVER_BUNDLE_ID = "com.trycua.driver"
-_CUA_DRIVER_TEAM_ID = "4YEC26S9KF"
+_CUA_DRIVER_TEAM_ID = "YCK386LBJ7"
 
 
 def _validate_cua_driver_app_signature(app_path: str) -> None:
