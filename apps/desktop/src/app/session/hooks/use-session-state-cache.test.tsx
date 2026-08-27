@@ -29,6 +29,7 @@ import {
   setSessionTileDelegate
 } from '@/store/session-states'
 
+import { createPersistedDisplayTranscriptProvenance } from './use-session-actions/transcript-provenance'
 import { useSessionStateCache } from './use-session-state-cache'
 
 type Cache = ReturnType<typeof useSessionStateCache>
@@ -84,6 +85,33 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     expect($activeSessionStoredIdRotation.get()).toBeNull()
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
+  })
+
+  it('clears transcript provenance when the stored session id rotates', () => {
+    let cache!: Cache
+
+    render(<Harness activeSessionId={null} onReady={value => (cache = value)} selectedStoredSessionId={null} />)
+
+    act(() => {
+      cache.updateSessionState(
+        'runtime-A',
+        state => ({
+          ...state,
+          transcriptProvenance: createPersistedDisplayTranscriptProvenance({
+            storedSessionId: 'stored-A',
+            lineageRootId: 'root-A',
+            scope: { connectionId: 'remote-1', profile: 'work' }
+          })
+        }),
+        'stored-A'
+      )
+      cache.updateSessionState('runtime-A', state => state, 'stored-A-next')
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')).toMatchObject({
+      storedSessionId: 'stored-A-next',
+      transcriptProvenance: undefined
+    })
   })
 })
 

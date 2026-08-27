@@ -142,7 +142,7 @@ export function useSessionStateCache({
           // Stored id changed (e.g. auto-compression rotated it). Create a NEW
           // state object rather than mutating in place — updateSessionState needs
           // the PREVIOUS state to detect transitions (busy→idle, id rotation).
-          const updated = { ...existing, storedSessionId }
+          const updated = { ...existing, storedSessionId, transcriptProvenance: undefined }
 
           // Drop the obsolete stored→runtime reverse mapping as soon as the id
           // rotates (e.g. auto-compression forks a continuation). Leaving the

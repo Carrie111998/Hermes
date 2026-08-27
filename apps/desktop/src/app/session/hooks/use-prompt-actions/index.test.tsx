@@ -4,6 +4,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { PersistedDisplayTranscriptProvenance } from '@/app/types'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -30,6 +31,7 @@ import { dropSessionState, publishSessionState } from '@/store/session-states'
 import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
+import { createPersistedDisplayTranscriptProvenance } from '../use-session-actions/transcript-provenance'
 import { clearSingleFlightSessionResumeState } from './single-flight-resume'
 import type { SubmitTextOptions } from './utils'
 
@@ -121,6 +123,7 @@ function Harness({
   resumeStoredSession,
   runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRefProp,
   seedMessages,
+  seedTranscriptProvenance,
   seedStreamId,
   seedTurnStartedAt,
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
@@ -146,6 +149,7 @@ function Harness({
   resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   seedMessages?: unknown[]
+  seedTranscriptProvenance?: PersistedDisplayTranscriptProvenance
   seedStreamId?: null | string
   seedTurnStartedAt?: null | number
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
@@ -177,6 +181,7 @@ function Harness({
 
   const stateRef = useRef({
     messages: seedMessages ?? [],
+    transcriptProvenance: seedTranscriptProvenance,
     busy: false,
     awaitingResponse: false,
     interrupted: true,
@@ -710,6 +715,46 @@ describe('usePromptActions /compress', () => {
 
     expect(renderedText).toContain('summarized context')
     expect(renderedText).toContain('sure, here is the summary')
+  })
+
+  it('clears persisted transcript provenance when manual compression replaces the transcript', async () => {
+    const states: Record<string, unknown>[] = []
+    const provenance = createPersistedDisplayTranscriptProvenance({
+      lineageRootId: 'root-A',
+      scope: undefined,
+      storedSessionId: RUNTIME_SESSION_ID
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        return {
+          messages: [
+            { content: 'compressed runtime prompt', role: 'user' },
+            { content: 'compressed runtime answer', role: 'assistant' }
+          ],
+          removed: 2
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={[{ id: 'persisted-base', parts: [textPart('persisted base')], role: 'user' }]}
+        seedTranscriptProvenance={provenance}
+      />
+    )
+
+    await handle!.submitText('/compress')
+
+    expect(JSON.stringify(states.at(-1)?.messages)).toContain('compressed runtime prompt')
+    expect(states.at(-1)?.transcriptProvenance).toBeUndefined()
   })
 
   it('uses the compute-host response transcript and success output', async () => {

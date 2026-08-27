@@ -582,7 +582,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             if (Array.isArray(result?.messages)) {
               updateSessionState(
                 sessionId,
-                state => ({ ...state, messages: toChatMessages(result.messages!) }),
+                state => ({
+                  ...state,
+                  messages: toChatMessages(result.messages!),
+                  transcriptProvenance: undefined
+                }),
                 storedSessionId
               )
             }
