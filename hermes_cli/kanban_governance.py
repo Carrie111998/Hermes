@@ -268,3 +268,86 @@ def materialize_maintainer_defect(
     
     return defect_id
 
+
+def scan_board_for_governance_defects(
+    conn: sqlite3.Connection,
+) -> list[GovernanceAnomaly]:
+    """Scan a board for governance defects and return detected anomalies.
+    
+    Iterates through all tasks on the board, detects governance anomalies,
+    and materializes maintainer defects for anomalies that haven't already
+    been defected (idempotently).
+    
+    Args:
+        conn: Database connection.
+    
+    Returns:
+        List of detected GovernanceAnomaly objects.
+    """
+    # Import here to avoid circular dependency
+    from hermes_cli import kanban_db as kb
+    
+    anomalies = []
+    
+    # Get all tasks on this board
+    tasks = kb.list_tasks(conn)
+    
+    for task in tasks:
+        # Check for governance anomalies
+        anomaly = classify_governance_anomaly(task)
+        if anomaly:
+            anomalies.append(anomaly)
+            
+            # Materialize the defect if it doesn't already exist
+            _ensure_maintainer_defect(conn, task.id, anomaly)
+    
+    return anomalies
+
+
+def _ensure_maintainer_defect(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    anomaly: GovernanceAnomaly,
+) -> None:
+    """Ensure a maintainer defect exists for the anomaly (idempotent).
+    
+    Creates a defect if one with the same fingerprint doesn't already exist
+    in an open state.
+    
+    Args:
+        conn: Database connection.
+        source_task_id: The task that triggered the anomaly.
+        anomaly: The detected GovernanceAnomaly.
+    """
+    # Import here to avoid circular dependency
+    from hermes_cli import kanban_db as kb
+    
+    # Fingerprint: unique identifier for this anomaly on this task
+    fingerprint = f"{source_task_id}:{anomaly.kind}"
+    
+    # Check if we already have an open defect with this fingerprint in body
+    existing_tasks = kb.list_tasks(
+        conn,
+        assignee="default",
+    )
+    
+    for task in existing_tasks:
+        if task.body and f"fingerprint: {fingerprint}" in task.body:
+            # Already have an open defect for this anomaly
+            return
+    
+    # Create new defect with fingerprint in body for idempotency
+    defect_body = (
+        f"Governance anomaly: {anomaly.reason}\n\n"
+        f"Source task: {source_task_id}\n"
+        f"Anomaly kind: {anomaly.kind}\n\n"
+        f"fingerprint: {fingerprint}"
+    )
+    
+    kb.create_task(
+        conn,
+        title=f"Governance defect: {anomaly.kind} on {source_task_id}",
+        body=defect_body,
+        assignee="default",
+    )
+
