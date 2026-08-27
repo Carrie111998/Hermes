@@ -1562,6 +1562,40 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # PE contract gate on the CLI mint path. The kanban-pe-gate plugin guards the
+    # kanban_create TOOL via pre_tool_call, but `hermes kanban create` does not route
+    # through the tool layer — so without this the gate covers agents and misses the
+    # CLI, which is exactly how 68/68 sampled cards got minted without a contract.
+    # Fails OPEN: a broken gate must never be the reason work cannot be minted.
+    # Escape hatch: HERMES_PE_GATE=off for a deliberate exception. The gate also
+    # stands down when HERMES_HOME is redirected (test harnesses and fixtures mint
+    # minimal cards on purpose; gating those tests the harness, not the factory).
+    _gate_on = os.environ.get("HERMES_PE_GATE", "").lower() not in ("off", "0", "false")
+    if _gate_on and os.environ.get("HERMES_HOME"):
+        _gate_on = Path(os.environ["HERMES_HOME"]).resolve() == (
+            Path.home() / ".hermes"
+        ).resolve()
+    if _gate_on:
+        try:
+            _pe_scripts = str(Path.home() / ".hermes" / "scripts")
+            if _pe_scripts not in sys.path:
+                sys.path.insert(0, _pe_scripts)
+            from pe_gate import gate_card as _gate_card
+
+            _ok, _feedback = _gate_card(args.body or "", verify_paths=False)
+        except Exception:
+            _ok, _feedback = True, ""
+        if not _ok:
+            print(
+                f"kanban: PE contract gate — card {args.title!r} was not minted.\n\n"
+                f"{_feedback}\n\n"
+                "A card is a CONTRACT, not a wish: GOAL / REFS / PROCEDURE / "
+                "DONE-CONDITION / FAIL.\n"
+                "DONE-CONDITION must be a measurement a third party can re-run.\n"
+                "Rewrite the body and run again, or set HERMES_PE_GATE=off to bypass.",
+                file=sys.stderr,
+            )
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
