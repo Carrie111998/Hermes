@@ -35,54 +35,38 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+_ORIG_WHICH = shutil.which
 
-# ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
+
+# ── Import-Time Sandbox Isolation ──────────────────────────────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
 # `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
 # So merely importing it - which many test modules do, directly or
 # transitively - points the whole pytest session's logging at the operator's
 # real `~/.hermes/logs/agent.log` and `errors.log`.
 #
-# The `_isolate_env` fixture below also sandboxes HERMES_HOME, but fixtures run
-# AFTER collection imports test modules, by which point the handler already
-# holds an absolute path to the real log. Measured on a live install: 126
-# warnings in the operator's agent.log came from test runs, not the gateway -
-# enough noise to make genuine warnings hard to find.
-#
-# conftest is imported before any test module, so setting it here closes that
-# window. The per-test fixture still applies for everything after import.
+# Similarly, watchdog and seal scripts inspect `HERMES_DOTFILES_DIR` and `HERMES_CONFIG`,
+# which if unset default to `~/Dev/dotfiles` and `~/.hermes/config.yaml`, polluting
+# real developer environments during test runs.
 #
 # ORDER MATTERS: the kanban write guard's deny-list (further down) must know
 # the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
 # otherwise the deny-list would point at the throwaway tempdir and the guard
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-_PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+_PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "").strip()
 _PRE_SANDBOX_DOTFILES_DIR = os.environ.get("HERMES_DOTFILES_DIR", "").strip()
 _PRE_SANDBOX_OBSIDIAN_VAULT = os.environ.get("OBSIDIAN_VAULT", "").strip()
 _PRE_SANDBOX_OBSIDIAN_VAULT_PATH = os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
 
-if not os.environ.get("HERMES_HOME"):
-    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
-    os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
-    atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
-
-if not os.environ.get("HERMES_DOTFILES_DIR"):
-    _SESSION_DOTFILES_DIR = tempfile.mkdtemp(prefix="hermes-test-dotfiles-")
-    os.environ["HERMES_DOTFILES_DIR"] = _SESSION_DOTFILES_DIR
-    atexit.register(shutil.rmtree, _SESSION_DOTFILES_DIR, True)
-
-if not os.environ.get("OBSIDIAN_VAULT"):
-    _SESSION_VAULT = tempfile.mkdtemp(prefix="hermes-test-vault-")
-    os.environ["OBSIDIAN_VAULT"] = _SESSION_VAULT
-    os.environ["OBSIDIAN_VAULT_PATH"] = _SESSION_VAULT
-    atexit.register(shutil.rmtree, _SESSION_VAULT, True)
-
-HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
-HERMES_DOTFILES_DIR_AT_CONFTEST_IMPORT = os.environ.get("HERMES_DOTFILES_DIR", "")
-OBSIDIAN_VAULT_AT_CONFTEST_IMPORT = os.environ.get("OBSIDIAN_VAULT", "")
-OBSIDIAN_VAULT_PATH_AT_CONFTEST_IMPORT = os.environ.get("OBSIDIAN_VAULT_PATH", "")
-
+# ── Deterministic runtime environment ──────────────────────────────────────
+os.environ["TZ"] = "UTC"
+os.environ["LANG"] = "C.UTF-8"
+os.environ["LC_ALL"] = "C.UTF-8"
+os.environ["PYTHONHASHSEED"] = "0"
+os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+os.environ["AWS_METADATA_SERVICE_TIMEOUT"] = "1"
+os.environ["AWS_METADATA_SERVICE_NUM_ATTEMPTS"] = "1"
 
 # ── Credential env-var filter ──────────────────────────────────────────────
 #
@@ -251,6 +235,9 @@ def _looks_like_credential(name: str) -> bool:
     return any(name.endswith(suf) for suf in _CREDENTIAL_SUFFIXES)
 
 
+_is_credential_var = _looks_like_credential
+
+
 # Strip credentials at conftest module-import time so collection imports cannot see real credentials
 for _name in list(os.environ.keys()):
     if _looks_like_credential(_name):
@@ -258,26 +245,6 @@ for _name in list(os.environ.keys()):
 
 
 # ── Sandbox HERMES_HOME, HERMES_DOTFILES_DIR, OBSIDIAN_VAULT before ANY test module is imported ──
-# `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
-# `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
-# So merely importing it - which many test modules do, directly or
-# transitively - points the whole pytest session's logging at the operator's
-# real `~/.hermes/logs/agent.log` and `errors.log`.
-#
-# Similarly, watchdog and seal scripts inspect `HERMES_DOTFILES_DIR` and `HERMES_CONFIG`,
-# which if unset default to `~/Dev/dotfiles` and `~/.hermes/config.yaml`, polluting
-# real developer environments during test runs.
-#
-# The `_hermetic_environment` fixture below also sandboxes these paths, but fixtures run
-# AFTER collection imports test modules, by which point handlers and module-level singletons
-# already hold paths.
-#
-# conftest is imported before any test module, so setting them here closes that window.
-#
-# ORDER MATTERS: the kanban write guard's deny-list (further down) must know
-# the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
-# otherwise the deny-list would point at the throwaway tempdir and the guard
-# would silently stop protecting the operator's actual ~/.hermes (#69385).
 _SESSION_SANDBOX_DIR = Path(tempfile.mkdtemp(prefix="hermes-test-sandbox-"))
 atexit.register(shutil.rmtree, str(_SESSION_SANDBOX_DIR), True)
 
@@ -672,6 +639,16 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     """Default Anthropic credential resolution away from the real macOS Keychain."""
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
         return None
+
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda cmd, *args, **kwargs: (
+            None
+            if cmd == "security"
+            else _ORIG_WHICH(cmd, *args, **kwargs)
+        ),
+    )
 
     try:
         import agent.anthropic_adapter as _anthropic_adapter
