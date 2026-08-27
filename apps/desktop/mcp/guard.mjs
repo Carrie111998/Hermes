@@ -52,7 +52,7 @@ export async function assertTargetAttested(cdp, opts) {
     const d = await cdp.eval(
       'globalThis.__DEBUG_MCP_INSTANCE__ ? globalThis.__DEBUG_MCP_INSTANCE__.dataRoot : null'
     )
-    realized = typeof d === 'string' ? d : (d && d.dataRoot) || null
+    realized = typeof d === 'string' ? d : d?.dataRoot ?? null
   } catch {
     realized = null
   }
