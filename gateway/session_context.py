@@ -445,6 +445,31 @@ def get_bound_session_principal() -> Optional[BoundSessionPrincipal]:
     )
 
 
+@contextmanager
+def apply_bound_session_principal(
+    principal: BoundSessionPrincipal,
+) -> Iterator[None]:
+    """Re-bind a previously captured principal in this task, then restore.
+
+    Used to carry gateway identity onto the dedicated MCP event-loop thread.
+    ``run_coroutine_threadsafe`` copies that thread's context, not the
+    scheduling thread's, so OAuth ``per_user`` capture would otherwise see
+    no requester (or a stale one). Tokens are reset, not cleared to ``""``,
+    so the loop thread does not retain the principal after the call.
+    """
+    tokens = (
+        _SESSION_PLATFORM.set(principal.platform),
+        _SESSION_SCOPE_ID.set(principal.scope_id),
+        _SESSION_USER_ID.set(principal.user_id),
+    )
+    try:
+        yield
+    finally:
+        _SESSION_USER_ID.reset(tokens[2])
+        _SESSION_SCOPE_ID.reset(tokens[1])
+        _SESSION_PLATFORM.reset(tokens[0])
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session context variable by its legacy ``HERMES_SESSION_*`` name.
 

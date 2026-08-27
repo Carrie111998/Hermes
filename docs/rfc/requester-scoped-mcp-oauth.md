@@ -59,6 +59,16 @@ decisions.
 10. **Subagents inherit the parent's bound principal** via ContextVar copy.
     Cron blanks identity and therefore fail-closes in `per_user`.
 
+11. **`_run_on_mcp_loop` copies the MCP loop thread's ContextVars, not the
+    agent's.** `run_coroutine_threadsafe` creates the task inside the loop
+    thread. Without an explicit wrap, `_capture_oauth_identity` (and any
+    `get_bound_session_principal()` inside connect) would fail closed on a
+    live gateway request, or worse inherit a stale loop-thread principal.
+    The scheduling thread's bound principal MUST be re-applied inside the
+    scheduled task (same hop as `HERMES_HOME` override). Identity is also
+    pinned on `MCPServerTask` in `start()` before `ensure_future(run())`
+    so reconnects never re-resolve ambient identity.
+
 ## Locked decisions
 
 | Topic | Decision |
@@ -74,6 +84,7 @@ decisions.
 | Registry key | `server_name` in shared; `server_name + \\x1f + persistence_key` in per_user |
 | Lookup | Exact key only. No "any connection named github" fallback |
 | CLI / TUI / desktop / cron in `per_user` | Fail closed with an actionable error when no bound principal |
+| MCP loop hop | `_run_on_mcp_loop` re-binds the caller's principal; `start()` pins it on the connection |
 | `hermes mcp remove` | Admin: may delete that server's artifacts across `by-user/*` |
 | Idle eviction / per-server override / HMAC path keys | Deferred |
 

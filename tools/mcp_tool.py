@@ -3950,7 +3950,11 @@ class MCPServerTask:
         self._config = config
         self.tool_timeout = _resolve_tool_timeout(config)
         self._auth_type = (config.get("auth") or "").lower().strip()
-        self._capture_oauth_identity(config)
+        # Prefer the identity pinned in start() on the wrapped MCP-loop
+        # task. Re-resolve only when run() is entered without start()
+        # (tests). Never overwrite a captured scope on reconnect.
+        if self._oauth_scope is None:
+            self._capture_oauth_identity(config)
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
 
@@ -4404,6 +4408,13 @@ class MCPServerTask:
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
+        # Pin OAuth identity on this (wrapped) task before ensure_future.
+        # run() copies this task's context, but the connection object must
+        # own the scope even if a later hop drops ContextVars.
+        self._config = config
+        self._auth_type = (config.get("auth") or "").lower().strip()
+        if self._oauth_scope is None:
+            self._capture_oauth_identity(config)
         self._task = asyncio.ensure_future(self.run(config))
         try:
             await self._ready.wait()
@@ -5720,6 +5731,34 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
+def _wrap_with_session_principal(coro: "Coroutine") -> "Coroutine":
+    """Carry the caller's bound requester identity onto the MCP loop.
+
+    Same hop as :func:`_wrap_with_home_override`: tasks scheduled via
+    ``run_coroutine_threadsafe`` copy the loop thread's ContextVars, not
+    the agent thread's. OAuth ``per_user`` capture in ``MCPServerTask``
+    would fail closed (or inherit a stale loop-thread principal) without
+    this wrap. No-op when no principal is bound.
+    """
+    try:
+        from gateway.session_context import (
+            apply_bound_session_principal,
+            get_bound_session_principal,
+        )
+
+        principal = get_bound_session_principal()
+    except Exception:
+        return coro
+    if principal is None:
+        return coro
+
+    async def _scoped():
+        with apply_bound_session_principal(principal):
+            return await coro
+
+    return _scoped()
+
+
 def _wrap_with_dashboard_oauth_flow(coro):
     """Propagate a dashboard OAuth flow onto the dedicated MCP loop task."""
     try:
@@ -5764,18 +5803,18 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
 
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
 
-    # Propagate the context-local HERMES_HOME override onto the MCP loop.
-    # Tasks scheduled via run_coroutine_threadsafe are created INSIDE the
-    # loop thread, so they copy the loop thread's context — not the
-    # scheduling thread's. A per-request profile scope (the dashboard's
-    # ?profile= endpoints, e.g. the MCP "Test server" probe) would silently
-    # vanish here: OAuth token stores and any other get_hermes_home()
-    # resolution inside the coroutine would read the process home instead
-    # of the selected profile's. Re-establish the override inside the
-    # task's own context (task-local — concurrent calls carrying different
-    # scopes don't interfere). No-op when no override is active.
+    # Propagate the context-local HERMES_HOME override AND the bound
+    # session principal onto the MCP loop. Tasks scheduled via
+    # run_coroutine_threadsafe are created INSIDE the loop thread, so they
+    # copy the loop thread's context — not the scheduling thread's. A
+    # per-request profile scope (dashboard ?profile=) or a gateway
+    # requester identity would silently vanish here: OAuth token stores
+    # would read the process home, and per_user capture would fail closed
+    # (or inherit a stale loop-thread principal). Wrappers are task-local
+    # so concurrent calls carrying different scopes don't interfere.
     coro = _wrap_with_home_override(coro)
     coro = _wrap_with_dashboard_oauth_flow(coro)
+    coro = _wrap_with_session_principal(coro)
 
     future = safe_schedule_threadsafe(
         coro, loop,
