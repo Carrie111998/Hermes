@@ -61,16 +61,26 @@ class FakeWriteStream extends EventEmitter {
   }
 }
 
-test('pumpStreamToFile streams chunks to the destination without buffering the whole body', async () => {
+test('pumpStreamToFile stages chunks and promotes only after the whole body succeeds', async () => {
   const res = new FakeResponse()
   const ws = new FakeWriteStream()
+  const created: string[] = []
   const unlinked: string[] = []
+  const renamed: Array<[string, string]> = []
 
   const promise = pumpStreamToFile(res as never, '/tmp/out.bin', {
-    createWriteStream: () => ws as never,
+    createWriteStream: p => {
+      created.push(p)
+
+      return ws as never
+    },
     unlink: async p => {
       unlinked.push(p)
-    }
+    },
+    rename: async (from, to) => {
+      renamed.push([from, to])
+    },
+    temporaryPath: () => '/tmp/out.bin.download'
   })
 
   res.emit('data', Buffer.from('abc'))
@@ -79,9 +89,11 @@ test('pumpStreamToFile streams chunks to the destination without buffering the w
 
   await promise
 
+  assert.deepEqual(created, ['/tmp/out.bin.download'])
   assert.equal(Buffer.concat(ws.chunks).toString('utf8'), 'abcdef')
   assert.equal(ws.ended, true)
-  assert.deepEqual(unlinked, []) // success -> no cleanup
+  assert.deepEqual(renamed, [['/tmp/out.bin.download', '/tmp/out.bin']])
+  assert.deepEqual(unlinked, [])
 })
 
 test('pumpStreamToFile applies backpressure: pauses on a full buffer and resumes on drain', async () => {
@@ -90,7 +102,9 @@ test('pumpStreamToFile applies backpressure: pauses on a full buffer and resumes
 
   const promise = pumpStreamToFile(res as never, '/tmp/out.bin', {
     createWriteStream: () => ws as never,
-    unlink: async () => {}
+    unlink: async () => {},
+    rename: async () => {},
+    temporaryPath: () => '/tmp/out.bin.download'
   })
 
   res.emit('data', Buffer.from('big-chunk'))
@@ -104,43 +118,84 @@ test('pumpStreamToFile applies backpressure: pauses on a full buffer and resumes
   await promise
 })
 
-test('pumpStreamToFile unlinks the partial file and rejects on a write error', async () => {
+test('pumpStreamToFile cleans only its staging file on a write error', async () => {
   const res = new FakeResponse()
   const ws = new FakeWriteStream()
+  const created: string[] = []
   const unlinked: string[] = []
+  const renamed: Array<[string, string]> = []
 
-  const promise = pumpStreamToFile(res as never, '/tmp/partial.bin', {
-    createWriteStream: () => ws as never,
+  const promise = pumpStreamToFile(res as never, '/tmp/existing.bin', {
+    createWriteStream: p => {
+      created.push(p)
+
+      return ws as never
+    },
     unlink: async p => {
       unlinked.push(p)
-    }
+    },
+    rename: async (from, to) => {
+      renamed.push([from, to])
+    },
+    temporaryPath: () => '/tmp/existing.bin.download'
   })
 
   res.emit('data', Buffer.from('abc'))
   ws.emit('error', new Error('ENOSPC: disk full'))
 
   await assert.rejects(promise, /disk full/)
-  assert.deepEqual(unlinked, ['/tmp/partial.bin'])
+  assert.deepEqual(created, ['/tmp/existing.bin.download'])
+  assert.deepEqual(unlinked, ['/tmp/existing.bin.download'])
+  assert.deepEqual(renamed, [])
   assert.equal(res.destroyed, true, 'source should be torn down on write failure')
 })
 
-test('pumpStreamToFile unlinks the partial file and rejects on a response error', async () => {
+test('pumpStreamToFile preserves the selected destination when the response fails', async () => {
   const res = new FakeResponse()
   const ws = new FakeWriteStream()
   const unlinked: string[] = []
+  const renamed: Array<[string, string]> = []
 
-  const promise = pumpStreamToFile(res as never, '/tmp/partial.bin', {
+  const promise = pumpStreamToFile(res as never, '/tmp/existing.bin', {
     createWriteStream: () => ws as never,
     unlink: async p => {
       unlinked.push(p)
-    }
+    },
+    rename: async (from, to) => {
+      renamed.push([from, to])
+    },
+    temporaryPath: () => '/tmp/existing.bin.download'
   })
 
   res.emit('data', Buffer.from('abc'))
   res.emit('error', new Error('socket hang up'))
 
   await assert.rejects(promise, /socket hang up/)
-  assert.deepEqual(unlinked, ['/tmp/partial.bin'])
+  assert.deepEqual(unlinked, ['/tmp/existing.bin.download'])
+  assert.deepEqual(renamed, [])
+})
+
+test('pumpStreamToFile removes staging and rejects if final promotion fails', async () => {
+  const res = new FakeResponse()
+  const ws = new FakeWriteStream()
+  const unlinked: string[] = []
+
+  const promise = pumpStreamToFile(res as never, '/tmp/existing.bin', {
+    createWriteStream: () => ws as never,
+    unlink: async p => {
+      unlinked.push(p)
+    },
+    rename: async () => {
+      throw new Error('rename failed')
+    },
+    temporaryPath: () => '/tmp/existing.bin.download'
+  })
+
+  res.emit('data', Buffer.from('complete'))
+  res.emit('end')
+
+  await assert.rejects(promise, /rename failed/)
+  assert.deepEqual(unlinked, ['/tmp/existing.bin.download'])
 })
 
 test('parseDataUrlToBuffer decodes base64 payloads', () => {
@@ -174,7 +229,7 @@ test('filenameFromContentDisposition prefers filename* and reduces to a basename
 test('gatewayFilePath normalizes bare paths and file:// URLs', () => {
   assert.equal(gatewayFilePath('/Users/me/report.md'), '/Users/me/report.md')
   assert.equal(gatewayFilePath('file:///Users/me/a%20b.md'), '/Users/me/a b.md')
-  assert.equal(gatewayFilePath(''), '')
+  assert.equal(gatewayFilePath('',), '')
   assert.equal(gatewayFilePath(null), '')
 })
 
