@@ -228,6 +228,21 @@ class TestProfileScopedModel:
         """A stale effective snapshot cannot replace newer raw auxiliary pins."""
         import hermes_cli.web_server as web_server
 
+        default_config = isolated_profiles["default"] / "config.yaml"
+        default_config.write_text(
+            yaml.safe_dump(
+                {
+                    "auxiliary": {
+                        "curator": {
+                            "provider": "openrouter",
+                            "model": "default/curator",
+                            "reasoning_effort": "low",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         worker_config = isolated_profiles["worker_beta"] / "config.yaml"
         worker_config.write_text(
             yaml.safe_dump(
@@ -278,6 +293,43 @@ class TestProfileScopedModel:
             "model": "grok-4.6",
             "reasoning_effort": "high",
         }
+
+    def test_main_assignment_does_not_materialize_default_auxiliary_config(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """Raw auxiliary removal wins over a stale default-expanded snapshot."""
+        import hermes_cli.web_server as web_server
+
+        original_load_config = web_server.load_config
+        load_count = 0
+
+        def stale_load_config():
+            nonlocal load_count
+            load_count += 1
+            config = original_load_config()
+            if load_count == 1:
+                config["auxiliary"]["curator"] = {
+                    "provider": "xai-oauth",
+                    "model": "stale/curator",
+                    "reasoning_effort": "high",
+                }
+            return config
+
+        monkeypatch.setattr(web_server, "load_config", stale_load_config)
+
+        resp = client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "openrouter",
+                "model": "test/model-1",
+                "confirm_expensive_model": True,
+                "profile": "worker_beta",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "auxiliary" not in _cfg(isolated_profiles["worker_beta"])
 
     def test_model_set_main_scoped(self, client, isolated_profiles):
         resp = client.post(

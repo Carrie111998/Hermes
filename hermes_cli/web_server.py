@@ -7707,14 +7707,14 @@ def _apply_model_assignment_sync(
                 # must never block saving the model assignment.
                 _log.debug("apply_nous_managed_defaults skipped", exc_info=True)
 
-        # A main-model assignment owns only ``model`` (plus the explicit Nous
-        # tool defaults above). ``load_config`` is a cached, default-expanded
-        # snapshot and can lag a CLI/API write to an auxiliary slot; saving that
-        # whole snapshot would turn a pinned provider/model back into auto/empty.
-        # Re-read the raw auxiliary section at the write boundary so unrelated
-        # per-task pins remain authoritative. The mutation lock also prevents a
-        # concurrent REST config save from interleaving between the re-read and
-        # the atomic write.
+        # ``load_config`` is a cached, default-expanded snapshot and can lag a
+        # CLI/API write to an auxiliary slot; saving that whole snapshot would
+        # turn a pinned provider/model back into auto/empty. Re-read the raw
+        # auxiliary section at the write boundary so those independent per-task
+        # assignments remain authoritative. This is deliberately a targeted
+        # guard: other sections keep this endpoint's existing effective-snapshot
+        # write semantics. The mutation lock also prevents a concurrent REST
+        # config save from interleaving between the re-read and atomic write.
         with _CONFIG_MUTATION_LOCK:
             raw_config = read_raw_config()
             if "auxiliary" in raw_config:
