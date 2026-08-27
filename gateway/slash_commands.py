@@ -1722,7 +1722,10 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _platformize_command_mentions
         from hermes_cli.slash_exec import CommandContext, execute_command
 
-        reply = execute_command("help", CommandContext(surface="gateway"))
+        reply = execute_command(
+            "help",
+            CommandContext(surface="gateway", args=event.get_command_args()),
+        )
         return _platformize_command_mentions(
             reply.text,
             getattr(getattr(event, "source", None), "platform", None),
