@@ -77,3 +77,26 @@ test('BUG #5: late response after timeout does not resolve a dead promise or cra
   assert.doesNotThrow(() => ws._emit('message', { data: JSON.stringify({ id: reply.id, result: {} }) }))
   assert.equal(cdp.pending.size, 0)
 })
+
+test('A5 (RED): eval tolerates a response without a result payload', async () => {
+  const ws = silentWs()
+  const cdp = new CDP(ws)
+  ws.addEventListener('message', ev => {
+    const m = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString('utf8'))
+    if (m.id != null && cdp.pending.has(m.id)) {
+      const { resolve, reject } = cdp.pending.get(m.id)
+      cdp.pending.delete(m.id)
+      m.error ? reject(new Error(m.error.message)) : resolve(m.result)
+    }
+  })
+  // Reply with a MALFORMED result: no `result.result` payload at all.
+  const origSend = ws.send.bind(ws)
+  ws.send = raw => {
+    const m = JSON.parse(raw)
+    setTimeout(() => ws._emit('message', { data: JSON.stringify({ id: m.id, result: {} }) }), 5)
+    origSend(raw)
+  }
+
+  const v = await cdp.eval('1 + 1')
+  assert.equal(v, undefined, 'malformed response must resolve undefined, not throw')
+})

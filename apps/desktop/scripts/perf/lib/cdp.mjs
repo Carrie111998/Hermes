@@ -156,7 +156,9 @@ export class CDP {
       throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'eval failed')
     }
 
-    return r.result.value
+    // A5: a malformed/protocol-level response may lack a result payload —
+    // resolve undefined rather than throwing a TypeError on `r.result.value`.
+    return r.result?.value
   }
 
   close() {
