@@ -122,6 +122,50 @@ const $botUnread = atom({})
 // last_active watermark per source-qualified bot, seeded on first poll so a
 // fresh mount doesn't mark ancient history unread.
 const rosterWatermarks = new Map()
+
+/** One durable-history reconciliation per selected Bot Chat at a time. Rapid
+ *  activity edges collapse to the latest trailing snapshot instead of
+ *  repeatedly reloading the full transcript. */
+const botChatReconciles = new Map()
+
+function reconcileSelectedBotChat(bot, key, storedId, activity, prev, ts) {
+  const payload = { bot, storedId, activity, prev, ts }
+  const active = botChatReconciles.get(key)
+
+  if (active) {
+    active.trailing = payload
+    return
+  }
+
+  const state = { trailing: null }
+  botChatReconciles.set(key, state)
+
+  const run = next => {
+    Promise.resolve()
+      .then(() => openStoredBotChat(next.bot, next.storedId, next.activity))
+      .then(() => {
+        rosterWatermarks.set(key, Math.max(rosterWatermarks.get(key) || 0, next.ts))
+      })
+      .catch(() => {
+        // Restore this edge so the existing roster-poll cadence owns retry.
+        rosterWatermarks.set(key, next.prev)
+        console.debug?.('[hermes-bots] durable transcript reconciliation failed', { bot: key })
+      })
+      .finally(() => {
+        const trailing = state.trailing
+
+        if (trailing) {
+          state.trailing = null
+          run(trailing)
+          return
+        }
+
+        botChatReconciles.delete(key)
+      })
+  }
+
+  run(payload)
+}
 let watermarksSeeded = false
 
 /** User pref: toast on every new bot activity. Default OFF — a busy roster
@@ -160,9 +204,19 @@ function trackInboundActivity(roster) {
       continue
     }
 
-    // Activity in the exact bot owner the user is currently looking at is
-    // already visible — never badge the open chat or its same-named twin.
+    // Activity in the exact bot owner the user is currently looking at is not
+    // necessarily visible. Bot-to-bot and background deliveries write through
+    // another client, so this window can miss their stream frames even though
+    // the roster already sees the durable reply. Re-open the SAME stored chat
+    // to reconcile it from history; the watermark makes this one-shot per
+    // activity edge. Do not badge the open chat or its same-named twin.
     if ($selectedBot.get() === key) {
+      const storedId = activity?.resolved_id || activity?.id
+
+      if ($botChatFocused.get() && storedId) {
+        reconcileSelectedBotChat(bot, key, storedId, activity, prev, ts)
+      }
+
       continue
     }
 

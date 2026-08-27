@@ -366,6 +366,32 @@ describe('toChatMessages', () => {
     }
   })
 
+  it('never paints persisted wait-interrupt metadata as an assistant bubble', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'check every bot', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: 'Operation interrupted: waiting for model response (7.9s elapsed).',
+        timestamp: 2
+      },
+      { role: 'user', content: 'why did that appear?', timestamp: 3 }
+    ])
+
+    expect(messages.map(chatMessageText)).toEqual(['check every bot', 'why did that appear?'])
+  })
+
+  it('keeps assistant prose that only starts like wait-interrupt metadata', () => {
+    const lookalike =
+      'Operation interrupted: waiting for model response (7.9s elapsed). This is what the cancellation notice looks like.'
+
+    const messages = toChatMessages([
+      { role: 'user', content: 'show me the notice', timestamp: 1 },
+      { role: 'assistant', content: lookalike, timestamp: 2 }
+    ])
+
+    expect(messages.map(chatMessageText)).toEqual(['show me the notice', lookalike])
+  })
+
   it('projects persisted composite compaction carriers to their live user turn', () => {
     const messages = toChatMessages([
       {

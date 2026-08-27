@@ -10,7 +10,7 @@ import vm from 'node:vm'
 
 const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
-function loadTracker(toastsEnabled) {
+function loadTracker(toastsEnabled, options = {}) {
   const start = source.indexOf('const rosterWatermarks = new Map()')
   const end = source.indexOf('/** Last good cron list', start)
   // The tracker keys watermarks off the REAL botActivitySession helper
@@ -19,7 +19,9 @@ function loadTracker(toastsEnabled) {
   const helperEnd = source.indexOf('/** Bots that are working', helperStart)
   assert.ok(helperStart >= 0 && helperEnd > helperStart, 'botActivitySession must remain extractable')
   const notifications = []
+  const reconciled = []
   const context = {
+    console: { debug: (...args) => options.onDebug?.(...args) },
     pluginCtx: null,
     atom: initial => {
       let value = initial
@@ -27,6 +29,7 @@ function loadTracker(toastsEnabled) {
     },
     host: { notify: params => notifications.push(params) },
     $selectedBot: { get: () => 'default' },
+    $botChatFocused: { get: () => true },
     $botMeta: { get: () => ({}) },
     $botUnread: (() => {
       let value = {}
@@ -34,7 +37,9 @@ function loadTracker(toastsEnabled) {
     })(),
     botRosterMeta: (bot, meta) => meta?.[bot.name] || null,
     botSelectionKey: bot => bot.name,
-    displayName: bot => bot.name
+    displayName: bot => bot.name,
+    openStoredBotChat:
+      options.openStoredBotChat || ((bot, storedId) => reconciled.push({ bot: bot.name, storedId }))
   }
   const section = source
     .slice(helperStart, helperEnd)
@@ -44,7 +49,7 @@ function loadTracker(toastsEnabled) {
   if (toastsEnabled) {
     context.__t.$activityToasts.set(true)
   }
-  return { ...context.__t, notifications, $botUnread: context.$botUnread }
+  return { ...context.__t, notifications, reconciled, $botUnread: context.$botUnread }
 }
 
 function rosterAt(ts) {
@@ -96,4 +101,92 @@ test('activity in the hidden canonical Bot Chat still badges (the "6d ago" class
   t.trackInboundActivity(at(150)) // seeding poll
   t.trackInboundActivity(at(250)) // Bot Chat got a DM; last_session unchanged
   assert.equal(t.$botUnread.get().researcher, true, 'hidden Bot Chat activity must set unread')
+})
+
+test('activity in the selected open Bot Chat rehydrates its durable transcript', async () => {
+  const t = loadTracker(false)
+  const at = ts => [
+    {
+      name: 'default',
+      canonical_session: { id: 'root', resolved_id: 'tip-1', last_active: ts }
+    }
+  ]
+
+  t.trackInboundActivity(at(100))
+  t.trackInboundActivity(at(200))
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.deepEqual(t.reconciled, [{ bot: 'default', storedId: 'tip-1' }])
+  assert.equal(t.$botUnread.get().default, undefined, 'the open bot must not badge itself')
+})
+
+test('selected Bot Chat coalesces rapid activity into one trailing reconciliation', async () => {
+  const calls = []
+  let finishFirst
+  const t = loadTracker(false, {
+    openStoredBotChat: (bot, storedId) => {
+      calls.push({ bot: bot.name, storedId })
+
+      if (calls.length === 1) {
+        return new Promise(resolve => {
+          finishFirst = resolve
+        })
+      }
+
+      return Promise.resolve()
+    }
+  })
+  const at = ts => [
+    {
+      name: 'default',
+      canonical_session: { id: 'root', resolved_id: `tip-${ts}`, last_active: ts }
+    }
+  ]
+
+  t.trackInboundActivity(at(100))
+  t.trackInboundActivity(at(200))
+  t.trackInboundActivity(at(300))
+  t.trackInboundActivity(at(400))
+  await Promise.resolve()
+
+  assert.deepEqual(calls, [{ bot: 'default', storedId: 'tip-200' }])
+
+  finishFirst()
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.deepEqual(calls, [
+    { bot: 'default', storedId: 'tip-200' },
+    { bot: 'default', storedId: 'tip-400' }
+  ])
+})
+
+test('failed reconciliation logs once and retries only on the next roster poll', async () => {
+  let calls = 0
+  const debug = []
+  const t = loadTracker(false, {
+    openStoredBotChat: () => {
+      calls += 1
+      return Promise.reject(new Error('profile wake failed'))
+    },
+    onDebug: (...args) => debug.push(args)
+  })
+  const at = ts => [
+    {
+      name: 'default',
+      canonical_session: { id: 'root', resolved_id: 'tip-1', last_active: ts }
+    }
+  ]
+
+  t.trackInboundActivity(at(100))
+  t.trackInboundActivity(at(200))
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(calls, 1)
+  assert.equal(debug.length, 1)
+
+  t.trackInboundActivity(at(200))
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(calls, 2, 'retry must be driven by the next roster poll')
+  assert.equal(debug.length, 2)
 })
