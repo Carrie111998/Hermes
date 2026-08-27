@@ -126,6 +126,12 @@ import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-r
 
 import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
 import {
+  createPersistedDisplayTranscriptProvenance,
+  hasPersistedDisplayTranscriptProvenance,
+  suppressTranscriptForView,
+  withoutTranscriptProvenance
+} from './transcript-provenance'
+import {
   appendLiveSessionProjection,
   applyRuntimeInfo,
   applyStoredSessionPreviewRuntimeInfo,
@@ -979,6 +985,22 @@ export function useSessionActions({
               }
             : cachedState
 
+        const expectedProvenance = stored
+          ? createPersistedDisplayTranscriptProvenance({
+              lineageRootId: stored._lineage_root_id ?? null,
+              scope: sessionRestScope,
+              storedSessionId
+            })
+          : null
+
+        const hasValidProvenance = Boolean(
+          expectedProvenance && hasPersistedDisplayTranscriptProvenance(cachedViewState, expectedProvenance)
+        )
+
+        if (!hasValidProvenance) {
+          cachedViewState = withoutTranscriptProvenance(cachedViewState)
+        }
+
         if (resumedSameSelectedSession) {
           const messages = preserveLocalPendingTurnMessages(cachedViewState.messages, resumeStartMessages)
 
@@ -1005,6 +1027,8 @@ export function useSessionActions({
           // terminal events go to the detached socket while the stale snapshot
           // leaves Desktop showing only the pre-disconnect partial answer.
           const shouldRefreshPersistedTranscript = !isWatchWindow()
+          const suppressUnprovenWarmTranscript =
+            !resumedSameSelectedSession && shouldRefreshPersistedTranscript && !hasValidProvenance
 
           setFreshDraftReady(false)
           clearNotifications()
@@ -1012,7 +1036,10 @@ export function useSessionActions({
           selectedStoredSessionIdRef.current = storedSessionId
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
-          syncSessionStateToView(cachedRuntimeId, cachedViewState)
+          syncSessionStateToView(
+            cachedRuntimeId,
+            suppressTranscriptForView(cachedViewState, suppressUnprovenWarmTranscript)
+          )
           setCurrentCwdTransient(cachedViewState.cwd)
           // The warm cache IS this conversation's own workspace truth, so the
           // switch is already re-homed here. This claim cannot wait for
@@ -1152,7 +1179,10 @@ export function useSessionActions({
               busyRef.current = running
               setBusy(running)
               setAwaitingResponse(running && !pendingClarify)
-              syncSessionStateToView(cachedRuntimeId, activatedLivenessState)
+              syncSessionStateToView(
+                cachedRuntimeId,
+                suppressTranscriptForView(activatedLivenessState, suppressUnprovenWarmTranscript)
+              )
 
               // session.activate is the ordering barrier for reconnect recovery:
               // it atomically rebinds a running turn before returning. If the
@@ -1170,6 +1200,9 @@ export function useSessionActions({
               // which is intentionally smaller than the user-visible conversation.
               // Reconcile its in-flight/queued tail onto the complete transcript
               // instead of replacing durable history while the turn is running.
+              let acceptedPersistedDisplayTranscript = false
+              let appliedPersistedDisplayTranscript = false
+
               if (persistedTranscriptPromise) {
                 const persisted = await persistedTranscriptPromise
 
@@ -1195,6 +1228,7 @@ export function useSessionActions({
                   persistedMatchesActivatedSession &&
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
+                  appliedPersistedDisplayTranscript = true
                   // The REST hydration is a newest-tail page; graft it onto any
                   // older pages the previous view already backfilled so
                   // re-activating a scrolled-back session keeps its history.
@@ -1216,6 +1250,29 @@ export function useSessionActions({
                     persistedMessages,
                     previousMessages,
                     liveProjection
+                  )
+
+                  const currentStored = $sessions
+                    .get()
+                    .find(session => sessionMatchesStoredId(session, storedSessionId))
+
+                  const currentExpectedProvenance = currentStored
+                    ? createPersistedDisplayTranscriptProvenance({
+                        lineageRootId: currentStored._lineage_root_id ?? null,
+                        scope: sessionRestScope,
+                        storedSessionId
+                      })
+                    : null
+
+                  acceptedPersistedDisplayTranscript = Boolean(
+                    expectedProvenance &&
+                    currentExpectedProvenance &&
+                    hasPersistedDisplayTranscriptProvenance(
+                      { transcriptProvenance: expectedProvenance },
+                      currentExpectedProvenance
+                    ) &&
+                    persisted.session_id === storedSessionId &&
+                    activatedStoredSessionId === storedSessionId
                   )
                 }
               }
@@ -1250,6 +1307,13 @@ export function useSessionActions({
                 state => ({
                   ...state,
                   messages: visibleActivatedMessages,
+                  transcriptProvenance: acceptedPersistedDisplayTranscript
+                    ? expectedProvenance ?? undefined
+                    : appliedPersistedDisplayTranscript
+                      ? undefined
+                      : hasValidProvenance
+                        ? expectedProvenance ?? undefined
+                        : undefined,
                   ...(pendingClarifyProjection
                     ? {
                         awaitingResponse: false,

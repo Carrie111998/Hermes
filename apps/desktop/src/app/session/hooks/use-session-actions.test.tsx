@@ -80,6 +80,7 @@ import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
+import { createPersistedDisplayTranscriptProvenance } from './use-session-actions/transcript-provenance'
 import { useSessionStateCache } from './use-session-state-cache'
 
 vi.mock('@/hermes', async importOriginal => ({
@@ -729,6 +730,7 @@ describe('createBackendSessionForSend profile routing', () => {
 // succeeds must NOT leave the flag armed.
 function ResumeHarness({
   onStateUpdate,
+  onViewSync,
   onReady,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
@@ -736,6 +738,7 @@ function ResumeHarness({
   sessionStateByRuntimeIdRef
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
+  onViewSync?: (sessionId: string, state: ClientSessionState) => void
   onReady: (
     resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   ) => void
@@ -763,7 +766,7 @@ function ResumeHarness({
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: stateMapRef,
-    syncSessionStateToView: vi.fn(),
+    syncSessionStateToView: (sessionId, state) => onViewSync?.(sessionId, state),
     updateSessionState: (sessionId, updater, storedSessionId) => {
       // Full default shape (not a bare {} cast) so seeded/derived fields like
       // turnStartedAt behave as in production state updates.
@@ -2331,6 +2334,102 @@ describe('resumeSession warm-cache mapping integrity', () => {
     })
     await resumePromise
     expect($messages.get()).toHaveLength(500)
+  })
+
+  it('does not publish an unproven warm transcript before persisted authority settles', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.messages = [
+      {
+        id: 'cached-user',
+        parts: [{ text: 'recent prompt', type: 'text' }],
+        role: 'user',
+        timestamp: 3
+      },
+      {
+        id: 'cached-assistant',
+        parts: [{ text: 'recent answer', type: 'text' }],
+        role: 'assistant',
+        timestamp: 4
+      }
+    ]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    setSessions([
+      storedSession({
+        _lineage_root_id: 'root-A',
+        id: 'stored-A',
+        message_count: 4
+      })
+    ])
+
+    const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const viewSnapshots: ClientSessionState[] = []
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onViewSync={(_sessionId, next) => viewSnapshots.push(next)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    const resumePromise = resume!('stored-A', true)
+
+    await waitFor(() => expect(viewSnapshots.length).toBeGreaterThanOrEqual(2))
+    expect(viewSnapshots.every(snapshot => snapshot.messages.length === 0)).toBe(true)
+    expect(sessionStateByRuntimeIdRef.current.get('rt-A')?.messages).toHaveLength(2)
+
+    persisted.resolve({
+      messages: [
+        { content: 'older prompt', role: 'user', timestamp: 1 },
+        { content: 'older answer', role: 'assistant', timestamp: 2 },
+        { content: 'recent prompt', role: 'user', timestamp: 3 },
+        { content: 'recent answer', role: 'assistant', timestamp: 4 }
+      ],
+      session_id: 'stored-A'
+    })
+    await resumePromise
+
+    const transcriptPublications = viewSnapshots.filter(snapshot => snapshot.messages.length > 0)
+    expect(transcriptPublications).toHaveLength(1)
+    expect(JSON.stringify(transcriptPublications[0].messages)).toContain('older prompt')
+    expect(transcriptPublications[0].transcriptProvenance).toEqual(
+      createPersistedDisplayTranscriptProvenance({
+        lineageRootId: 'root-A',
+        scope: undefined,
+        storedSessionId: 'stored-A'
+      })
+    )
   })
 
   it('honours a warm cache entry whose stored id matches and refreshes its persisted transcript', async () => {
