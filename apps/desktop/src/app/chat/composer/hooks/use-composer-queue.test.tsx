@@ -41,7 +41,6 @@ function renderQueueHook(
     queueSessionKey?: string | null
     runtimeDerived?: boolean
     sessionKey?: string
-    submitScopeKey?: string | null
   } = {}
 ) {
   const onSubmit = vi.fn<ChatBarProps['onSubmit']>(overrides.onSubmit ?? (async () => true))
@@ -93,8 +92,7 @@ function renderQueueHook(
         onSubmit,
         queueEditRef,
         queueSessionKey: overrides.runtimeDerived ? undefined : durableQueueSessionKey,
-        sessionId: `rt-${activeSessionKey}`,
-        submitScopeKey: overrides.submitScopeKey ?? durableQueueSessionKey
+        sessionId: `rt-${activeSessionKey}`
       })
     },
     { initialProps }
@@ -137,8 +135,7 @@ describe('useComposerQueue park integration', () => {
 
     const { onSubmit } = renderQueueHook({
       queueSessionKey: 'stored-1',
-      sessionKey: qualifiedKey,
-      submitScopeKey: 'stored-1'
+      sessionKey: qualifiedKey
     })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
@@ -264,8 +261,7 @@ describe('useComposerQueue park integration', () => {
     const { hook } = renderQueueHook({
       onSubmit,
       queueSessionKey: 'tip-a',
-      sessionKey: tipKey,
-      submitScopeKey: 'tip-a'
+      sessionKey: tipKey
     })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
@@ -281,6 +277,35 @@ describe('useComposerQueue park integration', () => {
 
     await waitFor(() => expect(getQueuedPrompts(rootKey)).toHaveLength(0))
     expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('submits a stale visible drain against the live aliased target identity', async () => {
+    const retiredKey = storageKey('stored-retired-visible')
+    const liveKey = storageKey('stored-live-visible')
+    const entry = enqueueQueuedPrompt(retiredKey, { attachments: [], text: 'follow the visible handoff' })!
+
+    const { hook, onSubmit } = renderQueueHook({
+      busy: true,
+      queueSessionKey: 'stored-retired-visible',
+      sessionKey: retiredKey
+    })
+
+    act(() => {
+      migrateComposerStorageScope(retiredKey, liveKey)
+    })
+
+    await act(async () => {
+      expect(await hook.result.current.drainNextQueued()).toBe(true)
+    })
+
+    expect(onSubmit).toHaveBeenCalledWith('follow the visible handoff', {
+      attachments: [],
+      composerStorageScope: liveKey,
+      fromQueue: true,
+      sessionId: null,
+      storedSessionId: 'stored-live-visible'
+    })
+    expect(getQueuedPrompts(liveKey).find(candidate => candidate.id === entry.id)).toBeUndefined()
   })
 
   it('retries A automatically after a stale A drain rejects across A to B to A', async () => {

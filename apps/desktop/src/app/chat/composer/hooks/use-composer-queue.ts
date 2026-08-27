@@ -28,7 +28,7 @@ import {
   isComposerQueueDrainExcluded
 } from '@/store/composer-queue-drain'
 import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
-import { resolveComposerStorageScopeKey } from '@/store/composer-storage-scope'
+import { decodeComposerStorageScopeKey, resolveComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { notify } from '@/store/notifications'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
@@ -50,7 +50,6 @@ interface UseComposerQueueArgs {
   queueEditRef: RefObject<QueueEditState | null>
   queueSessionKey: ChatBarProps['queueSessionKey']
   sessionId: string | null | undefined
-  submitScopeKey: string | null
 }
 
 /**
@@ -76,8 +75,7 @@ export function useComposerQueue({
   onSubmit,
   queueEditRef,
   queueSessionKey,
-  sessionId,
-  submitScopeKey
+  sessionId
 }: UseComposerQueueArgs) {
   const { t } = useI18n()
   const scope = useComposerScope()
@@ -239,9 +237,10 @@ export function useComposerQueue({
       }
 
       const liveQueueSessionKey = resolveComposerStorageScopeKey(drainQueueSessionKey)
+      const liveTarget = decodeComposerStorageScopeKey(liveQueueSessionKey)
       const liveEntry = getLatestQueuedPrompts(liveQueueSessionKey).find(candidate => candidate.id === entry.id)
 
-      if (!liveEntry) {
+      if (!liveTarget || liveTarget.format !== 'canonical' || !liveEntry) {
         finishComposerQueueDrain(drain)
 
         return false
@@ -256,8 +255,11 @@ export function useComposerQueue({
             composerStorageScope: liveQueueSessionKey,
             ...(liveEntry.displayText ? { displayText: liveEntry.displayText } : {}),
             fromQueue: true,
-            sessionId: drainRuntimeSessionId,
-            storedSessionId: submitScopeKey
+            // An alias means the captured visible runtime belongs to the
+            // retired identity. Force submit to resolve the live durable target
+            // instead of pairing that stale runtime with the migrated entry.
+            sessionId: liveQueueSessionKey === drainQueueSessionKey ? drainRuntimeSessionId : null,
+            storedSessionId: liveTarget.storedSessionId
           })
         )
 
@@ -280,7 +282,7 @@ export function useComposerQueue({
         }
       }
     },
-    [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId, submitScopeKey]
+    [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId]
   )
 
   const pickDrainHead = useCallback(

@@ -322,7 +322,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
         const handleDispatch = async (
           dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>
-        ): Promise<void> => {
+        ): Promise<boolean> => {
           if (dispatch.type === 'exec' || dispatch.type === 'plugin') {
             // `/goal clear|pause|resume|status` can come back as a TYPED exec
             // dispatch (command.dispatch routing) instead of the plain-output
@@ -337,13 +337,13 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
             renderSlashOutput(dispatch.output ?? '(no output)')
 
-            return
+            return true
           }
 
           if (dispatch.type === 'alias') {
             await runSlash(`/${dispatch.target}${arg ? ` ${arg}` : ''}`, sessionId, false)
 
-            return
+            return commandExecuted
           }
 
           // send / prefill carry an optional `notice` (e.g. "⊙ Goal set …")
@@ -372,7 +372,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               setComposerDraft(message)
             }
 
-            return
+            return true
           }
 
           if (!message) {
@@ -380,7 +380,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               `/${name}: ${dispatch.type === 'skill' ? 'skill payload missing message' : 'empty message'}`
             )
 
-            return
+            return true
           }
 
           // A skill/bundle dispatch's `message` is the expanded skill body —
@@ -395,6 +395,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // is on screen, while this command runs against the session
           // resolveTargetSessionId picked, routinely a different one.
           if (isTargetSessionBusy($sessionStates.get(), sessionId, busyRef.current)) {
+            // A queued slash is the entry currently holding the drain lock. If
+            // its target becomes busy after slash.exec, leave that source entry
+            // intact so the bounded drainer can retry it; replacing it with the
+            // expanded payload would falsely settle a command whose kickoff was
+            // never accepted.
+            if (options?.fromQueue) {
+              return false
+            }
+
             // The backend already executed the command — for `/goal <text>`
             // the goal is set and `message` is its kickoff prompt. Dropping
             // it here loses the kickoff silently (the goal exists but the
@@ -418,7 +427,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               renderSlashOutput('session busy — /interrupt the current turn before sending this command')
             }
 
-            return
+            return true
           }
 
           // Submit into the session this command was resolved against — the
@@ -429,8 +438,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // its kickoff as a user message into whatever conversation was on
           // screen. Every other target the dispatcher serves (tile, background
           // queue drain, a session created by this very call) had the same leak.
-          await submitPromptText(message, {
+          return await submitPromptText(message, {
             composerStorageScope: options?.composerStorageScope,
+            fromQueue: options?.fromQueue,
             sessionId,
             storedSessionId,
             displayText
@@ -443,15 +453,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             command: command.replace(/^\/+/, '')
           })
 
-          commandExecuted = true
-
           const dispatch = parseCommandDispatch(result)
 
           if (dispatch) {
-            await handleDispatch(dispatch)
+            commandExecuted = await handleDispatch(dispatch)
 
             return
           }
+
+          commandExecuted = true
 
           const output = result && typeof result === 'object' ? (result as SlashExecResponse) : null
           const body = output?.output || `/${name}: no output`
@@ -485,8 +495,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          commandExecuted = true
-          await handleDispatch(dispatch)
+          commandExecuted = await handleDispatch(dispatch)
         } catch (err) {
           // "not a quick/plugin/skill command" just means the fallback had
           // nothing to add — the slash.exec failure (worker timeout, crash) is

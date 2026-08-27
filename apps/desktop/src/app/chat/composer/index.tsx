@@ -359,8 +359,7 @@ export function ChatBar({
     onSubmit,
     queueEditRef,
     queueSessionKey,
-    sessionId,
-    submitScopeKey
+    sessionId
   })
 
   const statusStackVisible = !actionsDisabled && (queuedPrompts.length > 0 || statusPresent)

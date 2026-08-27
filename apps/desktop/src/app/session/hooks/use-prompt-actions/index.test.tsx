@@ -2079,6 +2079,127 @@ describe('usePromptActions submit / queue drain semantics', () => {
     dropSessionState('rt-owner-b')
   })
 
+  it('keeps a queued slash intact when its target becomes busy before kickoff', async () => {
+    const owner = { connectionId: 'source-a', profile: 'worker' }
+    const storedSessionId = 'stored-busy-queued-slash'
+    const runtimeSessionId = 'runtime-busy-queued-slash'
+    const queueKey = encodeComposerStorageScopeKey(owner, storedSessionId)
+    const queued = enqueueQueuedPrompt(queueKey, { attachments: [], text: '/work wait for idle' })!
+
+    publishSessionState(runtimeSessionId, {
+      ...createClientSessionState(storedSessionId),
+      busy: true
+    })
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'slash.exec') {
+        return {
+          display: '/work wait for idle',
+          message: 'expanded body must not replace the command',
+          name: 'work',
+          type: 'skill'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        getRuntimeIdForStoredSession={storedId => (storedId === storedSessionId ? runtimeSessionId : null)}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        storedSessionId={null}
+      />
+    )
+
+    const accepted = await handle!.submitText(queued.text, {
+      composerStorageScope: queueKey,
+      fromQueue: true,
+      sessionId: runtimeSessionId,
+      storedSessionId
+    })
+
+    expect(accepted).toBe(false)
+    expect(requestGatewayForAgent).not.toHaveBeenCalledWith(
+      owner.connectionId,
+      owner.profile,
+      'prompt.submit',
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
+    )
+    expect(getQueuedPrompts(queueKey).map(entry => ({ id: entry.id, text: entry.text }))).toEqual([
+      { id: queued.id, text: queued.text }
+    ])
+
+    dropSessionState(runtimeSessionId)
+  })
+
+  it('keeps a queued slash when its expanded kickoff submit is rejected', async () => {
+    const owner = { connectionId: 'source-a', profile: 'worker' }
+    const storedSessionId = 'stored-queued-slash'
+    const runtimeSessionId = 'runtime-queued-slash'
+    const queueKey = encodeComposerStorageScopeKey(owner, storedSessionId)
+    const queued = enqueueQueuedPrompt(queueKey, { attachments: [], text: '/work keep this command' })!
+
+    publishSessionState(runtimeSessionId, createClientSessionState(storedSessionId))
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method, params) => {
+      if (method === 'slash.exec') {
+        return {
+          display: '/work keep this command',
+          message: 'expanded queued skill body',
+          name: 'work',
+          type: 'skill'
+        } as never
+      }
+
+      if (method === 'prompt.submit') {
+        throw new Error('kickoff rejected')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        getRuntimeIdForStoredSession={storedId => (storedId === storedSessionId ? runtimeSessionId : null)}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        storedSessionId={null}
+      />
+    )
+
+    const accepted = await handle!.submitText(queued.text, {
+      composerStorageScope: queueKey,
+      fromQueue: true,
+      sessionId: runtimeSessionId,
+      storedSessionId
+    })
+
+    expect(accepted).toBe(false)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      owner.connectionId,
+      owner.profile,
+      'prompt.submit',
+      expect.objectContaining({
+        queued: true,
+        session_id: runtimeSessionId,
+        text: 'expanded queued skill body'
+      }),
+      1_800_000,
+      undefined
+    )
+    expect(getQueuedPrompts(queueKey).map(entry => entry.id)).toEqual([queued.id])
+
+    dropSessionState(runtimeSessionId)
+  })
+
   it('resumes and executes a background queued slash on its canonical duplicate owner', async () => {
     const ownerA = { connectionId: 'source-a', profile: 'worker' }
     const ownerB = { connectionId: 'source-b', profile: 'worker' }
