@@ -65,6 +65,53 @@ import { isBrowserWindow, isSecondaryWindow } from './windows'
 
 export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 
+export interface RuntimeStateScope {
+  connectionId?: null | string
+  profile?: null | string
+}
+
+const RUNTIME_OWNER_KEY_PREFIX = 'owner:'
+
+/** Canonical renderer key. Runtime ids remain unchanged on RPC/event boundaries;
+ * registry-owned state is qualified only inside renderer maps. */
+export function runtimeStateKey(runtimeId: string, scope?: RuntimeStateScope): string {
+  const connectionId = scope?.connectionId?.trim()
+
+  return connectionId
+    ? `${RUNTIME_OWNER_KEY_PREFIX}${JSON.stringify([connectionId, normalizeProfileKey(scope?.profile), runtimeId])}`
+    : runtimeId
+}
+
+function runtimeIdFromStateKey(key: string): string {
+  if (!key.startsWith(RUNTIME_OWNER_KEY_PREFIX)) {
+    return key
+  }
+
+  try {
+    const parsed = JSON.parse(key.slice(RUNTIME_OWNER_KEY_PREFIX.length)) as unknown[]
+    return typeof parsed[2] === 'string' ? parsed[2] : key
+  } catch {
+    return key
+  }
+}
+
+/** Owner-aware lookup. A bare legacy lookup may resolve one unique registry
+ * owner, but fails closed once the same runtime id exists on multiple sources. */
+export function getSessionState(runtimeId: string, scope?: RuntimeStateScope): ClientSessionState | undefined {
+  const states = $sessionStates.get()
+
+  if (scope?.connectionId?.trim()) {
+    return states[runtimeStateKey(runtimeId, scope)]
+  }
+
+  if (states[runtimeId]) {
+    return states[runtimeId]
+  }
+
+  const matches = Object.entries(states).filter(([key]) => runtimeIdFromStateKey(key) === runtimeId)
+  return matches.length === 1 ? matches[0][1] : undefined
+}
+
 // ---------------------------------------------------------------------------
 // Event-source scopes: which registry connection's socket delivered a runtime
 // session's events. Working/attention membership alone is profile-blind — two
@@ -79,8 +126,26 @@ const sessionScopeByRuntimeId = new Map<string, string>()
 
 export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
   if (event.session_id && event.connectionId) {
-    sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(event.connectionId, event.profile))
+    sessionScopeByRuntimeId.set(
+      runtimeStateKey(event.session_id, { connectionId: event.connectionId, profile: event.profile }),
+      registryBackendScopeKey(event.connectionId, event.profile)
+    )
   }
+}
+
+function recordedScopeForState(stateKey: string): string | undefined {
+  const direct = sessionScopeByRuntimeId.get(stateKey)
+
+  if (direct) {
+    return direct
+  }
+
+  // Legacy snapshots can install an unqualified entry after a tagged event.
+  // Alias only one unique owner; same-id A/B ambiguity must fail closed.
+  const runtimeId = runtimeIdFromStateKey(stateKey)
+  const matches = [...sessionScopeByRuntimeId].filter(([key]) => runtimeIdFromStateKey(key) === runtimeId)
+
+  return matches.length === 1 ? matches[0][1] : undefined
 }
 
 /** Composite scopes of registry-sourced sessions that are live (busy or
@@ -89,12 +154,12 @@ export function recordSessionEventScope(event: { connectionId?: string; profile?
 export function liveSessionScopes(): Set<string> {
   const scopes = new Set<string>()
 
-  for (const [runtimeId, state] of Object.entries($sessionStates.get())) {
+  for (const [stateKey, state] of Object.entries($sessionStates.get())) {
     if (!state || (!state.busy && !state.needsInput)) {
       continue
     }
 
-    const scope = sessionScopeByRuntimeId.get(runtimeId)
+    const scope = recordedScopeForState(stateKey)
 
     if (scope) {
       scopes.add(scope)
@@ -202,7 +267,12 @@ export function foregroundSessionScopes(): Set<string> {
   const scopes = new Set<string>()
 
   const addRuntimeScope = (runtimeId: string | undefined) => {
-    const scope = runtimeId ? sessionScopeByRuntimeId.get(runtimeId) : undefined
+    const state = runtimeId ? getSessionState(runtimeId) : undefined
+    const scope = runtimeId
+      ? recordedScopeForState(
+          state ? runtimeStateKey(runtimeId, { connectionId: state.connectionId, profile: state.profile }) : runtimeId
+        )
+      : undefined
 
     if (scope) {
       scopes.add(scope)
@@ -258,18 +328,26 @@ export function foregroundSessionScopes(): Set<string> {
 // presentation hint and never mutates the backend-derived busy state.
 export const $stalledSessionIds = atom<string[]>([])
 
-export function setSessionStalled(storedSessionId: string | null | undefined, stalled: boolean) {
+const stalledOwners = new Map<string, string>()
+
+export function setSessionStalled(
+  storedSessionId: string | null | undefined,
+  stalled: boolean,
+  scope?: RuntimeStateScope
+) {
   if (!storedSessionId) {
     return
   }
 
-  const current = $stalledSessionIds.get()
-  const present = current.includes(storedSessionId)
+  const ownerKey = runtimeStateKey(storedSessionId, scope)
+  const present = stalledOwners.has(ownerKey)
 
   if (stalled && !present) {
-    $stalledSessionIds.set([...current, storedSessionId])
+    stalledOwners.set(ownerKey, storedSessionId)
+    $stalledSessionIds.set([...stalledOwners.values()])
   } else if (!stalled && present) {
-    $stalledSessionIds.set(current.filter(id => id !== storedSessionId))
+    stalledOwners.delete(ownerKey)
+    $stalledSessionIds.set([...stalledOwners.values()])
   }
 }
 
@@ -282,32 +360,34 @@ export function setSessionStalled(storedSessionId: string | null | undefined, st
 export const SESSION_WATCHDOG_TIMEOUT_MS = 5 * 60 * 1000
 const sessionWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-function armWatchdog(runtimeId: string) {
-  const existing = sessionWatchdogTimers.get(runtimeId)
+function armWatchdog(runtimeId: string, scope?: RuntimeStateScope) {
+  const stateKey = runtimeStateKey(runtimeId, scope)
+  const existing = sessionWatchdogTimers.get(stateKey)
 
   if (existing) {
     clearTimeout(existing)
   }
 
   sessionWatchdogTimers.set(
-    runtimeId,
+    stateKey,
     setTimeout(() => {
-      sessionWatchdogTimers.delete(runtimeId)
-      const current = $sessionStates.get()[runtimeId]
+      sessionWatchdogTimers.delete(stateKey)
+      const current = $sessionStates.get()[stateKey]
 
       if (current?.busy) {
-        setSessionStalled(current.storedSessionId, true)
+        setSessionStalled(current.storedSessionId, true, current)
       }
     }, SESSION_WATCHDOG_TIMEOUT_MS)
   )
 }
 
-function clearWatchdog(runtimeId: string) {
-  const t = sessionWatchdogTimers.get(runtimeId)
+function clearWatchdog(runtimeId: string, scope?: RuntimeStateScope) {
+  const stateKey = runtimeStateKey(runtimeId, scope)
+  const t = sessionWatchdogTimers.get(stateKey)
 
   if (t) {
     clearTimeout(t)
-    sessionWatchdogTimers.delete(runtimeId)
+    sessionWatchdogTimers.delete(stateKey)
   }
 }
 
@@ -357,19 +437,19 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     }
 
     clearSettled(previous.storedSessionId)
-    setSessionStalled(previous.storedSessionId, false)
+    setSessionStalled(previous.storedSessionId, false, previous)
   }
 
   // Every busy publish is stream activity: clear the quiet hint and restart
   // the silence window. A real terminal transition clears both the timer and
   // any hint, but only that authoritative transition clears working/busy.
   if (next.busy) {
-    setSessionStalled(next.storedSessionId, false)
-    armWatchdog(runtimeId)
+    setSessionStalled(next.storedSessionId, false, next)
+    armWatchdog(runtimeId, next)
   } else {
-    clearWatchdog(runtimeId)
-    setSessionStalled(next.storedSessionId, false)
-    setSessionStalled(previous?.storedSessionId, false)
+    clearWatchdog(runtimeId, next)
+    setSessionStalled(next.storedSessionId, false, next)
+    setSessionStalled(previous?.storedSessionId, false, previous ?? undefined)
   }
 
   const storedId = next.storedSessionId
@@ -453,7 +533,14 @@ function evictable(runtimeId: string, state: ClientSessionState): boolean {
  *  state a beat before `$activeSessionId` / the tile binding points at it. */
 export function publishSessionState(runtimeId: string, state: ClientSessionState) {
   const current = $sessionStates.get()
-  const prev = current[runtimeId] ?? null
+  const stateKey = runtimeStateKey(runtimeId, state)
+  const legacyPrev = stateKey !== runtimeId ? current[runtimeId] : undefined
+  const matchingLegacyPrev =
+    legacyPrev?.connectionId?.trim() === state.connectionId?.trim() &&
+    normalizeProfileKey(legacyPrev?.profile) === normalizeProfileKey(state.profile)
+      ? legacyPrev
+      : undefined
+  const prev = current[stateKey] ?? matchingLegacyPrev ?? null
 
   if (prev === state) {
     return
@@ -466,7 +553,13 @@ export function publishSessionState(runtimeId: string, state: ClientSessionState
     return
   }
 
-  $sessionStates.set({ ...current, [runtimeId]: state })
+  const nextStates = { ...current, [stateKey]: state }
+
+  if (matchingLegacyPrev) {
+    delete nextStates[runtimeId]
+  }
+
+  $sessionStates.set(nextStates)
   handleTransition(prev, state, runtimeId)
 }
 
@@ -474,12 +567,13 @@ export function publishSessionState(runtimeId: string, state: ClientSessionState
  * transcript. Unread completion is stored separately, so it survives too. */
 export function releaseSessionTranscript(runtimeId: string, state?: ClientSessionState) {
   const current = $sessionStates.get()
+  const retained = state ?? getSessionState(runtimeId)
 
-  if (!(runtimeId in current)) {
+  if (!retained) {
     return
   }
 
-  const retained = state ?? current[runtimeId]
+  const stateKey = runtimeStateKey(runtimeId, retained)
 
   // Older persisted snapshots can contain an undefined state or omit the
   // messages field. Treat either shape as already cold instead of throwing
@@ -491,26 +585,36 @@ export function releaseSessionTranscript(runtimeId: string, state?: ClientSessio
   const lightweight =
     Array.isArray(retained.messages) && retained.messages.length === 0 ? retained : { ...retained, messages: [] }
 
-  $sessionStates.set({ ...current, [runtimeId]: lightweight })
+  $sessionStates.set({ ...current, [stateKey]: lightweight })
 }
 
-export function dropSessionState(runtimeId: string) {
+export function dropSessionState(runtimeId: string, scope?: RuntimeStateScope) {
+  clearSessionProviderWait(runtimeId)
+  const current = $sessionStates.get()
+  const state = getSessionState(runtimeId, scope)
+
+  if (!state) {
+    return
+  }
+
+  const stateKey = runtimeStateKey(runtimeId, state)
   // Disarm the watchdog — a dropped runtime must not fire a stale clear later.
   // Settle-grace entries are keyed by stored id and self-expire; leave them so
   // a just-finished session's row survives merge eviction even if its tile or
   // cached runtime is dropped in the meantime.
-  clearWatchdog(runtimeId)
-  clearSessionProviderWait(runtimeId)
-  sessionScopeByRuntimeId.delete(runtimeId)
+  clearWatchdog(runtimeId, state)
+  for (const key of [...sessionScopeByRuntimeId.keys()]) {
+    if (key === stateKey || (stateKey === runtimeId && runtimeIdFromStateKey(key) === runtimeId)) {
+      sessionScopeByRuntimeId.delete(key)
+    }
+  }
+  setSessionStalled(state.storedSessionId, false, state)
 
-  const current = $sessionStates.get()
-  setSessionStalled(current[runtimeId]?.storedSessionId, false)
-
-  if (!(runtimeId in current)) {
+  if (!(stateKey in current)) {
     return
   }
 
-  const { [runtimeId]: _dropped, ...rest } = current
+  const { [stateKey]: _dropped, ...rest } = current
   $sessionStates.set(rest)
 }
 
@@ -525,6 +629,7 @@ export function clearAllSessionStates() {
   }
 
   sessionWatchdogTimers.clear()
+  stalledOwners.clear()
   settledExpiry.clear()
   clearAllProviderWaits()
   sessionScopeByRuntimeId.clear()
@@ -570,21 +675,22 @@ export function clearAllSessionStates() {
 export function reconcileBusyStatesOnReconnect(scope?: string) {
   const states = $sessionStates.get()
 
-  for (const [runtimeId, state] of Object.entries(states)) {
+  for (const [stateKey, state] of Object.entries(states)) {
     if (!state || (!state.busy && !state.awaitingResponse)) {
       continue
     }
 
-    const recorded = sessionScopeByRuntimeId.get(runtimeId)
+    const recorded = recordedScopeForState(stateKey)
 
     if (scope === undefined ? recorded !== undefined : recorded !== scope) {
       continue
     }
 
+    const runtimeId = runtimeIdFromStateKey(stateKey)
     sessionTileDelegate()?.retireBusyClaim?.(runtimeId)
 
     // Re-read — the write path may have republished (and released) this entry.
-    const published = $sessionStates.get()[runtimeId]
+    const published = $sessionStates.get()[stateKey]
 
     if (published?.busy || published?.awaitingResponse) {
       publishSessionState(runtimeId, { ...published, awaitingResponse: false, busy: false })

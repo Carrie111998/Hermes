@@ -102,6 +102,7 @@ export function useRouteResume({
   // Per-session retry bookkeeping for the bounded auto-retry effect below.
   // Profile is part of the key because stored ids are only profile-local.
   const retrySessionIdRef = useRef<string | null>(null)
+  const retryOwnerRef = useRef<{ identity: string; owner: SessionOwnerScope } | null>(null)
   const retryAttemptRef = useRef(0)
   // Tracks the previous exhausted-latch value so we can detect its armed->cleared
   // edge. resumeSession clears $resumeExhaustedSessionId on a manual Retry /
@@ -111,7 +112,15 @@ export function useRouteResume({
   const prevResumeExhaustedRef = useRef<string | null>(null)
   const handledResumeRequestRef = useRef(0)
   const routeOwnerProfile = routedSessionProfile?.trim() || null
-  const routeSessionIdentity = routedSessionId ? `${routeOwnerProfile ?? ''}\0${routedSessionId}` : null
+
+  const requestedOwnerRoute =
+    sessionResumeRequest?.sessionId === routedSessionId ? sessionResumeRequest.ownerRoute : undefined
+
+  const routeOwnerConnection = typeof requestedOwnerRoute === 'object' ? requestedOwnerRoute.connectionId.trim() : ''
+
+  const routeSessionIdentity = routedSessionId
+    ? `${routeOwnerConnection}\0${routeOwnerProfile ?? ''}\0${routedSessionId}`
+    : null
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -199,6 +208,10 @@ export function useRouteResume({
 
         const resumeOwner = ownerRoute ?? routeOwnerProfile ?? undefined
 
+        if (routeSessionIdentity) {
+          retryOwnerRef.current = { identity: routeSessionIdentity, owner: resumeOwner }
+        }
+
         if (resumeOwner) {
           void resumeSession(routedSessionId, true, resumeOwner)
         } else {
@@ -229,6 +242,7 @@ export function useRouteResume({
     locationPathname,
     resumeSession,
     routeOwnerProfile,
+    routeSessionIdentity,
     sessionResumeRequest,
     routedSessionId,
     runtimeIdByStoredSessionIdRef,
@@ -331,8 +345,13 @@ export function useRouteResume({
       // re-renders with far fewer than MAX real attempts. (Point 3)
       retryAttemptRef.current += 1
 
-      if (routeOwnerProfile) {
-        void resumeSession(sessionId, true, routeOwnerProfile)
+      const capturedOwner =
+        retryOwnerRef.current?.identity === routeSessionIdentity
+          ? retryOwnerRef.current.owner
+          : (routeOwnerProfile ?? undefined)
+
+      if (capturedOwner) {
+        void resumeSession(sessionId, true, capturedOwner)
       } else {
         void resumeSession(sessionId, true)
       }

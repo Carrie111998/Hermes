@@ -524,7 +524,7 @@ describe('useRouteResume bounded auto-retry after a failed resume', () => {
   // Common stranded-window props: gateway open, route on the session, no runtime
   // yet, and the ref already synced to the route (resumeSession sets it at entry
   // before failing) — the exact state that defeats the main effect's self-heal.
-  function strandedProps(resumeSession: (sid: string, focus: boolean) => Promise<unknown>) {
+  function strandedProps(resumeSession: (sid: string, focus: boolean, owner?: SessionOwnerScope) => Promise<unknown>) {
     return {
       activeSessionId: null,
       activeSessionIdRef: { current: null } as MutableRefObject<null | string>,
@@ -580,6 +580,28 @@ describe('useRouteResume bounded auto-retry after a failed resume', () => {
 
     vi.advanceTimersByTime(1_000)
     expect(resumeSession).toHaveBeenCalledWith('session-1', true, 'meta')
+  })
+
+  it('retries on the captured connection owner instead of the ambient source', () => {
+    vi.useFakeTimers()
+    const resumeSession = vi.fn(async () => undefined)
+    const ownerRoute: SessionProfileRoute = {
+      connectionId: 'source-a',
+      mode: 'remote',
+      profile: 'default'
+    }
+
+    render(
+      <RouteResumeHarness
+        {...strandedProps(resumeSession)}
+        resumeFailedSessionId="session-1"
+        sessionResumeRequest={{ ownerRoute, sequence: 1, sessionId: 'session-1' }}
+      />
+    )
+    resumeSession.mockClear()
+
+    vi.advanceTimersByTime(1_000)
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true, ownerRoute)
   })
 
   it('does NOT retry a failed session that is not the routed one', () => {

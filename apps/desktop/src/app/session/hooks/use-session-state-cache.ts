@@ -21,10 +21,11 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
-import { $sessionStates, $sessionTiles, publishSessionState, releaseSessionTranscript } from '@/store/session-states'
+import { $sessionTiles, getSessionState, publishSessionState, releaseSessionTranscript } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../types'
 import {
+  SessionRuntimeIndex,
   sessionRuntimeStateMatchesOwner,
   SessionStateCache,
   sessionStateMatchesOwner,
@@ -92,7 +93,7 @@ export function useSessionStateCache({
     selectedStoredSessionIdRef.current = selectedStoredSessionId
   }
 
-  const runtimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
+  const runtimeIdByStoredSessionIdRef = useRef(new SessionRuntimeIndex())
   const sessionStateByRuntimeIdRef = useRef<SessionStateCache>(null!)
 
   if (sessionStateByRuntimeIdRef.current === null) {
@@ -112,8 +113,8 @@ export function useSessionStateCache({
       // pinned megabytes of warm transcript per reconnect cycle behind
       // #isWarmSettled (#95189). Trust the cached in-flight flags only while
       // the authoritative store still claims work for the same runtime id.
-      isAuthoritativelyActive: runtimeId => {
-        const live = $sessionStates.get()[runtimeId]
+      isAuthoritativelyActive: (runtimeId, state) => {
+        const live = getSessionState(runtimeId, state)
 
         return Boolean(live && (live.busy || live.awaitingResponse))
       },
@@ -144,11 +145,18 @@ export function useSessionStateCache({
 
   const ensureSessionState = useCallback(
     (sessionId: string, storedSessionId?: string | null, ownerProfile?: string, ownerConnectionId?: null | string) => {
-      const existing = sessionStateCache.get(sessionId)
       const normalizedOwnerProfile = ownerProfile === undefined ? undefined : normalizeProfileKey(ownerProfile)
 
       const normalizedOwnerConnectionId =
         ownerConnectionId === undefined ? undefined : ownerConnectionId?.trim() || null
+
+      const existing =
+        normalizedOwnerProfile !== undefined && normalizedOwnerConnectionId
+          ? sessionStateCache.getOwned(sessionId, {
+              connectionId: normalizedOwnerConnectionId,
+              profile: normalizedOwnerProfile
+            })
+          : sessionStateCache.get(sessionId)
 
       if (existing) {
         const nextProfile = normalizedOwnerProfile ?? existing.profile
@@ -193,13 +201,26 @@ export function useSessionStateCache({
           }
 
           if (storedSessionId) {
-            runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+            if (updated.connectionId && updated.profile) {
+              runtimeIdByStoredSessionIdRef.current.setOwned(storedSessionId, sessionId, {
+                connectionId: updated.connectionId,
+                profile: updated.profile
+              })
+            } else {
+              runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+            }
+          }
+
+          if (ownerClaimed && updated.connectionId) {
+            sessionStateCache.delete(sessionId)
           }
 
           sessionStateCache.set(sessionId, updated)
+
+          return updated
         }
 
-        return sessionStateCache.get(sessionId)!
+        return existing
       }
 
       const created = {
@@ -209,7 +230,14 @@ export function useSessionStateCache({
       }
 
       if (storedSessionId) {
-        runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+        if (created.connectionId && created.profile) {
+          runtimeIdByStoredSessionIdRef.current.setOwned(storedSessionId, sessionId, {
+            connectionId: created.connectionId,
+            profile: created.profile
+          })
+        } else {
+          runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+        }
       }
 
       sessionStateCache.set(sessionId, created)
@@ -359,6 +387,13 @@ export function useSessionStateCache({
         return
       }
 
+      if (
+        previous.connectionId !== next.connectionId ||
+        normalizeProfileKey(previous.profile) !== normalizeProfileKey(next.profile)
+      ) {
+        sessionStateCache.delete(sessionId)
+      }
+
       sessionStateCache.set(sessionId, next)
       // Crash-survivable turn progress: journal the running turn's visible
       // tail (throttled localStorage write; cleared the moment the turn
@@ -387,7 +422,13 @@ export function useSessionStateCache({
       const normalizedOwnerConnectionId =
         ownerConnectionId === undefined ? undefined : ownerConnectionId?.trim() || null
 
-      const installed = sessionStateCache.get(sessionId)
+      const installed =
+        normalizedOwnerProfile !== undefined && normalizedOwnerConnectionId
+          ? (sessionStateCache.getOwned(sessionId, {
+              connectionId: normalizedOwnerConnectionId,
+              profile: normalizedOwnerProfile
+            }) ?? sessionStateCache.get(sessionId))
+          : sessionStateCache.get(sessionId)
 
       // Gateway runtime ids are transport-local and can collide across profile
       // sockets. A session.info publisher may claim an unowned state, but it may
@@ -429,7 +470,7 @@ export function useSessionStateCache({
 
   const sessionStateHasOwner = useCallback(
     (sessionId: string, owner: SessionStateOwner): boolean =>
-      sessionStateMatchesOwner(sessionStateCache.get(sessionId), owner),
+      sessionStateMatchesOwner(sessionStateCache.getOwned(sessionId, owner), owner),
     [sessionStateCache]
   )
 
@@ -457,7 +498,7 @@ export function useSessionStateCache({
       // Do not call ensureSessionState here: a stale async completion must not
       // create a cache entry or rotate/graft a stored id before ownership is
       // proven against the currently installed runtime state.
-      const previous = sessionStateCache.get(sessionId)
+      const previous = sessionStateCache.getOwned(sessionId, owner)
 
       if (!sessionStateMatchesOwner(previous, owner)) {
         return false

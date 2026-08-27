@@ -24,6 +24,20 @@ describe('SessionStateCache', () => {
     $sessionTiles.set([])
   })
 
+  it('keeps identical runtime ids independent across connection owners', () => {
+    const cache = new SessionStateCache({ isReferenced: () => false, onEvict: () => undefined })
+    const ownerA = { ...settled('stored-a'), connectionId: 'connection-a', profile: 'default' }
+    const ownerB = { ...settled('stored-b'), connectionId: 'connection-b', profile: 'default' }
+
+    cache.set('runtime-shared', ownerA)
+    cache.set('runtime-shared', ownerB)
+
+    expect(cache.size).toBe(2)
+    expect(cache.getOwned('runtime-shared', ownerA)).toBe(ownerA)
+    expect(cache.getOwned('runtime-shared', ownerB)).toBe(ownerB)
+    expect(cache.get('runtime-shared')).toBeUndefined()
+  })
+
   it('bounds warm settled transcripts by LRU count and cleans ownership atomically', () => {
     const owners = new Map<string, string>()
     const evicted: string[] = []

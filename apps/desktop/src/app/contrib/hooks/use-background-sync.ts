@@ -23,12 +23,13 @@ import {
 } from '@/store/session'
 import { sessionOwnerRouteFromRow, type SessionProfileRoute } from '@/store/session-request-router'
 import {
-  $sessionStates,
   $sessionTiles,
+  getSessionState,
   publishSessionState,
   SESSION_WATCHDOG_TIMEOUT_MS,
   setSessionStalled
 } from '@/store/session-states'
+import type { SessionInfo } from '@/types/hermes'
 
 import { sessionStateMatchesOwner, type SessionStateOwner } from '../../session/session-state-cache'
 import type { ClientSessionState } from '../../types'
@@ -42,21 +43,23 @@ interface ActiveTranscriptSession {
 /** Resolve an active transcript from visible rows or its unique hidden owner. */
 export function resolveActiveTranscriptSession(
   storedSessionId: string,
-  ownerProfile: string
+  ownerProfile: string,
+  ownerConnectionId?: null | string
 ): ActiveTranscriptSession | undefined {
   const owner = normalizeProfileKey(ownerProfile)
+  const connectionId = ownerConnectionId?.trim() || null
 
-  const visible =
-    $sessions
-      .get()
-      .find(
-        session => sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
-      ) ??
-    $messagingSessions
-      .get()
-      .find(
-        session => sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
-      )
+  const matchesOwner = (session: SessionInfo) => {
+    const route = sessionOwnerRouteFromRow(session)
+
+    return (
+      sessionMatchesStoredId(session, storedSessionId) &&
+      normalizeProfileKey(session.profile) === owner &&
+      (!connectionId || route?.connectionId === connectionId)
+    )
+  }
+
+  const visible = $sessions.get().find(matchesOwner) ?? $messagingSessions.get().find(matchesOwner)
 
   if (visible) {
     return { ownerRoute: sessionOwnerRouteFromRow(visible), profile: visible.profile }
@@ -64,7 +67,9 @@ export function resolveActiveTranscriptSession(
 
   const ownerRoute = getSessionOwnerHint(storedSessionId)
 
-  return ownerRoute && normalizeProfileKey(ownerRoute.targetProfile ?? ownerRoute.profile) === owner
+  return ownerRoute &&
+    normalizeProfileKey(ownerRoute.targetProfile ?? ownerRoute.profile) === owner &&
+    (!connectionId || ownerRoute.connectionId === connectionId)
     ? { ownerRoute, profile: ownerRoute.profile }
     : undefined
 }
@@ -431,13 +436,17 @@ export function rehydrateLiveSessionStatuses(
     // misclassify the rejected replacement as disappearance of the old owner.
     occupiedRuntimeIds.add(runtimeSessionId)
 
-    const existing = $sessionStates.get()[runtimeSessionId]
+    const existing = getSessionState(runtimeSessionId, {
+      connectionId: ownerConnectionId,
+      profile: ownerProfile
+    })
+
     const owner = { connectionId: ownerConnectionId, profile: ownerProfile, storedSessionId }
 
     // Runtime ids are transport-local and can collide or be reused. Once a
     // slot exists, this snapshot may touch it only when BOTH durable owner
     // coordinates still match. Unknown profile provenance also fails closed.
-    if (existing && !sessionStateMatchesOwner(existing, owner)) {
+    if (!ownerConnectionId && existing && !sessionStateMatchesOwner(existing, owner)) {
       continue
     }
 
@@ -475,7 +484,7 @@ export function rehydrateLiveSessionStatuses(
     }
 
     if (!working) {
-      setSessionStalled(storedSessionId, false)
+      setSessionStalled(storedSessionId, false, owner)
 
       continue
     }
@@ -488,7 +497,7 @@ export function rehydrateLiveSessionStatuses(
       lastActiveMs > 0 &&
       nowMs - lastActiveMs >= SESSION_WATCHDOG_TIMEOUT_MS
 
-    setSessionStalled(storedSessionId, isQuiet)
+    setSessionStalled(storedSessionId, isQuiet, owner)
   }
 
   // A runtime this profile's snapshot reported live LAST poll but not this one
@@ -505,7 +514,11 @@ export function rehydrateLiveSessionStatuses(
         continue
       }
 
-      const existing = $sessionStates.get()[runtimeSessionId]
+      const existing = getSessionState(runtimeSessionId, {
+        connectionId: ownerConnectionId,
+        profile: ownerProfile
+      })
+
       const owner = { connectionId: ownerConnectionId, profile: ownerProfile, storedSessionId }
 
       if (

@@ -5,10 +5,13 @@ import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds }
 import {
   $attentionSessionIds,
   $sessionStates,
+  $stalledSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
   getRecentlySettledSessionIds,
-  publishSessionState
+  getSessionState,
+  publishSessionState,
+  SESSION_WATCHDOG_TIMEOUT_MS
 } from '@/store/session-states'
 
 import { rehydrateLiveSessionStatuses, resetLiveRuntimeTracking } from './use-background-sync'
@@ -134,28 +137,42 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
   })
 
   it('keeps same-profile live bookkeeping isolated across connections', () => {
+    const now = Date.now()
     rehydrateLiveSessionStatuses(
-      { sessions: [{ id: 'runtime-shared', session_key: 'stored-shared', status: 'working' }] },
-      Date.now(),
+      {
+        sessions: [
+          {
+            id: 'runtime-shared',
+            last_active: (now - SESSION_WATCHDOG_TIMEOUT_MS) / 1000,
+            session_key: 'stored-shared',
+            status: 'working'
+          }
+        ]
+      },
+      now,
       'default',
       'connection-a'
     )
 
-    const ownerB = {
-      ...createClientSessionState('stored-shared'),
-      awaitingResponse: true,
-      busy: true,
-      connectionId: 'connection-b',
-      profile: 'default'
-    }
+    rehydrateLiveSessionStatuses(
+      {
+        sessions: [{ id: 'runtime-shared', last_active: now / 1000, session_key: 'stored-shared', status: 'working' }]
+      },
+      now,
+      'default',
+      'connection-b'
+    )
 
-    publishSessionState('runtime-shared', ownerB)
+    expect(getSessionState('runtime-shared', { connectionId: 'connection-a', profile: 'default' })?.busy).toBe(true)
+    expect(getSessionState('runtime-shared', { connectionId: 'connection-b', profile: 'default' })?.busy).toBe(true)
+    expect($stalledSessionIds.get()).toEqual(['stored-shared'])
 
-    rehydrateLiveSessionStatuses({ sessions: [] }, Date.now(), 'default', 'connection-a')
+    rehydrateLiveSessionStatuses({ sessions: [] }, now, 'default', 'connection-a')
 
-    expect($sessionStates.get()['runtime-shared']).toBe(ownerB)
-    expect(ownerB.busy).toBe(true)
-    expect(ownerB.awaitingResponse).toBe(true)
+    expect(getSessionState('runtime-shared', { connectionId: 'connection-a', profile: 'default' })?.busy).toBe(false)
+    expect(getSessionState('runtime-shared', { connectionId: 'connection-b', profile: 'default' })?.busy).toBe(true)
+    expect(getSessionState('runtime-shared')).toBeUndefined()
+    expect($stalledSessionIds.get()).toEqual([])
   })
 
   it('leaves runtimes this poll never seeded alone', () => {

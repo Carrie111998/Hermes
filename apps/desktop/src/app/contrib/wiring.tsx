@@ -392,7 +392,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         activeSessionIdRef,
         busyRef,
         requestSequenceRef: activeTranscriptRequestSequenceRef,
-        resolveSession: resolveActiveTranscriptSession,
+        resolveSession: (storedSessionId, ownerProfile) =>
+          resolveActiveTranscriptSession(
+            storedSessionId,
+            ownerProfile,
+            activeSessionIdRef.current ? getSessionStateOwner(activeSessionIdRef.current)?.connectionId : undefined
+          ),
         selectedStoredSessionIdRef,
         selectedStoredSessionProfileRef,
         sessionStateHasOwner,
@@ -402,6 +407,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [
       activeSessionIdRef,
       busyRef,
+      getSessionStateOwner,
       selectedStoredSessionIdRef,
       selectedStoredSessionProfileRef,
       sessionStateHasOwner,

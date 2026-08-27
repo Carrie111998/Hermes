@@ -53,7 +53,9 @@ import {
   $sessionTileDelegateRevision,
   $sessionTiles,
   closeSessionTile,
+  getSessionState,
   patchSessionTile,
+  runtimeStateKey,
   type SessionTile,
   sessionTileDelegate,
   sessionTileOwnerRoute
@@ -104,9 +106,11 @@ function buildTileView(storedSessionId: string): SessionView {
     tiles => tiles.find(t => t.storedSessionId === storedSessionId)?.runtimeId ?? null
   )
 
-  const $state = computed([$runtimeId, $sessionStates], (runtimeId, states) =>
-    runtimeId ? states[runtimeId] : undefined
-  )
+  const $state = computed([$sessionTiles, $sessionStates], (tiles, states) => {
+    const tile = tiles.find(t => t.storedSessionId === storedSessionId)
+
+    return tile?.runtimeId ? states[runtimeStateKey(tile.runtimeId, tile.ownerRoute)] : undefined
+  })
 
   const $messages = computed($state, state => state?.messages ?? NO_MESSAGES)
 
@@ -476,8 +480,8 @@ const $confirmCloseTile = atom<null | string>(null)
 /** The tile closer, gated: a quiet session closes immediately; a busy or
  *  input-blocked one asks first. One state read — the tile's runtime slice. */
 export function requestCloseSessionTile(storedSessionId: string): void {
-  const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
-  const state = runtimeId ? $sessionStates.get()[runtimeId] : undefined
+  const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)
+  const state = tile?.runtimeId ? getSessionState(tile.runtimeId, tile.ownerRoute) : undefined
 
   if (state?.busy || state?.awaitingResponse || state?.needsInput) {
     $confirmCloseTile.set(storedSessionId)

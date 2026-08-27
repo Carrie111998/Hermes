@@ -206,7 +206,20 @@ afterEach(() => {
   resetLiveRuntimeTracking()
 })
 
-describe('active transcript refresh', () => {
+describe('active transcript reconciliation', () => {
+  it('resolves same-profile same-id rows by the selected connection owner', () => {
+    setSessions([
+      { connection_id: 'connection-a', id: ACTIVE_STORED_ID, profile: 'default' } as never,
+      { connection_id: 'connection-b', id: ACTIVE_STORED_ID, profile: 'default' } as never
+    ])
+
+    expect(resolveActiveTranscriptSession(ACTIVE_STORED_ID, 'default', 'connection-a')?.ownerRoute?.connectionId).toBe(
+      'connection-a'
+    )
+    expect(resolveActiveTranscriptSession(ACTIVE_STORED_ID, 'default', 'connection-b')?.ownerRoute?.connectionId).toBe(
+      'connection-b'
+    )
+  })
   beforeEach(() => {
     vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('answer') as never)
   })

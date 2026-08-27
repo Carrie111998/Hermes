@@ -29,7 +29,7 @@ import {
   type SessionProfileRoute
 } from '@/store/session-request-router'
 import {
-  $sessionStates,
+  getSessionState,
   isSessionRemote,
   patchSessionTile,
   sessionTileDelegate,
@@ -131,6 +131,8 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   runtimeIdRef.current = runtimeId
   const storedIdRef = useRef(storedSessionId)
   storedIdRef.current = storedSessionId
+  const readOwnedState = () =>
+    getSessionState(runtimeIdRef.current, sessionTileOwnerRoute(storedIdRef.current) ?? undefined)
   // A tile IS its session (see the comment on the useSubmitPrompt call below)
   // A tile owns one stable stored/runtime pair, so seed the shared ownership
   // cache explicitly rather than relying on the primary route cache.
@@ -155,7 +157,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     () =>
       ({
         get current() {
-          return $sessionStates.get()[runtimeIdRef.current]?.busy ?? false
+          return readOwnedState()?.busy ?? false
         },
         set current(_value: boolean) {
           // Owned by session state.
@@ -170,7 +172,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     []
   )
 
-  const readState = useCallback(() => $sessionStates.get()[runtimeIdRef.current], [])
+  const readState = useCallback(readOwnedState, [])
   const readMessages = useCallback(() => readState()?.messages ?? [], [readState])
 
   // Tile session RPCs must follow the tile's composite owner even when the
@@ -195,7 +197,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   // away (see listTileSessionRow).
   const listTileSession = useCallback((preview: string) => {
     const runtimeId = runtimeIdRef.current
-    const state = $sessionStates.get()[runtimeId]
+    const state = readOwnedState()
 
     listTileSessionRow({
       cwd: state?.cwd,

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $activeSessionId } from '@/store/session'
-import { $sessionStates, clearAllSessionStates, publishSessionState } from '@/store/session-states'
+import { clearAllSessionStates, getSessionState, publishSessionState } from '@/store/session-states'
 
 import { useBackgroundSync } from './use-background-sync'
 
@@ -126,6 +126,6 @@ describe('useBackgroundSync profile-scoped session refresh', () => {
     })
 
     expect(requestGateway).toHaveBeenCalledTimes(2)
-    expect($sessionStates.get()['runtime-shared']).toBe(ownerB)
+    expect(getSessionState('runtime-shared', { connectionId: 'connection-b', profile: 'default' })).toBe(ownerB)
   })
 })
