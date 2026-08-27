@@ -1650,6 +1650,12 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "environments": [str(e).strip() for e in environments if str(e).strip()],
+        # Same reason again, and the same failure when it is missing: the
+        # manual-invocation gate runs on the cold scan only, so without the
+        # verdict recorded here every warm rebuild re-lists manual-only skills
+        # by bare name. The description stays empty, but the name is the part
+        # that costs context and the part that invites the model to try.
+        "manual_only": skill_is_manual_only(frontmatter),
         "conditions": extract_skill_conditions(frontmatter),
     }
     if org_id:
@@ -1870,6 +1876,8 @@ def _build_skills_system_prompt_inner(
             if not skill_matches_platform_list(platforms):
                 continue
             if not skill_matches_environment_list(entry.get("environments")):
+                continue
+            if entry.get("manual_only"):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
