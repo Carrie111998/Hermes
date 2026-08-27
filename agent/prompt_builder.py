@@ -385,7 +385,7 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
+TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek", "muse", "claude", "spark", "mimo")
 
 # Model name substrings whose sessions receive OPENAI_MODEL_EXECUTION_GUIDANCE
 # (execution discipline: tool persistence, mandatory tool use for arithmetic,
@@ -404,6 +404,7 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 EXECUTION_GUIDANCE_MODELS = (
     "gpt", "codex", "grok",
     "deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral",
+    "muse", "spark",
 )
 
 # Universal "finish the job" guidance — applied to ALL models, not gated
