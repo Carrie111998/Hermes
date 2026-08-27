@@ -523,6 +523,51 @@ describe('useProjectTree', () => {
     expect(readDir).toHaveBeenCalledTimes(2)
   })
 
+  it('reloads under the new connection when the re-armed read was issued under the old one', async () => {
+    // Profile switch on current main: resetProjectTreeState() runs on the
+    // gateway-scope change BEFORE the swapped $connection is published, so the
+    // re-arm issues its read under the OLD connection key. The stale-connection
+    // guard rightly discards that read — but the reset also blanked
+    // lastConnectionKey, so the connection change is not seen as a change and
+    // the non-forced reload declined because a load was "in flight". Net: a
+    // store that owns the cwd, rootLoading stuck true, Refresh disabled.
+    readDir.mockResolvedValue(ok([{ name: 'src', path: '/p/src', isDirectory: true }]))
+    $connection.set({ connectionId: 'gateway', mode: 'local', profile: 'a' } as never)
+
+    const { result } = renderHook(() => useProjectTree('/p'))
+
+    await waitFor(() => expect(result.current.data.length).toBe(1))
+
+    let release: (value: HermesReadDirResult) => void = () => {}
+
+    readDir.mockImplementationOnce(
+      () =>
+        new Promise<HermesReadDirResult>(resolve => {
+          release = resolve
+        })
+    )
+
+    act(() => {
+      resetProjectTreeState()
+    })
+
+    // The re-arm's read is pending under connection "a" when "b" publishes.
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(2))
+
+    act(() => {
+      $connection.set({ connectionId: 'gateway', mode: 'local', profile: 'b' } as never)
+    })
+
+    await act(async () => {
+      release(ok([{ name: 'stale', path: '/p/stale', isDirectory: false }]))
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(result.current.data.map(n => n.name)).toEqual(['src']))
+    expect(result.current.rootLoading).toBe(false)
+    expect(readDir).toHaveBeenCalledTimes(3)
+  })
+
   it('does not re-arm when a different cwd owns the store', async () => {
     // The re-arm keys on the CLEARED store (cwd: ''), not on any mismatch. The
     // atom is global, so two mounted consumers with different cwds would

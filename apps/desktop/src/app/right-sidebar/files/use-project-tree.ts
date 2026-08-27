@@ -112,6 +112,12 @@ export interface UseProjectTreeResult {
 
 export interface ProjectTreeState {
   collapseNonce: number
+  /** desktopFsCacheKey() the root load was issued under. A load — in flight
+   *  or complete — only satisfies its own connection: a reset that lands
+   *  before the swapped $connection publishes re-arms a read under the OLD
+   *  key, which the stale-connection guard then rightly discards, so a fresh
+   *  load for the new key must not be declined as "already in flight". */
+  connectionKey: string
   cwd: string
   data: TreeNode[]
   loaded: boolean
@@ -125,6 +131,7 @@ export interface ProjectTreeState {
 
 const initialState: ProjectTreeState = {
   collapseNonce: 0,
+  connectionKey: '',
   cwd: '',
   data: [],
   loaded: false,
@@ -213,7 +220,7 @@ async function loadRoot(
 
   const current = $projectTree.get()
 
-  if (!force && current.cwd === cwd && (current.loaded || current.rootLoading)) {
+  if (!force && current.cwd === cwd && current.connectionKey === connectionKey && (current.loaded || current.rootLoading)) {
     return
   }
 
@@ -227,6 +234,7 @@ async function loadRoot(
 
   $projectTree.set({
     collapseNonce: current.collapseNonce,
+    connectionKey,
     cwd,
     data: [],
     loaded: false,
