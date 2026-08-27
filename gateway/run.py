@@ -30541,6 +30541,50 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
+# Last-seen live SQLite connection count per state.db path, for the
+# housekeeping fd-leak guard (#96027). Written only from the single
+# housekeeping thread, so no locking is needed.
+_fd_guard_last: Dict[str, int] = {}
+
+# Healthy ceiling for live connections to one state.db in a single-profile
+# gateway: 2 long-lived SessionDBs (SessionStore + AsyncSessionDB), each
+# holding 1 writer + up to _READ_POOL_MAX pooled readers. Anything above this
+# is an unclosed-handle leak, not configuration.
+_FD_GUARD_WARN_CEILING = 2 * (1 + 8) + 4  # 22 — writers + pools + margin
+
+
+def _check_state_db_fd_growth(db_path: str) -> None:
+    """Log live state.db connection growth for the #96027 fd-leak guard.
+
+    Counts this process's tracked sqlite3 connections to *db_path* and
+    compares against the last tick. INFO on any growth (the issue's
+    ``~2 connections/day`` signature shows up within hours), WARNING once
+    the count passes the healthy ceiling (the EMFILE cliff is still weeks
+    away). Pure read of the tracking registry — opens no descriptors, so the
+    check itself can never leak. Idempotent; call from the housekeeping loop
+    once per tick.
+    """
+    from hermes_cli.sqlite_safe_read import live_connection_count
+
+    current = live_connection_count(db_path)
+    previous = _fd_guard_last.get(db_path)
+    if previous is not None and current > previous:
+        logger.info(
+            "state.db live SQLite connections grew %d -> %d (fd-leak guard, #96027)",
+            previous,
+            current,
+        )
+    if current > _FD_GUARD_WARN_CEILING:
+        logger.warning(
+            "state.db live SQLite connections at %d exceed the healthy "
+            "ceiling (%d) — connections are leaking; check for unclosed "
+            "SessionDB handles (#96027)",
+            current,
+            _FD_GUARD_WARN_CEILING,
+        )
+    _fd_guard_last[db_path] = current
+
+
 def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
@@ -30574,6 +30618,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
     MEMORY_TRIM_EVERY = 1    # shared helper cooldown bounds actual allocator work
     MISFIRE_SWEEP_EVERY = 5  # ticks — every 5 minutes (grace window gates real work)
+    FD_GUARD_EVERY = 60      # ticks — hourly SQLite fd-leak check (#96027)
 
     # Every platform media cache prunes on the same hourly cadence — one loop
     # over (name, cleanup_fn), not a copy-pasted try/except per cache.
@@ -30705,6 +30750,19 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                         _adb.close()
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
+
+        # SQLite fd-leak guard (#96027): count this process's live tracked
+        # connections to the active state.db and log growth. A long-lived
+        # gateway whose connection count keeps climbing (the issue's 48 db +
+        # 46 wal fds over 22 days) hits EMFILE with no diagnostic; this makes
+        # the growth visible long before the limit.
+        if tick_count % FD_GUARD_EVERY == 0:
+            try:
+                from hermes_state import _default_db_path
+
+                _check_state_db_fd_growth(str(Path(_default_db_path()).resolve()))
+            except Exception as e:
+                logger.debug("state.db fd-guard tick error: %s", e)
 
         # This is the long-lived messaging-gateway counterpart to the TUI idle
         # reaper. The helper is config-gated and rate-limited, so calling it on
