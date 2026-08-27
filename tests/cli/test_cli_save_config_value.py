@@ -90,6 +90,34 @@ class TestSaveConfigValueAtomic:
         assert saved["approvals"]["destructive_slash_confirm"] is False
         assert saved["agent"]["max_turns"] == 42
 
+    def test_copied_stale_snapshot_preserves_newer_single_key_write(
+        self, config_env
+    ):
+        """A normal dict-style copy must retain the loaded baseline."""
+        from cli import save_config_value
+        from hermes_cli.config import load_config, save_config
+
+        stale = load_config().copy()
+        assert stale["approvals"]["destructive_slash_confirm"] is True
+
+        assert save_config_value("approvals.destructive_slash_confirm", False) is True
+        stale["agent"]["max_turns"] = 42
+        save_config(stale)
+
+        saved = yaml.safe_load(config_env.read_text())
+        assert saved["approvals"]["destructive_slash_confirm"] is False
+        assert saved["agent"]["max_turns"] == 42
+
+    def test_loaded_config_remains_safe_yaml_serializable(self, config_env):
+        """The tracked mapping preserves the former plain-dict YAML contract."""
+        from hermes_cli.config import load_config
+
+        dumped = yaml.safe_dump(load_config())
+
+        assert yaml.safe_load(dumped)["model"]["default"] == "test-model"
+        assert "_baseline" not in dumped
+        assert "!!python" not in dumped
+
 
 
     def test_model_write_runs_shared_cron_drift_warning(self, config_env, monkeypatch):

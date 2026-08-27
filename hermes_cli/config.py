@@ -318,6 +318,12 @@ class _LoadedConfig(dict):
     def __init__(self, value: Dict[str, Any]):
         super().__init__(value)
         self._baseline = copy.deepcopy(value)
+
+    def copy(self) -> "_LoadedConfig":
+        """Return a shallow snapshot without losing stale-write tracking."""
+        cloned = _LoadedConfig(dict(self))
+        cloned._baseline = copy.deepcopy(self._baseline)
+        return cloned
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -387,6 +393,11 @@ _EXTRA_ENV_KEYS = frozenset({
     "COPILOT_ACP_BASE_URL",
 })
 import yaml
+
+yaml.SafeDumper.add_representer(
+    _LoadedConfig,
+    yaml.representer.SafeRepresenter.represent_dict,
+)
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
