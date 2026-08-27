@@ -3,7 +3,12 @@ import { atom } from 'nanostores'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 
 import type { ComposerAttachment } from './composer'
-import { resolveComposerStorageScopeKey } from './composer-storage-scope'
+import {
+  type ComposerStorageOwner,
+  decodeComposerStorageScopeKey,
+  normalizeComposerStorageOwner,
+  resolveComposerStorageScopeKey
+} from './composer-storage-scope'
 
 export interface QueuedPromptEntry {
   id: string
@@ -28,6 +33,7 @@ export const isSteerableEntry = (entry: Pick<QueuedPromptEntry, 'attachments' | 
 type QueueState = Record<string, QueuedPromptEntry[]>
 
 const STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const PARK_STORAGE_KEY = 'hermes.desktop.composerQueueParks.v1'
 
 const load = (): QueueState => {
   if (typeof window === 'undefined') {
@@ -62,17 +68,61 @@ const save = (state: QueueState) => {
 
 export const $queuedPromptsBySession = atom<QueueState>(load())
 
+const loadParks = (): Record<string, true> => {
+  if (typeof window === 'undefined') {
+    return {}
+  }
+
+  try {
+    const raw = window.localStorage.getItem(PARK_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {}
+    }
+
+    return Object.fromEntries(
+      Object.keys(parsed)
+        .filter(key => parsed[key] === true)
+        .map(key => [key, true])
+    )
+  } catch {
+    return {}
+  }
+}
+
+const saveParks = (state: Record<string, true>): void => {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  try {
+    if (Object.keys(state).length === 0) {
+      window.localStorage.removeItem(PARK_STORAGE_KEY)
+    } else {
+      window.localStorage.setItem(PARK_STORAGE_KEY, JSON.stringify(state))
+    }
+  } catch {
+    // best-effort: storage may be unavailable, parking still works in-memory
+  }
+}
+
 /**
  * Sessions whose queue the user explicitly halted (Stop button / Esc). A parked
  * queue is skipped by both auto-drain paths until the user acts on it again —
  * resume, send-now, a manual drain, queueing a fresh prompt, or emptying the
- * queue all unpark. Deliberately in-memory only: a fresh app process starts
- * unparked, so restored-entry semantics stay a separate concern.
+ * queue all unpark. Persisted and synchronized across renderer windows so a
+ * Stop in one surface remains a drain boundary everywhere.
  */
-export const $parkedQueueSessions = atom<Record<string, true>>({})
+export const $parkedQueueSessions = atom<Record<string, true>>(loadParks())
+
+export function reloadPersistedComposerQueue(): void {
+  $queuedPromptsBySession.set(load())
+  $parkedQueueSessions.set(loadParks())
+}
 
 const setParked = (sid: string, parked: boolean) => {
-  const current = $parkedQueueSessions.get()
+  const current = loadParks()
 
   if (Boolean(current[sid]) === parked) {
     return
@@ -87,10 +137,21 @@ const setParked = (sid: string, parked: boolean) => {
   }
 
   $parkedQueueSessions.set(next)
+  saveParks(next)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', event => {
+    if (event.key === STORAGE_KEY) {
+      $queuedPromptsBySession.set(load())
+    } else if (event.key === PARK_STORAGE_KEY) {
+      $parkedQueueSessions.set(loadParks())
+    }
+  })
 }
 
 const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
-  const current = $queuedPromptsBySession.get()
+  const current = load()
   const next = { ...current }
 
   if (queue.length === 0) {
@@ -122,6 +183,12 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
   const sid = sidOf(key)
 
   return sid ? queueFor(sid) : []
+}
+
+export const getLatestQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
+  const sid = sidOf(key)
+
+  return sid ? (load()[sid] ?? []).map(entry => ({ ...entry, attachments: cloneAttachments(entry.attachments) })) : []
 }
 
 export const enqueueQueuedPrompt = (
@@ -263,6 +330,28 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
   }
 
   writeSession(sid, [])
+}
+
+export function clearQueuedPromptsForOwnerLineage(
+  owner: ComposerStorageOwner,
+  storedSessionIds: readonly (null | string | undefined)[]
+): void {
+  const normalizedOwner = normalizeComposerStorageOwner(owner)
+  const ids = new Set(storedSessionIds.flatMap(id => (id?.trim() ? [id.trim()] : [])))
+
+  for (const key of Object.keys($queuedPromptsBySession.get())) {
+    const decoded = decodeComposerStorageScopeKey(key)
+
+    if (
+      decoded?.format === 'canonical' &&
+      decoded.storedSessionId &&
+      ids.has(decoded.storedSessionId) &&
+      decoded.owner.connectionId === normalizedOwner.connectionId &&
+      decoded.owner.profile === normalizedOwner.profile
+    ) {
+      clearQueuedPrompts(key)
+    }
+  }
 }
 
 /**

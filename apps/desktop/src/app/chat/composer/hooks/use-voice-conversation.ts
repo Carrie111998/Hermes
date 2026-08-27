@@ -71,6 +71,7 @@ export function useVoiceConversation({
   const spokenSourceLengthRef = useRef(0)
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
   const speechSetupKeyRef = useRef<string | null>(null)
+  const speechSetupAttemptRef = useRef(0)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
   const bargedRef = useRef(false)
@@ -145,6 +146,7 @@ export function useVoiceConversation({
   }
 
   const dropSpeechSession = () => {
+    speechSetupAttemptRef.current += 1
     stopBargeMonitorRef.current?.()
     stopBargeMonitorRef.current = null
     bargeCapturePendingRef.current = false
@@ -594,6 +596,14 @@ export function useVoiceConversation({
       }
 
       speechSetupKeyRef.current = setupKey
+      const setupAttempt = ++speechSetupAttemptRef.current
+
+      const isCurrent = () =>
+        speechSetupAttemptRef.current === setupAttempt &&
+        conversationEpochRef.current === conversationEpoch &&
+        speechSetupKeyRef.current === setupKey &&
+        responseIdRef.current === responseId
+
       const sequenceBeforeStart = $voicePlayback.get().sequence
 
       responseIdRef.current = responseId
@@ -607,18 +617,10 @@ export function useVoiceConversation({
       ensureBargeMonitor()
 
       void (async () => {
-        const session = await startSpeechStream({ source: 'voice-conversation' })
+        const session = await startSpeechStream({ isCurrent, source: 'voice-conversation' })
 
         // The session may resolve after the loop moved on (barge, disable).
-        if (
-          conversationEpochRef.current !== conversationEpoch ||
-          speechSetupKeyRef.current !== setupKey ||
-          responseIdRef.current !== responseId
-        ) {
-          if (session) {
-            stopVoicePlayback()
-          }
-
+        if (!isCurrent()) {
           return
         }
 
@@ -741,8 +743,14 @@ export function useVoiceConversation({
 
       if (next) {
         conversationEpochRef.current += 1
+        pendingStartRef.current = false
         clearTurnTimeout()
         handle.cancel()
+        turnClosingRef.current = false
+        // Muting owns the microphone lifecycle, including full-duplex capture.
+        // Leave already-playing TTS audible, but retire its setup bookkeeping so
+        // stale completion cannot reopen capture while muted.
+        dropSpeechSession()
         setStatus('idle')
       } else if (enabledRef.current && !busyRef.current && statusRef.current === 'idle') {
         pendingStartRef.current = true

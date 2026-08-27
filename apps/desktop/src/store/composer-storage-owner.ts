@@ -1,7 +1,7 @@
 import type { PrimarySessionOwnerIntent } from '@/store/session'
 import type { SessionOwnerRoute, SessionOwnerScope } from '@/store/session-request-router'
 
-import type { ComposerStorageOwner } from './composer-storage-scope'
+import { type ComposerStorageOwner, normalizeComposerStorageOwner } from './composer-storage-scope'
 
 interface ResolveComposerStorageOwnerOptions {
   ambientOwner: ComposerStorageOwner
@@ -11,6 +11,26 @@ interface ResolveComposerStorageOwnerOptions {
   primaryIntent?: PrimarySessionOwnerIntent | null
   selectedSessionId: string | null
   tileOwner?: SessionOwnerRoute
+}
+
+export function composerOwnerMatchesUniqueHint(
+  owner: ComposerStorageOwner,
+  hint: SessionOwnerRoute | undefined
+): boolean {
+  if (!hint) {
+    return false
+  }
+
+  const normalizedOwner = normalizeComposerStorageOwner(owner)
+
+  const normalizedHint = normalizeComposerStorageOwner({
+    connectionId: hint.connectionId,
+    profile: hint.profile
+  })
+
+  return (
+    normalizedOwner.connectionId === normalizedHint.connectionId && normalizedOwner.profile === normalizedHint.profile
+  )
 }
 
 /** Select the exact renderer storage owner without treating ambient chrome as

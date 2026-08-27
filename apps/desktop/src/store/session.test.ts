@@ -290,6 +290,17 @@ describe('resolveComposerSessionKey', () => {
   it('falls back to the live id when the tip row is not loaded yet', () => {
     expect(resolveComposerSessionKey('tip-new', [])).toBe('tip-new')
   })
+
+  it('resolves duplicate raw ids only inside the exact owner', () => {
+    const sessions = [
+      session({ connection_id: 'source-a', id: 'shared-tip', _lineage_root_id: 'root-a', profile: 'worker' }),
+      session({ connection_id: 'source-b', id: 'shared-tip', _lineage_root_id: 'root-b', profile: 'worker' })
+    ]
+
+    expect(resolveComposerSessionKey('shared-tip', sessions, { connectionId: 'source-b', profile: 'worker' })).toBe(
+      'root-b'
+    )
+  })
 })
 
 describe('shouldMigrateComposerScope', () => {
@@ -318,6 +329,18 @@ describe('shouldMigrateComposerScope', () => {
     expect(shouldMigrateComposerScope('root-a', 'root-a', sessions)).toBe(false)
     expect(shouldMigrateComposerScope(null, 'root-a', sessions)).toBe(false)
     expect(shouldMigrateComposerScope('root-a', null, sessions)).toBe(false)
+  })
+
+  it('authorizes lineage migration only inside the exact owner', () => {
+    const sessions = [
+      session({ connection_id: 'source-a', id: 'shared-tip', _lineage_root_id: 'root-a', profile: 'worker' }),
+      session({ connection_id: 'source-b', id: 'shared-tip', _lineage_root_id: 'root-b', profile: 'worker' })
+    ]
+
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+
+    expect(shouldMigrateComposerScope('shared-tip', 'root-a', sessions, ownerB)).toBe(false)
+    expect(shouldMigrateComposerScope('shared-tip', 'root-b', sessions, ownerB)).toBe(true)
   })
 })
 

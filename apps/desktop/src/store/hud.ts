@@ -15,7 +15,7 @@
 
 import { atom } from 'nanostores'
 
-import { requestComposerDraftSync } from '@/store/composer'
+import { $composerNewChatGeneration, requestComposerDraftSync } from '@/store/composer'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $sessions, rememberedSessionProfile } from '@/store/session'
 import { isHudWindow } from '@/store/windows'
@@ -68,7 +68,11 @@ export function openHud(sessionId?: null | string): void {
 
   $hudActive.set(true)
   $hudSession.set(sessionId ?? null)
-  void api.open({ sessionId: sessionId ?? null, profile })
+  void api.open({
+    ...(sessionId == null ? { newChatGeneration: $composerNewChatGeneration.get() } : {}),
+    sessionId: sessionId ?? null,
+    profile
+  })
 }
 
 /** Leave HUD mode. Callable from either window — main closes the child, the

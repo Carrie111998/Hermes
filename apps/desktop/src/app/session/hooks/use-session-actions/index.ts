@@ -27,7 +27,7 @@ import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { advanceComposerNewChatGeneration, migrateSessionDraft } from '@/store/composer'
-import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import { clearQueuedPrompts, clearQueuedPromptsForOwnerLineage, migrateQueuedPrompts } from '@/store/composer-queue'
 import {
   openGatewayForAgent,
   openGatewayForProfile,
@@ -2276,6 +2276,12 @@ export function useSessionActions({
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
         forgetSessionUnread(removedIds, profile)
+        clearQueuedPromptsForOwnerLineage(
+          typeof removedOwner === 'object' && removedOwner
+            ? removedOwner
+            : { connectionId: 'local', profile: typeof removedOwner === 'string' ? removedOwner : 'default' },
+          removedIds
+        )
         clearQueuedPrompts(storedSessionId)
 
         if (closingRuntimeId) {

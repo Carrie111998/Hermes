@@ -329,6 +329,31 @@ export const sessionMatchesStoredId = (
 // session, which is what made a populated recents list drag every stream. The
 // list is replaced wholesale (never mutated), so its reference is the cache key.
 type LineageRow = Pick<SessionInfo, '_lineage_root_id' | 'id'>
+type OwnedLineageRow = LineageRow & Pick<SessionInfo, 'connection_id' | 'profile'>
+interface LineageOwner {
+  connectionId: string
+  profile: string
+}
+
+const normalizeLineageProfile = (profile: unknown): string =>
+  typeof profile === 'string' && profile.trim() ? profile.trim() : 'default'
+
+function lineageRowsForOwner<T extends LineageRow>(sessions: readonly T[], owner?: LineageOwner): readonly T[] {
+  if (!owner) {
+    return sessions
+  }
+
+  const connectionId = owner.connectionId.trim() || 'local'
+  const profile = normalizeLineageProfile(owner.profile)
+
+  return sessions.filter(
+    session =>
+      (('connection_id' in session && typeof session.connection_id === 'string' ? session.connection_id.trim() : '') ||
+        'local') === connectionId &&
+      normalizeLineageProfile('profile' in session ? session.profile : undefined) === profile
+  )
+}
+
 const lineageIndexBySessions = new WeakMap<readonly LineageRow[], Map<string, string[]>>()
 
 function lineageIndex(sessions: readonly LineageRow[]): Map<string, string[]> {
@@ -383,13 +408,16 @@ export function lineageAliases(storedId: string, sessions: readonly LineageRow[]
 export function idsShareLineage(
   a: string,
   b: string,
-  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[],
+  owner?: LineageOwner
 ): boolean {
   if (a === b) {
     return true
   }
 
-  return sessions.some(session => sessionMatchesStoredId(session, a) && sessionMatchesStoredId(session, b))
+  return lineageRowsForOwner(sessions, owner).some(
+    session => sessionMatchesStoredId(session, a) && sessionMatchesStoredId(session, b)
+  )
 }
 
 /**
@@ -403,7 +431,8 @@ export function idsShareLineage(
 export function shouldMigrateComposerScope(
   fromKey: string | null | undefined,
   toKey: string | null | undefined,
-  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+  sessions: readonly OwnedLineageRow[],
+  owner?: LineageOwner
 ): boolean {
   const from = fromKey?.trim()
   const to = toKey?.trim()
@@ -412,7 +441,7 @@ export function shouldMigrateComposerScope(
     return false
   }
 
-  return idsShareLineage(from, to, sessions)
+  return idsShareLineage(from, to, sessions, owner)
 }
 
 /**
@@ -425,13 +454,14 @@ export function shouldMigrateComposerScope(
  */
 export function resolveComposerSessionKey(
   selectedSessionId: string | null | undefined,
-  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+  sessions: readonly OwnedLineageRow[],
+  owner?: LineageOwner
 ): string | null {
   if (!selectedSessionId) {
     return null
   }
 
-  const row = sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))
+  const row = lineageRowsForOwner(sessions, owner).find(session => sessionMatchesStoredId(session, selectedSessionId))
 
   return row ? sessionPinId(row) : selectedSessionId
 }

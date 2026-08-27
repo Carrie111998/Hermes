@@ -305,12 +305,42 @@ describe('ChatBar transition focus', () => {
     const view = render(
       <MemoryRouter>
         <ThreadRuntime messages={[]}>
-          <ChatBar {...props({ queueSessionKey: 'stored-1', storageScopeKey: 'profile-a\0stored-1' })} />
+          <ChatBar
+            {...props({
+              legacyStorageScopeKeys: ['stored-1'],
+              queueSessionKey: 'stored-1',
+              storageScopeKey: 'profile-a\0stored-1'
+            })}
+          />
         </ThreadRuntime>
       </MemoryRouter>
     )
 
     expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe('legacy draft')
+  })
+
+  it('quarantines an ambiguous unqualified draft unless the caller proves the alias', () => {
+    const canonicalKey = storageKey('stored-ambiguous')
+
+    stashSessionDraft('stored-ambiguous', 'must not cross owners', [])
+
+    const view = render(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar
+            {...props({
+              legacyStorageScopeKeys: [legacyComposerStorageScopeKey(STORAGE_OWNER, 'stored-ambiguous')],
+              queueSessionKey: 'stored-ambiguous',
+              storageScopeKey: canonicalKey
+            })}
+          />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe('')
+    expect(takeSessionDraft('stored-ambiguous').text).toBe('must not cross owners')
+    expect(takeSessionDraft(canonicalKey).text).toBe('')
   })
 
   it('claims a pre-codec qualified draft and queue before the canonical scope paints', () => {

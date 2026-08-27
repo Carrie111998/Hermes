@@ -191,7 +191,12 @@ export function startSessionDrag(
 
     onCommit() {
       if (split) {
-        openSessionTile(payload.id, split.pos, split.anchor, split.before)
+        if (payload.workspaceScope) {
+          openSessionTile(payload.id, split.pos, split.anchor, split.before, payload.workspaceScope)
+        } else {
+          openSessionTile(payload.id, split.pos, split.anchor, split.before)
+        }
+
         // A tile for this session may already exist (openSessionTile is
         // idempotent — e.g. persisted from an earlier run): a drop must never
         // feel dead, so front/unhide/un-dismiss it either way.

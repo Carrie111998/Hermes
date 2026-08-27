@@ -1022,11 +1022,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       if (ownerRoute) {
         requestSessionResume(sessionId, ownerRoute)
-      } else {
-        forgetSessionOwnerHintsForSession(sessionId)
-        requestSessionResume(sessionId)
+        openSession(sessionId, navigate, 'in-place', { ownerRoute, workspaceMode: 'sessions' })
+
+        return
       }
 
+      forgetSessionOwnerHintsForSession(sessionId)
+      requestSessionResume(sessionId)
       openSession(sessionId, navigate)
     },
     onRetryResume: sessionId => void resumeSession(sessionId, true),

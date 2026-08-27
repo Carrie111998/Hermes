@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { clearSessionDraft, sessionDraftRevision, stashSessionDraft, takeSessionDraft } from './composer'
+import {
+  clearSessionDraft,
+  clearSessionDraftIfRevision,
+  sessionDraftRevision,
+  stashSessionDraft,
+  takeSessionDraft
+} from './composer'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
@@ -88,6 +94,21 @@ describe('composer storage migration', () => {
     expect(migrateComposerStorageScope(from, to)).toBe(true)
     expect(sessionDraftRevision(from)).toBe(submittedRevision)
     expect(sessionDraftRevision(to)).toBe(submittedRevision)
+  })
+
+  it('invalidates a late source completion when the destination already has a colliding revision', () => {
+    const from = key(OWNER_A, null, 8)
+    const to = key(OWNER_A, 'stored-touched')
+
+    stashSessionDraft(from, 'submitted prompt', [])
+    const submittedRevision = clearSessionDraft(from)
+    stashSessionDraft(to, 'older destination draft', [])
+    stashSessionDraft(to, 'newer destination draft', [])
+
+    expect(sessionDraftRevision(to)).toBe(submittedRevision)
+    expect(migrateComposerStorageScope(from, to)).toBe(true)
+    expect(clearSessionDraftIfRevision(from, submittedRevision)).toBe(false)
+    expect(takeSessionDraft(to).text).toBe('newer destination draft')
   })
 
   it('keeps the next New Chat generation independent from the previous handoff', () => {

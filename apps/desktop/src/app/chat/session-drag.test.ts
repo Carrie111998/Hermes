@@ -6,6 +6,7 @@ import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { openSessionTile } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
+import type { SessionDragPayload } from './composer/inline-refs'
 import { startSessionDrag } from './session-drag'
 
 /**
@@ -61,8 +62,13 @@ function mountStackedTabs() {
 
 /** Press on `source`, drag to (x, y), release. The drag session flushes its
  *  pending move synchronously on release, so no frame wait is needed. */
-function dragTo(source: HTMLElement, x: number, y: number) {
-  startSessionDrag({ id: 'dragged', profile: 'default', title: 'Dragged chat' }, {
+function dragTo(
+  source: HTMLElement,
+  x: number,
+  y: number,
+  payload: SessionDragPayload = { id: 'dragged', profile: 'default', title: 'Dragged chat' }
+) {
+  startSessionDrag(payload, {
     button: 0,
     clientX: 0,
     clientY: 0,
@@ -99,6 +105,26 @@ describe('session drop targeting across stacked tabs', () => {
 
     expect(openSessionTile).toHaveBeenCalledWith('dragged', 'right', 'session-tile:visible', undefined)
     expect(requestComposerInsertRefs).not.toHaveBeenCalled()
+  })
+
+  it('preserves exact tile workspace scope while relocating a split', () => {
+    const row = mountStackedTabs()
+
+    const workspaceScope = {
+      ownerRoute: { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' },
+      workspaceMode: 'bots' as const,
+      workspaceOwnerKey: 'bot-owner',
+      workspaceTabTitle: 'Bot Chat'
+    }
+
+    dragTo(row, 980, 400, {
+      id: 'dragged',
+      profile: 'worker',
+      title: 'Dragged bot chat',
+      workspaceScope
+    })
+
+    expect(openSessionTile).toHaveBeenCalledWith('dragged', 'right', 'session-tile:visible', undefined, workspaceScope)
   })
 
   it('commits nothing over a zone that hosts no chat surface', () => {

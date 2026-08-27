@@ -1469,11 +1469,33 @@ export function nextSessionTileForWorkspace(): null | string {
  *  Callers that own the router need the `'main'` vs `'tile'` distinction: a
  *  `'main'` hit only reaches the screen if the workspace pane is actually
  *  showing the chat, whereas a tile renders in its own pane regardless. */
+function tileMatchesWorkspaceScope(tile: SessionTile, scope: SessionTileWorkspaceScope): boolean {
+  if ((tile.workspaceMode ?? 'sessions') !== scope.workspaceMode) {
+    return false
+  }
+
+  if (scope.workspaceMode === 'bots' && tile.workspaceOwnerKey !== scope.workspaceOwnerKey) {
+    return false
+  }
+
+  if (!scope.ownerRoute) {
+    return !tile.ownerRoute
+  }
+
+  return Boolean(
+    tile.ownerRoute &&
+    tile.ownerRoute.connectionId.trim() === scope.ownerRoute.connectionId.trim() &&
+    normalizeProfileKey(tile.ownerRoute.profile) === normalizeProfileKey(scope.ownerRoute.profile)
+  )
+}
+
 export function focusOpenSession(
   storedSessionId: string,
   workspaceScope: SessionTileWorkspaceScope = { workspaceMode: 'sessions' }
 ): 'main' | 'tile' | null {
-  if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
+  if (
+    $sessionTiles.get().some(t => t.storedSessionId === storedSessionId && tileMatchesWorkspaceScope(t, workspaceScope))
+  ) {
     const paneId = `${TILE_PANE_PREFIX}${storedSessionId}`
     revealTreePane(paneId) // un-dismiss + adopt + front in its group
     const tree = $layoutTree.get()

@@ -18,6 +18,18 @@ test('buildHudWindowUrl carries the handoff profile in the query before the hash
   assert.ok(url.indexOf('profile=work') < url.indexOf('#'))
 })
 
+test('buildHudWindowUrl carries the exact New Chat generation before the hash', () => {
+  const generation = '44444444-4444-4444-8444-444444444444'
+
+  const url = buildHudWindowUrl(null, {
+    devServer: 'http://localhost:5173',
+    newChatGeneration: generation,
+    profile: 'work'
+  })
+
+  assert.equal(url, `http://localhost:5173/?win=hud&profile=work&newChatGeneration=${generation}#/`)
+})
+
 test('buildHudWindowUrl encodes the profile and the session id', () => {
   const url = buildHudWindowUrl('a b/c', { devServer: 'http://localhost:5173', profile: 'my profile' })
 

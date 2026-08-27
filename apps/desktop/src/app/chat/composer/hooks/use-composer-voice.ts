@@ -23,6 +23,8 @@ import { useCommittedActionScope } from './use-committed-action-scope'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
+let wakeVoiceOperationGeneration = 0
+
 interface UseComposerVoiceArgs {
   busy: boolean
   clearDraft: () => void
@@ -302,20 +304,44 @@ export function useComposerVoice({
       return
     }
 
+    const operationGeneration = ++wakeVoiceOperationGeneration
+    const pauseBarrier = wakePauseBarrierRef.current
+
     wakePausedRef.current = false
-    wakePauseBarrierRef.current = null
+
     // Reconcile, don't just resume: the wake word is a persistent setting, so
     // ending a voice chat must re-arm the listener whenever config says
     // enabled — including when the raw resume loses the mic-release race.
-    void resumeWakeAfterVoice()
+    void (async () => {
+      await pauseBarrier
+
+      if (wakeVoiceOperationGeneration !== operationGeneration || wakePausedRef.current) {
+        return
+      }
+
+      await resumeWakeAfterVoice()
+
+      if (wakeVoiceOperationGeneration === operationGeneration && wakePauseBarrierRef.current === pauseBarrier) {
+        wakePauseBarrierRef.current = null
+      }
+    })()
   }, [])
 
   // The ref is a request token (did WE issue wake.pause?), not an atom mirror —
   // it guards resumeWakeIfPaused from resuming a detector another surface owns.
   const pauseWakeForVoice = useCallback(() => {
+    const operationGeneration = ++wakeVoiceOperationGeneration
+    const previousBarrier = wakePauseBarrierRef.current
+
     wakePausedRef.current = true
 
     const barrier = (async () => {
+      await previousBarrier
+
+      if (wakeVoiceOperationGeneration !== operationGeneration || !wakePausedRef.current) {
+        return
+      }
+
       try {
         await $gateway.get()?.request('wake.pause', {})
       } catch {

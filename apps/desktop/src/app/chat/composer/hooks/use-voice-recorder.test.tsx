@@ -71,6 +71,32 @@ describe('useVoiceRecorder lifecycle', () => {
     await act(async () => resolveStart?.())
   })
 
+  it('uses a second Dictate toggle to cancel pending microphone acquisition', async () => {
+    let resolveStart: (() => void) | undefined
+    mic.start.mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveStart = resolve
+        })
+    )
+
+    const hook = renderHook(() =>
+      useVoiceRecorder({
+        focusInput: vi.fn(),
+        maxRecordingSeconds: 120,
+        onTranscribeAudio: vi.fn(async () => 'transcript'),
+        onTranscript: vi.fn()
+      })
+    )
+
+    act(() => hook.result.current.dictate())
+    act(() => hook.result.current.dictate())
+
+    expect(mic.cancel).toHaveBeenCalledOnce()
+    await act(async () => resolveStart?.())
+    expect(hook.result.current.voiceStatus).toBe('idle')
+  })
+
   it('cancels and invalidates transcription when unmounted', async () => {
     mic.recording = true
     mic.stop.mockResolvedValue({ audio: new Blob(['audio']), durationMs: 10, heardSpeech: true })

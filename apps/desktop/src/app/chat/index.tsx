@@ -28,7 +28,7 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $composerNewChatGeneration } from '@/store/composer'
 import { parkQueuedPrompts } from '@/store/composer-queue'
-import { resolveComposerStorageOwner } from '@/store/composer-storage-owner'
+import { composerOwnerMatchesUniqueHint, resolveComposerStorageOwner } from '@/store/composer-storage-owner'
 import { encodeComposerStorageScopeKey, legacyComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -56,7 +56,6 @@ import {
   $sessions,
   getSessionOwnerHint,
   resolveComposerSessionKey,
-  sessionMatchesStoredId,
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
@@ -88,6 +87,7 @@ import { ProfileTag } from './profile-tag'
 import { isRouteSessionMismatch } from './route-session-state'
 import { useRuntimeMessageRepository } from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
+import { sessionRowForOwner } from './session-row-owner'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { routedSessionIsLoading, threadLoadingState } from './thread-loading'
@@ -163,9 +163,18 @@ function ChatHeader({
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const primaryOwnerIntent = useStore($primarySessionOwnerIntent)
 
-  const activeStoredSession =
-    (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
+  const primaryOwnerRoute =
+    selectedSessionId && primaryOwnerIntent?.storedSessionId === selectedSessionId
+      ? primaryOwnerIntent.ownerRoute
+      : selectedSessionId
+        ? getSessionOwnerHint(selectedSessionId)
+        : undefined
+
+  const activeStoredSession = selectedSessionId
+    ? (sessionRowForOwner(sessions, selectedSessionId, primaryOwnerRoute) ?? null)
+    : null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : NEW_SESSION_TITLE
 
@@ -499,11 +508,6 @@ const ChatViewContent = memo(function ChatViewContent({
     ? primaryRouteSelectedSessionId(location.pathname, selectedSessionId)
     : selectedSessionId
 
-  const queueSessionKey = useMemo(
-    () => resolveComposerSessionKey(effectiveSelectedSessionId, sessions),
-    [effectiveSelectedSessionId, sessions]
-  )
-
   const activeComposerOwnerConnectionId = connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')
   const activeComposerOwnerProfile = activeGatewayProfile
 
@@ -545,6 +549,11 @@ const ChatViewContent = memo(function ChatViewContent({
     ]
   )
 
+  const queueSessionKey = useMemo(
+    () => resolveComposerSessionKey(effectiveSelectedSessionId, sessions, composerOwner),
+    [composerOwner, effectiveSelectedSessionId, sessions]
+  )
+
   const composerOwnerScopeKey = encodeComposerStorageScopeKey(composerOwner, null)
 
   const composerStorageScopeKey = encodeComposerStorageScopeKey(
@@ -561,44 +570,42 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const composerIdentityScopeKey = composerStorageScopeKey
 
-  const lineageStorageMigration = shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)
+  const lineageStorageMigration = shouldMigrateComposerScope(
+    selectedSessionId,
+    queueSessionKey,
+    sessions,
+    composerOwner
+  )
 
   const storageMigration = lineageStorageMigration
     ? ({ fromKey: selectedStorageScopeKey, kind: 'lineage', toKey: composerStorageScopeKey } as const)
     : undefined
 
   const legacyStorageScopeKeys = useMemo(() => {
+    const rawLegacyKey = (storedSessionId: string | null): string | undefined =>
+      storedSessionId && composerOwnerMatchesUniqueHint(composerOwner, getSessionOwnerHint(storedSessionId))
+        ? storedSessionId
+        : undefined
+
     const keys: (string | null | undefined)[] = [
-      queueSessionKey,
+      rawLegacyKey(queueSessionKey),
       legacyComposerStorageScopeKey(composerOwner, queueSessionKey)
     ]
 
     if (lineageStorageMigration) {
-      keys.push(selectedSessionId, legacyComposerStorageScopeKey(composerOwner, selectedSessionId))
+      keys.push(rawLegacyKey(selectedSessionId), legacyComposerStorageScopeKey(composerOwner, selectedSessionId))
     }
 
     return [...new Set(keys)]
   }, [composerOwner, lineageStorageMigration, queueSessionKey, selectedSessionId])
 
-  // Ownership belongs to a SURFACE generation, not to a runtime-id string.
-  // Backends are free to reuse the same runtime id across profiles. Keep the
-  // outgoing generation pinned while its runtime is still present (the action
-  // fence), retire it when the runtime clears, and let the next publication —
-  // even under the same id — claim the current route/profile generation.
+  // Runtime ownership is tied to the exact owner+route key captured when the
+  // runtime publishes. Returning A→B→A can therefore reaccept A's still-live
+  // runtime, while B remains fenced until a real runtime publication claims B.
   const ownerRouteKey = `${composerOwnerScopeKey}\0${location.pathname}`
-  const [committedOwner, setCommittedOwner] = useState({ generation: 0, key: ownerRouteKey })
-
-  const renderOwnerGeneration =
-    committedOwner.key === ownerRouteKey ? committedOwner.generation : committedOwner.generation + 1
-
-  useLayoutEffect(() => {
-    setCommittedOwner(current =>
-      current.key === ownerRouteKey ? current : { generation: renderOwnerGeneration, key: ownerRouteKey }
-    )
-  }, [ownerRouteKey, renderOwnerGeneration])
 
   const [runtimeOwner, setRuntimeOwner] = useState<{
-    generation: number
+    ownerRouteKey: string
     runtimeId: string
     storedSessionId: null | string
   } | null>(null)
@@ -619,7 +626,7 @@ const ChatViewContent = memo(function ChatViewContent({
         (activeRuntimeStoredId !== null && current.storedSessionId !== activeRuntimeStoredId)
       ) {
         return {
-          generation: renderOwnerGeneration,
+          ownerRouteKey,
           runtimeId: activeSessionId,
           storedSessionId: activeRuntimeStoredId
         }
@@ -627,7 +634,7 @@ const ChatViewContent = memo(function ChatViewContent({
 
       return current
     })
-  }, [activeRuntimeStoredId, activeSessionId, isPrimary, renderOwnerGeneration])
+  }, [activeRuntimeStoredId, activeSessionId, isPrimary, ownerRouteKey])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any
@@ -657,13 +664,8 @@ const ChatViewContent = memo(function ChatViewContent({
         isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
       : false
 
-  const activeRuntimeOwnerGeneration = runtimeOwner?.generation
-
   const activeRuntimeOwnerMismatch =
-    isPrimary &&
-    isRoutedSessionView &&
-    activeRuntimeOwnerGeneration !== undefined &&
-    activeRuntimeOwnerGeneration !== renderOwnerGeneration
+    isPrimary && isRoutedSessionView && runtimeOwner !== null && runtimeOwner.ownerRouteKey !== ownerRouteKey
 
   const newChatRouteHasStaleSession =
     isPrimary && isNewChatRoute(location.pathname) && Boolean(selectedSessionId || activeSessionId)

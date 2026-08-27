@@ -5,6 +5,7 @@ import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
   clearQueuedPrompts,
+  clearQueuedPromptsForOwnerLineage,
   dequeueQueuedPrompt,
   enqueueQueuedPrompt,
   getQueuedPrompts,
@@ -12,15 +13,18 @@ import {
   migrateQueuedPrompts,
   parkQueuedPrompts,
   promoteQueuedPrompt,
+  reloadPersistedComposerQueue,
   removeQueuedPrompt,
   shouldAutoDrain,
   unparkQueuedPrompts,
   updateQueuedPrompt,
   updateQueuedPromptText
 } from './composer-queue'
+import { encodeComposerStorageScopeKey } from './composer-storage-scope'
 
 const SESSION_KEY = 'session-abc'
 const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const PARK_STORAGE_KEY = 'hermes.desktop.composerQueueParks.v1'
 
 function attachment(id: string, kind: ComposerAttachment['kind'] = 'file'): ComposerAttachment {
   return {
@@ -34,7 +38,9 @@ function attachment(id: string, kind: ComposerAttachment['kind'] = 'file'): Comp
 describe('composer queue store', () => {
   beforeEach(() => {
     window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    window.localStorage.removeItem(PARK_STORAGE_KEY)
     $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
   })
 
   it('queues prompts in FIFO order', () => {
@@ -44,6 +50,37 @@ describe('composer queue store', () => {
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('first')
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('second')
     expect(dequeueQueuedPrompt(SESSION_KEY)).toBeNull()
+  })
+
+  it('reloads a queue removal written by another BrowserWindow', () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'already sent elsewhere' })
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+
+    reloadPersistedComposerQueue()
+
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('persists Stop parks so another BrowserWindow cannot drain them as unparked', () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'hold this turn' })
+    parkQueuedPrompts(SESSION_KEY)
+
+    expect(JSON.parse(window.localStorage.getItem(PARK_STORAGE_KEY) ?? '{}')).toEqual({ [SESSION_KEY]: true })
+  })
+
+  it('clears canonical lineage queues only for the deleted exact owner', () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const keyA = encodeComposerStorageScopeKey(ownerA, 'shared-id')
+    const keyB = encodeComposerStorageScopeKey(ownerB, 'shared-id')
+
+    enqueueQueuedPrompt(keyA, { attachments: [], text: 'owner A queued turn' })
+    enqueueQueuedPrompt(keyB, { attachments: [], text: 'owner B queued turn' })
+
+    clearQueuedPromptsForOwnerLineage(ownerA, ['shared-id'])
+
+    expect(getQueuedPrompts(keyA)).toHaveLength(0)
+    expect(getQueuedPrompts(keyB).map(entry => entry.text)).toEqual(['owner B queued turn'])
   })
 
   it('clones attachments when queueing', () => {

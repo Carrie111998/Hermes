@@ -87,6 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import { ComposerQueueDrainArbiter } from './composer-queue-drain-arbiter'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -13495,7 +13496,7 @@ function hudBounds() {
   return defaultHudBounds(area)
 }
 
-function hudUrl(sessionId, profile) {
+function hudUrl(sessionId, profile, newChatGeneration) {
   // The profile rides the query string next to `win=hud` (BEFORE the '#', so
   // HashRouter never sees it). The HUD renderer's gateway boot reads it and
   // adopts that backend instead of the primary — without it, a HUD opened on a
@@ -13503,6 +13504,7 @@ function hudUrl(sessionId, profile) {
   // wrong backend and falls back to the default profile's last session.
   return buildHudWindowUrl(sessionId, {
     devServer: DEV_SERVER,
+    newChatGeneration,
     profile,
     rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
   })
@@ -13522,7 +13524,7 @@ function broadcastHudState(open) {
   }
 }
 
-function spawnHudWindow(sessionId, profile) {
+function spawnHudWindow(sessionId, profile, newChatGeneration) {
   const win = new BrowserWindow({
     ...hudBounds(),
     minWidth: 380,
@@ -13629,7 +13631,7 @@ function spawnHudWindow(sessionId, profile) {
   // Log-only lifecycle (#81290): the HUD is a compact auxiliary surface the
   // user can re-toggle; a dead renderer should be diagnosable, not resurrected.
   installWindowRendererLifecycle(win, { kind: 'hud', callbacks: { log: rememberLog } })
-  loadWindowUrl(win, hudUrl(sessionId, profile), 'HUD')
+  loadWindowUrl(win, hudUrl(sessionId, profile, newChatGeneration), 'HUD')
 
   return win
 }
@@ -13647,7 +13649,7 @@ function restoreMainWindowFromHud() {
   }
 }
 
-function openHudWindow(sessionId, profile) {
+function openHudWindow(sessionId, profile, newChatGeneration) {
   const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
 
   if (hudWindow && !hudWindow.isDestroyed()) {
@@ -13663,7 +13665,7 @@ function openHudWindow(sessionId, profile) {
 
       hudSessionId = sessionId || null
       hudProfile = profileKey
-      hudWindow = spawnHudWindow(sessionId, profileKey)
+      hudWindow = spawnHudWindow(sessionId, profileKey, newChatGeneration)
       broadcastHudState(true)
       registerHudSnapShortcut()
 
@@ -13689,7 +13691,7 @@ function openHudWindow(sessionId, profile) {
   hudRestoreMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible())
   hudSessionId = sessionId || null
   hudProfile = profileKey
-  hudWindow = spawnHudWindow(sessionId, profileKey)
+  hudWindow = spawnHudWindow(sessionId, profileKey, newChatGeneration)
   broadcastHudState(true)
   registerHudSnapShortcut()
 
@@ -14480,6 +14482,45 @@ const hudIpc = registerHudIpc({
   setHudSessionId: value => {
     hudSessionId = value
   }
+})
+
+const composerQueueDrainArbiter = new ComposerQueueDrainArbiter()
+const composerQueueDrainRendererIds = new Set()
+
+ipcMain.on('hermes:composer-queue-drain:begin', (event, request) => {
+  const ownerId = event.sender.id
+
+  if (!composerQueueDrainRendererIds.has(ownerId)) {
+    composerQueueDrainRendererIds.add(ownerId)
+    event.sender.once('destroyed', () => {
+      composerQueueDrainRendererIds.delete(ownerId)
+      composerQueueDrainArbiter.releaseOwner(ownerId)
+    })
+  }
+
+  event.returnValue = composerQueueDrainArbiter.begin(
+    typeof request?.scopeKey === 'string' ? request.scopeKey : '',
+    typeof request?.entryId === 'string' ? request.entryId : '',
+    ownerId
+  )
+})
+
+ipcMain.on('hermes:composer-queue-drain:excluded', (event, request) => {
+  event.returnValue = composerQueueDrainArbiter.excluded(
+    typeof request?.scopeKey === 'string' ? request.scopeKey : '',
+    typeof request?.entryId === 'string' ? request.entryId : ''
+  )
+})
+
+ipcMain.on('hermes:composer-queue-drain:handoff', (event, request) => {
+  event.returnValue = composerQueueDrainArbiter.handoff(
+    typeof request?.fromScopeKey === 'string' ? request.fromScopeKey : '',
+    typeof request?.toScopeKey === 'string' ? request.toScopeKey : ''
+  )
+})
+
+ipcMain.on('hermes:composer-queue-drain:finish', (event, token) => {
+  event.returnValue = composerQueueDrainArbiter.finish(typeof token === 'number' ? token : -1)
 })
 
 ipcMain.handle('hermes:bootstrap:reset', async () => {

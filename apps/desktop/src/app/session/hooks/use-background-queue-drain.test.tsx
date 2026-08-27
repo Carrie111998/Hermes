@@ -19,6 +19,8 @@ import { useBackgroundQueueDrain } from './use-background-queue-drain'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
 const OWNER = { connectionId: 'local', profile: 'default' }
+const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const PARK_STORAGE_KEY = 'hermes.desktop.composerQueueParks.v1'
 const storageKey = (storedSessionId: string | null) => encodeComposerStorageScopeKey(OWNER, storedSessionId)
 
 const lineageSession = (over: Partial<SessionInfo>): SessionInfo =>
@@ -68,6 +70,10 @@ function Harness({
 describe('useBackgroundQueueDrain', () => {
   beforeEach(() => {
     vi.useRealTimers()
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    window.localStorage.removeItem(PARK_STORAGE_KEY)
+    $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
     clearAllSessionStates()
   })
 
@@ -138,6 +144,7 @@ describe('useBackgroundQueueDrain', () => {
       [foreignKey]: [{ ...foreignEntry, id: 'duplicate-entry' }],
       [localKey]: [{ ...localEntry, id: 'duplicate-entry' }]
     })
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify($queuedPromptsBySession.get()))
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 

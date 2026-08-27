@@ -678,10 +678,35 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         const createdSessionRef: { current: CreatedBackendSessionForSend | null } = { current: null }
+        let createdHandoffInvalid = false
 
         try {
           sessionId = await createBackendSessionForSend(bubbleText, created => {
             createdSessionRef.current = created
+
+            if (startedAsNewChat && submittedStorageScopeKey && submittedStorageScope) {
+              const createdOwner = normalizeComposerStorageOwner(created.owner ?? submittedStorageScope.owner)
+              const createdStoredSessionId = created.storedSessionId
+
+              if (
+                !createdStoredSessionId ||
+                submittedStorageScope.format !== 'canonical' ||
+                submittedStorageScope.storedSessionId !== null ||
+                createdOwner.connectionId !== submittedStorageScope.owner.connectionId ||
+                createdOwner.profile !== submittedStorageScope.owner.profile
+              ) {
+                createdHandoffInvalid = true
+
+                return
+              }
+
+              onSessionCreatedForSend?.({
+                fromScopeKey: submittedStorageScopeKey,
+                runtimeSessionId: created.runtimeSessionId,
+                storedSessionId: createdStoredSessionId,
+                toScopeKey: encodeComposerStorageScopeKey(createdOwner, createdStoredSessionId)
+              })
+            }
           })
         } catch (err) {
           dropOptimistic(null)
@@ -722,6 +747,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return abortForSessionSwitch(sessionId)
         }
 
+        if (createdHandoffInvalid) {
+          return abortForSessionSwitch(sessionId)
+        }
+
         // Selection is the durable identity and cannot be spoofed by a reused
         // runtime string. Background runtime events may retarget activeSessionId
         // without a user switch, so validate the created stored id directly.
@@ -743,26 +772,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // tile route / owner hint / row, probed REST by a runtime id, and fell
         // to the ambient socket — the fresh-chat owner loss behind #94071.
         targetStoredSessionId = createdSession.storedSessionId
-
-        if (startedAsNewChat && targetStoredSessionId && submittedStorageScopeKey && submittedStorageScope) {
-          const createdOwner = normalizeComposerStorageOwner(createdSession.owner ?? submittedStorageScope.owner)
-
-          if (
-            submittedStorageScope.format !== 'canonical' ||
-            submittedStorageScope.storedSessionId !== null ||
-            createdOwner.connectionId !== submittedStorageScope.owner.connectionId ||
-            createdOwner.profile !== submittedStorageScope.owner.profile
-          ) {
-            return abortForSessionSwitch(sessionId)
-          }
-
-          onSessionCreatedForSend?.({
-            fromScopeKey: submittedStorageScopeKey,
-            runtimeSessionId: createdSession.runtimeSessionId,
-            storedSessionId: targetStoredSessionId,
-            toScopeKey: encodeComposerStorageScopeKey(createdOwner, targetStoredSessionId)
-          })
-        }
 
         seedOptimistic(sessionId)
       }

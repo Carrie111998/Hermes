@@ -6,6 +6,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  getLatestQueuedPrompts,
   MAX_AUTO_DRAIN_ATTEMPTS,
   type QueuedPromptEntry,
   removeQueuedPrompt,
@@ -124,7 +125,7 @@ export function useBackgroundQueueDrain({
           // microtask runs. Resolve that scope, then match the entry only inside
           // its exact owner namespace: entry ids are not an ownership boundary.
           const liveScopeKey = resolveComposerStorageScopeKey(sessionKey)
-          const liveEntry = $queuedPromptsBySession.get()[liveScopeKey]?.find(candidate => candidate.id === entry.id)
+          const liveEntry = getLatestQueuedPrompts(liveScopeKey).find(candidate => candidate.id === entry.id)
 
           if (!liveEntry) {
             return

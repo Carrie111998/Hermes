@@ -62,7 +62,7 @@ import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH
 } from '@/store/layout'
-import { $activeGatewayProfile, normalizeProfileKey, resolveNewChatOwnerRoute } from '@/store/profile'
+import { $activeGatewayProfile, resolveNewChatOwnerRoute } from '@/store/profile'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import {
   $reviewOpen,
@@ -79,7 +79,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $yoloActive,
-  sessionMatchesStoredId
+  getSessionOwnerHint
 } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { knownOwnerForSession } from '@/store/session-states'
@@ -92,6 +92,7 @@ import type { SessionDragPayload } from '../chat/composer/inline-refs'
 import { watchPreviewTiles } from '../chat/preview-tile'
 import { watchRouteTiles } from '../chat/route-tile'
 import { startSessionDrag } from '../chat/session-drag'
+import { sessionRowForOwner } from '../chat/session-row-owner'
 import {
   SessionTileCloseConfirm,
   stackSessionTilesIntoMain,
@@ -168,18 +169,10 @@ const workspaceDragPayload = (): SessionDragPayload | null => {
   }
 
   const ownerIntent = $primarySessionOwnerIntent.get()
-  const candidates = $sessions.get().filter(session => sessionMatchesStoredId(session, selected))
 
-  const stored =
-    ownerIntent?.storedSessionId === selected
-      ? (candidates.find(
-          session =>
-            session.connection_id?.trim() === ownerIntent.ownerRoute.connectionId &&
-            normalizeProfileKey(session.profile) === normalizeProfileKey(ownerIntent.ownerRoute.profile)
-        ) ?? (candidates.length === 1 && !candidates[0]?.connection_id?.trim() ? candidates[0] : undefined))
-      : candidates.length === 1
-        ? candidates[0]
-        : undefined
+  const ownerRoute = ownerIntent?.storedSessionId === selected ? ownerIntent.ownerRoute : getSessionOwnerHint(selected)
+
+  const stored = sessionRowForOwner($sessions.get(), selected, ownerRoute)
 
   const connection = $connection.get()
 
@@ -547,7 +540,16 @@ watchUnreadWriteGuard()
 // above, so the pane content never remounts.
 const syncWorkspaceTitle = () => {
   const selected = $selectedStoredSessionId.get()
-  const stored = selected ? $sessions.get().find(s => sessionMatchesStoredId(s, selected)) : null
+  const ownerIntent = $primarySessionOwnerIntent.get()
+
+  const ownerRoute =
+    selected && ownerIntent?.storedSessionId === selected
+      ? ownerIntent.ownerRoute
+      : selected
+        ? getSessionOwnerHint(selected)
+        : undefined
+
+  const stored = selected ? (sessionRowForOwner($sessions.get(), selected, ownerRoute) ?? null) : null
 
   registry.register({
     id: 'workspace',
@@ -579,6 +581,7 @@ const syncWorkspaceTitle = () => {
 
 $selectedStoredSessionId.listen(syncWorkspaceTitle)
 $sessions.listen(syncWorkspaceTitle)
+$primarySessionOwnerIntent.listen(syncWorkspaceTitle)
 $activeGatewayProfile.listen(syncWorkspaceTitle)
 $composerNewChatGeneration.listen(syncWorkspaceTitle)
 $connection.listen(syncWorkspaceTitle)

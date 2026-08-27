@@ -75,6 +75,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       return () => ipcRenderer.removeListener('hermes:pet-overlay:control', listener)
     }
   },
+  composerQueueDrain: {
+    begin: request => ipcRenderer.sendSync('hermes:composer-queue-drain:begin', request),
+    excluded: request => ipcRenderer.sendSync('hermes:composer-queue-drain:excluded', request),
+    handoff: request => ipcRenderer.sendSync('hermes:composer-queue-drain:handoff', request),
+    finish: token => ipcRenderer.sendSync('hermes:composer-queue-drain:finish', token)
+  },
   // HUD mode: the chrome-free floating chat. A full app renderer (own gateway)
   // sized as a floating bar, so it mounts the real composer. Main owns the
   // window; `onChanged` keeps every window's toggle truthful.

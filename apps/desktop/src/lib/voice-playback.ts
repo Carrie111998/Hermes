@@ -72,6 +72,7 @@ function currentState(
 }
 
 export interface VoicePlaybackOptions {
+  isCurrent?: () => boolean
   messageId?: string | null
   source: VoicePlaybackSource
 }
@@ -524,6 +525,10 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
 export async function startSpeechStream(options: VoicePlaybackOptions): Promise<null | SpeechStreamSession> {
   const direct = await directTtsConfig().catch(() => null)
 
+  if (options.isCurrent?.() === false) {
+    return null
+  }
+
   if (direct) {
     stopVoicePlayback()
     setVoicePlaybackState(currentState('preparing', options))
@@ -541,7 +546,7 @@ export async function startSpeechStream(options: VoicePlaybackOptions): Promise<
 
   const wsUrl = await resolveSpeakStreamUrl()
 
-  if (!wsUrl) {
+  if (!wsUrl || options.isCurrent?.() === false) {
     return null
   }
 

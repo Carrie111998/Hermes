@@ -25,12 +25,17 @@ vi.mock('@/lib/voice-barge-in', () => ({
 }))
 
 const markVoicePlaybackInterrupted = vi.fn()
+
+const startSpeechStreamMock = vi.hoisted(() =>
+  vi.fn<(options: { isCurrent?: () => boolean; source: string }) => Promise<null>>(async () => null)
+)
+
 const stopVoicePlayback = vi.fn()
 
 vi.mock('@/lib/voice-playback', () => ({
   markVoicePlaybackInterrupted: () => markVoicePlaybackInterrupted(),
   playSpeechText: vi.fn(async () => true),
-  startSpeechStream: vi.fn(async () => null),
+  startSpeechStream: startSpeechStreamMock,
   stopVoicePlayback: () => stopVoicePlayback()
 }))
 
@@ -75,7 +80,13 @@ interface HookProps {
   busy: boolean
 }
 
-function renderConversation(overrides: { onInterrupt?: () => void; transcript?: string } = {}) {
+function renderConversation(
+  overrides: {
+    onInterrupt?: () => void
+    pendingResponse?: () => null | { id: string; pending: boolean; text: string }
+    transcript?: string
+  } = {}
+) {
   const onInterrupt = overrides.onInterrupt ?? vi.fn()
 
   // Mirrors the real app: submitting a turn makes the agent busy.
@@ -105,7 +116,7 @@ function renderConversation(overrides: { onInterrupt?: () => void; transcript?: 
         onStopWord,
         onSubmit,
         onTranscribeAudio,
-        pendingResponse: () => null
+        pendingResponse: overrides.pendingResponse ?? (() => null)
       }),
     { initialProps: { busy: false } }
   )
@@ -262,5 +273,61 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     hook.rerender({ busy: true })
 
     expect(monitorCalls.length).toBe(armed)
+  })
+
+  it('stops the active barge monitor when muted', async () => {
+    const { hook } = renderConversation()
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    act(() => hook.result.current.toggleMute())
+
+    expect(hook.result.current.muted).toBe(true)
+    expect(stopMonitor).toHaveBeenCalled()
+  })
+
+  it('allows the next listening turn to close after muting a pending close', async () => {
+    let settleFirstStop: ((recording: MicRecording | null) => void) | undefined
+
+    const firstStop = new Promise<MicRecording | null>(resolve => {
+      settleFirstStop = resolve
+    })
+
+    const { hook } = renderConversation()
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    micHandle.stop.mockReturnValueOnce(firstStop).mockResolvedValueOnce(null)
+
+    act(() => hook.result.current.stopTurn())
+    await waitFor(() => expect(hook.result.current.status).toBe('transcribing'))
+    act(() => hook.result.current.toggleMute())
+    await act(async () => settleFirstStop?.(null))
+    act(() => hook.result.current.toggleMute())
+    await waitFor(() => expect(hook.result.current.status).toBe('listening'))
+
+    act(() => hook.result.current.stopTurn())
+    await waitFor(() => expect(micHandle.stop).toHaveBeenCalledTimes(2))
+  })
+
+  it('invalidates an in-flight speech setup before its discovery can mutate playback', async () => {
+    let response: null | { id: string; pending: boolean; text: string } = null
+    const { hook } = renderConversation({ pendingResponse: () => response })
+
+    await enterThinking(hook)
+    response = { id: 'reused-response', pending: true, text: 'hello' }
+    hook.rerender({ busy: true })
+    await waitFor(() => expect(startSpeechStreamMock).toHaveBeenCalled())
+
+    const isCurrent = startSpeechStreamMock.mock.calls.at(-1)?.[0]?.isCurrent
+
+    expect(isCurrent?.()).toBe(true)
+    act(() => hook.result.current.toggleMute())
+    expect(isCurrent?.()).toBe(false)
   })
 })

@@ -56,7 +56,6 @@ interface UseComposerDraftArgs {
   activeQueueSessionKey: string | null
   focusKey: ChatBarProps['focusKey']
   inputDisabled: boolean
-  legacyScopeKey?: string | null
   legacyStorageScopeKeys?: readonly (string | null | undefined)[]
   queueEditRef: RefObject<QueueEditState | null>
   sessionId: string | null | undefined
@@ -78,7 +77,6 @@ export function useComposerDraft({
   activeQueueSessionKey,
   focusKey,
   inputDisabled,
-  legacyScopeKey,
   legacyStorageScopeKeys,
   queueEditRef,
   sessionId,
@@ -90,7 +88,9 @@ export function useComposerDraft({
   const { attachments: attachmentScope, target } = useComposerScope()
   const actionsDisabledRef = useRef(actionsDisabled)
 
-  actionsDisabledRef.current = actionsDisabled
+  useLayoutEffect(() => {
+    actionsDisabledRef.current = actionsDisabled
+  }, [actionsDisabled])
 
   // Coarse edges only — these flip rarely (empty↔non-empty, the `?` help sigil,
   // steerable-vs-slash), so typing within a line costs no render.
@@ -396,7 +396,10 @@ export function useComposerDraft({
   // Latest-closure ref so the once-only subscription always calls the current
   // insertInlineRefs without re-subscribing every render.
   const insertInlineRefsRef = useRef(insertInlineRefs)
-  insertInlineRefsRef.current = insertInlineRefs
+
+  useLayoutEffect(() => {
+    insertInlineRefsRef.current = insertInlineRefs
+  })
 
   useEffect(() => {
     return onComposerInsertRefsRequest(({ refs, target: requested }) => {
@@ -454,11 +457,6 @@ export function useComposerDraft({
     pendingDraftPersistRef.current = null
     draftScopeRef.current = activeQueueSessionKey
 
-    if (legacyScopeKey !== undefined && legacyScopeKey !== activeQueueSessionKey) {
-      claimSessionDraft(legacyScopeKey, activeQueueSessionKey)
-      migrateQueuedPrompts(legacyScopeKey, activeQueueSessionKey)
-    }
-
     const { attachments, text } = takeSessionDraft(activeQueueSessionKey)
     loadIntoComposer(text, attachments)
 
@@ -486,7 +484,7 @@ export function useComposerDraft({
       // lingers in the map and re-appears stale on the way back.
       clearDraftSuggestions(historySessionId)
     }
-  }, [activeQueueSessionKey, legacyScopeKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeQueueSessionKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // The HUD handoff's two verbs. Entering HUD mode flushes this editor's text
   // into the shared stash so the HUD's composer boots with it; leaving repaints
@@ -508,7 +506,10 @@ export function useComposerDraft({
   }
 
   const syncDraftRef = useRef(syncDraft)
-  syncDraftRef.current = syncDraft
+
+  useLayoutEffect(() => {
+    syncDraftRef.current = syncDraft
+  })
 
   useEffect(
     () =>

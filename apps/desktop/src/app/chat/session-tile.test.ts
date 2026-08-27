@@ -57,7 +57,13 @@ describe('qualified tile draft titles', () => {
     expect(tileDragPayload('duplicate-id')).toEqual({
       id: 'duplicate-id',
       profile: 'worker',
-      title: 'Owner B title'
+      title: 'Owner B title',
+      workspaceScope: {
+        ownerRoute,
+        workspaceMode: 'sessions',
+        workspaceOwnerKey: undefined,
+        workspaceTabTitle: undefined
+      }
     })
   })
 
@@ -73,7 +79,13 @@ describe('qualified tile draft titles', () => {
     expect(tileDragPayload('duplicate-id')).toEqual({
       id: 'duplicate-id',
       profile: 'default',
-      title: 'Exact owner draft title'
+      title: 'Exact owner draft title',
+      workspaceScope: {
+        ownerRoute,
+        workspaceMode: 'sessions',
+        workspaceOwnerKey: undefined,
+        workspaceTabTitle: undefined
+      }
     })
 
     clearSessionDraft(scope)

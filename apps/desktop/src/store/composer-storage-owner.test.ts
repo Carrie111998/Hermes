@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { resolveComposerStorageOwner } from './composer-storage-owner'
+import { composerOwnerMatchesUniqueHint, resolveComposerStorageOwner } from './composer-storage-owner'
 
 const ambientOwner = { connectionId: 'source-a', profile: 'default' }
 
@@ -40,5 +40,25 @@ describe('resolveComposerStorageOwner', () => {
         tileOwner: { connectionId: 'source-tile', mode: 'remote', profile: 'tile-profile' }
       })
     ).toEqual({ connectionId: 'source-tile', profile: 'tile-profile' })
+  })
+})
+
+describe('composerOwnerMatchesUniqueHint', () => {
+  it('accepts only an exact unique owner hint', () => {
+    expect(
+      composerOwnerMatchesUniqueHint(ambientOwner, {
+        connectionId: 'source-a',
+        mode: 'remote',
+        profile: 'default'
+      })
+    ).toBe(true)
+    expect(
+      composerOwnerMatchesUniqueHint(ambientOwner, {
+        connectionId: 'source-b',
+        mode: 'remote',
+        profile: 'default'
+      })
+    ).toBe(false)
+    expect(composerOwnerMatchesUniqueHint(ambientOwner, undefined)).toBe(false)
   })
 })

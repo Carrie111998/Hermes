@@ -1,6 +1,8 @@
-import { act, cleanup, renderHook } from '@testing-library/react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { type PropsWithChildren } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { $gateway } from '@/store/gateway'
 
 import { ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
@@ -22,7 +24,13 @@ interface RecorderOptions {
 const mocks = vi.hoisted(() => ({
   conversationOptions: null as ConversationOptions | null,
   recorderCancel: vi.fn(),
-  recorderOptions: null as RecorderOptions | null
+  recorderOptions: null as RecorderOptions | null,
+  resumeWakeAfterVoice: vi.fn(async () => undefined)
+}))
+
+vi.mock('@/store/wake-word', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  resumeWakeAfterVoice: mocks.resumeWakeAfterVoice
 }))
 
 vi.mock('./use-auto-speak-replies', () => ({ useAutoSpeakReplies: vi.fn() }))
@@ -65,6 +73,8 @@ describe('useComposerVoice session-transition lifecycle', () => {
     mocks.conversationOptions = null
     mocks.recorderCancel.mockReset()
     mocks.recorderOptions = null
+    mocks.resumeWakeAfterVoice.mockReset()
+    $gateway.set(null)
   })
 
   it('drops A callbacks that finish after the composer has converged on B', async () => {
@@ -124,5 +134,47 @@ describe('useComposerVoice session-transition lifecycle', () => {
     expect(onInterrupt).not.toHaveBeenCalled()
     expect(focusInput).not.toHaveBeenCalled()
     expect(mocks.conversationOptions?.enabled).toBe(true)
+  })
+
+  it('does not let a stale wake resume cross a rapid conversation restart', async () => {
+    const pauseResolvers: (() => void)[] = []
+
+    const request = vi.fn(
+      () =>
+        new Promise<void>(resolve => {
+          pauseResolvers.push(resolve)
+        })
+    )
+
+    $gateway.set({ request } as never)
+
+    const hook = renderHook(
+      () =>
+        useComposerVoice({
+          busy: false,
+          clearDraft: vi.fn(),
+          disabled: false,
+          focusInput: vi.fn(),
+          insertText: vi.fn(),
+          maxRecordingSeconds: 120,
+          onSubmit: vi.fn(async () => true),
+          onTranscribeAudio: vi.fn(async () => 'transcript'),
+          sessionId: 'runtime-a',
+          submissionKey: 'session-a',
+          target: 'main'
+        }),
+      { wrapper: Wrapper }
+    )
+
+    act(() => hook.result.current.startConversation())
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    mocks.resumeWakeAfterVoice.mockClear()
+    act(() => hook.result.current.endConversation())
+    act(() => hook.result.current.startConversation())
+
+    await act(async () => pauseResolvers[0]?.())
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+
+    expect(mocks.resumeWakeAfterVoice).not.toHaveBeenCalled()
   })
 })

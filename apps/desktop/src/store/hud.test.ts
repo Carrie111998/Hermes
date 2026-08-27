@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $composerNewChatGeneration } from '@/store/composer'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
@@ -30,6 +31,7 @@ beforeEach(() => {
   $hudSession.set(null)
   $sessions.set([])
   $activeGatewayProfile.set('default')
+  $composerNewChatGeneration.set('44444444-4444-4444-8444-444444444444')
 })
 
 afterEach(() => {
@@ -72,13 +74,21 @@ describe('openHud profile targeting (#82285)', () => {
 
     openHud()
 
-    expect(open).toHaveBeenCalledWith({ sessionId: null, profile: 'research' })
+    expect(open).toHaveBeenCalledWith({
+      newChatGeneration: '44444444-4444-4444-8444-444444444444',
+      sessionId: null,
+      profile: 'research'
+    })
   })
 
   it('normalizes to default for single-profile users', () => {
     openHud()
 
-    expect(open).toHaveBeenCalledWith({ sessionId: null, profile: 'default' })
+    expect(open).toHaveBeenCalledWith({
+      newChatGeneration: '44444444-4444-4444-8444-444444444444',
+      sessionId: null,
+      profile: 'default'
+    })
   })
 
   it('uses the active profile when the target session is not in the cache', () => {

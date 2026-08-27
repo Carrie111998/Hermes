@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   _resetComposerQueueDrainsForTests,
@@ -14,18 +14,47 @@ const scopeA = encodeComposerStorageScopeKey(owner, 'stored-a')
 const scopeB = encodeComposerStorageScopeKey(owner, 'stored-b')
 
 describe('composer queue drain coordinator', () => {
-  afterEach(() => _resetComposerQueueDrainsForTests())
+  const originalDesktop = window.hermesDesktop
+
+  afterEach(() => {
+    _resetComposerQueueDrainsForTests()
+    window.hermesDesktop = originalDesktop
+  })
+
+  it('delegates cross-window claims and settlement to the desktop arbiter', () => {
+    const begin = vi.fn().mockReturnValue(41)
+    const excluded = vi.fn().mockReturnValue(true)
+    const handoff = vi.fn().mockReturnValue(1)
+    const finish = vi.fn().mockReturnValue(scopeB)
+
+    window.hermesDesktop = {
+      ...originalDesktop,
+      composerQueueDrain: { begin, excluded, finish, handoff }
+    } as never
+
+    const drain = beginComposerQueueDrain(scopeA, 'entry-a')!
+
+    expect(begin).toHaveBeenCalledWith({ entryId: 'entry-a', scopeKey: scopeA })
+    expect(isComposerQueueDrainExcluded(scopeB, 'entry-b')).toBe(true)
+    expect(excluded).toHaveBeenCalledWith({ entryId: 'entry-b', scopeKey: scopeB })
+    expect(handoffComposerQueueDrains(scopeA, scopeB)).toBe(1)
+    expect(handoff).toHaveBeenCalledWith({ fromScopeKey: scopeA, toScopeKey: scopeB })
+    expect(finishComposerQueueDrain(drain)).toBe(scopeB)
+    expect(finish).toHaveBeenCalledWith(41)
+  })
 
   it('excludes visible/background contenders by both qualified scope and entry', () => {
     const drain = beginComposerQueueDrain(scopeA, 'entry-a')
+    const sameIdOtherOwner = beginComposerQueueDrain(scopeB, 'entry-a')
 
     expect(drain).not.toBeNull()
+    expect(sameIdOtherOwner).not.toBeNull()
     expect(beginComposerQueueDrain(scopeA, 'entry-b')).toBeNull()
-    expect(beginComposerQueueDrain(scopeB, 'entry-a')).toBeNull()
     expect(isComposerQueueDrainExcluded(scopeA, 'other-entry')).toBe(true)
     expect(isComposerQueueDrainExcluded(scopeB, 'entry-a')).toBe(true)
 
     expect(finishComposerQueueDrain(drain!)).toBe(scopeA)
+    expect(finishComposerQueueDrain(sameIdOtherOwner!)).toBe(scopeB)
     expect(isComposerQueueDrainExcluded(scopeA, 'entry-a')).toBe(false)
   })
 

@@ -26,8 +26,7 @@ import {
   focusedSessionNeedsRoute,
   focusOpenSession,
   openSessionTile,
-  reuseBlankDraftTile,
-  setSessionTileWorkspaceScope
+  reuseBlankDraftTile
 } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
@@ -99,7 +98,6 @@ export function openSession(
   // already on screen (open tile, or the main session) would otherwise return
   // at focusOpenSession and never clear its unread dot.
   markSessionRead(storedSessionId)
-  setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
 
   const hasWorkspaceMetadata = Boolean(
     workspaceScope.ownerRoute ||

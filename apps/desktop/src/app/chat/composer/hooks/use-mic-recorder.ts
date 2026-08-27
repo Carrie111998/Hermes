@@ -79,6 +79,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
   const startEpochRef = useRef(0)
   const startingRef = useRef(false)
+  const recorderGenerationRef = useRef(0)
 
   const cleanup = () => {
     if (animationRef.current) {
@@ -99,6 +100,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   useEffect(
     () => () => {
       startEpochRef.current += 1
+      recorderGenerationRef.current += 1
       startingRef.current = false
       cleanup()
     },
@@ -236,6 +238,8 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
         return
       }
 
+      const recorderGeneration = ++recorderGenerationRef.current
+
       chunksRef.current = []
       streamRef.current = stream
       recorderRef.current = recorder
@@ -245,12 +249,20 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       startedAtRef.current = Date.now()
 
       recorder.ondataavailable = event => {
-        if (event.data.size > 0) {
+        if (
+          recorderGenerationRef.current === recorderGeneration &&
+          recorderRef.current === recorder &&
+          event.data.size > 0
+        ) {
           chunksRef.current.push(event.data)
         }
       }
 
       recorder.onstop = () => {
+        if (recorderGenerationRef.current !== recorderGeneration || recorderRef.current !== recorder) {
+          return
+        }
+
         const chunks = chunksRef.current
         const recordingType = recorder.mimeType || mimeType || 'audio/webm'
         const durationMs = Date.now() - startedAtRef.current
@@ -276,6 +288,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       }
 
       recorder.onerror = event => {
+        if (recorderGenerationRef.current !== recorderGeneration || recorderRef.current !== recorder) {
+          return
+        }
+
         const error = micError((event as Event & { error?: unknown }).error, copy)
         const resolver = stopResolverRef.current
         stopResolverRef.current = null
@@ -298,8 +314,16 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     new Promise<MicRecording | null>(resolve => {
       const recorder = recorderRef.current
 
-      if (!recorder || recorder.state === 'inactive') {
+      if (!recorder) {
+        startEpochRef.current += 1
+        startingRef.current = false
         cleanup()
+        resolve(null)
+
+        return
+      }
+
+      if (recorder.state === 'inactive') {
         resolve(null)
 
         return
@@ -311,16 +335,20 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
 
   const cancel: MicRecorderHandle['cancel'] = () => {
     startEpochRef.current += 1
+    recorderGenerationRef.current += 1
     startingRef.current = false
     const recorder = recorderRef.current
     const resolver = stopResolverRef.current
     stopResolverRef.current = null
 
-    if (recorder && recorder.state !== 'inactive') {
+    if (recorder) {
       recorder.ondataavailable = null
       recorder.onerror = null
       recorder.onstop = null
-      recorder.stop()
+
+      if (recorder.state !== 'inactive') {
+        recorder.stop()
+      }
     }
 
     cleanup()

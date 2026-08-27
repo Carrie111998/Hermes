@@ -8,6 +8,7 @@ import {
   advanceComposerNewChatGeneration,
   claimSessionDraft,
   clearSessionDraft,
+  clearSessionDraftIfMatches,
   clearSessionDraftIfRevision,
   type ComposerAttachment,
   createComposerAttachmentOccurrenceId,
@@ -282,6 +283,17 @@ describe('session drafts', () => {
     expect(sessionDraftRevision('session-a')).toBeGreaterThan(submittedRevision)
     expect(clearSessionDraftIfRevision('session-a', submittedRevision)).toBe(false)
     expect(takeSessionDraft('session-a').text).toBe('newer other-window draft')
+  })
+
+  it('does not erase a newer persisted draft when dispatch clears a stale renderer snapshot', () => {
+    stashSessionDraft('session-a', 'submitted text', [])
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ 'session-a': 'newer other-window draft' }))
+
+    expect(clearSessionDraftIfMatches('session-a', 'submitted text', [])).toBeNull()
+    expect(takeSessionDraft('session-a').text).toBe('newer other-window draft')
+    expect(JSON.parse(window.localStorage.getItem(SESSION_DRAFTS_STORAGE_KEY) ?? '{}')).toEqual({
+      'session-a': 'newer other-window draft'
+    })
   })
 
   it('preserves attachment-only inactive drafts when another window updates persisted text', () => {

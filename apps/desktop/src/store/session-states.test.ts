@@ -281,6 +281,24 @@ describe('SessionTile workspace scope', () => {
     ])
   })
 
+  it('does not focus a duplicate-id tile owned by another exact route', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    openSessionTile('shared-focus-id', 'right', undefined, undefined, {
+      ownerRoute: ownerA,
+      workspaceMode: 'sessions'
+    })
+
+    expect(
+      focusOpenSession('shared-focus-id', {
+        ownerRoute: ownerB,
+        workspaceMode: 'sessions'
+      })
+    ).toBeNull()
+    expect($sessionTiles.get()[0]?.ownerRoute).toEqual(ownerA)
+  })
+
   it('allows a Bot-scoped tab when the same stored session is hidden in Sessions main', () => {
     const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
 

@@ -440,6 +440,28 @@ describe('ChatView render isolation', () => {
     expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
   })
 
+  it('reaccepts the still-live original runtime after a committed owner A→B→A round trip', () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <ChatView {...chatViewProps()} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
+
+    act(() => $activeGatewayProfile.set('profile-b'))
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('true')
+
+    act(() => $activeGatewayProfile.set('profile-a'))
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
+  })
+
   it('accepts a reused runtime id only after the owner generation turns over', () => {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } }

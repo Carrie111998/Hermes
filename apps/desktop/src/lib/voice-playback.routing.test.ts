@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection, setApiRequestProfile } from '@/hermes'
+import { $voicePlayback } from '@/store/voice-playback'
 
-import { resolveSpeakStreamUrl } from './voice-playback'
+import { resolveSpeakStreamUrl, startSpeechStream } from './voice-playback'
+
+const directTtsConfigMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@/lib/voice-client-direct', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  directTtsConfig: directTtsConfigMock
+}))
 
 // The speak-stream WebSocket must dial the ACTIVE (connection, profile)
 // backend — the same one chat and every REST audio call use. Before this
@@ -118,5 +126,36 @@ describe('resolveSpeakStreamUrl', () => {
     await vi.advanceTimersByTimeAsync(20_000)
 
     await expect(pending).resolves.toBeNull()
+  })
+})
+
+describe('startSpeechStream setup cancellation', () => {
+  it('does not disturb newer playback when stale discovery resolves', async () => {
+    let resolveConfig: ((config: unknown) => void) | undefined
+
+    const pendingConfig = new Promise(resolve => {
+      resolveConfig = resolve
+    })
+
+    let current = true
+    const sequenceBefore = $voicePlayback.get().sequence
+
+    directTtsConfigMock.mockReturnValueOnce(pendingConfig)
+    const session = startSpeechStream({ isCurrent: () => current, source: 'voice-conversation' })
+
+    current = false
+    resolveConfig?.({
+      api_key: 'test-only',
+      base_url: 'https://tts.invalid',
+      mode: 'direct',
+      model: null,
+      provider: 'test',
+      speed: null,
+      voice: null,
+      wire: 'openai-speech'
+    })
+
+    await expect(session).resolves.toBeNull()
+    expect($voicePlayback.get().sequence).toBe(sequenceBefore)
   })
 })

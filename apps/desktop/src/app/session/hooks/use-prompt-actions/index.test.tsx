@@ -331,12 +331,58 @@ describe('usePromptActions fresh-session composer handoff', () => {
     })
   })
 
+  it('emits the storage handoff before post-create work lets the create promise settle', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const onSessionCreatedForSend = vi.fn()
+    const owner = { connectionId: 'remote-owner', profile: 'profile-b' }
+    const sourceScope = encodeComposerStorageScopeKey(owner, null, '33333333-3333-4333-8333-333333333333')
+    let releaseCreate: (() => void) | undefined
+
+    const createBackendSessionForSend = vi.fn(async (_preview, onCreated) => {
+      activeSessionIdRef.current = 'runtime-created'
+      selectedStoredSessionIdRef.current = 'stored-created'
+      onCreated?.({ owner, runtimeSessionId: 'runtime-created', storedSessionId: 'stored-created' })
+      await new Promise<void>(resolve => {
+        releaseCreate = resolve
+      })
+
+      return 'runtime-created'
+    })
+
+    const requestGateway = vi.fn(async () => ({ accepted: true }) as never)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={next => (handle = next)}
+        onSessionCreatedForSend={onSessionCreatedForSend}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+
+    const submitting = handle!.submitText('first prompt', { composerStorageScope: sourceScope })
+
+    await waitFor(() => expect(releaseCreate).toBeTypeOf('function'))
+    expect(onSessionCreatedForSend).toHaveBeenCalledOnce()
+
+    releaseCreate?.()
+    await expect(submitting).resolves.toBe(true)
+  })
+
   it('does not adopt an existing chat that reuses the created runtime id after create', async () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
     const onSessionCreatedForSend = vi.fn()
     const owner = { connectionId: 'remote-owner', profile: 'profile-b' }
     const sourceScope = encodeComposerStorageScopeKey(owner, null, '22222222-2222-4222-8222-222222222222')
+    let routedStoredSessionId: string | null = null
 
     const createBackendSessionForSend = vi.fn(async (_preview, onCreated) => {
       activeSessionIdRef.current = 'runtime-reused'
@@ -344,6 +390,7 @@ describe('usePromptActions fresh-session composer handoff', () => {
       onCreated?.({ owner, runtimeSessionId: 'runtime-reused', storedSessionId: 'stored-created' })
       // User opens an existing chat whose backend reuses the same runtime text.
       selectedStoredSessionIdRef.current = 'stored-existing'
+      routedStoredSessionId = 'stored-existing'
 
       return 'runtime-reused'
     })
@@ -356,7 +403,7 @@ describe('usePromptActions fresh-session composer handoff', () => {
         activeSessionId={null}
         activeSessionIdRef={activeSessionIdRef}
         createBackendSessionForSend={createBackendSessionForSend}
-        getRoutedStoredSessionId={() => 'stored-existing'}
+        getRoutedStoredSessionId={() => routedStoredSessionId}
         onReady={next => (handle = next)}
         onSessionCreatedForSend={onSessionCreatedForSend}
         refreshSessions={async () => undefined}
@@ -368,7 +415,7 @@ describe('usePromptActions fresh-session composer handoff', () => {
 
     await expect(handle!.submitText('first prompt', { composerStorageScope: sourceScope })).resolves.toBe(false)
 
-    expect(onSessionCreatedForSend).not.toHaveBeenCalled()
+    expect(onSessionCreatedForSend).toHaveBeenCalledOnce()
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
   })
 })

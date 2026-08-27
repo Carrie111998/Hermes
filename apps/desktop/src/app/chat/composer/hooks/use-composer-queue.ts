@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
@@ -10,6 +10,7 @@ import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
+  getLatestQueuedPrompts,
   getQueuedPrompts,
   isSteerableEntry,
   MAX_AUTO_DRAIN_ATTEMPTS,
@@ -92,7 +93,10 @@ export function useComposerQueue({
   const queueParked = Boolean(activeQueueSessionKey && parkedSessions[activeQueueSessionKey])
 
   const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
-  queueEditRef.current = queueEdit
+
+  useLayoutEffect(() => {
+    queueEditRef.current = queueEdit
+  }, [queueEdit, queueEditRef])
 
   const setQueueEditSnapshot = useCallback(
     (next: QueueEditState | null) => {
@@ -233,13 +237,21 @@ export function useComposerQueue({
         return false
       }
 
+      const liveEntry = getLatestQueuedPrompts(drainQueueSessionKey).find(candidate => candidate.id === entry.id)
+
+      if (!liveEntry) {
+        finishComposerQueueDrain(drain)
+
+        return false
+      }
+
       let drainFinished = false
 
       try {
         const accepted = await Promise.resolve(
-          onSubmit(entry.text, {
-            attachments: entry.attachments,
-            ...(entry.displayText ? { displayText: entry.displayText } : {}),
+          onSubmit(liveEntry.text, {
+            attachments: liveEntry.attachments,
+            ...(liveEntry.displayText ? { displayText: liveEntry.displayText } : {}),
             fromQueue: true,
             sessionId: drainRuntimeSessionId,
             storedSessionId: submitScopeKey
@@ -254,8 +266,8 @@ export function useComposerQueue({
 
         drainFinished = true
 
-        drainFailuresRef.current.delete(entry.id)
-        removeQueuedPrompt(settledQueueSessionKey, entry.id)
+        drainFailuresRef.current.delete(liveEntry.id)
+        removeQueuedPrompt(settledQueueSessionKey, liveEntry.id)
         resetBrowseState(drainRuntimeSessionId)
 
         return true
@@ -340,6 +352,14 @@ export function useComposerQueue({
         return false
       }
 
+      const liveEntry = getLatestQueuedPrompts(steerScopeKey).find(candidate => candidate.id === entry.id)
+
+      if (!liveEntry || !isSteerableEntry(liveEntry)) {
+        finishComposerQueueDrain(drain)
+
+        return false
+      }
+
       let drainFinished = false
 
       triggerHaptic('submit')
@@ -349,7 +369,7 @@ export function useComposerQueue({
       unparkQueuedPrompts(steerScopeKey)
 
       try {
-        const accepted = await Promise.resolve(onSteer(entry.text))
+        const accepted = await Promise.resolve(onSteer(liveEntry.text))
 
         // Rejected (turn already settling, gateway said no): leave the entry
         // queued exactly where it was — the settle drain picks it up, so the
@@ -361,8 +381,8 @@ export function useComposerQueue({
         const settledScopeKey = finishComposerQueueDrain(drain) ?? steerScopeKey
 
         drainFinished = true
-        drainFailuresRef.current.delete(id)
-        removeQueuedPrompt(settledScopeKey, id)
+        drainFailuresRef.current.delete(liveEntry.id)
+        removeQueuedPrompt(settledScopeKey, liveEntry.id)
 
         return true
       } finally {

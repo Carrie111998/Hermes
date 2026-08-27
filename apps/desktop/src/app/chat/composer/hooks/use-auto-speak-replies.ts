@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 
 import { playSpeechText } from '@/lib/voice-playback'
 import { ownsAmbientCue } from '@/store/ambient'
@@ -45,7 +45,10 @@ export function useAutoSpeakReplies({
   // would never fire on its own replies (and would fire on someone else's).
   const { $messages } = useComposerScope()
   const latest = useRef({ conversationActive, failureLabel, markSpoken, pendingReply })
-  latest.current = { conversationActive, failureLabel, markSpoken, pendingReply }
+
+  useLayoutEffect(() => {
+    latest.current = { conversationActive, failureLabel, markSpoken, pendingReply }
+  }, [conversationActive, failureLabel, markSpoken, pendingReply])
 
   useEffect(() => {
     if (!enabled) {

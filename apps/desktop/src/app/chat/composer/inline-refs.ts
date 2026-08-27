@@ -1,6 +1,7 @@
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { translateNow } from '@/i18n'
 import { contextPath } from '@/lib/chat-runtime'
+import type { SessionTileWorkspaceScope } from '@/store/session-states'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -21,6 +22,8 @@ export interface SessionDragPayload {
   id: string
   profile: string
   title: string
+  /** Present only for an existing tile relocation; never serialized into the @session chip. */
+  workspaceScope?: SessionTileWorkspaceScope
 }
 
 /** A session's friendly display label — its title, or a localized fallback. */

@@ -281,7 +281,6 @@ export function ChatBar({
     activeQueueSessionKey,
     focusKey,
     inputDisabled,
-    legacyScopeKey: storageScopeKey === undefined ? undefined : submitScopeKey,
     legacyStorageScopeKeys,
     queueEditRef,
     sessionId,
@@ -1055,10 +1054,11 @@ export function ChatBar({
     target: scope.target
   })
 
-  // Keep the typed-stop interceptor (see onSubmit above) in sync with the
-  // live conversation state. Render-time ref assignment, same pattern as
-  // dispatchSubmitRef — no effect needed for a plain mirror.
-  voiceStopRef.current = { active: voiceConversationActive, end: endConversation }
+  // Publish only committed conversation state so an abandoned concurrent
+  // render cannot redirect typed Stop into another session's voice lifecycle.
+  useLayoutEffect(() => {
+    voiceStopRef.current = { active: voiceConversationActive, end: endConversation }
+  }, [endConversation, voiceConversationActive])
 
   const contextMenu = (
     <ContextMenu

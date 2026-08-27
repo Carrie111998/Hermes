@@ -6,6 +6,7 @@ export interface ComposerQueueDrainHandle {
 
 interface ActiveDrain {
   entryId: string
+  remoteToken?: number
   scopeKey: string
 }
 
@@ -15,6 +16,9 @@ const handleByEntry = new Map<string, number>()
 const handlesByScope = new Map<string, Set<number>>()
 
 const scopeIsClaimed = (scopeKey: string): boolean => Boolean(handlesByScope.get(scopeKey)?.size)
+const entryClaimKey = (scopeKey: string, entryId: string): string => `${scopeKey}\0${entryId}`
+
+const desktopArbiter = () => (typeof window === 'undefined' ? undefined : window.hermesDesktop?.composerQueueDrain)
 
 const canonicalScope = (scopeKey: string): string | null => {
   const resolved = resolveComposerStorageScopeKey(scopeKey)
@@ -25,16 +29,32 @@ const canonicalScope = (scopeKey: string): string | null => {
 /** Atomically claim one qualified queue scope + entry across every drainer. */
 export function beginComposerQueueDrain(scopeKey: string, entryId: string): ComposerQueueDrainHandle | null {
   const canonicalKey = canonicalScope(scopeKey)
+  const entry = entryId.trim()
 
-  if (!canonicalKey || !entryId.trim() || scopeIsClaimed(canonicalKey) || handleByEntry.has(entryId)) {
+  if (!canonicalKey || !entry) {
+    return null
+  }
+
+  const arbiter = desktopArbiter()
+  const remoteToken = arbiter?.begin({ entryId: entry, scopeKey: canonicalKey })
+  const qualifiedEntry = entryClaimKey(canonicalKey, entry)
+
+  if (
+    (arbiter && remoteToken === null) ||
+    (!arbiter && (scopeIsClaimed(canonicalKey) || handleByEntry.has(qualifiedEntry)))
+  ) {
     return null
   }
 
   const handle = { id: nextDrainId++ }
 
-  activeByHandle.set(handle.id, { entryId, scopeKey: canonicalKey })
+  activeByHandle.set(handle.id, {
+    entryId: entry,
+    ...(typeof remoteToken === 'number' ? { remoteToken } : {}),
+    scopeKey: canonicalKey
+  })
   handlesByScope.set(canonicalKey, new Set([handle.id]))
-  handleByEntry.set(entryId, handle.id)
+  handleByEntry.set(qualifiedEntry, handle.id)
 
   return handle
 }
@@ -43,7 +63,15 @@ export function beginComposerQueueDrain(scopeKey: string, entryId: string): Comp
 export function isComposerQueueDrainExcluded(scopeKey: string, entryId: string): boolean {
   const canonicalKey = canonicalScope(scopeKey)
 
-  return !canonicalKey || scopeIsClaimed(canonicalKey) || handleByEntry.has(entryId)
+  if (!canonicalKey || !entryId.trim()) {
+    return true
+  }
+
+  const arbiter = desktopArbiter()
+
+  return arbiter
+    ? arbiter.excluded({ entryId: entryId.trim(), scopeKey: canonicalKey })
+    : scopeIsClaimed(canonicalKey) || handleByEntry.has(entryClaimKey(canonicalKey, entryId.trim()))
 }
 
 /**
@@ -59,14 +87,16 @@ export function handoffComposerQueueDrains(fromScopeKey: string, toScopeKey: str
     return 0
   }
 
+  const remoteMoved = desktopArbiter()?.handoff({ fromScopeKey: from, toScopeKey: to })
+
   const sourceHandles = handlesByScope.get(from)
 
   if (!sourceHandles?.size) {
-    return 0
+    return remoteMoved ?? 0
   }
 
   if (from === to) {
-    return sourceHandles.size
+    return remoteMoved ?? sourceHandles.size
   }
 
   const targetHandles = handlesByScope.get(to) ?? new Set<number>()
@@ -85,14 +115,26 @@ export function handoffComposerQueueDrains(fromScopeKey: string, toScopeKey: str
       continue
     }
 
+    const previousEntryClaimKey = entryClaimKey(active.scopeKey, active.entryId)
+
+    if (handleByEntry.get(previousEntryClaimKey) === handleId) {
+      handleByEntry.delete(previousEntryClaimKey)
+    }
+
     targetHandles.add(handleId)
     active.scopeKey = to
+    const nextEntryClaimKey = entryClaimKey(to, active.entryId)
+
+    if (!handleByEntry.has(nextEntryClaimKey)) {
+      handleByEntry.set(nextEntryClaimKey, handleId)
+    }
+
     moved += 1
   }
 
   handlesByScope.delete(from)
 
-  return moved
+  return remoteMoved ?? moved
 }
 
 /** Release a claim and return the qualified key on which it finally settled. */
@@ -102,6 +144,8 @@ export function finishComposerQueueDrain(handle: ComposerQueueDrainHandle): stri
   if (!active) {
     return null
   }
+
+  const remoteSettledScope = active.remoteToken === undefined ? undefined : desktopArbiter()?.finish(active.remoteToken)
 
   activeByHandle.delete(handle.id)
 
@@ -115,11 +159,13 @@ export function finishComposerQueueDrain(handle: ComposerQueueDrainHandle): stri
     }
   }
 
-  if (handleByEntry.get(active.entryId) === handle.id) {
-    handleByEntry.delete(active.entryId)
+  const qualifiedEntry = entryClaimKey(active.scopeKey, active.entryId)
+
+  if (handleByEntry.get(qualifiedEntry) === handle.id) {
+    handleByEntry.delete(qualifiedEntry)
   }
 
-  return active.scopeKey
+  return remoteSettledScope ?? active.scopeKey
 }
 
 /** @internal */

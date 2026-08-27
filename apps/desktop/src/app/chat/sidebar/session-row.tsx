@@ -5,6 +5,7 @@ import type * as React from 'react'
 import { PrTag } from '@/app/chat/pr-tag'
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
+import { sessionRowOwnerRoute } from '@/app/chat/session-row-owner'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { openSession } from '@/app/open-session'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
@@ -146,6 +147,18 @@ function SidebarSessionRowImpl({
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
   const title = sessionTitle(session)
+  const ownerRoute = sessionRowOwnerRoute(session)
+
+  const openRowSession = (intent: 'tab' | 'window') => {
+    if (ownerRoute) {
+      openSession(session.id, () => undefined, intent, { ownerRoute, workspaceMode: 'sessions' })
+
+      return
+    }
+
+    openSession(session.id, () => undefined, intent)
+  }
+
   const density = useStore($sessionListDensity)
   const fmt = t.sidebar
 
@@ -422,7 +435,7 @@ function SidebarSessionRowImpl({
           // Middle-click = open in a new tab (browser muscle memory).
           {...middleClickHandlers(() => {
             triggerHaptic('selection')
-            openSession(session.id, () => undefined, 'tab')
+            openRowSession('tab')
           })}
           onClick={event => {
             // Modifier-click gestures on a row (see `resolveSessionRowClick`):
@@ -452,9 +465,9 @@ function SidebarSessionRowImpl({
             } else if (action === 'pin') {
               onPin()
             } else if (action === 'newTab') {
-              openSession(session.id, () => undefined, 'tab')
+              openRowSession('tab')
             } else {
-              openSession(session.id, () => undefined, 'window')
+              openRowSession('window')
             }
           }}
         >

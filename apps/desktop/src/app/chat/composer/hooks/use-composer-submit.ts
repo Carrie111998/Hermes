@@ -5,7 +5,7 @@ import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import {
-  clearSessionDraft,
+  clearSessionDraftIfMatches,
   clearSessionDraftIfRevision,
   type ComposerAttachment,
   reloadPersistedDrafts,
@@ -104,9 +104,11 @@ export function useComposerSubmit({
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
 
-    const submittedRevision = clearSubmittedDraft
-      ? clearSessionDraft(submittedScope)
-      : sessionDraftRevision(submittedScope)
+    const clearedRevision = clearSubmittedDraft
+      ? clearSessionDraftIfMatches(submittedScope, text, submittedAttachments)
+      : null
+
+    const submittedRevision = clearedRevision ?? sessionDraftRevision(submittedScope)
 
     const restore = () => {
       if (!clearSubmittedDraft) {
@@ -120,6 +122,12 @@ export function useComposerSubmit({
 
       const restoreScope =
         typeof submittedScope === 'string' ? resolveComposerStorageScopeKey(submittedScope) : submittedScope
+
+      if (clearedRevision === null) {
+        enqueueQueuedPrompt(restoreScope, { attachments: submittedAttachments, text })
+
+        return
+      }
 
       const visibleScopeIsSubmitted = activeQueueSessionKeyRef.current === restoreScope
 
@@ -170,7 +178,7 @@ export function useComposerSubmit({
       .then(accepted => {
         if (accepted === false) {
           restore()
-        } else if (clearSubmittedDraft) {
+        } else if (clearSubmittedDraft && clearedRevision !== null) {
           clearSessionDraftIfRevision(submittedScope, submittedRevision)
         }
       })
@@ -182,7 +190,10 @@ export function useComposerSubmit({
   // and the exact visible surface captured at click time — every tile stays
   // mounted, and a session can be rendered in more than one pane.
   const dispatchSubmitRef = useRef(dispatchSubmit)
-  dispatchSubmitRef.current = dispatchSubmit
+
+  useLayoutEffect(() => {
+    dispatchSubmitRef.current = dispatchSubmit
+  })
 
   useLayoutEffect(
     () =>

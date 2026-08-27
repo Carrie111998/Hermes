@@ -91,6 +91,12 @@ declare global {
         onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
         onControl: (callback: (payload: PetOverlayControl) => void) => () => void
       }
+      composerQueueDrain?: {
+        begin: (request: { entryId: string; scopeKey: string }) => number | null
+        excluded: (request: { entryId: string; scopeKey: string }) => boolean
+        handoff: (request: { fromScopeKey: string; toScopeKey: string }) => number
+        finish: (token: number) => null | string
+      }
       // HUD mode: the chrome-free floating chat. A FULL app renderer with its
       // own gateway (like an instance window), sized and skinned as a floating
       // bar — so it mounts the real composer rather than a lookalike. Main
@@ -104,7 +110,11 @@ declare global {
           solid: boolean
           workspaceTransfer: boolean
         }
-        open: (request?: { sessionId?: null | string; profile?: null | string }) => Promise<{ ok: boolean }>
+        open: (request?: {
+          newChatGeneration?: number | string
+          sessionId?: null | string
+          profile?: null | string
+        }) => Promise<{ ok: boolean }>
         close: () => Promise<{ ok: boolean }>
         setIgnoreMouse: (ignore: boolean) => void
         beginMove: () => void

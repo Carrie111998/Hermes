@@ -40,28 +40,46 @@ export const $composerAttachments = atom<ComposerAttachment[]>([])
 export const $composerTerminalSelections = atom<Record<string, string>>({})
 const createComposerNewChatGeneration = (): ComposerNewChatGeneration => crypto.randomUUID()
 
-export const $composerNewChatGeneration = persistentAtom<ComposerNewChatGeneration>(
+const decodeComposerNewChatGeneration = (raw: string): ComposerNewChatGeneration => {
+  const value = Number(raw)
+
+  if (Number.isSafeInteger(value) && value >= 0) {
+    return value
+  }
+
+  try {
+    encodeComposerStorageScopeKey({ connectionId: 'local', profile: 'default' }, null, raw)
+
+    return raw
+  } catch {
+    return createComposerNewChatGeneration()
+  }
+}
+
+const requestedComposerNewChatGeneration = (): ComposerNewChatGeneration | null => {
+  if (typeof window === 'undefined') {
+    return null
+  }
+
+  const raw = new URLSearchParams(window.location.search).get('newChatGeneration')?.trim()
+
+  return raw ? decodeComposerNewChatGeneration(raw) : null
+}
+
+const $persistedComposerNewChatGeneration = persistentAtom<ComposerNewChatGeneration>(
   'hermes.desktop.composerNewChatGeneration',
   createComposerNewChatGeneration(),
   {
-    decode: raw => {
-      const value = Number(raw)
-
-      if (Number.isSafeInteger(value) && value >= 0) {
-        return value
-      }
-
-      try {
-        encodeComposerStorageScopeKey({ connectionId: 'local', profile: 'default' }, null, raw)
-
-        return raw
-      } catch {
-        return createComposerNewChatGeneration()
-      }
-    },
+    decode: decodeComposerNewChatGeneration,
     encode: value => String(value)
   }
 )
+
+const requestedNewChatGeneration = requestedComposerNewChatGeneration()
+
+export const $composerNewChatGeneration = requestedNewChatGeneration
+  ? atom<ComposerNewChatGeneration>(requestedNewChatGeneration)
+  : $persistedComposerNewChatGeneration
 
 export const advanceComposerNewChatGeneration = (): ComposerNewChatGeneration => {
   const next = createComposerNewChatGeneration()
@@ -536,6 +554,28 @@ export function takeSessionDraft(scope: string | null | undefined): SessionDraft
 
 export const clearSessionDraft = (scope: string | null | undefined) => stashSessionDraft(scope, '', [])
 
+export function clearSessionDraftIfMatches(
+  scope: string | null | undefined,
+  text: string,
+  attachments: ComposerAttachment[]
+): number | null {
+  reloadPersistedDrafts()
+
+  const key = draftKey(scope)
+  const expected = text.trim() || attachments.length > 0 ? { attachments, text } : undefined
+  const current = draftsBySession.get(key)
+
+  if (!current) {
+    return clearSessionDraft(scope)
+  }
+
+  if (!draftEqual(current, expected)) {
+    return null
+  }
+
+  return clearSessionDraft(scope)
+}
+
 export function clearSessionDraftIfRevision(scope: string | null | undefined, expectedRevision: number): boolean {
   if (sessionDraftRevision(scope) !== expectedRevision) {
     return false
@@ -636,13 +676,16 @@ export function handoffEmptySessionDraftRevision(
     destinationRevision === 0 &&
     (!destinationDraft || (!destinationDraft.text.trim() && destinationDraft.attachments.length === 0))
 
-  if (sourceRevision > 0 && destinationUntouched) {
-    draftRevisionsBySession.set(to, sourceRevision)
+  if (sourceRevision > 0) {
+    draftRevisionsBySession.set(
+      to,
+      destinationUntouched ? sourceRevision : Math.max(sourceRevision, destinationRevision) + 1
+    )
   }
 
   draftRevisionsBySession.delete(from)
 
-  return sourceRevision > 0 && destinationUntouched
+  return sourceRevision > 0
 }
 
 export function setComposerDraft(value: string) {

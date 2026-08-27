@@ -38,7 +38,7 @@ import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { sessionAwaitingInput } from '@/store/prompts'
 import {
@@ -68,6 +68,7 @@ import { useComposerActions } from './hooks/use-composer-actions'
 import { paneMirror } from './pane-mirror'
 import { SessionDraftTitle } from './session-draft-title'
 import { startSessionDrag } from './session-drag'
+import { sessionRowForOwner } from './session-row-owner'
 import { SessionStatusDot } from './session-status-dot'
 import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
@@ -440,35 +441,14 @@ export function tileStoredRow(
   storedSessionId: string,
   ownerRoute: SessionOwnerRoute | undefined = sessionTileOwnerRoute(storedSessionId)
 ): SessionInfo | undefined {
-  const match = (s: SessionInfo) => sessionMatchesStoredId(s, storedSessionId)
-
   const candidates = [
-    ...$sessions.get().filter(match),
+    ...$sessions.get(),
     ...$projectTree
       .get()
       .flatMap(p => [...p.repos.flatMap(r => r.groups.flatMap(g => g.sessions)), ...(p.previewSessions ?? [])])
-      .filter(match)
   ]
 
-  if (!ownerRoute) {
-    return candidates[0]
-  }
-
-  const exactTagged = candidates.find(
-    row =>
-      row.connection_id?.trim() === ownerRoute.connectionId &&
-      normalizeProfileKey(row.profile) === normalizeProfileKey(ownerRoute.profile)
-  )
-
-  if (exactTagged) {
-    return exactTagged
-  }
-
-  const profileOnly = candidates.filter(
-    row => !row.connection_id?.trim() && normalizeProfileKey(row.profile) === normalizeProfileKey(ownerRoute.profile)
-  )
-
-  return profileOnly.length === 1 ? profileOnly[0] : undefined
+  return sessionRowForOwner(candidates, storedSessionId, ownerRoute)
 }
 
 /** The tab's REGISTERED name. Deliberately the bare placeholder for a draft
@@ -514,7 +494,17 @@ export function tileDragPayload(storedSessionId: string): SessionDragPayload {
   return {
     id: storedSessionId,
     profile: stored?.profile ?? tile?.ownerRoute?.targetProfile ?? tile?.ownerRoute?.profile ?? '',
-    title
+    title,
+    ...(tile
+      ? {
+          workspaceScope: {
+            ownerRoute: tile.ownerRoute,
+            workspaceMode: tile.workspaceMode ?? 'sessions',
+            workspaceOwnerKey: tile.workspaceOwnerKey,
+            workspaceTabTitle: tile.workspaceTabTitle
+          }
+        }
+      : {})
   }
 }
 

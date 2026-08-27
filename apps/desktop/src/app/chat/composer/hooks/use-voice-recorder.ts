@@ -159,7 +159,9 @@ export function useVoiceRecorder({
   }
 
   const dictate = () => {
-    if (recording) {
+    if (startingRef.current) {
+      cancel()
+    } else if (recording) {
       void stop()
     } else if (voiceStatus === 'idle') {
       void start()

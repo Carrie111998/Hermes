@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
 import { composerFocusBlockedBySurface } from '@/lib/keybinds/composer-focus-keys'
@@ -28,37 +28,44 @@ export function useComposerEscCancel({ awaitingInput, busy, onCancel, target }: 
   // close that overlay, never double as canceling the stream behind it.
   const escCancelRef = useRef<(event: globalThis.KeyboardEvent) => void>(() => {})
 
-  escCancelRef.current = (event: globalThis.KeyboardEvent) => {
-    // `awaitingInput`: the turn is parked on a clarify / approval / sudo / secret
-    // prompt, which owns Esc (or is meant to persist) — never cancel the stream
-    // out from under it.
-    if (event.key !== 'Escape' || event.defaultPrevented || !busy || awaitingInput) {
-      return
-    }
+  const escCancel = useCallback(
+    (event: globalThis.KeyboardEvent) => {
+      // `awaitingInput`: the turn is parked on a clarify / approval / sudo / secret
+      // prompt, which owns Esc (or is meant to persist) — never cancel the stream
+      // out from under it.
+      if (event.key !== 'Escape' || event.defaultPrevented || !busy || awaitingInput) {
+        return
+      }
 
-    // Only the focused composer cancels — otherwise every mounted busy tile
-    // stops at once (and the winner would be mount-order arbitrary).
-    if (getActiveComposer() !== target) {
-      return
-    }
+      // Only the focused composer cancels — otherwise every mounted busy tile
+      // stops at once (and the winner would be mount-order arbitrary).
+      if (getActiveComposer() !== target) {
+        return
+      }
 
-    const active = document.activeElement as HTMLElement | null
+      const active = document.activeElement as HTMLElement | null
 
-    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
-      return
-    }
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+        return
+      }
 
-    // An overlay covering the chat owns Esc (its escape layer closes it) —
-    // the composer stays mounted beneath it, so stand down. Same surface
-    // signal as type-to-focus; also covers Radix dialogs/popovers.
-    if (composerFocusBlockedBySurface()) {
-      return
-    }
+      // An overlay covering the chat owns Esc (its escape layer closes it) —
+      // the composer stays mounted beneath it, so stand down. Same surface
+      // signal as type-to-focus; also covers Radix dialogs/popovers.
+      if (composerFocusBlockedBySurface()) {
+        return
+      }
 
-    event.preventDefault()
-    triggerHaptic('cancel')
-    void Promise.resolve(onCancel())
-  }
+      event.preventDefault()
+      triggerHaptic('cancel')
+      void Promise.resolve(onCancel())
+    },
+    [awaitingInput, busy, onCancel, target]
+  )
+
+  useLayoutEffect(() => {
+    escCancelRef.current = escCancel
+  }, [escCancel])
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => escCancelRef.current(event)
