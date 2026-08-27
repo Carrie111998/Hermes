@@ -1,0 +1,11 @@
+# Default owners for everything
+* @NousResearch/hermes-agent-core
+
+# Python source and tests
+/**/*.py @NousResearch/hermes-agent-core
+/tests/ @NousResearch/hermes-agent-core
+
+# CI, packaging, docs
+/.github/ @NousResearch/hermes-agent-core
+/pyproject.toml @NousResearch/hermes-agent-core
+/setup-hermes.sh @NousResearch/hermes-agent-core
