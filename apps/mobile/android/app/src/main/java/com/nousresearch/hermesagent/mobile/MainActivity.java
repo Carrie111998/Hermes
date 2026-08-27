@@ -27,6 +27,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(InboundSharePlugin.class);
         registerPlugin(MobileCapabilitiesPlugin.class);
         registerPlugin(MobileQuickActionPlugin.class);
+        registerPlugin(MobileAudioRoutePlugin.class);
         super.onCreate(savedInstanceState);
         try {
             WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
