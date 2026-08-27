@@ -12,7 +12,7 @@ Hermes Mobile brings the **real Hermes Desktop experience** to Android. It packa
 
 ## 🚫 What this is not
 
-- Not a Termux/local-agent replacement.
+- Not a Termux/local-agent replacement. That research now lives in [Hermes Mobile Standalone](https://github.com/seagpt/hermes-mobile-standalone), so runtime experiments cannot destabilize this client contribution.
 - Not a separate mobile chat UI or a copy of the Desktop source tree.
 - Not an official Hermes app, signed release, or APK download source yet.
 - Not a way to expose a Hermes gateway publicly or to copy desktop credentials to a phone.
