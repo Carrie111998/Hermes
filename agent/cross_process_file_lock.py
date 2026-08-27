@@ -18,6 +18,18 @@ except ImportError:  # pragma: no cover - POSIX
     _msvcrt = None
 
 
+def secure_file_descriptor_permissions(fd: int) -> None:
+    """Tighten a descriptor when the platform exposes ``os.fchmod``.
+
+    Windows Python 3.11/3.12 lacks ``os.fchmod``; secure creation flags and
+    the owning user's ACL remain the platform boundary there.
+    """
+
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(fd, 0o600)
+
+
 @contextmanager
 def exclusive_file_lock(path: Path) -> Iterator[None]:
     """Hold one OS-backed lock file across all Hermes processes."""
@@ -32,7 +44,7 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600) if hasattr(os, "fchmod") else None
+        secure_file_descriptor_permissions(fd)
         if _fcntl is not None:
             _fcntl.flock(fd, _fcntl.LOCK_EX)
         elif _msvcrt is not None:  # pragma: no cover - Windows
@@ -54,4 +66,4 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
             os.close(fd)
 
 
-__all__ = ["exclusive_file_lock"]
+__all__ = ["exclusive_file_lock", "secure_file_descriptor_permissions"]

@@ -21,17 +21,16 @@ from agent.llm_egress_firewall import (
     OutboundText,
     SanitizedSegment,
     SourceBoundSegment,
+    SourcePresentationSegment,
     SourceGrant,
     TypedOutboundRequest,
     UntrustedProvenanceSegment,
-    ValidatedToolSyntaxSegment,
     DestinationClass,
     classify_destination,
     source_grant_digest,
     static_literal_sha256,
     validate_sanitized_text,
     content_free_violation_locations,
-    validate_tool_syntax,
 )
 from agent.source_provenance import DEFAULT_POLICY_DIGEST, SourceProvenanceRegistry
 
@@ -64,18 +63,6 @@ _PROTECTED_REMOTE_PROVIDERS = frozenset({
 })
 logger = logging.getLogger(__name__)
 
-_TOOL_SYNTAX_TOKEN = re.compile(
-    r"(?P<github_url>https://github\.com/[A-Za-z0-9_.-]{1,100}/"
-    r"[A-Za-z0-9_.-]{1,100}(?:\.git|/(?:pull|issues)/[0-9]{1,10})?)"
-    r"|(?P<safe_env_counter>HERMES_(?:KANBAN_RUN_ID|TURN_LEASE_TIMEOUT|"
-    r"STREAM_STALE_GIVEUP)=[0-9]{1,10})"
-    r"|(?P<run_counter>\b(?:run|run_id|attempt|attempt_id)(?:\s+|=)[0-9]{1,10}\b)"
-    r"|(?P<cli_option>--[a-z0-9][a-z0-9-]{0,63})"
-    r"|(?P<git_ref>(?:refs/(?:heads|tags)/)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
-    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){1,8})"
-    r"|(?P<source_identifier>\b(?:[A-Za-z0-9_.-]{1,100}/"
-    r"[A-Za-z0-9_.-]{1,100}#[0-9]{1,10}|[0-9a-f]{40}|[0-9a-f]{64})\b)"
-)
 _VALIDATED_SYNTAX_TOOL_NAMES = frozenset({"terminal"})
 _CREDENTIAL_ENV_SUFFIXES = (
     "_API_KEY",
@@ -311,36 +298,56 @@ def _segment_protected_tool_result(
     used_grants: dict[str, SourceGrant],
     *,
     sanitized_cap: int,
-) -> ValidatedToolSyntaxSegment | UntrustedProvenanceSegment | OutboundText:
-    """Admit only fully parsed terminal syntax; preserve all other provenance."""
+) -> UntrustedProvenanceSegment:
+    """Never infer non-source authority from generic terminal stdout shape."""
 
     del grant_texts, used_grants, sanitized_cap
-    segments: list[ValidatedToolSyntaxSegment] = []
-    cursor = 0
-    for match in _TOOL_SYNTAX_TOKEN.finditer(text):
-        if match.start() > cursor:
-            separator = text[cursor : match.start()]
-            try:
-                validate_tool_syntax(separator, "separator")
-            except (TypeError, ValueError):
-                return UntrustedProvenanceSegment(
-                    sha256(text.encode("utf-8")).hexdigest()
-                )
-            segments.append(ValidatedToolSyntaxSegment(separator, "separator"))
-        kind = match.lastgroup or ""
-        token = validate_tool_syntax(match.group(0), kind)
-        segments.append(ValidatedToolSyntaxSegment(token, kind))
-        cursor = match.end()
-    if cursor < len(text):
-        separator = text[cursor:]
-        try:
-            validate_tool_syntax(separator, "separator")
-        except (TypeError, ValueError):
-            return UntrustedProvenanceSegment(sha256(text.encode("utf-8")).hexdigest())
-        segments.append(ValidatedToolSyntaxSegment(separator, "separator"))
-    if not segments:
-        return UntrustedProvenanceSegment(sha256(text.encode("utf-8")).hexdigest())
-    return segments[0] if len(segments) == 1 else OutboundText(tuple(segments))
+    return UntrustedProvenanceSegment(sha256(text.encode("utf-8")).hexdigest())
+
+
+def _segment_read_file_presentation(
+    text: str,
+    metadata: Any,
+    grant_texts: Sequence[tuple[str, SourceGrant]],
+    used_grants: dict[str, SourceGrant],
+) -> SourcePresentationSegment | UntrustedProvenanceSegment:
+    """Bind the real JSON/line-number presentation to one exact read grant."""
+
+    denied = UntrustedProvenanceSegment(sha256(text.encode("utf-8")).hexdigest())
+    if not isinstance(metadata, Mapping):
+        return denied
+    if metadata.get("presentation_kind") != "read_file_json_v1":
+        return denied
+    if metadata.get("content_sha256") != sha256(text.encode("utf-8")).hexdigest():
+        return denied
+    digests = metadata.get("source_grant_digests")
+    if not isinstance(digests, (list, tuple)) or not digests:
+        return denied
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return denied
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("content"), str):
+        return denied
+    allowed_digests = {value for value in digests if isinstance(value, str)}
+    candidates: list[tuple[str, SourceGrant]] = []
+    for raw_text, grant in grant_texts:
+        digest = source_grant_digest(grant)
+        if digest not in allowed_digests or metadata.get("request_id") != grant.request_id:
+            continue
+        expected = "\n".join(
+            f"{line_number}|{line}"
+            for line_number, line in enumerate(
+                raw_text.split("\n"), start=grant.line_start
+            )
+        )
+        if parsed["content"] == expected:
+            candidates.append((digest, grant))
+    if len(candidates) != 1:
+        return denied
+    digest, grant = candidates[0]
+    used_grants[digest] = grant
+    return SourcePresentationSegment(digest, text, "read_file_json_v1")
 
 
 def _typed_payload(
@@ -370,6 +377,14 @@ def _typed_payload(
             sanitized_cap=sanitized_cap,
         )
     if isinstance(value, Mapping):
+        source_metadata = value.get("_source_provenance")
+        is_read_file_result = (
+            value.get("role") == "tool"
+            and (
+                value.get("tool_name") == "read_file"
+                or value.get("name") == "read_file"
+            )
+        )
         output_call_id = value.get("tool_call_id") or value.get("call_id")
         is_recognized_tool_result = (
             isinstance(output_call_id, str)
@@ -379,8 +394,16 @@ def _typed_payload(
                 or value.get("type") == "function_call_output"
             )
         )
-        return {
-            key: _typed_payload(
+        typed: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "_source_provenance":
+                continue
+            if is_read_file_result and key == "content" and isinstance(item, str):
+                typed[key] = _segment_read_file_presentation(
+                    item, source_metadata, grant_texts, used_grants
+                )
+                continue
+            typed[key] = _typed_payload(
                 item,
                 grant_texts,
                 used_grants,
@@ -391,8 +414,7 @@ def _typed_payload(
                     is_recognized_tool_result and key in {"content", "output"}
                 ),
             )
-            for key, item in value.items()
-        }
+        return typed
     if isinstance(value, (list, tuple)):
         return [
             _typed_payload(

@@ -25,7 +25,10 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from agent.file_safety import get_read_block_error
-from agent.cross_process_file_lock import exclusive_file_lock
+from agent.cross_process_file_lock import (
+    exclusive_file_lock,
+    secure_file_descriptor_permissions,
+)
 from agent.redact import redact_sensitive_text
 
 
@@ -91,6 +94,15 @@ class SourceBoundSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class SourcePresentationSegment:
+    """Trusted deterministic presentation of one verified source grant."""
+
+    source_grant_digest: str
+    text: str
+    presentation_kind: str
+
+
+@dataclass(frozen=True, slots=True)
 class OutboundText:
     """Ordered typed segments that construct one outbound JSON string."""
 
@@ -99,6 +111,7 @@ class OutboundText:
         | SanitizedSegment
         | ValidatedToolSyntaxSegment
         | SourceBoundSegment
+        | SourcePresentationSegment
         | UntrustedProvenanceSegment,
         ...,
     ]
@@ -785,6 +798,8 @@ def _is_strict_sanitized_only_payload(
         return isinstance(value.text, str), 0
     if isinstance(value, SourceBoundSegment):
         return False, 0
+    if isinstance(value, SourcePresentationSegment):
+        return False, 0
     if isinstance(value, OutboundText):
         if not value.segments:
             return False, 0
@@ -1220,6 +1235,7 @@ class LLMEgressFirewall:
                 | SanitizedSegment
                 | ValidatedToolSyntaxSegment
                 | SourceBoundSegment
+                | SourcePresentationSegment
                 | UntrustedProvenanceSegment
             ),
         ) -> str:
@@ -1282,6 +1298,35 @@ class LLMEgressFirewall:
                 scan_values.append(text)
                 base64_scan_values.append(text)
                 return text
+            if isinstance(segment, SourcePresentationSegment):
+                grant_and_content = grant_contents.get(segment.source_grant_digest)
+                if grant_and_content is None:
+                    reasons.append("source_segment_grant_mismatch")
+                    return ""
+                if segment.presentation_kind != "read_file_json_v1":
+                    reasons.append("invalid_source_presentation")
+                    return ""
+                try:
+                    raw_text = grant_and_content[1].decode("utf-8")
+                    expected_content = "\n".join(
+                        f"{line_number}|{line}"
+                        for line_number, line in enumerate(
+                            raw_text.split("\n"),
+                            start=grant_and_content[0].line_start,
+                        )
+                    )
+                    parsed = json.loads(segment.text)
+                except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+                    reasons.append("invalid_source_presentation")
+                    return ""
+                if not isinstance(parsed, dict) or parsed.get("content") != expected_content:
+                    reasons.append("invalid_source_presentation")
+                    return ""
+                referenced_grants.add(segment.source_grant_digest)
+                source_segment_count += 1
+                scan_values.append(segment.text)
+                base64_scan_values.append(segment.text)
+                return segment.text
             if isinstance(segment, UntrustedProvenanceSegment):
                 reasons.append("untrusted_provenance")
                 return ""
@@ -1296,6 +1341,7 @@ class LLMEgressFirewall:
                     SanitizedSegment,
                     ValidatedToolSyntaxSegment,
                     SourceBoundSegment,
+                    SourcePresentationSegment,
                     UntrustedProvenanceSegment,
                 ),
             ):
@@ -1406,7 +1452,7 @@ class LLMEgressFirewall:
         with exclusive_file_lock(self._receipt_path.with_suffix(".lock")):
             fd = os.open(self._receipt_path, flags, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                secure_file_descriptor_permissions(fd)
                 file_size = os.fstat(fd).st_size
                 previous_hash = ""
                 if file_size:
@@ -1444,6 +1490,7 @@ __all__ = [
     "OutboundText",
     "SanitizedSegment",
     "SourceBoundSegment",
+    "SourcePresentationSegment",
     "SourceGrant",
     "TypedOutboundRequest",
     "UntrustedProvenanceSegment",
