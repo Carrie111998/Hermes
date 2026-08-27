@@ -3723,6 +3723,25 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
+    # 编码工作区可单独使用编码模型；只有用户显式开启时才覆盖通用路由。
+    credentials_source = credentials_cfg if credentials_cfg else cfg
+    if not credentials_cfg:
+        try:
+            from agent.coding_router import resolve_coding_route
+
+            from hermes_cli.config import load_config_readonly
+
+            coding_route = resolve_coding_route(
+                platform=getattr(parent_agent, "platform", None),
+                cwd=_resolve_workspace_hint(parent_agent),
+                model=getattr(parent_agent, "model", None),
+                config=load_config_readonly(),
+            )
+            if coding_route:
+                credentials_source = coding_route
+        except Exception:
+            logger.debug("编码路由解析失败，继续使用通用委派路由", exc_info=True)
+
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
@@ -3736,7 +3755,7 @@ def delegate_task(
     # without touching the global delegation pin.
     try:
         creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
+            credentials_source, parent_agent
         )
     except ValueError as exc:
         return tool_error(str(exc))

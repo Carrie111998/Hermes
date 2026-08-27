@@ -232,6 +232,16 @@ DEFAULT_CONFIG = {
         #   "on"             — force the prompt posture everywhere.
         #   "off"            — disable entirely.
         "coding_context": "auto",
+        # 编码场景的子智能体路由。默认关闭，不改变现有模型和费用。
+        "coding_route": {
+            "enabled": False,
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "",
+            "max_output_tokens": None,
+        },
         # Standing operator instructions for the coding posture. A string (or
         # list of strings) appended to the coding brief as an extra stable
         # system block — pin project-wide workflow rules here instead of editing
