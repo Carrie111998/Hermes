@@ -395,15 +395,12 @@ describe('useComposerSubmit external request routing', () => {
     expect(hiddenA.onSubmit).not.toHaveBeenCalled()
   })
 
-  it('does not fan out when visible composers do not have queue session keys yet', async () => {
+  it('fails closed when visible new composers share a target without an exact surface', () => {
     const firstNewSession = renderSubmitHook({ sessionKey: null })
     const secondNewSession = renderSubmitHook({ sessionKey: null })
 
-    act(() => {
-      requestComposerSubmit('ship the visible new session', { target: 'main' })
-    })
-
-    await waitFor(() => expect(firstNewSession.onSubmit).toHaveBeenCalledTimes(1))
+    expect(requestComposerSubmit('do not guess between new sessions', { target: 'main' })).toBe(false)
+    expect(firstNewSession.onSubmit).not.toHaveBeenCalled()
     expect(secondNewSession.onSubmit).not.toHaveBeenCalled()
   })
 
