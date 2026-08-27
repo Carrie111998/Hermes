@@ -37,6 +37,13 @@ CHRISTOPHER_HOLD_PATTERNS = {
     "christopher",  # catch generic references
 }
 
+# First-class duplicate resolution kinds
+DUPLICATE_RESOLUTION_KINDS = {
+    "duplicate_of",  # Task is a duplicate of another
+    "intentional_sibling_of",  # Task is intentionally related but distinct
+    "distinct",  # Task is distinct despite similarity
+}
+
 
 @dataclass(frozen=True)
 class GovernanceBlockValidation:

@@ -7867,7 +7867,94 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Workspace resolution
+# Duplicate Resolution Governance
+# ---------------------------------------------------------------------------
+
+def resolve_duplicate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    other_task_id: Optional[str] = None,
+    reason: str = "",
+) -> None:
+    """Record a duplicate resolution event for governance tracking.
+
+    Args:
+        conn: Active database connection (will be wrapped in write_txn).
+        task_id: The task being classified.
+        kind: One of DUPLICATE_RESOLUTION_KINDS ("duplicate_of", "intentional_sibling_of", "distinct").
+        other_task_id: When kind is "duplicate_of" or "intentional_sibling_of",
+                       the ID of the other task. Optional for "distinct".
+        reason: Human-readable reason for the resolution.
+
+    Raises:
+        ValueError: If kind is not in DUPLICATE_RESOLUTION_KINDS.
+    """
+    from hermes_cli.kanban_governance import DUPLICATE_RESOLUTION_KINDS
+
+    if kind not in DUPLICATE_RESOLUTION_KINDS:
+        raise ValueError(
+            f"Invalid resolution_kind '{kind}' — must be one of: {', '.join(sorted(DUPLICATE_RESOLUTION_KINDS))}"
+        )
+
+    payload = {
+        "resolution_kind": kind,
+        "reason": reason,
+    }
+    if other_task_id:
+        payload["other_task_id"] = other_task_id
+
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "duplicate_resolved",
+            payload,
+        )
+
+
+def record_route_economics(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_route: str,
+    actual_route: str,
+    free_attempted: bool,
+    fallback_used: bool,
+    paid_seat_consumed: bool,
+    cactus_verdict: str,
+) -> None:
+    """Record route-economics metadata for governance scans.
+
+    Args:
+        conn: Active database connection (will be wrapped in write_txn).
+        task_id: The task being routed.
+        expected_route: The classifier's expected route.
+        actual_route: The actual route that was used.
+        free_attempted: Whether a free-route attempt was made.
+        fallback_used: Whether a fallback to another route was needed.
+        paid_seat_consumed: Whether a paid seat was consumed.
+        cactus_verdict: Cactus routing signal verdict.
+    """
+    payload = {
+        "expected_route": expected_route,
+        "actual_route": actual_route,
+        "free_attempted": free_attempted,
+        "fallback_used": fallback_used,
+        "paid_seat_consumed": paid_seat_consumed,
+        "cactus_verdict": cactus_verdict,
+    }
+
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "route_economics",
+            payload,
+        )
+
+
 # ---------------------------------------------------------------------------
 
 def _git_toplevel(path: Path) -> Optional[Path]:
