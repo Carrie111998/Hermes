@@ -3308,6 +3308,13 @@ def run_doctor(args):
                     )
                 except Exception as _e:
                     _fail_and_issue("Honcho connection failed", str(_e), f"Honcho unreachable: {_e}", issues)
+        except ModuleNotFoundError:
+            _fail_and_issue(
+                "Honcho plugin not installed",
+                "switch memory provider in config.yaml (Honcho plugin is retired in this installation)",
+                "Honcho is set as memory provider but the plugin is not installed",
+                issues,
+            )
         except ImportError:
             _fail_and_issue(
                 "honcho-ai not installed",
