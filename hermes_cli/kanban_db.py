@@ -8174,26 +8174,60 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
-def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children of this process without blocking.
+# Reaping -1 in a process that ALSO runs asyncio.create_subprocess_exec (like
+# the gateway does in run.py) steals asyncio's child exits: asyncio's watcher
+# never sees the status, await proc.wait() never resolves, and the awaiting
+# task hangs silently with nothing logged.
+#
+# Track the pids this process explicitly spawned as kanban workers and wait
+# only on those. A pid that has vanished or was never our child is forgotten
+# instead of triggering any wider wait. Never widen back to -1.
+_OWNED_WORKER_PIDS: "set[int]" = set()
+_OWNED_WORKER_PIDS_LOCK = threading.Lock()
 
-    Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+
+def register_worker_pid(pid: Optional[int]) -> None:
+    """Record a pid this process spawned, so the reaper may wait on it."""
+    if not pid or int(pid) <= 0 or os.name == "nt":
+        return
+    with _OWNED_WORKER_PIDS_LOCK:
+        _OWNED_WORKER_PIDS.add(int(pid))
+
+
+def reap_worker_zombies() -> "list[int]":
+    """Reap zombie children THIS process spawned as kanban workers.
+
+    Waits only on pids registered by :func:`register_worker_pid`, never on
+    ``-1`` — see the comment above ``_OWNED_WORKER_PIDS`` for why that
+    distinction froze the board twice.
+
+    Returns the list of reaped PIDs. Safe to call when there are no children
+    (returns []). No-op on Windows.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if os.name == "nt":
+        return reaped
+    with _OWNED_WORKER_PIDS_LOCK:
+        candidates = sorted(_OWNED_WORKER_PIDS)
+    done: "list[int]" = []
+    for pid in candidates:
         try:
-            while True:
-                try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if pid == 0:
-                    break
-                _record_worker_exit(pid, status)
-                reaped.append(pid)
+            got, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            # Not our child any more (already reaped, or never was). Stop
+            # tracking it; do NOT fall back to a wider wait.
+            done.append(pid)
+            continue
         except Exception:
-            pass
+            continue
+        if got == 0:
+            continue  # still running
+        _record_worker_exit(got, status)
+        reaped.append(got)
+        done.append(pid)
+    if done:
+        with _OWNED_WORKER_PIDS_LOCK:
+            _OWNED_WORKER_PIDS.difference_update(done)
     return reaped
 
 
@@ -9361,6 +9395,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    register_worker_pid(pid)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
