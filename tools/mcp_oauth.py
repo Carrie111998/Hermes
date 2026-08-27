@@ -1217,6 +1217,39 @@ def _get_hermes_oauth_provider_class() -> type | None:
             request = await super()._refresh_token()
             return self._stamp_token_user_agent(request)
 
+        def _stamp_flow_user_agent(self, request):
+            """Stamp ``oauth.user_agent`` onto any UA-less SDK request.
+
+            The SDK builds metadata-discovery and dynamic-registration
+            requests as bare ``httpx.Request`` objects, so they never inherit
+            the client's default ``User-Agent``. A WAF that rejects UA-less
+            requests then 403s ``/.well-known/oauth-*`` and ``/register``,
+            failing the flow before the browser step with a misleading
+            ``Registration failed: 403``. ``_stamp_token_user_agent`` covers
+            only the token endpoint, so extend the configured value to the
+            whole flow — never overriding a UA the request already carries.
+            """
+            ua = getattr(self, "_hermes_token_user_agent", None)
+            if ua and request is not None and not request.headers.get("User-Agent"):
+                request.headers["User-Agent"] = ua
+            return request
+
+        async def async_auth_flow(self, request):
+            # Bridge the SDK's bidirectional generator so each outbound
+            # request can be stamped. httpx feeds responses back with
+            # ``asend(response)``; a naive ``async for`` wrapper would drop
+            # them and the SDK's ``response = yield request`` would see None.
+            inner = super().async_auth_flow(self._stamp_flow_user_agent(request))
+            try:
+                outgoing = self._stamp_flow_user_agent(await inner.__anext__())
+                while True:
+                    incoming = yield outgoing
+                    outgoing = self._stamp_flow_user_agent(
+                        await inner.asend(incoming)
+                    )
+            except StopAsyncIteration:
+                return
+
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
             if 200 <= response.status_code < 300:
