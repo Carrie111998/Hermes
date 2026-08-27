@@ -9,10 +9,13 @@ const reactUi: TestProjectConfiguration = {
     setupFiles: ['./vitest.setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
     globals: true,
-    // The first test in each file pays jsdom env init + full module transform,
-    // which can exceed vitest's 5000ms default under CI/load. 15s gives the
-    // cold start headroom without masking genuinely hung tests.
-    testTimeout: 15_000
+    // The first test in each file pays jsdom env init + full module transform.
+    // On Windows the larger renderer graphs can exceed 15s cold, and Vitest's
+    // default all-core fan-out (32 workers on common desktops) turns that into
+    // transform starvation. Bound parallelism and leave enough cold-start
+    // headroom without disabling the timeout for genuinely hung tests.
+    maxWorkers: 4,
+    testTimeout: 30_000
   }
 }
 
