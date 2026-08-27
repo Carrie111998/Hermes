@@ -120,6 +120,7 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
 
     const lease = acquireGatewayRequestLeaseForAgent('source-b', 'default')
 
+    expect(lease.ownerRoute).toEqual({ connectionId: 'source-b', profile: 'default' })
     await expect(lease.request('session.branch', { session_id: 'runtime-b' })).resolves.toEqual({
       method: 'session.branch',
       params: { session_id: 'runtime-b' }

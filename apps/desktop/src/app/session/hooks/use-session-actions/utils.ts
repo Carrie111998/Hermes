@@ -1245,6 +1245,7 @@ export function selectBranchMessages(
 interface OptimisticSessionContext {
   connectionId?: string
   cwd?: null | string
+  mode?: 'local' | 'remote'
   profile?: null | string
   targetProfile?: string
 }
@@ -1293,7 +1294,12 @@ export function upsertOptimisticSession(
   }
 
   if (connectionId && context?.profile) {
-    setSessionOwnerHint(id, context as SessionProfileRoute)
+    setSessionOwnerHint(id, {
+      connectionId,
+      profile: context.profile,
+      ...(context.mode ? { mode: context.mode } : {}),
+      ...(context.targetProfile ? { targetProfile: context.targetProfile } : {})
+    })
   }
 
   setSessions(prev => [session, ...prev.filter(s => s.id !== id)])

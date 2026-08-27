@@ -1614,9 +1614,15 @@ export function reopenLastClosedTile(): void {
 
     if (!$sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
       openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before, {
+        ownerRoute: tile.ownerRoute,
         workspaceMode: tile.workspaceMode ?? 'sessions',
         workspaceOwnerKey: tile.workspaceOwnerKey
       })
+
+      if (tile.ownerRoute) {
+        patchSessionTile(storedSessionId, { ownerRoute: tile.ownerRoute })
+      }
+
       focusOpenSession(storedSessionId)
 
       return

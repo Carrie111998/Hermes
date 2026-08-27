@@ -1984,7 +1984,7 @@ export function useSessionActions({
           preview,
           parentStoredId,
           parent ? parent.last_active || parent.started_at : undefined,
-          { cwd, profile }
+          { cwd, ...(sourceOwnerRoute ?? { profile }) }
         )
         ensureSessionState(branched.session_id, routedSessionId)
         updateSessionState(
@@ -2134,6 +2134,7 @@ export function useSessionActions({
           }
 
           sourceLease = bindGatewayRequest(sourceGateway, uiIntent.profile)
+          sourceOwnerRoute = sourceLease.ownerRoute
           const resolvedProfile = await resolveSessionProfile(parentStoredId)
           profile = normalizeProfileKey(resolvedProfile ?? uiIntent.profile)
         } else {

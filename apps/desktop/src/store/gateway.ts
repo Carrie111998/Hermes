@@ -13,6 +13,7 @@ import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
 // Concurrent sessions across profiles need concurrent sockets: the renderer's
@@ -39,6 +40,8 @@ export type GatewayRequester = <T>(
 ) => Promise<T>
 
 export interface GatewayRequestLease {
+  /** Exact registry route of the pinned socket, when the registry names it. */
+  ownerRoute?: SessionOwnerRoute
   request: GatewayRequester
   release(): void
 }
@@ -1608,7 +1611,10 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
     return stillRegistered() && isOpen(gateway)
   }
 
+  const ownerConnectionId = secondary?.connectionId ?? primaryOwnerConnectionId
+
   return {
+    ...(ownerConnectionId ? { ownerRoute: { connectionId: ownerConnectionId, profile: key } } : {}),
     request: async <T>(
       method: string,
       params = {},

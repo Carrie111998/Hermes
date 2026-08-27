@@ -75,7 +75,7 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
-import { $sessionTiles, closeSessionTile, sessionTileOwnerRoute } from '@/store/session-states'
+import { $sessionTiles, closeSessionTile, reopenLastClosedTile, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
@@ -1796,9 +1796,12 @@ describe('branchStoredSession desktop source tagging', () => {
     ])
 
     let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    const sourceOwnerRoute: SessionProfileRoute = { connectionId: 'source-a', profile: 'default' }
+
     render(
       <BranchHarness
         activeSessionId="live-parent"
+        bindGatewayRequest={gateway => ({ ...directGatewayLease(gateway), ownerRoute: sourceOwnerRoute })}
         onCurrentReady={branch => (branchCurrentSession = branch)}
         onReady={() => undefined}
         requestGateway={requestGateway}
@@ -1816,6 +1819,12 @@ describe('branchStoredSession desktop source tagging', () => {
       count: 2
     })
     expect(branchParams).toEqual({ session_id: 'live-parent', count: 2 })
+    expect($sessions.get().find(session => session.id === 'branch-stored')).toMatchObject({
+      connection_id: 'source-a',
+      profile: 'default'
+    })
+    expect(getSessionOwnerHint('branch-stored')).toEqual(sourceOwnerRoute)
+    expect(sessionTileOwnerRoute('branch-stored')).toEqual(sourceOwnerRoute)
   })
 
   it('keeps a branch-from-branched tile on the exact owner when connections share a profile', async () => {
@@ -1922,10 +1931,12 @@ describe('branchStoredSession desktop source tagging', () => {
     expect($currentProvider.get()).toBe('foreground-provider')
     expect($freshDraftReady.get()).toBe(true)
     expect($sessions.get().find(session => session.id === 'branch-stored-1')).toMatchObject({
+      connection_id: 'source-b',
       cwd: '/tile/workspace',
       parent_session_id: 'tile-stored',
       profile: 'default'
     })
+    expect(getSessionOwnerHint('branch-stored-1')).toEqual({ connectionId: 'source-b', profile: 'default' })
     expect(sessionStateByRuntimeIdRef.current.get('branch-runtime-1')).toMatchObject({
       cwd: '/tile/workspace',
       fast: true,
@@ -1934,6 +1945,15 @@ describe('branchStoredSession desktop source tagging', () => {
       provider: 'tile-provider',
       storedSessionId: 'branch-stored-1'
     })
+    expect(sessionTileOwnerRoute('branch-stored-1')).toEqual({ connectionId: 'source-b', profile: 'default' })
+
+    closeSessionTile('branch-stored-1')
+    expect(sessionTileOwnerRoute('branch-stored-1')).toBeUndefined()
+    expect(knownSessionOwner($sessions.get(), 'branch-stored-1')).toEqual({
+      connectionId: 'source-b',
+      profile: 'default'
+    })
+    reopenLastClosedTile()
     expect(sessionTileOwnerRoute('branch-stored-1')).toEqual({ connectionId: 'source-b', profile: 'default' })
 
     await expect(branchCurrentSession!(undefined, 'branch-runtime-1')).resolves.toBe(true)
