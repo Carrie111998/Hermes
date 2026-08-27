@@ -1151,7 +1151,10 @@ class TestUpdateNodeDependencies:
         class _FakeProc:
             def __init__(self, cmd, **kwargs):
                 calls.append({"cmd": cmd, "kwargs": kwargs})
-                self.stderr = iter(stderr_lines)
+                # _run_with_idle_timeout streams stdout and merges stderr into
+                # it (stderr=STDOUT) via a reader thread, so the tee'd lines
+                # must be surfaced through ``stdout``, not ``stderr``.
+                self.stdout = iter(list(stderr_lines))
 
             def __enter__(self):
                 return self
@@ -1159,7 +1162,7 @@ class TestUpdateNodeDependencies:
             def __exit__(self, *exc_info):
                 return False
 
-            def wait(self):
+            def wait(self, timeout=None):
                 return returncode
 
         return _FakeProc
@@ -1372,3 +1375,100 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestNpmInstallStreamingTimeoutFallback:
+    """A deadlocked ``npm ci`` (Issue #39267) must not block ``hermes update``
+    forever. The streaming (``capture_output=False``) install path reuses the
+    idle-output timeout the ``npm run build`` path already uses (#33788), so a
+    silent reify stall is terminated and ``_attempt``'s ci->install fallback
+    can fire instead of hanging indefinitely.
+    """
+
+    @staticmethod
+    def _make_checkout(tmp_path):
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / "package-lock.json").write_text("{}")
+        return checkout
+
+    def test_ci_stall_falls_back_to_install(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        checkout = self._make_checkout(tmp_path)
+        calls = []
+
+        def fake_timeout(cmd, **kwargs):
+            calls.append(("idle", cmd, kwargs))
+            joined = " ".join(cmd)
+            if "ci" in joined:
+                # Simulate the idle-timeout kill: non-zero, no clean return, so
+                # _attempt must fall through to `npm install`.
+                return subprocess.CompletedProcess(cmd, 124, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hm, "_run_with_idle_timeout", fake_timeout)
+
+        def _fail_if_capture_path(*a, **k):  # pragma: no cover
+            raise AssertionError("capture path used for streaming install")
+
+        monkeypatch.setattr(hm, "_run_npm_watching_for_engine_failure", _fail_if_capture_path)
+
+        result = hm._run_npm_install_deterministic(
+            "/usr/bin/npm", checkout, capture_output=False
+        )
+
+        assert result.returncode == 0
+        # Both ci and install went through the idle-timeout runner (not the
+        # plain capture/stream subprocess runner).
+        assert [c[0] for c in calls] == ["idle", "idle"]
+        assert "ci" in " ".join(calls[0][1])
+        assert "install" in " ".join(calls[1][1])
+
+    def test_ci_success_skips_install(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        checkout = self._make_checkout(tmp_path)
+        calls = []
+
+        def fake_timeout(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hm, "_run_with_idle_timeout", fake_timeout)
+
+        result = hm._run_npm_install_deterministic(
+            "/usr/bin/npm", checkout, capture_output=False
+        )
+
+        assert result.returncode == 0
+        # ci succeeded -> the install fallback is NOT attempted.
+        assert len(calls) == 1
+        assert "ci" in " ".join(calls[0])
+
+    def test_capture_path_keeps_engine_failure_runner(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        checkout = self._make_checkout(tmp_path)
+        used = {"watching": False, "idle": False}
+
+        def fake_watching(cmd, **kwargs):
+            used["watching"] = True
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        def fake_idle(cmd, **kwargs):
+            used["idle"] = True
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hm, "_run_with_idle_timeout", fake_idle)
+        monkeypatch.setattr(hm, "_run_npm_watching_for_engine_failure", fake_watching)
+
+        result = hm._run_npm_install_deterministic(
+            "/usr/bin/npm", checkout, capture_output=True
+        )
+
+        assert result.returncode == 0
+        # capture_output=True (desktop/web-silent callers) must keep the
+        # original engine-failure runner; the idle-timeout path is not used.
+        assert used["watching"] is True
+        assert used["idle"] is False
