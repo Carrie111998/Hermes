@@ -13,6 +13,11 @@ function hudWindowing() {
   return resolveHudWindowing(process.platform, process.env, process.argv)
 }
 
+export interface HudSessionState {
+  newChatGeneration: null | number | string
+  sessionId: null | string
+}
+
 export interface HudIpcDeps {
   isMac: boolean
   /** Main's authoritative translucency state (Settings → Appearance). */
@@ -21,7 +26,7 @@ export interface HudIpcDeps {
   openHudWindow: (sessionId: null | string, profile: null | string, newChatGeneration: null | string) => void
   closeHudWindow: () => void
   resetHudLayout: () => boolean
-  setHudSessionId: (sessionId: null | string) => void
+  setHudSessionState: (state: HudSessionState) => void
 }
 
 export function registerHudIpc({
@@ -31,7 +36,7 @@ export function registerHudIpc({
   openHudWindow,
   closeHudWindow,
   resetHudLayout,
-  setHudSessionId
+  setHudSessionState
 }: HudIpcDeps) {
   const hudDrag = createHudDragSession()
 
@@ -284,13 +289,21 @@ export function registerHudIpc({
     return { ok: resetHudLayout() }
   })
 
-  // The HUD renderer reporting which session it is on, so the close broadcast
-  // can hand it back to the app window (see hudSessionId).
-  ipcMain.on('hermes:hud:session', (event, sessionId) => {
+  // The HUD renderer reports its exact chat identity. Main outlives that
+  // renderer, so this latch is the authority used by the close broadcast.
+  ipcMain.on('hermes:hud:session', (event, state) => {
     const hudWindow = getHudWindow()
 
     if (hudWindow && !hudWindow.isDestroyed() && event.sender === hudWindow.webContents) {
-      setHudSessionId(typeof sessionId === 'string' && sessionId ? sessionId : null)
+      const sessionId = typeof state?.sessionId === 'string' && state.sessionId ? state.sessionId : null
+
+      const newChatGeneration =
+        sessionId === null &&
+        (typeof state?.newChatGeneration === 'string' || typeof state?.newChatGeneration === 'number')
+          ? state.newChatGeneration
+          : null
+
+      setHudSessionState({ newChatGeneration, sessionId })
     }
   })
 

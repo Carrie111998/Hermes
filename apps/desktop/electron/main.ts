@@ -13232,7 +13232,13 @@ let hudRestoreMainWindow = false
 // HUD may have switched sessions, or started a new one the app has never
 // seen. Main is the only party that outlives the HUD's renderer, so it holds
 // the id and hands it over in the close broadcast.
-let hudSessionId = null
+let hudSessionId: null | string = null
+
+// Exact New Chat draft identity when hudSessionId is null. HUD-side /new can
+// advance this while the app renderer is hidden; main must retain the latest
+// report after the HUD renderer is gone so the close handoff cannot adopt a
+// stale generation owned by another window.
+let hudNewChatGeneration: null | number | string = null
 
 // The profile the live HUD renderer booted against (rides hudUrl's query
 // string). A renderer adopts its backend once at boot, so a retarget onto a
@@ -13515,7 +13521,7 @@ function hudUrl(sessionId, profile, newChatGeneration) {
 // Carries the HUD's session so the app window can re-home onto it on the way
 // out (see hudSessionId).
 function broadcastHudState(open) {
-  const payload = { open, sessionId: hudSessionId }
+  const payload = { newChatGeneration: hudNewChatGeneration, open, sessionId: hudSessionId }
 
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
@@ -13649,6 +13655,11 @@ function restoreMainWindowFromHud() {
   }
 }
 
+function latchHudSessionState(sessionId: null | string, newChatGeneration: null | number | string) {
+  hudSessionId = sessionId || null
+  hudNewChatGeneration = hudSessionId === null ? newChatGeneration || null : null
+}
+
 function openHudWindow(sessionId, profile, newChatGeneration) {
   const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
 
@@ -13663,7 +13674,7 @@ function openHudWindow(sessionId, profile, newChatGeneration) {
       win.removeAllListeners('closed')
       win.destroy()
 
-      hudSessionId = sessionId || null
+      latchHudSessionState(sessionId, newChatGeneration)
       hudProfile = profileKey
       hudWindow = spawnHudWindow(sessionId, profileKey, newChatGeneration)
       broadcastHudState(true)
@@ -13676,7 +13687,7 @@ function openHudWindow(sessionId, profile, newChatGeneration) {
     // raising it. Asking for HUD mode from another tab means "put THIS
     // conversation in the HUD", and a plain focus leaves the wrong one there.
     if (sessionId && sessionId !== hudSessionId) {
-      hudSessionId = sessionId
+      latchHudSessionState(sessionId, null)
       hudWindow.webContents.send('hermes:hud:goto', sessionId)
       // Keep every window's idea of where the HUD is pointed in step, so the
       // toggle keeps reading "switch" vs "dismiss" correctly.
@@ -13689,7 +13700,7 @@ function openHudWindow(sessionId, profile, newChatGeneration) {
   }
 
   hudRestoreMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible())
-  hudSessionId = sessionId || null
+  latchHudSessionState(sessionId, newChatGeneration)
   hudProfile = profileKey
   hudWindow = spawnHudWindow(sessionId, profileKey, newChatGeneration)
   broadcastHudState(true)
@@ -14479,8 +14490,9 @@ const hudIpc = registerHudIpc({
   openHudWindow,
   closeHudWindow,
   resetHudLayout: resetHudWindowLayout,
-  setHudSessionId: value => {
-    hudSessionId = value
+  setHudSessionState: state => {
+    hudSessionId = state.sessionId
+    hudNewChatGeneration = state.newChatGeneration
   }
 })
 

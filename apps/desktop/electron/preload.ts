@@ -106,9 +106,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     // user's translucency setting to decide the native frost (macOS vibrancy /
     // Windows 11 DWM backdrop) — see hudFrostFor.
     setFrost: showing => ipcRenderer.invoke('hermes:hud:frost', showing),
-    // The HUD tells main which session it is on; main hands that back to the
-    // app window when the HUD closes, so the app can re-home onto it.
-    setSession: sessionId => ipcRenderer.send('hermes:hud:session', sessionId),
+    // The HUD tells main its exact chat identity. A null session carries its
+    // New Chat generation so the app can re-home onto the same draft on close.
+    setSession: state => ipcRenderer.send('hermes:hud:session', state),
     onGoto: callback => {
       const listener = (_event, sessionId) => callback(sessionId)
       ipcRenderer.on('hermes:hud:goto', listener)

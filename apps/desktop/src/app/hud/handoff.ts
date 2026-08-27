@@ -17,7 +17,11 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
-import { reloadPersistedDrafts, requestComposerDraftSync } from '@/store/composer'
+import {
+  $composerNewChatGeneration,
+  reloadPersistedDrafts,
+  requestComposerDraftSync
+} from '@/store/composer'
 import { reportHudSession, watchHudState } from '@/store/hud'
 import { $selectedStoredSessionId } from '@/store/session'
 import { focusOpenSession, sessionTileDelegate } from '@/store/session-states'
@@ -26,6 +30,8 @@ import { isHudWindow } from '@/store/windows'
 import { getActiveComposer } from '../chat/composer/focus'
 import { openSession, type OpenSessionNavigate } from '../open-session'
 import { sessionRoute } from '../routes'
+
+import { resolveHudCloseHandoff } from './handoff-target'
 
 /** Session tiles route on `tile:<storedSessionId>` (see session-tile.tsx). */
 const TILE_TARGET_PREFIX = 'tile:'
@@ -66,12 +72,21 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
       return
     }
 
-    return watchHudState(hudSessionId => {
+    return watchHudState(hudState => {
+      const selected = $selectedStoredSessionId.get()
+      const handoff = resolveHudCloseHandoff(hudState, selected)
+
+      // Adopt the HUD's exact New Chat identity before repainting from the
+      // shared stash. Null alone is not an identity: another app window may
+      // own a different fresh draft for the same profile.
+      if (handoff.newChatGeneration !== null) {
+        $composerNewChatGeneration.set(handoff.newChatGeneration)
+      }
+
       // The HUD may have typed or sent since this window last read the stash.
       reloadPersistedDrafts()
 
-      const selected = $selectedStoredSessionId.get()
-      const target = hudSessionId ?? selected
+      const target = handoff.sessionId
 
       // Somewhere other than the workspace pane. If it is an open tile, front
       // it and re-resume THROUGH the tile delegate: the ordinary resume path
@@ -117,10 +132,11 @@ export function useHudGoto(navigate: OpenSessionNavigate): void {
 /** HUD side: keep main told which session this window is on. */
 export function useReportHudSession(): void {
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const newChatGeneration = useStore($composerNewChatGeneration)
 
   useEffect(() => {
     if (isHudWindow()) {
-      reportHudSession(selectedStoredSessionId)
+      reportHudSession(selectedStoredSessionId, newChatGeneration)
     }
-  }, [selectedStoredSessionId])
+  }, [newChatGeneration, selectedStoredSessionId])
 }

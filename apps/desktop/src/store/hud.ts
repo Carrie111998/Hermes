@@ -16,6 +16,7 @@
 import { atom } from 'nanostores'
 
 import { $composerNewChatGeneration, requestComposerDraftSync } from '@/store/composer'
+import type { ComposerNewChatGeneration } from '@/store/composer-storage-scope'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $sessions, rememberedSessionProfile } from '@/store/session'
 import { isHudWindow } from '@/store/windows'
@@ -38,6 +39,11 @@ export const $hudMode = atom(isHudWindow())
 /** Which conversation the HUD is showing, as far as this window knows. Lets the
  *  toggle tell "switch the HUD to this tab" apart from "dismiss the HUD". */
 export const $hudSession = atom<null | string>(null)
+
+export interface HudSessionState {
+  newChatGeneration: ComposerNewChatGeneration | null
+  sessionId: string | null
+}
 
 /** True when the shell exposes HUD mode (desktop only). */
 export const canUseHud = (): boolean =>
@@ -99,7 +105,14 @@ export function resetHudLayout(): void {
 /** Tell main which session this HUD is on. Main holds it (the HUD's renderer
  *  doesn't outlive the window) and hands it back in the close broadcast so the
  *  app window knows what to re-home onto. */
-export const reportHudSession = (sessionId: null | string): void => window.hermesDesktop?.hud?.setSession?.(sessionId)
+export const reportHudSession = (
+  sessionId: null | string,
+  newChatGeneration: ComposerNewChatGeneration = $composerNewChatGeneration.get()
+): void =>
+  window.hermesDesktop?.hud?.setSession?.({
+    newChatGeneration: sessionId === null ? newChatGeneration : null,
+    sessionId
+  })
 
 /**
  * Track the HUD window's real state so the titlebar toggle can't go stale when
@@ -107,13 +120,18 @@ export const reportHudSession = (sessionId: null | string): void => window.herme
  * app window the session the HUD ended on. Returns a disposer; no-ops outside
  * Electron.
  */
-export function watchHudState(onClosed?: (sessionId: null | string) => void): () => void {
-  const off = window.hermesDesktop?.hud?.onChanged?.(({ open, sessionId }) => {
+export function watchHudState(onClosed?: (state: HudSessionState) => void): () => void {
+  const off = window.hermesDesktop?.hud?.onChanged?.(({ newChatGeneration, open, sessionId }) => {
+    const state: HudSessionState = {
+      newChatGeneration: sessionId === null ? (newChatGeneration ?? null) : null,
+      sessionId
+    }
+
     $hudActive.set(open)
     $hudSession.set(open ? sessionId : null)
 
     if (!open) {
-      onClosed?.(sessionId)
+      onClosed?.(state)
     }
   })
 

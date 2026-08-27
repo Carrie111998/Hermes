@@ -124,9 +124,15 @@ declare global {
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
         resetLayout: () => Promise<{ ok: boolean }>
         setFrost: (showing: boolean) => Promise<{ ok: boolean }>
-        setSession: (sessionId: null | string) => void
+        setSession: (state: { newChatGeneration: number | string | null; sessionId: null | string }) => void
         onGoto: (callback: (sessionId: string) => void) => () => void
-        onChanged: (callback: (state: { open: boolean; sessionId: null | string }) => void) => () => void
+        onChanged: (
+          callback: (state: {
+            newChatGeneration: number | string | null
+            open: boolean
+            sessionId: null | string
+          }) => void
+        ) => () => void
         onCursor: (callback: (point: { x: number; y: number } | null) => void) => () => void
         onGameOverlay: (callback: (state: { active: boolean; app: string }) => void) => () => void
       }
