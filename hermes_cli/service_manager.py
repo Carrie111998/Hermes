@@ -605,25 +605,33 @@ class S6CommandError(S6Error):
 
 def _refuse_live_s6_mutation_under_test(
     scandir: Path, *, operation: str, profile: str
-) -> None:
-    """Fail before effects when test isolation targets the live scandir."""
+) -> Optional[Path]:
+    """Deny live test mutations; return a stable safe scandir when active."""
     if not os.environ.get("HERMES_TEST_ISOLATION"):
-        return
-    is_live = scandir == S6_DYNAMIC_SCANDIR
-    if not is_live:
-        try:
-            is_live = scandir.resolve() == S6_DYNAMIC_SCANDIR.resolve()
-        except OSError:
-            # Lexical equality was checked above. Resolution failures for a
-            # different path do not make it the canonical live scandir.
-            is_live = False
-    if is_live:
-        service = f"{S6_SERVICE_PREFIX}{profile}"
+        return None
+    service = f"{S6_SERVICE_PREFIX}{profile}"
+    if scandir == S6_DYNAMIC_SCANDIR:
         raise S6TestIsolationError(
             f"refusing to {operation} {service!r} in the live s6 scandir "
             "while Hermes test isolation is active",
             service=service,
         )
+    try:
+        resolved_scandir = scandir.resolve()
+        resolved_live = S6_DYNAMIC_SCANDIR.resolve()
+    except OSError as exc:
+        raise S6TestIsolationError(
+            "refusing s6 mutation under test isolation: could not prove "
+            "the target scandir is separate from the live canonical scandir",
+            service=service,
+        ) from exc
+    if resolved_scandir == resolved_live:
+        raise S6TestIsolationError(
+            f"refusing to {operation} {service!r} in the live s6 scandir "
+            "while Hermes test isolation is active",
+            service=service,
+        )
+    return resolved_scandir
 
 
 class S6ServiceManager:
@@ -993,9 +1001,11 @@ class S6ServiceManager:
                 directory already exists.
             RuntimeError: if ``s6-svscanctl`` fails.
         """
-        _refuse_live_s6_mutation_under_test(
+        safe_scandir = _refuse_live_s6_mutation_under_test(
             self.scandir, operation="register", profile=profile
         )
+        if safe_scandir is not None:
+            self.scandir = safe_scandir
 
         import shutil
         import subprocess
@@ -1097,9 +1107,11 @@ class S6ServiceManager:
         rmtree races s6-supervise on a set of root-owned files inside
         the supervise dir and the dir is left half-removed.
         """
-        _refuse_live_s6_mutation_under_test(
+        safe_scandir = _refuse_live_s6_mutation_under_test(
             self.scandir, operation="unregister", profile=profile
         )
+        if safe_scandir is not None:
+            self.scandir = safe_scandir
 
         import shutil
         import subprocess

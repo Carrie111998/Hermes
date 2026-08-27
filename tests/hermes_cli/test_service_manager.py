@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import service_manager as service_manager_module
@@ -149,6 +151,101 @@ def test_windows_manager_lifecycle_delegates(monkeypatch: pytest.MonkeyPatch) ->
 # ---------------------------------------------------------------------------
 # S6ServiceManager — unit tests against a tmp-path scandir (no real s6)
 # ---------------------------------------------------------------------------
+
+
+def test_s6_test_isolation_denies_when_scandir_identity_cannot_be_resolved(
+    monkeypatch, tmp_path, fake_subprocess_run
+):
+    scandir = tmp_path / "uncertain-scandir"
+    scandir.mkdir()
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test")
+    monkeypatch.setattr(
+        service_manager_module, "S6_DYNAMIC_SCANDIR", tmp_path / "canonical"
+    )
+
+    def fail_resolve(self, *args, **kwargs):
+        raise OSError("identity unavailable")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    manager = S6ServiceManager(scandir=scandir)
+
+    with pytest.raises(S6TestIsolationError, match="could not prove"):
+        manager.register_profile_gateway("coder", start_now=False)
+
+    assert not (scandir / "gateway-coder").exists()
+    assert fake_subprocess_run == []
+
+
+def test_s6_test_isolation_binds_safe_resolved_scandir_before_mutation(
+    monkeypatch, tmp_path, fake_subprocess_run
+):
+    canonical = tmp_path / "canonical-service"
+    canonical.mkdir()
+    sentinel = canonical / "sentinel"
+    sentinel.write_text("untouched")
+    safe = tmp_path / "safe-scandir"
+    safe.mkdir()
+    alias = tmp_path / "mutable-alias"
+    alias.symlink_to(safe, target_is_directory=True)
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test")
+    monkeypatch.setattr(service_manager_module, "S6_DYNAMIC_SCANDIR", canonical)
+    manager = S6ServiceManager(scandir=alias)
+    original_service_dir = manager._service_dir
+    retargeted = False
+
+    def retarget_then_resolve(profile):
+        nonlocal retargeted
+        if not retargeted:
+            alias.unlink()
+            alias.symlink_to(canonical, target_is_directory=True)
+            retargeted = True
+        return original_service_dir(profile)
+
+    monkeypatch.setattr(manager, "_service_dir", retarget_then_resolve)
+
+    manager.register_profile_gateway("coder", start_now=False)
+
+    assert sentinel.read_text() == "untouched"
+    assert not (canonical / "gateway-coder").exists()
+    assert (safe / "gateway-coder").is_dir()
+    assert manager.scandir == safe.resolve()
+
+
+def test_s6_test_isolation_binds_safe_scandir_before_unregister(
+    monkeypatch, tmp_path, fake_subprocess_run
+):
+    canonical = tmp_path / "canonical-service"
+    canonical_service = canonical / "gateway-coder"
+    canonical_service.mkdir(parents=True)
+    canonical_sentinel = canonical_service / "sentinel"
+    canonical_sentinel.write_text("untouched")
+    safe = tmp_path / "safe-scandir"
+    safe_service = safe / "gateway-coder"
+    safe_service.mkdir(parents=True)
+    alias = tmp_path / "mutable-alias"
+    alias.symlink_to(safe, target_is_directory=True)
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test")
+    monkeypatch.setattr(service_manager_module, "S6_DYNAMIC_SCANDIR", canonical)
+    manager = S6ServiceManager(scandir=alias)
+    original_service_dir = manager._service_dir
+    retargeted = False
+
+    def retarget_then_resolve(profile):
+        nonlocal retargeted
+        if not retargeted:
+            alias.unlink()
+            alias.symlink_to(canonical, target_is_directory=True)
+            retargeted = True
+        return original_service_dir(profile)
+
+    monkeypatch.setattr(manager, "_service_dir", retarget_then_resolve)
+
+    manager.unregister_profile_gateway("coder")
+
+    assert canonical_sentinel.read_text() == "untouched"
+    assert canonical_service.is_dir()
+    assert not safe_service.exists()
+    assert manager.scandir == safe.resolve()
 
 
 @pytest.fixture
