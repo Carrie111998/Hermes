@@ -68,6 +68,7 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.room_profiles import RoomModelProfile, RoomProfileStore, exact_room_id
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -3790,6 +3791,9 @@ def _channel_override_lookup_keys(
     """
     keys: list[str] = []
     seen: set[str] = set()
+    # A trusted thread id is the exact channel identity.  Chat is only the
+    # fallback for messages without a thread; parent remains the final
+    # inheritance fallback for forum/channel adapters.
     for key in (chat_id, thread_id, parent_id):
         if not key:
             continue
@@ -6871,6 +6875,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._room_profile_stores: Dict[Path, RoomProfileStore] = {}
+        self._room_profile_stores_lock = threading.Lock()
         # When non-None, SessionDB init failed — the gateway broadcasts a
         # one-time warning to the home channel(s) after connecting, so the
         # user knows persistence is broken instead of discovering it later
@@ -8062,6 +8068,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _room_profile_store(self) -> RoomProfileStore:
+        from hermes_constants import get_hermes_home
+        path = (Path(get_hermes_home()) / "room_profiles.json").resolve()
+        stores = self.__dict__.setdefault("_room_profile_stores", {})
+        lock = self.__dict__.setdefault("_room_profile_stores_lock", threading.Lock())
+        with lock:
+            return stores.setdefault(path, RoomProfileStore(path))
+
+    def _dynamic_room_profile(self, source: Optional[SessionSource]) -> RoomModelProfile | None:
+        if source is None: return None
+        room = exact_room_id(source)
+        return self._room_profile_store().get(source.platform, room) if room else None
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -8141,6 +8160,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             model = runtime_model
 
+        dynamic = self._dynamic_room_profile(source)
+        if dynamic:
+            model = dynamic.model
+            runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(dynamic.provider)
+            runtime_kwargs["provider"] = dynamic.provider
+
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
             chat_id = str(source.chat_id) if source.chat_id else ""
@@ -8159,7 +8184,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id=thread_id,
                 parent_id=parent_id,
             )
-            if ch:
+            if ch and not dynamic:
                 if ch.model:
                     model = ch.model
                 if ch.provider:
@@ -9441,6 +9466,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from hermes_cli.model_switch import resolve_effective_model
 
+        dynamic = self._dynamic_room_profile(SessionSource(platform=platform, chat_id=chat_id, user_id="", thread_id=thread_id))
+        if dynamic: return dynamic.model
         override = None
         config = getattr(self, "config", None)
         if config:
@@ -9555,6 +9582,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+
+        dynamic = self._dynamic_room_profile(source)
+        if dynamic:
+            from hermes_constants import parse_reasoning_effort
+            parsed = parse_reasoning_effort(dynamic.reasoning)
+            if parsed is not None: return parsed
+
+        # Channel reasoning follows the same trusted platform/chat lookup as
+        # model/provider resolution.  Missing ``reasoning`` is a legacy config
+        # and must fall through to per-model/global resolution.
+        if source is not None:
+            cfg = getattr(self, "config", None)
+            if cfg is not None:
+                channel = _get_channel_override(
+                    cfg, source.platform, str(source.chat_id or ""),
+                    thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+                    parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+                )
+                if channel is not None and channel.reasoning is not None:
+                    from hermes_constants import parse_reasoning_effort
+                    parsed = parse_reasoning_effort(channel.reasoning)
+                    if parsed is not None:
+                        return parsed
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(

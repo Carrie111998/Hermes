@@ -1434,6 +1434,7 @@ def run_import(args) -> None:
 _QUICK_STATE_FILES = (
     "state.db",
     "config.yaml",
+    "room_profiles.json",
     ".env",
     "auth.json",
     "cron/jobs.json",

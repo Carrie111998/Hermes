@@ -101,6 +101,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets
     "auth.json", ".env",
+    "room_profiles.json",
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",
     "hermes_state.db", "response_store.db",

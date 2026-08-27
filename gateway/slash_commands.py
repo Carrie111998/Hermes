@@ -1748,6 +1748,70 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    # Exact room presets are intentionally duplicated from the adapter picker
+    # as a small, closed allowlist.  Never accept arbitrary values from event
+    # metadata: the adapter supplies only the key, while Hermes owns the tuple.
+    _ROOM_MODEL_PRESETS = {
+        "sol-max": ("gpt-5.6-sol", "openai-codex", "max"),
+        "sol-xhigh": ("gpt-5.6-sol", "openai-codex", "xhigh"),
+        "sol-high": ("gpt-5.6-sol", "openai-codex", "high"),
+        "sol-medium": ("gpt-5.6-sol", "openai-codex", "medium"),
+        "sol-1m-xhigh": ("gpt-5.6-sol-1m-local", "cliproxy", "xhigh"),
+        "luna-max": ("gpt-5.6-luna", "openai-codex", "max"),
+        "luna-xhigh": ("gpt-5.6-luna", "openai-codex", "xhigh"),
+        "55-xhigh": ("gpt-5.5", "openai-codex", "xhigh"),
+        "55-high": ("gpt-5.5", "openai-codex", "high"),
+        "55-medium": ("gpt-5.5", "openai-codex", "medium"),
+    }
+
+    async def _handle_room_model_request(self, event: MessageEvent, request, *, config_path=None) -> Optional[str]:
+        """Persist a trusted NextDo room preset in the profile sidecar."""
+        from hermes_cli.model_switch import switch_model
+        from hermes_constants import parse_reasoning_effort
+        from gateway.room_profiles import RoomModelProfile, exact_room_id
+        source = event.source
+        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        if (source is None or source.platform != Platform.NEXTDO or
+                metadata.get("route_kind") != "internal_room_model_preset" or
+                metadata.get("synthetic") is not True):
+            return "❌ Room model presets are available only from a trusted NextDo picker event."
+        room = exact_room_id(source)
+        preset_key = metadata.get("preset_key")
+        preset = self._ROOM_MODEL_PRESETS.get(preset_key)
+        if not room: return "❌ Room model preset requires a room chat id."
+        if preset is None: return "❌ Invalid room model preset."
+        model, provider, effort = preset
+        if request.target != model or request.explicit_provider != provider or request.reasoning != effort:
+            return "❌ Room model preset does not match its signed request."
+        if parse_reasoning_effort(effort) is None: return "❌ Invalid reasoning effort."
+        try:
+            result = await asyncio.to_thread(switch_model, raw_input=model,
+                current_provider="openrouter", current_model="", current_base_url="",
+                current_api_key="", is_global=False, explicit_provider=provider,
+                user_providers=None, custom_providers=None)
+            if not result.success or (result.new_model, result.target_provider) != (model, provider):
+                return "❌ Room model preset failed provider/model validation."
+            store = await asyncio.to_thread(self._room_profile_store)
+            await asyncio.to_thread(store.upsert, source.platform, room,
+                RoomModelProfile(model, provider, effort))
+        except Exception as exc:
+            logger.warning("Room model preset sidecar write/validation failed: %s", exc)
+            return "❌ Room model preset was not pinned; runtime is unchanged."
+        # Converge transient state only after durable sidecar success.
+        session_source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        session_key = self._session_key_for_source(session_source)
+        try:
+            await self.async_session_store.set_model_override(session_key, None)
+        except Exception as exc:
+            logger.warning("Room preset session override clear failed: %s", exc)
+            return f"❌ Room model preset was saved, but session override clear failed ({exc}); state is partial. Retry the same preset to converge."
+        state = self._session_state(session_key)
+        state.conversation.model_override = None
+        state.conversation.reasoning_override = None
+        getattr(self, "_pending_model_notes", {}).pop(session_key, None)
+        self._evict_cached_agent(session_key)
+        return f"✅ Pinned profile: {preset_key} ({model} / {provider} / reasoning {effort}) for this NextDo room."
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -1789,6 +1853,8 @@ class GatewaySlashCommandsMixin:
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
+        if request.is_room:
+            return await self._handle_room_model_request(event, request)
         persist_global = resolve_persist_behavior(
             is_global_flag,
             is_session,

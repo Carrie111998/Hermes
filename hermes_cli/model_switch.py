@@ -639,6 +639,8 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    reasoning: str = ""
+    is_room: bool = False
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -671,11 +673,13 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     force_refresh = False
     is_session = False
     is_once = False
+    reasoning = ""
+    is_room = False
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once)', r'--\1', raw_args)
+    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once|reasoning|room)', r'--\1', raw_args)
 
     # Keep this hand-rolled because model IDs may contain colons/slashes and
     # the historical parser did not require shell quoting.
@@ -695,6 +699,12 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         elif parts[i] == "--once":
             is_once = True
             i += 1
+        elif parts[i] == "--room":
+            is_room = True
+            i += 1
+        elif parts[i] == "--reasoning" and i + 1 < len(parts):
+            reasoning = parts[i + 1].strip().lower()
+            i += 2
         elif parts[i] == "--provider" and i + 1 < len(parts):
             explicit_provider = parts[i + 1]
             i += 2
@@ -710,6 +720,8 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         force_refresh=force_refresh,
         is_session=is_session,
         is_once=is_once,
+        reasoning=reasoning,
+        is_room=is_room,
     )
 
 
@@ -820,6 +832,8 @@ class ModelSwitchRequest:
     is_global: bool = False
     is_session: bool = False
     is_once: bool = False
+    reasoning: str = ""
+    is_room: bool = False
     force_refresh: bool = False
     scope: str = "default"
     errors: tuple = ()
@@ -839,6 +853,8 @@ class ModelSwitchRequest:
             force_refresh=self.force_refresh,
             is_session=self.is_session,
             is_once=self.is_once,
+            reasoning=self.reasoning,
+            is_room=self.is_room,
         )
 
     def error_messages(self) -> list:
@@ -889,6 +905,8 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         is_global=parsed.is_global,
         is_session=parsed.is_session,
         is_once=parsed.is_once,
+        reasoning=parsed.reasoning,
+        is_room=parsed.is_room,
         force_refresh=parsed.force_refresh,
         scope=scope,
         errors=tuple(errors),

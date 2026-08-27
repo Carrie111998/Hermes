@@ -239,7 +239,7 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
 # (#58394). Add new artifacts here when introduced in ``hermes_constants``.
 _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # Configuration / persona
-    "config.yaml", "SOUL.md", "MEMORY.md", "USER.md", "todo.json",
+    "config.yaml", "room_profiles.json", "SOUL.md", "MEMORY.md", "USER.md", "todo.json",
     "system_prompt.md", "AGENTS.md", "CLAUDE.md", ".cursorrules",
     # Desktop appearance/interface overlay (written by the desktop app's
     # profile export; applied by its import — see desktop.json handling).
