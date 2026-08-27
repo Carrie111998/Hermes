@@ -1002,6 +1002,113 @@ class TestStuckLoopEscalation:
         counts = json.loads(counts_file.read_text(encoding="utf-8"))
         assert counts == {entry.session_key: 1}
 
+    @pytest.mark.asyncio
+    async def test_startup_resume_requires_persisted_attempt(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed attempt publication must prevent synthetic dispatch."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="write-failure")
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:write-failure",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+        adapter.handle_message = AsyncMock()
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        counts_file.write_text(json.dumps({entry.session_key: 2}), encoding="utf-8")
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("gateway.run.atomic_json_write", fail_write)
+
+        assert runner._schedule_resume_pending_sessions() == 0
+        adapter.handle_message.assert_not_awaited()
+        assert json.loads(counts_file.read_text(encoding="utf-8")) == {
+            entry.session_key: 2
+        }
+
+    @pytest.mark.asyncio
+    async def test_startup_resume_preserves_malformed_attempt_ledger(
+        self, tmp_path, monkeypatch
+    ):
+        """Unknown persisted attempts must not be reset before dispatch."""
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="malformed-ledger")
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:malformed-ledger",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+        adapter.handle_message = AsyncMock()
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        malformed = "{not-json"
+        counts_file.write_text(malformed, encoding="utf-8")
+
+        assert runner._schedule_resume_pending_sessions() == 0
+        adapter.handle_message.assert_not_awaited()
+        assert counts_file.read_text(encoding="utf-8") == malformed
+
+    @pytest.mark.asyncio
+    async def test_startup_resume_dispatches_after_persisted_attempt(
+        self, tmp_path, monkeypatch
+    ):
+        """Successful durable admission still schedules the recovery turn."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="persisted-attempt")
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:persisted-attempt",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+        adapter.handle_message = AsyncMock()
+
+        assert runner._schedule_resume_pending_sessions() == 1
+        await asyncio.sleep(0)
+        adapter.handle_message.assert_awaited_once()
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        assert json.loads(counts_file.read_text(encoding="utf-8")) == {
+            entry.session_key: 1
+        }
+
 
 @pytest.mark.asyncio
 async def test_auto_resume_sets_sentinel_before_task_execution():

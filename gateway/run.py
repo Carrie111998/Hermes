@@ -11413,7 +11413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-    def _record_startup_resume_attempt(self, session_key: str) -> None:
+    def _record_startup_resume_attempt(self, session_key: str) -> bool:
         """Persist one synthetic startup-resume attempt for ``session_key``.
 
         Unlike the shutdown counter, this runs before dispatch and therefore
@@ -11426,24 +11426,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         path = _hermes_home / self._STUCK_LOOP_FILE
         try:
             counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(counts, dict):
+                raise ValueError("restart failure ledger must be a JSON object")
         except Exception:
-            counts = {}
+            logger.warning(
+                "Refusing startup auto-resume for %s: restart failure ledger "
+                "could not be read",
+                session_key,
+                exc_info=True,
+            )
+            return False
 
         previous = counts.get(session_key, 0)
         if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
-            previous = 0
+            logger.warning(
+                "Refusing startup auto-resume for %s: restart failure count "
+                "is invalid",
+                session_key,
+            )
+            return False
         counts[session_key] = previous + 1
         try:
             atomic_json_write(path, counts, indent=None)
             self.__dict__.setdefault("_startup_resume_attempt_keys", set()).add(
                 session_key
             )
+            return True
         except Exception:
-            logger.debug(
-                "Failed to persist startup auto-resume attempt for %s",
+            logger.warning(
+                "Refusing startup auto-resume for %s: attempt could not be persisted",
                 session_key,
                 exc_info=True,
             )
+            return False
 
     def _suspend_stuck_loop_sessions(self) -> int:
         """Suspend sessions that have been active across too many restarts.
@@ -12504,7 +12519,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # every shutdown/finally path from running, so shutdown-only
             # accounting cannot bound this retry class. Successful completion
             # clears this same counter in _handle_message_with_agent.
-            self._record_startup_resume_attempt(entry.session_key)
+            if not self._record_startup_resume_attempt(entry.session_key):
+                continue
 
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
