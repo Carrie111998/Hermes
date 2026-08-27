@@ -184,7 +184,7 @@ class TestFabricatedToolUseRecovery:
         _landed_real_tool_call_this_turn guard)."""
         from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
 
-        loop_agent.valid_tool_names = {"web_search"}
+        loop_agent.valid_tool_names.add("web_search")
 
         tool_turn = _mock_response(
             content="",
@@ -218,7 +218,7 @@ class TestFabricatedToolUseRecovery:
         disable this check for every later, unrelated turn."""
         from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
 
-        loop_agent.valid_tool_names = {"web_search"}
+        loop_agent.valid_tool_names.add("web_search")
 
         # First turn: a real tool call lands and completes cleanly.
         first_turn_tool_call = _mock_response(
@@ -278,6 +278,34 @@ class TestFabricatedToolUseRecovery:
             "Consecutive fabrications must be bounded (no infinite loop)."
         )
         assert result is not None
+
+    def test_tool_calls_finish_reason_does_not_compound_both_budgets(self, loop_agent):
+        """A finish_reason=tool_calls stall whose narration ALSO happens to
+        match the fabrication pattern must be bounded by the dropped-toolcall
+        check's own budget (3) alone -- not get 3 MORE retries from the
+        fabrication check once that budget is exhausted."""
+        from tests.run_agent.test_run_agent import _mock_response
+
+        # Text that is BOTH a dropped-toolcall stall (finish_reason=tool_calls,
+        # empty tool_calls) AND matches the fabrication pattern.
+        overlapping_stall = _mock_response(
+            content=RAW_JSON_LEAK_TEXT, finish_reason="tool_calls", tool_calls=None,
+        )
+        loop_agent.client.chat.completions.create.side_effect = [
+            overlapping_stall for _ in range(9)
+        ] + [_mock_response(content="done", finish_reason="stop")]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            loop_agent.run_conversation("what's the price of gold")
+
+        assert loop_agent.client.chat.completions.create.call_count <= 4, (
+            "The dropped-toolcall and fabrication budgets must not compound: "
+            "an overlap case is bounded by 3 total consecutive retries, not 6."
+        )
 
     def test_nudge_pair_is_ephemeral_scaffolding(self, loop_agent):
         """The re-prompt pair must be flagged as ephemeral scaffolding so

@@ -8270,20 +8270,26 @@ def run_conversation(
                     continue
 
                 # ── Fabricated tool-use recovery (any provider, any tool) ──
-                # A completed turn (any finish_reason, including "stop") whose
-                # text either leaks a raw tool-call JSON fragment or
-                # affirmatively claims a completed tool action with a result,
-                # while tool_calls came back empty. Unlike the dropped-toolcall
-                # guard above, this does NOT gate on finish_reason=="tool_calls"
-                # — that guard's own comment notes "finish_reason='stop' text
-                # finishes never enter this guard," which is exactly the gap
-                # this closes. Guarded by _landed_real_tool_call_this_turn so a
-                # genuine post-tool-call summary (whose text may legitimately
+                # A completed turn (any finish_reason other than "tool_calls",
+                # including "stop") whose text either leaks a raw tool-call
+                # JSON fragment or affirmatively claims a completed tool
+                # action with a result, while tool_calls came back empty.
+                # Unlike the dropped-toolcall guard above, this does NOT gate
+                # on finish_reason=="tool_calls" being PRESENT — that guard's
+                # own comment notes "finish_reason='stop' text finishes never
+                # enter this guard," which is exactly the gap this closes.
+                # Excludes finish_reason=="tool_calls" deliberately: that's
+                # the dropped-toolcall check's own territory above, and
+                # letting both checks apply to the same overlap case would
+                # silently double the effective retry budget to 6 instead of
+                # the stated 3. Guarded by _landed_real_tool_call_this_turn so
+                # a genuine post-tool-call summary (whose text may legitimately
                 # say things like "the search returned...") is never mistaken
                 # for a fabrication. See
                 # docs/rfcs/2026-08-fabricated-tool-use-detection.md.
                 elif (
-                    not assistant_message.tool_calls
+                    finish_reason != "tool_calls"
+                    and not assistant_message.tool_calls
                     and not getattr(agent, "_landed_real_tool_call_this_turn", False)
                     and _looks_like_fabricated_tool_use(final_response)
                     and getattr(agent, "_fabricated_tool_use_retries", 0) < 3
