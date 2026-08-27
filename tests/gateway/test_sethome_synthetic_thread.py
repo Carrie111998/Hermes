@@ -1,4 +1,4 @@
-"""/sethome must not persist Slack's synthetic per-message session thread.
+"""/sethome must not persist synthetic per-message session threads.
 
 Live repro (relay-fronted Slack staging, 2026-08-13): /sethome run as a
 top-level DM message captured source.thread_id — which the relay adapter had
@@ -7,8 +7,9 @@ persisted HomeChannel. Every bare-platform delivery (deliver="slack") then
 resolved home chat + home thread and landed inside the ephemeral thread
 spawned around the old /sethome message.
 
-Same contract as cron origin capture: a Slack thread id equal to the
-message's own id is a synthetic session key, never a durable location.
+Same contract as cron origin capture: on platforms with per-message session
+keying, a thread id equal to the message's own id is a synthetic session key,
+never a durable location.
 """
 
 from types import SimpleNamespace
@@ -34,6 +35,24 @@ class TestHomeThreadFromSource:
         src = _source(thread_id="1755040000.000100", message_id="1755043010.123456")
         assert _home_thread_from_source(src) == "1755040000.000100"
 
+    def test_synthetic_matrix_thread_dropped(self):
+        """Matrix auto-thread roots equal to the event id are not durable."""
+        src = _source(
+            platform=Platform.MATRIX,
+            thread_id="$sethome-event:example.org",
+            message_id="$sethome-event:example.org",
+        )
+        assert _home_thread_from_source(src) is None
+
+    def test_genuine_matrix_thread_kept(self):
+        """/sethome inside an existing Matrix thread keeps its root."""
+        src = _source(
+            platform=Platform.MATRIX,
+            thread_id="$thread-root:example.org",
+            message_id="$sethome-event:example.org",
+        )
+        assert _home_thread_from_source(src) == "$thread-root:example.org"
+
     def test_no_thread_returns_none(self):
         assert _home_thread_from_source(_source()) is None
 
@@ -42,7 +61,7 @@ class TestHomeThreadFromSource:
         src = _source(thread_id="1755040000.000100", message_id=None)
         assert _home_thread_from_source(src) == "1755040000.000100"
 
-    def test_non_slack_platform_untouched(self):
-        """Telegram forum topics legitimately reuse ids; rule is Slack-scoped."""
+    def test_other_platform_untouched(self):
+        """Telegram forum topics legitimately reuse ids; keep their thread."""
         src = _source(platform=Platform.TELEGRAM, thread_id="2203", message_id="2203")
         assert _home_thread_from_source(src) == "2203"
