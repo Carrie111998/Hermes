@@ -9211,6 +9211,7 @@ class _ChatStreamAccumulator:
         self._total_ceiling = total_ceiling
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
+        self.reasoning_details_acc: List[Any] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
         self.finish_reason = None
         self.usage = None
@@ -9249,6 +9250,10 @@ class _ChatStreamAccumulator:
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
+        from agent.chat_completion_helpers import coerce_stream_reasoning_details
+        details = coerce_stream_reasoning_details(delta)
+        if details:
+            self.reasoning_details_acc.extend(details)
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
@@ -9282,6 +9287,7 @@ class _ChatStreamAccumulator:
             content="".join(self.content_parts),
             tool_calls=tool_calls,
             reasoning="".join(self.reasoning_parts) or None,
+            reasoning_details=self.reasoning_details_acc or None,
         )
         choice = SimpleNamespace(
             index=0,

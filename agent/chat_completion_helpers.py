@@ -54,6 +54,37 @@ _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 
+
+def coerce_stream_reasoning_details(delta: Any) -> list[Any]:
+    """Normalize OpenRouter ``delta.reasoning_details`` from a stream chunk.
+
+    OpenAI SDK 2.24+ keeps unknown ChoiceDelta fields in ``model_extra``.
+    The stream assembler historically read only ``reasoning`` /
+    ``reasoning_content``, so a details-only OpenRouter turn looked empty
+    and conversation_loop empty-retried. Do not promote details to visible
+    content — only preserve the structured field.
+    """
+    rd = getattr(delta, "reasoning_details", None)
+    if rd is None:
+        extra = getattr(delta, "model_extra", None) or {}
+        if isinstance(extra, dict):
+            rd = extra.get("reasoning_details")
+    if not rd:
+        return []
+    items = rd if isinstance(rd, list) else [rd]
+    out: list[Any] = []
+    for item in items:
+        if hasattr(item, "model_dump"):
+            try:
+                item = item.model_dump()
+            except Exception:
+                pass
+        if isinstance(item, dict):
+            out.append(item)
+        elif item is not None:
+            out.append({"value": item})
+    return out
+
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
 # arm a short cooldown so the NEXT turn's restore_primary_runtime stays gated
@@ -3297,6 +3328,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 def _build_partial_stream_stub(
     role, full_content, full_reasoning, model_name, usage_obj, *,
     dropped_tool_names=None,
+    reasoning_details=None,
 ):
     """Build a partial-stream-stub response for mid-stream drop scenarios.
 
@@ -3311,6 +3343,7 @@ def _build_partial_stream_stub(
         content=full_content,
         tool_calls=None,
         reasoning_content=full_reasoning,
+        reasoning_details=reasoning_details or None,
     )
     mock_choice = SimpleNamespace(
         index=0,
@@ -3951,6 +3984,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         model_name = None
         role = "assistant"
         reasoning_parts: list = []
+        reasoning_details_acc: list = []
         usage_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -4197,6 +4231,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
+            details = coerce_stream_reasoning_details(delta)
+            if details:
+                reasoning_details_acc.extend(details)
+                _fire_first_delta()
+
             # Accumulate text content — fire callback only when no tool calls
             delta_content = getattr(delta, "content", None)
             if delta_content:
@@ -4420,6 +4459,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             finish_reason is None
             and not content_parts
             and not reasoning_parts
+            and not reasoning_details_acc
             and not tool_calls_acc
         ):
             raise EmptyStreamError(
@@ -4464,6 +4504,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
                 dropped_tool_names=_dropped_names or None,
+                reasoning_details=reasoning_details_acc or None,
             )
 
         # Text-only stream drop: the upstream closed the connection (or the
@@ -4485,6 +4526,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
+                reasoning_details=reasoning_details_acc or None,
             )
 
         effective_finish_reason = finish_reason or "stop"
@@ -4506,6 +4548,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             content=full_content,
             tool_calls=mock_tool_calls,
             reasoning_content=full_reasoning,
+            reasoning_details=reasoning_details_acc or None,
         )
         mock_choice = SimpleNamespace(
             index=0,
