@@ -1,6 +1,12 @@
+import type { SessionOwnerScope } from '@/store/session-request-router'
+
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
-import { singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
+import {
+  canonicalSessionResumeIdentity,
+  singleFlightSessionResume,
+  takeRecoveredRuntime
+} from './single-flight-resume'
 import type { GatewayRequest } from './utils'
 
 /**
@@ -46,8 +52,12 @@ export interface ResolveTargetSessionDeps {
   activeRuntimeId: null | string
   createSession: () => Promise<null | string>
   explicitRuntimeId?: null | string
+  explicitStoredSessionId?: null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
+  owner?: SessionOwnerScope
+  ownerProfile?: string
   requestGateway: GatewayRequest
+  resumeIdentity?: string
   routedStoredSessionId: null | string
   selectedStoredSessionId: null | string
 }
@@ -57,8 +67,12 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
     activeRuntimeId,
     createSession,
     explicitRuntimeId,
+    explicitStoredSessionId,
     getRuntimeIdForStoredSession,
+    owner,
+    ownerProfile,
     requestGateway,
+    resumeIdentity,
     routedStoredSessionId,
     selectedStoredSessionId
   } = deps
@@ -79,27 +93,36 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
       activeRuntimeId !== getRuntimeIdForStoredSession(routedStoredSessionId))
   )
 
+  const explicitStoredNeedsResume = Boolean(
+    explicitStoredSessionId &&
+    (!activeRuntimeId || activeRuntimeId !== getRuntimeIdForStoredSession(explicitStoredSessionId))
+  )
+
   // 2. Trust the live runtime unless the durable route disagrees with it.
-  if (activeRuntimeId && !routedNeedsResume) {
+  if (activeRuntimeId && !routedNeedsResume && !explicitStoredNeedsResume) {
     return activeRuntimeId
   }
 
   // 3. Rebind the durable conversation on its owning profile. The route wins
   //    over a stale selection; otherwise continue whatever is selected.
-  const storedTarget = routedNeedsResume ? routedStoredSessionId : (selectedStoredSessionId ?? routedStoredSessionId)
+  const storedTarget =
+    explicitStoredSessionId ??
+    (routedNeedsResume ? routedStoredSessionId : (selectedStoredSessionId ?? routedStoredSessionId))
 
   if (storedTarget) {
     try {
       // Reuse a runtime an aborted recovery already minted for this stored
       // session; otherwise resume once, shared across concurrent callers.
-      const cachedRuntimeId = takeRecoveredRuntime(storedTarget)
+      const coordinationKey = resumeIdentity ?? canonicalSessionResumeIdentity(storedTarget, owner)
+      const cachedRuntimeId = takeRecoveredRuntime(coordinationKey)
 
       if (cachedRuntimeId) {
         return cachedRuntimeId
       }
 
-      const resumed = await singleFlightSessionResume(storedTarget, async () => {
-        const profile = await resolveSessionProfile(storedTarget)
+      const resumed = await singleFlightSessionResume(coordinationKey, async () => {
+        const exactOwnerProfile = typeof owner === 'string' ? owner : owner?.profile
+        const profile = ownerProfile ?? exactOwnerProfile ?? (await resolveSessionProfile(storedTarget))
 
         return requestGateway<{ session_id?: string }>('session.resume', {
           session_id: storedTarget,

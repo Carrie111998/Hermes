@@ -15,7 +15,7 @@ import {
   readOnlyRuntimeIdFor,
   resumeWithStoredTranscriptFallback
 } from '@/store/read-only-transcript'
-import { knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
+import { $sessions, knownSessionOwner, ownerLookupSessionRows, resolveComposerSessionKey } from '@/store/session'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import {
   requestForSessionProfile,
@@ -31,7 +31,10 @@ import {
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
-import { singleFlightSessionResume } from '../../session/hooks/use-prompt-actions/single-flight-resume'
+import {
+  canonicalSessionResumeIdentity,
+  singleFlightSessionResume
+} from '../../session/hooks/use-prompt-actions/single-flight-resume'
 import { markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
 import {
   chatMessageArraysEquivalent,
@@ -130,15 +133,13 @@ export function useSessionTileDelegate({
       return owner
     }
 
-    const requestForStoredSession = async <T>(
-      storedSessionId: string,
-      method: string,
-      params: Record<string, unknown>,
-      timeoutMs?: number
-    ): Promise<T> => {
-      const owner = await ownerForStoredSession(storedSessionId)
+    const coordinationIdentity = (storedSessionId: string, owner: SessionOwnerScope): string => {
+      const lineageOwner =
+        typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
 
-      return requestForSessionProfile<T>(owner, requestGateway, method, params, timeoutMs)
+      const durableId = resolveComposerSessionKey(storedSessionId, $sessions.get(), lineageOwner) ?? storedSessionId
+
+      return canonicalSessionResumeIdentity(durableId, owner)
     }
 
     setSessionTileDelegate({
@@ -152,7 +153,16 @@ export function useSessionTileDelegate({
         await removeSession(storedSessionId, ownerRoute)
       },
       executeSlash: async (rawCommand, sessionId) => {
-        await executeSlashCommand(rawCommand, { sessionId })
+        const storedSessionId = storedSessionIdForRuntime(sessionId)
+        const owner = storedSessionId ? await ownerForStoredSession(storedSessionId) : undefined
+
+        await executeSlashCommand(rawCommand, {
+          ...(storedSessionId ? { storedSessionId } : {}),
+          ...(storedSessionId && owner
+            ? { composerStorageScope: coordinationIdentity(storedSessionId, owner) }
+            : {}),
+          sessionId
+        })
       },
       // Gateway reconnect (sleep/wake, backend respawn): every stored→runtime
       // binding recorded pre-reconnect points at a runtime id the respawned
@@ -195,10 +205,11 @@ export function useSessionTileDelegate({
         markSessionRecentlyInterrupted(runtimeId)
 
         const storedSessionId = storedSessionIdForRuntime(runtimeId)
+        const owner = storedSessionId ? await ownerForStoredSession(storedSessionId) : undefined
 
         const routedRequest = storedSessionId
           ? <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) =>
-              requestForStoredSession<T>(storedSessionId, method, params ?? {}, timeoutMs)
+              requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs)
           : requestGateway
 
         await withSessionNotFoundResume(
@@ -206,6 +217,7 @@ export function useSessionTileDelegate({
           storedSessionId,
           liveId => routedRequest('session.interrupt', { session_id: liveId }),
           {
+            recoveryKey: storedSessionId ? coordinationIdentity(storedSessionId, owner) : undefined,
             requestGateway: routedRequest,
             onRecovered: recoveredId => {
               markSessionRecentlyInterrupted(recoveredId)
@@ -222,11 +234,7 @@ export function useSessionTileDelegate({
         const refreshTranscript = options?.refreshTranscript === true
 
         const capturedOwnerIdentity = capturedOwnerRoute
-          ? ownerQualifiedSessionIdentity(
-              capturedOwnerRoute.connectionId,
-              capturedOwnerRoute.profile,
-              storedSessionId
-            )
+          ? coordinationIdentity(storedSessionId, capturedOwnerRoute)
           : null
 
         // Warm path: reuse a live binding — but only when it still carries a
@@ -259,10 +267,7 @@ export function useSessionTileDelegate({
         // the same cross-profile bleed the recovery resumes had (#67603).
         const owner = capturedOwnerRoute ?? (await ownerForStoredSession(storedSessionId))
 
-        const ownerIdentity =
-          owner && typeof owner === 'object'
-            ? ownerQualifiedSessionIdentity(owner.connectionId, owner.profile, storedSessionId)
-            : ownerQualifiedSessionIdentity('local', owner, storedSessionId)
+        const ownerIdentity = coordinationIdentity(storedSessionId, owner)
 
         const restScope =
           owner && typeof owner === 'object'
@@ -390,17 +395,22 @@ export function useSessionTileDelegate({
         }
 
         const storedSessionId = storedSessionIdForRuntime(runtimeId)
+        const owner = storedSessionId ? await ownerForStoredSession(storedSessionId) : undefined
 
         const routedRequest = storedSessionId
           ? <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) =>
-              requestForStoredSession<T>(storedSessionId, method, params ?? {}, timeoutMs)
+              requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs)
           : requestGateway
 
         await withSessionNotFoundResume(
           runtimeId,
           storedSessionId,
           liveId => routedRequest('prompt.submit', { session_id: liveId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS),
-          { requestGateway: routedRequest, onRecovered: rebindTileRuntime(runtimeId) }
+          {
+            recoveryKey: storedSessionId ? coordinationIdentity(storedSessionId, owner) : undefined,
+            requestGateway: routedRequest,
+            onRecovered: rebindTileRuntime(runtimeId)
+          }
         )
       },
       updateSession: (runtimeId, updater) => updateSessionState(runtimeId, updater)

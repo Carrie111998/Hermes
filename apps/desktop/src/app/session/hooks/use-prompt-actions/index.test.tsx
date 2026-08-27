@@ -8,7 +8,7 @@ import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { $queuedPromptsBySession, enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
 import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
@@ -1523,6 +1523,56 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     $queuedPromptsBySession.set({})
   })
 
+  it('queues a busy slash kickoff on the mounted canonical owner scope when duplicate ids exist', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const sharedStoredId = 'stored-shared'
+    const ownerAQueueKey = encodeComposerStorageScopeKey(ownerA, sharedStoredId)
+    const ownerBQueueKey = encodeComposerStorageScopeKey(ownerB, sharedStoredId)
+    const runtimeId = 'rt-owner-b'
+
+    setSessions([
+      sessionInfo({ connection_id: ownerA.connectionId, id: sharedStoredId, profile: ownerA.profile }),
+      sessionInfo({ connection_id: ownerB.connectionId, id: sharedStoredId, profile: ownerB.profile })
+    ])
+    publishSessionState(runtimeId, {
+      ...createClientSessionState(sharedStoredId),
+      busy: true
+    })
+
+    const dispatch = async (method: string) =>
+      (method === 'slash.exec'
+        ? { type: 'skill', name: 'work', message: 'expanded owner B skill body', display: '/work fix owner B' }
+        : {}) as never
+
+    const ambientRequest = vi.fn(dispatch)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => dispatch(method))
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="foreground-runtime"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        storedSessionId="foreground-stored"
+      />
+    )
+
+    await handle!.submitText('/work fix owner B', {
+      composerStorageScope: ownerBQueueKey,
+      sessionId: runtimeId,
+      storedSessionId: sharedStoredId
+    })
+
+    expect(getQueuedPrompts(ownerBQueueKey).map(entry => entry.text)).toEqual(['expanded owner B skill body'])
+    expect(getQueuedPrompts(ownerAQueueKey)).toEqual([])
+    expect(getQueuedPrompts(sharedStoredId)).toEqual([])
+
+    dropSessionState(runtimeId)
+    $queuedPromptsBySession.set({})
+  })
+
   it('gates the busy queue on the TARGET session, not the foreground busy flag', async () => {
     // `busyRef` is the FOREGROUND view's busy flag; a slash command runs against
     // the session `resolveTargetSessionId` picked, which is frequently not the
@@ -1980,6 +2030,104 @@ describe('usePromptActions submit / queue drain semantics', () => {
       { session_id: 'runtime-remote', text: 'continue remotely' },
       1_800_000
     )
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('fails closed instead of consuming a queued slash when its runtime belongs to the duplicate owner', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const sharedStoredId = 'stored-shared'
+    const ownerBQueueKey = encodeComposerStorageScopeKey(ownerB, sharedStoredId)
+    const queued = { attachments: [], text: '/work stay on owner B' }
+
+    setSessions([
+      sessionInfo({ connection_id: ownerA.connectionId, id: sharedStoredId, profile: ownerA.profile }),
+      sessionInfo({ connection_id: ownerB.connectionId, id: sharedStoredId, profile: ownerB.profile })
+    ])
+    enqueueQueuedPrompt(ownerBQueueKey, queued)
+    publishSessionState('rt-owner-a', createClientSessionState(sharedStoredId))
+    publishSessionState('rt-owner-b', createClientSessionState(sharedStoredId))
+
+    const ambientRequest = vi.fn(async () => ({ type: 'exec', output: 'wrong owner executed' }) as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({ type: 'exec', output: 'wrong owner executed' } as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        getRuntimeIdForStoredSession={() => 'rt-owner-b'}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        storedSessionId={null}
+      />
+    )
+
+    const accepted = await handle!.submitText(queued.text, {
+      composerStorageScope: ownerBQueueKey,
+      fromQueue: true,
+      sessionId: 'rt-owner-a',
+      storedSessionId: sharedStoredId
+    })
+
+    expect(accepted).toBe(false)
+    expect(ambientRequest).not.toHaveBeenCalled()
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(ownerBQueueKey).map(entry => entry.text)).toEqual([queued.text])
+
+    dropSessionState('rt-owner-a')
+    dropSessionState('rt-owner-b')
+  })
+
+  it('resumes and executes a background queued slash on its canonical duplicate owner', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const sharedStoredId = 'stored-shared'
+    const ownerBQueueKey = encodeComposerStorageScopeKey(ownerB, sharedStoredId)
+
+    setSessions([
+      sessionInfo({ connection_id: ownerA.connectionId, id: sharedStoredId, profile: ownerA.profile }),
+      sessionInfo({ connection_id: ownerB.connectionId, id: sharedStoredId, profile: ownerB.profile })
+    ])
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'session.resume') {
+        return { session_id: 'rt-owner-b' } as never
+      }
+
+      return { type: 'exec', output: 'owner B command executed' } as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="rt-owner-a"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        storedSessionId={null}
+      />
+    )
+
+    await expect(
+      handle!.submitText('/audit-only', {
+        composerStorageScope: ownerBQueueKey,
+        fromQueue: true,
+        sessionId: null,
+        storedSessionId: sharedStoredId
+      })
+    ).resolves.toBe(true)
+
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(1, ownerB.connectionId, ownerB.profile, 'session.resume', {
+      profile: ownerB.profile,
+      session_id: sharedStoredId,
+      source: 'desktop'
+    })
+    expect(requestGatewayForAgent).toHaveBeenNthCalledWith(2, ownerB.connectionId, ownerB.profile, 'slash.exec', {
+      command: 'audit-only',
+      session_id: 'rt-owner-b'
+    })
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 

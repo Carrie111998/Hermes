@@ -2096,6 +2096,76 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
+  it('keeps concurrent duplicate-id resumes independent for two captured owners', async () => {
+    const ownerA: SessionProfileRoute = { connectionId: 'source-a', mode: 'remote', profile: 'worker' }
+    const ownerB: SessionProfileRoute = { connectionId: 'source-b', mode: 'remote', profile: 'worker' }
+    const resumeAResult = deferred<SessionResumeResponse>()
+    const resumeBResult = deferred<SessionResumeResponse>()
+
+    setSessions([
+      storedSession({ connection_id: ownerA.connectionId, id: 'stored-shared', profile: ownerA.profile }),
+      storedSession({ connection_id: ownerB.connectionId, id: 'stored-shared', profile: ownerB.profile })
+    ])
+    vi.mocked(getSession).mockImplementation(async (_id, scope) =>
+      storedSession({
+        connection_id: scope && typeof scope === 'object' ? (scope.connectionId ?? undefined) : undefined,
+        id: 'stored-shared',
+        profile: 'worker'
+      })
+    )
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-shared' } as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (connectionId, _profile, method) => {
+      if (method !== 'session.resume') {
+        return {} as never
+      }
+
+      return (connectionId === ownerA.connectionId ? resumeAResult.promise : resumeBResult.promise) as never
+    })
+
+    let resumeA: ((id: string, replace?: boolean, owner?: SessionProfileRoute) => Promise<unknown>) | null = null
+    let resumeB: ((id: string, replace?: boolean, owner?: SessionProfileRoute) => Promise<unknown>) | null = null
+
+    render(
+      <>
+        <ResumeHarness
+          onReady={ready => (resumeA = ready)}
+          requestGateway={vi.fn(async () => ({}) as never)}
+        />
+        <ResumeHarness
+          onReady={ready => (resumeB = ready)}
+          requestGateway={vi.fn(async () => ({}) as never)}
+        />
+      </>
+    )
+    await waitFor(() => expect(resumeA && resumeB).toBeTruthy())
+
+    const pendingA = resumeA!('stored-shared', true, ownerA)
+    const pendingB = resumeB!('stored-shared', true, ownerB)
+
+    await waitFor(() =>
+      expect(vi.mocked(requestGatewayForAgent).mock.calls.filter(([, , method]) => method === 'session.resume')).toHaveLength(
+        2
+      )
+    )
+
+    resumeAResult.resolve({ info: {}, messages: [], resumed: 'stored-shared', session_id: 'rt-owner-a' } as never)
+    resumeBResult.resolve({ info: {}, messages: [], resumed: 'stored-shared', session_id: 'rt-owner-b' } as never)
+    await Promise.all([pendingA, pendingB])
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerA.connectionId,
+      ownerA.profile,
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-shared' })
+    )
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerB.connectionId,
+      ownerB.profile,
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-shared' })
+    )
+  })
+
   it('pins metadata, transcript, resume, activate, and usage to the captured connection', async () => {
     const ownerRoute: SessionProfileRoute = {
       connectionId: 'source-a',

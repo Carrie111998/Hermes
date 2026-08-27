@@ -19,6 +19,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
+import { decodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { applyGoalStatusText } from '@/store/goals'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
@@ -42,6 +43,7 @@ import {
   setSessions,
   setYoloActive
 } from '@/store/session'
+import { requestForSessionProfile } from '@/store/session-request-router'
 import { $sessionStates } from '@/store/session-states'
 import {
   applyWakeStartResult,
@@ -172,7 +174,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
     handoffSession,
     openMemoryGraph,
     refreshSessions,
-    requestGateway,
+    requestGateway: ambientRequestGateway,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
@@ -183,7 +185,51 @@ export function useSlashCommand(deps: SlashCommandDeps) {
   const compressInFlightRef = useRef(new Set<string>())
 
   return useCallback(
-    async (rawCommand: string, options?: { sessionId?: string; recordInput?: boolean }) => {
+    async (
+      rawCommand: string,
+      options?: Pick<
+        SubmitTextOptions,
+        'composerStorageScope' | 'fromQueue' | 'sessionId' | 'storedSessionId'
+      > & {
+        recordInput?: boolean
+      }
+    ) => {
+      const storageScope = options?.composerStorageScope
+        ? decodeComposerStorageScopeKey(options.composerStorageScope)
+        : null
+
+      // A queue scope is both the exact owner and the durable target. Fail
+      // closed before any RPC when untrusted drain metadata disagrees, so the
+      // caller retains the queued entry instead of consuming it on another
+      // connection's same-named session.
+      if (
+        options?.composerStorageScope &&
+        (!storageScope ||
+          storageScope.format !== 'canonical' ||
+          storageScope.storedSessionId !== (options.storedSessionId ?? null))
+      ) {
+        return false
+      }
+
+      if (
+        options?.fromQueue &&
+        options.sessionId &&
+        options.storedSessionId &&
+        getRuntimeIdForStoredSession(options.storedSessionId) !== options.sessionId
+      ) {
+        return false
+      }
+
+      const requestGateway: GatewayRequest =
+        storageScope?.format === 'canonical'
+          ? (method, params = {}, timeoutMs) =>
+              requestForSessionProfile(storageScope.owner, ambientRequestGateway, method, params, timeoutMs)
+          : ambientRequestGateway
+
+      // Direct composer dispatches preserve the historical "handled" contract;
+      // queue drains require positive proof below before they may consume.
+      let commandExecuted = !options?.fromQueue
+
       // Resolve the session this command targets through the SHARED ladder that
       // submit.ts uses. A slash command runs backend commands against a runtime
       // session, and per-session state (`/goal`, `/usage`, `/status`) is keyed by
@@ -198,8 +244,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           activeRuntimeId: activeSessionIdRef.current,
           createSession: () => createBackendSessionForSend(preview),
           explicitRuntimeId: sessionHint,
+          explicitStoredSessionId: options?.storedSessionId,
           getRuntimeIdForStoredSession,
+          owner: storageScope?.format === 'canonical' ? storageScope.owner : undefined,
+          ownerProfile: storageScope?.format === 'canonical' ? storageScope.owner.profile : undefined,
           requestGateway,
+          resumeIdentity: storageScope?.format === 'canonical' ? options?.composerStorageScope : undefined,
           routedStoredSessionId: getRoutedStoredSessionId(),
           selectedStoredSessionId: selectedStoredSessionIdRef.current
         })
@@ -230,7 +280,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         // to updateSessionState re-keyed the tile's cache entry onto the
         // primary's stored session. Fall back to the selection only for a
         // session with no published state yet (a draft this call just created).
-        const storedSessionId = $sessionStates.get()[sessionId]?.storedSessionId ?? selectedStoredSessionIdRef.current
+        const storedSessionId =
+          options?.storedSessionId ??
+          $sessionStates.get()[sessionId]?.storedSessionId ??
+          selectedStoredSessionIdRef.current
 
         // Header carries the command token only. The full invocation would
         // duplicate long args — `/goal <prose>` echoed the whole goal in the
@@ -353,7 +406,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // rather than re-reading the globals here — a session switch between
             // dispatch and this branch would otherwise queue the kickoff on
             // whichever chat is now in front.
-            const queueKey = resolveComposerSessionKey(storedSessionId, $sessions.get()) || storedSessionId || sessionId
+            const queueKey =
+              options?.composerStorageScope ||
+              resolveComposerSessionKey(storedSessionId, $sessions.get()) ||
+              storedSessionId ||
+              sessionId
 
             if (enqueueQueuedPrompt(queueKey, { attachments: [], text: message, displayText })) {
               renderSlashOutput('session busy — message queued to send when the current turn finishes')
@@ -372,7 +429,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // its kickoff as a user message into whatever conversation was on
           // screen. Every other target the dispatcher serves (tile, background
           // queue drain, a session created by this very call) had the same leak.
-          await submitPromptText(message, { sessionId, storedSessionId, displayText })
+          await submitPromptText(message, {
+            composerStorageScope: options?.composerStorageScope,
+            sessionId,
+            storedSessionId,
+            displayText
+          })
         }
 
         try {
@@ -380,6 +442,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             session_id: sessionId,
             command: command.replace(/^\/+/, '')
           })
+
+          commandExecuted = true
 
           const dispatch = parseCommandDispatch(result)
 
@@ -421,6 +485,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
+          commandExecuted = true
           await handleDispatch(dispatch)
         } catch (err) {
           // "not a quick/plugin/skill command" just means the fallback had
@@ -469,6 +534,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // requestGateway layer keeps (30s) is too tight for RPCs that do
           // real work.
           const result = await requestGateway<unknown>(surface.rpc, params, surface.timeoutMs)
+          commandExecuted = true
           const body = renderRpcResult(result, ctx.name)
 
           renderSlashOutput(body || `/${ctx.name}: no output`)
@@ -556,6 +622,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
                   SESSION_COMPRESS_TIMEOUT_MS
                 ),
               {
+                recoveryKey: storageScope?.format === 'canonical' ? options?.composerStorageScope : undefined,
                 requestGateway,
                 onRecovered: recoveredId => {
                   // Move the in-flight claim onto the live id so the coalesce
@@ -1089,6 +1156,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
         switch (surface?.kind) {
           case 'unavailable': {
+            commandExecuted = true
             const resolved = await withSlashOutput(ctx)
             resolved?.render(desktopSlashUnavailableMessage(name) || `/${name} is not available in the desktop app.`)
 
@@ -1096,9 +1164,13 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           case 'picker':
+            commandExecuted = true
+
             return openPicker(surface.picker, ctx)
 
           case 'action':
+            commandExecuted = true
+
             return actionHandlers[surface.action](ctx)
 
           case 'rpc':
@@ -1110,7 +1182,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
       }
 
-      await runSlash(rawCommand, options?.sessionId, options?.recordInput ?? true)
+      await runSlash(rawCommand, options?.sessionId ?? undefined, options?.recordInput ?? true)
+
+      return commandExecuted
     },
     [
       activeSessionIdRef,
@@ -1125,7 +1199,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       handoffSession,
       openMemoryGraph,
       refreshSessions,
-      requestGateway,
+      ambientRequestGateway,
       resumeStoredSession,
       selectedStoredSessionIdRef,
       startFreshSessionDraft,

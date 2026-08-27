@@ -2,9 +2,18 @@ import { renderHook } from '@testing-library/react'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { MAIN_COMPOSER_SCOPE } from './composer/scope'
+import { createComposerAttachmentScope } from '@/store/composer'
+import { requestGatewayForAgent } from '@/store/gateway'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
+
+import { type ComposerScope, MAIN_COMPOSER_SCOPE } from './composer/scope'
 
 const requestGatewayMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@/store/gateway', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  requestGatewayForAgent: vi.fn()
+}))
 
 const { $activeSessionId, $sessions, setSessions } = await import('@/store/session')
 const { $sessionTiles, setSessionTileDelegate } = await import('@/store/session-states')
@@ -14,14 +23,25 @@ const RUNTIME_SESSION_ID = 'rt-tile-current'
 const STORED_SESSION_ID = 'stored-tile-db'
 const RECOVERED_SESSION_ID = 'rt-tile-recovered'
 
-function renderTileActions() {
+function renderTileActions({
+  ownerRoute,
+  runtimeId = RUNTIME_SESSION_ID,
+  scope = MAIN_COMPOSER_SCOPE,
+  storedSessionId = STORED_SESSION_ID
+}: {
+  ownerRoute?: SessionOwnerRoute
+  runtimeId?: string
+  scope?: ComposerScope
+  storedSessionId?: string
+} = {}) {
   return renderHook(() =>
     useSessionTileActions({
+      ownerRoute,
       requestGateway: requestGatewayMock,
-      runtimeId: RUNTIME_SESSION_ID,
-      scope: MAIN_COMPOSER_SCOPE,
-      storedSessionId: STORED_SESSION_ID
-    })
+      runtimeId,
+      scope,
+      storedSessionId
+    } as never)
   )
 }
 
@@ -204,5 +224,104 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
     expect($activeSessionId.get()).toBe('foreground-runtime')
+  })
+
+  it('keeps duplicate-owner interrupt and attachment recoveries in separate canonical flights', async () => {
+    const ownerA: SessionOwnerRoute = { connectionId: 'source-a', mode: 'remote', profile: 'worker' }
+    const ownerB: SessionOwnerRoute = { connectionId: 'source-b', mode: 'remote', profile: 'worker' }
+    let releaseOwnerA!: () => void
+
+    const ownerAResumeGate = new Promise<void>(resolve => {
+      releaseOwnerA = resolve
+    })
+
+    setSessions([
+      { connection_id: ownerA.connectionId, id: STORED_SESSION_ID, profile: ownerA.profile } as never,
+      { connection_id: ownerB.connectionId, id: STORED_SESSION_ID, profile: ownerB.profile } as never
+    ])
+    $sessionTiles.set([
+      { ownerRoute: ownerA, runtimeId: 'rt-dead-a', storedSessionId: STORED_SESSION_ID },
+      { ownerRoute: ownerB, runtimeId: 'rt-dead-b', storedSessionId: STORED_SESSION_ID }
+    ])
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (connectionId, _profile, method, params) => {
+      if (method === 'session.interrupt' && params?.session_id === 'rt-dead-a') {
+        throw new Error('session not found')
+      }
+
+      if (method === 'image.attach_bytes' && params?.session_id === 'rt-dead-b') {
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        if (connectionId === ownerA.connectionId) {
+          await ownerAResumeGate
+
+          return { session_id: 'rt-owner-a' } as never
+        }
+
+        return { session_id: 'rt-owner-b' } as never
+      }
+
+      if (method === 'image.attach_bytes') {
+        return { attached: true, path: '/remote/photo.png' } as never
+      }
+
+      return {} as never
+    })
+
+    const scopeB: ComposerScope = {
+      ...MAIN_COMPOSER_SCOPE,
+      attachments: createComposerAttachmentScope(),
+      target: `tile:${STORED_SESSION_ID}:owner-b`
+    }
+
+    scopeB.attachments.add({
+      id: 'image:owner-b',
+      kind: 'image',
+      label: 'photo.png',
+      path: '/client/photo.png',
+      previewUrl: 'data:image/png;base64,aGVsbG8='
+    })
+
+    const ownerAHook = renderTileActions({ ownerRoute: ownerA, runtimeId: 'rt-dead-a' })
+    const ownerBHook = renderTileActions({ ownerRoute: ownerB, runtimeId: 'rt-dead-b', scope: scopeB })
+
+    let cancelA!: Promise<void>
+    act(() => {
+      cancelA = ownerAHook.result.current.cancelRun()
+    })
+
+    await vi.waitFor(() =>
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(
+        ownerA.connectionId,
+        ownerA.profile,
+        'session.resume',
+        expect.objectContaining({ session_id: STORED_SESSION_ID })
+      )
+    )
+
+    let submitB!: Promise<boolean>
+    act(() => {
+      submitB = ownerBHook.result.current.submitText('inspect owner B image')
+    })
+
+    await Promise.resolve()
+    releaseOwnerA()
+    await act(async () => {
+      await Promise.all([cancelA, submitB])
+    })
+
+    const resumeCalls = vi.mocked(requestGatewayForAgent).mock.calls.filter(([, , method]) => method === 'session.resume')
+    expect(resumeCalls).toHaveLength(2)
+    expect(resumeCalls.map(([connectionId]) => connectionId)).toEqual(
+      expect.arrayContaining([ownerA.connectionId, ownerB.connectionId])
+    )
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerB.connectionId,
+      ownerB.profile,
+      'image.attach_bytes',
+      expect.objectContaining({ session_id: 'rt-owner-b' })
+    )
   })
 })

@@ -16,6 +16,22 @@
  * `session_id`); joiners receive whatever the winning call returns.
  */
 
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
+import type { SessionOwnerScope } from '@/store/session-request-router'
+
+/** Canonical renderer-only coordination identity for one durable exact owner.
+ * Backend RPC payloads must continue to use the raw stored session id. */
+export function canonicalSessionResumeIdentity(storedSessionId: string, owner?: SessionOwnerScope): string {
+  if (!owner) {
+    return storedSessionId
+  }
+
+  return encodeComposerStorageScopeKey(
+    typeof owner === 'string' ? { connectionId: 'local', profile: owner } : owner,
+    storedSessionId
+  )
+}
+
 const _inFlightResumeByIdentity = new Map<string, Promise<unknown>>()
 
 export function singleFlightSessionResume<T>(resumeIdentity: string, run: () => Promise<T>): Promise<T> {

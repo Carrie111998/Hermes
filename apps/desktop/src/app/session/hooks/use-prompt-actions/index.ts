@@ -31,15 +31,19 @@ import {
   $connection,
   $currentCwd,
   $messages,
+  $primarySessionOwnerIntent,
+  $sessions,
   $terminalBackend,
   getSessionOwnerHint,
+  resolveComposerSessionKey,
+  sessionMatchesStoredId,
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
-import type { SessionOwnerRoute } from '@/store/session-request-router'
+import { requestForSessionProfile, type SessionOwnerRoute, type SessionOwnerScope } from '@/store/session-request-router'
 import { $sessionStates, isSessionRemote } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
@@ -69,6 +73,7 @@ import {
   runRewindSubmit,
   type SurvivorUserRowIds
 } from './rewind'
+import { canonicalSessionResumeIdentity } from './single-flight-resume'
 import { useSlashCommand } from './slash'
 import { useSubmitPrompt } from './submit'
 import {
@@ -514,6 +519,49 @@ export function usePromptActions({
     }
   }, [activeSessionId, composerAttachments, eagerlyUploadAttachment])
 
+  const ownerForStoredSession = useCallback((storedSessionId: string): SessionOwnerScope => {
+    const intent = $primarySessionOwnerIntent.get()
+
+    if (intent?.storedSessionId === storedSessionId) {
+      return intent.ownerRoute
+    }
+
+    const hint = getSessionOwnerHint(storedSessionId)
+
+    if (hint) {
+      return hint
+    }
+
+    const candidates = $sessions.get().filter(session => sessionMatchesStoredId(session, storedSessionId))
+
+    if (candidates.length !== 1) {
+      return undefined
+    }
+
+    const row = candidates[0]!
+    const connectionId = row.connection_id?.trim()
+    const profile = row.profile?.trim() || 'default'
+
+    // A bare profile is not an exact owner when two registry sources can expose
+    // the same name. Preserve the ambient legacy path unless the row/hint/intent
+    // proves a concrete connection.
+    return connectionId ? { connectionId, profile } : undefined
+  }, [])
+
+  const recoveryKeyForStoredSession = useCallback(
+    (storedSessionId: string): string => {
+      const owner = ownerForStoredSession(storedSessionId)
+
+      const lineageOwner =
+        typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+
+      const durableId = resolveComposerSessionKey(storedSessionId, $sessions.get(), lineageOwner) ?? storedSessionId
+
+      return canonicalSessionResumeIdentity(durableId, owner)
+    },
+    [ownerForStoredSession]
+  )
+
   // Session resume can be routed through a registry connection while the
   // render-time requestGateway still points at the local default socket. Keep
   // every follow-up session RPC on the same composite owner; otherwise resume
@@ -522,20 +570,23 @@ export function usePromptActions({
   const requestForPromptSession = useCallback<GatewayRequest>(
     (method, params = {}, timeoutMs) => {
       const storedSessionId = selectedStoredSessionIdRef.current
-      const owner = storedSessionId ? getSessionOwnerHint(storedSessionId) : undefined
+      const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
       const ambientConnection = $connection.get()
 
+      if (owner) {
+        return requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+      }
+
       const connectionId =
-        owner?.connectionId ||
-        (ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : '')
+        ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
 
       if (connectionId) {
-        return requestGatewayForAgent(connectionId, owner?.profile || 'default', method, params, timeoutMs)
+        return requestGatewayForAgent(connectionId, 'default', method, params, timeoutMs)
       }
 
       return timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
     },
-    [requestGateway, selectedStoredSessionIdRef]
+    [ownerForStoredSession, requestGateway, selectedStoredSessionIdRef]
   )
 
   const submitPromptText = useSubmitPrompt({
@@ -665,11 +716,15 @@ export function usePromptActions({
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
+
         // Forward the explicit target (background queue drain, tile) — dropping
         // it ran the command against whatever chat happened to be in front.
-        await executeSlashCommand(visibleText, options?.sessionId ? { sessionId: options.sessionId } : undefined)
-
-        return true
+        return await executeSlashCommand(visibleText, {
+          composerStorageScope: options?.composerStorageScope,
+          fromQueue: options?.fromQueue,
+          sessionId: options?.sessionId ?? undefined,
+          storedSessionId: options?.storedSessionId
+        })
       }
 
       return await submitPromptText(rawText, options)
@@ -764,12 +819,21 @@ export function usePromptActions({
     clearClarifyRequest(undefined, sessionId)
 
     try {
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
+
+      const targetRequest: GatewayRequest = owner
+        ? (method, params = {}, timeoutMs) =>
+            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+        : requestGateway
+
       await withSessionNotFoundResume(
         sessionId,
-        selectedStoredSessionIdRef.current,
-        liveId => requestGateway('session.interrupt', { session_id: liveId }),
+        storedSessionId,
+        liveId => targetRequest('session.interrupt', { session_id: liveId }),
         {
-          requestGateway,
+          recoveryKey: storedSessionId ? recoveryKeyForStoredSession(storedSessionId) : undefined,
+          requestGateway: targetRequest,
           onRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -781,7 +845,16 @@ export function usePromptActions({
       releaseBusy()
       notifyError(err, copy.stopFailed)
     }
-  }, [activeSessionIdRef, busyRef, copy.stopFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState])
+  }, [
+    activeSessionIdRef,
+    busyRef,
+    copy.stopFailed,
+    ownerForStoredSession,
+    recoveryKeyForStoredSession,
+    requestGateway,
+    selectedStoredSessionIdRef,
+    updateSessionState
+  ])
 
   // The desktop steering action is an immediate correction: the core cancels
   // model generation and rebuilds the live turn with displayed reasoning and
@@ -798,6 +871,14 @@ export function usePromptActions({
       if (!text || !sessionId) {
         return false
       }
+
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
+
+      const targetRequest: GatewayRequest = owner
+        ? (method, params = {}, timeoutMs) =>
+            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+        : requestGateway
 
       // Accepted whether the live turn was redirected in place or queued for
       // the next turn (the build window, before the agent is wired) — either
@@ -828,7 +909,7 @@ export function usePromptActions({
           })
 
         try {
-          const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
+          const result = await targetRequest<SessionRedirectResponse>('session.redirect', { session_id: id, text })
 
           if (result?.status === 'redirected') {
             triggerHaptic('submit')
@@ -858,8 +939,9 @@ export function usePromptActions({
         // A stale runtime id after reconnect 404s ("session not found"): the
         // shared resolver resumes the stored session and retries once, so a
         // correction right after a reconnect isn't lost to the race.
-        const { result } = await withSessionNotFoundResume(sessionId, selectedStoredSessionIdRef.current, send, {
-          requestGateway,
+        const { result } = await withSessionNotFoundResume(sessionId, storedSessionId, send, {
+          recoveryKey: storedSessionId ? recoveryKeyForStoredSession(storedSessionId) : undefined,
+          requestGateway: targetRequest,
           onRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -873,7 +955,15 @@ export function usePromptActions({
 
       return false
     },
-    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      appendSessionTextMessage,
+      ownerForStoredSession,
+      recoveryKeyForStoredSession,
+      requestGateway,
+      selectedStoredSessionIdRef,
+      updateSessionState
+    ]
   )
 
   // After a durable rewind the surviving bubbles' cached rowIds are stale (the
@@ -905,16 +995,25 @@ export function usePromptActions({
       truncateRowId?: number,
       sourceText?: string,
       rebindRowIds?: readonly number[]
-    ) =>
-      runRewindSubmit(
-        requestGateway,
+    ) => {
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
+
+      const targetRequest: GatewayRequest = owner
+        ? (method, params = {}, timeoutMs) =>
+            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+        : requestGateway
+
+      return runRewindSubmit(
+        targetRequest,
         sessionId,
         text,
         truncateOrdinal,
         truncateMessageId,
         interruptFirst,
         {
-          storedSessionId: selectedStoredSessionIdRef.current,
+          recoveryKey: storedSessionId ? recoveryKeyForStoredSession(storedSessionId) : undefined,
+          storedSessionId,
           onSessionRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -923,8 +1022,15 @@ export function usePromptActions({
         truncateRowId,
         sourceText,
         rebindRowIds
-      ),
-    [activeSessionIdRef, requestGateway, selectedStoredSessionIdRef]
+      )
+    },
+    [
+      activeSessionIdRef,
+      ownerForStoredSession,
+      recoveryKeyForStoredSession,
+      requestGateway,
+      selectedStoredSessionIdRef
+    ]
   )
 
   const reloadFromMessage = useCallback(

@@ -139,7 +139,10 @@ import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, Usag
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
-import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
+import {
+  canonicalSessionResumeIdentity,
+  singleFlightSessionResume
+} from '../use-prompt-actions/single-flight-resume'
 import type { CreatedBackendSessionForSend } from '../use-prompt-actions/utils'
 
 import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
@@ -961,6 +964,16 @@ export function useSessionActions({
             }
           : sessionProfile)
 
+      const coordinationOwner =
+        typeof sessionOwner === 'string'
+          ? { connectionId: 'local', profile: sessionOwner }
+          : sessionOwner
+
+      const resumeCoordinationStoredId =
+        resolveComposerSessionKey(storedSessionId, $sessions.get(), coordinationOwner) ?? storedSessionId
+
+      const resumeCoordinationKey = canonicalSessionResumeIdentity(resumeCoordinationStoredId, sessionOwner)
+
       // All-profiles / plugin navigation must not steal chrome API-home:
       // dial the owning backend without moving $activeGatewayProfile.
       if ($showAllProfiles.get()) {
@@ -1498,7 +1511,7 @@ export function useSessionActions({
         let resumeRuntimeBaselineMessages: ChatMessage[] = []
         const resumeStartedAt = Date.now() / 1000
 
-        const resumePromise = singleFlightSessionResume(storedSessionId, () =>
+        const resumePromise = singleFlightSessionResume(resumeCoordinationKey, () =>
           requestForSession<SessionResumeResponse>('session.resume', {
             session_id: storedSessionId,
             cols: 96,

@@ -22,9 +22,16 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $sessions, knownSessionOwner, ownerLookupSessionRows, sessionMatchesStoredId } from '@/store/session'
+import {
+  $sessions,
+  knownSessionOwner,
+  ownerLookupSessionRows,
+  resolveComposerSessionKey,
+  sessionMatchesStoredId
+} from '@/store/session'
 import {
   requestForSessionProfile,
+  type SessionOwnerRoute,
   type SessionOwnerScope,
   type SessionProfileRoute
 } from '@/store/session-request-router'
@@ -57,6 +64,7 @@ import {
   runRewindSubmit,
   type SurvivorUserRowIds
 } from '../session/hooks/use-prompt-actions/rewind'
+import { canonicalSessionResumeIdentity } from '../session/hooks/use-prompt-actions/single-flight-resume'
 import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
 import {
   markSessionRecentlyInterrupted,
@@ -117,13 +125,14 @@ export function listTileSessionRow(deps: {
 }
 
 interface SessionTileActionsArgs {
+  ownerRoute?: SessionOwnerRoute
   requestGateway: GatewayRequester
   runtimeId: string
   scope: ComposerScope
   storedSessionId: string
 }
 
-export function useSessionTileActions({ requestGateway, runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
+export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
   const { t } = useI18n()
   const copy = t.desktop
 
@@ -131,6 +140,8 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   runtimeIdRef.current = runtimeId
   const storedIdRef = useRef(storedSessionId)
   storedIdRef.current = storedSessionId
+  const ownerRouteRef = useRef(ownerRoute)
+  ownerRouteRef.current = ownerRoute
   // A tile IS its session (see the comment on the useSubmitPrompt call below)
   // A tile owns one stable stored/runtime pair, so seed the shared ownership
   // cache explicitly rather than relying on the primary route cache.
@@ -173,12 +184,31 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   const readState = useCallback(() => $sessionStates.get()[runtimeIdRef.current], [])
   const readMessages = useCallback(() => readState()?.messages ?? [], [readState])
 
+  const readOwner = useCallback(
+    (): SessionOwnerScope =>
+      ownerRouteRef.current ??
+      sessionTileOwnerRoute(storedIdRef.current) ??
+      knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current),
+    []
+  )
+
+  const recoveryKey = useCallback((): string => {
+    const owner = readOwner()
+
+    const lineageOwner =
+      typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+
+    const durableId =
+      resolveComposerSessionKey(storedIdRef.current, $sessions.get(), lineageOwner) ?? storedIdRef.current
+
+    return canonicalSessionResumeIdentity(durableId, owner)
+  }, [readOwner])
+
   // Tile session RPCs must follow the tile's composite owner even when the
   // active gateway has moved to a same-named profile on another source.
   const requestSessionGateway = useCallback(
     <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
-      const knownOwner: SessionOwnerScope =
-        sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
+      const knownOwner = readOwner()
 
       // A bare profile is the legacy/unknown tile shape. Preserve its ambient
       // behavior; only a composite route is strong enough to retarget a tile
@@ -187,7 +217,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       return requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs, signal)
     },
-    [requestGateway]
+    [readOwner, requestGateway]
   )
 
   // A ⌘T tab's session is unlisted until its first turn persists — seed the
@@ -213,7 +243,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: { recoveryKey?: string; updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const remote = isSessionRemote(storedIdRef.current ?? sessionId)
       let liveSessionId = sessionId
@@ -237,6 +267,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
           const next = await uploadComposerAttachment(attachment, {
             backendCwd: readState()?.cwd,
             remote,
+            recoveryKey: options.recoveryKey ?? recoveryKey(),
             requestGateway: requestSessionGateway,
             sessionId: liveSessionId,
             storedSessionId: storedIdRef.current,
@@ -270,7 +301,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       return { attachments: synced, sessionId: liveSessionId }
     },
-    [bindRecoveredRuntime, readState, requestSessionGateway, scope.attachments]
+    [bindRecoveredRuntime, readState, recoveryKey, requestSessionGateway, scope.attachments]
   )
 
   // The REAL submit pipeline with tile seams: session always exists, and the
@@ -354,6 +385,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         storedIdRef.current,
         liveId => requestSessionGateway('session.interrupt', { session_id: liveId }),
         {
+          recoveryKey: recoveryKey(),
           requestGateway: requestSessionGateway,
           onRecovered: bindRecoveredRuntime
         }
@@ -361,7 +393,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     } catch (err) {
       notifyError(err, copy.stopFailed)
     }
-  }, [bindRecoveredRuntime, copy.stopFailed, requestSessionGateway, update])
+  }, [bindRecoveredRuntime, copy.stopFailed, recoveryKey, requestSessionGateway, update])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
@@ -413,6 +445,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
           storedIdRef.current,
           liveId => requestSessionGateway<{ status?: string }>('session.redirect', { session_id: liveId, text }),
           {
+            recoveryKey: recoveryKey(),
             requestGateway: requestSessionGateway,
             onRecovered: bindRecoveredRuntime
           }
@@ -441,7 +474,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       return false
     },
-    [bindRecoveredRuntime, requestSessionGateway]
+    [bindRecoveredRuntime, recoveryKey, requestSessionGateway]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with
@@ -464,6 +497,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         truncateMessageId,
         interruptFirst,
         {
+          recoveryKey: recoveryKey(),
           storedSessionId: storedIdRef.current,
           onSessionRecovered: bindRecoveredRuntime
         },
@@ -471,7 +505,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         sourceText,
         rebindRowIds
       ),
-    [bindRecoveredRuntime, requestSessionGateway]
+    [bindRecoveredRuntime, recoveryKey, requestSessionGateway]
   )
 
   // After a durable rewind the surviving bubbles' cached rowIds are stale (the

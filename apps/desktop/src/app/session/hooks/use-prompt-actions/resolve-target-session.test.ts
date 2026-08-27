@@ -95,6 +95,41 @@ describe('resolveTargetSessionId', () => {
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
+  it('keeps concurrent duplicate-id resumes independent for two exact owners', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    let releaseA!: () => void
+
+    const gateA = new Promise<void>(resolve => {
+      releaseA = resolve
+    })
+
+    const requestA = vi.fn(async () => {
+      await gateA
+
+      return { session_id: 'rt-owner-a' }
+    })
+
+    const requestB = vi.fn(async () => ({ session_id: 'rt-owner-b' }))
+
+    const resolvingA = resolveTargetSessionId({
+      ...deps({ explicitStoredSessionId: STORED, requestGateway: requestA as never }),
+      owner: ownerA
+    } as never)
+
+    const resolvingB = resolveTargetSessionId({
+      ...deps({ explicitStoredSessionId: STORED, requestGateway: requestB as never }),
+      owner: ownerB
+    } as never)
+
+    await Promise.resolve()
+    releaseA()
+
+    await expect(Promise.all([resolvingA, resolvingB])).resolves.toEqual(['rt-owner-a', 'rt-owner-b'])
+    expect(requestA).toHaveBeenCalledOnce()
+    expect(requestB).toHaveBeenCalledOnce()
+  })
+
   it('creates a session only for a genuine new-chat draft', async () => {
     const createSession = vi.fn(async () => 'rt-brand-new')
 

@@ -203,7 +203,7 @@ function TileChat({
   // Tile actions must keep the persisted owner route. The ambient gateway hook
   // follows foreground focus and can point at another backend during restore or
   // reconnect, which turns a recoverable stale runtime into "session not found".
-  const actions = useSessionTileActions({ requestGateway: requestTileGateway, runtimeId, scope, storedSessionId })
+  const actions = useSessionTileActions({ ownerRoute, requestGateway: requestTileGateway, runtimeId, scope, storedSessionId })
 
   // The same attach/pick/paste/drop pipeline the primary composer uses,
   // pointed at this tile's chips + session.
