@@ -94,6 +94,7 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
 # resolved bin that is a python script escaping the running venv.
 def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
+    import os
     import sys
 
     root = _make_project(tmp_path)
@@ -107,8 +108,11 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    interpreter = os.path.abspath(sys.executable)
     assert exec_line.split(" ")[0].strip('"') == interpreter
+    # The prefix must stay INSIDE the venv: resolving the symlink would yield
+    # the uv base interpreter, which cannot import Hermes' dependencies.
+    assert Path(exec_line.split(" ")[0].strip('"')).is_absolute()
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
 
@@ -147,6 +151,78 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     # Console-script with the venv's own interpreter in the shebang: correct
     # as-is, prefixing would only add noise.
     assert exec_line == f"{hermes_bin} desktop"
+
+
+# Regression: on a uv-created venv, ``venv/bin/python`` is a SYMLINK into
+# ``~/.local/share/uv/python/cpython-<X.Y.Z>-.../bin/``. Resolving it wrote the
+# base interpreter into Exec=, which has no access to the venv's site-packages
+# -> the app died on ``import yaml`` with Terminal=false, so clicking the
+# launcher icon did nothing. It also pinned a patch version that vanished on
+# the next uv upgrade. Exec must keep the unresolved venv path.
+def test_exec_keeps_uv_venv_symlink_unresolved(tmp_path, xdg_home, monkeypatch):
+    import os
+
+    root = _make_project(tmp_path)
+
+    # Mimic uv's layout: a base interpreter + a venv whose python is a symlink.
+    base_bin = tmp_path / "uv" / "cpython-3.11.16" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python3.11"
+    base_python.write_text("", encoding="utf-8")
+    base_python.chmod(0o755)
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    try:
+        venv_python.symlink_to(base_python)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform")
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+
+    # A python script with an /usr/bin/env shebang forces the interpreter prefix.
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+    written = exec_line.split(" ")[0].strip('"')
+
+    assert written == os.path.abspath(str(venv_python))
+    # The version-pinned base interpreter must NOT appear: it breaks imports
+    # and disappears when uv upgrades the patch release.
+    assert str(base_python) not in exec_line
+    assert "cpython-3.11.16" not in exec_line
+
+
+# A venv console script whose shebang names the venv (unresolved) is
+# self-sufficient: _needs_interpreter must not demand a prefix just because
+# sys.executable resolves elsewhere.
+def test_venv_shebang_matches_unresolved_executable(tmp_path, monkeypatch):
+    base_bin = tmp_path / "uv" / "cpython-3.11.16" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python3.11"
+    base_python.write_text("", encoding="utf-8")
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    try:
+        venv_python.symlink_to(base_python)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform")
+
+    script = venv_bin / "hermes"
+    script.write_text(f"#!{venv_bin / 'python3'}\nimport hermes_cli\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    assert lde._needs_interpreter(script) is False
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):

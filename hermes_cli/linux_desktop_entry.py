@@ -78,12 +78,32 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            argv = [_launcher_python(), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [_launcher_python(), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _launcher_python() -> str:
+    """The interpreter to write into ``Exec=``: absolute, but NOT symlink-resolved.
+
+    ``sys.executable`` is already absolute, so ``.resolve()`` buys nothing —
+    and on a uv-created venv it is actively wrong. ``venv/bin/python`` is a
+    symlink to the uv-managed CPython under
+    ``~/.local/share/uv/python/cpython-<X.Y.Z>-.../bin/python3.11``. Resolving
+    it hands the launcher the *base* interpreter, whose ``sys.prefix`` is the
+    uv install, not the venv — so none of Hermes' dependencies are importable
+    and the app dies on ``import yaml`` before it can draw a window. With
+    ``Terminal=false`` the traceback goes nowhere and the icon looks inert.
+
+    Keeping the symlink intact preserves venv detection (PEP 405 uses the
+    unresolved argv[0]/executable path to find ``pyvenv.cfg``), and it also
+    survives a uv patch upgrade: the version-pinned resolved path disappears
+    when uv swaps 3.11.16 for 3.11.17, while ``venv/bin/python`` keeps working.
+    """
+    return os.path.abspath(sys.executable)
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -106,8 +126,15 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # Compare against the UNRESOLVED venv bin dir: a uv venv's shebang reads
+    # ``#!/…/venv/bin/python3`` while the resolved interpreter lives under
+    # ``~/.local/share/uv/python/…``. Resolving here would never match, so a
+    # perfectly self-sufficient venv console script gets needlessly prefixed.
+    candidates = {
+        str(Path(sys.executable).parent),
+        str(Path(sys.executable).resolve().parent),
+    }
+    return not any(c.lower() in shebang for c in candidates)
 
 
 def _quote_exec_arg(arg: str) -> str:
