@@ -237,6 +237,7 @@ class HostedRoomService:
         room_id: str,
         event_id: str,
         payload: Any,
+        actor: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized = discussion.validate_user_payload(payload)
         event = hosted_rooms.append_event(
@@ -244,7 +245,7 @@ class HostedRoomService:
             room_id=room_id,
             event_id=event_id,
             kind="message.user",
-            actor={"kind": "user", "id": "desktop"},
+            actor=actor or {"kind": "user", "id": "desktop"},
             payload=normalized,
         )
         binding = next(

@@ -573,6 +573,147 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_rooms_command(self, event: MessageEvent) -> str:
+        """List hosted Bot rooms or show one room's recent activity."""
+
+        from gateway import hosted_rooms
+        from gateway.hosted_room_messaging import (
+            RoomControlError,
+            command_form,
+            current_room_backend,
+            format_room_detail,
+            format_room_list,
+            is_machine_authored,
+            list_messaging_rooms,
+            relay_provenance_is_unknown,
+            resolve_room,
+        )
+
+        if is_machine_authored(event):
+            return "Hosted Bot room controls are only available to people."
+        if relay_provenance_is_unknown(event):
+            return (
+                "Room controls need a relay connector that reports whether the "
+                "sender is a person or a bot. Update the connector and try again."
+            )
+        from gateway.slash_access import policy_for_source
+
+        policy = policy_for_source(self.config, event.source)
+        if not policy.enabled or not policy.is_admin(event.source.user_id):
+            return (
+                "Room controls are off for this chat. Add your user ID to this "
+                "channel’s admin list, then try again."
+            )
+        service = current_room_backend()
+        rooms_command = command_form(event)
+        query = event.get_command_args().strip()
+        try:
+            rooms = list_messaging_rooms(service)
+            exact_name = next(
+                (
+                    room
+                    for room in rooms
+                    if str(room.get("name") or "").casefold() == query.casefold()
+                ),
+                None,
+            )
+            if exact_name is not None:
+                return await asyncio.to_thread(
+                    format_room_detail,
+                    service,
+                    exact_name,
+                    room_command=rooms_command,
+                )
+            if query.partition(" ")[0].casefold() in {"send", "stop"}:
+                return await self._handle_room_command(event)
+            if not query:
+                return await asyncio.to_thread(
+                    format_room_list,
+                    service,
+                    rooms_command=rooms_command,
+                )
+
+            def _detail() -> str:
+                room = resolve_room(rooms, query)
+                return format_room_detail(
+                    service,
+                    room,
+                    room_command=rooms_command,
+                )
+
+            return await asyncio.to_thread(_detail)
+        except (RoomControlError, hosted_rooms.HostedRoomError) as exc:
+            return str(exc)
+        except Exception:
+            logger.exception("Failed to read hosted Bot rooms from messaging")
+            return "Couldn’t load hosted Bot rooms. Try again in a moment."
+
+    async def _handle_room_command(self, event: MessageEvent) -> str:
+        """Send to or stop work in a hosted Bot room."""
+
+        from gateway import hosted_rooms
+        from gateway.hosted_room_messaging import (
+            RoomControlError,
+            command_form,
+            current_room_backend,
+            parse_room_command,
+            resolve_room,
+            room_reference,
+            send_to_room,
+            stop_room,
+            is_machine_authored,
+            list_messaging_rooms,
+            relay_provenance_is_unknown,
+        )
+        from gateway.slash_access import policy_for_source
+
+        if is_machine_authored(event):
+            return "Hosted Bot room controls are only available to people."
+        if relay_provenance_is_unknown(event):
+            return (
+                "Room controls need a relay connector that reports whether the "
+                "sender is a person or a bot. Update the connector and try again."
+            )
+        policy = policy_for_source(self.config, event.source)
+        if not policy.enabled or not policy.is_admin(event.source.user_id):
+            return (
+                "Room controls are off for this chat. Add your user ID to this "
+                "channel’s admin list, then try again."
+            )
+        service = current_room_backend()
+        rooms_command = command_form(event)
+        try:
+            command = parse_room_command(
+                event.get_command_args(),
+                command_root=rooms_command,
+            )
+            if not command.room_query.isdecimal():
+                if command.action == "send":
+                    raise RoomControlError(
+                        f"Use `{rooms_command} send <room number> -- <message>`."
+                    )
+                raise RoomControlError(
+                    f"Use `{rooms_command} stop <room number>`."
+                )
+
+            def _mutate() -> str:
+                room = resolve_room(
+                    list_messaging_rooms(service),
+                    command.room_query,
+                )
+                if command.action == "send":
+                    result = send_to_room(service, room, event, command.message)
+                    return f"{result} Check: `{rooms_command} {room_reference(room)}`."
+                result = stop_room(service, room, event)
+                return f"{result} Check: `{rooms_command} {room_reference(room)}`."
+
+            return await asyncio.to_thread(_mutate)
+        except (RoomControlError, hosted_rooms.HostedRoomError) as exc:
+            return str(exc)
+        except Exception:
+            logger.exception("Failed to control hosted Bot room from messaging")
+            return "Couldn’t update that Bot room. Try again in a moment."
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

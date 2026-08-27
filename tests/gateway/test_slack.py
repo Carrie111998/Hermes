@@ -242,6 +242,30 @@ class TestBotEventDiagnostics:
             for line in debug_lines
         ), debug_lines
 
+    @pytest.mark.asyncio
+    async def test_users_info_bot_classification_reaches_session_source(self, adapter):
+        adapter.config.extra["allow_bots"] = "all"
+        adapter._app.client.users_info = AsyncMock(
+            return_value={
+                "user": {
+                    "is_bot": True,
+                    "profile": {"display_name": "Peer Bot"},
+                    "real_name": "Peer Bot",
+                }
+            }
+        )
+        event = {
+            "type": "message",
+            "user": "U_PEER_BOT",
+            "channel": "D_SHARED",
+            "channel_type": "im",
+            "text": "hello from a peer bot",
+            "ts": "1770000000.000001",
+        }
+        await adapter._handle_slack_message(event)
+        delivered = adapter.handle_message.await_args.args[0]
+        assert delivered.source.is_bot is True
+
 
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
@@ -3475,6 +3499,23 @@ class TestSlashCommands:
         await adapter._handle_slash_command(command)
         msg = adapter.handle_message.call_args[0][0]
         assert msg.text == "/btw run the tests"
+
+    @pytest.mark.asyncio
+    async def test_room_control_keeps_slack_trigger_for_idempotency(self, adapter):
+        from gateway.hosted_room_messaging import messaging_event_id
+
+        command = {
+            "command": "/hermes",
+            "text": "rooms send release-room -- hello",
+            "trigger_id": "trigger-room-1",
+            "user_id": "U1",
+            "channel_id": "C1",
+            "team_id": "T1",
+        }
+        await adapter._handle_slash_command(command)
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "/rooms send release-room -- hello"
+        assert messaging_event_id(event) == messaging_event_id(event)
 
 
 # ---------------------------------------------------------------------------

@@ -251,7 +251,7 @@ class SessionSource:
         return ", ".join(parts)
     
     def to_dict(self) -> Dict[str, Any]:
-        d = {
+        d: Dict[str, Any] = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "chat_name": self.chat_name,
@@ -260,6 +260,7 @@ class SessionSource:
             "user_name": self.user_name,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
+            "is_bot": self.is_bot,
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -305,6 +306,7 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            is_bot=bool(data.get("is_bot", False)),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),

@@ -994,6 +994,9 @@ class TestSignalQuoteExtraction:
         assert event.reply_to_text == "want to grab lunch?"
         assert event.reply_to_author_id == "other-author"
         assert event.reply_to_is_own_message is False
+        from gateway.hosted_room_messaging import messaging_event_id
+
+        assert messaging_event_id(event) == messaging_event_id(event)
 
 
     @pytest.mark.asyncio

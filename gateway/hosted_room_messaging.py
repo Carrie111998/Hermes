@@ -1,0 +1,646 @@
+"""Messaging-facing controls for gateway-hosted Bot rooms.
+
+The handlers in :mod:`gateway.slash_commands` deliberately stay thin.  This
+module owns parsing, room lookup, bounded presentation, and server-owned actor
+identity so Telegram, Signal, WhatsApp, and the other gateway transports share
+one behavior contract.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import sqlite3
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from gateway import hosted_room_discussion as discussion
+from gateway import hosted_room_driver as driver
+from gateway import hosted_rooms
+
+
+MAX_ROOM_CHOICES = 8
+MAX_RECENT_MESSAGES = 5
+MAX_PREVIEW_CHARS = 180
+
+
+def list_messaging_rooms(service: Any) -> list[dict[str, Any]]:
+    """Return active rooms with gateway-stable numeric messaging references."""
+
+    rooms = hosted_rooms.list_rooms(service.db_path)
+    if not rooms:
+        return []
+
+    db_path = Path(service.db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(conn, db_label="state.db (room messaging refs)")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS hosted_room_messaging_refs (
+                room_ref INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT NOT NULL UNIQUE
+            )"""
+        )
+        # Existing rooms receive deterministic first-use numbers. AUTOINCREMENT
+        # keeps those numbers stable and prevents a disbanded room's reference
+        # from being reassigned to unrelated work later.
+        for room in sorted(
+            rooms,
+            key=lambda item: (
+                float(item.get("created_at") or 0),
+                str(item.get("room_id") or ""),
+            ),
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO hosted_room_messaging_refs (room_id) VALUES (?)",
+                (str(room["room_id"]),),
+            )
+        refs = {
+            str(row["room_id"]): int(row["room_ref"])
+            for row in conn.execute(
+                "SELECT room_id, room_ref FROM hosted_room_messaging_refs"
+            )
+        }
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return [
+        {**room, "messaging_ref": refs[str(room["room_id"])]}
+        for room in rooms
+    ]
+
+
+def room_reference(room: Mapping[str, Any]) -> str:
+    """Return the short messaging reference, with an internal-id fallback."""
+
+    reference = room.get("messaging_ref")
+    if isinstance(reference, int) and reference > 0:
+        return str(reference)
+    return str(room.get("room_id") or "")
+
+
+class RoomControlError(ValueError):
+    """A user-actionable hosted-room command error."""
+
+
+@dataclass(frozen=True)
+class RoomCommand:
+    """Parsed mutating ``/rooms`` subcommand."""
+
+    action: str
+    room_query: str
+    message: str = ""
+
+
+class MessagingRoomBackend:
+    """Cross-process hosted-room access through the shared durable stores."""
+
+    def __init__(self, *, db_path: Any, service: Any = None) -> None:
+        self.db_path = db_path
+        self.service = service
+
+    def status(self, room_id: str) -> dict[str, Any]:
+        if self.service is not None:
+            return self.service.status(room_id)
+        tasks = driver.list_tasks(self.db_path, room_id=room_id)
+        counts: dict[str, int] = {}
+        for task in tasks:
+            status = str(task.get("status") or "")
+            counts[status] = counts.get(status, 0) + 1
+        return {
+            "working": any(counts.get(status) for status in ("queued", "running", "stopping")),
+            "blocked": bool(counts.get("indeterminate")),
+            "counts": counts,
+        }
+
+    def send(
+        self,
+        *,
+        room_id: str,
+        event_id: str,
+        payload: Any,
+        actor: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.service is not None:
+            return self.service.send(
+                room_id=room_id,
+                event_id=event_id,
+                payload=payload,
+                actor=actor,
+            )
+        normalized = discussion.validate_user_payload(payload)
+        return hosted_rooms.append_event(
+            self.db_path,
+            room_id=room_id,
+            event_id=event_id,
+            kind="message.user",
+            actor=dict(actor),
+            payload=normalized,
+        )
+
+    def stop_room(self, room_id: str, *, cancel_id: str) -> int:
+        if self.service is not None:
+            return self.service.stop_room(room_id, cancel_id=cancel_id)
+        hosted_rooms.request_room_stop(
+            self.db_path,
+            room_id=room_id,
+            cancel_id=cancel_id,
+        )
+        requested = 0
+        for task in driver.list_tasks(self.db_path, room_id=room_id):
+            for _attempt in range(3):
+                current = driver.get_task(self.db_path, task["identity"])
+                status = str(current.get("status") or "")
+                try:
+                    if status == "queued":
+                        driver.cancel_task(
+                            self.db_path,
+                            current["identity"],
+                            cancel_id=cancel_id,
+                            expected_cancel_generation=int(
+                                current["cancel_generation"]
+                            ),
+                            clock=time.time,
+                        )
+                        requested += 1
+                    elif status in {"running", "indeterminate"}:
+                        driver.begin_task_cancel(
+                            self.db_path,
+                            current["identity"],
+                            cancel_id=cancel_id,
+                            expected_cancel_generation=int(
+                                current["cancel_generation"]
+                            ),
+                            clock=time.time,
+                        )
+                        requested += 1
+                    elif status == "stopping":
+                        requested += 1
+                    elif (
+                        status == "cancelled"
+                        and current.get("cancel_id") == cancel_id
+                    ):
+                        requested += 1
+                    break
+                except (driver.InvalidTaskTransitionError, driver.StaleTaskError):
+                    # Queued work can become running between the list and the
+                    # write. Reload and retry under the new generation.
+                    continue
+        return requested
+
+
+def current_room_backend() -> MessagingRoomBackend:
+    """Resolve in-process service access or the shared cross-process store."""
+
+    from tui_gateway.methods_groups import get_hosted_room_service
+
+    service = get_hosted_room_service()
+    return MessagingRoomBackend(
+        db_path=service.db_path if service is not None else hosted_rooms.default_db_path(),
+        service=service,
+    )
+
+
+def _clean_line(value: Any, *, limit: int = MAX_PREVIEW_CHARS) -> str:
+    """Collapse untrusted text to one bounded display line."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def command_form(event: Any) -> str:
+    """Return the channel-valid hosted-room command prefix."""
+
+    source = getattr(event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", "")
+    if platform == "slack":
+        return "/hermes rooms"
+    if platform == "matrix":
+        return "!rooms"
+    return "/rooms"
+
+
+def parse_room_command(args: str, *, command_root: str = "/rooms") -> RoomCommand:
+    """Parse ``send`` and ``stop`` without making room names quote-only."""
+
+    raw = str(args or "").strip()
+    action, _, remainder = raw.partition(" ")
+    action = action.casefold()
+    remainder = remainder.strip()
+    if action == "send":
+        room_query, delimiter, message = remainder.partition(" -- ")
+        if not delimiter or not room_query.strip() or not message.strip():
+            raise RoomControlError(
+                f"Use `{command_root} send <room number> -- <message>`."
+            )
+        return RoomCommand("send", room_query.strip(), message.strip())
+    if action == "stop":
+        if not remainder:
+            raise RoomControlError(f"Use `{command_root} stop <room number>`.")
+        return RoomCommand("stop", remainder)
+    raise RoomControlError(
+        f"Use `{command_root} send <room number> -- <message>` or "
+        f"`{command_root} stop <room number>`."
+    )
+
+
+def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
+    """Resolve by stable messaging number, then id/name convenience matches."""
+
+    needle = _clean_line(query, limit=hosted_rooms.MAX_ROOM_NAME_CHARS).casefold()
+    if not needle:
+        raise RoomControlError("Enter a room number or name.")
+
+    if needle.isdecimal():
+        numeric_ref = int(needle)
+        matches = [
+            room for room in rooms if room.get("messaging_ref") == numeric_ref
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        raise RoomControlError(f"No hosted Bot room is numbered {numeric_ref}.")
+
+    if needle.startswith("id:"):
+        internal_id = needle.removeprefix("id:")
+        matches = [
+            room
+            for room in rooms
+            if str(room.get("room_id") or "").casefold() == internal_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        raise RoomControlError("No hosted Bot room matches that internal ID.")
+
+    def _keys(room: Mapping[str, Any]) -> tuple[str, str]:
+        return (
+            str(room.get("room_id") or "").casefold(),
+            str(room.get("name") or "").casefold(),
+        )
+
+    for match_kind in ("exact", "prefix", "contains"):
+        matches: list[dict[str, Any]] = []
+        for room in rooms:
+            room_id, name = _keys(room)
+            if match_kind == "exact" and needle in {room_id, name}:
+                matches.append(room)
+            elif match_kind == "prefix" and (
+                room_id.startswith(needle) or name.startswith(needle)
+            ):
+                matches.append(room)
+            elif match_kind == "contains" and (needle in room_id or needle in name):
+                matches.append(room)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            names = ", ".join(
+                (
+                    f"{_clean_line(room.get('name') or room.get('room_id'), limit=48)} "
+                    f"[{room_reference(room)}]"
+                )
+                for room in matches[:MAX_ROOM_CHOICES]
+            )
+            suffix = "…" if len(matches) > MAX_ROOM_CHOICES else ""
+            raise RoomControlError(
+                f"That matches several rooms: {names}{suffix}. Enter more of the name."
+            )
+    raise RoomControlError(f"No hosted Bot room matches “{_clean_line(query)}”.")
+
+
+def _room_status(service: Any, room_id: str) -> str:
+    status = service.status(room_id)
+    if status.get("blocked"):
+        return "needs attention"
+    if status.get("counts", {}).get("stopping"):
+        return "stopping"
+    if status.get("working"):
+        return "work queued or running"
+    state = hosted_rooms.room_state(service.db_path, room_id=room_id)
+    since = max(0, int(state.get("latest_seq") or 0) - 80)
+    recent = hosted_rooms.read_events(
+        service.db_path,
+        room_id=room_id,
+        since_seq=since,
+        limit=80,
+    ).get("events", [])
+    latest_user = max(
+        (int(event["seq"]) for event in recent if event.get("kind") == "message.user"),
+        default=0,
+    )
+    latest_boundary = max(
+        (
+            int(event["seq"])
+            for event in recent
+            if event.get("kind") in {"room.activity", "room.stop_requested"}
+        ),
+        default=0,
+    )
+    if latest_user > latest_boundary:
+        return "waiting for the room host"
+    return "idle"
+
+
+def format_room_list(service: Any, *, rooms_command: str = "/rooms") -> str:
+    """Render a bounded, scan-friendly hosted-room list."""
+
+    rooms = list_messaging_rooms(service)
+    if not rooms:
+        return "No hosted Bot rooms yet. Create one in Hermes Desktop first."
+    lines = ["Hosted Bot rooms"]
+    for room in rooms[:MAX_ROOM_CHOICES]:
+        name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
+        raw_members = room.get("members")
+        members: list[Any] = raw_members if isinstance(raw_members, list) else []
+        lines.append(
+            f"{room_reference(room)}. {name} — {_room_status(service, str(room['room_id']))}, "
+            f"{len(members)} bot{'s' if len(members) != 1 else ''}"
+        )
+    if len(rooms) > MAX_ROOM_CHOICES:
+        lines.append(f"…and {len(rooms) - MAX_ROOM_CHOICES} more")
+    lines.append(f"Use `{rooms_command} <number>` to see recent activity.")
+    return "\n".join(lines)
+
+
+def _event_label(event: Mapping[str, Any], member_names: Mapping[str, str]) -> str:
+    raw_actor = event.get("actor")
+    actor: Mapping[str, Any] = raw_actor if isinstance(raw_actor, Mapping) else {}
+    actor_id = str(actor.get("id") or "")
+    display_name = _clean_line(actor.get("display_name"), limit=48)
+    if display_name:
+        return display_name
+    if event.get("kind") == "message.member":
+        raw_payload = event.get("payload")
+        payload: Mapping[str, Any] = (
+            raw_payload if isinstance(raw_payload, Mapping) else {}
+        )
+        member_id = str(payload.get("member_id") or actor_id)
+        return member_names.get(member_id, "Bot")
+    return "You"
+
+
+def format_room_detail(
+    service: Any,
+    room: Mapping[str, Any],
+    *,
+    room_command: str = "/rooms",
+) -> str:
+    """Render status plus the latest visible room messages."""
+
+    room_id = str(room["room_id"])
+    if not isinstance(room.get("messaging_ref"), int):
+        room = next(
+            (
+                candidate
+                for candidate in list_messaging_rooms(service)
+                if str(candidate["room_id"]) == room_id
+            ),
+            dict(room),
+        )
+    state = hosted_rooms.room_state(service.db_path, room_id=room_id)
+    since = max(0, int(state.get("latest_seq") or 0) - 80)
+    delta = hosted_rooms.read_events(
+        service.db_path,
+        room_id=room_id,
+        since_seq=since,
+        limit=80,
+    )
+    raw_members = room.get("members")
+    members: list[Any] = raw_members if isinstance(raw_members, list) else []
+    member_names = {
+        str(member.get("member_id") or ""): _clean_line(
+            member.get("display_name") or member.get("handle") or "Bot",
+            limit=48,
+        )
+        for member in members
+        if isinstance(member, Mapping)
+    }
+    visible = [
+        event
+        for event in delta.get("events", [])
+        if isinstance(event, Mapping)
+        and event.get("kind") in {"message.user", "message.member"}
+    ][-MAX_RECENT_MESSAGES:]
+    name = _clean_line(room.get("name") or room_id, limit=72)
+    lines = [
+        f"{name} — {_room_status(service, room_id)}",
+        f"{len(members)} bot{'s' if len(members) != 1 else ''}",
+    ]
+    if visible:
+        lines.append("Recent activity")
+        for event in visible:
+            payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+            lines.append(
+                f"• {_event_label(event, member_names)}: "
+                f"{_clean_line(payload.get('text'))}"
+            )
+    else:
+        lines.append("No messages yet.")
+    lines.append(
+        f"Send: `{room_command} send {room_reference(room)} -- <message>`"
+    )
+    lines.append(f"Stop: `{room_command} stop {room_reference(room)}`")
+    return "\n".join(lines)
+
+
+def messaging_actor(event: Any, *, gateway_id: str) -> dict[str, str]:
+    """Build a stable actor without persisting raw platform user IDs."""
+
+    source = getattr(event, "source", None)
+    platform_value = getattr(getattr(source, "platform", None), "value", None)
+    platform = _clean_line(platform_value or "messaging", limit=32).casefold()
+    raw_user_id = (
+        getattr(source, "user_id_alt", None)
+        or getattr(event, "user_id", None)
+        or getattr(source, "user_id", None)
+        or "unknown"
+    )
+    scope = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+    chat_id = getattr(source, "chat_id", None)
+    digest = hashlib.sha256(
+        f"{gateway_id}:{platform}:{scope or ''}:{chat_id or ''}:{raw_user_id}".encode()
+    ).hexdigest()[:20]
+    raw_name = _clean_line(
+        getattr(event, "user_name", None) or getattr(source, "user_name", None),
+        limit=48,
+    )
+    platform_label = platform.replace("_", " ").title()
+    display_name = (
+        f"{raw_name} via {platform_label}"
+        if raw_name and raw_name != str(raw_user_id)
+        else platform_label
+    )
+    return {
+        "kind": "user",
+        "id": f"messaging:{platform}:{digest}",
+        "display_name": display_name,
+    }
+
+
+def _raw_transport_id(event: Any) -> Any:
+    """Extract one adapter-owned redelivery key without guessing from text."""
+
+    metadata = getattr(event, "metadata", None)
+    candidates: list[Any] = []
+    if isinstance(metadata, Mapping):
+        candidates.extend(
+            metadata.get(key)
+            for key in (
+                "delivery_id",
+                "event_id",
+                "message_id",
+                "request_id",
+                "update_id",
+            )
+        )
+    raw = getattr(event, "raw_message", None)
+    payloads = [raw]
+    if isinstance(raw, Mapping):
+        payloads.extend(
+            raw.get(key) for key in ("event", "message", "data", "container")
+        )
+    for payload in payloads:
+        if isinstance(payload, Mapping):
+            candidates.extend(
+                payload.get(key)
+                for key in (
+                    "client_msg_id",
+                    "trigger_id",
+                    "event_id",
+                    "message_id",
+                    "id",
+                    "ts",
+                    "event_ts",
+                    "timestamp_ms",
+                    "timestamp",
+                )
+            )
+    if raw is not None and not isinstance(raw, Mapping):
+        candidates.extend(
+            getattr(raw, key, None) for key in ("id", "interaction_id")
+        )
+    return next(
+        (
+            value
+            for value in candidates
+            if value is not None and str(value).strip()
+        ),
+        None,
+    )
+
+
+def messaging_event_id(event: Any) -> str:
+    """Return a deterministic idempotency key when the transport provides one."""
+
+    source = getattr(event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", "messaging")
+    stable_message_id = (
+        getattr(event, "platform_update_id", None)
+        or getattr(event, "message_id", None)
+        or getattr(source, "message_id", None)
+        or _raw_transport_id(event)
+    )
+    if stable_message_id is None:
+        raise RoomControlError(
+            "This channel didn’t provide a stable message ID, so Hermes can’t "
+            "safely repeat this room command. Try another connected channel."
+        )
+    material = "|".join(
+        str(value or "")
+        for value in (
+            platform,
+            getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+            getattr(source, "user_id_alt", None)
+            or getattr(event, "user_id", None)
+            or getattr(source, "user_id", None),
+            stable_message_id,
+        )
+    )
+    return f"messaging:{hashlib.sha256(material.encode()).hexdigest()}"
+
+
+def ensure_text_only(event: Any) -> None:
+    """Reject media explicitly until hosted-room attachment transport exists."""
+
+    if getattr(event, "media_urls", None) or getattr(event, "media_types", None):
+        raise RoomControlError(
+            "Attachments from messaging chats aren’t supported yet. Send text only."
+        )
+
+
+def is_machine_authored(event: Any) -> bool:
+    """Recognize native and relayed bot/webhook provenance defensively."""
+
+    source = getattr(event, "source", None)
+    if getattr(source, "is_bot", False):
+        return True
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, Mapping) and any(
+        metadata.get(key) is True
+        for key in ("is_bot", "sender_is_bot", "webhook_sender")
+    ):
+        return True
+    raw = getattr(event, "raw_message", None)
+    if isinstance(raw, Mapping):
+        if raw.get("bot_id") or raw.get("bot_profile"):
+            return True
+        if raw.get("subtype") in {"bot_message", "webhook_message"}:
+            return True
+    for owner_field in ("author", "user"):
+        owner = getattr(raw, owner_field, None)
+        if getattr(owner, "bot", False) or getattr(owner, "is_bot", False):
+            return True
+    return False
+
+
+def relay_provenance_is_unknown(event: Any) -> bool:
+    """Fail closed until a relay producer classifies the inbound author."""
+
+    source = getattr(event, "source", None)
+    if not getattr(source, "delivered_via_upstream_relay", False):
+        return False
+    metadata = getattr(event, "metadata", None)
+    return not (
+        isinstance(metadata, Mapping)
+        and metadata.get("relay_author_classified") is True
+    )
+
+
+def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -> str:
+    """Append one idempotent user turn and wake the hosted driver."""
+
+    ensure_text_only(event)
+    event_id = messaging_event_id(event)
+    service.send(
+        room_id=str(room["room_id"]),
+        event_id=event_id,
+        payload={"text": text, "thread_id": event_id},
+        actor=messaging_actor(
+            event,
+            gateway_id=str(room["authority_gateway_id"]),
+        ),
+    )
+    name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
+    return f"Queued in {name}."
+
+
+def stop_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
+    """Cancel active room tasks using a transport-derived idempotency key."""
+
+    cancel_id = f"stop:{messaging_event_id(event)}"
+    service.stop_room(str(room["room_id"]), cancel_id=cancel_id)
+    name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
+    return f"Stop requested for {name}. Active work will stop safely."

@@ -530,6 +530,17 @@ class TestMatrixBangCommandAlias:
         )
         assert _normalize_matrix_bang_command("!tasks") == "/tasks"
 
+    @pytest.mark.asyncio
+    async def test_room_control_normalizes_and_keeps_matrix_event_id(self):
+        from gateway.hosted_room_messaging import messaging_event_id
+
+        captured_event = await self._dispatch_text(
+            "!rooms send release-room -- hello"
+        )
+        assert captured_event is not None
+        assert captured_event.text == "/rooms send release-room -- hello"
+        assert messaging_event_id(captured_event) == messaging_event_id(captured_event)
+
 
     @pytest.mark.asyncio
     async def test_unknown_bang_text_stays_normal_text(self):

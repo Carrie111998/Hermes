@@ -289,6 +289,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         scope_id=src.get("scope_id"),
         parent_chat_id=src.get("parent_chat_id"),
         message_id=src.get("message_id"),
+        is_bot=bool(src.get("is_bot", False)),
         # The HERMES profile this event is routed to (multiplex mode). The
         # connector stamps it on the wire source when NAS resolves the target
         # profile for a Team-Gateway message; absent for a single-profile
@@ -336,6 +337,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         text=text,
         message_type=msg_type,
         source=source,
+        metadata={"relay_author_classified": "is_bot" in src},
         message_id=raw.get("message_id"),
         reply_to_message_id=raw.get("reply_to_message_id"),
         # Richer quoted-reply context (Phase 4): what the user replied TO,

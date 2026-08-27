@@ -493,6 +493,23 @@ class _FakeThreadChannel(_discord_mod.Thread):
         return _empty()
 
 
+def test_discord_slash_interaction_supplies_room_control_idempotency(adapter):
+    from gateway.hosted_room_messaging import messaging_event_id
+
+    channel = _FakeTextChannel(channel_id=123)
+    interaction = SimpleNamespace(
+        id=987654321,
+        channel=channel,
+        channel_id=channel.id,
+        user=SimpleNamespace(id=42, display_name="Jezza"),
+    )
+    event = adapter._build_slash_event(
+        interaction,
+        "/rooms send release-room -- hello",
+    )
+    assert messaging_event_id(event) == messaging_event_id(event)
+
+
 def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza"):
     return SimpleNamespace(
         author=SimpleNamespace(id=author_id, display_name=display_name, bot=False),
@@ -600,5 +617,4 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
 
