@@ -1258,7 +1258,11 @@ _FABRICATED_TOOL_USE_NUDGE_CONTENT = (
 # tool-call payload (OpenAI/Responses-API function-call JSON), independent
 # of whatever prose wording surrounds it. Two separate regexes (not one
 # spanning both) so neither key's position relative to the other, nor how
-# much text sits between them, matters.
+# much text sits between them, matters. Accepted false-positive class:
+# legitimate prose that quotes a tool-call-shaped JSON example (e.g.
+# explaining an API schema) will also match — the retry cost of a
+# wrong-but-bounded re-prompt is judged cheaper than the complexity of
+# disambiguating intent here.
 _FABRICATED_TOOL_USE_HAS_NAME_KEY = re.compile(r'"name"\s*:\s*"[^"]*"')
 _FABRICATED_TOOL_USE_HAS_ARGUMENTS_KEY = re.compile(r'"arguments"\s*:')
 
@@ -1277,7 +1281,7 @@ _FABRICATED_TOOL_USE_PATTERNS = (
 )
 
 
-def _looks_like_fabricated_tool_use(text: str) -> bool:
+def _looks_like_fabricated_tool_use(text: Optional[str]) -> bool:
     """True when ``text`` either leaks a tool-call-shaped JSON fragment or
     affirmatively claims a completed tool action with a result.
 

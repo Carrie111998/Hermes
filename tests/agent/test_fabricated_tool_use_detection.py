@@ -63,3 +63,12 @@ class TestLooksLikeFabricatedToolUse:
     def test_returns_false_for_empty_or_none_text(self):
         assert _looks_like_fabricated_tool_use("") is False
         assert _looks_like_fabricated_tool_use(None) is False
+
+    def test_flags_legitimate_schema_discussion_as_an_accepted_tradeoff(self):
+        """KNOWN, ACCEPTED limitation: prose that legitimately quotes a
+        tool-call-shaped JSON example (e.g. explaining an API schema) also
+        matches. Pinned here deliberately so this boundary is visible and
+        intentional, not a silent gap -- see the comment above
+        _FABRICATED_TOOL_USE_HAS_NAME_KEY."""
+        text = 'Your schema should look like {"name": "get_weather", "arguments": {"location": "string"}}'
+        assert _looks_like_fabricated_tool_use(text) is True

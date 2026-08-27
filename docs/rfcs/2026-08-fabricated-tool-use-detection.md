@@ -81,9 +81,11 @@ wins over either signal, exactly like the existing checks.
 regexes, `"name"\s*:\s*"[^"]*"` and `"arguments"\s*:`, both required to match somewhere in the
 text (order-independent, no single regex spanning both keys). This is tool-agnostic and
 wording-agnostic by construction — it does not need to know what the leaked JSON's surrounding
-prose says, only that the payload shape is present. (This mirrors a structural fix already
-shipped and verified in a downstream consumer of this framework, ported here so every consumer
-benefits, not just that one.)
+prose says, only that the payload shape is present. Accepted false-positive class: legitimate
+prose that quotes a tool-call-shaped JSON example (e.g. explaining an API schema) will also match
+— the retry cost of a wrong-but-bounded re-prompt is judged cheaper than the complexity of
+disambiguating intent here. (This mirrors a structural fix already shipped and verified in a
+downstream consumer of this framework, ported here so every consumer benefits, not just that one.)
 
 **2. Self-claim language (`_FABRICATED_TOOL_USE_PATTERNS`).** A small, curated, evidence-seeded
 list of regexes for text that affirmatively claims a *completed* tool action with a *result* —
