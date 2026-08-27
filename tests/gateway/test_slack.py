@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -821,6 +821,112 @@ class TestSlackSocketWatchdog:
         adapter._socket_first_ping_grace_s = 0.0
         adapter._socket_handler_started_monotonic = time.monotonic() - 200
         assert adapter._socket_ping_pong_stale() is True
+
+    # -- closed-session wedge (#96069/#85574): the "Session is closed" retry loop --
+
+    @pytest.mark.asyncio
+    async def test_transport_probe_detects_closed_aiohttp_session(self):
+        """A closed aiohttp session is the wedge signature: retrying connect()
+        on it can never succeed ("Session is closed"), even while the SDK's
+        is_connected() still reports healthy (it only inspects the current
+        websocket). The probe must report unhealthy."""
+        adapter = self._adapter_with_fake_client(
+            aiohttp_client_session=SimpleNamespace(closed=True),
+            closed=False,
+            is_connected=lambda: True,
+        )
+        assert await adapter._socket_transport_connected() is False
+
+    @pytest.mark.asyncio
+    async def test_transport_probe_detects_closed_client_flag(self):
+        """A client whose ``closed`` flag is stuck True (close() ran while its
+        connect() retry loop was still alive) can never recover in place."""
+        adapter = self._adapter_with_fake_client(
+            closed=True,
+            is_connected=lambda: True,
+        )
+        assert await adapter._socket_transport_connected() is False
+
+    @pytest.mark.asyncio
+    async def test_transport_probe_ignores_mock_only_session_state(self):
+        """Partial/mocked clients (MagicMock attrs instead of real booleans)
+        must not be misread as wedged — a mocked session would otherwise trip
+        a spurious reconnect on every healthy adapter."""
+        adapter = self._adapter_with_fake_client(is_connected=lambda: True)
+        assert await adapter._socket_transport_connected() is True
+
+    @pytest.mark.asyncio
+    async def test_closed_session_wedge_escalates_to_retryable_fatal(self):
+        """Regression for #96069/#85574: when the Socket Mode transport stays
+        wedged (closed aiohttp session that no in-place handler rebuild can
+        fix), the watchdog must stop retrying forever and emit ONE retryable
+        fatal event so the gateway rebuilds the whole adapter with a fresh
+        session — never an infinite 'Session is closed' retry loop."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.0
+        adapter._socket_unhealthy_fatal_threshold = 2
+
+        fatal_events: list = []
+
+        class WedgedHandler:
+            """Every instance is wedged: closed aiohttp session + closed flag,
+            so each in-place rebuild produces another zombie — exactly the
+            state the SDK's connect() loop retries forever."""
+
+            def __init__(self, app, app_token, proxy=None):
+                self.app = app
+                self.app_token = app_token
+                self.proxy = proxy
+                self.client = SimpleNamespace(
+                    is_connected=None,
+                    closed=True,
+                    aiohttp_client_session=SimpleNamespace(closed=True),
+                    ping_interval=10,
+                    last_ping_pong_time=None,
+                )
+                self._start_event = asyncio.Event()
+                self.closed = False
+
+            async def start_async(self):
+                await self._start_event.wait()
+
+            async def close_async(self):
+                self.closed = True
+                self._start_event.set()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(WedgedHandler):
+                stack.enter_context(p)
+
+            async def _record_fatal(a):
+                fatal_events.append((a.fatal_error_code, a.fatal_error_retryable))
+
+            adapter.set_fatal_error_handler(_record_fatal)
+
+            try:
+                assert await adapter.connect() is True
+                watchdog = adapter._socket_watchdog_task
+                assert watchdog is not None
+
+                # The watchdog must escalate and exit on its own — not loop
+                # reconnecting forever. wait_for bounds a regression: pre-fix
+                # the loop never escalates and this times out.
+                await asyncio.wait_for(asyncio.shield(watchdog), timeout=5)
+
+                assert fatal_events == [("slack_socket_mode_wedged", True)], (
+                    "expected exactly one retryable fatal event, got "
+                    f"{fatal_events}"
+                )
+                assert adapter.fatal_error_code == "slack_socket_mode_wedged"
+                assert adapter.fatal_error_retryable is True
+                assert adapter._running is False
+            except asyncio.TimeoutError:
+                pytest.fail(
+                    "watchdog kept retrying the closed-session wedge instead "
+                    "of escalating to a retryable fatal (full adapter rebuild)"
+                )
+            finally:
+                await adapter.disconnect()
 
 
 # ---------------------------------------------------------------------------

@@ -708,6 +708,18 @@ _SOCKET_CLIENT_TASK_ATTRS = (
 # call must not be able to hold up shutdown indefinitely.
 _SOCKET_TASK_CANCEL_TIMEOUT_S = 3.0
 
+# Escalation rung for the SDK's wedged-session retry loop
+# (slackapi/python-slack-sdk#1913): ``AsyncSocketModeClient.connect()`` is a
+# ``while True`` loop that never checks the client's ``closed`` flag, so once
+# the underlying aiohttp session is closed every retry fails identically
+# ("Session is closed") and no in-place handler rebuild can help — the rebuilt
+# handler still wraps the same AsyncApp, and only a brand-new adapter gets a
+# fresh session. After this many consecutive unhealthy watchdog samples the
+# adapter stops retrying in place and emits one retryable fatal event so the
+# gateway reconnect watcher tears the adapter down and builds a fresh one
+# (Discord health-model parity).
+_SOCKET_UNHEALTHY_FATAL_THRESHOLD = 3
+
 
 async def _cancel_socket_tasks(tasks: Any) -> None:
     """Cancel Socket Mode tasks and wait, with a bound, for them to finish.
@@ -1090,6 +1102,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Allow at least this long after (re)connect before treating a missing
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
+        # Consecutive unhealthy watchdog samples before escalating from
+        # in-place restarts to a retryable fatal event (full adapter rebuild).
+        # Instance attribute so tests can shrink the window; mirrors the
+        # Discord adapter's liveness-failure threshold model.
+        self._socket_unhealthy_fatal_threshold = _SOCKET_UNHEALTHY_FATAL_THRESHOLD
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1278,10 +1295,29 @@ class SlackAdapter(BasePlatformAdapter):
                 )
 
     async def _socket_transport_connected(self) -> Optional[bool]:
-        """Best-effort check of current Socket Mode transport state."""
+        """Best-effort check of current Socket Mode transport state.
+
+        Also detects the wedged-session signature directly: once the SDK's
+        aiohttp session is closed, ``connect()`` retries can never succeed
+        again (``"Session is closed"`` retry loop,
+        slackapi/python-slack-sdk#1913), and the SDK's ``is_connected()`` only
+        inspects the *current* websocket — so probe the session/client flags
+        themselves. Only real booleans count: partial/mocked clients must never
+        trip a spurious reconnect.
+        """
         client = getattr(self._handler, "client", None)
         if client is None:
             return None
+
+        session = getattr(client, "aiohttp_client_session", None)
+        if session is not None:
+            session_closed = getattr(session, "closed", None)
+            if isinstance(session_closed, bool) and session_closed:
+                return False
+
+        client_closed = getattr(client, "closed", None)
+        if isinstance(client_closed, bool) and client_closed:
+            return False
 
         state = getattr(client, "is_connected", None)
         if state is None:
@@ -1351,33 +1387,53 @@ class SlackAdapter(BasePlatformAdapter):
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
 
+        In-place restarts are the first rung of an escalation ladder: a
+        transient blip heals after one or two rebuilds, but a wedged session —
+        the SDK's ``connect()`` retry loop against a closed aiohttp session
+        (``"Session is closed"``, slackapi/python-slack-sdk#1913) — cannot be
+        fixed in place, because every rebuilt handler still wraps the same
+        AsyncApp and only a brand-new adapter gets a fresh session. After
+        ``_socket_unhealthy_fatal_threshold`` consecutive unhealthy samples the
+        loop emits one retryable fatal event so the gateway rebuilds the whole
+        adapter (Discord health-model parity) instead of retrying forever.
+
         The body is wrapped in a broad except so a transient bug in
         ``_restart_socket_mode`` or the transport probe cannot permanently
         disable self-healing — the loop logs and keeps polling.
         """
+        unhealthy_streak = 0
         while self._running:
             try:
                 await asyncio.sleep(self._socket_watchdog_interval_s)
                 if not self._running:
                     break
 
+                reason: Optional[str] = None
                 task = self._socket_mode_task
                 if task is None:
-                    await self._restart_socket_mode("socket task missing")
+                    reason = "socket task missing"
+                elif task.done():
+                    reason = "socket task stopped"
+                else:
+                    connected = await self._socket_transport_connected()
+                    if connected is False:
+                        reason = "transport disconnected"
+                    elif self._socket_ping_pong_stale():
+                        # is_connected() can lie when the aiohttp session is
+                        # closed but the client keeps retrying; ping/pong
+                        # staleness catches that wedged-zombie case that the
+                        # bool check above misses.
+                        reason = "ping/pong stale"
+
+                if reason is None:
+                    unhealthy_streak = 0
                     continue
 
-                if task.done():
-                    await self._restart_socket_mode("socket task stopped")
-                    continue
-
-                connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
-                elif self._socket_ping_pong_stale():
-                    # is_connected() can lie when the aiohttp session is closed
-                    # but the client keeps retrying; ping/pong staleness catches
-                    # that wedged-zombie case that the bool check above misses.
-                    await self._restart_socket_mode("ping/pong stale")
+                unhealthy_streak += 1
+                if unhealthy_streak >= self._socket_unhealthy_fatal_threshold:
+                    await self._escalate_socket_wedge(reason)
+                    return
+                await self._restart_socket_mode(reason)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1385,6 +1441,32 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Socket Mode watchdog iteration failed; continuing",
                     exc_info=True,
                 )
+
+    async def _escalate_socket_wedge(self, reason: str) -> None:
+        """Stop retrying in place and ask the gateway to rebuild the adapter.
+
+        In-place restarts rebuild the SocketMode handler but reuse the same
+        AsyncApp; when the SDK's ``connect()`` retry loop is wedged against a
+        closed aiohttp session (``"Session is closed"``,
+        slackapi/python-slack-sdk#1913), no handler rebuild can succeed — only
+        a brand-new adapter gets a fresh session. Emit one retryable fatal
+        event so the gateway reconnect watcher tears this adapter down and
+        builds a fresh one.
+        """
+        if self.has_fatal_error:
+            return
+        logger.error(
+            "[Slack] Socket Mode unhealthy after %d consecutive samples (%s); "
+            "requesting full adapter rebuild",
+            self._socket_unhealthy_fatal_threshold,
+            reason,
+        )
+        self._set_fatal_error(
+            "slack_socket_mode_wedged",
+            f"Socket Mode wedged in retry loop ({reason}); the gateway will rebuild the adapter",
+            retryable=True,
+        )
+        await self._notify_fatal_error()
 
     def _on_socket_watchdog_done(self, task: asyncio.Task) -> None:
         if task is not self._socket_watchdog_task:
