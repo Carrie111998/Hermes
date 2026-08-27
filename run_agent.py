@@ -1908,7 +1908,7 @@ class AIAgent:
         # inflating token cost (#85859). An explicit ``/refine`` (``focus`` set)
         # is a deliberate user request and still runs.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
-            return
+            return False
         # Explicit off-switch for automatic post-turn forks
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
         # still works — same contract as zeroing the nudge intervals (#87250).
@@ -1919,7 +1919,7 @@ class AIAgent:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
-                return
+                return False
         from agent.background_review import (
             finish_background_review_run,
             prepare_background_review_run,
@@ -1929,7 +1929,7 @@ class AIAgent:
 
         review_run = prepare_background_review_run(self)
         if review_run is None:
-            return
+            return False
         try:
             target, _prompt = spawn_background_review_thread(
                 self,
@@ -1951,6 +1951,7 @@ class AIAgent:
         except Exception:
             finish_background_review_run(self, review_run)
             raise
+        return True
 
     def _build_memory_write_metadata(
         self,

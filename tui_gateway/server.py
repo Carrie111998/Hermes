@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -15174,6 +15174,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "history",
         "models",
         "prompt",
+        "refine",
         "rename",
         "review",
         "status",
@@ -15182,6 +15183,45 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
 )
 
 _ISOLATED_SESSION_READ_COMMANDS = frozenset({"context", "tools", "help"})
+
+
+def _live_session_dispatch_preflight(cmd: str, session: Optional[dict]) -> Optional[str]:
+    """Shared /review + /refine guards; returns the refusal text or None.
+
+    Order matters: the agent check needs a non-None session, so session-None
+    must resolve first.
+    """
+    if session is None:
+        return f"Nothing to {cmd} yet — send a message first."
+    if _session_uses_compute_host(session):
+        return (
+            f"/{cmd} runs on the local agent only for now — this session's "
+            "agent lives on a remote compute host."
+        )
+    if session.get("agent") is None:
+        return f"Nothing to {cmd} yet — send a message first."
+    if session.get("running"):
+        return f"session busy — wait for the current turn to finish, then /{cmd}"
+    return None
+
+
+def _snapshot_live_history(session: dict) -> List[Dict[str, Any]]:
+    """Snapshot the live conversation for a background fork.
+
+    Prefers the session's own history under its lock; falls back to the
+    agent's message list when the session record hasn't been populated yet
+    (the two alias each other once a turn completes).
+    """
+    history_lock = session.get("history_lock")
+    if history_lock is not None:
+        with history_lock:
+            snapshot = list(session.get("history", []))
+    else:
+        snapshot = list(session.get("history", []))
+    if not snapshot:
+        agent = session.get("agent")
+        snapshot = list(getattr(agent, "_session_messages", None) or [])
+    return snapshot
 
 
 def _format_live_review_output(session: Optional[dict], arg: str) -> str:
@@ -15195,27 +15235,13 @@ def _format_live_review_output(session: Optional[dict], arg: str) -> str:
     fallback), which is exactly what ``_session_owns_notification_event``
     matches against.
     """
-    if session is None:
-        return "Nothing to review yet — send a message first."
-    if _session_uses_compute_host(session):
-        return (
-            "/review runs on the local agent only for now — this session's "
-            "agent lives on a remote compute host."
-        )
-    agent = session.get("agent")
-    if agent is None:
-        return "Nothing to review yet — send a message first."
-    if session.get("running"):
-        return "session busy — wait for the current turn to finish, then /review"
+    refusal = _live_session_dispatch_preflight("review", session)
+    if refusal:
+        return refusal
 
-    history_lock = session.get("history_lock")
-    if history_lock is not None:
-        with history_lock:
-            snapshot = list(session.get("history", []))
-    else:
-        snapshot = list(session.get("history", []))
-    if not snapshot:
-        snapshot = list(getattr(agent, "_session_messages", None) or [])
+    assert session is not None  # preflight guarantees non-None from here on
+    agent = session["agent"]
+    snapshot = _snapshot_live_history(session)
 
     try:
         from agent.review_engine import format_dispatch_note, start_review
@@ -15226,6 +15252,55 @@ def _format_live_review_output(session: Optional[dict], arg: str) -> str:
     except Exception as exc:
         return f"/review failed to start: {exc}"
     return format_dispatch_note(result, arg or "")
+
+
+def _format_live_refine_output(session: Optional[dict], arg: str) -> str:
+    """Dispatch /refine against the live TUI/desktop session's agent.
+
+    Runs the memory/skill review fork (``AIAgent._spawn_background_review``)
+    on a snapshot of the live conversation — the same machinery as the
+    automatic post-turn review, but user-triggered with optional focus
+    instructions. Writes go to the memory + skill stores in a background
+    thread; the live conversation and prompt cache are untouched. Must run
+    on the live agent: the slash-worker subprocess never constructs one for
+    pure slash commands.
+    """
+    refusal = _live_session_dispatch_preflight("refine", session)
+    if refusal:
+        return refusal
+
+    assert session is not None  # preflight guarantees non-None from here on
+    agent = session["agent"]
+    snapshot = _snapshot_live_history(session)
+    if not snapshot:
+        return "Nothing to refine yet — the conversation is empty."
+
+    review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
+    focus = (arg or "").strip() or None
+    try:
+        started = agent._spawn_background_review(
+            messages_snapshot=snapshot,
+            review_memory=True,
+            review_skills=review_skills,
+            focus=focus,
+        )
+    except Exception as exc:
+        return f"/refine failed to start: {exc}"
+    # _spawn_background_review returns False (pre-fix callers may return
+    # None) when it silently declined: a review run is already active, or
+    # automatic reviews are disabled and no focus was given. Never claim a
+    # start that didn't happen.
+    if not started:
+        return (
+            "No review was started — a background review is already running "
+            "(or automatic reviews are disabled). Try again shortly, or add "
+            "focus instructions to force a manual pass."
+        )
+    tail = f" (focus: {focus})" if focus else ""
+    return (
+        f"⚗ Reviewing this conversation in the background{tail} — "
+        f"any memory/skill updates will be reported when done."
+    )
 
 
 def _format_live_usage_output(session: dict) -> str:
@@ -15435,6 +15510,8 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         return _format_live_usage_output(session)
     if name == "review":
         return _format_live_review_output(session, arg)
+    if name == "refine":
+        return _format_live_refine_output(session, arg)
     if name == "history":
         if session is None:
             return "No conversation history yet."
