@@ -358,7 +358,9 @@ def _normalize_input_images(
     for ref in normalize_reference_images(reference_image_urls) or []:
         values.append(ref)
     if len(values) > _MAX_INPUT_IMAGES:
-        raise ValueError("Codex image edits accept at most 5 total images")
+        raise ValueError(
+            "Hermes' first-party Codex client accepts at most 5 total images"
+        )
     return [_to_input_image_part(value) for value in values]
 
 

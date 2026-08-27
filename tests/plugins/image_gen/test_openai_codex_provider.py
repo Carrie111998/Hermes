@@ -348,7 +348,7 @@ class TestRequestShape:
         assert captured["accept"] == "application/json"
         assert captured["authorization"] == "Bearer codex-token"
         assert captured["content_type"] == "application/json"
-        assert captured["originator"] == "codex_cli_rs"
+        assert captured["originator"] == "hermes-agent"
         assert captured["turn_id"]
         assert captured["payload"]["prompt"] == "a cat"
 
@@ -392,7 +392,7 @@ class TestRequestShape:
         assert captured["path"].endswith("/codex/images/edits")
         assert captured["authorization"] == "Bearer codex-token"
         assert captured["content_type"] == "application/json"
-        assert captured["originator"] == "codex_cli_rs"
+        assert captured["originator"] == "hermes-agent"
         assert captured["turn_id"]
         assert captured["payload"]["images"] == [{"image_url": image["image_url"]}]
 
@@ -587,8 +587,13 @@ class TestRequestShape:
             path.write_bytes(bytes.fromhex(_PNG_HEX))
             paths.append(str(path))
 
-        with pytest.raises(ValueError, match="at most 5 total images"):
+        with pytest.raises(ValueError, match="at most 5 total images") as excinfo:
             codex_plugin._normalize_input_images(paths[0], paths[1:])
+
+        # Compatibility disclosure is deliberately scoped to Hermes' Codex
+        # client contract; it does not claim an independently measured server
+        # ceiling for the Images endpoint.
+        assert "first-party Codex client" in str(excinfo.value)
 
     def test_primary_plus_five_references_returns_invalid_input(
         self, provider, monkeypatch, tmp_path
@@ -611,6 +616,7 @@ class TestRequestShape:
         assert result["success"] is False
         assert result["error_type"] == "invalid_image_input"
         assert "at most 5 total images" in result["error"]
+        assert "first-party Codex client" in result["error"]
 
 
 # ── Plugin entry point ──────────────────────────────────────────────────────
