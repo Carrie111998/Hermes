@@ -675,12 +675,24 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    dispatch=None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
+
+    ``dispatch`` overrides how an allowed, budgeted call is executed:
+    per-call sandboxes use the default (this thread already carries the
+    cell's context via propagate_context_to_thread), while session kernels
+    pass a dispatcher that rebinds each call to the CURRENT cell's
+    authority — the serving thread outlives many cells there and must not
+    freeze the first cell's context.
     """
     from model_tools import handle_function_call
+
+    if dispatch is None:
+        def dispatch(tool_name, tool_args):
+            return handle_function_call(tool_name, tool_args, task_id=task_id)
 
     conn = None
     try:
@@ -762,9 +774,7 @@ def _rpc_server_loop(
                 # their status prints don't leak into the CLI spinner.
                 try:
                     with thread_scoped_silence():
-                        result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
-                        )
+                        result = dispatch(tool_name, tool_args)
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
                     result = tool_error(str(exc))

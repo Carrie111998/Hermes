@@ -174,3 +174,190 @@ class TestSchemaSurface(unittest.TestCase):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestKernelOwnershipAndLifecycle(unittest.TestCase):
+    """The kernel belongs to the conversation, and its lifetime is bounded.
+
+    run_agent mints a fresh task id per top-level turn, so a task-keyed
+    kernel would neither survive the next user turn nor ever be disposed
+    with anything. The owner is the approval session key; disposal rides
+    the same session boundary that clears approval/yolo state, idle
+    kernels are reaped, and the process-wide live count is capped (the
+    lifecycle shape carried forward from hermes-agent#88637).
+    """
+
+    def _run_as(self, session_key, code, task_id, **kwargs):
+        from tools.approval import reset_current_session_key, set_current_session_key
+
+        token = set_current_session_key(session_key)
+        try:
+            return json.loads(execute_code(code, task_id=task_id, **kwargs))
+        finally:
+            reset_current_session_key(token)
+
+    def test_state_survives_across_turns_of_one_conversation(self):
+        # Two top-level turns: same session, different per-turn task ids.
+        with _kernel_config():
+            first = self._run_as("conv-a", "x = 41", task_id="turn-1")
+            self.assertEqual(first["status"], "success", first)
+            second = self._run_as("conv-a", "print(x + 1)", task_id="turn-2")
+        self.assertEqual(second["status"], "success", second)
+        self.assertIn("42", second["output"])
+        self.assertEqual(second["kernel"]["reused"], True)
+
+    def test_sessions_are_isolated_from_each_other(self):
+        # Same task id, different sessions (a delegated subagent runs under
+        # its own session key): no state may cross.
+        with _kernel_config():
+            self._run_as("conv-a", "x = 41", task_id="turn-1")
+            other = self._run_as("conv-b", "print(x + 1)", task_id="turn-1")
+        self.assertEqual(other["status"], "error", other)
+        self.assertIn("NameError", other.get("error", ""))
+
+    def test_session_clear_disposes_the_owners_kernels(self):
+        from tools.approval import clear_session
+
+        with _kernel_config():
+            self._run_as("conv-a", "x = 41", task_id="turn-1")
+            self.assertEqual(len(_KERNELS), 1)
+            kernel = next(iter(_KERNELS.values()))
+            self.assertTrue(kernel.alive())
+            clear_session("conv-a")
+            self.assertEqual(len(_KERNELS), 0)
+            kernel.proc.wait(timeout=10)
+            self.assertFalse(kernel.alive())
+            # The next turn in a cleared session starts fresh.
+            after = self._run_as("conv-a", "print('x' in dir())", task_id="turn-2")
+        self.assertEqual(after["status"], "success", after)
+        self.assertIn("False", after["output"])
+
+    def test_live_kernels_are_capped_lru_across_owners(self):
+        with _kernel_config(max_session_kernels=2):
+            kernels = []
+            for index in range(4):
+                self._run_as(f"conv-{index}", "x = 1", task_id=f"turn-{index}")
+                kernels.append(list(_KERNELS.values()))
+            self.assertLessEqual(len(_KERNELS), 2)
+            live_owners = {key[0] for key in _KERNELS}
+            # The two most recently used owners survive.
+            self.assertEqual(live_owners, {"conv-2", "conv-3"})
+        # Evicted kernels are actually dead, not orphaned.
+        evicted = [
+            kernel
+            for snapshot in kernels
+            for kernel in snapshot
+            if kernel.key not in _KERNELS
+        ]
+        for kernel in evicted:
+            kernel.proc.wait(timeout=10)
+            self.assertFalse(kernel.alive())
+
+    def test_idle_kernels_are_reaped(self):
+        import time as time_module
+
+        with _kernel_config(kernel_idle_timeout=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-1")
+            stale = next(iter(_KERNELS.values()))
+            time_module.sleep(1.2)
+            # Any owner's next call sweeps expired kernels process-wide.
+            self._run_as("conv-b", "y = 1", task_id="turn-2")
+            self.assertNotIn(stale.key, _KERNELS)
+            stale.proc.wait(timeout=10)
+            self.assertFalse(stale.alive())
+
+
+class TestPerCellRpcAuthority(unittest.TestCase):
+    """Interpreter state persists across cells; RPC authority must not."""
+
+    def _recorder(self, seen):
+        def _handle(tool_name, tool_args, task_id=None):
+            from tools.thread_context import _callback_api
+
+            get_approval, _get_sudo, _set_a, _set_s = _callback_api()
+            seen.append(
+                {
+                    "tool": tool_name,
+                    "task_id": task_id,
+                    "approval_cb": get_approval(),
+                }
+            )
+            return json.dumps({"ok": True})
+
+        return _handle
+
+    def test_a_later_cells_rpc_runs_under_that_cells_authority(self):
+        from tools.terminal_tool import set_approval_callback
+
+        seen = []
+        cell = "import hermes_tools\nhermes_tools.web_search(query='q')\n"
+        with _kernel_config(), patch(
+            "model_tools.handle_function_call", new=self._recorder(seen)
+        ):
+            def cb_one():
+                return "one"
+
+            def cb_two():
+                return "two"
+
+            set_approval_callback(cb_one)
+            try:
+                first = _run(cell)
+                set_approval_callback(cb_two)
+                second = _run(cell)
+            finally:
+                set_approval_callback(None)
+        self.assertEqual(first["status"], "success", first)
+        self.assertEqual(second["status"], "success", second)
+        self.assertEqual(len(seen), 2)
+        self.assertIs(seen[0]["approval_cb"], cb_one)
+        self.assertIs(seen[1]["approval_cb"], cb_two)
+        self.assertEqual(seen[0]["task_id"], "kernel-test")
+
+    def test_cross_cell_alias_dispatches_under_the_current_cell(self):
+        # Adversarial cross-cell dataflow: a callable captured in cell 1 and
+        # invoked by an opaque global name in cell 2 still crosses the RPC
+        # boundary — under cell 2's authority, allow-list, and budget — the
+        # operative enforcement a per-script static scan cannot provide once
+        # state persists (composition contract with the execute-code guard).
+        from tools.terminal_tool import set_approval_callback
+
+        seen = []
+        with _kernel_config(), patch(
+            "model_tools.handle_function_call", new=self._recorder(seen)
+        ):
+            def cb_one():
+                return "one"
+
+            def cb_two():
+                return "two"
+
+            set_approval_callback(cb_one)
+            try:
+                first = _run("import hermes_tools\nalias = hermes_tools.web_search\n")
+                set_approval_callback(cb_two)
+                second = _run("alias(query='q')\n")
+            finally:
+                set_approval_callback(None)
+        self.assertEqual(first["status"], "success", first)
+        self.assertEqual(second["status"], "success", second)
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0]["approval_cb"], cb_two)
+
+    def test_a_settled_cells_authority_refuses_dispatch(self):
+        from tools.code_kernel import CellAuthority
+
+        authority = CellAuthority("turn-1")
+        authority.retire()
+        result = authority.dispatch("web_search", {"query": "q"})
+        self.assertIn("No active execute_code cell", result)
+
+    def test_each_cell_installs_a_fresh_authority(self):
+        with _kernel_config():
+            _run("x = 1")
+            kernel = next(iter(_KERNELS.values()))
+            first_authority = kernel.cell_authority
+            self.assertFalse(first_authority.active)
+            _run("y = 2")
+            self.assertIsNot(kernel.cell_authority, first_authority)
+            self.assertFalse(kernel.cell_authority.active)

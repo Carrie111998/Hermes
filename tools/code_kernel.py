@@ -151,11 +151,85 @@ if __name__ == "__main__":
 '''.format(capture_limit=_RUNNER_CAPTURE_BYTES)
 
 
+class CellAuthority:
+    """The approval/context identity of exactly one execute_code cell.
+
+    Interpreter state persists across cells; RPC authority must not. Each
+    cell installs a fresh authority — captured from the CALLING thread at
+    cell start, exactly what ``propagate_context_to_thread`` would have
+    captured for a per-call RPC thread — and retires it when the cell
+    settles, so a tool call arriving later (a background thread the cell
+    left behind, a raced client write) is refused instead of running under
+    a stale approval/session/turn identity.
+    """
+
+    def __init__(self, task_id: str):
+        import contextvars
+
+        self.task_id = task_id
+        self.ctx = contextvars.copy_context()
+        self.active = True
+        self._approval_cb = None
+        self._sudo_cb = None
+        self._callback_setters = None
+        try:
+            from tools.thread_context import _callback_api
+
+            get_approval, get_sudo, set_approval, set_sudo = _callback_api()
+            self._approval_cb = get_approval()
+            self._sudo_cb = get_sudo()
+            self._callback_setters = (set_approval, set_sudo)
+        except Exception:
+            # Fail-closed, mirroring propagate_context_to_thread: with no
+            # callbacks installed, dangerous approvals deny.
+            self._callback_setters = None
+
+    def retire(self) -> None:
+        self.active = False
+
+    def dispatch(self, tool_name: str, tool_args: dict) -> str:
+        """Run one tool call under THIS cell's context and callbacks."""
+        from tools.code_execution_tool import tool_error
+
+        if not self.active:
+            return tool_error(
+                "No active execute_code cell: the cell this kernel call "
+                "belonged to has settled, so its tool authority is retired."
+            )
+        return self.ctx.run(self._invoke, tool_name, tool_args)
+
+    def _invoke(self, tool_name: str, tool_args: dict) -> str:
+        from model_tools import handle_function_call
+
+        previous = None
+        if self._callback_setters is not None:
+            try:
+                from tools.thread_context import _callback_api
+
+                get_approval, get_sudo, set_approval, set_sudo = _callback_api()
+                previous = (get_approval(), get_sudo())
+                set_approval(self._approval_cb)
+                set_sudo(self._sudo_cb)
+            except Exception:
+                previous = None
+        try:
+            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+        finally:
+            if previous is not None and self._callback_setters is not None:
+                set_approval, set_sudo = self._callback_setters
+                try:
+                    set_approval(previous[0])
+                    set_sudo(previous[1])
+                except Exception:
+                    pass
+
+
 class SessionKernel:
     """One live kernel process plus its RPC server and reader threads."""
 
     def __init__(self, key: Tuple):
         self.key = key
+        self.owner: str = key[0]
         self.lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
         self.tmpdir: str = ""
@@ -172,6 +246,8 @@ class SessionKernel:
         self.stderr_chunks: List[bytes] = []
         self.stderr_bytes = [0]
         self.execution_count = 0
+        self.last_used: float = time.monotonic()
+        self.cell_authority: Optional[CellAuthority] = None
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -180,10 +256,55 @@ class SessionKernel:
 _KERNELS: Dict[Tuple, SessionKernel] = {}
 _KERNELS_LOCK = threading.Lock()
 
+# Bounded lifecycle defaults (config: code_execution.max_session_kernels /
+# code_execution.kernel_idle_timeout). A long-lived gateway must never
+# accumulate one live child per finished conversation — the ownership,
+# disposal, idle-reap, and cap shape here deliberately carries forward the
+# lifecycle invariants of the earlier session-persistent implementation in
+# hermes-agent#88637 by @z80dev (stable owner id, owner-teardown disposal,
+# idle reaping, max-live bound).
+DEFAULT_MAX_SESSION_KERNELS = 4
+DEFAULT_KERNEL_IDLE_TIMEOUT = 1800
 
-def _kernel_key(task_id: str, mode: str, child_python: str, child_cwd: str,
+
+def _lifecycle_limits() -> Tuple[int, int]:
+    from tools.code_execution_tool import _load_config
+
+    config = _load_config()
+    try:
+        cap = int(config.get("max_session_kernels", DEFAULT_MAX_SESSION_KERNELS))
+    except (TypeError, ValueError):
+        cap = DEFAULT_MAX_SESSION_KERNELS
+    try:
+        idle = int(config.get("kernel_idle_timeout", DEFAULT_KERNEL_IDLE_TIMEOUT))
+    except (TypeError, ValueError):
+        idle = DEFAULT_KERNEL_IDLE_TIMEOUT
+    return max(1, cap), max(1, idle)
+
+
+def _resolve_owner(task_id: str) -> str:
+    """The stable identity a session kernel belongs to.
+
+    The conversation's approval session key — context-propagated, stable
+    across turns of one conversation, and distinct per session (delegated
+    subagent sessions carry their own keys, which is what isolates their
+    kernels). ``run_agent`` mints a fresh task id per top-level turn, so a
+    task-keyed kernel would neither survive the next user turn nor ever be
+    torn down with anything; the task id is only the last-resort owner for
+    embeds and tests that run with no session context at all.
+    """
+    try:
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="")
+    except Exception:
+        session_key = ""
+    return session_key or (task_id or "")
+
+
+def _kernel_key(owner: str, mode: str, child_python: str, child_cwd: str,
                 sandbox_tools: frozenset) -> Tuple:
-    return (task_id or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+    return (owner or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
 
 
 def shutdown_all_kernels() -> None:
@@ -193,6 +314,47 @@ def shutdown_all_kernels() -> None:
         _KERNELS.clear()
     for kernel in kernels:
         _teardown(kernel)
+
+
+def shutdown_kernels_for_owner(owner: str) -> None:
+    """Dispose every kernel a session owns.
+
+    Wired into ``tools.approval.clear_session`` so kernels die at the same
+    session boundary that clears the owner's approval and yolo state
+    (the /new + session-close disposal shape from hermes-agent#88637).
+    """
+    if not owner:
+        return
+    with _KERNELS_LOCK:
+        doomed = [key for key in _KERNELS if key[0] == owner]
+        kernels = [_KERNELS.pop(key) for key in doomed]
+    for kernel in kernels:
+        _teardown(kernel)
+
+
+def _reap_unlocked() -> List[SessionKernel]:
+    """Pop idle-expired kernels; caller tears them down outside the lock."""
+    _, idle_timeout = _lifecycle_limits()
+    now = time.monotonic()
+    doomed = [
+        key
+        for key, kernel in _KERNELS.items()
+        if now - kernel.last_used > idle_timeout
+    ]
+    return [_KERNELS.pop(key) for key in doomed]
+
+
+def _evict_over_cap_unlocked(keep: Tuple) -> List[SessionKernel]:
+    """Pop least-recently-used kernels beyond the process-wide cap."""
+    cap, _ = _lifecycle_limits()
+    if len(_KERNELS) <= cap:
+        return []
+    by_age = sorted(
+        (key for key in _KERNELS if key != keep),
+        key=lambda key: _KERNELS[key].last_used,
+    )
+    doomed = by_age[: len(_KERNELS) - cap]
+    return [_KERNELS.pop(key) for key in doomed]
 
 
 atexit.register(shutdown_all_kernels)
@@ -221,7 +383,7 @@ def _teardown(kernel: SessionKernel) -> None:
         shutil.rmtree(kernel.tmpdir, ignore_errors=True)
 
 
-def _rpc_forever(kernel: SessionKernel, task_id: str, max_tool_calls: int,
+def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
                  sandbox_tools: frozenset) -> None:
     """Serve tool RPC for the kernel's whole life.
 
@@ -229,19 +391,35 @@ def _rpc_forever(kernel: SessionKernel, task_id: str, max_tool_calls: int,
     on its 300s idle timeout; a kernel legitimately sits idle longer than
     that between cells, so re-accept until the kernel is torn down. The
     client stub reconnects on its side (HERMES_RPC_PERSISTENT).
+
+    The serving thread carries NO frozen authority of its own: every
+    dispatch is routed through the CURRENT cell's ``CellAuthority``, so a
+    later cell's tool calls run under that cell's approval/session/turn
+    context instead of whatever the first cell happened to capture.
+    Interpreter state persists; RPC authority does not.
     """
-    from tools.code_execution_tool import _rpc_server_loop
+    from tools.code_execution_tool import _rpc_server_loop, tool_error
+
+    def _dispatch(tool_name: str, tool_args: dict) -> str:
+        authority = kernel.cell_authority
+        if authority is None:
+            return tool_error(
+                "No active execute_code cell: this kernel has no cell "
+                "authority installed."
+            )
+        return authority.dispatch(tool_name, tool_args)
 
     while not kernel.stop_event.is_set():
         _rpc_server_loop(
             kernel.server_sock,
-            task_id,
+            "",
             kernel.tool_call_log,
             kernel.tool_call_counter,
             max_tool_calls,
             sandbox_tools,
             kernel.stop_event,
             kernel.rpc_token,
+            dispatch=_dispatch,
         )
 
 
@@ -383,11 +561,12 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
         creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
     )
 
-    from tools.thread_context import propagate_context_to_thread
-
+    # Deliberately NOT propagate_context_to_thread: that would freeze the
+    # spawning cell's context/callbacks into the server thread for the
+    # kernel's whole life. Authority is rebound per cell via CellAuthority.
     threading.Thread(
-        target=propagate_context_to_thread(_rpc_forever),
-        args=(kernel, task_id, max_tool_calls, sandbox_tools),
+        target=_rpc_forever,
+        args=(kernel, max_tool_calls, sandbox_tools),
         daemon=True,
     ).start()
     threading.Thread(target=_stdout_reader, args=(kernel,), daemon=True).start()
@@ -417,7 +596,14 @@ def execute_in_session_kernel(
     reset: bool,
     is_interrupted,
 ) -> str:
-    """Run one cell in the (task, mode, python, cwd, tools) session kernel."""
+    """Run one cell in the (owner, mode, python, cwd, tools) session kernel.
+
+    The owner is the conversation's session key (``_resolve_owner``), not
+    the per-turn task id, so state genuinely survives across user turns of
+    one conversation and dies with the session. Every entry also sweeps
+    idle-expired kernels and enforces the process-wide cap, so a long-lived
+    host stays bounded even for owners that never toggle or reset.
+    """
     from tools.code_execution_tool import (
         _sandbox_failure_hint,
         _truncate_stdout_text,
@@ -425,21 +611,33 @@ def execute_in_session_kernel(
     from agent.redact import redact_sensitive_text
     from tools.ansi_strip import strip_ansi
 
-    key = _kernel_key(task_id, mode, child_python, child_cwd, sandbox_tools)
+    owner = _resolve_owner(task_id)
+    key = _kernel_key(owner, mode, child_python, child_cwd, sandbox_tools)
     exec_start = time.monotonic()
     state_reset = False
 
     with _KERNELS_LOCK:
+        expired = _reap_unlocked()
         kernel = _KERNELS.get(key)
         if kernel is not None and (reset or not kernel.alive()):
             _KERNELS.pop(key, None)
-            _teardown(kernel)
+            expired.append(kernel)
             kernel = None
             state_reset = True
         if kernel is None:
             kernel = SessionKernel(key)
             _KERNELS[key] = kernel
+        kernel.last_used = time.monotonic()
+        expired.extend(_evict_over_cap_unlocked(keep=key))
+    for doomed in expired:
+        _teardown(doomed)
     reused = kernel.proc is not None
+
+    # Captured on the calling thread BEFORE the cell runs — the same
+    # snapshot a per-call RPC thread would have received — and installed
+    # atomically on the kernel so the serving thread dispatches this cell's
+    # tool calls under this cell's approval/session/turn identity.
+    authority = CellAuthority(task_id)
 
     with kernel.lock:
         try:
@@ -460,6 +658,7 @@ def execute_in_session_kernel(
             # Anything raw that leaked between cells belongs to no cell.
             _drain_raw(kernel)
             _drain_stderr(kernel)
+            kernel.cell_authority = authority
 
             request = json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n"
             kernel.proc.stdin.write(request.encode("utf-8"))
@@ -581,3 +780,8 @@ def execute_in_session_kernel(
                 "tool_calls_made": kernel.tool_call_counter[0],
                 "duration_seconds": round(time.monotonic() - exec_start, 2),
             }, ensure_ascii=False)
+        finally:
+            # The cell has settled on every path (success, exception,
+            # timeout, exit, kernel death): its tool authority retires with
+            # it, so nothing the cell left running can dispatch under it.
+            authority.retire()
