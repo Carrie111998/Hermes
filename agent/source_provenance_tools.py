@@ -108,6 +108,35 @@ def attach_trusted_source_provenance_metadata(
         return None
 
 
+def build_source_provenance_sidecar(messages: Any) -> list[dict[str, Any]]:
+    """Extract bounded content-free provenance before wire conversion strips it."""
+
+    if not isinstance(messages, list):
+        return []
+    sidecar: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        metadata = message.get("_source_provenance")
+        content = message.get("content")
+        if (
+            message.get("role") != "tool"
+            or not isinstance(metadata, dict)
+            or not isinstance(content, str)
+            or metadata.get("content_sha256")
+            != sha256(content.encode("utf-8")).hexdigest()
+        ):
+            continue
+        sidecar.append(
+            {
+                **metadata,
+                "message_index": index,
+                "tool_call_id": message.get("tool_call_id"),
+            }
+        )
+    return sidecar
+
+
 def issue_active_read_provenance(
     *,
     resolved: Path | PurePosixPath,
@@ -163,6 +192,7 @@ def issue_active_read_provenance(
 
 __all__ = [
     "attach_trusted_source_provenance_metadata",
+    "build_source_provenance_sidecar",
     "issue_active_read_provenance",
     "source_provenance_activation",
 ]
