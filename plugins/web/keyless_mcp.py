@@ -54,6 +54,7 @@ _RATE_LIMIT_MARKERS = (
     "429",
     "quota exceeded",
     "slow down",
+    "daily_cap_reached",
 )
 
 
