@@ -3971,7 +3971,24 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """Remove a dependency edge.
+
+    Refuses while the PARENT is parked at a human approval gate. Removing that
+    edge is a gate release by another name: the parent stays gated but stops
+    blocking the child, and the ``recompute_ready`` below then promotes the
+    child if this was its last blocking dependency — with no human approval.
+
+    POLICY — a gated CHILD's edges are deliberately NOT frozen (see the route
+    inventory in ``M3B-SLICE-1-RESULT.md``). Editing them cannot release
+    anything: the child remains gated either way, and ``release_plan_gate``
+    re-evaluates ``_parents_satisfied`` at approval time, so the human's
+    decision is applied against the graph as it stands when they approve. The
+    calculus changes only once an attestation binds the task graph rather than
+    the plan text; at that point both directions should freeze.
+    """
     with write_txn(conn):
+        if _refuse_if_gated(conn, parent_id, via="unlink_tasks"):
+            return False
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -6990,9 +7007,24 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, gate_state FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        # A task parked at a HUMAN APPROVAL GATE must not be released by the
+        # ordinary resume path. ``unblock_task`` is reachable from the CLI, the
+        # ``/kanban unblock`` slash command, cron automation, and the dashboard
+        # — none of which carries proof of human approval. The only way out of
+        # a gate is ``release_plan_gate``.
+        #
+        # This lives at the DB layer on purpose: the tool and dashboard guards
+        # above it are UX, not trust boundaries. Anything that reaches this
+        # function — including a worker shelling out to the CLI — is refused.
+        if current is not None and current["gate_state"]:
+            record_gate_release_refusal(
+                conn, task_id,
+                via="unblock_task", gate_state=current["gate_state"],
+            )
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -7602,6 +7634,12 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        # A gated task must not become terminal. ``archived`` counts as
+        # satisfied in ``_parents_satisfied``, so archiving a gated PARENT
+        # would let ``recompute_ready`` (called at the end of this function)
+        # advance its children without the human approval the gate requires.
+        if _refuse_if_gated(conn, task_id, via="archive_task"):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7643,6 +7681,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        # Defence in depth. A correctly gated task stays ``scheduled`` and can
+        # never reach this function, but a legacy, hand-edited, or corrupted
+        # archived row that still carries ``gate_state`` must not be purgeable
+        # either — purging it would silently drop the gate along with the row.
+        if _refuse_if_gated(conn, task_id, via="delete_archived_task"):
+            return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7666,6 +7710,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        # Deleting a gated task drops its task_links rows, so its children stop
+        # being gated at all, and the recompute_ready below then advances them.
+        # That is the same bypass as archiving, by a more destructive route.
+        if _refuse_if_gated(conn, task_id, via="delete_task"):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8080,6 +8129,45 @@ def gate_state_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
         "SELECT gate_state FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     return row["gate_state"] if row else None
+
+
+def record_gate_release_refusal(
+    conn: sqlite3.Connection, task_id: str, *, via: str, gate_state: str
+) -> None:
+    """Append the audit row for a refused gate release.
+
+    One helper so every refusing path — DB verbs and the dashboard alike —
+    emits the same ``gate_release_refused`` event kind with a ``via`` tag
+    naming the route that was refused. Callers inside a ``write_txn`` get the
+    row in their own transaction; the dashboard calls it standalone.
+    """
+    _append_event(
+        conn, task_id, "gate_release_refused",
+        {"via": via, "gate_state": gate_state},
+    )
+
+
+def _refuse_if_gated(
+    conn: sqlite3.Connection, task_id: str, *, via: str
+) -> bool:
+    """True (and audited) when ``task_id`` is parked at a human approval gate.
+
+    Every terminal or destructive verb calls this. A gate is only worth having
+    if NO ordinary path can make a gated task terminal, gone, or otherwise
+    stop blocking its children: archiving a gated parent would let
+    ``recompute_ready`` advance its children, and deleting one would drop the
+    dependency links entirely. Both bypass the human approval the gate exists
+    to require.
+    """
+    row = conn.execute(
+        "SELECT gate_state FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["gate_state"]:
+        return False
+    record_gate_release_refusal(
+        conn, task_id, via=via, gate_state=row["gate_state"]
+    )
+    return True
 
 
 def park_for_plan_approval(
