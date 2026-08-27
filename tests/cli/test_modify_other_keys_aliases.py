@@ -487,11 +487,98 @@ def test_ctrl_backspace_with_numlock_is_backward_kill_word():
     assert _parse("\x1b[127;133u") == [Keys.Escape, Keys.ControlH]
 
 
-def test_modify_other_keys_tilde_form_has_no_lock_variants():
-    """The xterm modifyOtherKeys encoding never carries lock bits, so no
-    +64/+128 variants of the ESC[27;N;CP~ form may be installed."""
-    for seq in ("\x1b[27;69;99~", "\x1b[27;133;99~", "\x1b[27;197;99~"):
-        assert seq not in ANSI_SEQUENCES
+def test_modify_other_keys_tilde_form_lock_variants_map_same_as_base():
+    """Lock-bit variants of the modifyOtherKeys tilde form must parse the
+    same as the base sequence — iTerm2/ghostty/mintty under modifyOtherKeys
+    DO encode CapsLock/NumLock state into the modifier parameter, so
+    ESC[27;69;99~ (Ctrl+C + CapsLock) must parse identically to the raw
+    control byte, just like ESC[27;5;99~ already does.
+
+    The original "no lock variants" claim was wrong (#94930): the same
+    rationale that requires lock twins for CSI-u (5+64=69 for Ctrl+C with
+    CapsLock) applies to the tilde form. Without these aliases the
+    sequence arrives as raw `[27;69;99~` and leaks into the input line.
+    """
+    expected = _parse(chr(3))  # raw \x03 = Ctrl+C
+    for mod in (69, 133, 197):  # 5+64 / 5+128 / 5+64+128
+        assert _parse(f"\x1b[27;{mod};99~") == expected, (
+            f"modifyOtherKeys Ctrl+C + lock modifier={mod} should parse as raw \\x03"
+        )
+
+
+def test_unmapped_modify_other_keys_sequences_are_consumed():
+    """Regression for #94930: any modifyOtherKeys sequence (ESC[27;N;CP~)
+    that has no explicit mapping must be consumed silently instead of
+    falling through to the default text-insertion handler.
+
+    Before the fix, e.g. ESC[27;66;32~ (Shift+Space + CapsLock, which
+    iTerm2 emits under modifyOtherKeys with a lock on) arrived as the
+    literal text ``[27;66;32~`` and corrupted the input line. The fix
+    installs a catch-all that maps every plausible modifier+codepoint
+    combination to Keys.Ignore.
+    """
+    # These are all UNMAPPED pre-fix — each currently parses as multiple
+    # character keys (Escape + literal text) and leaks into the input.
+    # NOTE: ESC[27;66;32~ (Shift+Space + CapsLock) used to leak too but
+    # is now explicitly mapped to a space by the lock-twin installer —
+    # verified separately in test_modify_other_keys_tilde_form_lock_variants_map_same_as_base.
+    leak_cases = [
+        "\x1b[27;5;0~",    # Ctrl+@ (null codepoint, no Keys value)
+        "\x1b[27;2;126~",  # Shift+~ — printable, no explicit mapping
+        "\x1b[27;5;30~",   # Ctrl+RS (record separator — no key combo)
+        "\x1b[27;5;31~",   # Ctrl+US
+        "\x1b[27;3;124~",  # Alt+| — no explicit mapping
+        "\x1b[27;2;96~",   # Shift+` (backtick) — no explicit mapping
+    ]
+    for seq in leak_cases:
+        result = _parse(seq)
+        assert result == [Keys.Ignore], (
+            f"{seq!r} should be consumed (Keys.Ignore), got {result!r}"
+        )
+
+
+def test_unmapped_csi_u_sequences_are_consumed():
+    """Symmetric catch-all for CSI-u: any ESC[<codepoint>;N<locks>u
+    sequence not explicitly mapped must be consumed silently rather than
+    leaking as literal text."""
+    # These codepoints have no CSI-u mapping (no key in the codepoint
+    # table) but a terminal could still emit them under a modifier.
+    leak_cases = [
+        "\x1b[30;5u",     # RS under Ctrl — no mapping
+        "\x1b[31;5u",     # US under Ctrl
+        "\x1b[126;5u",    # ~ under Ctrl
+        "\x1b[124;2u",    # | under Shift
+        "\x1b[96;2u",     # ` under Shift
+        "\x1b[30;133u",   # RS + Ctrl + NumLock (lock twin of unmapped)
+    ]
+    for seq in leak_cases:
+        result = _parse(seq)
+        assert result == [Keys.Ignore], (
+            f"{seq!r} should be consumed (Keys.Ignore), got {result!r}"
+        )
+
+
+def test_catch_all_does_not_clobber_explicit_mappings():
+    """The catch-all must run AFTER explicit handlers and use setdefault
+    semantics — none of the existing mappings may change to Ignore."""
+    from hermes_cli.pt_input_extras import (
+        install_ctrl_enter_alias,
+        install_modify_other_keys_aliases,
+        install_shift_enter_alias,
+    )
+    install_shift_enter_alias()
+    install_ctrl_enter_alias()
+    install_modify_other_keys_aliases()
+
+    # Shift+Enter / Ctrl+Enter / Space / letters still fire their bindings
+    newline = _parse("\x1b\r")
+    assert _parse("\x1b[13;2u") == newline
+    assert _parse("\x1b[13;5u") == newline
+    assert _parse("\x1b[32;2u") == [" "]
+    assert _parse("\x1b[97;2u") == ["A"]
+    assert _parse("\x1b[99;5u") == [Keys.ControlC]
+    # The Esc key under disambiguate mode is still Escape
+    assert _parse("\x1b[27u") == [Keys.Escape]
 
 
 # ---------------------------------------------------------------------------

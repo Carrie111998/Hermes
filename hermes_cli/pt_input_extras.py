@@ -15,8 +15,15 @@ from __future__ import annotations
 # event while a lock is on: CapsLock=64, NumLock=128, both=192 (#88221,
 # #89651).  Every fixed-modifier CSI-u (and legacy CSI-tilde / CSI-letter)
 # registration therefore needs lock-offset twins, or those events leak into
-# the prompt as literal text.  The xterm modifyOtherKeys ``ESC[27;N;CP~``
-# encoding never carries lock bits, so it never gets the twins.
+# the prompt as literal text.
+#
+# Although the xterm ``modifyOtherKeys`` specification never defined the
+# lock bits for the ``ESC[27;N;CP~`` form, multiple real terminals encode
+# them anyway: iTerm2 under ``modifyOtherKeys=2`` with CapsLock on emits
+# e.g. ``ESC[27;66;32~`` for Shift+Space, ghostty/mintty have done
+# similar in the past. The xterm modifyOtherKeys tilde form therefore
+# also needs lock twins (#94930) — see ``install_modify_other_keys_aliases``
+# for the catch-all that handles any combination that is still missing.
 _LOCK_BIT_OFFSETS = (0, 64, 128, 192)
 
 
@@ -287,11 +294,19 @@ def install_modify_other_keys_aliases() -> int:
         mappings for the given modifier and codepoint→key mapping.
 
         The tilde form is skipped for modifier 1 ("no modifier") — xterm
-        never emits modifier-1 tilde sequences.
+        never emits modifier-1 tilde sequences. For modifiers ≥ 2 the
+        tilde form is registered with its full lock-bit twin set: although
+        the xterm ``modifyOtherKeys`` spec doesn't define the lock bits,
+        real terminals (iTerm2 under modifyOtherKeys=2 with CapsLock on,
+        #94930) emit ``ESC[27;N+64;CP~`` and the sequence must parse the
+        same as the lock-less form.
         """
         nonlocal changed
         for codepoint, key_val in mapping.items():
-            seqs = [] if modifier == 1 else [f"\x1b[27;{modifier};{codepoint}~"]
+            seqs = []
+            if modifier != 1:
+                for mod in _lock_variants(modifier):
+                    seqs.append(f"\x1b[27;{mod};{codepoint}~")
             for mod in _lock_variants(modifier):
                 seqs.append(f"\x1b[{codepoint};{mod}u")
             for seq in seqs:
@@ -489,6 +504,48 @@ def install_modify_other_keys_aliases() -> int:
     # New longer sequences can flip "is this a prefix of a longer match?"
     # answers the VT100 parser already cached — drop the cache so parsers
     # created before this install (or in earlier tests) can't misparse.
+    if changed:
+        _clear_vt100_prefix_cache()
+
+    # -- Catch-all for any CSI-u / modifyOtherKeys sequence still unmapped --
+    # Even after every targeted mapping above, terminals can still emit
+    # sequences for codepoints we have no explicit handler for (e.g.
+    # ``ESC[27;5;0~`` for Ctrl+@, ``ESC[27;66;32~`` for Shift+Space with
+    # CapsLock on in iTerm2 under modifyOtherKeys=2, or any CSI-u
+    # combination that falls outside our letter/digit/symbol set).
+    # Without this catch-all the bytes fall through prompt_toolkit's
+    # default handler and arrive in the input buffer as literal
+    # ``[27;66;32~`` text — the exact "garbage in the prompt" symptom
+    # reported in #94930.
+    #
+    # We register ``Keys.Ignore`` for every plausible (modifier × codepoint)
+    # pair that the terminal could plausibly emit. Codepoint universe is
+    # the union of ASCII control (0..31), printable ASCII (32..126), DEL
+    # (127), and the Kitty Private Use Area for functional keys
+    # (57344..57454). Modifier universe is 1..16 with each of the four
+    # lock-bit twins (0/64/128/192). Anything still missing after this
+    # loop is a malformed or out-of-spec sequence and will still leak,
+    # but every realistic terminal-emitted byte is consumed.
+    _csiu_codepoints = list(range(0, 128)) + list(range(57344, 57455))
+    for codepoint in _csiu_codepoints:
+        for mod in range(1, 17):
+            for lock_off in _LOCK_BIT_OFFSETS:
+                full_mod = mod + lock_off
+                csiu_seq = f"\x1b[{codepoint};{full_mod}u"
+                if csiu_seq not in ANSI_SEQUENCES:
+                    ANSI_SEQUENCES[csiu_seq] = Keys.Ignore
+                    changed += 1
+                # modifyOtherKeys tilde form: never emitted for mod=1
+                # (xterm uses CSI-u for modifier-less keys), and the
+                # "default base modifier 1" is a no-op for the lock-bit
+                # universe so we only enumerate mods 2..16 with their
+                # four lock twins each.
+                if mod != 1:
+                    mok_seq = f"\x1b[27;{full_mod};{codepoint}~"
+                    if mok_seq not in ANSI_SEQUENCES:
+                        ANSI_SEQUENCES[mok_seq] = Keys.Ignore
+                        changed += 1
+
     if changed:
         _clear_vt100_prefix_cache()
 
