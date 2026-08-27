@@ -5848,6 +5848,7 @@ def run_job(
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _non_dispatcher_token = None
+    _defer_cron_worker_teardown = False
     try:
         if not _cwd_lock_acquired:
             # Fail closed (#79768): running without the lock would let a
@@ -6533,6 +6534,24 @@ def run_job(
                 _cur_tool or "none",
             )
             request_hard_interrupt(agent, "Cron job timed out (inactivity)")
+            if not _cron_future.done():
+                # The worker is intentionally abandoned so a stuck provider or
+                # tool cannot wedge the scheduler. Its AIAgent and SessionDB
+                # must not be torn down while run_conversation is still using
+                # them, though: that turns the eventual flush into
+                # ``NoneType.execute`` and destroys the transcript. Transfer
+                # cleanup to the worker future's completion boundary instead.
+                _defer_cron_worker_teardown = True
+                _cron_future.add_done_callback(
+                    lambda future: _teardown_detached_cron_worker(
+                        future,
+                        session_db=_session_db,
+                        agent=agent,
+                        cron_session_id=_cron_session_id,
+                        job_id=job_id,
+                        job_name=job_name,
+                    )
+                )
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
@@ -6741,7 +6760,7 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
-        if _session_db:
+        if _session_db and not _defer_cron_worker_teardown:
             # The agent turn has already returned. Bound every subsequent DB
             # operation so storage failure cannot hold the dispatch guard.
             _session_db = _BoundedCronSessionDB(_session_db, job_id)
@@ -6822,11 +6841,75 @@ def run_job(
         # When the caller opted to defer teardown (passed a list), hand the live
         # agent back instead of closing it here — delivery must run against a
         # live async client, and the caller tears down afterwards (#58720).
-        if defer_agent_teardown is not None:
+        if _defer_cron_worker_teardown:
+            pass
+        elif defer_agent_teardown is not None:
             if agent is not None:
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
+
+
+def _teardown_detached_cron_worker(
+    future,
+    *,
+    session_db,
+    agent,
+    cron_session_id: str,
+    job_id: str,
+    job_name: str,
+) -> None:
+    """Finalize resources only after an abandoned cron worker has exited."""
+    try:
+        future.result()
+    except BaseException:
+        logger.debug(
+            "Job '%s': detached cron worker exited with an error",
+            job_id,
+            exc_info=True,
+        )
+
+    if session_db is not None:
+        bounded_db = _BoundedCronSessionDB(session_db, job_id)
+        final_session_id = getattr(agent, "session_id", None) or cron_session_id
+        try:
+            compression_tip = bounded_db.get_compression_tip(cron_session_id)
+            if compression_tip:
+                final_session_id = compression_tip
+        except (Exception, KeyboardInterrupt):
+            logger.debug(
+                "Job '%s': detached cleanup could not resolve compression tip",
+                job_id,
+                exc_info=True,
+            )
+        try:
+            title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+            title = f"{title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+            _set_cron_session_title(bounded_db, final_session_id, title)
+        except (Exception, KeyboardInterrupt):
+            logger.debug(
+                "Job '%s': detached cleanup could not title cron session",
+                job_id,
+                exc_info=True,
+            )
+        try:
+            bounded_db.end_session(final_session_id, "cron_timeout")
+        except (Exception, KeyboardInterrupt):
+            logger.debug(
+                "Job '%s': detached cleanup could not end cron session",
+                job_id,
+                exc_info=True,
+            )
+        try:
+            bounded_db.close()
+        except (Exception, KeyboardInterrupt):
+            logger.debug(
+                "Job '%s': detached cleanup could not close session store",
+                job_id,
+                exc_info=True,
+            )
+
+    _teardown_cron_agent(agent, job_id)
 
 
 def _teardown_cron_agent(

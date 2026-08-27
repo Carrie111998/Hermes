@@ -211,6 +211,23 @@ class TestRunSingleChildTimeoutDump:
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
 
+    def test_timeout_defers_child_close_until_worker_exits(self, hermes_home, monkeypatch):
+        """A detached worker must keep its persistence handle until it stops."""
+        child = _StubChild(api_call_count=1, hang_seconds=10.0)
+        child.interrupt = lambda *args, **kwargs: None
+        child.close = MagicMock()
+
+        result = self._invoke_with_short_timeout(child, monkeypatch)
+
+        assert result["status"] == "timeout"
+        assert not child.close.called
+
+        child._hang.set()
+        deadline = time.monotonic() + 2.0
+        while not child.close.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child.close.call_count == 1
+
 
     # ── explicit timeout metadata (#51690, salvaged from PR #60378) ────
 
