@@ -6151,10 +6151,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # Create the watcher awaitable ONCE (#95938): calling it
+                    # inside inspect.isawaitable() created a coroutine that was
+                    # then discarded, and the race branch below called
+                    # _watch_children() a SECOND time — so every
+                    # fast-fail-raced call leaked one never-awaited coroutine.
+                    # Checking the cheap _call_coro condition first means no
+                    # watcher coroutine is created at all when it could never
+                    # be scheduled.
+                    _watch_coro = (
+                        _watch_children()
+                        if (
+                            _watch_children is not None
+                            and asyncio.iscoroutine(_call_coro)
+                        )
+                        else None
+                    )
                     _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
-                        and asyncio.iscoroutine(_call_coro)
+                        _watch_coro is not None
+                        and inspect.isawaitable(_watch_coro)
                     )
                     if not _watch_ok:
                         # Stubbed sessions (MagicMock in tests) return a
@@ -6172,7 +6187,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_coro)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
