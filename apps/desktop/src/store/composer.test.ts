@@ -4,6 +4,7 @@ import {
   $composerAttachments,
   $voiceConversationStartRequest,
   addComposerAttachment,
+  claimSessionDraft,
   clearSessionDraft,
   clearSessionDraftIfRevision,
   type ComposerAttachment,
@@ -316,5 +317,19 @@ describe('session drafts', () => {
 
     clearSessionDraft('from')
     clearSessionDraft('to')
+  })
+
+  it('claims a legacy draft once even when the qualified destination is non-empty', () => {
+    stashSessionDraft('stored-1', 'legacy unqualified draft', [])
+    stashSessionDraft('profile-a\0stored-1', 'newer profile A draft', [])
+
+    expect(claimSessionDraft('stored-1', 'profile-a\0stored-1')).toBe(true)
+    expect(takeSessionDraft('profile-a\0stored-1').text).toBe('newer profile A draft')
+    expect(takeSessionDraft('stored-1').text).toBe('')
+
+    expect(claimSessionDraft('stored-1', 'profile-b\0stored-1')).toBe(false)
+    expect(takeSessionDraft('profile-b\0stored-1').text).toBe('')
+
+    clearSessionDraft('profile-a\0stored-1')
   })
 })

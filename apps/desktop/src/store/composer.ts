@@ -506,6 +506,39 @@ export function migrateSessionDraft(fromKey: string | null | undefined, toKey: s
   return true
 }
 
+/**
+ * Claim a one-time compatibility draft for one qualified owner.
+ *
+ * Unlike a same-conversation migration, a legacy unqualified source must not
+ * remain available when the claiming destination already has newer content:
+ * leaving it behind lets a later profile claim the same draft. Preserve the
+ * destination, consume the source, and report whether anything was claimed.
+ */
+export function claimSessionDraft(fromKey: string | null | undefined, toKey: string | null | undefined): boolean {
+  const from = draftKey(fromKey)
+  const to = draftKey(toKey)
+
+  if (fromKey === undefined || !toKey || from === to) {
+    return false
+  }
+
+  const source = draftsBySession.get(from)
+
+  if (!source || (!source.text.trim() && source.attachments.length === 0)) {
+    return false
+  }
+
+  const dest = draftsBySession.get(to)
+
+  if (!dest || (!dest.text.trim() && dest.attachments.length === 0)) {
+    stashSessionDraft(toKey, source.text, source.attachments)
+  }
+
+  clearSessionDraft(fromKey)
+
+  return true
+}
+
 export function setComposerDraft(value: string) {
   $composerDraft.set(value)
 }

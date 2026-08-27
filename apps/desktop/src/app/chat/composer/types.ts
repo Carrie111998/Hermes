@@ -31,6 +31,15 @@ export interface ChatBarState {
   voice: { enabled: boolean; active: boolean }
 }
 
+export type ComposerStorageMigrationKind = 'lineage' | 'new-session'
+
+/** Explicit same-owner handoff between two opaque persisted composer keys. */
+export interface ComposerStorageMigration {
+  fromKey: string
+  kind: ComposerStorageMigrationKind
+  toKey: string
+}
+
 export interface ChatBarProps {
   actionsDisabled?: boolean
   busy: boolean
@@ -45,6 +54,8 @@ export interface ChatBarProps {
   queueSessionKey?: string | null
   /** Profile-qualified local draft/attachment/queue key. Never sent to the backend. */
   storageScopeKey?: string | null
+  /** Explicit same-owner New Chat or lineage storage handoff. */
+  storageMigration?: ComposerStorageMigration
   sessionId?: string | null
   cwd?: string | null
   onCancel: () => Promise<void> | void

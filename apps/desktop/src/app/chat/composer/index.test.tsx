@@ -4,7 +4,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ThreadRuntime } from '@/components/assistant-ui/test-utils'
 import { registry } from '@/contrib/registry'
-import { clearSessionDraft, stashSessionDraft } from '@/store/composer'
+import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+import {
+  $parkedQueueSessions,
+  $queuedPromptsBySession,
+  enqueueQueuedPrompt,
+  getQueuedPrompts,
+  isQueueParked,
+  parkQueuedPrompts
+} from '@/store/composer-queue'
 
 import { COMPOSER_AREAS, type ComposerDraft, type ComposerMiddleware } from './contrib'
 import type { ChatBarProps } from './types'
@@ -45,7 +53,12 @@ describe('ChatBar transition focus', () => {
     clearSessionDraft('runtime-a')
     clearSessionDraft(null)
     clearSessionDraft('profile-a\0stored-1')
+    clearSessionDraft('profile-a\0tip-a')
+    clearSessionDraft('profile-a\0root-a')
+    clearSessionDraft('profile-a\0__new__')
     clearSessionDraft('profile-b\0stored-1')
+    $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
   })
 
   it('keeps the real contenteditable, draft, focus, and caret while actions become fenced', () => {
@@ -286,6 +299,78 @@ describe('ChatBar transition focus', () => {
     )
 
     expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe('legacy draft')
+  })
+
+  it('moves the qualified New Chat composer state onto its first stored session before paint', () => {
+    const newChatKey = 'profile-a\0__new__'
+    const storedKey = 'profile-a\0stored-1'
+
+    stashSessionDraft(newChatKey, 'first-session draft', [])
+    enqueueQueuedPrompt(newChatKey, { attachments: [], text: 'queued before create' })
+    parkQueuedPrompts(newChatKey)
+
+    const view = render(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar {...props({ busy: true, queueSessionKey: null, storageScopeKey: newChatKey })} />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    const editor = view.container.querySelector<HTMLElement>('[data-slot="composer-rich-input"]')!
+    expect(editor.textContent).toBe('first-session draft')
+
+    view.rerender(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar
+            {...props({
+              busy: true,
+              queueSessionKey: 'stored-1',
+              storageMigration: { fromKey: newChatKey, kind: 'new-session', toKey: storedKey },
+              storageScopeKey: storedKey
+            })}
+          />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    expect(view.container.querySelector('[data-slot="composer-rich-input"]')).toBe(editor)
+    expect(editor.textContent).toBe('first-session draft')
+    expect(takeSessionDraft(newChatKey).text).toBe('')
+    expect(takeSessionDraft(storedKey).text).toBe('first-session draft')
+    expect(getQueuedPrompts(newChatKey)).toHaveLength(0)
+    expect(getQueuedPrompts(storedKey).map(entry => entry.text)).toEqual(['queued before create'])
+    expect(isQueueParked(newChatKey)).toBe(false)
+    expect(isQueueParked(storedKey)).toBe(true)
+  })
+
+  it('moves a qualified lineage-tip draft before the root scope first takes and paints', () => {
+    const tipKey = 'profile-a\0tip-a'
+    const rootKey = 'profile-a\0root-a'
+
+    stashSessionDraft(tipKey, 'draft typed on compression tip', [])
+
+    const view = render(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar
+            {...props({
+              busy: true,
+              queueSessionKey: 'root-a',
+              storageMigration: { fromKey: tipKey, kind: 'lineage', toKey: rootKey },
+              storageScopeKey: rootKey
+            })}
+          />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe(
+      'draft typed on compression tip'
+    )
+    expect(takeSessionDraft(tipKey).text).toBe('')
+    expect(takeSessionDraft(rootKey).text).toBe('draft typed on compression tip')
   })
 
   it('swaps profile-qualified drafts when both profiles share the same stored id', () => {

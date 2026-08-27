@@ -7,6 +7,7 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
+  migrateQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
 
@@ -228,6 +229,41 @@ describe('useComposerQueue park integration', () => {
     await act(async () => settle?.(true))
 
     await waitFor(() => expect(getQueuedPrompts(sessionB)).toHaveLength(0))
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('hands an in-flight qualified tip drain lock and removal target to the lineage root', async () => {
+    const tipKey = 'profile-a\0tip-a'
+    const rootKey = 'profile-a\0root-a'
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(() => pending)
+
+    enqueueQueuedPrompt(tipKey, { attachments: [], text: 'lineage handoff' })
+
+    const { hook } = renderQueueHook({
+      onSubmit,
+      queueSessionKey: 'tip-a',
+      sessionKey: tipKey,
+      submitScopeKey: 'tip-a'
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      migrateQueuedPrompts(tipKey, rootKey)
+      hook.rerender({ busy: false, queueSessionKey: 'root-a', sessionKey: rootKey })
+    })
+
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    await act(async () => settle?.(true))
+
+    await waitFor(() => expect(getQueuedPrompts(rootKey)).toHaveLength(0))
     expect(onSubmit).toHaveBeenCalledTimes(1)
   })
 

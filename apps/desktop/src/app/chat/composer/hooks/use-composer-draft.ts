@@ -12,6 +12,7 @@ import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useSta
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import {
+  claimSessionDraft,
   type ComposerAttachment,
   type ComposerDraftSyncMode,
   migrateSessionDraft,
@@ -21,6 +22,7 @@ import {
   takeSessionDraft
 } from '@/store/composer'
 import { isBrowsingHistory } from '@/store/composer-input-history'
+import { migrateQueuedPrompts } from '@/store/composer-queue'
 import { clearDraftSuggestions, sampleComposerDraft } from '@/store/composer-suggestions'
 
 import {
@@ -57,6 +59,7 @@ interface UseComposerDraftArgs {
   legacyScopeKey?: string | null
   queueEditRef: RefObject<QueueEditState | null>
   sessionId: string | null | undefined
+  storageMigration?: ChatBarProps['storageMigration']
 }
 
 /**
@@ -76,7 +79,8 @@ export function useComposerDraft({
   inputDisabled,
   legacyScopeKey,
   queueEditRef,
-  sessionId
+  sessionId,
+  storageMigration
 }: UseComposerDraftArgs) {
   const aui = useAui()
   const composerRuntime = useComposerRuntime()
@@ -400,6 +404,22 @@ export function useComposerDraft({
     })
   }, [target])
 
+  // Storage re-homes are explicit events, not inferred from arbitrary key
+  // inequality. React runs the outgoing scope cleanup first (stashing the last
+  // editor snapshot), then this layout effect moves the complete persistent
+  // state before the incoming scope's layout effect takes and paints it.
+  const migrationFromKey = storageMigration?.fromKey
+  const migrationToKey = storageMigration?.toKey
+
+  useLayoutEffect(() => {
+    if (!migrationFromKey || !migrationToKey || migrationToKey !== activeQueueSessionKey) {
+      return
+    }
+
+    migrateSessionDraft(migrationFromKey, migrationToKey)
+    migrateQueuedPrompts(migrationFromKey, migrationToKey)
+  }, [activeQueueSessionKey, migrationFromKey, migrationToKey])
+
   // Per-thread draft swap — the composer's only session coupling. Lifecycle
   // never clears composer state; this effect alone stashes on leave, restores
   // on enter. Keyed writes are idempotent, so no skip-sentinel.
@@ -425,7 +445,8 @@ export function useComposerDraft({
     draftScopeRef.current = activeQueueSessionKey
 
     if (legacyScopeKey !== undefined && legacyScopeKey !== activeQueueSessionKey) {
-      migrateSessionDraft(legacyScopeKey, activeQueueSessionKey)
+      claimSessionDraft(legacyScopeKey, activeQueueSessionKey)
+      migrateQueuedPrompts(legacyScopeKey, activeQueueSessionKey)
     }
 
     const { attachments, text } = takeSessionDraft(activeQueueSessionKey)

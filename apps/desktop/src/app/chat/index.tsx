@@ -27,7 +27,7 @@ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-s
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { migrateSessionDraft } from '@/store/composer'
+import { claimSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -486,41 +486,31 @@ const ChatViewContent = memo(function ChatViewContent({
     : activeOwnerScopeKey
 
   const composerStorageScopeKey = `${composerOwnerScopeKey}\0${queueSessionKey ?? '__new__'}`
+  const selectedStorageScopeKey = `${composerOwnerScopeKey}\0${selectedSessionId ?? '__new__'}`
   const composerIdentityScopeKey = composerStorageScopeKey
+
+  const storageMigration = shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)
+    ? ({ fromKey: selectedStorageScopeKey, kind: 'lineage', toKey: composerStorageScopeKey } as const)
+    : undefined
+
   const runtimeOwnerScopeByIdRef = useRef(new Map<string, string>())
 
   if (isPrimary && activeSessionId && !runtimeOwnerScopeByIdRef.current.has(activeSessionId)) {
     runtimeOwnerScopeByIdRef.current.set(activeSessionId, composerOwnerScopeKey)
   }
 
-  // When the tip row arrives after compression, migrate any tip-keyed stash onto
-  // the durable lineage key before the composer remounts onto that key.
-  //
-  // ONLY same-conversation rekeys (tip → root). The route-driven queueSessionKey
-  // can flip to Session B a frame before the store selection leaves Session A;
-  // migrating on bare inequality would re-home A's queued prompts onto B and
-  // auto-drain them into the wrong chat.
+  // One-time compatibility bridge from legacy unqualified stores. Each raw
+  // draft is claimed exactly once; an existing qualified draft wins but still
+  // consumes the source so another profile cannot claim it later.
   useEffect(() => {
-    const selectedStorageScopeKey = `${composerOwnerScopeKey}\0${selectedSessionId ?? '__new__'}`
-
-    // One-time compatibility bridge from the legacy unqualified stores. The
-    // ambient owner claims the old entry; after this point every profile has a
-    // distinct local draft/queue namespace even when backend IDs collide.
-    migrateSessionDraft(selectedSessionId, selectedStorageScopeKey)
+    claimSessionDraft(selectedSessionId, selectedStorageScopeKey)
     migrateQueuedPrompts(selectedSessionId, selectedStorageScopeKey)
 
     if (queueSessionKey !== selectedSessionId) {
-      migrateSessionDraft(queueSessionKey, composerStorageScopeKey)
+      claimSessionDraft(queueSessionKey, composerStorageScopeKey)
       migrateQueuedPrompts(queueSessionKey, composerStorageScopeKey)
     }
-
-    if (!shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)) {
-      return
-    }
-
-    migrateSessionDraft(selectedStorageScopeKey, composerStorageScopeKey)
-    migrateQueuedPrompts(selectedStorageScopeKey, composerStorageScopeKey)
-  }, [composerOwnerScopeKey, composerStorageScopeKey, queueSessionKey, selectedSessionId, sessions])
+  }, [composerStorageScopeKey, queueSessionKey, selectedSessionId, selectedStorageScopeKey])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any
@@ -825,6 +815,7 @@ const ChatViewContent = memo(function ChatViewContent({
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}
               state={chatBarState}
+              storageMigration={storageMigration}
               storageScopeKey={composerStorageScopeKey}
             />
           </Suspense>

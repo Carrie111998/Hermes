@@ -398,17 +398,26 @@ export function useComposerQueue({
     const prev = prevQueueKeyRef.current
     prevQueueKeyRef.current = activeQueueSessionKey
 
-    if (queueSessionKey !== undefined || !prev || !activeQueueSessionKey || prev === activeQueueSessionKey) {
+    if (!prev || !activeQueueSessionKey || prev === activeQueueSessionKey) {
       return
     }
 
+    if (queueSessionKey === undefined) {
+      migrateQueuedPrompts(prev, activeQueueSessionKey)
+    }
+
+    // A parent-level explicit lineage migration can move the entry before this
+    // hook observes the key change. Hand off only when the exact in-flight id is
+    // now present at the destination and absent at the source; arbitrary A → B
+    // navigation therefore cannot retarget a lock or its eventual removal.
+    const destinationEntryIds = new Set(getQueuedPrompts(activeQueueSessionKey).map(entry => entry.id))
+    const sourceEntryIds = new Set(getQueuedPrompts(prev).map(entry => entry.id))
+
     for (const [entryId, drain] of drainingQueueEntriesRef.current) {
-      if (drain.sessionKey === prev) {
+      if (drain.sessionKey === prev && destinationEntryIds.has(entryId) && !sourceEntryIds.has(entryId)) {
         drainingQueueEntriesRef.current.set(entryId, { sessionKey: activeQueueSessionKey })
       }
     }
-
-    migrateQueuedPrompts(prev, activeQueueSessionKey)
   }, [activeQueueSessionKey, queueSessionKey])
 
   // Queued turns flow whenever the session is idle — on the busy→false settle

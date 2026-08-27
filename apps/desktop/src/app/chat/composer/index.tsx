@@ -98,6 +98,7 @@ export function ChatBar({
   queueSessionKey,
   sessionId,
   state,
+  storageMigration,
   storageScopeKey,
   onCancel,
   onAddUrl,
@@ -280,7 +281,8 @@ export function ChatBar({
     inputDisabled,
     legacyScopeKey: storageScopeKey === undefined ? undefined : submitScopeKey,
     queueEditRef,
-    sessionId
+    sessionId,
+    storageMigration
   })
 
   // Undo/redo. The rich editor bypasses Chromium's editing pipeline for speed,
