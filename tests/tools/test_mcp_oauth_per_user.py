@@ -37,6 +37,28 @@ def _bob_scope():
     return resolve_mcp_oauth_scope(identity_mode="per_user", principal=_bob())
 
 
+def _seed_cached_tokens(
+    home: Path, server_name: str, oauth_scope, access_token: str = "TOK"
+) -> None:
+    from tools.mcp_oauth import HermesTokenStorage
+
+    storage = HermesTokenStorage(
+        server_name, hermes_home=home, oauth_scope=oauth_scope
+    )
+    path = storage._tokens_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_per_user_config(home: Path) -> None:
     (home / "config.yaml").write_text(
         "mcp:\n  oauth:\n    identity_mode: per_user\n",
@@ -170,6 +192,8 @@ class TestPerUserManager:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_oauth_manager import MCPOAuthManager
 
+        _seed_cached_tokens(tmp_path, "github", _alice_scope(), "ALICE")
+        _seed_cached_tokens(tmp_path, "github", _bob_scope(), "BOB")
         manager = MCPOAuthManager()
         alice = manager.get_or_build_provider(
             "github",
@@ -196,6 +220,8 @@ class TestPerUserManager:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_oauth_manager import MCPOAuthManager
 
+        _seed_cached_tokens(tmp_path, "github", _alice_scope(), "ALICE")
+        _seed_cached_tokens(tmp_path, "github", _bob_scope(), "BOB")
         manager = MCPOAuthManager()
         alice = manager.get_or_build_provider(
             "github",
@@ -222,6 +248,7 @@ class TestPerUserManager:
             hermes_home=tmp_path,
         )
         assert still_bob is bob
+        _seed_cached_tokens(tmp_path, "github", _alice_scope(), "ALICE2")
         rebuilt_alice = manager.get_or_build_provider(
             "github",
             "https://mcp.example/mcp",
