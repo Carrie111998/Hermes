@@ -1,6 +1,5 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { userEvent } from '@testing-library/user-event'
 import { useEffect, useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -652,11 +651,11 @@ describe('assistant-ui streaming renderer', () => {
 
     // Collapse the live preview first, then manually expand it (userOpen=true, isPreview=false).
     const toggle = within(container).getByRole('button', { name: /thought/i })
-    await userEvent.click(toggle)
+    fireEvent.click(toggle)
     await waitFor(() => {
       expect(toggle.getAttribute('aria-expanded')).toBe('false')
     })
-    await userEvent.click(toggle)
+    fireEvent.click(toggle)
     await waitFor(() => {
       expect(toggle.getAttribute('aria-expanded')).toBe('true')
     })
