@@ -643,8 +643,7 @@ class HermesTokenStorage:
     def snapshot(self) -> dict[str, bytes]:
         """Capture on-disk OAuth state so a failed re-auth can restore it.
 
-        Maps filename -> bytes for whichever of the three primary state files
-        exist. Legacy client backups are deliberately excluded from rollback.
+        Maps filename -> bytes for existing primary state files; legacy backups are excluded.
         Feed back to ``restore()`` to undo an intervening ``remove()`` when a
         re-authentication attempt fails, so a still-valid token isn't destroyed.
         """
@@ -658,15 +657,10 @@ class HermesTokenStorage:
 
     def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write."""
-        allowed = {
-            self._tokens_path().name,
-            self._client_info_path().name,
-            self._meta_path().name,
-        }
+        allowed = {self._tokens_path().name, self._client_info_path().name, self._meta_path().name}
         invalid = [fname for fname in snapshot if not isinstance(fname, str) or fname not in allowed]
         if invalid:
-            names = ", ".join(repr(fname) for fname in invalid)
-            raise ValueError(f"Invalid OAuth snapshot filename(s): {names}")
+            raise ValueError(f"Invalid OAuth snapshot filename(s): {', '.join(repr(name) for name in invalid)}")
         if only_if_absent and any(
             path.exists()
             for path in (self._tokens_path(), self._client_info_path(), self._meta_path())
@@ -708,8 +702,7 @@ class HermesTokenStorage:
         re-authorization overwrites them, and keeping them avoids losing a
         still-valid refresh token if the re-registration never completes.
 
-        Legacy backups are removed; cleanup errors propagate before callers
-        clear in-memory state while secret-bearing files remain on disk.
+        Legacy backups are removed; cleanup errors propagate before callers clear memory.
         Returns True if a client file was present and removed.
         """
         client_path = self._client_info_path()
@@ -720,11 +713,7 @@ class HermesTokenStorage:
         backup.unlink(missing_ok=True)
         client_path.unlink(missing_ok=True)
         self._meta_path().unlink(missing_ok=True)
-        logger.warning(
-            "MCP OAuth '%s': cached client registration rejected as invalid_client; "
-            "removed client.json + meta.json and legacy backup to force re-registration",
-            self._server_name,
-        )
+        logger.warning("MCP OAuth '%s': invalid_client; removed client.json, meta.json, and legacy backup", self._server_name)
         return True
 
     def has_cached_tokens(self) -> bool:
