@@ -77,6 +77,7 @@ import os
 import re
 import random
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -101,6 +102,8 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "escalation_required", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+QUALITY_GATE_MAX_OUTPUT = 4_000
+QUALITY_GATE_MAX_TIMEOUT_SECONDS = 300
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3955,7 +3958,7 @@ def _quality_policy_required(row: sqlite3.Row) -> bool:
         policy = json.loads(raw) if raw else {}
     except (KeyError, TypeError, json.JSONDecodeError):
         return False
-    return isinstance(policy, dict) and bool(policy.get("enabled")) and bool(policy.get("required"))
+    return isinstance(policy, dict) and policy.get("enabled") is True and policy.get("required") is True
 
 
 def set_reasoning_effort(
@@ -6988,7 +6991,104 @@ def request_review(
     return _ret(True)
 
 
-def record_quality_gate(
+def _quality_gate_command(gate: Any) -> tuple[list[str], int]:
+    """Validate an operator-configured, shell-free quality command."""
+    if not isinstance(gate, Mapping):
+        raise ValueError("quality gate must be an object")
+    command = gate.get("command")
+    if isinstance(command, str):
+        argv = shlex.split(command)
+    elif isinstance(command, list) and all(isinstance(part, str) for part in command):
+        argv = list(command)
+    else:
+        raise ValueError("quality gate command must be a string or string array")
+    if not argv or any(not part or "\x00" in part for part in argv):
+        raise ValueError("quality gate command must not be empty")
+    timeout = gate.get("timeout_seconds", 60)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("quality gate timeout_seconds must be a number")
+    if not 0 < timeout <= QUALITY_GATE_MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"quality gate timeout_seconds must be 1..{QUALITY_GATE_MAX_TIMEOUT_SECONDS}")
+    return argv, int(timeout)
+
+
+def _bounded_quality_output(value: Any) -> str:
+    return str(redact_review_value(value or ""))[:QUALITY_GATE_MAX_OUTPUT]
+
+
+def execute_quality_gates(
+    conn: sqlite3.Connection, *, task_id: str, run_id: int,
+) -> bool:
+    """Execute persisted operator gates outside a SQLite write transaction.
+
+    The caller supplies no command. Every validation, workspace, spawn,
+    timeout, and non-zero failure is durably escalated by the same review run.
+    """
+    task = conn.execute(
+        "SELECT status, current_run_id, quality_policy_json, workspace_path "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task is None or not _quality_policy_required(task):
+        return False
+    if task["status"] != "running" or task["current_run_id"] != int(run_id):
+        return _persist_executed_quality_gate(
+            conn, task_id=task_id, run_id=run_id, passed=False,
+            reason="quality gate result was stale", result={"gates": [], "status": "stale"},
+        )
+    try:
+        policy = json.loads(task["quality_policy_json"])
+        gates = policy["gates"]
+        if not isinstance(gates, list) or not gates:
+            raise ValueError("quality policy requires one or more gates")
+        commands = [_quality_gate_command(gate) for gate in gates]
+        if not task["workspace_path"] or not Path(task["workspace_path"]).is_dir():
+            raise ValueError("quality gate workspace is missing or not a directory")
+    except (TypeError, KeyError, json.JSONDecodeError, ValueError) as exc:
+        return _persist_executed_quality_gate(
+            conn, task_id=task_id, run_id=run_id, passed=False,
+            reason=f"quality gate configuration failure: {exc}",
+            result={"gates": [], "status": "configuration_failed"},
+        )
+
+    results: list[dict[str, Any]] = []
+    workspace = str(Path(task["workspace_path"]))
+    for argv, timeout in commands:
+        try:
+            completed = subprocess.run(
+                argv, cwd=workspace, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                errors="replace", timeout=timeout, check=False,
+            )
+            entry: dict[str, Any] = {
+                "command": argv,
+                "status": "passed" if completed.returncode == 0 else "nonzero",
+                "output": _bounded_quality_output(completed.stdout),
+            }
+            results.append(entry)
+            if completed.returncode:
+                entry["exit_code"] = completed.returncode
+                return _persist_executed_quality_gate(
+                    conn, task_id=task_id, run_id=run_id, passed=False,
+                    reason=f"quality gate exited {completed.returncode}", result={"gates": results},
+                )
+        except subprocess.TimeoutExpired as exc:
+            results.append({"command": argv, "status": "timeout", "output": _bounded_quality_output(exc.stdout)})
+            return _persist_executed_quality_gate(
+                conn, task_id=task_id, run_id=run_id, passed=False,
+                reason="quality gate timed out", result={"gates": results},
+            )
+        except OSError as exc:
+            results.append({"command": argv, "status": "spawn_error", "output": _bounded_quality_output(str(exc))})
+            return _persist_executed_quality_gate(
+                conn, task_id=task_id, run_id=run_id, passed=False,
+                reason="quality gate could not be started", result={"gates": results},
+            )
+    return _persist_executed_quality_gate(
+        conn, task_id=task_id, run_id=run_id, passed=True, result={"gates": results},
+    )
+
+
+def _persist_executed_quality_gate(
     conn: sqlite3.Connection,
     *,
     task_id: str,
@@ -6997,13 +7097,13 @@ def record_quality_gate(
     reason: Optional[str] = None,
     result: Optional[Mapping[str, Any]] = None,
 ) -> bool:
-    """Persist the review-owned quality result for an opt-in task.
+    """Persist an executor-owned quality result for an opt-in task.
 
-    The gate intentionally executes no subprocess and never changes model
-    overrides. A pass merely permits a later explicit completion; a failure
-    closes the review run, records ``quality_failed`` before
-    ``escalation_required``, and asks the router for a fresh auditable policy
-    decision using the prior route, evidence, and retry count.
+    Only :func:`execute_quality_gates` calls this private helper after running
+    the persisted operator command(s) outside the SQLite transaction. A pass
+    merely permits a later explicit completion; a failure closes the review
+    run, records ``quality_failed`` before ``escalation_required``, and asks
+    the router for a fresh auditable policy decision.
     """
     reason = str(redact_review_value(reason or "")).strip()
     safe_result = redact_review_value(dict(result or {}))
@@ -7019,6 +7119,25 @@ def record_quality_gate(
         if task is None or not _quality_policy_required(task):
             return False
         if task["status"] != "running" or task["current_run_id"] != int(run_id):
+            # A command result that arrives after its review lease changed can
+            # never authorize completion. Escalate the live task rather than
+            # silently leaving an ambiguous running review behind.
+            active_run_id = task["current_run_id"]
+            if task["status"] == "running" and active_run_id is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = 'escalation_required', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND current_run_id = ?",
+                    (task_id, int(active_run_id)),
+                )
+                closed_run_id = _end_run(
+                    conn, task_id, outcome="quality_failed", status="quality_failed",
+                    error="quality gate result was stale",
+                )
+                stale = {"requested_run_id": int(run_id), "active_run_id": int(active_run_id)}
+                _append_event(conn, task_id, "quality_failed", {"reason": "quality gate result was stale", "result": stale}, run_id=closed_run_id)
+                _append_event(conn, task_id, "escalation_required", {"prior_run_id": int(run_id), "failure_reason": "quality gate result was stale", "quality_result": stale, "decision": {"action": "human_escalation_required"}}, run_id=closed_run_id)
+            else:
+                _append_event(conn, task_id, "quality_gate_stale", {"run_id": int(run_id)}, run_id=int(run_id))
             return False
         claimed = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
@@ -7092,6 +7211,19 @@ def record_quality_gate(
             run_id=closed_run_id,
         )
     return True
+
+
+def record_quality_gate(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    passed: bool,
+    reason: Optional[str] = None,
+    result: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Deprecated compatibility API; workers cannot self-certify a pass."""
+    return False
 
 
 def request_changes(
