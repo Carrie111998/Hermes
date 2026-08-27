@@ -7161,6 +7161,32 @@ class APIServerAdapter(BasePlatformAdapter):
         return None
 
     @staticmethod
+    def _profile_workspace_dir() -> str:
+        """Resolve (and ensure) the active request scope's workspace directory.
+
+        Under ``/p/<profile>/`` the request's profile pins HERMES_HOME to the
+        profile home, but the terminal/file working directory is a single
+        process-global override — every multiplexed profile would otherwise
+        share one cwd and overwrite each other's files. Anchoring each request
+        in its own home's ``workspace/`` gives concurrent profiles isolated
+        default working directories.
+
+        Returns "" when resolution fails so callers skip registration and keep
+        the legacy behavior instead of failing the turn.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+
+            ws = get_hermes_home() / "workspace"
+            ws.mkdir(parents=True, exist_ok=True)
+            return str(ws)
+        except Exception:
+            logger.debug(
+                "[api_server] failed to resolve profile workspace dir", exc_info=True
+            )
+            return ""
+
+    @staticmethod
     def _bind_api_server_session(
         *,
         chat_id: str = "",
@@ -7168,6 +7194,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
+        cwd: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -7178,6 +7205,10 @@ class APIServerAdapter(BasePlatformAdapter):
         forgetting to mark the channel as non-delivering. There is no
         ``async_delivery`` parameter to get wrong; the stateless HTTP path can
         never wake the agent after the turn ends, on ANY route.
+
+        ``cwd`` pins the logical working directory this context advertises
+        (consumed via the session-cwd machinery by the system prompt and the
+        terminal/file tools).
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -7195,6 +7226,7 @@ class APIServerAdapter(BasePlatformAdapter):
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
             cron_session="",
+            cwd=cwd,
         )
 
     async def _run_agent(
@@ -7264,6 +7296,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
+                profile_workspace = self._profile_workspace_dir()
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -7272,6 +7305,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     browser_control_transport_family=(
                         request_browser_control_transport_family
                     ),
+                    cwd=profile_workspace,
                 )
                 agent = None
                 try:
@@ -7295,6 +7329,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
+                    # Anchor terminal/file tools' mechanical cwd for this task —
+                    # the same registration TUI/ACP entries drive via
+                    # register_task_env_overrides. CWD-only overrides share the
+                    # "default" sandbox, so this anchors files without forking
+                    # a separate environment per profile.
+                    if profile_workspace:
+                        try:
+                            from tools.terminal_tool import (
+                                register_task_env_overrides,
+                            )
+
+                            register_task_env_overrides(
+                                effective_task_id, {"cwd": profile_workspace}
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[api_server] failed to register task cwd",
+                                exc_info=True,
+                            )
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
                     # gateway-turn cleanup (#76115); this API-server surface
@@ -7728,6 +7781,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return
                 with self._profile_scope(request_profile):
+                    # /v1/runs builds the agent — and therefore its system
+                    # prompt — here, BEFORE the worker below binds session
+                    # context. Pin the logical cwd around construction so the
+                    # prompt advertises this profile's workspace; release right
+                    # after so later code in this task sees the same state as
+                    # before the pin.
+                    profile_workspace = self._profile_workspace_dir()
+                    pinned_cwd_token = None
+                    if profile_workspace:
+                        try:
+                            from agent.runtime_cwd import set_session_cwd
+
+                            pinned_cwd_token = set_session_cwd(profile_workspace)
+                        except Exception:
+                            logger.debug(
+                                "[api_server] failed to pin run cwd", exc_info=True
+                            )
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -7739,6 +7809,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                     )
+                    if pinned_cwd_token is not None:
+                        try:
+                            pinned_cwd_token.var.reset(pinned_cwd_token)
+                        except Exception:
+                            pass
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -7789,6 +7864,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # contextvars so concurrent runs do not share process
                             # environment state.
                             approval_token = set_current_session_key(approval_session_key)
+                            profile_workspace = self._profile_workspace_dir()
                             session_tokens = self._bind_api_server_session(
                                 # chat_id carries the raw session id (the
                                 # X-Hermes-Session-Id equivalent) exactly like
@@ -7807,8 +7883,33 @@ class APIServerAdapter(BasePlatformAdapter):
                                 browser_control_transport_family=(
                                     request_browser_control_transport_family
                                 ),
+                                cwd=profile_workspace,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            # Anchor terminal/file tools' mechanical cwd. The
+                            # first command resolves its cwd through the
+                            # run-scoped key; later ones go through the tool
+                            # task id — register both so the anchor holds from
+                            # the first command regardless of which lookup wins.
+                            if profile_workspace:
+                                try:
+                                    from tools.terminal_tool import (
+                                        register_task_env_overrides,
+                                    )
+
+                                    register_task_env_overrides(
+                                        effective_task_id, {"cwd": profile_workspace}
+                                    )
+                                    if approval_session_key != effective_task_id:
+                                        register_task_env_overrides(
+                                            approval_session_key,
+                                            {"cwd": profile_workspace},
+                                        )
+                                except Exception:
+                                    logger.debug(
+                                        "[api_server] failed to register run task cwd",
+                                        exc_info=True,
+                                    )
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
