@@ -1,8 +1,8 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $composerNewChatGeneration } from '@/store/composer'
-import { $selectedStoredSessionId } from '@/store/session'
+import { $composerNewChatGeneration, onComposerDraftSyncRequest } from '@/store/composer'
+import { $primarySessionOwnerIntent, $selectedStoredSessionId } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
 import type * as WindowsStore from '@/store/windows'
 
@@ -44,6 +44,7 @@ beforeEach(() => {
   emitHudChanged = null
   windowKind.isHud = true
   desktopWindow.hermesDesktop = { hud: { onChanged, setSession } } as unknown as Window['hermesDesktop']
+  $primarySessionOwnerIntent.set(null)
   $selectedStoredSessionId.set(null)
   $sessionTiles.set([])
   $composerNewChatGeneration.set('66666666-6666-4666-8666-666666666666')
@@ -93,20 +94,47 @@ describe('useReportHudSession', () => {
 })
 
 describe('useHudHandoff', () => {
-  it('adopts the exact New Chat generation reported when the HUD closes', () => {
-    windowKind.isHud = false
-    renderHook(() => useHudHandoff({ navigate: vi.fn(), resumeSession: vi.fn() }))
+  it('adopts the HUD New Chat in main routing before hydrating its exact generation', async () => {
+    const generation = '99999999-9999-4999-8999-999999999999'
+    const staleOwner = { connectionId: 'source-a', profile: 'worker' }
+    const navigate = vi.fn()
 
-    act(() =>
+    const hydrationStates: Array<{
+      generation: number | string
+      ownerIntent: unknown
+      selectedSessionId: string | null
+    }> = []
+
+    windowKind.isHud = false
+    $selectedStoredSessionId.set('stored-selected-before-hud')
+    $primarySessionOwnerIntent.set({ ownerRoute: staleOwner, storedSessionId: 'stored-selected-before-hud' })
+
+    const offDraftSync = onComposerDraftSyncRequest(() => {
+      hydrationStates.push({
+        generation: $composerNewChatGeneration.get(),
+        ownerIntent: $primarySessionOwnerIntent.get(),
+        selectedSessionId: $selectedStoredSessionId.get()
+      })
+    })
+
+    renderHook(() => useHudHandoff({ navigate, resumeSession: vi.fn() }))
+
+    await act(async () => {
       emitHudChanged?.({
-        newChatGeneration: '99999999-9999-4999-8999-999999999999',
+        newChatGeneration: generation,
         open: false,
         ownerRoute: null,
         sessionId: null
       })
-    )
+      await Promise.resolve()
+    })
 
-    expect($composerNewChatGeneration.get()).toBe('99999999-9999-4999-8999-999999999999')
+    expect($composerNewChatGeneration.get()).toBe(generation)
+    expect($selectedStoredSessionId.get()).toBeNull()
+    expect($primarySessionOwnerIntent.get()).toBeNull()
+    expect(navigate).toHaveBeenCalledWith('/')
+    expect(hydrationStates).toEqual([{ generation, ownerIntent: null, selectedSessionId: null }])
+    offDraftSync()
   })
 
   it('re-resumes a stored HUD session through its exact connection owner', () => {
@@ -114,6 +142,7 @@ describe('useHudHandoff', () => {
     const resumeSession = vi.fn()
     windowKind.isHud = false
     $selectedStoredSessionId.set('shared')
+    $primarySessionOwnerIntent.set({ ownerRoute, storedSessionId: 'shared' })
     renderHook(() => useHudHandoff({ navigate: vi.fn(), resumeSession }))
 
     act(() =>
@@ -126,5 +155,49 @@ describe('useHudHandoff', () => {
     )
 
     expect(resumeSession).toHaveBeenCalledWith('shared', false, ownerRoute)
+  })
+
+  it('routes a duplicate raw id into main when the HUD owner differs from the selected owner', () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const navigate = vi.fn()
+    const resumeSession = vi.fn()
+
+    windowKind.isHud = false
+    $selectedStoredSessionId.set('shared')
+    $primarySessionOwnerIntent.set({ ownerRoute: ownerA, storedSessionId: 'shared' })
+    renderHook(() => useHudHandoff({ navigate, resumeSession }))
+
+    act(() =>
+      emitHudChanged?.({
+        newChatGeneration: null,
+        open: false,
+        ownerRoute: ownerB,
+        sessionId: 'shared'
+      })
+    )
+
+    expect($primarySessionOwnerIntent.get()).toEqual({ ownerRoute: ownerB, storedSessionId: 'shared' })
+    expect(navigate).toHaveBeenCalledWith('/shared')
+    expect(resumeSession).not.toHaveBeenCalled()
+  })
+
+  it('preserves the ownerless same-session handoff shortcut for legacy HUD reports', () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const navigate = vi.fn()
+    const resumeSession = vi.fn()
+
+    windowKind.isHud = false
+    $selectedStoredSessionId.set('shared')
+    $primarySessionOwnerIntent.set({ ownerRoute: ownerA, storedSessionId: 'shared' })
+    renderHook(() => useHudHandoff({ navigate, resumeSession }))
+
+    act(() =>
+      emitHudChanged?.({ newChatGeneration: null, open: false, ownerRoute: null, sessionId: 'shared' })
+    )
+
+    expect($primarySessionOwnerIntent.get()).toEqual({ ownerRoute: ownerA, storedSessionId: 'shared' })
+    expect(navigate).not.toHaveBeenCalled()
+    expect(resumeSession).toHaveBeenCalledWith('shared', false, undefined)
   })
 })

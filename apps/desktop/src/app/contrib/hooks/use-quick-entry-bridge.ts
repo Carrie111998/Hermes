@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 
+import { notifyError } from '@/store/notifications'
 import {
   initQuickEntryBridge,
   QUICK_TARGET_CURRENT,
@@ -96,14 +97,35 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
         if (delegate) {
           const storedSessionId = session?.id || target
 
-          const resume = session?.ownerRoute
+          const resume = session
             ? delegate.resumeTile(storedSessionId, session.ownerGeneration, session.ownerRoute)
             : delegate.resumeTile(storedSessionId)
 
           void resume
             .then(runtimeId => delegate.submitToSession(runtimeId, text))
-            // A dead/undeliverable target must not swallow the prompt.
-            .catch(() => void submitTextRef.current(text))
+            .catch(error => {
+              // Exact picked metadata is an authority boundary: redirecting its
+              // prompt into whichever ambient composer happens to be selected
+              // can send private text to the wrong backend/session. Surface the
+              // failed handoff instead. Keep the legacy metadata-free fallback
+              // for old quick windows whose raw-id payload cannot name a target.
+              if (session) {
+                notifyError(error, 'Quick Entry could not reach the selected session')
+
+                return
+              }
+
+              void submitTextRef.current(text)
+            })
+
+          return
+        }
+
+        if (session) {
+          notifyError(
+            new Error('Quick Entry background session bridge is unavailable'),
+            'Quick Entry could not reach the selected session'
+          )
 
           return
         }

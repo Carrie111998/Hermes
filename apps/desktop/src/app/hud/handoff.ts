@@ -26,7 +26,7 @@ import { isHudWindow, windowSessionOwnerRoute } from '@/store/windows'
 
 import { getActiveComposer } from '../chat/composer/focus'
 import { openSession, type OpenSessionNavigate } from '../open-session'
-import { sessionRoute } from '../routes'
+import { NEW_CHAT_ROUTE, sessionRoute } from '../routes'
 
 import { resolveHudCloseHandoff } from './handoff-target'
 
@@ -98,11 +98,25 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
       const selected = $selectedStoredSessionId.get()
       const handoff = resolveHudCloseHandoff(hudState, selected)
 
-      // Adopt the HUD's exact New Chat identity before repainting from the
-      // shared stash. Null alone is not an identity: another app window may
-      // own a different fresh draft for the same profile.
+      // A generation makes null an exact New Chat identity. Adopt the whole
+      // main-surface identity before repainting: a stale selected session,
+      // exact-owner intent, or route would keep the composer scoped to the chat
+      // that was visible before HUD opened and hydrate the wrong draft.
       if (handoff.newChatGeneration !== null) {
         $composerNewChatGeneration.set(handoff.newChatGeneration)
+        $selectedStoredSessionId.set(null)
+        $primarySessionOwnerIntent.set(null)
+        paramsRef.current.navigate(NEW_CHAT_ROUTE)
+
+        // Store + router publications schedule the main composer scope swap.
+        // Hydrate on the next microtask so its live scope ref already names
+        // this exact generation rather than the previously selected session.
+        queueMicrotask(() => {
+          reloadPersistedDrafts()
+          requestComposerDraftSync('reload')
+        })
+
+        return
       }
 
       // The HUD may have typed or sent since this window last read the stash.
@@ -113,6 +127,30 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
       const workspaceScope = handoff.ownerRoute
         ? { ownerRoute: handoff.ownerRoute, workspaceMode: 'sessions' as const }
         : undefined
+
+      const selectedOwnerIntent = $primarySessionOwnerIntent.get()
+
+      const selectedIdentity = selected
+        ? sessionTileIdentity(
+            selected,
+            selectedOwnerIntent?.storedSessionId === selected ? selectedOwnerIntent.ownerRoute : undefined
+          )
+        : null
+
+      const targetIdentity = target ? sessionTileIdentity(target, handoff.ownerRoute ?? undefined) : null
+
+      // A raw id is not a session identity when two owners expose it. Route the
+      // exact HUD owner through the ordinary main-open path so it publishes the
+      // new primary owner intent and lets route hydration bind that backend.
+      // Ownerless legacy reports keep the historical same-raw-id shortcut.
+      if (target && target === selected && handoff.ownerRoute && targetIdentity !== selectedIdentity) {
+        openSession(target, paramsRef.current.navigate, 'main', {
+          ownerRoute: handoff.ownerRoute,
+          workspaceMode: 'sessions'
+        })
+
+        return
+      }
 
       // Somewhere other than the workspace pane. If it is an open tile, front
       // it and re-resume THROUGH the tile delegate: the ordinary resume path
