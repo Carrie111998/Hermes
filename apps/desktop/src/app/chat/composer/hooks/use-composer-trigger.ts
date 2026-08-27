@@ -24,6 +24,8 @@ import {
 } from '../rich-editor'
 import { detectTrigger, textBeforeCaret, type TriggerState } from '../text-utils'
 
+import { useCommittedActionScope } from './use-committed-action-scope'
+
 /**
  * Rebuild-from-text fallback for carets the range walk can't anchor (a
  * non-collapsed selection, a caret not preceded by contiguous text). It
@@ -134,21 +136,7 @@ export function useComposerTrigger({
   // without stealing prose from everyone who never touched the arrows.
   const [triggerActiveExplicit, setTriggerActiveExplicit] = useState(false)
   const [triggerItems, setTriggerItems] = useState<readonly Unstable_TriggerItem[]>([])
-  const scopeEpochRef = useRef({ key: scopeKey, value: 0 })
-
-  if (scopeEpochRef.current.key !== scopeKey) {
-    scopeEpochRef.current = { key: scopeKey, value: scopeEpochRef.current.value + 1 }
-  }
-
-  const renderScopeEpoch = scopeEpochRef.current.value
-  const actionsDisabledRef = useRef(actionsDisabled)
-
-  actionsDisabledRef.current = actionsDisabled
-
-  const actionIsCurrent = useCallback(
-    () => scopeEpochRef.current.value === renderScopeEpoch && !actionsDisabledRef.current,
-    [renderScopeEpoch]
-  )
+  const actionIsCurrent = useCommittedActionScope(scopeKey, actionsDisabled)
 
   // Set synchronously in keydown when the open trigger popover consumes a
   // navigation/control key (Arrow/Enter/Tab/Escape). The subsequent keyup must

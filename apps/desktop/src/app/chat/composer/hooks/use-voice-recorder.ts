@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { notify, notifyError } from '@/store/notifications'
@@ -23,12 +23,18 @@ export function useVoiceRecorder({
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
   const { handle, level, recording } = useMicRecorder(voiceCopy)
+  const handleRef = useRef(handle)
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('idle')
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const startedAtRef = useRef(0)
   const intervalRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
   const recordingEpochRef = useRef(0)
+  const startingRef = useRef(false)
+
+  useLayoutEffect(() => {
+    handleRef.current = handle
+  }, [handle])
 
   const clearTimers = () => {
     if (intervalRef.current) {
@@ -42,7 +48,15 @@ export function useVoiceRecorder({
     }
   }
 
-  useEffect(() => () => clearTimers(), [])
+  useEffect(
+    () => () => {
+      recordingEpochRef.current += 1
+      startingRef.current = false
+      clearTimers()
+      handleRef.current.cancel()
+    },
+    [] // recorder handle methods close over stable refs; cleanup must run once
+  )
 
   const stop = async () => {
     const recordingEpoch = recordingEpochRef.current
@@ -93,6 +107,10 @@ export function useVoiceRecorder({
   }
 
   const start = async () => {
+    if (startingRef.current || recording || voiceStatus !== 'idle') {
+      return
+    }
+
     if (!onTranscribeAudio) {
       notify({ kind: 'warning', title: voiceCopy.unavailable, message: voiceCopy.transcriptionUnavailable })
 
@@ -102,6 +120,7 @@ export function useVoiceRecorder({
     const recordingEpoch = recordingEpochRef.current + 1
 
     recordingEpochRef.current = recordingEpoch
+    startingRef.current = true
 
     try {
       await handle.start({ onError: error => notifyError(error, voiceCopy.recordingFailed) })
@@ -123,11 +142,16 @@ export function useVoiceRecorder({
         setVoiceStatus('idle')
         notifyError(error, voiceCopy.recordingFailed)
       }
+    } finally {
+      if (recordingEpochRef.current === recordingEpoch) {
+        startingRef.current = false
+      }
     }
   }
 
   const cancel = () => {
     recordingEpochRef.current += 1
+    startingRef.current = false
     clearTimers()
     handle.cancel()
     setElapsedSeconds(0)

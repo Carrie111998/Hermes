@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
-import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
@@ -536,40 +536,49 @@ const ChatViewContent = memo(function ChatViewContent({
   // outgoing generation pinned while its runtime is still present (the action
   // fence), retire it when the runtime clears, and let the next publication —
   // even under the same id — claim the current route/profile generation.
-  const ownerGenerationRef = useRef({ generation: 0, ownerScopeKey: composerOwnerScopeKey, route: location.pathname })
+  const ownerRouteKey = `${composerOwnerScopeKey}\0${location.pathname}`
+  const [committedOwner, setCommittedOwner] = useState({ generation: 0, key: ownerRouteKey })
 
-  if (
-    ownerGenerationRef.current.ownerScopeKey !== composerOwnerScopeKey ||
-    ownerGenerationRef.current.route !== location.pathname
-  ) {
-    ownerGenerationRef.current = {
-      generation: ownerGenerationRef.current.generation + 1,
-      ownerScopeKey: composerOwnerScopeKey,
-      route: location.pathname
-    }
-  }
+  const renderOwnerGeneration =
+    committedOwner.key === ownerRouteKey ? committedOwner.generation : committedOwner.generation + 1
 
-  const runtimeOwnerRef = useRef<{
+  useLayoutEffect(() => {
+    setCommittedOwner(current =>
+      current.key === ownerRouteKey ? current : { generation: renderOwnerGeneration, key: ownerRouteKey }
+    )
+  }, [ownerRouteKey, renderOwnerGeneration])
+
+  const [runtimeOwner, setRuntimeOwner] = useState<{
     generation: number
     runtimeId: string
     storedSessionId: null | string
   } | null>(null)
 
-  if (isPrimary) {
-    if (!activeSessionId) {
-      runtimeOwnerRef.current = null
-    } else if (
-      !runtimeOwnerRef.current ||
-      runtimeOwnerRef.current.runtimeId !== activeSessionId ||
-      (activeRuntimeStoredId !== null && runtimeOwnerRef.current.storedSessionId !== activeRuntimeStoredId)
-    ) {
-      runtimeOwnerRef.current = {
-        generation: ownerGenerationRef.current.generation,
-        runtimeId: activeSessionId,
-        storedSessionId: activeRuntimeStoredId
-      }
+  useLayoutEffect(() => {
+    if (!isPrimary) {
+      return
     }
-  }
+
+    setRuntimeOwner(current => {
+      if (!activeSessionId) {
+        return null
+      }
+
+      if (
+        !current ||
+        current.runtimeId !== activeSessionId ||
+        (activeRuntimeStoredId !== null && current.storedSessionId !== activeRuntimeStoredId)
+      ) {
+        return {
+          generation: renderOwnerGeneration,
+          runtimeId: activeSessionId,
+          storedSessionId: activeRuntimeStoredId
+        }
+      }
+
+      return current
+    })
+  }, [activeRuntimeStoredId, activeSessionId, isPrimary, renderOwnerGeneration])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any
@@ -599,13 +608,13 @@ const ChatViewContent = memo(function ChatViewContent({
         isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
       : false
 
-  const activeRuntimeOwnerGeneration = runtimeOwnerRef.current?.generation
+  const activeRuntimeOwnerGeneration = runtimeOwner?.generation
 
   const activeRuntimeOwnerMismatch =
     isPrimary &&
     isRoutedSessionView &&
     activeRuntimeOwnerGeneration !== undefined &&
-    activeRuntimeOwnerGeneration !== ownerGenerationRef.current.generation
+    activeRuntimeOwnerGeneration !== renderOwnerGeneration
 
   const newChatRouteHasStaleSession =
     isPrimary && isNewChatRoute(location.pathname) && Boolean(selectedSessionId || activeSessionId)

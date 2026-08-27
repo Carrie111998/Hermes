@@ -1,6 +1,7 @@
-import { useCallback, useRef } from 'react'
+import { useCallback } from 'react'
 
 import { requestComposerFocus, requestComposerInsert, requestComposerInsertRefs } from '@/app/chat/composer/focus'
+import { useCommittedActionScope } from '@/app/chat/composer/hooks/use-committed-action-scope'
 import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { useI18n } from '@/i18n'
@@ -304,14 +305,7 @@ export function useComposerActions({
 }: ComposerActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
-  const actionEpochRef = useRef({ key: composerScopeKey, value: 0 })
-
-  if (actionEpochRef.current.key !== composerScopeKey) {
-    actionEpochRef.current = { key: composerScopeKey, value: actionEpochRef.current.value + 1 }
-  }
-
-  const renderActionEpoch = actionEpochRef.current.value
-  const actionIsCurrent = useCallback(() => actionEpochRef.current.value === renderActionEpoch, [renderActionEpoch])
+  const actionIsCurrent = useCommittedActionScope(composerScopeKey, false)
 
   /** Add to this scope's composer and focus it. All sidebar/picker/drop
    *  attach paths funnel through here. */

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { startThinkingSound, stopThinkingSound } from '@/lib/thinking-sound'
@@ -60,6 +60,7 @@ export function useVoiceConversation({
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
   const { handle, level } = useMicRecorder(voiceCopy)
+  const handleRef = useRef(handle)
   const [status, setStatus] = useState<ConversationStatus>('idle')
   const [muted, setMuted] = useState(false)
   const turnTimeoutRef = useRef<number | null>(null)
@@ -69,6 +70,7 @@ export function useVoiceConversation({
   const responseIdRef = useRef<string | null>(null)
   const spokenSourceLengthRef = useRef(0)
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
+  const speechSetupKeyRef = useRef<string | null>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
   const bargedRef = useRef(false)
@@ -80,11 +82,28 @@ export function useVoiceConversation({
   const wasEnabledRef = useRef(enabled)
   const onStopWordRef = useRef(onStopWord)
   const onInterruptRef = useRef(onInterrupt)
+  const conversationEpochRef = useRef(0)
+
+  useLayoutEffect(() => {
+    handleRef.current = handle
+  }, [handle])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     onInterruptRef.current = onInterrupt
   }, [onInterrupt])
+
+  useEffect(
+    () => () => {
+      conversationEpochRef.current += 1
+      pendingStartRef.current = false
+      clearTurnTimeout()
+      stopVoicePlayback()
+      handleRef.current.cancel()
+      dropSpeechSession()
+    },
+    [] // teardown only; helpers and recorder methods close over stable refs
+  )
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -131,6 +150,7 @@ export function useVoiceConversation({
     bargeCapturePendingRef.current = false
     bargedRef.current = false
     speechSessionRef.current = null
+    speechSetupKeyRef.current = null
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
   }
@@ -142,11 +162,17 @@ export function useVoiceConversation({
       }
 
       turnClosingRef.current = true
+      const conversationEpoch = conversationEpochRef.current
+
       clearTurnTimeout()
       setStatus('transcribing')
 
       try {
         const result = await handle.stop()
+
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
 
         if (!result || (!result.heardSpeech && !forceTranscribe) || !onTranscribeAudio) {
           if (enabledRef.current && !mutedRef.current && !busyRef.current && statusRef.current !== 'speaking') {
@@ -160,6 +186,10 @@ export function useVoiceConversation({
 
         try {
           const transcript = (await onTranscribeAudio(result.audio)).trim()
+
+          if (conversationEpochRef.current !== conversationEpoch) {
+            return
+          }
 
           if (!transcript) {
             if (enabledRef.current) {
@@ -186,8 +216,17 @@ export function useVoiceConversation({
           awaitingSpokenResponseRef.current = true
           dropSpeechSession()
           await onSubmit(transcript)
+
+          if (conversationEpochRef.current !== conversationEpoch) {
+            return
+          }
+
           setStatus('thinking')
         } catch (error) {
+          if (conversationEpochRef.current !== conversationEpoch) {
+            return
+          }
+
           notifyError(error, voiceCopy.transcriptionFailed)
 
           if (enabledRef.current && !mutedRef.current && !busyRef.current) {
@@ -197,13 +236,17 @@ export function useVoiceConversation({
           setStatus('idle')
         }
       } finally {
-        turnClosingRef.current = false
+        if (conversationEpochRef.current === conversationEpoch) {
+          turnClosingRef.current = false
+        }
       }
     },
     [handle, onSubmit, onTranscribeAudio, voiceCopy.transcriptionFailed]
   )
 
   const startListening = useCallback(async () => {
+    const conversationEpoch = conversationEpochRef.current
+
     pendingStartRef.current = false
 
     if (!enabledRef.current || mutedRef.current || busyRef.current) {
@@ -228,7 +271,13 @@ export function useVoiceConversation({
     }
 
     // enabled/muted/busy or an interleaved turn may have changed while we waited.
-    if (!enabledRef.current || mutedRef.current || busyRef.current || statusRef.current !== 'idle') {
+    if (
+      conversationEpochRef.current !== conversationEpoch ||
+      !enabledRef.current ||
+      mutedRef.current ||
+      busyRef.current ||
+      statusRef.current !== 'idle'
+    ) {
       return
     }
 
@@ -245,6 +294,13 @@ export function useVoiceConversation({
         },
         onSilence: () => void handleTurn()
       })
+
+      if (conversationEpochRef.current !== conversationEpoch) {
+        handle.cancel()
+
+        return
+      }
+
       setStatus('listening')
       // Clear any prior turn-timeout before arming a fresh one. Each listen
       // cycle reassigns turnTimeoutRef; without clearing first, a stale 60s
@@ -254,6 +310,10 @@ export function useVoiceConversation({
       clearTurnTimeout()
       turnTimeoutRef.current = window.setTimeout(() => void handleTurn(), 60_000)
     } catch (error) {
+      if (conversationEpochRef.current !== conversationEpoch) {
+        return
+      }
+
       notifyError(error, voiceCopy.couldNotStartSession)
       pendingStartRef.current = false
       setStatus('idle')
@@ -307,7 +367,13 @@ export function useVoiceConversation({
    */
   const submitCapturedUtterance = useCallback(
     async (audio: Blob | null) => {
+      const conversationEpoch = conversationEpochRef.current
+
       const resumeListening = () => {
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
+
         if (enabledRef.current && !mutedRef.current) {
           pendingStartRef.current = true
         }
@@ -325,6 +391,10 @@ export function useVoiceConversation({
 
       try {
         const transcript = (await onTranscribeAudio(audio)).trim()
+
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
 
         if (!transcript) {
           resumeListening()
@@ -349,14 +419,27 @@ export function useVoiceConversation({
 
         while (busyRef.current && Date.now() < deadline) {
           await new Promise(resolve => window.setTimeout(resolve, 100))
+
+          if (conversationEpochRef.current !== conversationEpoch) {
+            return
+          }
         }
 
         awaitingSpokenResponseRef.current = true
         dropSpeechSession()
         consumePendingResponse()
         await onSubmit(transcript)
+
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
+
         setStatus('thinking')
       } catch (error) {
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
+
         notifyError(error, voiceCopy.transcriptionFailed)
         resumeListening()
       }
@@ -383,9 +466,15 @@ export function useVoiceConversation({
       return
     }
 
+    const conversationEpoch = conversationEpochRef.current
+
     stopBargeMonitorRef.current = monitorSpeechDuringPlayback({
       isPlaying: () => $voicePlayback.get().status === 'speaking',
       onSpeech: () => {
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
+
         bargeCapturePendingRef.current = true
         bargedRef.current = true
         markVoicePlaybackInterrupted()
@@ -398,6 +487,10 @@ export function useVoiceConversation({
         }
       },
       onUtterance: audio => {
+        if (conversationEpochRef.current !== conversationEpoch) {
+          return
+        }
+
         bargeCapturePendingRef.current = false
         stopBargeMonitorRef.current = null
         void submitCapturedUtterance(audio)
@@ -436,8 +529,10 @@ export function useVoiceConversation({
   /** Whole-text fallback: wait for the reply to complete, then speak it. */
   const awaitFallbackSpeech = useCallback(
     (responseId: string) => {
+      const conversationEpoch = conversationEpochRef.current
+
       const poll = () => {
-        if (responseIdRef.current !== responseId) {
+        if (conversationEpochRef.current !== conversationEpoch || responseIdRef.current !== responseId) {
           return
         }
 
@@ -466,9 +561,13 @@ export function useVoiceConversation({
         speechStartSequenceRef.current = $voicePlayback.get().sequence
 
         void playback
-          .catch(error => notifyError(error, voiceCopy.playbackFailed))
+          .catch(error => {
+            if (conversationEpochRef.current === conversationEpoch) {
+              notifyError(error, voiceCopy.playbackFailed)
+            }
+          })
           .finally(() => {
-            if (responseIdRef.current === responseId) {
+            if (conversationEpochRef.current === conversationEpoch && responseIdRef.current === responseId) {
               awaitingSpokenResponseRef.current = false
               settleAfterSpeech(bargedRef.current)
             }
@@ -487,6 +586,14 @@ export function useVoiceConversation({
    */
   const openLiveSpeech = useCallback(
     (responseId: string) => {
+      const conversationEpoch = conversationEpochRef.current
+      const setupKey = `${conversationEpoch}\0${responseId}`
+
+      if (speechSetupKeyRef.current === setupKey) {
+        return
+      }
+
+      speechSetupKeyRef.current = setupKey
       const sequenceBeforeStart = $voicePlayback.get().sequence
 
       responseIdRef.current = responseId
@@ -503,7 +610,11 @@ export function useVoiceConversation({
         const session = await startSpeechStream({ source: 'voice-conversation' })
 
         // The session may resolve after the loop moved on (barge, disable).
-        if (responseIdRef.current !== responseId) {
+        if (
+          conversationEpochRef.current !== conversationEpoch ||
+          speechSetupKeyRef.current !== setupKey ||
+          responseIdRef.current !== responseId
+        ) {
           if (session) {
             stopVoicePlayback()
           }
@@ -555,7 +666,11 @@ export function useVoiceConversation({
         const outcome = await session.done
         window.clearInterval(feedTimer)
 
-        if (responseIdRef.current !== responseId) {
+        if (
+          conversationEpochRef.current !== conversationEpoch ||
+          speechSetupKeyRef.current !== setupKey ||
+          responseIdRef.current !== responseId
+        ) {
           return
         }
 
@@ -584,6 +699,7 @@ export function useVoiceConversation({
       return
     }
 
+    conversationEpochRef.current += 1
     setMuted(false)
     awaitingSpokenResponseRef.current = false
     dropSpeechSession()
@@ -600,6 +716,7 @@ export function useVoiceConversation({
   ])
 
   const end = useCallback(async () => {
+    conversationEpochRef.current += 1
     pendingStartRef.current = false
     clearTurnTimeout()
     stopVoicePlayback()
@@ -623,6 +740,7 @@ export function useVoiceConversation({
       const next = !value
 
       if (next) {
+        conversationEpochRef.current += 1
         clearTurnTimeout()
         handle.cancel()
         setStatus('idle')

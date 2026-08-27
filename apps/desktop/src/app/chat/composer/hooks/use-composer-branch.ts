@@ -1,8 +1,10 @@
-import { type MutableRefObject, useCallback, useRef } from 'react'
+import { type MutableRefObject, useCallback, useLayoutEffect, useRef } from 'react'
 
 import { listRepoBranches, requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
 
 import { useComposerScope } from '../scope'
+
+import { useCommittedActionScope } from './use-committed-action-scope'
 
 interface UseComposerBranchOptions {
   actionsDisabled: boolean
@@ -27,21 +29,12 @@ export function useComposerBranch({
   sessionKey
 }: UseComposerBranchOptions) {
   const scope = useComposerScope()
-  const actionEpochRef = useRef({ key: sessionKey, value: 0 })
-
-  if (actionEpochRef.current.key !== sessionKey) {
-    actionEpochRef.current = { key: sessionKey, value: actionEpochRef.current.value + 1 }
-  }
-
-  const renderActionEpoch = actionEpochRef.current.value
+  const actionIsCurrent = useCommittedActionScope(sessionKey, actionsDisabled)
   const actionStateRef = useRef({ actionsDisabled, clearDraft, cwd, draftRef })
 
-  actionStateRef.current = { actionsDisabled, clearDraft, cwd, draftRef }
-
-  const actionIsCurrent = useCallback(
-    () => actionEpochRef.current.value === renderActionEpoch && !actionStateRef.current.actionsDisabled,
-    [renderActionEpoch]
-  )
+  useLayoutEffect(() => {
+    actionStateRef.current = { actionsDisabled, clearDraft, cwd, draftRef }
+  }, [actionsDisabled, clearDraft, cwd, draftRef])
 
   // Hand a worktree off to the controller: open a fresh session anchored there,
   // carrying the composer draft as its first turn. Clearing here means the draft

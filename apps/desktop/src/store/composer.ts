@@ -230,7 +230,9 @@ function loadPersistedDraftTexts(): [string, SessionDraft][] {
   }
 }
 
-const draftsBySession = new Map<string, SessionDraft>(loadPersistedDraftTexts())
+const initialPersistedDrafts = loadPersistedDraftTexts()
+const draftsBySession = new Map<string, SessionDraft>(initialPersistedDrafts)
+let persistedTextKeys = new Set(initialPersistedDrafts.map(([key]) => key))
 const draftRevisionsBySession = new Map<string, number>()
 
 function attachmentEqual(a: ComposerAttachment, b: ComposerAttachment): boolean {
@@ -370,14 +372,32 @@ export function reloadPersistedDrafts(): void {
     publishDraftTitle(key, deriveDraftTitle(draft.text))
   }
 
-  // A key that vanished from storage was cleared (sent) in the other window.
-  for (const key of [...draftsBySession.keys()]) {
-    if (!incoming.has(key)) {
+  // Only keys that previously had persisted text can be external clears.
+  // Memory-only attachment drafts are deliberately absent from localStorage;
+  // treating every missing key as a tombstone deletes their blobs/metadata.
+  for (const key of persistedTextKeys) {
+    if (incoming.has(key)) {
+      continue
+    }
+
+    const local = draftsBySession.get(key)
+
+    if (local?.attachments.length) {
+      const next = { ...local, text: '' }
+
+      if (!draftEqual(local, next)) {
+        draftsBySession.set(key, next)
+        bumpDraftRevision(key)
+      }
+    } else if (local) {
       draftsBySession.delete(key)
       bumpDraftRevision(key)
-      publishDraftTitle(key, '')
     }
+
+    publishDraftTitle(key, '')
   }
+
+  persistedTextKeys = new Set(incoming.keys())
 }
 
 // localStorage `storage` events fire across Electron BrowserWindows of the
@@ -442,6 +462,8 @@ function persistDraftTexts() {
     } else {
       window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)))
     }
+
+    persistedTextKeys = new Set(entries.map(([key]) => key))
   } catch {
     // Best-effort only — quota/private-mode must never break typing.
   }

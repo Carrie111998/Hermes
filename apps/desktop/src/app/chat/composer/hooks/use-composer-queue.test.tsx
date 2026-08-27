@@ -378,6 +378,75 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
+  it('serializes a pending steer and removes it from the migrated destination', async () => {
+    const destination = storageKey('stored-after-steer')
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'one redirect only' })
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const onSteer = vi.fn(() => pending)
+    const { hook } = renderQueueHook({ busy: true, onSteer })
+    let first: Promise<boolean>
+    let second: Promise<boolean>
+
+    act(() => {
+      first = hook.result.current.steerQueuedNow(entry!.id)
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledOnce())
+
+    act(() => {
+      second = hook.result.current.steerQueuedNow(entry!.id)
+    })
+
+    expect(onSteer).toHaveBeenCalledOnce()
+
+    act(() => {
+      migrateComposerStorageScope(SESSION_KEY, destination)
+      hook.rerender({ busy: true, queueSessionKey: 'stored-after-steer', sessionKey: destination })
+    })
+
+    await act(async () => settle?.(true))
+
+    await expect(first!).resolves.toBe(true)
+    await expect(second!).resolves.toBe(false)
+    expect(onSteer).toHaveBeenCalledOnce()
+    expect(getQueuedPrompts(destination)).toHaveLength(0)
+  })
+
+  it('does not clear a newer Stop park when a pending steer succeeds', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'pending redirect' })
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'must stay parked' })
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const onSteer = vi.fn(() => pending)
+    const { hook } = renderQueueHook({ busy: true, onSteer })
+    let steering: Promise<boolean>
+
+    act(() => {
+      steering = hook.result.current.steerQueuedNow(entry!.id)
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledOnce())
+
+    act(() => {
+      parkQueuedPrompts(SESSION_KEY)
+    })
+
+    await act(async () => settle?.(true))
+
+    await expect(steering!).resolves.toBe(true)
+    expect(isQueueParked(SESSION_KEY)).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY).map(item => item.text)).toEqual(['must stay parked'])
+  })
+
   it('a rejected steer leaves the entry queued so the settle drain still sends it', async () => {
     const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'kept on reject' })
     const onSteer = vi.fn(async () => false)

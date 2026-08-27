@@ -176,7 +176,7 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
 
     expect(takeSessionDraft('session-B').text).toBe('')
     draftHook.draftRef.current = 'fast draft in B'
-    expect(isBrowsingHistory('runtime-A')).toBe(true)
+    expect(isBrowsingHistory('runtime-A')).toBe(false)
     expect(takeSessionDraft('session-B').text).toBe('')
 
     view.rerender(

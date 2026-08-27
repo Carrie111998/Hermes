@@ -109,7 +109,12 @@ export function useComposerQueue({
   const [autoDrainRetryEpoch, setAutoDrainRetryEpoch] = useState(0)
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
-    if (actionsDisabled || !activeQueueSessionKey || queueEdit) {
+    if (
+      actionsDisabled ||
+      !activeQueueSessionKey ||
+      queueEdit ||
+      isComposerQueueDrainExcluded(activeQueueSessionKey, entry.id)
+    ) {
       return
     }
 
@@ -252,11 +257,6 @@ export function useComposerQueue({
         drainFailuresRef.current.delete(entry.id)
         removeQueuedPrompt(settledQueueSessionKey, entry.id)
         resetBrowseState(drainRuntimeSessionId)
-        // A successful drain means the queue is flowing again — lift any park
-        // so the remaining entries follow. Manual drains (Enter on an empty
-        // composer, the per-row send arrow) are exactly the resume gestures a
-        // parked queue waits for; the auto path only reaches here unparked.
-        unparkQueuedPrompts(settledQueueSessionKey)
 
         return true
       } finally {
@@ -277,7 +277,13 @@ export function useComposerQueue({
     [queueEditRef] // reads the edit id off a ref so the lock-holder always sees the latest
   )
 
-  const drainNextQueued = useCallback(() => runDrain(pickDrainHead), [pickDrainHead, runDrain])
+  const drainNextQueued = useCallback(() => {
+    if (activeQueueSessionKey) {
+      unparkQueuedPrompts(activeQueueSessionKey)
+    }
+
+    return runDrain(pickDrainHead)
+  }, [activeQueueSessionKey, pickDrainHead, runDrain])
 
   const sendQueuedNow = useCallback(
     (id: string) => {
@@ -302,6 +308,7 @@ export function useComposerQueue({
       // A manual send clears the auto-drain backoff so a stuck entry the user
       // taps gets a fresh attempt (and re-enables auto-retry on success).
       drainFailuresRef.current.delete(id)
+      unparkQueuedPrompts(activeQueueSessionKey)
 
       return runDrain(entries => entries.find(e => e.id === id))
     },
@@ -326,24 +333,43 @@ export function useComposerQueue({
         return false
       }
 
-      triggerHaptic('submit')
+      const steerScopeKey = activeQueueSessionKey
+      const drain = beginComposerQueueDrain(steerScopeKey, entry.id)
 
-      const accepted = await Promise.resolve(onSteer(entry.text))
-
-      // Rejected (turn already settling, gateway said no): leave the entry
-      // queued exactly where it was — the settle drain picks it up, so the
-      // words are never lost. Only a delivered redirect consumes the entry.
-      if (!accepted) {
+      if (!drain) {
         return false
       }
 
-      drainFailuresRef.current.delete(id)
-      removeQueuedPrompt(activeQueueSessionKey, id)
-      // A steer is the same "keep it moving" intent as a manual send — a park
-      // from an earlier Stop must not hold back what's left of the queue.
-      unparkQueuedPrompts(activeQueueSessionKey)
+      let drainFinished = false
 
-      return true
+      triggerHaptic('submit')
+      // This click is the manual resume gesture. Lift an older park now; a Stop
+      // pressed while the redirect is pending establishes a newer park that
+      // settlement must not clear.
+      unparkQueuedPrompts(steerScopeKey)
+
+      try {
+        const accepted = await Promise.resolve(onSteer(entry.text))
+
+        // Rejected (turn already settling, gateway said no): leave the entry
+        // queued exactly where it was — the settle drain picks it up, so the
+        // words are never lost. Only a delivered redirect consumes the entry.
+        if (!accepted) {
+          return false
+        }
+
+        const settledScopeKey = finishComposerQueueDrain(drain) ?? steerScopeKey
+
+        drainFinished = true
+        drainFailuresRef.current.delete(id)
+        removeQueuedPrompt(settledScopeKey, id)
+
+        return true
+      } finally {
+        if (!drainFinished) {
+          finishComposerQueueDrain(drain)
+        }
+      }
     },
     [actionsDisabled, activeQueueSessionKey, busy, onSteer, queueEditRef]
   )

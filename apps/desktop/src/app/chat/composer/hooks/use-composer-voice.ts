@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
@@ -19,6 +19,7 @@ import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
+import { useCommittedActionScope } from './use-committed-action-scope'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
@@ -77,13 +78,7 @@ export function useComposerVoice({
   // stays mounted across route switches, so a callback created for A can finish
   // after the same editor is showing B. Invalidate every callback generation on
   // a durable draft-scope change and read all action dependencies live.
-  const voiceScopeEpochRef = useRef({ key: submissionKey, value: 0 })
-
-  if (voiceScopeEpochRef.current.key !== submissionKey) {
-    voiceScopeEpochRef.current = { key: submissionKey, value: voiceScopeEpochRef.current.value + 1 }
-  }
-
-  const renderVoiceScopeEpoch = voiceScopeEpochRef.current.value
+  const voiceScopeIsCurrent = useCommittedActionScope(submissionKey, disabled)
 
   const voiceActionStateRef = useRef({
     busy,
@@ -96,10 +91,18 @@ export function useComposerVoice({
     sessionId
   })
 
-  voiceActionStateRef.current = { busy, clearDraft, disabled, focusInput, insertText, onInterrupt, onSubmit, sessionId }
-
-  const voiceScopeIsCurrent = () =>
-    voiceScopeEpochRef.current.value === renderVoiceScopeEpoch && !voiceActionStateRef.current.disabled
+  useLayoutEffect(() => {
+    voiceActionStateRef.current = {
+      busy,
+      clearDraft,
+      disabled,
+      focusInput,
+      insertText,
+      onInterrupt,
+      onSubmit,
+      sessionId
+    }
+  }, [busy, clearDraft, disabled, focusInput, insertText, onInterrupt, onSubmit, sessionId])
 
   const insertVoiceTranscript = (text: string) => {
     if (voiceScopeIsCurrent()) {
@@ -127,7 +130,9 @@ export function useComposerVoice({
 
   const cancelDictationRef = useRef(cancelDictation)
 
-  cancelDictationRef.current = cancelDictation
+  useLayoutEffect(() => {
+    cancelDictationRef.current = cancelDictation
+  }, [cancelDictation])
 
   /** Auto-speak selector: the latest unspoken reply only — a backlog collapses to the newest. */
   const pendingResponse = () => {

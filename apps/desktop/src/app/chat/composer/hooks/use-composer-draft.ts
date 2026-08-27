@@ -20,7 +20,7 @@ import {
   stashSessionDraft,
   takeSessionDraft
 } from '@/store/composer'
-import { isBrowsingHistory } from '@/store/composer-input-history'
+import { isBrowsingHistory, resetBrowseState } from '@/store/composer-input-history'
 import { migrateQueuedPrompts } from '@/store/composer-queue'
 import { migrateComposerStorageScope } from '@/store/composer-storage-migration'
 import { clearDraftSuggestions, sampleComposerDraft } from '@/store/composer-suggestions'
@@ -122,22 +122,22 @@ export function useComposerDraft({
   const pendingDraftPersistRef = useRef<{ scope: string | null; text: string } | null>(null)
   const draftPersistTimerRef = useRef<number | undefined>(undefined)
   const activeQueueSessionKeyRef = useRef(activeQueueSessionKey)
-  activeQueueSessionKeyRef.current = activeQueueSessionKey
-  // Owned only by the swap effect below — unlike activeQueueSessionKeyRef this
-  // does NOT update on every render, so it always reflects the session whose
-  // text is actually loaded in the editor. Async work (debounce timers,
-  // pagehide flush) must persist against this, not the render-time ref, or a
-  // session switch mid-flight files one session's draft under another's key
-  // (#54527).
+  // Owned only by the swap effect below — activeQueueSessionKeyRef publishes in
+  // a layout effect so an abandoned render cannot retarget visible callbacks.
+  // draftScopeRef reflects the session whose text is actually loaded in the
+  // editor. Async work (debounce timers, pagehide flush) persists against it.
   const draftScopeRef = useRef(activeQueueSessionKey)
   const historySessionByScopeRef = useRef(new Map<string | null, string | null>())
-
-  if (!actionsDisabled) {
-    historySessionByScopeRef.current.set(activeQueueSessionKey, sessionId ?? null)
-  }
-
   const queueEditStateRef = useRef<QueueEditState | null>(queueEditRef.current)
-  queueEditStateRef.current = queueEditRef.current
+
+  useLayoutEffect(() => {
+    activeQueueSessionKeyRef.current = activeQueueSessionKey
+    queueEditStateRef.current = queueEditRef.current
+
+    if (!actionsDisabled) {
+      historySessionByScopeRef.current.set(activeQueueSessionKey, sessionId ?? null)
+    }
+  }, [actionsDisabled, activeQueueSessionKey, queueEditRef, sessionId])
 
   const [focusRequestId, setFocusRequestId] = useState(0)
 
@@ -466,12 +466,19 @@ export function useComposerDraft({
       const latestText = syncDraftFromEditor()
       const editing = queueEditStateRef.current
       const historySessionId = historySessionByScope.get(activeQueueSessionKey) ?? null
+      const browsingHistory = isBrowsingHistory(historySessionId)
 
       if (editing?.sessionKey === activeQueueSessionKey) {
         stashAt(activeQueueSessionKey, editing.draft, editing.attachments)
-      } else if (!isBrowsingHistory(historySessionId)) {
+      } else if (!browsingHistory) {
         stashAt(activeQueueSessionKey, latestText)
       }
+
+      if (browsingHistory) {
+        resetBrowseState(historySessionId)
+      }
+
+      historySessionByScope.delete(activeQueueSessionKey)
 
       // Withdraw the outgoing session's draft suggestions (and any pending
       // sample timer). The incoming session re-earns its own from the draft

@@ -8,8 +8,15 @@ import { useVoiceConversation } from './use-voice-conversation'
 const mocks = vi.hoisted(() => {
   let deferStreamStart = false
   let onSilence: null | (() => void) = null
-  let resolveStreamStart: null | (() => void) = null
+  const resolveStreamStarts: Array<() => void> = []
   let resolveSpeech: null | ((outcome: 'done' | 'fallback') => void) = null
+
+  const sessions: Array<{
+    append: ReturnType<typeof vi.fn>
+    done: Promise<'done' | 'fallback'>
+    finish: ReturnType<typeof vi.fn>
+  }> = []
+
   let streamAvailable = true
 
   const stopVoicePlayback = vi.fn(() => {
@@ -36,8 +43,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     continueStreamStart() {
-      resolveStreamStart?.()
-      resolveStreamStart = null
+      resolveStreamStarts.shift()?.()
     },
     deferStreamStart() {
       deferStreamStart = true
@@ -49,14 +55,16 @@ const mocks = vi.hoisted(() => {
     playSpeechText,
     resetSpeechMocks() {
       deferStreamStart = false
-      resolveStreamStart = null
+      resolveStreamStarts.length = 0
       resolveSpeech = null
+      sessions.length = 0
       streamAvailable = true
     },
+    sessions,
     startSpeechStream: vi.fn(async () => {
       if (deferStreamStart) {
         await new Promise<void>(resolve => {
-          resolveStreamStart = resolve
+          resolveStreamStarts.push(resolve)
         })
       }
 
@@ -67,13 +75,17 @@ const mocks = vi.hoisted(() => {
       const current = $voicePlayback.get()
       $voicePlayback.set({ ...current, sequence: current.sequence + 1, status: 'preparing' })
 
-      return {
+      const session = {
         append: vi.fn(),
         done: new Promise<'done' | 'fallback'>(resolve => {
           resolveSpeech = resolve
         }),
         finish: vi.fn()
       }
+
+      sessions.push(session)
+
+      return session
     }),
     stopVoicePlayback,
     triggerSilence() {
@@ -206,6 +218,38 @@ describe('useVoiceConversation playback rearm', () => {
     await waitFor(() => expect(hook.result.current.status).toBe('idle'))
     expect(mocks.stopVoicePlayback).toHaveBeenCalledTimes(2)
     expect(mocks.handle.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('starts only one stream discovery while a response setup is pending', async () => {
+    mocks.deferStreamStart()
+    const hook = renderRearmConversation('reply-single-setup', 'One stream only')
+
+    await beginReply(hook)
+    await waitFor(() => expect(mocks.startSpeechStream).toHaveBeenCalled())
+
+    expect(mocks.startSpeechStream).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops stale stream setup after end and restart reuse the same response id', async () => {
+    mocks.deferStreamStart()
+    const hook = renderRearmConversation('reply-reused', 'Same reply id')
+
+    await beginReply(hook)
+    await waitFor(() => expect(mocks.startSpeechStream.mock.calls.length).toBeGreaterThan(0))
+    const oldStartCount = mocks.startSpeechStream.mock.calls.length
+
+    await act(async () => hook.result.current.end())
+    hook.rerender({ enabled: false })
+    hook.rerender({ enabled: true })
+    await waitFor(() => expect(mocks.handle.start.mock.calls.length).toBeGreaterThan(1))
+
+    await act(async () => mocks.triggerSilence())
+    await waitFor(() => expect(mocks.startSpeechStream.mock.calls.length).toBeGreaterThan(oldStartCount))
+
+    await act(async () => mocks.continueStreamStart())
+    await waitFor(() => expect(mocks.sessions).toHaveLength(1))
+
+    expect(mocks.sessions[0]?.append).not.toHaveBeenCalled()
   })
 
   it('does not start fallback playback after Stop during stream discovery', async () => {

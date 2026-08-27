@@ -4,7 +4,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { $clarifyRequests } from '@/store/clarify'
-import { clearSessionDraft, type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+import {
+  clearSessionDraft,
+  type ComposerAttachment,
+  SESSION_DRAFTS_STORAGE_KEY,
+  stashSessionDraft,
+  takeSessionDraft
+} from '@/store/composer'
+import { clearQueuedPrompts, getQueuedPrompts } from '@/store/composer-queue'
 import {
   _resetComposerStorageMigrationsForTests,
   migrateComposerStorageScope
@@ -161,6 +168,7 @@ describe('useComposerSubmit rejection restoration', () => {
     cleanup()
     vi.restoreAllMocks()
     clearSessionDraft('session-a')
+    clearQueuedPrompts('session-a')
     _resetComposerStorageMigrationsForTests()
   })
 
@@ -241,6 +249,30 @@ describe('useComposerSubmit rejection restoration', () => {
     await act(async () => settle?.(false))
 
     expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('session-a').map(entry => entry.text)).toEqual(['older submitted A'])
+  })
+
+  it('synchronously observes a newer cross-window draft before restoring a rejection', async () => {
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const { hook, onSubmit } = renderSubmitHook({ sessionKey: 'session-a' })
+
+    onSubmit.mockImplementationOnce(() => pending)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('submitted in window A')
+    })
+
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ 'session-a': 'newer window B draft' }))
+
+    await act(async () => settle?.(false))
+
+    expect(takeSessionDraft('session-a').text).toBe('newer window B draft')
+    expect(getQueuedPrompts('session-a').map(entry => entry.text)).toEqual(['submitted in window A'])
   })
 
   it('does not clear a newer stashed A draft when an older A submission is accepted late', async () => {

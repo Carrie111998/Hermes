@@ -1,6 +1,15 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
+import {
+  type ClipboardEvent,
+  type FormEvent,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef
+} from 'react'
 
 import { useTourMarker } from '@/app/chat/tour-marker'
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
@@ -45,6 +54,7 @@ import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-aff
 import { markActiveComposer, onComposerAttachImagesRequest } from './focus'
 import { HelpHint } from './help-hint'
 import { useAtCompletions } from './hooks/use-at-completions'
+import { useCommittedActionScope } from './hooks/use-committed-action-scope'
 import { useComposerBranch } from './hooks/use-composer-branch'
 import { useComposerDraft } from './hooks/use-composer-draft'
 import { useComposerDrop } from './hooks/use-composer-drop'
@@ -132,21 +142,12 @@ export function ChatBar({
   const submitScopeKey = queueSessionKey === undefined ? (sessionId ?? null) : queueSessionKey
   const activeQueueSessionKey = storageScopeKey === undefined ? submitScopeKey : storageScopeKey
   const actionScopeKey = identityScopeKey ?? activeQueueSessionKey
-  const submitScopeEpochRef = useRef({ key: actionScopeKey, value: 0 })
-
-  if (submitScopeEpochRef.current.key !== actionScopeKey) {
-    submitScopeEpochRef.current = { key: actionScopeKey, value: submitScopeEpochRef.current.value + 1 }
-  }
-
-  const renderSubmitScopeEpoch = submitScopeEpochRef.current.value
+  const submitActionIsCurrent = useCommittedActionScope(actionScopeKey, actionsDisabled)
   const actionsDisabledRef = useRef(actionsDisabled)
 
-  actionsDisabledRef.current = actionsDisabled
-
-  const submitActionIsCurrent = useCallback(
-    () => submitScopeEpochRef.current.value === renderSubmitScopeEpoch && !actionsDisabledRef.current,
-    [renderSubmitScopeEpoch]
-  )
+  useLayoutEffect(() => {
+    actionsDisabledRef.current = actionsDisabled
+  }, [actionsDisabled])
 
   // Every send (typed, queued, voice) passes through the contributed
   // middleware chain first — rewrite / pass-through / cancel. Empty chain =

@@ -8,6 +8,7 @@ import {
   clearSessionDraft,
   clearSessionDraftIfRevision,
   type ComposerAttachment,
+  reloadPersistedDrafts,
   sessionDraftRevision
 } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -111,6 +112,11 @@ export function useComposerSubmit({
         return
       }
 
+      // Storage events are asynchronous across BrowserWindows. Pull the shared
+      // text snapshot synchronously before comparing revisions so a rejection
+      // cannot overwrite a newer draft written by another window.
+      reloadPersistedDrafts()
+
       const restoreScope =
         typeof submittedScope === 'string' ? resolveComposerStorageScopeKey(submittedScope) : submittedScope
 
@@ -119,7 +125,11 @@ export function useComposerSubmit({
       const visibleDraftChanged =
         visibleScopeIsSubmitted && (draftRef.current.length > 0 || scope.attachments.$attachments.get().length > 0)
 
-      if (visibleDraftChanged || sessionDraftRevision(submittedScope) !== submittedRevision) {
+      const submittedRevisionChanged = sessionDraftRevision(submittedScope) !== submittedRevision
+
+      if (visibleDraftChanged || submittedRevisionChanged) {
+        enqueueQueuedPrompt(restoreScope, { attachments: submittedAttachments, text })
+
         return
       }
 

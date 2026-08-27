@@ -261,6 +261,16 @@ describe('session drafts', () => {
     expect(takeSessionDraft('session-a').text).toBe('newer other-window draft')
   })
 
+  it('preserves attachment-only inactive drafts when another window updates persisted text', () => {
+    stashSessionDraft('session-a', '', [attachment({ id: 'image:a', kind: 'image' })])
+
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ 'session-b': 'other window text' }))
+    reloadPersistedDrafts()
+
+    expect(takeSessionDraft('session-a').attachments.map(item => item.id)).toEqual(['image:a'])
+    expect(takeSessionDraft('session-b').text).toBe('other window text')
+  })
+
   it('evicts empty drafts instead of leaving stale entries behind', () => {
     stashSessionDraft('session-a', 'saved', [])
     stashSessionDraft('session-a', '   ', [])
