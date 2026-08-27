@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -26,12 +27,18 @@ from agent.command_token_source import (
     CommandTokenError,
     CommandTokenSource,
     _mint,
+    _parse_command_argv,
     build_command_token_provider,
 )
 
 
 def _python_command(code: str) -> str:
-    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    argv = [sys.executable, "-c", code]
+    if sys.platform == "win32":
+        # Force quoting for Python snippets containing shell-like punctuation;
+        # native Windows argv parsing otherwise leaves ``print(...)`` unquoted.
+        return subprocess.list2cmdline([sys.executable, "-c", f"{code} "])
+    return " ".join(shlex.quote(part) for part in argv)
 
 
 def _python_print(value: str) -> str:
@@ -54,6 +61,55 @@ class TestMinting:
             "command": ["token-helper", "--profile", "prod"],
             "shell": False,
         }
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            (
+                r"helper --config C:\Users\andre\config.json",
+                ["helper", "--config", r"C:\Users\andre\config.json"],
+            ),
+            (
+                r'"C:\Program Files\helper.exe" --path C:\tmp\token',
+                [
+                    r"C:\Program Files\helper.exe",
+                    "--path",
+                    r"C:\tmp\token",
+                ],
+            ),
+            (
+                "helper --path C:\\tmp\\",
+                ["helper", "--path", "C:\\tmp\\"],
+            ),
+        ],
+    )
+    def test_windows_parser_preserves_native_backslashes(self, command, expected):
+        if sys.platform != "win32":
+            pytest.skip("native backslash parsing is Windows-specific")
+        assert _parse_command_argv(command, "dbx") == expected
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'cmd.exe /d /c "echo pwned > marker"',
+            'powershell -NoProfile -Command "Set-Content marker pwned"',
+            'pwsh -NoProfile -c "Set-Content marker pwned"',
+            'sh -c "echo pwned > marker"',
+            'bash -c "echo pwned > marker"',
+        ],
+    )
+    def test_shell_launchers_are_rejected_before_execution(self, monkeypatch, command):
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("shell launcher must be rejected before process creation")
+
+        monkeypatch.setattr("agent.command_token_source.subprocess.run", fail_if_called)
+        with pytest.raises(CommandTokenError, match="shell"):
+            _mint(command, "dbx")
+
+    def test_nul_command_is_normalized_to_provider_error(self):
+        with pytest.raises(CommandTokenError, match="could not be parsed") as excinfo:
+            _mint("helper\x00--token", "dbx")
+        assert "helper" not in str(excinfo.value)
 
     def test_shell_injection_marker_never_runs(self, tmp_path):
         marker = tmp_path / "marker"
