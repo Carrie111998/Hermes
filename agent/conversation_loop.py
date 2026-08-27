@@ -1881,7 +1881,10 @@ def _apply_context_engine_selection(
     # with an empty message list that the downstream sanitizers cannot restore,
     # reaching the provider as an invalid request instead of failing open.
     if isinstance(selected, list) and selected and all(isinstance(m, dict) for m in selected):
-        return selected
+        # Downstream request shaping mutates messages in place. Clone the
+        # engine-owned result so stripping route metadata on this request does
+        # not make a cached/reused selection appear unprovenanced next turn.
+        return [_clone_message_for_send(m) for m in selected]
 
     logger.warning(
         "Context engine select_context returned an invalid value "
@@ -2483,9 +2486,13 @@ def run_conversation(
                 # ``_flush_messages_to_session_db``).
                 api_msg["content"] = _api_content
 
-            # For ALL assistant messages, pass reasoning back to the API
-            # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
+            # For ALL assistant messages, pass reasoning back to the API.
+            # Keep the internal provenance marker until after the optional
+            # context-selection hook, which may replace this request with raw
+            # canonical messages. The final pass below validates and strips it.
+            agent._copy_reasoning_content_for_api(
+                msg, api_msg, retain_route_provenance=True
+            )
 
             # ``reasoning`` is normally trajectory-only. An explicitly
             # configured replay provider may consume it as a wire field.
@@ -2645,6 +2652,25 @@ def run_conversation(
             _sel_incoming,
             logger=request_logger,
         )
+
+        # Context selection may return canonical/history messages rather than
+        # the already-shaped request copies above. Revalidate reasoning at this
+        # final selection boundary so unknown or foreign hidden traces cannot
+        # bypass route provenance checks. This also strips the internal marker
+        # before any provider transport sees the request.
+        for api_msg in api_messages:
+            if not isinstance(api_msg, dict):
+                continue
+            if api_msg.get("role") == "assistant":
+                agent._copy_reasoning_content_for_api(api_msg, api_msg)
+                continue
+            # Structured reasoning and its provenance are assistant-only.
+            # A context engine must not be able to place them on another role
+            # and bypass the assistant validation path.
+            api_msg.pop("_reasoning_route", None)
+            api_msg.pop("reasoning", None)
+            api_msg.pop("reasoning_content", None)
+            api_msg.pop("reasoning_details", None)
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not

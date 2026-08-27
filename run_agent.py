@@ -8438,10 +8438,21 @@ class AIAgent:
             "mimo", (self.provider or "").lower(), self.model, self.base_url
         )
 
-    def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
+    def _copy_reasoning_content_for_api(
+        self,
+        source_msg: dict,
+        api_msg: dict,
+        *,
+        retain_route_provenance: bool = False,
+    ) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
         from agent.agent_runtime_helpers import copy_reasoning_content_for_api
-        return copy_reasoning_content_for_api(self, source_msg, api_msg)
+        return copy_reasoning_content_for_api(
+            self,
+            source_msg,
+            api_msg,
+            retain_route_provenance=retain_route_provenance,
+        )
 
     def _reasoning_replay_field_for_api(self) -> str | None:
         """Return the configured provider-facing reasoning replay field."""
