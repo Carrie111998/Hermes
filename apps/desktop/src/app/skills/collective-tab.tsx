@@ -97,6 +97,7 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   const [actionPlan, setActionPlan] = useState<
     null | (WisdomActionPlan & { action: 'install' | 'uninstall' | 'update' })
   >(null)
+
   const [actionPlanReference, setActionPlanReference] = useState<null | string>(null)
 
   const [acceptSensitive, setAcceptSensitive] = useState(false)
