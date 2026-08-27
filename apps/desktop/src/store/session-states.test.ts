@@ -1126,9 +1126,13 @@ describe('boot-restore selection homing (⌘R tab persistence)', () => {
 })
 
 describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
+  const botOwner = { connectionId: 'source-b', mode: 'remote' as const, profile: 'bot:b' }
+  const botPane = sessionTilePaneId('chat-b', botOwner)
+
   afterEach(() => {
     $layoutTree.set(null)
     $selectedStoredSessionId.set(null)
+    $sessionTiles.set([])
     setWorkspaceScope('sessions')
   })
 
@@ -1142,10 +1146,11 @@ describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
     // home over the still-visible chat (the reported "jumps to the list").
     setWorkspaceScope('bots', 'bot:b')
     $selectedStoredSessionId.set(null)
+    $sessionTiles.set([{ ownerRoute: botOwner, storedSessionId: 'chat-b' }])
     $layoutTree.set(
       split('row', [
         group(['sessions', 'hermes-bots:pane'], { active: 'hermes-bots:pane', id: 'grp-sessions' }),
-        group(['workspace', tilePane('chat-b')], { active: tilePane('chat-b'), id: 'grp-main' })
+        group(['workspace', botPane], { active: botPane, id: 'grp-main' })
       ])
     )
     noteActiveTreeGroup('grp-sessions')
@@ -1156,7 +1161,8 @@ describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
   it('the main-zone tile also answers while the tracker sits on the workspace tab itself', () => {
     setWorkspaceScope('bots', 'bot:b')
     $selectedStoredSessionId.set(null)
-    $layoutTree.set(group(['workspace', tilePane('chat-b')], { active: tilePane('chat-b'), id: 'grp-main' }))
+    $sessionTiles.set([{ ownerRoute: botOwner, storedSessionId: 'chat-b' }])
+    $layoutTree.set(group(['workspace', botPane], { active: botPane, id: 'grp-main' }))
     noteActiveTreeGroup('grp-main')
 
     expect($focusedStoredSessionId.get()).toBe('chat-b')
