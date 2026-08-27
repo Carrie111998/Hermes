@@ -79,16 +79,28 @@ HERMES_DESKTOP_CDP_PORT=9333 \
   (read *and* mutating) refuses to run unless the *connected target proves* it is
   the isolated sandbox you declared. The Electron main process that opens the dev
   CDP port emits a per-instance descriptor (`__DEBUG_MCP_INSTANCE__ = { nonce,
-  dataRoot }`) into the renderer. The server reads the *realized* `dataRoot` from
-  the target over CDP and compares it (canonicalized) to `DESKTOP_DEBUG_MCP_EXPECTED_HOME`.
-  If the env var is unset, the target exposes no descriptor, or the realized home
-  does not match the declared one, every call returns `REFUSED`. This is
-  **target-derived authority, not a caller declaration** — so a real dev Desktop
-  running on `~/.hermes` cannot be reached by merely declaring a fake
-  `DESKTOP_DEBUG_MCP_EXPECTED_HOME`. It prevents a debug run from reading/writing
-  your real API keys and chat history — the exact failure mode of the 2026-08-26
-  incident where a manual `electron .` launch (with only `HERMES_DESKTOP_USER_DATA_DIR`
-  set) silently used `~/.hermes` as `HERMES_HOME`.
+  dataRoot }`) into the renderer. `dataRoot` is the **realized** Hermes home from
+  the single home authority (`electron/hermes-home.ts`) — the same value the app
+  actually uses, so a `HERMES_DESKTOP_USER_DATA_DIR`-only sandbox launch attests
+  `<userData>/hermes-home`, never `~/.hermes`. The server reads it over CDP and
+  checks two independent policies:
+  1. **Protected home refusal** — if the realized home equals the server's default
+     home (`HERMES_HOME` env or `~/.hermes`) or the OS user's literal `~/.hermes`,
+     the call is REFUSED even when the declared `EXPECTED_HOME` agrees. Agreement
+     is not permission.
+  2. **Identity match** — the realized home must (canonically) equal
+     `DESKTOP_DEBUG_MCP_EXPECTED_HOME`.
+  If the env var is unset, the target exposes no descriptor, or either policy
+  fails, every call returns `REFUSED`. This is **target-derived authority, not a
+  caller declaration** — so a real dev Desktop running on `~/.hermes` cannot be
+  reached by merely declaring a fake `DESKTOP_DEBUG_MCP_EXPECTED_HOME`. It
+  prevents a debug run from reading/writing your real API keys and chat history —
+  the exact failure mode of the 2026-08-26 incident where a manual `electron .`
+  launch (with only `HERMES_DESKTOP_USER_DATA_DIR` set) silently used `~/.hermes`
+  as `HERMES_HOME`.
+- **`desktop_ui_status` is a preflight.** It deliberately skips connection and
+  attestation so it can report `cdpAlive: false` when no dev instance is running.
+  Every other tool (read included) still connects and attests first.
 
 ## Launching an isolated probe instance (REQUIRED before any act/flow)
 
