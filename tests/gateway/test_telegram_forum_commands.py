@@ -83,3 +83,24 @@ async def test_ensure_forum_commands_race_safety():
 
     # The lock should make this exactly 1 call, not 2.
     assert adapter._bot.set_my_commands.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_forum_commands_respects_menu_opt_out():
+    """#96025: command_menu.enabled=false must skip lazy forum registration.
+
+    The automatic set_my_commands overwrites BotFather customizations (e.g.
+    localized descriptions) on every registration; the opt-out keeps Hermes
+    from touching the menu at all.
+    """
+    adapter = _make_test_adapter()
+    msg = _forum_message(chat_id=-456, is_forum=True)
+
+    with patch("hermes_cli.commands.telegram_menu_enabled", return_value=False):
+        with patch("hermes_cli.commands.telegram_menu_commands") as mock_menu:
+            await adapter._ensure_forum_commands(msg)
+
+    adapter._bot.set_my_commands.assert_not_awaited()
+    mock_menu.assert_not_called()
+    # Marked handled so the check short-circuits on later messages too.
+    assert -456 in adapter._forum_command_registered
