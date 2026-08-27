@@ -2447,6 +2447,11 @@ DEFAULT_CONFIG = {
         #   after_processing  — mark read only once the agent finishes the turn
         #   disabled          — never send read receipts
         "read_receipts": "immediate",
+        # Lifecycle reactions on processed messages: an eyes reaction when the
+        # agent starts and a checkmark/cross when it finishes. On Beeper these
+        # propagate to every bridged network, so each incoming message visibly
+        # gets a checkmark. Set false to disable (eyes + checkmark/cross).
+        "reactions": True,
     },
 
     # Approval mode for dangerous commands:

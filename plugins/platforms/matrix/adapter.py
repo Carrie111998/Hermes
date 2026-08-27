@@ -1307,10 +1307,14 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_PROCESS_NOTICES", "false"
         ).lower() in ("true", "1", "yes")
 
-        # Reactions: configurable via MATRIX_REACTIONS (default: true).
-        self._reactions_enabled: bool = os.getenv(
-            "MATRIX_REACTIONS", "true"
-        ).lower() not in {"false", "0", "no"}
+        # Lifecycle reactions: configurable via config.yaml ``matrix.reactions``
+        # (env ``MATRIX_REACTIONS`` as legacy fallback; YAML wins when set).
+        # When enabled (default), the adapter annotates every processed message
+        # with an eyes reaction on start and a checkmark/cross on completion. On
+        # Beeper those reactions propagate to each bridged network, so every
+        # incoming message visibly gets a checkmark — set ``reactions: false``
+        # to stop that.
+        self._reactions_enabled: bool = self._parse_reactions_enabled(config)
 
         # Read receipts: configurable via config.yaml ``matrix.read_receipts``
         # (env ``MATRIX_READ_RECEIPTS`` as legacy fallback; YAML wins when set).
@@ -1487,6 +1491,34 @@ class MatrixAdapter(BasePlatformAdapter):
         if env_mode is not None:
             return env_mode
         return default
+
+    @staticmethod
+    def _parse_reactions_enabled(config) -> bool:
+        """Resolve lifecycle-reaction toggle from ``matrix.reactions``.
+
+        Falls back to the legacy ``MATRIX_REACTIONS`` env var; the YAML value
+        always wins when set. Defaults to enabled. A value is falsy when it is
+        the boolean ``False`` or one of ``"false"`` / ``"0"`` / ``"no"`` /
+        ``"off"`` (case-insensitive); everything else is truthy.
+        """
+
+        def _coerce(raw) -> Optional[bool]:
+            if raw is None:
+                return None
+            if isinstance(raw, bool):
+                return raw
+            token = str(raw).strip().lower()
+            if not token:
+                return None
+            return token not in {"false", "0", "no", "off"}
+
+        configured = _coerce(config.extra.get("reactions"))
+        if configured is not None:
+            return configured
+        env_val = _coerce(os.getenv("MATRIX_REACTIONS"))
+        if env_val is not None:
+            return env_val
+        return True
 
     # ------------------------------------------------------------------
     # E2EE helpers
@@ -5483,6 +5515,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
     if "read_receipts" in matrix_cfg and not os.getenv("MATRIX_READ_RECEIPTS"):
         os.environ["MATRIX_READ_RECEIPTS"] = str(matrix_cfg["read_receipts"]).lower()
+    if "reactions" in matrix_cfg and not os.getenv("MATRIX_REACTIONS"):
+        os.environ["MATRIX_REACTIONS"] = str(matrix_cfg["reactions"]).lower()
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
