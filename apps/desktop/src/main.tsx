@@ -5,6 +5,8 @@ import './store/active-work'
 import './store/power'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
+// Side-effect: hot-import prompt template jobs from $HERMES_HOME/prompt-templates-inbox.
+import { startPromptImportInbox } from './store/prompt-import-inbox'
 // Dev-only render/state churn counters. MUST precede the `react-dom` import
 // below: react-dom captures the devtools hook at module init, so bippy has to
 // install during THIS import's evaluation or every commit goes unseen
@@ -34,6 +36,7 @@ installClipboardShim()
 // theme's computed colors inlined; without this guard a dark-theme selection
 // pastes as near-white text into light-background targets.
 installSelectionCopyColorGuard()
+startPromptImportInbox()
 
 // The perf probe ships in dev, and in a production build ONLY when explicitly
 // opted in (VITE_PERF_PROBE=1) — this lets the perf harness measure a real,
