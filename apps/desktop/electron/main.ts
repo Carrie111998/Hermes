@@ -310,7 +310,12 @@ import {
   spliceRegistrySessionRows,
   tagRegistrySessionResponse
 } from './profile-session-routing'
-import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import {
+  createQuickEntryShortcut,
+  normalizeQuickEntrySubmitPayload,
+  quickEntryWindowBounds,
+  sanitizeQuickEntrySettings
+} from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
@@ -12798,7 +12803,11 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, ownerRoute, watch }: { sessionId?: string; ownerRoute?: unknown; watch?: boolean } = {}) {
+function spawnSecondaryWindow({
+  sessionId,
+  ownerRoute,
+  watch
+}: { sessionId?: string; ownerRoute?: unknown; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -13252,11 +13261,16 @@ let hudSessionId: null | string = null
 // stale generation owned by another window.
 let hudNewChatGeneration: null | number | string = null
 
+// Exact registry connection/profile owner for the HUD conversation. Profile
+// alone is ambiguous when two connections expose the same profile/id.
+type HudOwnerRoute = { connectionId: string; mode?: 'local' | 'remote'; profile: string; targetProfile?: string }
+let hudOwnerRoute: HudOwnerRoute | null = null
+
 // The profile the live HUD renderer booted against (rides hudUrl's query
 // string). A renderer adopts its backend once at boot, so a retarget onto a
 // session from a DIFFERENT profile cannot be a same-window `goto` — the HUD
 // must be respawned against the new profile's backend (see openHudWindow).
-let hudProfile = null
+let hudProfile: null | string = null
 
 // A wide, short bar parked near the bottom of the active display — the shape
 // of a game chat frame, and where one belongs. Defaults only: once the user
@@ -13514,7 +13528,12 @@ function hudBounds() {
   return defaultHudBounds(area)
 }
 
-function hudUrl(sessionId, profile, newChatGeneration) {
+function hudUrl(
+  sessionId: null | string,
+  ownerRoute: HudOwnerRoute | null,
+  profile: null | string,
+  newChatGeneration: null | number | string
+) {
   // The profile rides the query string next to `win=hud` (BEFORE the '#', so
   // HashRouter never sees it). The HUD renderer's gateway boot reads it and
   // adopts that backend instead of the primary — without it, a HUD opened on a
@@ -13523,6 +13542,7 @@ function hudUrl(sessionId, profile, newChatGeneration) {
   return buildHudWindowUrl(sessionId, {
     devServer: DEV_SERVER,
     newChatGeneration,
+    ownerRoute,
     profile,
     rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
   })
@@ -13533,7 +13553,12 @@ function hudUrl(sessionId, profile, newChatGeneration) {
 // Carries the HUD's session so the app window can re-home onto it on the way
 // out (see hudSessionId).
 function broadcastHudState(open) {
-  const payload = { newChatGeneration: hudNewChatGeneration, open, sessionId: hudSessionId }
+  const payload = {
+    newChatGeneration: hudNewChatGeneration,
+    open,
+    ownerRoute: hudOwnerRoute,
+    sessionId: hudSessionId
+  }
 
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
@@ -13542,7 +13567,12 @@ function broadcastHudState(open) {
   }
 }
 
-function spawnHudWindow(sessionId, profile, newChatGeneration) {
+function spawnHudWindow(
+  sessionId: null | string,
+  ownerRoute: HudOwnerRoute | null,
+  profile: null | string,
+  newChatGeneration: null | number | string
+) {
   const win = new BrowserWindow({
     ...hudBounds(),
     minWidth: 380,
@@ -13649,7 +13679,7 @@ function spawnHudWindow(sessionId, profile, newChatGeneration) {
   // Log-only lifecycle (#81290): the HUD is a compact auxiliary surface the
   // user can re-toggle; a dead renderer should be diagnosable, not resurrected.
   installWindowRendererLifecycle(win, { kind: 'hud', callbacks: { log: rememberLog } })
-  loadWindowUrl(win, hudUrl(sessionId, profile, newChatGeneration), 'HUD')
+  loadWindowUrl(win, hudUrl(sessionId, ownerRoute, profile, newChatGeneration), 'HUD')
 
   return win
 }
@@ -13667,28 +13697,44 @@ function restoreMainWindowFromHud() {
   }
 }
 
-function latchHudSessionState(sessionId: null | string, newChatGeneration: null | number | string) {
+function latchHudSessionState(
+  sessionId: null | string,
+  ownerRoute: HudOwnerRoute | null,
+  newChatGeneration: null | number | string
+) {
   hudSessionId = sessionId || null
+  hudOwnerRoute = ownerRoute
   hudNewChatGeneration = hudSessionId === null ? newChatGeneration || null : null
 }
 
-function openHudWindow(sessionId, profile, newChatGeneration) {
-  const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
+function openHudWindow(
+  sessionId: null | string,
+  ownerRoute: HudOwnerRoute | null,
+  profile: null | string,
+  newChatGeneration: null | string
+) {
+  const profileKey = ownerRoute?.profile || (typeof profile === 'string' && profile.trim() ? profile.trim() : null)
+
+  const requestedOwnerKey = ownerRoute
+    ? JSON.stringify([ownerRoute.connectionId, ownerRoute.profile])
+    : JSON.stringify([null, profileKey])
+
+  const liveOwnerKey = hudOwnerRoute
+    ? JSON.stringify([hudOwnerRoute.connectionId, hudOwnerRoute.profile])
+    : JSON.stringify([null, hudProfile])
 
   if (hudWindow && !hudWindow.isDestroyed()) {
-    // Pointed at another PROFILE: the live renderer is bound to the old
-    // profile's backend, and a renderer adopts its backend exactly once at
-    // boot — an in-place goto would resolve the id against the wrong backend
-    // (the #82285 fallback). Respawn against the right one.
-    if (profileKey && hudProfile !== profileKey) {
+    // A renderer adopts one exact backend at boot. Different connection OR
+    // profile means respawn; a profile-only equality cannot prove ownership.
+    if (requestedOwnerKey !== liveOwnerKey) {
       const win = hudWindow
       hudWindow = null
       win.removeAllListeners('closed')
       win.destroy()
 
-      latchHudSessionState(sessionId, newChatGeneration)
+      latchHudSessionState(sessionId, ownerRoute, newChatGeneration)
       hudProfile = profileKey
-      hudWindow = spawnHudWindow(sessionId, profileKey, newChatGeneration)
+      hudWindow = spawnHudWindow(sessionId, ownerRoute, profileKey, newChatGeneration)
       broadcastHudState(true)
       registerHudSnapShortcut()
 
@@ -13696,13 +13742,10 @@ function openHudWindow(sessionId, profile, newChatGeneration) {
     }
 
     // Already up, but pointed somewhere else — switch it rather than just
-    // raising it. Asking for HUD mode from another tab means "put THIS
-    // conversation in the HUD", and a plain focus leaves the wrong one there.
+    // raising it. The structured payload keeps the exact owner through goto.
     if (sessionId && sessionId !== hudSessionId) {
-      latchHudSessionState(sessionId, null)
-      hudWindow.webContents.send('hermes:hud:goto', sessionId)
-      // Keep every window's idea of where the HUD is pointed in step, so the
-      // toggle keeps reading "switch" vs "dismiss" correctly.
+      latchHudSessionState(sessionId, ownerRoute, null)
+      hudWindow.webContents.send('hermes:hud:goto', { ownerRoute, sessionId })
       broadcastHudState(true)
     }
 
@@ -13712,9 +13755,9 @@ function openHudWindow(sessionId, profile, newChatGeneration) {
   }
 
   hudRestoreMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible())
-  latchHudSessionState(sessionId, newChatGeneration)
+  latchHudSessionState(sessionId, ownerRoute, newChatGeneration)
   hudProfile = profileKey
-  hudWindow = spawnHudWindow(sessionId, profileKey, newChatGeneration)
+  hudWindow = spawnHudWindow(sessionId, ownerRoute, profileKey, newChatGeneration)
   broadcastHudState(true)
   registerHudSnapShortcut()
 
@@ -14508,6 +14551,7 @@ const hudIpc = registerHudIpc({
   setHudSessionState: state => {
     hudSessionId = state.sessionId
     hudNewChatGeneration = state.newChatGeneration
+    hudOwnerRoute = state.ownerRoute
   }
 })
 
@@ -16666,9 +16710,9 @@ ipcMain.handle('hermes:quick-entry:settings:set', async (_event, patch) => {
 ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
   hideQuickEntryWindow()
 
-  const text = typeof payload?.text === 'string' ? payload.text.trim() : ''
+  const submit = normalizeQuickEntrySubmitPayload(payload)
 
-  if (!text) {
+  if (!submit) {
     return
   }
 
@@ -16680,10 +16724,7 @@ ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
 
   // Deliberately does NOT raise/focus the main window — the user asked to fire
   // a prompt from wherever they were, not to be yanked into the app.
-  mainWindow.webContents.send('hermes:quick-entry:submit', {
-    target: typeof payload?.target === 'string' && payload.target ? payload.target : 'current',
-    text
-  })
+  mainWindow.webContents.send('hermes:quick-entry:submit', submit)
 })
 
 // Primary renderer → main → quick window: gateway connection state + the

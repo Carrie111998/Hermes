@@ -297,18 +297,20 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
 
 // Mutations take the owning `profile` so Electron can route them to the correct
 // remote backend or local profile scope. Omit for the current/default profile.
-export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+export function setSessionArchived(id: string, archived: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
   // Carry the owning profile IN THE PATCH BODY, mirroring renameSession — the
   // backend reads its target DB from body.profile (_open_session_db_for_profile).
   // Passing it only as request.profile (Electron routing) is not enough on a
   // remote gateway with no remoteProfile alias: the archive lands on the wrong
   // (default) state.db, no-ops on a missing row, and the archived/unarchived
   // state silently fails to stick — the same class as the unscoped DELETE.
+  const scope = sessionScoped(profile)
+
   return hermesApi<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...scope,
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { archived, ...(profile ? { profile } : {}) }
+    body: { archived, ...(scope.profile ? { profile: scope.profile } : {}) }
   })
 }
 
@@ -332,16 +334,18 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
 // (sessions.last_read_at via SessionDB.set_session_read). Same profile
 // routing as the other session mutations: a remote session's row lives only
 // on its remote host, so the owning profile must travel with the request.
-export function setSessionUnreadRemote(id: string, unread: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+export function setSessionUnreadRemote(id: string, unread: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
   // Owning profile in the PATCH body (see setSessionArchived / renameSession):
   // the handler reads its target DB from body.profile, so a remote/foreign
   // profile's unread toggle must travel in the body or it no-ops on the wrong
   // state.db.
+  const scope = sessionScoped(profile)
+
   return hermesApi<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...scope,
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { unread, ...(profile ? { profile } : {}) }
+    body: { unread, ...(scope.profile ? { profile: scope.profile } : {}) }
   })
 }
 

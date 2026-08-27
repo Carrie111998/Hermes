@@ -7,6 +7,7 @@ import { type BrowserWindow, ipcMain, screen } from 'electron'
 import { createHudDragSession } from './hud-drag'
 import { normalizeHudResizeBounds } from './hud-geometry'
 import { hudWindowingView, resolveHudWindowing } from './hud-windowing'
+import { normalizeSessionWindowOwnerRoute } from './session-windows'
 import { hudFrostFor, type TranslucencyState } from './translucency'
 
 function hudWindowing() {
@@ -15,6 +16,7 @@ function hudWindowing() {
 
 export interface HudSessionState {
   newChatGeneration: null | number | string
+  ownerRoute: null | ReturnType<typeof normalizeSessionWindowOwnerRoute>
   sessionId: null | string
 }
 
@@ -23,7 +25,12 @@ export interface HudIpcDeps {
   /** Main's authoritative translucency state (Settings → Appearance). */
   getTranslucencyState: () => TranslucencyState
   getHudWindow: () => BrowserWindow | null
-  openHudWindow: (sessionId: null | string, profile: null | string, newChatGeneration: null | string) => void
+  openHudWindow: (
+    sessionId: null | string,
+    ownerRoute: ReturnType<typeof normalizeSessionWindowOwnerRoute>,
+    profile: null | string,
+    newChatGeneration: null | string
+  ) => void
   closeHudWindow: () => void
   resetHudLayout: () => boolean
   setHudSessionState: (state: HudSessionState) => void
@@ -142,6 +149,7 @@ export function registerHudIpc({
   ipcMain.handle('hermes:hud:open', async (_event, request) => {
     openHudWindow(
       typeof request?.sessionId === 'string' ? request.sessionId : null,
+      normalizeSessionWindowOwnerRoute(request?.ownerRoute),
       typeof request?.profile === 'string' ? request.profile : null,
       typeof request?.newChatGeneration === 'string' || typeof request?.newChatGeneration === 'number'
         ? String(request.newChatGeneration)
@@ -296,6 +304,7 @@ export function registerHudIpc({
 
     if (hudWindow && !hudWindow.isDestroyed() && event.sender === hudWindow.webContents) {
       const sessionId = typeof state?.sessionId === 'string' && state.sessionId ? state.sessionId : null
+      const ownerRoute = normalizeSessionWindowOwnerRoute(state?.ownerRoute)
 
       const newChatGeneration =
         sessionId === null &&
@@ -303,7 +312,7 @@ export function registerHudIpc({
           ? state.newChatGeneration
           : null
 
-      setHudSessionState({ newChatGeneration, sessionId })
+      setHudSessionState({ newChatGeneration, ownerRoute, sessionId })
     }
   })
 

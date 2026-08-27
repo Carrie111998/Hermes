@@ -1,5 +1,4 @@
 import { cleanup, fireEvent, render } from '@testing-library/react'
-import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SidebarListRow } from '@/lib/session-date-groups'
@@ -30,6 +29,12 @@ const useSortable = vi.hoisted(() =>
   }))
 )
 
+const virtualRowPropsHistory: Array<{
+  onArchive: () => void
+  onBranch?: () => void
+  onToggleUnread: () => void
+}> = []
+
 vi.mock('@dnd-kit/sortable', () => ({ useSortable }))
 vi.mock('@dnd-kit/utilities', () => ({ CSS: { Transform: { toString: vi.fn() } } }))
 vi.mock('@tanstack/react-virtual', () => ({
@@ -58,26 +63,29 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('./chrome', () => ({
-  SidebarDateDivider: ({ label, ...props }: { label: string } & React.ComponentProps<'div'>) => (
-    <div data-testid={`divider-${label}`} {...props} />
-  )
+  SidebarDateDivider: ({ label }: { label: string }) => <div data-testid={`divider-${label}`} />
 }))
 
 vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({
-    isSelected,
-    onDelete
-  }: {
+  SidebarSessionRow: (props: {
     isSelected: boolean
+    onArchive: () => void
+    onBranch?: () => void
     onDelete: () => void
-  }) => (
-    <button
-      data-selected={isSelected ? 'true' : 'false'}
-      data-testid="virtual-delete"
-      onClick={onDelete}
-      type="button"
-    />
-  )
+    onToggleUnread: () => void
+  }) => {
+    virtualRowPropsHistory.push(props)
+    const { isSelected, onDelete } = props
+
+    return (
+      <button
+        data-selected={isSelected ? 'true' : 'false'}
+        data-testid="virtual-delete"
+        onClick={onDelete}
+        type="button"
+      />
+    )
+  }
 }))
 
 afterEach(cleanup)
@@ -90,6 +98,47 @@ const rows: SidebarListRow[] = [
 const noop = () => {}
 
 describe('VirtualSessionList', () => {
+  it('carries the virtual duplicate row exact owner through archive, branch, and unread actions', () => {
+    virtualRowPropsHistory.length = 0
+    const onArchiveSession = vi.fn()
+    const onBranchSession = vi.fn()
+    const onToggleUnread = vi.fn()
+    const session = { connection_id: 'source-b', id: 'shared', profile: 'worker-b' } as SessionInfo
+
+    render(
+      <VirtualSessionList
+        activeSessionId={null}
+        onArchiveSession={onArchiveSession}
+        onBranchSession={onBranchSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onTogglePin={noop}
+        onToggleUnread={onToggleUnread}
+        pinned={false}
+        rows={[
+          { key: 'today', kind: 'divider', label: 'Today' },
+          { entry: { session }, kind: 'session' }
+        ]}
+        sortable={false}
+      />
+    )
+
+    const props = virtualRowPropsHistory.at(-1)!
+    props.onArchive()
+    props.onBranch?.()
+    props.onToggleUnread()
+
+    const ownerRoute = {
+      connectionId: 'source-b',
+      profile: 'worker-b',
+      targetProfile: 'worker-b'
+    }
+
+    expect(onArchiveSession).toHaveBeenCalledWith('shared', ownerRoute)
+    expect(onBranchSession).toHaveBeenCalledWith('shared', ownerRoute)
+    expect(onToggleUnread).toHaveBeenCalledWith('shared', ownerRoute)
+  })
+
   it('uses distinct owner-qualified virtual and sortable ids for duplicate rows', () => {
     const sessionRow = (connection_id: string): SidebarListRow => ({
       entry: { session: { connection_id, id: 'shared', profile: 'worker' } as SessionInfo },

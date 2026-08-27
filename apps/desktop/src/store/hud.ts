@@ -18,7 +18,8 @@ import { atom } from 'nanostores'
 import { $composerNewChatGeneration, requestComposerDraftSync } from '@/store/composer'
 import type { ComposerNewChatGeneration } from '@/store/composer-storage-scope'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import { $sessions, rememberedSessionProfile } from '@/store/session'
+import { $connection, $sessions, rememberedSessionProfile } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { isHudWindow } from '@/store/windows'
 
 /** Whether a HUD window is currently up. In the HUD's own renderer this is
@@ -39,9 +40,11 @@ export const $hudMode = atom(isHudWindow())
 /** Which conversation the HUD is showing, as far as this window knows. Lets the
  *  toggle tell "switch the HUD to this tab" apart from "dismiss the HUD". */
 export const $hudSession = atom<null | string>(null)
+export const $hudOwnerRoute = atom<SessionOwnerRoute | null>(null)
 
 export interface HudSessionState {
   newChatGeneration: ComposerNewChatGeneration | null
+  ownerRoute: SessionOwnerRoute | null
   sessionId: string | null
 }
 
@@ -49,7 +52,7 @@ export interface HudSessionState {
 export const canUseHud = (): boolean =>
   typeof window !== 'undefined' && typeof window.hermesDesktop?.hud?.open === 'function'
 
-export function openHud(sessionId?: null | string): void {
+export function openHud(sessionId?: null | string, capturedOwner?: SessionOwnerRoute): void {
   const api = window.hermesDesktop?.hud
 
   if (!api) {
@@ -72,12 +75,42 @@ export function openHud(sessionId?: null | string): void {
     rememberedSessionProfile($sessions.get(), sessionId ?? null, $activeGatewayProfile.get())
   )
 
+  const row = sessionId
+    ? $sessions
+        .get()
+        .find(
+          candidate =>
+            candidate.id === sessionId &&
+            (!capturedOwner ||
+              ((candidate.connection_id?.trim() || 'local') === capturedOwner.connectionId.trim() &&
+                normalizeProfileKey(candidate.profile) === normalizeProfileKey(capturedOwner.profile)))
+        )
+    : undefined
+
+  const rowProfile = row?.profile?.trim()
+  const connectionId = row?.connection_id?.trim()
+  const activeConnectionId = $connection.get()?.connectionId?.trim()
+
+  const ownerRoute =
+    capturedOwner ??
+    (rowProfile
+      ? {
+          connectionId: connectionId || 'local',
+          ...(connectionId ? {} : { mode: 'local' as const }),
+          profile: rowProfile,
+          targetProfile: rowProfile
+        }
+      : activeConnectionId
+        ? { connectionId: activeConnectionId, profile }
+        : undefined)
+
   $hudActive.set(true)
   $hudSession.set(sessionId ?? null)
+  $hudOwnerRoute.set(ownerRoute ?? null)
   void api.open({
     ...(sessionId == null ? { newChatGeneration: $composerNewChatGeneration.get() } : {}),
     sessionId: sessionId ?? null,
-    profile
+    ...(ownerRoute ? { ownerRoute } : { profile })
   })
 }
 
@@ -92,10 +125,12 @@ export function closeHud(): void {
 
   $hudActive.set(false)
   $hudSession.set(null)
+  $hudOwnerRoute.set(null)
   void api.close()
 }
 
-export const toggleHud = (sessionId?: null | string) => ($hudActive.get() ? closeHud() : openHud(sessionId))
+export const toggleHud = (sessionId?: null | string, ownerRoute?: SessionOwnerRoute) =>
+  $hudActive.get() ? closeHud() : openHud(sessionId, ownerRoute)
 
 /** Restore the HUD's persisted geometry to its display-aware default. */
 export function resetHudLayout(): void {
@@ -107,10 +142,12 @@ export function resetHudLayout(): void {
  *  app window knows what to re-home onto. */
 export const reportHudSession = (
   sessionId: null | string,
-  newChatGeneration: ComposerNewChatGeneration = $composerNewChatGeneration.get()
+  newChatGeneration: ComposerNewChatGeneration = $composerNewChatGeneration.get(),
+  ownerRoute: SessionOwnerRoute | null = $hudOwnerRoute.get()
 ): void =>
   window.hermesDesktop?.hud?.setSession?.({
     newChatGeneration: sessionId === null ? newChatGeneration : null,
+    ownerRoute,
     sessionId
   })
 
@@ -121,14 +158,16 @@ export const reportHudSession = (
  * Electron.
  */
 export function watchHudState(onClosed?: (state: HudSessionState) => void): () => void {
-  const off = window.hermesDesktop?.hud?.onChanged?.(({ newChatGeneration, open, sessionId }) => {
+  const off = window.hermesDesktop?.hud?.onChanged?.(({ newChatGeneration, open, ownerRoute, sessionId }) => {
     const state: HudSessionState = {
       newChatGeneration: sessionId === null ? (newChatGeneration ?? null) : null,
+      ownerRoute: ownerRoute ?? null,
       sessionId
     }
 
     $hudActive.set(open)
     $hudSession.set(open ? sessionId : null)
+    $hudOwnerRoute.set(open ? (ownerRoute ?? null) : null)
 
     if (!open) {
       onClosed?.(state)

@@ -49,6 +49,8 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
 function renderTile(
   requestGateway: ReturnType<typeof vi.fn>,
   refs?: {
+    archiveSession?: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
+    branchStoredSession?: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
     removeSession?: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
     runtimeIdByStoredSessionIdRef?: { current: Map<string, string> }
     sessionStateByRuntimeIdRef?: { current: Map<string, unknown> }
@@ -57,8 +59,8 @@ function renderTile(
 ) {
   renderHook(() =>
     useSessionTileDelegate({
-      archiveSession: vi.fn(async () => undefined),
-      branchStoredSession: vi.fn(async () => undefined),
+      archiveSession: refs?.archiveSession ?? vi.fn(async () => undefined),
+      branchStoredSession: refs?.branchStoredSession ?? vi.fn(async () => undefined),
       executeSlashCommand: vi.fn(async () => undefined) as never,
       removeSession: refs?.removeSession ?? vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
@@ -70,6 +72,19 @@ function renderTile(
 }
 
 describe('useSessionTileDelegate deleteSession', () => {
+  it('threads the tab captured owner route through archive and branch', async () => {
+    const archiveSession = vi.fn(async () => undefined)
+    const branchStoredSession = vi.fn(async () => undefined)
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    renderTile(vi.fn(), { archiveSession, branchStoredSession })
+    await sessionTileDelegate()!.archiveSession('duplicate-id', ownerRoute)
+    await sessionTileDelegate()!.branchSession('duplicate-id', ownerRoute)
+
+    expect(archiveSession).toHaveBeenCalledWith('duplicate-id', ownerRoute)
+    expect(branchStoredSession).toHaveBeenCalledWith('duplicate-id', ownerRoute)
+  })
+
   it('threads the tab captured owner route through to removeSession', async () => {
     const removeSession = vi.fn(async () => undefined)
     const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }

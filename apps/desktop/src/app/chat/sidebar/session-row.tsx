@@ -194,10 +194,7 @@ function SidebarSessionRowImpl({
   // tile opens or closes, and the boolean bails every unaffected row out.
   const rowIdentity = sessionRowIdentity(session)
 
-  const openUnfocused = useStoreSelector(
-    $openSessionRowIdentities,
-    open => !isSelected && open.has(rowIdentity)
-  )
+  const openUnfocused = useStoreSelector($openSessionRowIdentities, open => !isSelected && open.has(rowIdentity))
 
   const totalTokens = session.input_tokens + session.output_tokens
   const cost = sessionCostUsd(session)
@@ -276,10 +273,7 @@ function SidebarSessionRowImpl({
   // The same resolved state the row's dot paints, so the arc and the dot cannot
   // contradict each other. A selector, not a plain useStore: the map is rebuilt
   // whenever any session's status changes, but a row only repaints on its own.
-  const dotState = useStoreSelector(
-    $sessionDotStateById,
-    states => states[sessionRowIdentity(session)] ?? 'idle'
-  )
+  const dotState = useStoreSelector($sessionDotStateById, states => states[sessionRowIdentity(session)] ?? 'idle')
 
   const liveTurn = hasLiveTurn(dotState)
 
@@ -338,6 +332,7 @@ function SidebarSessionRowImpl({
         onDelete={onDelete}
         onPin={onPin}
         onToggleUnread={onToggleUnread}
+        ownerRoute={ownerRoute}
         pinned={isPinned}
         profile={session.profile}
         sessionId={session.id}
@@ -367,6 +362,7 @@ function SidebarSessionRowImpl({
       onDelete={onDelete}
       onPin={onPin}
       onToggleUnread={onToggleUnread}
+      ownerRoute={ownerRoute}
       pinned={isPinned}
       profile={session.profile}
       sessionId={session.id}

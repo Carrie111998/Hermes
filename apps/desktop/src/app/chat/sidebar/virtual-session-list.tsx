@@ -46,12 +46,12 @@ export interface VirtualSessionListProps {
   /** Hover-revealed control for date dividers (the group-level "+"). */
   dividerAction?: React.ReactNode
   rows: SidebarListRow[]
-  onArchiveSession: (sessionId: string) => void
-  onBranchSession?: (sessionId: string, profile?: string) => void
+  onArchiveSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
+  onBranchSession?: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   onDeleteSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onTogglePin: (sessionId: string) => void
-  onToggleUnread: (sessionId: string) => void
+  onToggleUnread: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   pinned: boolean
   showProfileTags?: boolean
   sortable: boolean
@@ -144,6 +144,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
     const { branchStem, session } = row.entry
     const reorderable = sortable && !branchStem
+    const ownerRoute = sessionRowOwnerRoute(session)
 
     const commonProps: SessionRowCommonProps = {
       branchStem,
@@ -153,11 +154,11 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
         activeSessionIdentity !== undefined
           ? activeSessionIdentity !== null && sessionRowIdentity(session) === activeSessionIdentity
           : session.id === activeSessionId,
-      onArchive: () => onArchiveSession(session.id),
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id, sessionRowOwnerRoute(session)),
+      onArchive: () => onArchiveSession(session.id, ownerRoute),
+      onBranch: onBranchSession ? () => onBranchSession(session.id, ownerRoute) : undefined,
+      onDelete: () => onDeleteSession(session.id, ownerRoute),
       onPin: () => onTogglePin(sessionPinId(session)),
-      onToggleUnread: () => onToggleUnread(session.id),
+      onToggleUnread: () => onToggleUnread(session.id, ownerRoute),
       onResume: () => onResumeSession(session.id, session),
       reorderable,
       showProfile: showProfileTags,

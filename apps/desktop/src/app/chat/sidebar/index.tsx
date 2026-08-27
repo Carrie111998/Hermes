@@ -150,6 +150,7 @@ import {
   SKILLS_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
+import { sessionRowForOwner } from '../session-row-owner'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
@@ -305,8 +306,8 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
-  onArchiveSession: (sessionId: string) => void
-  onBranchSession: (sessionId: string) => void
+  onArchiveSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
+  onBranchSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
@@ -403,14 +404,20 @@ export function ChatSidebar({
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
   // become the truth (optimistic update + rollback in markSessionUnread).
-  const toggleUnread = (storedId: string) => {
-    const row = $sessions.get().find(r => r.id === storedId)
+  const toggleUnread = (storedId: string, ownerRoute?: SessionOwnerRoute) => {
+    const row = ownerRoute
+      ? sessionRowForOwner($sessions.get(), storedId, ownerRoute)
+      : $sessions.get().find(r => r.id === storedId)
 
     if (!row) {
       return
     }
 
-    markSessionUnread(storedId, row.unread !== true).catch(err => notifyError(err, s.row.unreadFailed))
+    const write = ownerRoute
+      ? markSessionUnread(storedId, row.unread !== true, ownerRoute)
+      : markSessionUnread(storedId, row.unread !== true)
+
+    write.catch(err => notifyError(err, s.row.unreadFailed))
   }
 
   // Only surface the profile switcher when more than one profile exists, so
@@ -508,10 +515,7 @@ export function ChatSidebar({
   // membership in the filtered set.
   const sessionMatchesFilters = useCallback(
     (session: SessionInfo) => {
-      if (
-        statusFilter.length &&
-        !statusFilter.includes(sessionStatusBucket(dotStates[sessionRowIdentity(session)]))
-      ) {
+      if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[sessionRowIdentity(session)]))) {
         return false
       }
 

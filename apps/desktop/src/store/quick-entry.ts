@@ -17,6 +17,8 @@
 
 import { atom } from 'nanostores'
 
+import type { SessionOwnerRoute } from './session-request-router'
+
 export interface QuickEntryState {
   enabled: boolean
   /** null before the first read; the settings row shows a skeleton until then. */
@@ -102,7 +104,17 @@ export async function saveQuickEntrySettings(patch: { enabled?: boolean; shortcu
 /** A recent session the quick window can target (pushed by the primary). */
 export interface QuickEntrySessionOption {
   id: string
+  ownerGeneration?: number
+  ownerRoute?: SessionOwnerRoute
+  /** Owner-qualified picker value. Legacy options omit it and use `id`. */
+  target?: string
   title: string
+}
+
+export interface QuickEntrySessionTarget {
+  id: string
+  ownerGeneration?: number
+  ownerRoute?: SessionOwnerRoute
 }
 
 /** Send into whatever chat the main window currently has in front. */
@@ -123,6 +135,8 @@ export interface QuickEntryStatePush {
 
 /** What a quick-window submit carries back to the primary renderer. */
 export interface QuickEntrySubmitPayload {
+  /** Exact stored-session target metadata for recent-session choices. */
+  session?: QuickEntrySessionTarget
   /** QUICK_TARGET_CURRENT, QUICK_TARGET_NEW, or a stored session id. */
   target: string
   text: string
@@ -208,7 +222,7 @@ export function quickComposerReducer(state: QuickComposerState, event: QuickComp
         event.connected &&
         (state.target === QUICK_TARGET_CURRENT ||
           state.target === QUICK_TARGET_NEW ||
-          event.sessions.some(session => session.id === state.target))
+          event.sessions.some(session => (session.target || session.id) === state.target))
 
       return {
         send: null,
@@ -230,8 +244,19 @@ export function quickComposerReducer(state: QuickComposerState, event: QuickComp
         return { send: null, state }
       }
 
+      const selected = state.sessions.find(session => (session.target || session.id) === state.target)
+
+      const exactSession =
+        selected && (selected.ownerRoute || selected.ownerGeneration !== undefined)
+          ? {
+              id: selected.id,
+              ...(selected.ownerGeneration !== undefined ? { ownerGeneration: selected.ownerGeneration } : {}),
+              ...(selected.ownerRoute ? { ownerRoute: selected.ownerRoute } : {})
+            }
+          : undefined
+
       return {
-        send: { target: state.target, text },
+        send: { ...(exactSession ? { session: exactSession } : {}), target: state.target, text },
         state: { ...state, draft: '', submitting: true, visible: false }
       }
     }
@@ -278,7 +303,45 @@ function normalizeSubmitPayload(raw: unknown): null | QuickEntrySubmitPayload {
     return null
   }
 
+  const sessionRecord =
+    record.session && typeof record.session === 'object' ? (record.session as Record<string, unknown>) : null
+
+  const ownerRecord =
+    sessionRecord?.ownerRoute && typeof sessionRecord.ownerRoute === 'object'
+      ? (sessionRecord.ownerRoute as Record<string, unknown>)
+      : null
+
+  const connectionId = typeof ownerRecord?.connectionId === 'string' ? ownerRecord.connectionId.trim() : ''
+  const profile = typeof ownerRecord?.profile === 'string' ? ownerRecord.profile.trim() : ''
+  const id = typeof sessionRecord?.id === 'string' ? sessionRecord.id.trim() : ''
+
+  const ownerGeneration =
+    typeof sessionRecord?.ownerGeneration === 'number' && Number.isFinite(sessionRecord.ownerGeneration)
+      ? sessionRecord.ownerGeneration
+      : undefined
+
+  const ownerRoute: SessionOwnerRoute | undefined =
+    connectionId && profile
+      ? {
+          connectionId,
+          ...(ownerRecord?.mode === 'local' || ownerRecord?.mode === 'remote' ? { mode: ownerRecord.mode } : {}),
+          profile,
+          ...(typeof ownerRecord?.targetProfile === 'string' && ownerRecord.targetProfile.trim()
+            ? { targetProfile: ownerRecord.targetProfile.trim() }
+            : {})
+        }
+      : undefined
+
   return {
+    ...(id && (ownerRoute || ownerGeneration !== undefined)
+      ? {
+          session: {
+            id,
+            ...(ownerGeneration !== undefined ? { ownerGeneration } : {}),
+            ...(ownerRoute ? { ownerRoute } : {})
+          }
+        }
+      : {}),
     target: typeof record.target === 'string' && record.target ? record.target : QUICK_TARGET_CURRENT,
     text
   }

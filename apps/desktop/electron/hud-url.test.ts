@@ -11,6 +11,23 @@ test('buildHudWindowUrl puts win=hud before the hash route (dev server)', () => 
   assert.ok(url.indexOf('?win=hud') < url.indexOf('#'))
 })
 
+test('buildHudWindowUrl carries the exact connection owner before the hash', () => {
+  const url = buildHudWindowUrl('shared', {
+    devServer: 'http://localhost:5173',
+    ownerRoute: {
+      connectionId: 'source b',
+      mode: 'remote',
+      profile: 'worker',
+      targetProfile: 'backend worker'
+    }
+  })
+
+  assert.equal(
+    url,
+    'http://localhost:5173/?win=hud&connection=source%20b&profile=worker&targetProfile=backend%20worker&mode=remote#/shared'
+  )
+})
+
 test('buildHudWindowUrl carries the handoff profile in the query before the hash', () => {
   const url = buildHudWindowUrl('sess-1', { devServer: 'http://localhost:5173', profile: 'work' })
 

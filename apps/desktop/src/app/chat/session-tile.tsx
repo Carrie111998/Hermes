@@ -83,6 +83,12 @@ import { ChatView } from '.'
 
 const NO_MESSAGES: ChatMessage[] = []
 
+/** Focus-bus/composer target for a tile. The historical ownerless shape stays
+ * stable, while exact-owner twins get the same qualified identity as panes. */
+export function sessionTileComposerTarget(storedSessionId: string, ownerRoute?: SessionOwnerRoute): `tile:${string}` {
+  return `tile:${sessionTileIdentity(storedSessionId, ownerRoute)}`
+}
+
 export function sessionTileResumeFailure(
   message: string,
   durableSessionFound: boolean | undefined,
@@ -207,15 +213,21 @@ function TileChat({
       $awaitingInput: sessionAwaitingInput(runtimeId),
       $messages: view.$messages,
       attachments,
-      target: `tile:${storedSessionId}`
+      target: sessionTileComposerTarget(storedSessionId, ownerRoute)
     }),
-    [attachments, runtimeId, storedSessionId, view.$messages]
+    [attachments, ownerRoute, runtimeId, storedSessionId, view.$messages]
   )
 
   // Tile actions must keep the persisted owner route. The ambient gateway hook
   // follows foreground focus and can point at another backend during restore or
   // reconnect, which turns a recoverable stale runtime into "session not found".
-  const actions = useSessionTileActions({ ownerRoute, requestGateway: requestTileGateway, runtimeId, scope, storedSessionId })
+  const actions = useSessionTileActions({
+    ownerRoute,
+    requestGateway: requestTileGateway,
+    runtimeId,
+    scope,
+    storedSessionId
+  })
 
   // The same attach/pick/paste/drop pipeline the primary composer uses,
   // pointed at this tile's chips + session.
@@ -319,7 +331,11 @@ export function SessionTilePane({
 }) {
   const tiles = useStore($sessionTiles)
   const identity = sessionTileIdentity(storedSessionId, ownerRoute)
-  const tile = tiles.find(candidate => sessionTileIdentity(candidate.storedSessionId, candidate.ownerRoute) === identity)
+
+  const tile = tiles.find(
+    candidate => sessionTileIdentity(candidate.storedSessionId, candidate.ownerRoute) === identity
+  )
+
   const runtimeId = tile?.runtimeId ?? null
   const gatewayOpen = useStore($gatewayState) === 'open'
   const delegateRevision = useStore($sessionTileDelegateRevision)
@@ -385,12 +401,7 @@ export function SessionTilePane({
   // latched every restored tile into the error card.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (
-      !gatewayOpen ||
-      runtimeId ||
-      tile?.error ||
-      resumingOwnerGenerationRef.current === ownerGeneration
-    ) {
+    if (!gatewayOpen || runtimeId || tile?.error || resumingOwnerGenerationRef.current === ownerGeneration) {
       return
     }
 
@@ -514,7 +525,11 @@ export function tileStoredRow(
  *  skipping the re-register that hands the tab back to this string. */
 function tileTitle(storedSessionId: string, ownerRoute?: SessionOwnerRoute): string {
   const identity = sessionTileIdentity(storedSessionId, ownerRoute)
-  const tile = $sessionTiles.get().find(candidate => sessionTileIdentity(candidate.storedSessionId, candidate.ownerRoute) === identity)
+
+  const tile = $sessionTiles
+    .get()
+    .find(candidate => sessionTileIdentity(candidate.storedSessionId, candidate.ownerRoute) === identity)
+
   const stored = tileStoredRow(storedSessionId, tile?.ownerRoute)
   const explicit = tile?.workspaceTabTitle
 
@@ -685,10 +700,7 @@ function useTileMenuRow(
  * Tile tabs carry their persisted route; the workspace tab carries the
  * primary selection intent. A bare stored id is insufficient when two
  * connections expose the same profile/id. */
-export function sessionTabDeleteOwnerRoute(
-  storedSessionId: string,
-  tabPaneId: string
-): SessionOwnerRoute | undefined {
+export function sessionTabDeleteOwnerRoute(storedSessionId: string, tabPaneId: string): SessionOwnerRoute | undefined {
   if (tabPaneId !== 'workspace') {
     return sessionTileOwnerRoute(storedSessionId)
   }
@@ -724,21 +736,48 @@ export function SessionTabMenu({
   const { pinId, profile, title } = useTileMenuRow(storedSessionId, ownerRoute)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const pinned = pinnedSessionIds.includes(pinId)
+  const actionOwnerRoute = ownerRoute ?? sessionTabDeleteOwnerRoute(storedSessionId, tabPaneId)
+
+  const archive = () => {
+    const delegate = sessionTileDelegate()
+
+    if (actionOwnerRoute) {
+      void delegate?.archiveSession(storedSessionId, actionOwnerRoute)
+    } else {
+      void delegate?.archiveSession(storedSessionId)
+    }
+  }
+
+  const branch = () => {
+    const delegate = sessionTileDelegate()
+
+    if (actionOwnerRoute) {
+      void delegate?.branchSession(storedSessionId, actionOwnerRoute)
+    } else {
+      void delegate?.branchSession(storedSessionId)
+    }
+  }
+
+  const remove = () => {
+    const delegate = sessionTileDelegate()
+
+    if (actionOwnerRoute) {
+      void delegate?.deleteSession(storedSessionId, actionOwnerRoute)
+    } else {
+      void delegate?.deleteSession(storedSessionId)
+    }
+  }
 
   return (
     <span className="contents" onContextMenu={event => event.stopPropagation()}>
       <SessionContextMenu
-        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
-        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
+        onArchive={archive}
+        onBranch={branch}
         onClose={onClose}
-        onDelete={() =>
-          void sessionTileDelegate()?.deleteSession(
-            storedSessionId,
-            sessionTabDeleteOwnerRoute(storedSessionId, tabPaneId)
-          )
-        }
+        onDelete={remove}
         onHideTabBar={onHideTabBar}
         onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+        ownerRoute={actionOwnerRoute}
         pinned={pinned}
         profile={profile}
         sessionId={storedSessionId}
@@ -788,9 +827,7 @@ export function WorkspaceTabMenu({ children }: { children: React.ReactElement })
 /** Keep pane contributions mirroring `$sessionTiles` (+ titles from
  *  `$sessions`). Tiles dock against main on the chosen edge, flex width. */
 const tileForMirrorIdentity = (identity: string): SessionTile | undefined =>
-  $sessionTiles
-    .get()
-    .find(tile => sessionTileIdentity(tile.storedSessionId, tile.ownerRoute) === identity)
+  $sessionTiles.get().find(tile => sessionTileIdentity(tile.storedSessionId, tile.ownerRoute) === identity)
 
 export const watchSessionTiles = paneMirror<SessionTile>({
   source: $sessionTiles,

@@ -8,8 +8,10 @@ import {
   setQuickEntrySubmitHandler
 } from '@/store/quick-entry'
 import { $gatewayState, $sessions } from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
+import { $sessionTiles, sessionTileDelegate, sessionTileIdentity } from '@/store/session-states'
 import { isAuxiliaryWindow } from '@/store/windows'
+
+import { sessionRowOwnerRoute } from '../../chat/session-row-owner'
 
 interface QuickEntryBridgeParams {
   startFreshSessionDraft: () => void
@@ -21,14 +23,29 @@ interface QuickEntryBridgeParams {
 const QUICK_ENTRY_SESSION_OPTIONS = 5
 
 function sessionOptions(): QuickEntrySessionOption[] {
+  const tiles = $sessionTiles.get()
+
   return $sessions
     .get()
     .filter(session => !session.archived)
     .slice(0, QUICK_ENTRY_SESSION_OPTIONS)
-    .map(session => ({
-      id: session.id,
-      title: session.title?.trim() || session.preview?.trim() || session.id
-    }))
+    .map(session => {
+      const rowOwnerRoute = sessionRowOwnerRoute(session)
+      const target = sessionTileIdentity(session.id, rowOwnerRoute)
+
+      const tile = tiles.find(
+        candidate => sessionTileIdentity(candidate.storedSessionId, candidate.ownerRoute) === target
+      )
+
+      const ownerRoute = tile?.ownerRoute ?? rowOwnerRoute
+
+      return {
+        id: session.id,
+        ...(tile ? { ownerGeneration: tile.ownerGeneration ?? 0 } : {}),
+        ...(ownerRoute ? { ownerRoute, target } : {}),
+        title: session.title?.trim() || session.preview?.trim() || session.id
+      }
+    })
 }
 
 /**
@@ -61,7 +78,7 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
       return
     }
 
-    setQuickEntrySubmitHandler(({ target, text }) => {
+    setQuickEntrySubmitHandler(({ session, target, text }) => {
       if (target === QUICK_TARGET_NEW) {
         // Same as the user clicking New Chat and typing: fresh draft, then the
         // normal submit creates the backend session.
@@ -77,8 +94,13 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
         const delegate = sessionTileDelegate()
 
         if (delegate) {
-          void delegate
-            .resumeTile(target)
+          const storedSessionId = session?.id || target
+
+          const resume = session?.ownerRoute
+            ? delegate.resumeTile(storedSessionId, session.ownerGeneration, session.ownerRoute)
+            : delegate.resumeTile(storedSessionId)
+
+          void resume
             .then(runtimeId => delegate.submitToSession(runtimeId, text))
             // A dead/undeliverable target must not swallow the prompt.
             .catch(() => void submitTextRef.current(text))
@@ -119,10 +141,12 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
 
     const offGateway = $gatewayState.listen(push)
     const offSessions = $sessions.listen(push)
+    const offTiles = $sessionTiles.listen(push)
 
     return () => {
       offGateway()
       offSessions()
+      offTiles()
     }
   }, [])
 }

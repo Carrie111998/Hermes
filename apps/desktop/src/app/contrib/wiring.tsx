@@ -68,6 +68,7 @@ import {
   $gatewayState,
   $messages,
   $messagingSessions,
+  $primarySessionOwnerIntent,
   $resumeExhaustedSessionId,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
@@ -933,7 +934,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
-    void archiveSession(sessionId)
+    const intent = $primarySessionOwnerIntent.get()
+
+    if (intent?.storedSessionId === sessionId) {
+      void archiveSession(sessionId, intent.ownerRoute)
+    } else {
+      void archiveSession(sessionId)
+    }
   }, [archiveSession])
 
   // Single global listener for every rebindable hotkey plus the on-screen
@@ -973,21 +980,30 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveSession: (sessionId, ownerRoute) =>
+      ownerRoute ? void archiveSession(sessionId, ownerRoute) : void archiveSession(sessionId),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onAttachPrCommentUrl: composer.attachPrCommentUrl,
     onBranchInNewChat: messageId => void branchInNewChat(messageId),
-    onBranchSession: sessionId => void branchStoredSession(sessionId),
+    onBranchSession: (sessionId, ownerRoute) =>
+      ownerRoute ? void branchStoredSession(sessionId, ownerRoute) : void branchStoredSession(sessionId),
     onCancel: cancelRun,
     onDeleteSelectedSession: () => {
       const id = $selectedStoredSessionId.get()
 
       if (id) {
-        void removeSession(id)
+        const intent = $primarySessionOwnerIntent.get()
+
+        if (intent?.storedSessionId === id) {
+          void removeSession(id, intent.ownerRoute)
+        } else {
+          void removeSession(id)
+        }
       }
     },
-    onDeleteSession: (sessionId, ownerRoute) => void removeSession(sessionId, ownerRoute),
+    onDeleteSession: (sessionId, ownerRoute) =>
+      ownerRoute ? void removeSession(sessionId, ownerRoute) : void removeSession(sessionId),
     onDismissError: dismissError,
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,

@@ -688,9 +688,7 @@ export function sessionStatusMembershipIdentities(
         identities.add(ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, id))
       }
 
-      const matchingRows = sessions.filter(
-        session => session.id === id || session._lineage_root_id === id
-      )
+      const matchingRows = sessions.filter(session => session.id === id || session._lineage_root_id === id)
 
       if (matchingRows.length <= 1) {
         identities.add(id)
@@ -1028,11 +1026,7 @@ if (!isSecondaryWindow() && !isBrowserWindow()) {
   })
 }
 
-export function patchSessionTile(
-  storedSessionId: string,
-  patch: Partial<SessionTile>,
-  ownerRoute?: SessionOwnerRoute
-) {
+export function patchSessionTile(storedSessionId: string, patch: Partial<SessionTile>, ownerRoute?: SessionOwnerRoute) {
   const tiles = $sessionTiles.get()
   const identity = resolveTileTargetIdentity(tiles, storedSessionId, ownerRoute)
 
@@ -1426,9 +1420,9 @@ export interface SessionTileResumeOptions {
 
 export interface SessionTileDelegate {
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
-  archiveSession(storedSessionId: string): Promise<void>
+  archiveSession(storedSessionId: string, ownerRoute?: SessionOwnerRoute): Promise<void>
   /** Branch a stored session into a new chat (the sidebar's branch). */
-  branchSession(storedSessionId: string): Promise<void>
+  branchSession(storedSessionId: string, ownerRoute?: SessionOwnerRoute): Promise<void>
   /** Delete a stored session (the sidebar's delete, incl. tile cleanup). */
   deleteSession(storedSessionId: string, ownerRoute?: SessionOwnerRoute): Promise<void>
   /** Run a slash command against a tile's session (app-level effects — e.g.
@@ -2132,11 +2126,7 @@ export const $focusedSessionRowIdentity = computed(
         ? primaryOwnerIntent.ownerRoute
         : getSessionOwnerHint(storedSessionId)
 
-    return sessionRowIdentityForOwner(
-      [...sessions, ...cronSessions, ...messagingSessions],
-      storedSessionId,
-      ownerRoute
-    )
+    return sessionRowIdentityForOwner([...sessions, ...cronSessions, ...messagingSessions], storedSessionId, ownerRoute)
   }
 )
 
@@ -2167,9 +2157,7 @@ export const $openSessionRowIdentities = computed(
 
     if (selected) {
       const ownerRoute =
-        primaryOwnerIntent?.storedSessionId === selected
-          ? primaryOwnerIntent.ownerRoute
-          : getSessionOwnerHint(selected)
+        primaryOwnerIntent?.storedSessionId === selected ? primaryOwnerIntent.ownerRoute : getSessionOwnerHint(selected)
 
       add(selected, ownerRoute)
     }

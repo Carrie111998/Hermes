@@ -7,17 +7,14 @@ export type HudCloseHandoff = HudSessionState
  * A generation makes a null session an exact New Chat identity; legacy null
  * reports without one retain the app window's selected stored-session fallback.
  */
-export function resolveHudCloseHandoff(
-  hudState: HudSessionState,
-  selectedSessionId: string | null
-): HudCloseHandoff {
+export function resolveHudCloseHandoff(hudState: HudSessionState, selectedSessionId: string | null): HudCloseHandoff {
   if (hudState.sessionId) {
-    return { newChatGeneration: null, sessionId: hudState.sessionId }
+    return { newChatGeneration: null, ownerRoute: hudState.ownerRoute, sessionId: hudState.sessionId }
   }
 
   if (hudState.newChatGeneration !== null) {
-    return { newChatGeneration: hudState.newChatGeneration, sessionId: null }
+    return { newChatGeneration: hudState.newChatGeneration, ownerRoute: hudState.ownerRoute, sessionId: null }
   }
 
-  return { newChatGeneration: null, sessionId: selectedSessionId }
+  return { newChatGeneration: null, ownerRoute: hudState.ownerRoute, sessionId: selectedSessionId }
 }

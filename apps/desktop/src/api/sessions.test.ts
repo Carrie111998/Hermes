@@ -103,6 +103,19 @@ describe('setSessionArchived profile scoping', () => {
     })
   })
 
+  it('routes an owner-qualified archive while serializing its profile name', async () => {
+    hermesApi.mockResolvedValue({ ok: true } as never)
+
+    await setSessionArchived('sess-owner', true, { connectionId: 'source-a', profile: 'worker' })
+
+    expect(hermesApi.mock.calls[0][0]).toMatchObject({
+      body: { archived: true, profile: 'worker' },
+      connectionId: 'source-a',
+      method: 'PATCH',
+      profile: 'worker'
+    })
+  })
+
   it('omits the profile from the body when none is given', async () => {
     hermesApi.mockResolvedValue({ ok: true } as never)
 
@@ -138,6 +151,19 @@ describe('setSessionPinnedRemote / setSessionUnreadRemote profile scoping', () =
       path: '/api/sessions/sess-u',
       profile: 'tommy',
       body: { unread: true, profile: 'tommy' }
+    })
+  })
+
+  it('routes an owner-qualified unread update while serializing its profile name', async () => {
+    hermesApi.mockResolvedValue({ ok: true } as never)
+
+    await setSessionUnreadRemote('sess-owner', true, { connectionId: 'source-b', profile: 'worker' })
+
+    expect(hermesApi.mock.calls[0][0]).toMatchObject({
+      body: { profile: 'worker', unread: true },
+      connectionId: 'source-b',
+      method: 'PATCH',
+      profile: 'worker'
     })
   })
 

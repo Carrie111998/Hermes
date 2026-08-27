@@ -63,8 +63,8 @@ function mergeTileTranscript(
 }
 
 interface SessionTileDelegateParams {
-  archiveSession: (storedSessionId: string) => Promise<unknown>
-  branchStoredSession: (storedSessionId: string) => Promise<unknown>
+  archiveSession: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
+  branchStoredSession: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
   removeSession: (storedSessionId: string, ownerRoute?: SessionOwnerRoute) => Promise<unknown>
   requestGateway: GatewayRequester
@@ -136,8 +136,7 @@ export function useSessionTileDelegate({
     }
 
     const coordinationIdentity = (storedSessionId: string, owner: SessionOwnerScope): string => {
-      const lineageOwner =
-        typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+      const lineageOwner = typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
 
       const durableId = resolveComposerSessionKey(storedSessionId, $sessions.get(), lineageOwner) ?? storedSessionId
 
@@ -145,14 +144,26 @@ export function useSessionTileDelegate({
     }
 
     setSessionTileDelegate({
-      archiveSession: async storedSessionId => {
-        await archiveSession(storedSessionId)
+      archiveSession: async (storedSessionId, ownerRoute) => {
+        if (ownerRoute) {
+          await archiveSession(storedSessionId, ownerRoute)
+        } else {
+          await archiveSession(storedSessionId)
+        }
       },
-      branchSession: async storedSessionId => {
-        await branchStoredSession(storedSessionId)
+      branchSession: async (storedSessionId, ownerRoute) => {
+        if (ownerRoute) {
+          await branchStoredSession(storedSessionId, ownerRoute)
+        } else {
+          await branchStoredSession(storedSessionId)
+        }
       },
       deleteSession: async (storedSessionId, ownerRoute) => {
-        await removeSession(storedSessionId, ownerRoute)
+        if (ownerRoute) {
+          await removeSession(storedSessionId, ownerRoute)
+        } else {
+          await removeSession(storedSessionId)
+        }
       },
       executeSlash: async (rawCommand, sessionId) => {
         const storedSessionId = storedSessionIdForRuntime(sessionId)
@@ -160,9 +171,7 @@ export function useSessionTileDelegate({
 
         await executeSlashCommand(rawCommand, {
           ...(storedSessionId ? { storedSessionId } : {}),
-          ...(storedSessionId && owner
-            ? { composerStorageScope: coordinationIdentity(storedSessionId, owner) }
-            : {}),
+          ...(storedSessionId && owner ? { composerStorageScope: coordinationIdentity(storedSessionId, owner) } : {}),
           sessionId
         })
       },

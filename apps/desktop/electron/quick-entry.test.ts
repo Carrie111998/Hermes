@@ -4,10 +4,35 @@ import {
   createQuickEntryShortcut,
   DEFAULT_QUICK_ENTRY_SHORTCUT,
   type GlobalShortcutLike,
+  normalizeQuickEntrySubmitPayload,
   parseQuickEntryShortcut,
   quickEntryWindowBounds,
   sanitizeQuickEntrySettings
 } from './quick-entry'
+
+describe('normalizeQuickEntrySubmitPayload', () => {
+  it('preserves an exact owner-qualified recent target and generation across IPC', () => {
+    expect(
+      normalizeQuickEntrySubmitPayload({
+        session: {
+          id: 'shared',
+          ownerGeneration: 7,
+          ownerRoute: { connectionId: 'source-b', mode: 'remote', profile: 'worker' }
+        },
+        target: 'qualified-owner-b-target',
+        text: ' owner B only '
+      })
+    ).toEqual({
+      session: {
+        id: 'shared',
+        ownerGeneration: 7,
+        ownerRoute: { connectionId: 'source-b', mode: 'remote', profile: 'worker' }
+      },
+      target: 'qualified-owner-b-target',
+      text: 'owner B only'
+    })
+  })
+})
 
 function fakeGlobalShortcut(options: { register?: boolean; taken?: string[] } = {}) {
   const held = new Set(options.taken ?? [])

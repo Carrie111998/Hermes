@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
-import { hudTargetSessionId } from '@/app/hud/handoff'
+import { hudTargetSession } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Badge } from '@/components/ui/badge'
@@ -235,7 +235,8 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       label: t.titlebar.enterHud,
       onSelect: () => {
         triggerHaptic('open')
-        toggleHud(hudTargetSessionId())
+        const target = hudTargetSession()
+        toggleHud(target.sessionId, target.ownerRoute)
       }
     },
     {

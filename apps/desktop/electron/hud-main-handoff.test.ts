@@ -21,6 +21,7 @@ describe('main HUD close handoff', () => {
   it('broadcasts the latched New Chat generation with the null session', () => {
     expect(mainSource).toMatch(/let hudNewChatGeneration[^=]*= null/)
     expect(functionBody('broadcastHudState')).toContain('newChatGeneration: hudNewChatGeneration')
+    expect(functionBody('broadcastHudState')).toContain('ownerRoute: hudOwnerRoute')
   })
 
   it('latches both fields from the authoritative HUD renderer report', () => {
@@ -31,13 +32,15 @@ describe('main HUD close handoff', () => {
     expect(registration).toContain('setHudSessionState: state => {')
     expect(registration).toContain('hudSessionId = state.sessionId')
     expect(registration).toContain('hudNewChatGeneration = state.newChatGeneration')
+    expect(registration).toContain('hudOwnerRoute = state.ownerRoute')
   })
 
   it('latches the opening New Chat generation and clears it for stored sessions', () => {
     const open = functionBody('openHudWindow')
 
-    expect(open).toContain('latchHudSessionState(sessionId, newChatGeneration)')
-    expect(open).toContain('latchHudSessionState(sessionId, null)')
+    expect(open).toContain('latchHudSessionState(sessionId, ownerRoute, newChatGeneration)')
+    expect(open).toContain('latchHudSessionState(sessionId, ownerRoute, null)')
+    expect(functionBody('latchHudSessionState')).toContain('hudOwnerRoute = ownerRoute')
     expect(functionBody('latchHudSessionState')).toContain(
       'hudNewChatGeneration = hudSessionId === null ? newChatGeneration || null : null'
     )

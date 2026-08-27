@@ -44,6 +44,7 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { $sessionTiles, closeAllOpenSessionTiles } from '@/store/session-states'
 import { ackStoredSessionId } from '@/store/session-unread'
 import { canOpenSessionInTerminal, canOpenSessionWindow, openSessionInTerminal } from '@/store/windows'
@@ -98,6 +99,8 @@ export async function renameSessionPreferringRpc(
 interface SessionActions {
   sessionId: string
   title: string
+  /** Exact connection/profile owner captured by the row or tab. */
+  ownerRoute?: SessionOwnerRoute
   pinned?: boolean
   /** Backend-derived read state — drives the Mark as unread/read label. */
   unread?: boolean
@@ -186,6 +189,7 @@ function useSessionActions({
   title,
   pinned = false,
   unread = false,
+  ownerRoute,
   profile,
   onPin,
   onToggleUnread,
@@ -233,10 +237,15 @@ function useSessionActions({
             label: r.openInNewTab,
             onSelect: () => {
               triggerHaptic('selection')
+
               // Stack into the MAIN zone as a tab (center dock; the strip
               // sticky-shows on gain) — the door to the tab bar. Focuses first
               // if the session is already on screen.
-              openSession(sessionId, () => undefined, 'tab')
+              if (ownerRoute) {
+                openSession(sessionId, () => undefined, 'tab', { ownerRoute, workspaceMode: 'sessions' })
+              } else {
+                openSession(sessionId, () => undefined, 'tab')
+              }
             }
           })
         ]
@@ -249,7 +258,12 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              openSession(sessionId, () => undefined, 'window')
+
+              if (ownerRoute) {
+                openSession(sessionId, () => undefined, 'window', { ownerRoute, workspaceMode: 'sessions' })
+              } else {
+                openSession(sessionId, () => undefined, 'window')
+              }
             }
           })
         ]

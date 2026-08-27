@@ -4,6 +4,8 @@
 
 import { pathToFileURL } from 'node:url'
 
+import { normalizeSessionWindowOwnerRoute } from './session-windows'
+
 /**
  * Build the renderer URL for the HUD window.
  *
@@ -22,25 +24,50 @@ export function buildHudWindowUrl(
   {
     devServer,
     newChatGeneration,
+    ownerRoute,
     profile,
     rendererIndexPath
   }: {
     devServer?: null | string
     newChatGeneration?: null | number | string
+    ownerRoute?: unknown
     profile?: null | string
     rendererIndexPath?: string
   } = {}
 ): string {
-  const profileKey = typeof profile === 'string' ? profile.trim() : ''
+  const owner = normalizeSessionWindowOwnerRoute(ownerRoute)
+  const profileKey = owner?.profile || (typeof profile === 'string' ? profile.trim() : '')
   const generation = newChatGeneration == null ? '' : String(newChatGeneration).trim()
-  const query = `?win=hud${profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''}${generation ? `&newChatGeneration=${encodeURIComponent(generation)}` : ''}`
+  const query: string[] = ['win=hud']
+
+  if (owner) {
+    query.push(`connection=${encodeURIComponent(owner.connectionId)}`)
+  }
+
+  if (profileKey) {
+    query.push(`profile=${encodeURIComponent(profileKey)}`)
+  }
+
+  if (owner?.targetProfile) {
+    query.push(`targetProfile=${encodeURIComponent(owner.targetProfile)}`)
+  }
+
+  if (owner?.mode) {
+    query.push(`mode=${owner.mode}`)
+  }
+
+  if (generation) {
+    query.push(`newChatGeneration=${encodeURIComponent(generation)}`)
+  }
+
+  const queryString = `?${query.join('&')}`
   const route = sessionId ? `#/${encodeURIComponent(sessionId)}` : '#/'
 
   if (devServer) {
     const base = devServer.endsWith('/') ? devServer.slice(0, -1) : devServer
 
-    return `${base}/${query}${route}`
+    return `${base}/${queryString}${route}`
   }
 
-  return `${pathToFileURL(rendererIndexPath!).toString()}${query}${route}`
+  return `${pathToFileURL(rendererIndexPath!).toString()}${queryString}${route}`
 }

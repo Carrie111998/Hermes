@@ -22,42 +22,77 @@
 import { atom } from 'nanostores'
 
 import { setSessionUnreadRemote } from '@/hermes'
+import { ownerQualifiedSessionIdentity } from '@/lib/session-row-identity'
 
+import { normalizeProfileKey } from './profile'
 import { $sessions, setSessions } from './session'
+import type { SessionOwnerRoute } from './session-request-router'
 
 export const UNREAD_WRITE_GUARD_MS = 10_000
 
 /** id -> the value we wrote and when. Guarded rows outrank list pages. */
-export const $unreadWriteGuard = atom<Map<string, { at: number; value: boolean }>>(new Map())
+export const $unreadWriteGuard = atom<
+  Map<string, { at: number; ownerRoute?: SessionOwnerRoute; storedId?: string; value: boolean }>
+>(new Map())
 
-function rowFor(storedId: string) {
-  return $sessions.get().find(row => row.id === storedId)
+function matchesOwner(
+  row: { connection_id?: null | string; id: string; profile?: null | string },
+  storedId: string,
+  ownerRoute?: SessionOwnerRoute
+) {
+  if (row.id !== storedId) {
+    return false
+  }
+
+  return ownerRoute
+    ? (row.connection_id?.trim() || 'local') === ownerRoute.connectionId.trim() &&
+        normalizeProfileKey(row.profile) === normalizeProfileKey(ownerRoute.profile)
+    : true
+}
+
+function rowFor(storedId: string, ownerRoute?: SessionOwnerRoute) {
+  return $sessions.get().find(row => matchesOwner(row, storedId, ownerRoute))
 }
 
 /** Toggle the persisted unread flag: optimistic row update, then PATCH, then
  *  roll back visibly if the write fails. No-op for runtime-only sessions (a
  *  brand-new chat with no persisted row yet — there is nothing to flag). */
-export async function markSessionUnread(storedId: string, unread: boolean): Promise<void> {
-  const row = rowFor(storedId)
+export async function markSessionUnread(
+  storedId: string,
+  unread: boolean,
+  ownerRoute?: SessionOwnerRoute
+): Promise<void> {
+  const row = rowFor(storedId, ownerRoute)
 
   if (!row) {
     return
   }
 
   const guard = new Map($unreadWriteGuard.get())
-  guard.set(storedId, { at: Date.now(), value: unread })
+
+  const guardKey = ownerRoute
+    ? ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedId)
+    : storedId
+
+  guard.set(guardKey, { at: Date.now(), ownerRoute, storedId, value: unread })
   $unreadWriteGuard.set(guard)
 
-  setSessions(rows => rows.map(r => (r.id === storedId ? { ...r, unread } : r)))
+  setSessions(rows => rows.map(r => (matchesOwner(r, storedId, ownerRoute) ? { ...r, unread } : r)))
 
   try {
-    await setSessionUnreadRemote(storedId, unread, row.profile)
+    await setSessionUnreadRemote(
+      storedId,
+      unread,
+      ownerRoute
+        ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
+        : row.profile
+    )
   } catch (err) {
     // Roll back visibly: the backend kept the old value.
     const guard2 = new Map($unreadWriteGuard.get())
-    guard2.delete(storedId)
+    guard2.delete(guardKey)
     $unreadWriteGuard.set(guard2)
-    setSessions(rows => rows.map(r => (r.id === storedId ? { ...r, unread: !unread } : r)))
+    setSessions(rows => rows.map(r => (matchesOwner(r, storedId, ownerRoute) ? { ...r, unread: !unread } : r)))
     throw err
   }
 }
@@ -86,7 +121,7 @@ export function watchUnreadWriteGuard(): void {
     let changed = false
 
     for (const [id, entry] of guard) {
-      const row = rows.find(r => r.id === id)
+      const row = rows.find(r => matchesOwner(r, entry.storedId ?? id, entry.ownerRoute))
 
       if (row && row.unread === entry.value) {
         guard.delete(id)

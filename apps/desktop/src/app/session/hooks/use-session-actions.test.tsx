@@ -78,11 +78,7 @@ import {
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionStates, $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
-import {
-  $transcriptTailBySessionId,
-  recordTranscriptTail,
-  transcriptTailState
-} from '@/store/transcript-tail'
+import { $transcriptTailBySessionId, recordTranscriptTail, transcriptTailState } from '@/store/transcript-tail'
 import { loadTranscriptTail, saveTranscriptTail } from '@/store/transcript-tail-cache'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
@@ -1544,7 +1540,12 @@ function BranchHarness({
   activeSessionId?: string | null
   navigate?: ReturnType<typeof vi.fn>
   onCurrentReady?: (branchCurrentSession: (messageId?: string) => Promise<boolean>) => void
-  onReady: (branchStoredSession: (storedSessionId: string, sessionProfile?: string | null) => Promise<boolean>) => void
+  onReady: (
+    branchStoredSession: (
+      storedSessionId: string,
+      sessionOwner?: SessionProfileRoute | null | string
+    ) => Promise<boolean>
+  ) => void
   onRefs?: (refs: {
     activeSessionIdRef: MutableRefObject<string | null>
     selectedStoredSessionIdRef: MutableRefObject<string | null>
@@ -1592,6 +1593,56 @@ describe('branchStoredSession desktop source tagging', () => {
     $sessionTiles.set([])
     setSelectedStoredSessionId(null)
     vi.restoreAllMocks()
+  })
+
+  it('branches a duplicate id on the exact owner connection', async () => {
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    const ownerA = storedSession({
+      connection_id: 'source-a',
+      id: 'shared-parent',
+      message_count: 1,
+      profile: 'worker'
+    })
+
+    const ownerB = storedSession({
+      connection_id: 'source-b',
+      id: 'shared-parent',
+      message_count: 1,
+      profile: 'worker'
+    })
+
+    setSessions([ownerA, ownerB])
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch owner B', role: 'user', timestamp: 1 }],
+      session_id: 'shared-parent'
+    } as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({
+      session_id: 'branch-runtime-b',
+      stored_session_id: 'branch-stored-b'
+    } as never)
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    let branchStoredSession: ((storedSessionId: string, ownerRoute?: SessionProfileRoute) => Promise<boolean>) | null =
+      null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('shared-parent', ownerRoute)).resolves.toBe(true)
+
+    expect(getAllSessionMessages).toHaveBeenCalledWith('shared-parent', {
+      connectionId: 'source-b',
+      profile: 'worker'
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-b',
+      'worker',
+      'session.create',
+      expect.objectContaining({ parent_session_id: 'shared-parent', profile: 'worker' })
+    )
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })
 
   it('opens the branch as the primary session in the main workspace (#93444)', async () => {
@@ -2162,14 +2213,8 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     render(
       <>
-        <ResumeHarness
-          onReady={ready => (resumeA = ready)}
-          requestGateway={vi.fn(async () => ({}) as never)}
-        />
-        <ResumeHarness
-          onReady={ready => (resumeB = ready)}
-          requestGateway={vi.fn(async () => ({}) as never)}
-        />
+        <ResumeHarness onReady={ready => (resumeA = ready)} requestGateway={vi.fn(async () => ({}) as never)} />
+        <ResumeHarness onReady={ready => (resumeB = ready)} requestGateway={vi.fn(async () => ({}) as never)} />
       </>
     )
     await waitFor(() => expect(resumeA && resumeB).toBeTruthy())
@@ -2178,9 +2223,9 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const pendingB = resumeB!('stored-shared', true, ownerB)
 
     await waitFor(() =>
-      expect(vi.mocked(requestGatewayForAgent).mock.calls.filter(([, , method]) => method === 'session.resume')).toHaveLength(
-        2
-      )
+      expect(
+        vi.mocked(requestGatewayForAgent).mock.calls.filter(([, , method]) => method === 'session.resume')
+      ).toHaveLength(2)
     )
 
     resumeAResult.resolve({ info: {}, messages: [], resumed: 'stored-shared', session_id: 'rt-owner-a' } as never)
@@ -4354,6 +4399,26 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     expect($pinnedSessionIds.get()).toEqual(['tg-roll'])
     expect($removedSessionIds.get().has('tg-roll')).toBe(false)
     expect($sessionMutationsInFlight.get().has('tg-roll')).toBe(false)
+  })
+
+  it('archives only the exact owner when duplicate ids exist', async () => {
+    const ownerA = storedSession({ connection_id: 'source-a', id: 'duplicate-arch', profile: 'worker' })
+    const ownerB = storedSession({ connection_id: 'source-b', id: 'duplicate-arch', profile: 'worker' })
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    mockSetSessionArchived.mockResolvedValue({ ok: true })
+    setSessions([ownerA, ownerB])
+
+    const handle = await readyActions()
+    await act(async () => {
+      await handle.archiveSession('duplicate-arch', ownerRoute)
+    })
+
+    expect(mockSetSessionArchived).toHaveBeenCalledWith('duplicate-arch', true, {
+      connectionId: 'source-b',
+      profile: 'worker'
+    })
+    expect($sessions.get()).toEqual([ownerA])
   })
 
   it('archives a messaging row against its owning profile', async () => {

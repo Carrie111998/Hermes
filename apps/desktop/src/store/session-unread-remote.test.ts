@@ -2,14 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-const patch = vi.fn<(id: string, unread: boolean, profile?: null | string) => Promise<{ ok: boolean }>>(() =>
+const patch = vi.fn<(id: string, unread: boolean, profile?: unknown) => Promise<{ ok: boolean }>>(() =>
   Promise.resolve({ ok: true })
 )
 
 vi.mock('@/hermes', () => ({
   // The store only needs the REST mutation; keep the mock minimal.
   setApiRequestProfile: () => {},
-  setSessionUnreadRemote: (id: string, unread: boolean, profile?: null | string) => patch(id, unread, profile)
+  setSessionUnreadRemote: (id: string, unread: boolean, profile?: unknown) => patch(id, unread, profile)
 }))
 
 import { $sessions } from '@/store/session'
@@ -31,6 +31,17 @@ afterEach(() => {
 })
 
 describe('markSessionUnread', () => {
+  it('updates and PATCHes only the exact owner when duplicate ids exist', async () => {
+    const ownerA = row('shared', { connection_id: 'source-a', profile: 'worker', unread: false })
+    const ownerB = row('shared', { connection_id: 'source-b', profile: 'worker', unread: false })
+
+    $sessions.set([ownerA, ownerB])
+    await markSessionUnread('shared', true, { connectionId: 'source-b', profile: 'worker' })
+
+    expect(patch).toHaveBeenCalledWith('shared', true, { connectionId: 'source-b', profile: 'worker' })
+    expect($sessions.get()).toEqual([ownerA, { ...ownerB, unread: true }])
+  })
+
   it('optimistically paints the row, then PATCHes with the owning profile', async () => {
     $sessions.set([row('a', { profile: 'work', unread: false })])
 

@@ -84,6 +84,13 @@ describe('windowSessionOwnerRoute', () => {
     })
   })
 
+  it('reconstructs the exact owner from a HUD URL', () => {
+    expect(windowSessionOwnerRoute('?win=hud&connection=source-b&profile=worker')).toEqual({
+      connectionId: 'source-b',
+      profile: 'worker'
+    })
+  })
+
   it('preserves the legacy ownerless shape', () => {
     expect(windowSessionOwnerRoute('?win=secondary')).toBeNull()
   })

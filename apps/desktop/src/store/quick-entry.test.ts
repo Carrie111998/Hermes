@@ -38,7 +38,38 @@ const connect: QuickComposerEvent = {
   type: 'state'
 }
 
+const ownerA = { connectionId: 'source-a', profile: 'worker' }
+const ownerB = { connectionId: 'source-b', profile: 'worker' }
+const targetA = 'owner-a/worker/shared'
+const targetB = 'owner-b/worker/shared'
+
 describe('quickComposerReducer', () => {
+  it('sends the selected duplicate recent target with its exact owner and generation', () => {
+    const duplicateConnect: QuickComposerEvent = {
+      connected: true,
+      sessions: [
+        { id: 'shared', ownerGeneration: 3, ownerRoute: ownerA, target: targetA, title: 'Owner A' },
+        { id: 'shared', ownerGeneration: 7, ownerRoute: ownerB, target: targetB, title: 'Owner B' }
+      ],
+      type: 'state'
+    }
+
+    const { sent } = run([
+      duplicateConnect,
+      { target: targetB, type: 'target' },
+      { draft: 'send only to owner B', type: 'edit' },
+      { type: 'submit' }
+    ])
+
+    expect(sent).toEqual([
+      {
+        session: { id: 'shared', ownerGeneration: 7, ownerRoute: ownerB },
+        target: targetB,
+        text: 'send only to owner B'
+      }
+    ])
+  })
+
   it('starts visible, empty, DISCONNECTED, and targeting the current chat', () => {
     expect(initialQuickComposerState).toEqual({
       connected: false,

@@ -4,12 +4,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 
+const { openSession } = vi.hoisted(() => ({ openSession: vi.fn() }))
+
 afterEach(cleanup)
 
 // Exercises the real SessionActionsMenu end-to-end (no DropdownMenu mock) so
 // a broken asChild composition on the kebab trigger fails here — the menu
 // must still open on click.
 
+vi.mock('@/app/open-session', () => ({ openSession }))
 vi.mock('@/components/pane-shell/tree/store', () => ({
   closeAllTreeTabs: vi.fn(),
   closeOtherTreeTabs: vi.fn(),
@@ -55,6 +58,8 @@ vi.mock('@/i18n', () => ({
           export: 'Export',
           hideTabBar: 'Hide tab bar',
           markRead: 'Mark as read',
+          newWindow: 'Open in new window',
+          openInNewTab: 'Open in new tab',
           pin: 'Pin',
           rename: 'Rename',
           renameDesc: 'Leave empty to clear.',
@@ -105,7 +110,7 @@ vi.mock('@/store/session-states', () => ({
 }))
 vi.mock('@/store/windows', () => ({
   canOpenSessionInTerminal: () => false,
-  canOpenSessionWindow: () => false,
+  canOpenSessionWindow: () => true,
   isBrowserWindow: () => false,
   isSecondaryWindow: () => false,
   openSessionInNewWindow: vi.fn(),
@@ -123,6 +128,29 @@ function renderMenu() {
 }
 
 describe('SessionActionsMenu', () => {
+  it('opens a duplicate session window with the row exact owner route', async () => {
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    render(
+      <SessionActionsMenu ownerRoute={ownerRoute} sessionId="duplicate-id" title="Owner B session">
+        <button aria-label="Session actions" type="button">
+          ⋮
+        </button>
+      </SessionActionsMenu>
+    )
+
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Open in new window' }))
+
+    expect(openSession).toHaveBeenCalledWith('duplicate-id', expect.any(Function), 'window', {
+      ownerRoute,
+      workspaceMode: 'sessions'
+    })
+  })
+
   it('opens the dropdown on click without a tooltip on the kebab', async () => {
     renderMenu()
 

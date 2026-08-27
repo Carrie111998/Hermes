@@ -5,15 +5,12 @@ import { clearSessionDraft, stashSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { $connection, $sessions, setPrimarySessionOwnerIntent } from '@/store/session'
-import {
-  $sessionTiles,
-  sessionTileOwnerGeneration,
-  sessionTilePaneId
-} from '@/store/session-states'
+import { $sessionTiles, sessionTileOwnerGeneration, sessionTilePaneId } from '@/store/session-states'
 
 import {
   commitSessionTileResume,
   sessionTabDeleteOwnerRoute,
+  sessionTileComposerTarget,
   sessionTileDraftScope,
   sessionTileResumeFailure,
   tileDragPayload,
@@ -27,6 +24,18 @@ afterEach(() => {
   $sessions.set([])
   $sessionTiles.set([])
   setPrimarySessionOwnerIntent(null)
+})
+
+describe('exact-owner tile composer targets', () => {
+  it('gives duplicate stored ids distinct focus/attachment/Esc/model/voice targets', () => {
+    const ownerA = { connectionId: 'source-a', profile: 'default' }
+    const ownerB = { connectionId: 'source-b', profile: 'default' }
+
+    expect(sessionTileComposerTarget('shared-composer-id', ownerA)).not.toBe(
+      sessionTileComposerTarget('shared-composer-id', ownerB)
+    )
+    expect(sessionTileComposerTarget('legacy-id')).toBe('tile:legacy-id')
+  })
 })
 
 describe('tab delete owner routing', () => {
@@ -98,10 +107,7 @@ describe('exact-owner tile panes', () => {
       .map(entry => entry.id)
       .filter(id => id.includes('shared-pane-id'))
 
-    expect(paneIds).toEqual([
-      sessionTilePaneId('shared-pane-id', ownerA),
-      sessionTilePaneId('shared-pane-id', ownerB)
-    ])
+    expect(paneIds).toEqual([sessionTilePaneId('shared-pane-id', ownerA), sessionTilePaneId('shared-pane-id', ownerB)])
   })
 })
 

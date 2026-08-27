@@ -134,7 +134,9 @@ export function windowSessionOwnerRoute(
     const connectionId = params.get('connection')?.trim() || ''
     const profile = params.get('profile')?.trim() || ''
 
-    if (params.get('win') !== SECONDARY_WINDOW_FLAG || !connectionId || !profile) {
+    const windowKind = params.get('win')
+
+    if ((windowKind !== SECONDARY_WINDOW_FLAG && windowKind !== 'hud') || !connectionId || !profile) {
       return null
     }
 

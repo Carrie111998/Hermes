@@ -106,10 +106,10 @@ interface SidebarSessionsSectionProps {
   activeSessionIdentity?: null | string
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
-  onArchiveSession: (sessionId: string) => void
-  onBranchSession?: (sessionId: string, profile?: string) => void
+  onArchiveSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
+  onBranchSession?: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   onTogglePin: (sessionId: string) => void
-  onToggleUnread: (sessionId: string) => void
+  onToggleUnread: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
   rootClassName?: string
@@ -255,6 +255,8 @@ export function SidebarSessionsSection({
 
   const renderRow = useCallback(
     (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+      const ownerRoute = sessionRowOwnerRoute(session)
+
       const rowProps = {
         branchStem,
         card,
@@ -263,11 +265,11 @@ export function SidebarSessionsSection({
           activeSessionIdentity !== undefined
             ? activeSessionIdentity !== null && sessionRowIdentity(session) === activeSessionIdentity
             : session.id === activeSessionId,
-        onArchive: () => onArchiveSession(session.id),
-        onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-        onDelete: () => onDeleteSession(session.id, sessionRowOwnerRoute(session)),
+        onArchive: () => onArchiveSession(session.id, ownerRoute),
+        onBranch: onBranchSession ? () => onBranchSession(session.id, ownerRoute) : undefined,
+        onDelete: () => onDeleteSession(session.id, ownerRoute),
         onPin: () => onTogglePin(sessionPinId(session)),
-        onToggleUnread: () => onToggleUnread(session.id),
+        onToggleUnread: () => onToggleUnread(session.id, ownerRoute),
         onResume: () => onResumeSession(session.id, session),
         reorderable: draggable && !branchStem,
         session,

@@ -290,6 +290,66 @@ export function sanitizeQuickEntrySettings(raw: unknown): QuickEntrySettings {
   }
 }
 
+/** Validate the quick-window payload at the Electron trust boundary without
+ * collapsing an exact recent target back to a raw stored id. */
+export function normalizeQuickEntrySubmitPayload(raw: unknown): null | Record<string, unknown> {
+  if (!raw || typeof raw !== 'object') {
+    return null
+  }
+
+  const record = raw as Record<string, unknown>
+  const text = typeof record.text === 'string' ? record.text.trim() : ''
+
+  if (!text) {
+    return null
+  }
+
+  const target = typeof record.target === 'string' && record.target ? record.target : 'current'
+
+  const session =
+    record.session && typeof record.session === 'object' ? (record.session as Record<string, unknown>) : null
+
+  const owner =
+    session?.ownerRoute && typeof session.ownerRoute === 'object'
+      ? (session.ownerRoute as Record<string, unknown>)
+      : null
+
+  const id = typeof session?.id === 'string' ? session.id.trim() : ''
+  const connectionId = typeof owner?.connectionId === 'string' ? owner.connectionId.trim() : ''
+  const profile = typeof owner?.profile === 'string' ? owner.profile.trim() : ''
+
+  const ownerGeneration =
+    typeof session?.ownerGeneration === 'number' && Number.isFinite(session.ownerGeneration)
+      ? session.ownerGeneration
+      : undefined
+
+  const ownerRoute =
+    connectionId && profile
+      ? {
+          connectionId,
+          ...(owner?.mode === 'local' || owner?.mode === 'remote' ? { mode: owner.mode } : {}),
+          profile,
+          ...(typeof owner?.targetProfile === 'string' && owner.targetProfile.trim()
+            ? { targetProfile: owner.targetProfile.trim() }
+            : {})
+        }
+      : undefined
+
+  return {
+    ...(id && (ownerRoute || ownerGeneration !== undefined)
+      ? {
+          session: {
+            id,
+            ...(ownerGeneration !== undefined ? { ownerGeneration } : {}),
+            ...(ownerRoute ? { ownerRoute } : {})
+          }
+        }
+      : {}),
+    target,
+    text
+  }
+}
+
 /** The slice of Electron's `globalShortcut` we use (injected for testing). */
 export interface GlobalShortcutLike {
   isRegistered(accelerator: string): boolean

@@ -17,15 +17,12 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
-import {
-  $composerNewChatGeneration,
-  reloadPersistedDrafts,
-  requestComposerDraftSync
-} from '@/store/composer'
+import { $composerNewChatGeneration, reloadPersistedDrafts, requestComposerDraftSync } from '@/store/composer'
 import { reportHudSession, watchHudState } from '@/store/hud'
-import { $selectedStoredSessionId } from '@/store/session'
-import { focusOpenSession, sessionTileDelegate } from '@/store/session-states'
-import { isHudWindow } from '@/store/windows'
+import { $primarySessionOwnerIntent, $selectedStoredSessionId } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
+import { $sessionTiles, focusOpenSession, sessionTileDelegate, sessionTileIdentity } from '@/store/session-states'
+import { isHudWindow, windowSessionOwnerRoute } from '@/store/windows'
 
 import { getActiveComposer } from '../chat/composer/focus'
 import { openSession, type OpenSessionNavigate } from '../open-session'
@@ -48,15 +45,40 @@ const TILE_TARGET_PREFIX = 'tile:'
  * session id.
  */
 export function hudTargetSessionId(): null | string {
-  const target = getActiveComposer()
-  const tile = target.startsWith(TILE_TARGET_PREFIX) ? target.slice(TILE_TARGET_PREFIX.length) : null
+  return hudTargetSession().sessionId
+}
 
-  return tile || $selectedStoredSessionId.get()
+export interface HudOpenTarget {
+  ownerRoute?: SessionOwnerRoute
+  sessionId: null | string
+}
+
+export function hudTargetSession(): HudOpenTarget {
+  const target = getActiveComposer()
+  const tileIdentity = target.startsWith(TILE_TARGET_PREFIX) ? target.slice(TILE_TARGET_PREFIX.length) : null
+
+  const tile = tileIdentity
+    ? $sessionTiles
+        .get()
+        .find(candidate => sessionTileIdentity(candidate.storedSessionId, candidate.ownerRoute) === tileIdentity)
+    : undefined
+
+  if (tile) {
+    return { ownerRoute: tile.ownerRoute, sessionId: tile.storedSessionId }
+  }
+
+  const sessionId = $selectedStoredSessionId.get()
+  const intent = $primarySessionOwnerIntent.get()
+
+  return {
+    ...(sessionId && intent?.storedSessionId === sessionId ? { ownerRoute: intent.ownerRoute } : {}),
+    sessionId
+  }
 }
 
 interface HudHandoffParams {
   navigate: OpenSessionNavigate
-  resumeSession: (storedSessionId: string) => unknown
+  resumeSession: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionOwnerRoute) => unknown
 }
 
 /** App-window side: take the session back when the HUD goes away. Also keeps
@@ -88,6 +110,10 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
 
       const target = handoff.sessionId
 
+      const workspaceScope = handoff.ownerRoute
+        ? { ownerRoute: handoff.ownerRoute, workspaceMode: 'sessions' as const }
+        : undefined
+
       // Somewhere other than the workspace pane. If it is an open tile, front
       // it and re-resume THROUGH the tile delegate: the ordinary resume path
       // enforces "a session is either main or a tile, never both" and would
@@ -96,15 +122,26 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
       // — route to it and let the route resume do the rest, including loading
       // its draft as the composer's scope swaps.
       if (target && target !== selected) {
-        const delegate = focusOpenSession(target) === 'tile' ? sessionTileDelegate() : null
+        const delegate =
+          (workspaceScope ? focusOpenSession(target, workspaceScope) : focusOpenSession(target)) === 'tile'
+            ? sessionTileDelegate()
+            : null
 
         if (delegate) {
-          void delegate.resumeTile(target).catch(() => undefined)
+          void (
+            handoff.ownerRoute
+              ? delegate.resumeTile(target, undefined, handoff.ownerRoute)
+              : delegate.resumeTile(target)
+          ).catch(() => undefined)
 
           return
         }
 
-        openSession(target, paramsRef.current.navigate)
+        if (workspaceScope) {
+          openSession(target, paramsRef.current.navigate, 'in-place', workspaceScope)
+        } else {
+          openSession(target, paramsRef.current.navigate)
+        }
 
         return
       }
@@ -114,7 +151,7 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
       requestComposerDraftSync('reload')
 
       if (target) {
-        void paramsRef.current.resumeSession(target)
+        void paramsRef.current.resumeSession(target, false, handoff.ownerRoute ?? undefined)
       }
     })
   }, [])
@@ -126,17 +163,33 @@ export function useHudGoto(navigate: OpenSessionNavigate): void {
   const navigateRef = useRef(navigate)
   navigateRef.current = navigate
 
-  useEffect(() => window.hermesDesktop?.hud?.onGoto?.(id => navigateRef.current(sessionRoute(id))), [])
+  useEffect(
+    () =>
+      window.hermesDesktop?.hud?.onGoto?.(target => {
+        if (typeof target === 'string') {
+          navigateRef.current(sessionRoute(target))
+
+          return
+        }
+
+        openSession(target.sessionId, navigateRef.current, 'main', {
+          ...(target.ownerRoute ? { ownerRoute: target.ownerRoute } : {}),
+          workspaceMode: 'sessions'
+        })
+      }),
+    []
+  )
 }
 
 /** HUD side: keep main told which session this window is on. */
 export function useReportHudSession(): void {
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const newChatGeneration = useStore($composerNewChatGeneration)
+  const ownerRoute = windowSessionOwnerRoute()
 
   useEffect(() => {
     if (isHudWindow()) {
-      reportHudSession(selectedStoredSessionId, newChatGeneration)
+      reportHudSession(selectedStoredSessionId, newChatGeneration, ownerRoute)
     }
-  }, [newChatGeneration, selectedStoredSessionId])
+  }, [newChatGeneration, ownerRoute, selectedStoredSessionId])
 }

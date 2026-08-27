@@ -29,6 +29,13 @@ vi.mock('@/i18n', () => ({
 
 const mockVirtualListPropsHistory: VirtualSessionListProps[] = []
 
+const sessionRowPropsHistory: Array<{
+  onArchive: () => void
+  onBranch?: () => void
+  onToggleUnread: () => void
+  session: SessionInfo
+}> = []
+
 vi.mock('./virtual-session-list', () => ({
   VirtualSessionList: (props: VirtualSessionListProps) => {
     mockVirtualListPropsHistory.push(props)
@@ -38,24 +45,28 @@ vi.mock('./virtual-session-list', () => ({
 }))
 
 vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({
-    isSelected,
-    onDelete,
-    session
-  }: {
+  SidebarSessionRow: (props: {
     isSelected: boolean
+    onArchive: () => void
+    onBranch?: () => void
     onDelete: () => void
+    onToggleUnread: () => void
     session: SessionInfo
-  }) => (
-    <button
-      data-selected={isSelected ? 'true' : 'false'}
-      data-testid={`session-row-${session.connection_id?.trim() || 'local'}-${session.id}`}
-      onClick={onDelete}
-      type="button"
-    >
-      {session.id}
-    </button>
-  )
+  }) => {
+    sessionRowPropsHistory.push(props)
+    const { isSelected, onDelete, session } = props
+
+    return (
+      <button
+        data-selected={isSelected ? 'true' : 'false'}
+        data-testid={`session-row-${session.connection_id?.trim() || 'local'}-${session.id}`}
+        onClick={onDelete}
+        type="button"
+      >
+        {session.id}
+      </button>
+    )
+  }
 }))
 
 function makeSession(id: string, startedAt = 1000): SessionInfo {
@@ -76,6 +87,47 @@ function generateSessions(count: number): SessionInfo[] {
 const noop = () => {}
 
 describe('SidebarSessionsSection memoization & virtualizer stability', () => {
+  it('carries the regular duplicate row exact owner through archive, branch, and unread actions', () => {
+    sessionRowPropsHistory.length = 0
+    const onArchiveSession = vi.fn()
+    const onBranchSession = vi.fn()
+    const onToggleUnread = vi.fn()
+    const sourceB = { ...makeSession('shared'), connection_id: 'source-b', profile: 'worker-b' }
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={onArchiveSession}
+        onBranchSession={onBranchSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={onToggleUnread}
+        open
+        pinned={false}
+        sessions={[sourceB]}
+      />
+    )
+
+    const props = sessionRowPropsHistory.find(item => item.session === sourceB)!
+    props.onArchive()
+    props.onBranch?.()
+    props.onToggleUnread()
+
+    const ownerRoute = {
+      connectionId: 'source-b',
+      profile: 'worker-b',
+      targetProfile: 'worker-b'
+    }
+
+    expect(onArchiveSession).toHaveBeenCalledWith('shared', ownerRoute)
+    expect(onBranchSession).toHaveBeenCalledWith('shared', ownerRoute)
+    expect(onToggleUnread).toHaveBeenCalledWith('shared', ownerRoute)
+  })
+
   it('selects only the owner-qualified row when same-profile ids collide', () => {
     const ownerA = makeSession('shared')
     ownerA.connection_id = 'source-a'

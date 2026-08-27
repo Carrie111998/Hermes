@@ -121,6 +121,7 @@ declare global {
         }
         open: (request?: {
           newChatGeneration?: number | string
+          ownerRoute?: SessionOwnerRoute
           sessionId?: null | string
           profile?: null | string
         }) => Promise<{ ok: boolean }>
@@ -133,12 +134,19 @@ declare global {
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
         resetLayout: () => Promise<{ ok: boolean }>
         setFrost: (showing: boolean) => Promise<{ ok: boolean }>
-        setSession: (state: { newChatGeneration: number | string | null; sessionId: null | string }) => void
-        onGoto: (callback: (sessionId: string) => void) => () => void
+        setSession: (state: {
+          newChatGeneration: number | string | null
+          ownerRoute: SessionOwnerRoute | null
+          sessionId: null | string
+        }) => void
+        onGoto: (
+          callback: (target: { ownerRoute: SessionOwnerRoute | null; sessionId: string } | string) => void
+        ) => () => void
         onChanged: (
           callback: (state: {
             newChatGeneration: number | string | null
             open: boolean
+            ownerRoute: SessionOwnerRoute | null
             sessionId: null | string
           }) => void
         ) => () => void
