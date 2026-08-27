@@ -3673,6 +3673,28 @@ def delegate_task(
             f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
         )
 
+    # ── Authoritative runtime policy: refuse to spawn at all.
+    # A child gets a fresh session AND a fresh task id, and inherits the
+    # parent's MCP toolsets (`inherit_mcp_toolsets`, default on). Neither
+    # fresh id resolves to the parent's run lease, so the child's MCP calls
+    # take the best-effort observer path in `tools/mcp_tool.py` — no trusted
+    # request metadata, no result stop-directive authority, no required
+    # finalization — and it runs on its own delegation budget, outside the
+    # job's turn cap. Binding the child to the PARENT's lease is not the fix:
+    # re-entering `activate_authoritative_run` repoints the lease at the child
+    # session, so the parent's own later calls miss and downgrade, and child
+    # teardown finalizes the parent's run mid-flight. Correct support needs
+    # nested sub-leases with their own admission, budget and settlement, which
+    # is its own change. Until then this fails loudly rather than silently
+    # laundering unidentified work through a subagent. Control actions return
+    # above — they never create a child.
+    if getattr(parent_agent, "runtime_policy", None):
+        return tool_error(
+            "delegate_task cannot spawn under an authoritative runtime "
+            "policy: a child agent would run without an authoritative run "
+            "lease. Do the work in this run, or schedule a separate job."
+        )
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.

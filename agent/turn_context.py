@@ -577,7 +577,7 @@ def build_turn_context(
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
     # Generate unique task_id if not provided to isolate VMs between tasks.
-    effective_task_id = task_id or str(uuid.uuid4())
+    effective_task_id = task_id or getattr(agent, "runtime_task_id", None) or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
     turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
     if not turn_id:

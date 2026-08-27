@@ -176,7 +176,11 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
-    elif final_response is None and budget_fallback_eligible:
+    elif (
+        final_response is None
+        and budget_fallback_eligible
+        and not getattr(agent, "strict_iteration_limit", False)
+    ):
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
@@ -225,8 +229,14 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    _runtime_terminal_outcome = getattr(agent, "_runtime_terminal_outcome", None)
+    trusted_runtime_success = (
+        isinstance(_runtime_terminal_outcome, dict)
+        and _runtime_terminal_outcome.get("status") == "success"
+        and _runtime_terminal_outcome.get("policy") not in {None, "", "observer"}
+    )
     completed = (
-        final_response is not None
+        (final_response is not None or trusted_runtime_success)
         and not failed
         and (
             api_call_count < agent.max_iterations
@@ -553,7 +563,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not isinstance(_runtime_terminal_outcome, dict):
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -735,6 +745,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if isinstance(_runtime_terminal_outcome, dict):
+        result["trusted_terminal_outcome"] = dict(_runtime_terminal_outcome)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

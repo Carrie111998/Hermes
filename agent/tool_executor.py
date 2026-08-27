@@ -1943,6 +1943,52 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+def _append_runtime_stopped_tool_results(
+    agent, messages: list, tool_calls, *, effective_task_id: str, reason: str,
+) -> bool:
+    """Pair every undispatched call with an explicit not-executed result.
+
+    A trusted stop directive is authoritative the moment its triggering result
+    is persisted, so no later call in the same assistant batch may run. The
+    conversation loop only suppresses the next MODEL request, which is too late
+    for siblings already in the batch. Each remaining call still needs a
+    matching ``tool`` row or the next provider request violates message-role
+    alternation.
+
+    Returns ``False`` when persistence failed mid-drain (caller must return).
+    """
+    for tc in tool_calls:
+        name = getattr(getattr(tc, "function", None), "name", "") or "tool"
+        stopped_result = (
+            f"[Tool execution stopped — {name} was not executed. The run was "
+            f"terminated by runtime policy: {reason}]"
+        )
+        messages.append(make_tool_result_message(
+            name,
+            stopped_result,
+            _pairing_tool_call_id(tc),
+            effect_disposition="none",
+        ))
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=name,
+            function_args={},
+            result=stopped_result,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tc, "id", "") or "",
+            status="cancelled",
+            error_type="runtime_stop",
+            error_message=f"Tool execution stopped by runtime policy: {reason}",
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"stopped tool result {name}",
+        ):
+            return False
+    return True
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -1957,6 +2003,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # duplicating timeout policy across the branch-specific callbacks below.
     def _run_agent_tool_execution_middleware(agent, **kwargs):
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
+
+    def _record_mcp_stop(result: Any) -> Any:
+        from agent.agent_runtime_helpers import apply_mcp_runtime_stop
+
+        apply_mcp_runtime_stop(agent)
+        return result
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         tool_call_id = _pairing_tool_call_id(tool_call)
@@ -1996,6 +2048,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent,
                     messages,
                     stage=f"cancelled tool result {skipped_name}",
+                ):
+                    return
+            break
+
+        # SAFETY: a trusted result from an earlier call in THIS batch already
+        # ended the run. Its result is persisted and authoritative, so nothing
+        # after it may execute — dispatching the rest would cross the policy
+        # boundary (e.g. claim a second work item past an item cap) even though
+        # the conversation loop will refuse the next model request.
+        _runtime_stop = getattr(agent, "_runtime_stop_reason", None)
+        if _runtime_stop is not None:
+            remaining_calls = assistant_message.tool_calls[i-1:]
+            if remaining_calls:
+                agent._vprint(
+                    f"{agent.log_prefix}⛔ Runtime stop: skipping "
+                    f"{len(remaining_calls)} tool call(s)",
+                    force=True,
+                )
+                if not _append_runtime_stopped_tool_results(
+                    agent,
+                    messages,
+                    remaining_calls,
+                    effective_task_id=effective_task_id,
+                    reason=str(_runtime_stop),
                 ):
                     return
             break
@@ -2505,7 +2581,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                        return _record_mcp_stop(_ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2525,7 +2601,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                        )
+                        ))
 
                 (
                     function_result,
@@ -2587,7 +2663,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                        return _record_mcp_stop(_ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2607,7 +2683,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                        )
+                        ))
 
                 (
                     function_result,
@@ -2883,9 +2959,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+        segments = _plan_tool_batch_segments(
+            assistant_message.tool_calls,
+            execution_cwd=_exec_cwd,
+            mcp_barrier=bool(getattr(agent, "runtime_policy", None)),
+        )
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -2902,6 +2982,32 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+
+        # A trusted stop inside this segment ends the batch: later segments are
+        # never dispatched, and their calls are paired with explicit
+        # not-executed results so alternation stays valid.
+        _runtime_stop = getattr(agent, "_runtime_stop_reason", None)
+        if _runtime_stop is not None:
+            remaining_calls = [
+                call
+                for _kind, later_calls in segments[segment_index + 1:]
+                for call in later_calls
+            ]
+            if remaining_calls:
+                agent._vprint(
+                    f"{agent.log_prefix}⛔ Runtime stop: skipping "
+                    f"{len(remaining_calls)} tool call(s) in later segment(s)",
+                    force=True,
+                )
+                if not _append_runtime_stopped_tool_results(
+                    agent,
+                    messages,
+                    remaining_calls,
+                    effective_task_id=effective_task_id,
+                    reason=str(_runtime_stop),
+                ):
+                    return
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

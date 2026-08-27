@@ -1126,9 +1126,15 @@ class DockerEnvironment(BaseEnvironment):
         # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
         # env vars so outbound traffic routes through the host-side proxy.
         # The sandbox receives PROXY tokens instead of real API keys.
-        egress_volume_args, egress_env_overrides, egress_host_args = (
-            _egress_proxy_args_for_docker()
-        )
+        # An explicitly air-gapped task cannot use or need the host egress
+        # proxy. Requiring a live proxy before adding --network=none makes the
+        # stronger isolation mode depend on an unrelated network service.
+        if network:
+            egress_volume_args, egress_env_overrides, egress_host_args = (
+                _egress_proxy_args_for_docker()
+            )
+        else:
+            egress_volume_args, egress_env_overrides, egress_host_args = [], {}, []
         egress_label = _egress_reuse_fingerprint(
             egress_volume_args, egress_env_overrides, egress_host_args,
         )

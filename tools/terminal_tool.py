@@ -2282,7 +2282,7 @@ def ensure_task_env(task_id: Optional[str] = None):
     instance, or ``None`` when local or when creation fails (best-effort: a
     failure leaves the caller's fail-closed error path intact).
     """
-    config = _get_env_config()
+    config = {**_get_env_config(), **resolve_task_overrides(task_id)}
     env_type = config["env_type"]
     if env_type == "local":
         return None
@@ -2874,7 +2874,7 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         # Get configuration
-        config = _get_env_config()
+        config = {**_get_env_config(), **resolve_task_overrides(task_id)}
         env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent

@@ -122,6 +122,17 @@ from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
 
+_mcp_runtime_stop: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+    contextvars.ContextVar("mcp_runtime_stop", default=None)
+)
+
+
+def consume_mcp_runtime_stop() -> Optional[Dict[str, str]]:
+    """Consume the trusted stop directive produced by the last MCP call."""
+    directive = _mcp_runtime_stop.get()
+    _mcp_runtime_stop.set(None)
+    return directive
+
 
 # Hard allocation ceiling for a single MCP text payload (chars). This is the
 # FIRST line of defense against a buggy or malicious MCP server returning
@@ -6071,6 +6082,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        _mcp_runtime_stop.set(None)
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -6138,7 +6150,52 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        request_meta: Dict[str, Any] = {}
+        try:
+            from hermes_cli.plugins import (
+                invoke_authoritative_run_hook,
+                invoke_hook,
+                resolve_authoritative_run,
+            )
+            _session_id = str(kwargs.get("session_id") or "")
+            _task_id = str(kwargs.get("task_id") or "")
+            # Resolve by the immutable run identity first; the session id is
+            # only the fallback, because compression rotates it mid-run.
+            _run_id = resolve_authoritative_run(
+                run_id=_task_id, session_id=_session_id,
+            )
+            if _run_id:
+                values = [invoke_authoritative_run_hook(
+                    _run_id, "mcp_request_metadata", session_id=_session_id,
+                    server_name=server_name, tool_name=tool_name,
+                    task_id=_task_id,
+                )]
+            else:
+                values = invoke_hook(
+                    "mcp_request_metadata", server_name=server_name,
+                    tool_name=tool_name, session_id=_session_id,
+                    task_id=_task_id,
+                )
+            for value in values:
+                supplied = value.get("meta") if isinstance(value, dict) else None
+                if not isinstance(supplied, dict):
+                    if _run_id:
+                        raise RuntimeError("authoritative metadata callback returned no meta")
+                    continue
+                overlap = request_meta.keys() & supplied.keys()
+                if overlap:
+                    return tool_error(
+                        "Conflicting trusted MCP metadata keys: "
+                        + ", ".join(sorted(overlap))
+                    )
+                request_meta.update(supplied)
+        except Exception as exc:
+            return tool_error(f"Trusted MCP metadata failed: {type(exc).__name__}")
+
+        response_meta: Any = None
+
         async def _call():
+            nonlocal response_meta
             _mark_server_call_started(server)
             async with server._rpc_lock, _track_inflight_rpc(
                 server, server_name, f"tools/call {tool_name}"
@@ -6166,7 +6223,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs = {"arguments": args}
+                    if request_meta:
+                        call_kwargs["meta"] = request_meta
+                    _call_coro = server.session.call_tool(tool_name, **call_kwargs)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
@@ -6321,7 +6381,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _structured_json = None
                 if _structured_json is not None and len(_structured_json) > _MCP_HARD_RESULT_CAP_CHARS:
                     structured = _truncate_mcp_text_result(_structured_json)
-            meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
+            response_meta = mcp_field(result, "meta", "meta")
+            meta = _strip_reserved_meta_keys(response_meta)
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
                 if text_result:
@@ -6346,6 +6407,67 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
+        def _record_runtime_stop(result: str) -> str:
+            _session_id = str(kwargs.get("session_id") or "")
+            _task_id = str(kwargs.get("task_id") or "")
+            _run_id = None
+            _policy_id = None
+            try:
+                from hermes_cli.plugins import (
+                    authoritative_run_policy,
+                    invoke_authoritative_run_hook,
+                    invoke_hook,
+                    resolve_authoritative_run,
+                )
+                _run_id = resolve_authoritative_run(
+                    run_id=_task_id, session_id=_session_id,
+                )
+                _policy_id = authoritative_run_policy(_run_id) if _run_id else None
+                if _run_id:
+                    decisions = [invoke_authoritative_run_hook(
+                        _run_id, "mcp_tool_result", session_id=_session_id,
+                        server_name=server_name, tool_name=tool_name,
+                        task_id=_task_id, meta=response_meta,
+                    )]
+                else:
+                    decisions = invoke_hook(
+                        "mcp_tool_result", server_name=server_name,
+                        tool_name=tool_name, session_id=_session_id,
+                        task_id=_task_id, meta=response_meta,
+                    )
+                for decision in decisions:
+                    if not isinstance(decision, dict):
+                        if _run_id:
+                            raise RuntimeError("authoritative result callback returned no decision")
+                        continue
+                    if decision.get("action") == "stop":
+                        reason = str(decision.get("reason") or "mcp_result")
+                        status = str(decision.get("status") or "success")
+                        if _run_id and status not in {"success", "failure"}:
+                            raise RuntimeError("authoritative stop status is invalid")
+                        directive = {"reason": reason}
+                        if _run_id:
+                            directive.update(
+                                status=status,
+                                policy=str(_policy_id or _run_id),
+                                run_id=str(_run_id),
+                            )
+                        _mcp_runtime_stop.set(directive)
+                        break
+                    if _run_id and decision.get("action") != "continue":
+                        raise RuntimeError("authoritative result action is invalid")
+            except Exception as exc:
+                if _run_id:
+                    _mcp_runtime_stop.set({
+                        "reason": "policy_error", "status": "failure",
+                        "policy": str(_policy_id or _run_id), "run_id": str(_run_id),
+                    })
+                    return tool_error(
+                        f"Trusted MCP result policy failed: {type(exc).__name__}"
+                    )
+                logger.warning("MCP result hook failed", exc_info=True)
+            return result
+
         try:
             result = _call_once()
             # Check if the MCP tool itself returned an error
@@ -6357,7 +6479,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
-            return result
+            return _record_runtime_stop(result)
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
@@ -6369,7 +6491,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
-                return recovered
+                return _record_runtime_stop(recovered)
 
             # Transport session expiry (#13383): same reconnect flow
             # but skips OAuth recovery because the access token is
@@ -6379,7 +6501,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
-                return recovered
+                return _record_runtime_stop(recovered)
 
             _bump_server_error(server_name)
             logger.error(

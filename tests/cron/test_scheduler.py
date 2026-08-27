@@ -653,6 +653,157 @@ class TestRunJobSessionPersistence:
             "memory toolset must not be policy-denied in cron"
         )
 
+    def test_run_job_enforces_per_job_turn_cap(self, tmp_path):
+        job = {
+            "id": "bounded-job",
+            "name": "bounded",
+            "prompt": "hello",
+            "max_turns": 12,
+        }
+        with self._run_job_patches(tmp_path) as (_, mock_agent_cls):
+            run_job(job)
+
+        agent = mock_agent_cls.return_value
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 12
+        assert agent.strict_iteration_limit is True
+        assert agent.cron_max_turns == 12
+
+    def test_trusted_terminal_outcome_reaches_policy_finalizer(self, tmp_path):
+        outcome = {"reason": "max_items", "status": "success",
+                   "policy": "fleet-runtime"}
+        finalize = MagicMock(return_value=[{"status": "finalized"}])
+        with self._run_job_patches(
+            tmp_path, extra=(patch("hermes_cli.lifecycle.finalize_session", finalize),),
+        ) as (_, mock_agent_cls):
+            mock_agent_cls.return_value.run_conversation.return_value = {
+                "completed": True, "failed": False, "final_response": None,
+                "turn_exit_reason": "runtime_stop(max_items)",
+                "trusted_terminal_outcome": outcome,
+            }
+            success, _output, final_response, error = run_job({
+                "id": "bounded", "name": "bounded", "prompt": "work",
+                "max_turns": 12, "runtime_policy": "fleet-runtime",
+            })
+
+        assert success is True
+        assert final_response == ""
+        assert error is None
+        assert finalize.call_args.kwargs["terminal_outcome"] == outcome
+        assert finalize.call_args.kwargs["completed"] is True
+
+    def test_required_policy_finalizer_failure_fails_the_run(self, tmp_path):
+        """A failed settlement fails the RUN; it must not make cleanup optional.
+
+        The settlement raise used to leave run_job's finally before the
+        ContextVar resets, the SessionDB title/end/close, and the agent
+        teardown — leaking the cron session state and the agent's
+        subprocess/sandbox/HTTP resources on exactly the runs an operator most
+        needs to trust.
+        """
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set("prior-platform")
+        cron_session_before = _VAR_MAP["HERMES_CRON_SESSION"].get()
+
+        with self._run_job_patches(
+            tmp_path,
+            extra=(patch("hermes_cli.lifecycle.finalize_session",
+                         side_effect=RuntimeError("no settlement receipt")),),
+        ) as (fake_db, mock_agent_cls):
+            with pytest.raises(RuntimeError, match="no settlement receipt"):
+                run_job({
+                    "id": "bounded", "name": "bounded", "prompt": "work",
+                    "runtime_policy": "fleet-runtime",
+                })
+
+            assert fake_db.end_session.called, "session store was not ended"
+            assert fake_db.close.called, "session store was not closed"
+            assert mock_agent_cls.return_value.close.called, (
+                "agent resources were not released"
+            )
+
+        assert _VAR_MAP["HERMES_CRON_SESSION"].get() == cron_session_before
+        assert _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].get() == ""
+
+    @pytest.mark.parametrize("status", ["success", "failure"])
+    def test_run_job_persists_trusted_settlement(self, tmp_path, status):
+        """The typed outcome becomes durable proof bound to fire + session.
+
+        Both directions are recorded verbatim: a trusted success stays success
+        and a trusted failure stays failure, so cron settlement and the runtime
+        policy can never disagree about the same fire.
+        """
+        from cron import executions
+
+        outcome = {
+            "reason": "max_items", "status": status, "policy": "fleet-runtime",
+        }
+        recorded = {}
+
+        def _record(execution_id, *, session_id, settlement):
+            recorded.update(
+                execution_id=execution_id, session_id=session_id,
+                settlement=settlement,
+            )
+            return True
+
+        with self._run_job_patches(
+            tmp_path,
+            extra=(
+                patch.object(executions, "record_execution_settlement", _record),
+                patch("hermes_cli.lifecycle.finalize_session",
+                      return_value=[{"status": "finalized", "receipt": "abc"}]),
+            ),
+        ) as (fake_db, mock_agent_cls):
+            # Compression rotated this run onto a continuation: the settlement
+            # must bind to the session the run actually ended on.
+            fake_db.get_compression_tip.return_value = "cron_bounded_child"
+            mock_agent_cls.return_value.run_conversation.return_value = {
+                "final_response": None,
+                "turn_exit_reason": "runtime_stop(max_items)",
+                "trusted_terminal_outcome": outcome,
+            }
+            run_job({
+                "id": "bounded", "name": "bounded", "prompt": "work",
+                "runtime_policy": "fleet-runtime", "execution_id": "exec-1",
+            })
+
+        assert recorded["execution_id"] == "exec-1"
+        assert recorded["session_id"] == "cron_bounded_child"
+        assert recorded["settlement"]["outcome"] == outcome
+        assert recorded["settlement"]["settled"] is True
+        assert recorded["settlement"]["receipt"] == {
+            "status": "finalized", "receipt": "abc",
+        }
+
+    def test_unprovable_trusted_success_fails_the_run(self, tmp_path):
+        """Trusted success with no durable settlement never passes as green."""
+        from cron import executions
+
+        with self._run_job_patches(
+            tmp_path,
+            extra=(
+                patch.object(
+                    executions, "record_execution_settlement", return_value=False,
+                ),
+                patch("hermes_cli.lifecycle.finalize_session", return_value=[]),
+            ),
+        ) as (fake_db, mock_agent_cls):
+            fake_db.get_compression_tip.return_value = None
+            mock_agent_cls.return_value.run_conversation.return_value = {
+                "final_response": None,
+                "turn_exit_reason": "runtime_stop(max_items)",
+                "trusted_terminal_outcome": {
+                    "reason": "max_items", "status": "success",
+                    "policy": "fleet-runtime",
+                },
+            }
+            with pytest.raises(RuntimeError, match="could not be settled durably"):
+                run_job({
+                    "id": "bounded", "name": "bounded", "prompt": "work",
+                    "runtime_policy": "fleet-runtime", "execution_id": "exec-1",
+                })
+
     def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
         """A per-job enabled_toolsets naming memory keeps it."""
         job = {

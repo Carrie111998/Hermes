@@ -5680,6 +5680,7 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    result = None
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -5982,6 +5983,15 @@ def run_job(
         if _mt is None:
             _mt = _cfg.get("max_turns")
         max_iterations = _resolve_turn_limit(_mt)
+        if job.get("max_turns") is not None:
+            from cron.jobs import _normalize_max_turns
+            job_max_turns = _normalize_max_turns(job["max_turns"])
+            if job_max_turns is None:
+                raise ValueError("max_turns must be a positive integer")
+            max_iterations = min(
+                max_iterations,
+                job_max_turns,
+            )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -6343,6 +6353,12 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        agent.strict_iteration_limit = job.get("max_turns") is not None
+        agent.cron_job_id = job_id
+        agent.cron_job_name = job_name
+        agent.cron_max_turns = job.get("max_turns")
+        agent.runtime_policy = job.get("runtime_policy")
+        agent.runtime_task_id = _cron_session_id
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -6673,6 +6689,43 @@ def run_job(
                 _terminal_cwd_lock.release_write()
             else:
                 _terminal_cwd_lock.release_read()
+        _settlement_error: Optional[BaseException] = None
+        _settlement_receipt: Optional[dict] = None
+        if agent is not None:
+            try:
+                from hermes_cli.lifecycle import finalize_session
+                _finalize_results = finalize_session(
+                    session_id=getattr(agent, "session_id", None) or _cron_session_id,
+                    # The lease is keyed by the run's immutable fire identity;
+                    # agent.session_id may have rotated onto a compression
+                    # continuation, which would resolve no lease at all.
+                    runtime_run_id=(
+                        getattr(agent, "runtime_task_id", None) or _cron_session_id
+                    ),
+                    platform="cron",
+                    cron_job_id=job_id,
+                    cron_job_name=job_name,
+                    cron_max_turns=job.get("max_turns"),
+                    completed=(result or {}).get("completed") is True,
+                    failed=(result or {}).get("failed") is True,
+                    terminal_outcome=(result or {}).get("trusted_terminal_outcome"),
+                )
+                # finalize_session prepends the authoritative receipt when a run
+                # lease settled; compatibility observers follow it.
+                if job.get("runtime_policy") and _finalize_results:
+                    _head = _finalize_results[0]
+                    if isinstance(_head, dict) and _head.get("status") == "finalized":
+                        _settlement_receipt = _head
+            except (Exception, KeyboardInterrupt) as exc:
+                if job.get("runtime_policy"):
+                    # Fail the RUN, never the cleanup: the ContextVar resets,
+                    # SessionDB close, and agent teardown below all still run,
+                    # and this is re-raised at the end of the finally.
+                    _settlement_error = exc
+                else:
+                    logger.warning(
+                        "Job '%s': session finalizer failed: %s", job_id, exc
+                    )
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
@@ -6683,6 +6736,10 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        # Resolved below from the SessionDB lineage when one exists; the live
+        # agent id is the fallback so a run without a session store still binds
+        # its durable settlement to the session it actually ended on.
+        _final_cron_session_id = getattr(agent, "session_id", None) or _cron_session_id
         if _session_db:
             # The agent turn has already returned. Bound every subsequent DB
             # operation so storage failure cannot hold the dispatch guard.
@@ -6769,6 +6826,82 @@ def run_job(
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
+
+        # Durable trusted settlement, written after teardown so it records what
+        # the run actually ended on. A trusted SUCCESS that cannot be persisted
+        # is not provable, so it fails the run rather than passing unverifiably.
+        _trusted_outcome = (result or {}).get("trusted_terminal_outcome")
+        if isinstance(_trusted_outcome, dict):
+            _settled = _record_trusted_settlement(
+                job_id=job_id,
+                execution_id=job.get("execution_id"),
+                session_id=_final_cron_session_id,
+                outcome=_trusted_outcome,
+                receipt=_settlement_receipt,
+                settled=_settlement_error is None,
+            )
+            if (
+                not _settled
+                and _settlement_error is None
+                and job.get("execution_id")
+                and _trusted_outcome.get("status") == "success"
+            ):
+                _settlement_error = RuntimeError(
+                    "trusted terminal success could not be settled durably"
+                )
+
+        # Cleanup is complete; a failed settlement now fails the run.
+        if _settlement_error is not None:
+            raise _settlement_error
+
+
+def _record_trusted_settlement(
+    *,
+    job_id: str,
+    execution_id: Optional[str],
+    session_id: str,
+    outcome: Optional[dict],
+    receipt: Optional[dict],
+    settled: bool,
+) -> bool:
+    """Persist this fire's trusted terminal proof, bound to its final session.
+
+    Cron completion is classified from the persisted transcript tail, and a
+    trusted stop deliberately ends that tail on a tool result rather than a
+    closing assistant row. Without this durable proof the same fire can be
+    success to the runtime policy and incomplete to durable settlement.
+
+    Returns ``True`` when the fire now carries a durable settlement.
+    """
+    if not isinstance(outcome, dict):
+        return False
+    if not execution_id:
+        logger.warning(
+            "Job '%s': trusted terminal outcome has no execution row to bind to; "
+            "durable settlement was not recorded.",
+            job_id,
+        )
+        return False
+    try:
+        from cron.executions import record_execution_settlement
+
+        return record_execution_settlement(
+            execution_id,
+            session_id=str(session_id or ""),
+            settlement={
+                "outcome": dict(outcome),
+                "receipt": dict(receipt) if isinstance(receipt, dict) else None,
+                "settled": bool(settled),
+                "recorded_at": _hermes_now().isoformat(),
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Job '%s': failed to persist trusted settlement",
+            job_id,
+            exc_info=True,
+        )
+        return False
 
 
 def _teardown_cron_agent(
@@ -7013,6 +7146,10 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # run_job binds this fire's durable trusted settlement to the execution row,
+    # so the id has to be on the job it receives (the ticker path already sets
+    # it; the direct path created it just above).
+    job["execution_id"] = execution_id
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):

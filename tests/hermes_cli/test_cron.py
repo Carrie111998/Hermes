@@ -217,6 +217,7 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
                 "enabled": True,
                 "next_run_at": "2026-06-01T00:00:00Z",
                 "deliver": ["local"],
+                "max_turns": 12,
             }
         ],
     )
@@ -228,6 +229,7 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Gateway is not running" in out
     assert "Nightly docs" in out
+    assert "Max turns: 12" in out
 
 
 def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):

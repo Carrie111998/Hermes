@@ -80,6 +80,26 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+
+def _rebind_authoritative_run(agent) -> None:
+    """Re-point an authoritative run lease at the rotated transcript session.
+
+    Best-effort by design: authority resolves primarily by the run's immutable
+    fire id, which this rotation never touches. The reverse index refreshed
+    here is only the fallback for callers that know a session id and nothing
+    else, so a failure here cannot open the authority gate.
+    """
+    run_id = str(getattr(agent, "runtime_task_id", "") or "")
+    if not run_id:
+        return
+    try:
+        from hermes_cli.plugins import bind_authoritative_run_session
+
+        bind_authoritative_run_session(run_id, str(getattr(agent, "session_id", "") or ""))
+    except Exception:
+        logger.debug("authoritative run rebind skipped", exc_info=True)
+
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -1281,6 +1301,7 @@ def _adopt_live_compression_child(
         return None
 
     agent.session_id = child_session_id
+    _rebind_authoritative_run(agent)
     try:
         from gateway.session_context import set_current_session_id
 
@@ -3787,6 +3808,7 @@ def compress_context(
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
                     agent.session_id = new_session_id
+                    _rebind_authoritative_run(agent)
                     try:
                         from gateway.session_context import set_current_session_id
 
