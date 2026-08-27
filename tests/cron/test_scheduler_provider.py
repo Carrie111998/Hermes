@@ -640,3 +640,90 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_skips_deleted_profile_home(tmp_path, monkeypatch):
+    """Regression test for #47368: a profile deleted while the desktop
+    backend runs must not be resurrected by the cron ticker.
+
+    The multiplex ticker's profile_homes list is snapshotted at startup. If a
+    profile is deleted mid-run (hermes profile delete / desktop DELETE route),
+    the old code still ticked and heartbeated its home every cycle, and
+    record_ticker_heartbeat -> ensure_dirs -> mkdir(parents=True) recreated
+    the deleted profile's cron/ workspace — so the profile "came back" on disk
+    and in `hermes profile list` within ~60s. The ticker must skip homes whose
+    directory no longer exists.
+    """
+    import shutil
+    from pathlib import Path
+
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    # Two profile homes. One is later "deleted" (directory removed).
+    live = tmp_path / "live-profile"
+    deleted = tmp_path / "deleted-profile"
+    for d in (live, deleted):
+        (d / "cron").mkdir(parents=True)
+
+    profile_homes = [("live-profile", live), ("deleted-profile", deleted)]
+
+    ticked_homes: list[Path] = []
+
+    def _tracking_tick(*args, **kwargs):
+        # The tick runs under the profile's HERMES_HOME override; record the
+        # resolved home so we can assert which profiles were actually ticked.
+        import hermes_constants
+
+        ticked_homes.append(Path(hermes_constants.get_hermes_home()))
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    # Simulate the deletion happening between scheduler start and first tick.
+    shutil.rmtree(deleted)
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={"interval": 0, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        t.start()
+        deadline = time.monotonic() + 10
+        while len(ticked_homes) < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    # The live profile was ticked (at least once); the deleted one never was.
+    assert ticked_homes, "Expected the live profile to be ticked"
+    assert all(Path(h).resolve() == live.resolve() for h in ticked_homes), (
+        f"Deleted profile was ticked — only live expected: {ticked_homes}"
+    )
+    # The deleted home's directory must NOT have been recreated.
+    assert not deleted.exists(), (
+        "Deleted profile home was resurrected by the cron ticker — "
+        "its cron/ workspace must not be recreated (#47368)"
+    )
+
+
+def test_existing_profile_homes_filters_deleted(tmp_path):
+    """The existence filter keeps live homes and drops deleted ones, whether
+    entries are (name, path) tuples or bare paths."""
+    from cron.scheduler_provider import _existing_profile_homes
+
+    live = tmp_path / "live"
+    deleted = tmp_path / "deleted"
+    live.mkdir(parents=True)
+    # deleted intentionally not created
+
+    as_tuples = _existing_profile_homes([("live", live), ("deleted", deleted)])
+    assert [p[0] for p in as_tuples] == ["live"]
+
+    as_paths = _existing_profile_homes([live, deleted])
+    assert [p for p in as_paths] == [live]
+
+
+
