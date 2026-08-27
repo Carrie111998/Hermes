@@ -5,8 +5,6 @@ import './store/active-work'
 import './store/power'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
-// Side-effect: hot-import prompt template jobs from $HERMES_HOME/prompt-templates-inbox.
-import { startPromptImportInbox } from './store/prompt-import-inbox'
 // Dev-only render/state churn counters. MUST precede the `react-dom` import
 // below: react-dom captures the devtools hook at module init, so bippy has to
 // install during THIS import's evaluation or every commit goes unseen
@@ -29,6 +27,7 @@ import { installClipboardShim } from './lib/clipboard'
 import { queryClient } from './lib/query-client'
 import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
 import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
+import { startPromptImportInbox } from './store/prompt-import-inbox'
 import { ThemeProvider } from './themes/context'
 
 installClipboardShim()
