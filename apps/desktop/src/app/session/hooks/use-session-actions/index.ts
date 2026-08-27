@@ -771,6 +771,20 @@ export function useSessionActions({
         if (dir === 'center' && runtimeInfo?.cwd) {
           setCurrentCwdTransient(runtimeInfo.cwd)
           setWorkspaceCwdOwner(stored)
+          // #76696's fix set $currentCwd + the owner marker so the Files pane
+          // (which keys off both, per right-sidebar/index.tsx's `hasWorkspace`
+          // check) would follow a center tile's workspace — but the pane's
+          // ownership match is against $selectedStoredSessionId too, which
+          // this path never touched. A center tile IS meant to be the focused
+          // surface (see the comment above), so it should carry the same
+          // selection a navigated session gets; without this line the pane
+          // silently blanks for every session-tab tile after the first
+          // (whose accidental null===null match on the fresh-draft path was
+          // masking this gap — traced live via hermes-ddebug's CDP session,
+          // 2026-08-27, on the workspace.preview series once it started
+          // giving tiles a real cwd to lose).
+          setSelectedStoredSessionId(stored)
+          selectedStoredSessionIdRef.current = stored
         }
 
         revealTreePane(`session-tile:${stored}`)
@@ -782,7 +796,7 @@ export function useSessionActions({
         notifyError(error, copy.createSessionFailed)
       }
     },
-    [copy, requestGateway, updateSessionState]
+    [copy, requestGateway, selectedStoredSessionIdRef, updateSessionState]
   )
 
   const openSettings = useCallback(() => {
