@@ -1496,6 +1496,16 @@ def discover_provider_mappings(
     return mappings
 
 
+def known_credential_env_names() -> set[str]:
+    """Return every provider credential name and alias recognized by egress."""
+
+    names = set(_BEARER_PROVIDERS) | set(_NON_BEARER_PROVIDERS)
+    for env_name, spec in _HEADER_AUTH_PROVIDERS.items():
+        names.add(env_name)
+        names.update(spec.get("aliases") or ())
+    return names
+
+
 def discover_uncovered_providers(
     *,
     available_env_names: Optional[List[str]] = None,
@@ -2483,6 +2493,7 @@ __all__ = [
     "get_status",
     "install_iron_proxy",
     "iron_proxy_version",
+    "known_credential_env_names",
     "load_mappings",
     "merge_mappings",
     "mint_proxy_token",

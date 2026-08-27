@@ -55,6 +55,16 @@ def test_mint_proxy_token_has_prefix_and_length():
     assert len(t) >= len("alpha-") + 32
 
 
+def test_known_credential_env_names_includes_provider_kinds_and_aliases():
+    names = ip.known_credential_env_names()
+
+    assert "OPENAI_API_KEY" in names
+    assert "ANTHROPIC_API_KEY" in names
+    assert "GEMINI_API_KEY" in names
+    assert "GOOGLE_API_KEY" in names
+    assert "AWS_ACCESS_KEY_ID" in names
+
+
 
 
 
