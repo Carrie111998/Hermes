@@ -5041,6 +5041,15 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <!-- macOS 26 (Darwin 25.x) hands launchd-spawned jobs
+             XPC_SERVICE_NAME=0 — the same sentinel an interactive shell
+             inherits — so is_gateway_supervisor_process() cannot tell the
+             service's own startup from a stray shell launch, and
+             _guard_supervised_gateway_conflict() exits 1 in a respawn/refuse
+             loop. Declare the documented external-supervisor opt-in so the
+             guard stands down for the job launchd itself started. -->
+        <key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
