@@ -18,10 +18,12 @@ import { hostPathLabel } from '@/lib/external-link'
 import { openCommandPalette } from '@/store/command-palette'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
+import { REASONING_EFFORT_VALUES, reasoningEffortLabel } from '@/lib/reasoning-effort'
+import { $gateway } from '@/store/gateway'
 import { $previewTabs, closeRightRailTab, newBrowserTab, openPreview } from '@/store/preview'
 import { $nativeNotifyPrefs, resumeNativeNotifications, silenceNativeNotificationsFor } from '@/store/native-notifications'
 import { toggleWakeWord } from '@/store/wake-word'
-import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import { $activeSessionId, $currentReasoningEffort, $selectedStoredSessionId, markComposerSelectionManual, setCurrentReasoningEffort } from '@/store/session'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -105,10 +107,23 @@ export function MobileBehaviors() {
   )
   const hapticsMuted = useStore($hapticsMuted)
   const mobileDisplayScale = useStore($mobileDisplayScale)
+  const currentReasoningEffort = useStore($currentReasoningEffort)
+  const activeSessionId = useStore($activeSessionId)
   const nativeNotifyPrefs = useStore($nativeNotifyPrefs)
   const notificationsSilenced = nativeNotifyPrefs.silencedUntil > Date.now()
   const leftTitlebarTools = useTitlebarToolContributions('left')
   const rightTitlebarTools = useTitlebarToolContributions('right')
+  const chooseReasoning = useCallback((effort: string) => {
+    const previous = currentReasoningEffort
+    markComposerSelectionManual()
+    setCurrentReasoningEffort(effort)
+    const gateway = $gateway.get()
+    if (!gateway || !activeSessionId) return
+
+    void gateway.request('config.set', { key: 'reasoning', session_id: activeSessionId, value: effort }).catch(() => {
+      setCurrentReasoningEffort(previous)
+    })
+  }, [activeSessionId, currentReasoningEffort])
   const appActions = useMemo<MobileToolbarAction[]>(
     () => [
       { group: 'session', id: 'new-chat', label: t.commandCenter.nav.newChat.title, onSelect: () => navigate(NEW_CHAT_ROUTE) },
@@ -123,6 +138,12 @@ export function MobileBehaviors() {
       },
       { group: 'session', id: 'command-center', label: t.commandCenter.commandCenter, onSelect: () => navigate(COMMAND_CENTER_ROUTE) },
       { group: 'session', id: 'command-palette', label: t.commandCenter.paletteTitle, onSelect: openCommandPalette },
+      ...REASONING_EFFORT_VALUES.map(effort => ({
+        group: 'system' as const,
+        id: `thinking-${effort}`,
+        label: `Thinking: ${reasoningEffortLabel(effort)}${currentReasoningEffort === effort ? ' ✓' : ''}`,
+        onSelect: () => chooseReasoning(effort),
+      })),
       { group: 'view', id: 'layout', label: t.titlebar.layoutEditor, onSelect: toggleLayoutEditMode },
       { group: 'view', id: 'hud', label: t.titlebar.enterHud, onSelect: () => toggleHud(hudTargetSessionId()) },
       {
@@ -179,7 +200,7 @@ export function MobileBehaviors() {
       },
       { group: 'system', id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
     ],
-    [hapticsMuted, mobileDisplayScale.overall, mobileDisplayScale.text, navigate, notificationsSilenced, previewTabs.length, t],
+    [chooseReasoning, currentReasoningEffort, hapticsMuted, mobileDisplayScale.overall, mobileDisplayScale.text, navigate, notificationsSilenced, previewTabs.length, t],
   )
   const runContributedToolbarTool = useCallback(
     (tool: MobileToolbarContextAction) => {
