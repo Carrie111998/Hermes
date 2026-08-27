@@ -577,7 +577,10 @@ def test_handle_message_event_data_forwards_sender_when_admitted():
         (None, {}, False),
         ("true", {}, True),
         ("false", {}, False),
-        ("false", {"ignore_at_all": True}, True),
+        # Env wins over extra-config (documented bridge contract).
+        ("true", {"ignore_at_all": False}, True),
+        (None, {"ignore_at_all": True}, True),
+        (None, {"ignore_at_all": False}, False),
         ("TRUE", {}, False),
         ("1", {}, False),
     ],

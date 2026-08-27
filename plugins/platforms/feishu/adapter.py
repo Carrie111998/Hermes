@@ -1662,8 +1662,11 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            # Env wins over extra-config (matches the _apply_yaml_config
+            # bridge contract: "Env vars take precedence over YAML").
             ignore_at_all=_to_boolean(
-                extra.get("ignore_at_all", os.getenv("FEISHU_IGNORE_AT_ALL", "false"))
+                os.getenv("FEISHU_IGNORE_AT_ALL")
+                or str(extra.get("ignore_at_all", "false")).lower()
             ),
         )
 
@@ -4452,8 +4455,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _mentions_self(self, message: Any) -> bool:
         # @_all is Feishu's @everyone placeholder.
-        # When FEISHU_IGNORE_AT_ALL is set, @_all alone does not trigger
-        # the bot; an explicit bot mention is still required.
+        # When the ignore_at_all setting is enabled, @_all alone does not
+        # trigger the bot; an explicit bot mention is still required.
         raw_content = getattr(message, "content", "") or ""
         if not self._ignore_at_all and "@_all" in raw_content:
             return True
