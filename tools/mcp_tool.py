@@ -122,6 +122,13 @@ from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
 
+# The reserved key carrying the calling conversation's durable session id.
+#
+# Namespaced rather than bare so it cannot collide with a server's own metadata,
+# and stable because delegate-wave keys its watch registration off it: renaming
+# this silently returns the system to starting sessions nobody is watching.
+CALLER_SESSION_META_KEY = "io.delegate-wave/hermes-session-id"
+
 
 # Hard allocation ceiling for a single MCP text payload (chars). This is the
 # FIRST line of defense against a buggy or malicious MCP server returning
@@ -6046,6 +6053,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # THE CALLER'S IDENTITY, READ HERE AND NOWHERE ELSE.
+        #
+        # An MCP server that wants to call back into the conversation that asked
+        # it for something needs to know which conversation that was. That is
+        # transport context, not task input: a model should never be choosing --
+        # or mistyping, or forgetting -- its own return address. delegate-wave's
+        # session_start made it an optional argument, the model omitted it, and
+        # the work ran with nobody registered to be told it had finished.
+        #
+        # Read in THIS synchronous handler, before anything is scheduled onto the
+        # MCP background loop. The stdio subprocess is long-lived and shared
+        # across conversations, so its environment cannot carry a per-conversation
+        # id, and the loop it runs on does not inherit this turn's ContextVars --
+        # which is the precise problem gateway/session_context.py exists to solve.
+        # Captured into the closure, it stays bound to the turn that made the call.
+        from gateway.session_context import get_session_env
+
+        _caller_session_id = (get_session_env("HERMES_SESSION_ID") or "").strip()
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -6141,7 +6167,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    # Stamped onto every call, invisible to the model. `_meta` is
+                    # exactly what MCP reserves for information the client and
+                    # server need and the LLM should neither see nor generate.
+                    _meta = (
+                        {CALLER_SESSION_META_KEY: _caller_session_id}
+                        if _caller_session_id
+                        else None
+                    )
+                    _call_coro = server.session.call_tool(
+                        tool_name, arguments=args, meta=_meta
+                    )
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
