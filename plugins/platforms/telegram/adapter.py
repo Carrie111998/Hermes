@@ -7704,7 +7704,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _telegram_oversize_recovery_skill(self, event: MessageEvent) -> Optional[str]:
         """Resolve an authenticated, profile-scoped oversized-media skill route."""
-        source = event.source
+        source = getattr(event, "source", None)
         if source is None:
             return None
         route_chat_id = str(getattr(source, "chat_id", "") or "")
@@ -7756,13 +7756,18 @@ class TelegramAdapter(BasePlatformAdapter):
         max_bytes = int(getattr(self, "_max_doc_bytes", 20 * 1024 * 1024) or 20 * 1024 * 1024)
         file_size = getattr(source, "file_size", None)
         note = self._telegram_media_too_large_note(label, file_size, max_bytes)
-        event.metadata["telegram_media_recovery"] = {
-            "chat_id": str(getattr(event.source, "chat_id", "") or ""),
-            "message_id": str(event.message_id or ""),
-            "thread_id": str(getattr(event.source, "thread_id", "") or ""),
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        event_source = getattr(event, "source", None)
+        metadata["telegram_media_recovery"] = {
+            "chat_id": str(getattr(event_source, "chat_id", "") or ""),
+            "message_id": str(getattr(event, "message_id", "") or ""),
+            "thread_id": str(getattr(event_source, "thread_id", "") or ""),
             "sender_user_id": str(
-                event.metadata.get("telegram_transport_sender_user_id")
-                or getattr(event.source, "user_id", "")
+                metadata.get("telegram_transport_sender_user_id")
+                or getattr(event_source, "user_id", "")
                 or ""
             ),
             "media_label": label,
@@ -7774,8 +7779,10 @@ class TelegramAdapter(BasePlatformAdapter):
         original = (event.text or "").strip()
         if skill and not event.is_command():
             target = event.metadata["telegram_media_recovery"]
+            # The generated slash command is the sole activation path. Clear any
+            # topic/channel binding to avoid loading the same skill twice.
+            event.auto_skill = None
             event.metadata["preserve_command_args"] = True
-            event.auto_skill = skill
             event.text = (
                 f"/{skill} Recover the exact oversized Telegram {label} through the "
                 "configured canonical recovery path. The trusted transport target is "
