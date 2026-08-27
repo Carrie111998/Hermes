@@ -201,3 +201,127 @@ def test_ephemeral_port_zero_unaffected(tmp_path):
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_ready_sentinel_on_real_stdout_not_stderr(tmp_path):
+    """The READY sentinel must land on REAL stdout (fd 1), never stderr.
+
+    ``start_server`` imports ``tui_gateway.server`` (via
+    ``install_exit_flush_signal_handlers``), and that module's import does a
+    process-global ``sys.stdout = sys.stderr`` to reserve fd 1 for ACP JSON-RPC.
+    A plain ``print()`` of the sentinel would therefore land on stderr, and the
+    Desktop's port-announcement resolver — which reads ``child.stdout`` (fd 1)
+    only — would time out after 90s (the regression introduced by commit
+    6d4e851d80 "fix(serve): bounded flush-on-SIGTERM"). This test uses SEPARATE
+    stdout/stderr pipes (stderr is NOT merged into stdout) to catch that split.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    home = tmp_path / "hermes_home"
+    home.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    env.update(
+        HERMES_HOME=str(home),
+        HERMES_SERVE_HEADLESS="1",
+        PYTHONUNBUFFERED="1",
+    )
+    # No HERMES_DESKTOP: this asserts the sentinel reaches fd 1 for *any*
+    # serve consumer, not just desktop-spawned ones.
+    for k in ("HERMES_DESKTOP", "HERMES_PARENT_PID", "HERMES_PARENT_START_MARKER",
+              "HERMES_PARENT_NONCE"):
+        env.pop(k, None)
+    code = (
+        "from hermes_cli.web_server import start_server\n"
+        f"start_server(host='127.0.0.1', port={port}, open_browser=False, "
+        "headless=True)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,  # SEPARATE pipe — the Desktop reads stdout only
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        stdout_lines: list[str] = []
+        hit = threading.Event()
+
+        def _pump_stdout():
+            for line in proc.stdout:
+                stdout_lines.append(line)
+                if "HERMES_BACKEND_READY" in line:
+                    hit.set()
+                    return
+
+        def _drain_stderr():
+            # Keep the stderr pipe from filling and blocking the child.
+            for _ in proc.stderr:
+                pass
+
+        threading.Thread(target=_pump_stdout, daemon=True).start()
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+        hit.wait(120)
+        out = "".join(stdout_lines)
+        assert hit.is_set(), f"READY sentinel never reached stdout; got:\n{out}"
+        assert f"HERMES_BACKEND_READY port={port}" in out
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_port_in_use_sentinel_on_real_stdout(tmp_path):
+    """BACKEND_PORT_IN_USE sentinel must also reach REAL stdout (fd 1).
+
+    Same fd-1 contract as the READY sentinel: `_report_port_in_use` runs after
+    `tui_gateway.server`'s import has redirected ``sys.stdout`` to stderr, so a
+    plain ``print()`` would hide the conflict sentinel from the Desktop (which
+    reads ``child.stdout`` only). Uses SEPARATE pipes to catch the split.
+    """
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    try:
+        home = tmp_path / "hermes_home"
+        home.mkdir(exist_ok=True)
+        env = dict(os.environ)
+        env.update(
+            HERMES_HOME=str(home),
+            HERMES_SERVE_HEADLESS="1",
+            PYTHONUNBUFFERED="1",
+        )
+        for k in ("HERMES_DESKTOP", "HERMES_PARENT_PID", "HERMES_PARENT_START_MARKER",
+                  "HERMES_PARENT_NONCE"):
+            env.pop(k, None)
+        code = (
+            "from hermes_cli.web_server import start_server\n"
+            f"start_server(host='127.0.0.1', port={port}, open_browser=False, "
+            "headless=True)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,  # SEPARATE pipe
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None and proc.stderr is not None
+            # Process self-exits 75 after reporting the conflict.
+            stdout, _stderr = proc.communicate(timeout=180)
+            assert proc.returncode == 75, f"exit={proc.returncode}\n{stdout}"
+            assert f"BACKEND_PORT_IN_USE port={port}" in stdout
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    finally:
+        holder.close()

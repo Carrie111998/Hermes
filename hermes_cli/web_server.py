@@ -19503,7 +19503,15 @@ def _port_bind_conflict(host: str, port: int) -> bool:
 
 def _report_port_in_use(host: str, port: int) -> None:
     """Print the machine sentinel + a human hint naming likely holders."""
-    print(_PORT_IN_USE_SENTINEL.format(port=port), flush=True)
+    # The sentinel is machine-readable and parsed from REAL stdout (fd 1) by the
+    # Desktop and scripts — same fd-1 contract as the READY sentinel. Inside
+    # start_server, tui_gateway.server's import has redirected sys.stdout to
+    # stderr (ACP fd-1 reservation), so a plain print() would hide it there.
+    print(
+        _PORT_IN_USE_SENTINEL.format(port=port),
+        file=(sys.__stdout__ or sys.stdout),
+        flush=True,
+    )
     print(
         f"  Port {port} on {host} is already in use — likely another "
         "'hermes serve' / 'hermes dashboard' backend or the Hermes gateway. "
@@ -19874,7 +19882,22 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            # The port sentinel must reach its consumer on the REAL stdout (fd 1).
+            # `from tui_gateway.server import install_exit_flush_signal_handlers`
+            # above triggers tui_gateway/server.py's process-global
+            # `sys.stdout = sys.stderr` (it reserves fd 1 for ACP JSON-RPC). That
+            # redirect also captures this serve/dashboard process, so a plain
+            # print() would land on stderr — but the Desktop's port-announcement
+            # resolver only watches child.stdout (fd 1) and would time out
+            # (regression introduced by 6d4e851d80 "fix(serve): bounded
+            # flush-on-SIGTERM"). start_server never runs under `hermes acp`, so
+            # writing to sys.__stdout__ (the interpreter's un-redirected fd-1
+            # wrapper) is safe here and never leaks into a JSON-RPC stream.
+            print(
+                f"{ready_token} port={actual_port}",
+                file=(sys.__stdout__ or sys.stdout),
+                flush=True,
+            )
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
