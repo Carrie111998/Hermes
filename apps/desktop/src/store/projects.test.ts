@@ -4,7 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
-import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
+import {
+  $connection,
+  $currentCwd,
+  $selectedStoredSessionId,
+  $sessions,
+  applyConfiguredDefaultProjectDir
+} from '@/store/session'
 
 import {
   $activeProjectId,
@@ -171,6 +177,48 @@ describe('projects RPC profile forwarding', () => {
 
     expect(request).not.toHaveBeenCalled()
     setShowAllProfiles(false)
+  })
+})
+
+describe('project tree startup cache', () => {
+  afterEach(() => {
+    $connection.set(null)
+    $activeGatewayProfile.set('default')
+    window.localStorage.clear()
+  })
+
+  it('paints the matching connection and profile before live reconciliation finishes', async () => {
+    const cached = { id: 'cached', label: 'Cached', path: '/cached', repos: [], sessionCount: 1 }
+    const live = { id: 'live', label: 'Live', path: '/live', repos: [], sessionCount: 2 }
+    const response = deferred<{ active_id: string; projects: SidebarProjectTree[]; scoped_session_ids: string[] }>()
+    const request = vi.fn(() => response.promise)
+
+    $connection.set({ connectionId: 'connection-a' } as never)
+    $activeGatewayProfile.set('profile-a')
+    $projectTree.set([])
+    $activeProjectId.set(null)
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    window.localStorage.setItem(
+      'hermes.desktop.projectTreeCache.v1',
+      JSON.stringify({
+        [JSON.stringify(['connection-a', 'profile-a'])]: {
+          activeId: 'cached',
+          projects: [cached],
+          savedAt: Date.now()
+        }
+      })
+    )
+
+    const pending = refreshProjectTree()
+
+    expect($projectTree.get().map(project => project.id)).toEqual(['cached'])
+    expect($activeProjectId.get()).toBe('cached')
+
+    response.resolve({ active_id: 'live', projects: [live], scoped_session_ids: [] })
+    await pending
+
+    expect($projectTree.get().map(project => project.id)).toEqual(['live'])
+    expect($activeProjectId.get()).toBe('live')
   })
 })
 

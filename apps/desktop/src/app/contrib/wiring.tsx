@@ -309,7 +309,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   )
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
-    useSessionListActions({ profileScope })
+    useSessionListActions({ activeConnectionId, profileScope })
 
   const updateActiveSessionRuntimeInfo = useCallback(
     (info: { branch?: string; cwd?: string }) => {

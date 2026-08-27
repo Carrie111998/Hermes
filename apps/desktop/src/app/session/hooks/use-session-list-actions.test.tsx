@@ -28,6 +28,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { writeSessionListSnapshot } from '@/store/session-list-cache'
 
 import { deferred } from '../../../test/deferred'
 
@@ -103,6 +104,7 @@ vi.mock('@/store/projects', () => ({
 }))
 
 beforeEach(() => {
+  window.localStorage.clear()
   gatewayScope.epoch = 0
   getCronJobs.mockReset()
   getCronJobs.mockResolvedValue([])
@@ -121,6 +123,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  window.localStorage.clear()
   setCronJobs([])
   setSessions([])
   setCronSessions([])
@@ -130,6 +133,52 @@ afterEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
+})
+
+describe('persisted session-list fast paint', () => {
+  it('hydrates the matching connection/profile before the live refresh', () => {
+    writeSessionListSnapshot(
+      { connectionId: 'connection-a', profile: 'profile-a' },
+      {
+        cron: [row('cached-cron', { profile: 'profile-a', source: 'cron' })],
+        messaging: [row('cached-message', { profile: 'profile-a', source: 'signal' })],
+        messagingTruncated: true,
+        profilesTruncated: { 'profile-a': true },
+        profilesUsage: { 'profile-a': { cost_usd: 3, tokens: 30 } },
+        recents: [row('cached-recent', { profile: 'profile-a' })]
+      }
+    )
+
+    renderHook(() => useSessionListActions({ activeConnectionId: 'connection-a', profileScope: 'profile-a' }))
+
+    expect($sessions.get().map(session => session.id)).toEqual(['cached-recent'])
+    expect($cronSessions.get().map(session => session.id)).toEqual(['cached-cron'])
+    expect($messagingSessions.get().map(session => session.id)).toEqual(['cached-message'])
+    expect($messagingTruncated.get()).toBe(true)
+    expect($sessionProfilesTruncated.get()).toEqual({ 'profile-a': true })
+    expect($sessionProfilesUsage.get()).toEqual({ 'profile-a': { cost_usd: 3, tokens: 30 } })
+    expect($sessionsLoading.get()).toBe(false)
+    expect(listSidebarSessions).not.toHaveBeenCalled()
+  })
+
+  it('does not paint another connection or profile cache', () => {
+    writeSessionListSnapshot(
+      { connectionId: 'connection-b', profile: 'profile-a' },
+      {
+        cron: [],
+        messaging: [],
+        messagingTruncated: false,
+        profilesTruncated: {},
+        profilesUsage: {},
+        recents: [row('wrong-owner', { profile: 'profile-a' })]
+      }
+    )
+
+    renderHook(() => useSessionListActions({ activeConnectionId: 'connection-a', profileScope: 'profile-a' }))
+
+    expect($sessions.get()).toEqual([])
+    expect($sessionsLoading.get()).toBe(false)
+  })
 })
 
 describe('refreshSessions identity + loading hygiene', () => {

@@ -24,6 +24,13 @@ import {
   requestFreshSession
 } from '@/store/profile'
 import {
+  type ProjectTreeCacheScope,
+  projectTreeCacheScopeKey,
+  readProjectTreeSnapshot,
+  writeProjectTreeSnapshot
+} from '@/store/project-tree-cache'
+import {
+  $connection,
   $selectedStoredSessionId,
   $sessions,
   sessionMatchesStoredId,
@@ -46,6 +53,42 @@ export const $activeProjectId = atom<null | string>(null)
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
 export const $projectTreeLoading = atom(false)
+
+function currentProjectConnectionId(): string {
+  return $connection.get()?.connectionId?.trim() || 'local'
+}
+
+function currentProjectTreeCacheScope(): ProjectTreeCacheScope | null {
+  const profile = $profileScope.get() === ALL_PROFILES ? ALL_PROFILES : projectProfile()
+
+  return profile ? { connectionId: currentProjectConnectionId(), profile } : null
+}
+
+let paintedProjectTreeScopeKey: null | string = null
+
+function hydrateProjectTreeCache(scope: ProjectTreeCacheScope): void {
+  const key = projectTreeCacheScopeKey(scope)
+
+  if (paintedProjectTreeScopeKey === key) {
+    return
+  }
+
+  paintedProjectTreeScopeKey = key
+  const cached = readProjectTreeSnapshot(scope)
+
+  if (cached) {
+    $projectTree.set(cached.projects)
+    $activeProjectId.set(cached.activeId)
+  }
+}
+
+function keepCurrentProjectTreeAheadOfCache(): void {
+  const scope = currentProjectTreeCacheScope()
+
+  if (scope) {
+    paintedProjectTreeScopeKey = projectTreeCacheScopeKey(scope)
+  }
+}
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -379,12 +422,17 @@ function isRetryableProjectTreeReadError(error: unknown): boolean {
 }
 
 interface ActiveProjectsContext {
+  connectionId: string
   gateway: HermesGateway
   profile: string
 }
 
 function stillOnProjectsContext(context: ActiveProjectsContext): boolean {
-  return activeGateway() === context.gateway && projectProfile() === context.profile
+  return (
+    activeGateway() === context.gateway &&
+    currentProjectConnectionId() === context.connectionId &&
+    projectProfile() === context.profile
+  )
 }
 
 async function activeProjectsContext(): Promise<ActiveProjectsContext> {
@@ -404,7 +452,7 @@ async function activeProjectsContext(): Promise<ActiveProjectsContext> {
     throw new Error('Active Hermes profile changed while connecting')
   }
 
-  return { gateway, profile }
+  return { connectionId: currentProjectConnectionId(), gateway, profile }
 }
 
 function applyPayload(payload: ProjectsPayload): void {
@@ -457,10 +505,15 @@ const PROJECT_TREE_REQUEST_TIMEOUT_MS = 60_000
 
 let projectTreeRefreshGeneration = 0
 
-function applyProjectTreePayload(res: ProjectTreePayload): void {
+function applyProjectTreePayload(res: ProjectTreePayload, scope: ProjectTreeCacheScope): void {
   const scoped = new Set(res.scoped_session_ids ?? [])
   $projectTree.set(res.projects ?? [])
   $activeProjectId.set(res.active_id ?? null)
+  paintedProjectTreeScopeKey = projectTreeCacheScopeKey(scope)
+  writeProjectTreeSnapshot(scope, {
+    activeId: res.active_id ?? null,
+    projects: res.projects ?? []
+  })
   const tombstones = $removedSessionIds.get()
 
   if (tombstones.size) {
@@ -478,7 +531,9 @@ function applyProjectTreePayload(res: ProjectTreePayload): void {
 
 async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<void> {
   const generation = ++projectTreeRefreshGeneration
-  const { gateway, profile } = context
+  const { connectionId, gateway, profile } = context
+
+  hydrateProjectTreeCache({ connectionId, profile })
 
   if (activeGateway() === gateway) {
     $projectTreeLoading.set(true)
@@ -513,7 +568,7 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
       return
     }
 
-    applyProjectTreePayload(res)
+    applyProjectTreePayload(res, { connectionId, profile })
     markProjectsRpcSuccess()
   } catch (err) {
     if (generation === projectTreeRefreshGeneration && stillOnProjectsContext(context)) {
@@ -530,8 +585,14 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
 export async function refreshProjectTree(): Promise<void> {
+  const cacheScope = currentProjectTreeCacheScope()
+
+  if (cacheScope) {
+    hydrateProjectTreeCache(cacheScope)
+  }
+
   if ($profileScope.get() === ALL_PROFILES) {
-    await refreshProjectTreeAcrossProfiles()
+    await refreshProjectTreeAcrossProfiles(cacheScope)
 
     return
   }
@@ -547,7 +608,7 @@ export async function refreshProjectTree(): Promise<void> {
 // backend's own profile, so it can only ever describe a slice of this view;
 // the REST fan-out reads every profile's databases directly instead of asking
 // us to hold a backend open per profile just to draw lanes.
-async function refreshProjectTreeAcrossProfiles(): Promise<void> {
+async function refreshProjectTreeAcrossProfiles(cacheScope: ProjectTreeCacheScope | null): Promise<void> {
   const generation = ++projectTreeRefreshGeneration
   $projectTreeLoading.set(true)
 
@@ -563,7 +624,13 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
       return
     }
 
-    applyProjectTreePayload(res)
+    if (cacheScope) {
+      applyProjectTreePayload(res, cacheScope)
+    } else {
+      $projectTree.set(res.projects ?? [])
+      $activeProjectId.set(res.active_id ?? null)
+    }
+
     markProjectsRpcSuccess()
   } catch (err) {
     markProjectsRpcFailure(err)
@@ -898,6 +965,9 @@ async function persistOrRollback(snap: ProjectsSnapshot, write: () => Promise<vo
 }
 
 const reconcileProjects = (): void => {
+  // A mutation has already painted newer local state. Reconcile from the
+  // backend without first restoring an older persisted snapshot.
+  keepCurrentProjectTreeAheadOfCache()
   void refreshProjects()
   void refreshProjectTree()
 }

@@ -36,6 +36,11 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import {
+  readSessionListSnapshot,
+  sessionListCacheScopeKey,
+  writeSessionListSnapshot
+} from '@/store/session-list-cache'
 import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
@@ -94,30 +99,69 @@ function sessionsToKeep(scope?: string): Set<string> {
 }
 
 interface UseSessionListActionsArgs {
+  activeConnectionId?: null | string
   profileScope: string
 }
 
 /** Owns the sidebar's session-list fetching + paging: recents, cron runs/jobs,
  *  and the per-platform messaging slices. Returns the callbacks the controller
  *  wires into the sidebar and refresh effects. */
-export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
+export function useSessionListActions({ activeConnectionId, profileScope }: UseSessionListActionsArgs) {
+  const normalizedConnectionId = activeConnectionId ?? null
+  const activeConnectionIdRef = useRef(normalizedConnectionId)
   const profileScopeRef = useRef(profileScope)
+  const paintedCacheScopeRef = useRef<null | string>(null)
   const loadMoreMessagingRequestRef = useRef<Record<string, number>>({})
   const refreshMessagingSessionsRequestRef = useRef(0)
   const refreshSessionsRequestRef = useRef(0)
 
   useLayoutEffect(() => {
+    activeConnectionIdRef.current = normalizedConnectionId
     profileScopeRef.current = profileScope
-  }, [profileScope])
+
+    const profile = sidebarProfileForScope(profileScope)
+    const scope = { connectionId: normalizedConnectionId, profile }
+    const scopeKey = sessionListCacheScopeKey(scope)
+
+    if (paintedCacheScopeRef.current === scopeKey) {
+      return
+    }
+
+    paintedCacheScopeRef.current = scopeKey
+    // Requests started for the previous connection/profile are obsolete even
+    // when the gateway activation epoch has not advanced yet.
+    refreshSessionsRequestRef.current += 1
+    refreshMessagingSessionsRequestRef.current += 1
+
+    const cached = readSessionListSnapshot(scope)
+
+    // A cache hit replaces an empty cold renderer immediately. A miss is
+    // deliberately non-destructive because the context-switch owner may have
+    // already published newer state before this layout effect commits.
+    if (cached) {
+      setSessions(cached.recents)
+      setCronSessions(cached.cron)
+      setMessagingSessions(cached.messaging)
+      setMessagingPlatformTotals({})
+      setMessagingTruncated(cached.messagingTruncated)
+      setSessionProfilesTruncated(cached.profilesTruncated)
+      setSessionProfilesUsage(cached.profilesUsage)
+      setSessionsLoading(false)
+    }
+  }, [normalizedConnectionId, profileScope])
 
   /** Refresh the active profile's messaging-platform sidebar slice. */
   const refreshMessagingSessions = useCallback(async () => {
     const sessionProfile = sidebarProfileForScope(profileScope)
+    const requestConnectionId = normalizedConnectionId
     const activationEpoch = gatewayActivationEpoch()
 
     // A callback captured before a profile switch may still be queued by an
     // event subscription. Do not let it start a request against the old scope.
-    if (sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
+    if (
+      activeConnectionIdRef.current !== requestConnectionId ||
+      sidebarProfileForScope(profileScopeRef.current) !== sessionProfile
+    ) {
       return
     }
 
@@ -131,6 +175,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
       if (
         refreshMessagingSessionsRequestRef.current !== requestId ||
+        activeConnectionIdRef.current !== requestConnectionId ||
         sidebarProfileForScope(profileScopeRef.current) !== sessionProfile ||
         gatewayActivationEpoch() !== activationEpoch
       ) {
@@ -148,15 +193,19 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     } catch {
       // Non-fatal: the messaging sections just stay empty/stale.
     }
-  }, [profileScope])
+  }, [normalizedConnectionId, profileScope])
 
   /** Page one messaging platform without replacing another platform's rows. */
   const loadMoreMessagingForPlatform = useCallback(
     async (platform: string) => {
       const sessionProfile = sidebarProfileForScope(profileScope)
+      const requestConnectionId = normalizedConnectionId
       const activationEpoch = gatewayActivationEpoch()
 
-      if (sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
+      if (
+        activeConnectionIdRef.current !== requestConnectionId ||
+        sidebarProfileForScope(profileScopeRef.current) !== sessionProfile
+      ) {
         return
       }
 
@@ -188,6 +237,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
       if (
         loadMoreMessagingRequestRef.current[requestKey] !== requestId ||
+        activeConnectionIdRef.current !== requestConnectionId ||
         sidebarProfileForScope(profileScopeRef.current) !== sessionProfile ||
         gatewayActivationEpoch() !== activationEpoch
       ) {
@@ -205,14 +255,18 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
       setMessagingPlatformTotals(prev => ({ ...prev, [requestKey]: Math.max(total, incoming.length) }))
     },
-    [profileScope]
+    [normalizedConnectionId, profileScope]
   )
 
   /** Refresh cron jobs only while the profile that requested them remains active. */
   const refreshCronJobs = useCallback(async () => {
     const sessionProfile = sidebarProfileForScope(profileScope)
+    const requestConnectionId = normalizedConnectionId
 
-    if (sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
+    if (
+      activeConnectionIdRef.current !== requestConnectionId ||
+      sidebarProfileForScope(profileScopeRef.current) !== sessionProfile
+    ) {
       return
     }
 
@@ -221,15 +275,20 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     } catch {
       // Non-fatal: the cron section just keeps its last-known jobs.
     }
-  }, [profileScope])
+  }, [normalizedConnectionId, profileScope])
 
   /** Refresh every sidebar session slice without committing an obsolete profile response. */
   const refreshSessions = useCallback(
     async (shouldPublish: () => boolean = () => true) => {
       const sessionProfile = sidebarProfileForScope(profileScope)
+      const requestConnectionId = normalizedConnectionId
       const activationEpoch = gatewayActivationEpoch()
 
-      if (!shouldPublish() || sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
+      if (
+        !shouldPublish() ||
+        activeConnectionIdRef.current !== requestConnectionId ||
+        sidebarProfileForScope(profileScopeRef.current) !== sessionProfile
+      ) {
         return
       }
 
@@ -273,6 +332,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         if (
           shouldPublish() &&
           refreshSessionsRequestRef.current === requestId &&
+          activeConnectionIdRef.current === requestConnectionId &&
           sidebarProfileForScope(profileScopeRef.current) === sessionProfile &&
           gatewayActivationEpoch() === activationEpoch
         ) {
@@ -332,6 +392,21 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
           setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
           // Hit the cap → at least one platform may have more on disk than loaded.
           setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+
+          // Store exactly what the sidebar accepted after tombstones, source
+          // filtering, and active-row preservation. A later launch can paint
+          // this bounded snapshot while the same authoritative request runs.
+          writeSessionListSnapshot(
+            { connectionId: requestConnectionId, profile: sessionProfile },
+            {
+              cron: result.cron.sessions,
+              messaging: messagingRows,
+              messagingTruncated: result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT,
+              profilesTruncated: result.recents.profiles_truncated ?? {},
+              profilesUsage: result.recents.profiles_usage ?? {},
+              recents: $sessions.get()
+            }
+          )
         }
       } finally {
         // Request identity preserves the zero-argument refresh contract across a
@@ -347,7 +422,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         void refreshCronJobs()
       }
     },
-    [profileScope, refreshCronJobs]
+    [normalizedConnectionId, profileScope, refreshCronJobs]
   )
 
   const loadMoreSessions = useCallback(async () => {
