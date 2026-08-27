@@ -27,7 +27,7 @@ import {
   setMessages,
   setSessions
 } from '@/store/session'
-import { dropSessionState, publishSessionState } from '@/store/session-states'
+import { $sessionTiles, dropSessionState, publishSessionState } from '@/store/session-states'
 import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -1999,6 +1999,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
     $connection.set(null)
+    $sessionTiles.set([])
     vi.mocked(requestGatewayForAgent).mockReset()
     vi.restoreAllMocks()
   })
@@ -2045,6 +2046,10 @@ describe('usePromptActions submit / queue drain semantics', () => {
       sessionInfo({ connection_id: ownerB.connectionId, id: sharedStoredId, profile: ownerB.profile })
     ])
     enqueueQueuedPrompt(ownerBQueueKey, queued)
+    $sessionTiles.set([
+      { ownerRoute: ownerA, runtimeId: 'rt-owner-a', storedSessionId: sharedStoredId },
+      { ownerRoute: ownerB, runtimeId: 'rt-owner-b', storedSessionId: sharedStoredId }
+    ])
     publishSessionState('rt-owner-a', createClientSessionState(sharedStoredId))
     publishSessionState('rt-owner-b', createClientSessionState(sharedStoredId))
 
@@ -2078,6 +2083,93 @@ describe('usePromptActions submit / queue drain semantics', () => {
     dropSessionState('rt-owner-a')
     dropSessionState('rt-owner-b')
   })
+
+  it.each([
+    [
+      'send',
+      '/audit-only',
+      { message: 'expanded queued send', type: 'send' },
+      'expanded queued send'
+    ],
+    [
+      'skill',
+      '/work stay on owner B',
+      {
+        display: '/work stay on owner B',
+        message: 'expanded queued skill',
+        name: 'work',
+        type: 'skill'
+      },
+      'expanded queued skill'
+    ]
+  ] as const)(
+    'accepts a queued %s slash from its exact duplicate-owner tile despite the bare runtime map collision',
+    async (_kind, command, dispatch, expandedText) => {
+      const ownerA = { connectionId: 'source-a', profile: 'worker' }
+      const ownerB = { connectionId: 'source-b', profile: 'worker' }
+      const sharedStoredId = 'stored-shared'
+      const ownerBQueueKey = encodeComposerStorageScopeKey(ownerB, sharedStoredId)
+
+      setSessions([
+        sessionInfo({ connection_id: ownerA.connectionId, id: sharedStoredId, profile: ownerA.profile }),
+        sessionInfo({ connection_id: ownerB.connectionId, id: sharedStoredId, profile: ownerB.profile })
+      ])
+      $sessionTiles.set([
+        { ownerRoute: ownerA, runtimeId: 'rt-owner-a', storedSessionId: sharedStoredId },
+        { ownerRoute: ownerB, runtimeId: 'rt-owner-b', storedSessionId: sharedStoredId }
+      ])
+      enqueueQueuedPrompt(ownerBQueueKey, { attachments: [], text: command })
+      publishSessionState('rt-owner-a', createClientSessionState(sharedStoredId))
+      publishSessionState('rt-owner-b', createClientSessionState(sharedStoredId))
+
+      const ambientRequest = vi.fn(async () => ({}) as never)
+      vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+        if (method === 'slash.exec') {
+          return dispatch as never
+        }
+
+        return {} as never
+      })
+
+      let handle: HarnessHandle | null = null
+      await actRender(
+        <Harness
+          activeSessionId={null}
+          getRuntimeIdForStoredSession={() => 'rt-owner-a'}
+          onReady={h => (handle = h)}
+          refreshSessions={async () => undefined}
+          requestGateway={ambientRequest}
+          storedSessionId={null}
+        />
+      )
+
+      await expect(
+        handle!.submitText(command, {
+          composerStorageScope: ownerBQueueKey,
+          fromQueue: true,
+          sessionId: 'rt-owner-b',
+          storedSessionId: sharedStoredId
+        })
+      ).resolves.toBe(true)
+
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(ownerB.connectionId, ownerB.profile, 'slash.exec', {
+        command: command.replace(/^\/+/, ''),
+        session_id: 'rt-owner-b'
+      })
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(
+        ownerB.connectionId,
+        ownerB.profile,
+        'prompt.submit',
+        expect.objectContaining({ queued: true, session_id: 'rt-owner-b', text: expandedText }),
+        1_800_000,
+        undefined
+      )
+      expect(ambientRequest).not.toHaveBeenCalled()
+
+      dropSessionState('rt-owner-a')
+      dropSessionState('rt-owner-b')
+    }
+  )
 
   it('keeps a queued slash intact when its target becomes busy before kickoff', async () => {
     const owner = { connectionId: 'source-a', profile: 'worker' }

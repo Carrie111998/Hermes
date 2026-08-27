@@ -44,7 +44,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import { requestForSessionProfile } from '@/store/session-request-router'
-import { $sessionStates } from '@/store/session-states'
+import { $sessionStates, runtimeIdForExactSessionTile } from '@/store/session-states'
 import {
   applyWakeStartResult,
   applyWakeStatus,
@@ -211,13 +211,22 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         return false
       }
 
-      if (
-        options?.fromQueue &&
-        options.sessionId &&
-        options.storedSessionId &&
-        getRuntimeIdForStoredSession(options.storedSessionId) !== options.sessionId
-      ) {
-        return false
+      if (options?.fromQueue && options.sessionId && options.storedSessionId) {
+        // Canonical queue identity names an exact owner. The legacy bare
+        // stored→runtime map cannot: duplicate sources may expose the same
+        // durable id, and whichever binding wrote last would falsely reject
+        // the other owner's live tile forever. Only an exact owner-qualified
+        // tile binding can contradict this explicit target. An unbound/missing
+        // exact tile is not proof of mismatch, so the caller's explicit runtime
+        // remains authoritative (resolveTargetSessionId's highest-trust rung).
+        const boundRuntimeId =
+          storageScope?.format === 'canonical'
+            ? runtimeIdForExactSessionTile(options.storedSessionId, storageScope.owner)
+            : getRuntimeIdForStoredSession(options.storedSessionId)
+
+        if (boundRuntimeId && boundRuntimeId !== options.sessionId) {
+          return false
+        }
       }
 
       const requestGateway: GatewayRequest =

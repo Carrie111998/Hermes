@@ -37,7 +37,7 @@ import {
   touchSessionActivity
 } from '@/store/session'
 import { requestForSessionProfile, type SessionOwnerRoute } from '@/store/session-request-router'
-import { $sessionStates } from '@/store/session-states'
+import { $sessionStates, runtimeIdForExactSessionTile } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -257,6 +257,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
       )
 
+      const submittedStorageScopeKey = options?.composerStorageScope
+
+      const submittedStorageScope = submittedStorageScopeKey
+        ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
+        : null
+
       let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
 
       // A QUEUED runtime id is authoritative ONLY while it still belongs to its
@@ -286,10 +292,25 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         options.storedSessionId &&
         options.storedSessionId !== options.sessionId
       ) {
-        const boundRuntimeId = getRuntimeIdForStoredSession(options.storedSessionId)
+        if (submittedStorageScope?.format === 'canonical') {
+          // Canonical scope is owner-qualified; the bare stored-id cache is
+          // not. Trust the explicit tile runtime unless that exact owner's tile
+          // has a different live binding. Missing/unbound is unknown, not a
+          // mismatch, and must not retarget an owner-B kickoff onto owner A.
+          const exactRuntimeId = runtimeIdForExactSessionTile(
+            options.storedSessionId,
+            submittedStorageScope.owner
+          )
 
-        if (boundRuntimeId !== options.sessionId) {
-          sessionId = boundRuntimeId
+          if (exactRuntimeId && exactRuntimeId !== options.sessionId) {
+            sessionId = exactRuntimeId
+          }
+        } else {
+          const boundRuntimeId = getRuntimeIdForStoredSession(options.storedSessionId)
+
+          if (boundRuntimeId !== options.sessionId) {
+            sessionId = boundRuntimeId
+          }
         }
       }
 
@@ -301,12 +322,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const startingActiveSessionId = activeSessionIdRef.current
       const selectedStoredSessionId = selectedStoredSessionIdRef.current
       const routedStoredSessionId = getRoutedStoredSessionId()
-
-      const submittedStorageScopeKey = options?.composerStorageScope
-
-      const submittedStorageScope = submittedStorageScopeKey
-        ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
-        : null
 
       const submittedOwner = submittedStorageScope?.format === 'canonical' ? submittedStorageScope.owner : undefined
 

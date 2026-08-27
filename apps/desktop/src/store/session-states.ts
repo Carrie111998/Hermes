@@ -1080,6 +1080,19 @@ export function sessionTileOwnerRoute(
   return tileForIdentity(tiles, identity)?.ownerRoute
 }
 
+/** Runtime bound to one exact owner-qualified tile. `undefined` means that
+ * owner has no tile; `null` means the tile exists but is not currently bound.
+ * Keep those states distinct so callers never fall back to an ambiguous bare
+ * stored-id map merely because an exact tile is between bindings. */
+export function runtimeIdForExactSessionTile(
+  storedSessionId: string,
+  ownerRoute: SessionOwnerRoute
+): string | null | undefined {
+  const tile = tileForIdentity($sessionTiles.get(), sessionTileIdentity(storedSessionId, ownerRoute))
+
+  return tile ? (tile.runtimeId ?? null) : undefined
+}
+
 /**
  * Gateway keep-set scopes for currently open tiles. Bot chats (and any other
  * owner-routed tile) hold a secondary socket even while chrome stays on the
