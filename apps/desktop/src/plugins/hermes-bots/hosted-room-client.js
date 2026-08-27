@@ -315,7 +315,7 @@ export function resolveAutonomousRoomPlan(
     return (
       roomLink?.enabled === true &&
       roomLink?.catalog?.persistentProcess === true &&
-      roomLink?.catalog?.protocolVersions?.includes(1) &&
+      roomLink?.catalog?.protocolVersions?.includes(ROOM_LINK_PROTOCOL_VERSION) &&
       roomLink?.catalog?.linkModes?.includes('direct')
     )
   })
@@ -345,7 +345,7 @@ export function resolveAutonomousRoomPlan(
       roomLink?.catalog?.text !== true ||
       !roomLink?.catalog?.installationId ||
       !roomLink?.catalog?.digest ||
-      !roomLink?.catalog?.protocolVersions?.includes(1) ||
+      !roomLink?.catalog?.protocolVersions?.includes(ROOM_LINK_PROTOCOL_VERSION) ||
       !roomLink?.catalog?.linkModes?.includes('direct')
     )
   })

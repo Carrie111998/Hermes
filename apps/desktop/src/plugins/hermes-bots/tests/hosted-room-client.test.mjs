@@ -25,37 +25,43 @@ const protocolFixture = JSON.parse(
 test('RoomLink client accepts the backend v2 catalog and rejects unpublished v1', () => {
   assert.equal(ROOM_LINK_PROTOCOL_VERSION, protocolFixture.protocol_version)
 
-  const capability = classifyHostedRoomCapability({
+  const capability = (installationId, digest) => classifyHostedRoomCapability({
     driver: true,
     persistent_process: true,
-    authority_gateway_id: 'install:peer',
+    authority_gateway_id: installationId,
     room_link: {
       enabled: true,
       endpoint: { available: true, url: 'https://peer.example.test' },
-      catalog: protocolFixture.catalog
+      catalog: {
+        ...protocolFixture.catalog,
+        installation_id: installationId,
+        catalog_digest: digest
+      }
     }
   })
+  const homeCapability = capability('install:home', 'a'.repeat(64))
+  const peerCapability = capability('install:peer', protocolFixture.catalog.catalog_digest)
   const members = [
     { name: 'home', connectionId: 'home', sourceScoped: true },
     { name: 'peer', connectionId: 'peer', sourceScoped: true }
   ]
   const plan = resolveAutonomousRoomPlan(members, {
     activeConnectionId: 'home',
-    capabilities: { home: capability, peer: capability }
+    capabilities: { home: homeCapability, peer: peerCapability }
   })
 
   assert.equal(plan.kind, 'multi-gateway')
   const v1 = {
-    ...capability,
+    ...peerCapability,
     roomLink: {
-      ...capability.roomLink,
-      catalog: { ...capability.roomLink.catalog, protocolVersions: [1] }
+      ...peerCapability.roomLink,
+      catalog: { ...peerCapability.roomLink.catalog, protocolVersions: [1] }
     }
   }
   assert.equal(
     resolveAutonomousRoomPlan(members, {
       activeConnectionId: 'home',
-      capabilities: { home: capability, peer: v1 }
+      capabilities: { home: homeCapability, peer: v1 }
     }).reason,
     'remote-needs-setup'
   )
@@ -144,7 +150,7 @@ test('capability classification distinguishes old, disabled, transient, and driv
           profile: 'default',
           catalog: {
             installation_id: 'install:stable-home',
-            protocol_versions: [1],
+            protocol_versions: [ROOM_LINK_PROTOCOL_VERSION],
             link_modes: ['direct', 'pull'],
             persistent_process: true,
             text: true,
@@ -244,7 +250,7 @@ test('autonomous room planning chooses a persistent home and verified remote cat
       profile: 'default',
       catalog: {
         installation_id: 'install:home',
-        protocol_versions: [1],
+        protocol_versions: [ROOM_LINK_PROTOCOL_VERSION],
         link_modes: ['direct'],
         persistent_process: true,
         text: true,
@@ -262,7 +268,7 @@ test('autonomous room planning chooses a persistent home and verified remote cat
       profile: 'default',
       catalog: {
         installation_id: 'install:peer',
-        protocol_versions: [1],
+        protocol_versions: [ROOM_LINK_PROTOCOL_VERSION],
         link_modes: ['direct', 'pull'],
         persistent_process: true,
         text: true,
