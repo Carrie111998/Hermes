@@ -673,9 +673,30 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     in-flight run (no outcome yet) doesn't break the trailing crash scan,
     so a retried card kept showing "crashed Nx" over an active run. The
     banner re-fires if the new attempt also crashes.
+
+    An explicit ``unblocked`` event is also a recovery boundary. It resets
+    the dispatcher's retry counter and records an operator's decision that
+    the prior failure class has been repaired. The old runs remain valuable
+    history, but they must not keep an alert visible while the replacement
+    attempt is pending. A later crash still re-enables the diagnostic.
     """
     if _task_field(task, "status") in ("done", "archived", "running"):
         return []
+    latest_crash_at = max(
+        (
+            int(_task_field(run, "ended_at", 0) or _task_field(run, "started_at", 0) or 0)
+            for run in runs
+            if _task_field(run, "outcome") == "crashed"
+        ),
+        default=0,
+    )
+    if latest_crash_at:
+        latest_unblock_at = max(
+            (_event_ts(event) for event in events if _event_kind(event) == "unblocked"),
+            default=0,
+        )
+        if latest_unblock_at >= latest_crash_at:
+            return []
     failure_threshold = int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),
