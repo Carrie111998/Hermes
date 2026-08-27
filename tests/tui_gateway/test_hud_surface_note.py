@@ -86,6 +86,14 @@ class TestNoteContents:
 
         assert "annotate_screen" in note
         assert "computer_use" not in note
+        assert "chart" in note
+        assert "180" in note
+
+    def test_chart_offer_needs_the_annotation_tool(self):
+        note = hud_surface_note({"read_window_below"})
+
+        assert "chart" not in note
+        assert "annotate_screen" not in note
 
     def test_subtitle_offer_needs_the_subtitle_tool(self):
         note = hud_surface_note({"read_window_below", "annotate_screen"})

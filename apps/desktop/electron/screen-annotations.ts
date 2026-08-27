@@ -40,10 +40,14 @@ const DEFAULT_COLOR: AnnotationColor = 'red'
  *  callers that replace shapes rapidly (live subtitles) need text that sits
  *  still. `fill` turns a rect from an outline into an opaque cover; it is not
  *  reachable from the agent schema — covering content is the subtitle
- *  channel's job, pointing at it is the agent's. */
+ *  channel's job, pointing at it is the agent's. `dashed` is the agent's
+ *  weaker-structure stroke (projected levels, the far side of a channel). */
+export type AnnotationPoint = { x: number; y: number }
+
 export type MappedAnnotationShape =
   | {
       color: AnnotationColor
+      dashed?: boolean
       kind: 'arrow' | 'line'
       fromX: number
       fromY: number
@@ -56,6 +60,14 @@ export type MappedAnnotationShape =
   | { color: AnnotationColor; fontSize?: number; kind: 'label'; steady?: boolean; text: string; x: number; y: number }
   | {
       color: AnnotationColor
+      dashed?: boolean
+      kind: 'polyline'
+      label?: string
+      points: AnnotationPoint[]
+      steady?: boolean
+    }
+  | {
+      color: AnnotationColor
       fill?: boolean
       height: number
       kind: 'rect'
@@ -66,11 +78,13 @@ export type MappedAnnotationShape =
       y: number
     }
 
-// Auto-expiry bounds. The default outlives a glance but not a lunch break; the
-// clamp keeps a typo'd ttl from parking marks on the screen for a day.
+// Auto-expiry bounds. The default is a glance (chess move, which button);
+// chart and diagram analysis needs to sit while the user reads it. The
+// ceiling is 15 minutes — long enough to study, short enough a forgotten
+// overlay cannot park on the display until logout.
 export const ANNOTATION_TTL_DEFAULT_S = 30
 export const ANNOTATION_TTL_MIN_S = 3
-export const ANNOTATION_TTL_MAX_S = 300
+export const ANNOTATION_TTL_MAX_S = 900
 
 export function clampAnnotationTtlSeconds(raw: unknown): number {
   const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : ANNOTATION_TTL_DEFAULT_S
@@ -122,6 +136,31 @@ export function annotationShapeBounds(shape: MappedAnnotationShape): AnnotationB
     return { height, width, x: shape.x - width / 2, y: shape.y - size }
   }
 
+  if (shape.kind === 'polyline') {
+    if (shape.points.length === 0) {
+      return null
+    }
+
+    let left = Infinity
+    let top = Infinity
+    let right = -Infinity
+    let bottom = -Infinity
+
+    for (const point of shape.points) {
+      left = Math.min(left, point.x)
+      top = Math.min(top, point.y)
+      right = Math.max(right, point.x)
+      bottom = Math.max(bottom, point.y)
+    }
+
+    return {
+      height: Math.max(1, bottom - top),
+      width: Math.max(1, right - left),
+      x: left,
+      y: top
+    }
+  }
+
   const x = Math.min(shape.fromX, shape.toX)
   const y = Math.min(shape.fromY, shape.toY)
 
@@ -163,6 +202,10 @@ export function offsetAnnotationShapes(shapes: MappedAnnotationShape[], dx: numb
   return shapes.map(shape => {
     if (shape.kind === 'rect' || shape.kind === 'circle' || shape.kind === 'label') {
       return { ...shape, x: shape.x + dx, y: shape.y + dy }
+    }
+
+    if (shape.kind === 'polyline') {
+      return { ...shape, points: shape.points.map(point => ({ x: point.x + dx, y: point.y + dy })) }
     }
 
     return {
@@ -279,12 +322,14 @@ export function resolveAnnotationWindow(
 
 interface RawShape {
   color?: unknown
+  dashed?: unknown
   font_size?: unknown
   from_x?: unknown
   from_y?: unknown
   height?: unknown
   kind?: unknown
   label?: unknown
+  points?: unknown
   radius?: unknown
   text?: unknown
   to_x?: unknown
@@ -311,11 +356,14 @@ const asCaption = (value: unknown): string | undefined => {
   return text ? text.slice(0, MAX_TEXT_CHARS) : undefined
 }
 
+const asDashed = (value: unknown): true | undefined => (value === true ? true : undefined)
+
 // Visibility floors, in DIP. A sub-pixel circle or rect is a draw that
 // happened but cannot be seen — worse than an error.
 const MIN_CIRCLE_RADIUS = 12
 const DEFAULT_CIRCLE_RADIUS = 36
 const MIN_RECT_SIZE = 8
+const MAX_POLYLINE_POINTS = 24
 
 // Label font-size bounds, in DIP after frame→screen scaling. The floor keeps a
 // tiny-frame coordinate space from producing unreadable text; the ceiling keeps
@@ -422,14 +470,55 @@ export function mapAnnotationShapes(
         continue
       }
 
+      const dashed = asDashed(shape.dashed)
+
       shapes.push({
         color,
+        ...(dashed ? { dashed } : {}),
         fromX: localX(fromX),
         fromY: localY(fromY),
         kind: shape.kind,
         label,
         toX: localX(toX),
         toY: localY(toY)
+      })
+
+      continue
+    }
+
+    if (shape.kind === 'polyline') {
+      const rawPoints = Array.isArray(shape.points) ? shape.points : []
+      const points: AnnotationPoint[] = []
+      let broken = false
+
+      for (const rawPoint of rawPoints) {
+        const point = (rawPoint ?? {}) as { x?: unknown; y?: unknown }
+        const x = asNumber(point.x)
+        const y = asNumber(point.y)
+
+        if (x === null || y === null) {
+          broken = true
+
+          break
+        }
+
+        points.push({ x: localX(x), y: localY(y) })
+      }
+
+      if (broken || points.length < 2 || points.length > MAX_POLYLINE_POINTS) {
+        skipped += 1
+
+        continue
+      }
+
+      const dashed = asDashed(shape.dashed)
+
+      shapes.push({
+        color,
+        ...(dashed ? { dashed } : {}),
+        kind: 'polyline',
+        label,
+        points
       })
 
       continue

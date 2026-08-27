@@ -856,10 +856,12 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
             )
     if "annotate_screen" in names:
         sentences.append(
-            "When they ask where something is or what to do next in that "
-            "app, annotate_screen draws the answer straight onto their "
-            "screen — a red circle on the piece, an arrow to the square — "
-            "which lands better than prose coordinates."
+            "When they ask where something is, what to do next, or to read a "
+            "chart or diagram in that app, annotate_screen draws the answer "
+            "onto their screen — a circle on the piece, a polyline along a "
+            "trend, a label on a level — which lands better than prose. "
+            "Chart and diagram marks should stay up long enough to read "
+            "(ttl_seconds around 180)."
         )
     if "subtitle_overlay" in names:
         sentences.append(

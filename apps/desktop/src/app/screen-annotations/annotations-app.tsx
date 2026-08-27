@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import {
   SCREEN_ANNOTATION_HEX,
   type ScreenAnnotationColor,
+  type ScreenAnnotationPolyline,
   type ScreenAnnotationShape,
   type ScreenAnnotationStroke
 } from './shapes'
@@ -15,6 +16,7 @@ const HALO_WIDTH = 8
 const ARROW_HEAD_LENGTH = 16
 const LABEL_FONT_SIZE = 15
 const LABEL_OFFSET = 10
+const DASH_ARRAY = '10 8'
 
 const hexFor = (color: ScreenAnnotationColor): string => SCREEN_ANNOTATION_HEX[color] ?? SCREEN_ANNOTATION_HEX.red
 
@@ -78,6 +80,7 @@ function StrokeShape({ shape }: { shape: ScreenAnnotationStroke }) {
   const halo = haloFor(shape.color)
   const angle = Math.atan2(shape.toY - shape.fromY, shape.toX - shape.fromX)
   const hasHead = shape.kind === 'arrow'
+  const dash = shape.dashed ? DASH_ARRAY : undefined
 
   // Shorten the shaft so it does not poke through the head's tip.
   const shaftToX = hasHead ? shape.toX - Math.cos(angle) * (ARROW_HEAD_LENGTH * 0.6) : shape.toX
@@ -98,6 +101,7 @@ function StrokeShape({ shape }: { shape: ScreenAnnotationStroke }) {
       <line
         fill="none"
         stroke={halo}
+        strokeDasharray={dash}
         strokeLinecap="round"
         strokeWidth={HALO_WIDTH}
         x1={shape.fromX}
@@ -109,6 +113,7 @@ function StrokeShape({ shape }: { shape: ScreenAnnotationStroke }) {
       <line
         fill="none"
         stroke={hex}
+        strokeDasharray={dash}
         strokeLinecap="round"
         strokeWidth={STROKE_WIDTH}
         x1={shape.fromX}
@@ -123,6 +128,40 @@ function StrokeShape({ shape }: { shape: ScreenAnnotationStroke }) {
         x={(shape.fromX + shape.toX) / 2}
         y={(shape.fromY + shape.toY) / 2 - LABEL_OFFSET}
       />
+    </g>
+  )
+}
+
+function PolylineShape({ shape }: { shape: ScreenAnnotationPolyline }) {
+  const hex = hexFor(shape.color)
+  const halo = haloFor(shape.color)
+  const dash = shape.dashed ? DASH_ARRAY : undefined
+  const points = shape.points.map(point => `${point.x},${point.y}`).join(' ')
+  const mid = shape.points[Math.floor(shape.points.length / 2)] ?? shape.points[0]
+
+  return (
+    <g>
+      <polyline
+        fill="none"
+        points={points}
+        stroke={halo}
+        strokeDasharray={dash}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={HALO_WIDTH}
+      />
+      <polyline
+        fill="none"
+        points={points}
+        stroke={hex}
+        strokeDasharray={dash}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={STROKE_WIDTH}
+      />
+      {mid ? (
+        <Caption color={shape.color} text={shape.label} x={mid.x} y={mid.y - LABEL_OFFSET} />
+      ) : null}
     </g>
   )
 }
@@ -198,6 +237,10 @@ function Shape({ shape }: { shape: ScreenAnnotationShape }) {
 
   if (shape.kind === 'arrow' || shape.kind === 'line') {
     return <StrokeShape shape={shape} />
+  }
+
+  if (shape.kind === 'polyline') {
+    return <PolylineShape shape={shape} />
   }
 
   if (shape.kind === 'label') {

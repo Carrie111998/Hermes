@@ -35,6 +35,9 @@ test('ttl defaults when absent or garbage, and clamps both ends', () => {
   assert.equal(clampAnnotationTtlSeconds(0.5), ANNOTATION_TTL_MIN_S)
   assert.equal(clampAnnotationTtlSeconds(86_400), ANNOTATION_TTL_MAX_S)
   assert.equal(clampAnnotationTtlSeconds(45), 45)
+  assert.equal(clampAnnotationTtlSeconds(180), 180)
+  assert.ok(ANNOTATION_TTL_MAX_S > ANNOTATION_TTL_DEFAULT_S)
+  assert.ok(clampAnnotationTtlSeconds(ANNOTATION_TTL_MAX_S) === ANNOTATION_TTL_MAX_S)
 })
 
 // ── Target spec ──────────────────────────────────────────────────────────────
@@ -266,4 +269,88 @@ test('a non-array shapes payload maps to nothing rather than throwing', () => {
 
   assert.equal(shapes.length, 0)
   assert.equal(skipped, 0)
+})
+
+test('polylines map every vertex and can be dashed', () => {
+  const target = { x: 0, y: 0, width: 500, height: 500 }
+  const frame = { width: 1000, height: 1000 }
+
+  const { shapes, skipped } = mapAnnotationShapes(
+    [
+      {
+        dashed: true,
+        kind: 'polyline',
+        label: 'trend',
+        points: [
+          { x: 100, y: 800 },
+          { x: 400, y: 500 },
+          { x: 900, y: 200 }
+        ]
+      },
+      { dashed: true, from_x: 0, from_y: 0, kind: 'line', to_x: 100, to_y: 100 }
+    ],
+    frame,
+    target,
+    DISPLAY
+  )
+
+  assert.equal(skipped, 0)
+  assert.deepEqual(shapes[0], {
+    color: 'red',
+    dashed: true,
+    kind: 'polyline',
+    label: 'trend',
+    points: [
+      { x: 50, y: 400 },
+      { x: 200, y: 250 },
+      { x: 450, y: 100 }
+    ]
+  })
+  assert.equal((shapes[1] as { dashed?: boolean }).dashed, true)
+})
+
+test('a polyline with too few or a broken vertex is skipped', () => {
+  const target = { x: 0, y: 0, width: 100, height: 100 }
+  const frame = { width: 100, height: 100 }
+
+  const { shapes, skipped } = mapAnnotationShapes(
+    [
+      { kind: 'polyline', points: [{ x: 1, y: 1 }] },
+      { kind: 'polyline', points: [{ x: 1, y: 1 }, { x: 'right', y: 2 }] }
+    ],
+    frame,
+    target,
+    DISPLAY
+  )
+
+  assert.equal(shapes.length, 0)
+  assert.equal(skipped, 2)
+})
+
+test('offsetAnnotationShapes shifts polyline vertices', () => {
+  const shapes = offsetAnnotationShapes(
+    [
+      {
+        color: 'green',
+        kind: 'polyline',
+        points: [
+          { x: 500, y: 820 },
+          { x: 600, y: 700 }
+        ]
+      }
+    ],
+    -388,
+    -788
+  )
+
+  assert.deepEqual(shapes, [
+    {
+      color: 'green',
+      kind: 'polyline',
+      points: [
+        { x: 112, y: 32 },
+        { x: 212, y: -88 }
+      ]
+    }
+  ])
 })

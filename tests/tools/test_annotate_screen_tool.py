@@ -51,6 +51,14 @@ def test_draw_validates_its_shapes():
     )["error"]
     assert "needs numeric 'width'" in _draw(shapes=[{"kind": "rect", "x": 1, "y": 2, "height": 3}])["error"]
     assert "needs non-empty 'text'" in _draw(shapes=[{"kind": "label", "x": 1, "y": 2}])["error"]
+    assert "at least two points" in _draw(shapes=[{"kind": "polyline", "points": [{"x": 1, "y": 2}]}])["error"]
+    assert "numeric 'x' and 'y'" in _draw(
+        shapes=[{"kind": "polyline", "points": [{"x": 1, "y": 2}, {"x": "right", "y": 3}]}]
+    )["error"]
+    assert "at most" in _draw(
+        shapes=[{"kind": "polyline", "points": [{"x": i, "y": i} for i in range(sa.MAX_POLYLINE_POINTS + 1)]}]
+    )["error"]
+    assert "dashed must be a boolean" in _draw(shapes=[{**CIRCLE, "dashed": 1}])["error"]
     assert "color must be one of" in _draw(shapes=[{**CIRCLE, "color": "chartreuse"}])["error"]
 
 
@@ -65,6 +73,7 @@ def test_ttl_must_be_a_positive_number():
     assert "positive" in _draw(ttl_seconds=-3)["error"]
     assert "positive" in _draw(ttl_seconds=0)["error"]
     assert "error" not in _draw(ttl_seconds=45)
+    assert "error" not in _draw(ttl_seconds=180)
 
 
 def test_draw_payload_carries_frame_shapes_and_target():
@@ -90,6 +99,33 @@ def test_draw_payload_carries_frame_shapes_and_target():
         "shapes": [CIRCLE],
         "ttl_seconds": 45,
     }
+
+
+def test_polyline_payload_keeps_points_and_dashed():
+    seen = {}
+    path = {
+        "kind": "polyline",
+        "dashed": True,
+        "label": "trend",
+        "color": "green",
+        "points": [{"x": 10, "y": 80}, {"x": 40, "y": 50}, {"x": 90, "y": 20}],
+    }
+
+    def cb(payload):
+        seen.update(payload)
+        return json.dumps({"success": True})
+
+    sa.annotate_screen_tool(
+        action="draw",
+        frame_width=100,
+        frame_height=100,
+        shapes=[path],
+        ttl_seconds=180,
+        callback=cb,
+    )
+
+    assert seen["shapes"] == [path]
+    assert seen["ttl_seconds"] == 180
 
 
 def test_clear_payload_omits_the_draw_fields():

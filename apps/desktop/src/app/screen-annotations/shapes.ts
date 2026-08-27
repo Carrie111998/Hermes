@@ -36,11 +36,20 @@ export interface ScreenAnnotationRect extends ScreenAnnotationShapeBase {
 }
 
 export interface ScreenAnnotationStroke extends ScreenAnnotationShapeBase {
+  /** Weaker-structure stroke (projected level, far side of a channel). */
+  dashed?: boolean
   fromX: number
   fromY: number
   kind: 'arrow' | 'line'
   toX: number
   toY: number
+}
+
+export interface ScreenAnnotationPolyline extends ScreenAnnotationShapeBase {
+  /** Weaker-structure stroke (projected level, far side of a channel). */
+  dashed?: boolean
+  kind: 'polyline'
+  points: Array<{ x: number; y: number }>
 }
 
 export interface ScreenAnnotationLabel extends ScreenAnnotationShapeBase {
@@ -53,7 +62,11 @@ export interface ScreenAnnotationLabel extends ScreenAnnotationShapeBase {
 }
 
 export type ScreenAnnotationShape =
-  ScreenAnnotationCircle | ScreenAnnotationLabel | ScreenAnnotationRect | ScreenAnnotationStroke
+  | ScreenAnnotationCircle
+  | ScreenAnnotationLabel
+  | ScreenAnnotationPolyline
+  | ScreenAnnotationRect
+  | ScreenAnnotationStroke
 
 /** Vivid, screen-legible strokes (Apple system palette hues). */
 export const SCREEN_ANNOTATION_HEX: Record<ScreenAnnotationColor, string> = {
