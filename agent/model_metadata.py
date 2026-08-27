@@ -568,7 +568,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # OpenRouter live metadata reports 262144 (256 × 1024); align the
     # static fallback so cache and offline both agree (issue #22268).
     "hy3-preview": 262144,
-    # Tencent — Hy3 (GA successor to Hy3 Preview), same 256K window.
+    # Tencent — Hy3 (GA successor to Hy3 Preview)
     "hy3": 262144,
     # OpenCode Zen — "Ox Alpha" stealth model (x-preview-f-free). 1M context
     # per OpenCode's launch announcement (2026-08-20); free, ZDR.
