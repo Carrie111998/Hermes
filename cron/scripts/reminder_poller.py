@@ -2,7 +2,9 @@
 """Reminder queue poller — prints due reminders to stdout for no_agent delivery.
 
 Designed to run as a no_agent cron job: the scheduler delivers stdout verbatim
-to the origin chat.  Empty stdout = silent run (no delivery).  This means
+via the job's configured delivery channel (v1 — the entry's origin field is
+recorded for future per-chat routing).  Empty stdout = silent run (no
+delivery).  This means
 quiet nights cost zero tokens — the poller is pure Python, no LLM.
 
 Behaviour:
@@ -20,11 +22,11 @@ Usage (standalone, for testing):
     python reminder_poller.py
 
 Usage (as no_agent cron job):
-    hermes cron create 'every 1m' "reminder poller" \\
-        --name reminder-poller \\
-        --script reminder_poller.py \\
-        --no-agent \\
-        --deliver telegram
+    hermes cron create '* * * * *' "reminder poller" \
+            --name reminder-poller \
+            --script reminder_poller.py \
+            --no-agent \
+            --deliver telegram
 
 Setup (one-time):
     copy this script to <HERMES_HOME>/scripts/reminder_poller.py
@@ -66,12 +68,22 @@ def _bootstrap_imports() -> None:
 
 _bootstrap_imports()
 
-from cron.reminder_queue import due_now, mark_fired  # noqa: E402
+from hermes_time import now as _now  # noqa: E402
+from cron.reminder_queue import (  # noqa: E402
+    add_reminder,
+    due_now,
+    mark_fired,
+    next_occurrence,
+)
 
 
 def main() -> int:
-    """Print due reminders and mark them fired.  Empty stdout = silent."""
-    due = due_now()
+    """Print due reminders, mark fired, re-arm recurring entries.
+
+    Empty stdout = silent.
+    """
+    now = _now()
+    due = due_now(now)
     if not due:
         return 0  # silent run — no stdout, no delivery
 
@@ -89,6 +101,32 @@ def main() -> int:
             # Don't crash the poller — print a warning to stderr so the
             # user sees it in logs but the reminder still delivers.
             print(f"WARNING: failed to mark {rid} as fired: {exc}", file=sys.stderr)
+            continue
+        # Re-arm recurring entries (repeat-flag): compute the next occurrence
+        # strictly after this poll tick and re-add with the same identity.
+        recurring = entry.get("recurring")
+        if recurring:
+            try:
+                next_due = next_occurrence(recurring, now)
+            except Exception as exc:
+                print(
+                    f"WARNING: recurring rule for {rid} invalid "
+                    f"({exc}); dropped after this fire",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                add_reminder(
+                    due_at=next_due,
+                    message=msg,
+                    origin=entry.get("origin") or None,
+                    recurring=recurring,
+                )
+            except Exception as exc:
+                print(
+                    f"WARNING: failed to re-arm recurring reminder {rid}: {exc}",
+                    file=sys.stderr,
+                )
 
     print("\n\n".join(lines))
     return 0

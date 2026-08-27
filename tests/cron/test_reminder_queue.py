@@ -353,11 +353,11 @@ class TestOriginRecording:
 
 
 class TestRecurringFlag:
-    """Recurring entries are flagged for graduation (queue doesn't handle recurrence)."""
+    """Recurring entries store a structured rule; the poller re-arms them."""
 
     def test_recurring_stored(self, queue, tz):
         due = datetime(2026, 8, 28, 8, 0, tzinfo=tz)
-        recurring = {"rule": "every tuesday 8am"}
+        recurring = {"kind": "weekly", "weekday": 1, "time": "08:00"}
         entry = queue.add_reminder(due, "take out trash", recurring=recurring)
         assert entry["recurring"] == recurring
 

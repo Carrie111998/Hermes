@@ -17,7 +17,7 @@ Each pending entry:
         "origin":      {platform, chat_id, thread_id?},  # delivery target
         "status":      "pending",
         "created_at":  str, ISO-8601,
-        "recurring":   null | {"rule": "every tuesday 8am"},  # see graduate note
+        "recurring":   null | {"kind": "weekly", "weekday": 1, "time": "08:00"} | {"kind": "daily", "time": "18:00"},  # poller re-arms via next_occurrence
     }
 
 Operations: add / list / cancel / mark_fired / due_now.
@@ -114,10 +114,11 @@ def add_reminder(
                  (e.g. "the plumber arrives today", not "tomorrow").
         origin: Delivery target — ``{platform, chat_id, thread_id?}``.
                 None means "deliver to home channel" (fallback).
-        recurring: If set (``{"rule": "every tuesday 8am"}``), the entry
-                   is flagged for graduation to a registered cron job.
-                   The queue itself does NOT handle recurrence — the skill
-                   layer graduates it.
+        recurring: If set, a structured recurrence rule — ``{"kind": "weekly",
+                   "weekday": <0-6, Mon=0>, "time": "HH:MM"}`` or
+                   ``{"kind": "daily", "time": "HH:MM"}``.  After firing, the
+                   poller computes the next occurrence via ``next_occurrence``
+                   and re-adds the entry with the same message/origin/rule.
 
     Returns:
         The created entry dict.
@@ -189,9 +190,10 @@ def cancel_by_query(query: str) -> List[Dict[str, Any]]:
                 e["cancelled_at"] = _hermes_now().isoformat()
                 cancelled.append(e)
         if cancelled:
-            # Remove cancelled entries from the queue file (they're in the
-            # fired log if we want an audit trail — but cancel ≠ fire, so we
-            # just drop them).
+            # Remove cancelled entries from the queue file.  Cancellations
+            # are deliberately NOT appended to fired.log (cancel ≠ fire, and
+            # that log is the delivery audit).  A separate cancels.log could
+            # be added later if a cancellation audit is ever needed.
             remaining = [e for e in entries if e.get("status") == "pending"]
             _save_queue(remaining)
         return cancelled
@@ -383,6 +385,56 @@ def parse_when(when_str: str, now: Optional[datetime] = None) -> datetime:
         pass
 
     raise ValueError(f"could not parse time expression: {when_str!r}")
+
+
+def next_occurrence(recurring: Dict[str, Any], after: datetime) -> datetime:
+    """Next occurrence of a recurring rule, strictly after ``after``.
+
+    Rules (structured, produced by the skill layer):
+      ``{"kind": "weekly", "weekday": 0-6, "time": "HH:MM"}``  (Mon=0)
+      ``{"kind": "daily", "time": "HH:MM"}``
+
+    Returns a timezone-aware datetime in ``after``'s timezone.  The poller
+    uses this to re-arm an entry after it fires (repeat-flag semantics — the
+    queue is stateless about recurrence; the poller owns the loop).
+    """
+    if after.tzinfo is None:
+        raise ValueError("after must be timezone-aware")
+    if not isinstance(recurring, dict):
+        raise ValueError(f"invalid recurring rule: {recurring!r}")
+
+    try:
+        hour, minute = (int(x) for x in str(recurring["time"]).split(":"))
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"invalid recurring time: {recurring!r}") from exc
+
+    kind = recurring.get("kind")
+
+    def candidate(day) -> datetime:
+        return datetime.combine(
+            day, datetime.min.time(), tzinfo=after.tzinfo
+        ).replace(hour=hour, minute=minute)
+
+    if kind == "daily":
+        next_due = candidate(after.date())
+        if next_due <= after:
+            next_due = candidate(after.date() + timedelta(days=1))
+        return next_due
+
+    if kind == "weekly":
+        try:
+            target_dow = int(recurring["weekday"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError(f"invalid weekly weekday: {recurring!r}") from exc
+        if not 0 <= target_dow <= 6:
+            raise ValueError(f"weekly weekday out of range: {target_dow}")
+        days_ahead = (target_dow - after.weekday()) % 7
+        next_due = candidate(after.date() + timedelta(days=days_ahead))
+        if next_due <= after:
+            next_due = candidate(after.date() + timedelta(days=days_ahead + 7))
+        return next_due
+
+    raise ValueError(f"unknown recurring rule kind: {kind!r}")
 
 
 def rephrase_for_fire_time(message: str, due_at: datetime, now: Optional[datetime] = None) -> str:

@@ -27,11 +27,11 @@ themselves to a queue file and expire on fire.  No cron-registration cleanup.
 - "Remind me tomorrow 9am to send the report"
 - "What reminders do I have this week?" / "What's due?"
 - "Cancel the reminder about the plumber" / "Forget the reminder about X"
-- "Every Tuesday at 8am, remind me to take out the trash" (recurring → graduates to a cron job)
+- "Every Tuesday at 8am, remind me to take out the trash" (recurring → repeat-flag on the queue entry; the poller re-arms it after each fire)
 
 Don't use for: alarms with exact-second precision (latency bound = poll
-cadence, ~1 min).  Don't use for: recurring reminders that need custom repeat
-flags (use a cron job directly).
+cadence, ~1 min).  Don't use for: recurrence beyond daily/weekly (e.g. "every
+2 hours") — use a cron job directly for those.
 
 ## How It Works
 
@@ -44,10 +44,16 @@ Three layers, all local — no LLM in the wait/fire path:
    the existing no_agent cron mechanism.  Empty stdout = silent.  Zero tokens
    on idle.
 3. **Fire**: poller sees `due_at` passed → prints the message to stdout →
-   scheduler delivers verbatim to origin chat → entry marked `fired` and
-   removed from the queue.
+   scheduler delivers verbatim via the job's configured delivery channel
+   (v1: home channel — the entry's `origin` is recorded for future per-chat
+   routing) → entry marked `fired` and moved to the append-only fired log;
+   recurring entries are re-armed for their next occurrence on the same poll.
 
 ## Procedure
+
+> Windows note: the shell snippets below use `python -c` with nested quotes,
+> which can mangle through cmd on this box.  If a snippet misbehaves, write
+> the call to a small temp `.py` probe and run that instead.
 
 ### 1. Parse the request
 
@@ -118,20 +124,33 @@ Confirm to the user: "✅ Set for <local time>.  ID: <id>"
 Format the time in local time (the configured timezone), e.g. "Tue 08:00"
 or "2026-08-28 08:00".
 
-### 5. Recurring reminders → graduate to cron job
+### 5. Recurring reminders → repeat-flag on the queue entry
 
 If the user says "every Tuesday 8am" or "every day at 6pm", this is a
-recurring cadence, NOT a one-shot queue entry.  Graduate it to a registered
-cron job:
+recurring cadence.  It still lives in the queue — as an entry with a
+structured `recurring` rule.  After the entry fires, the poller computes the
+next occurrence deterministically (no LLM) and re-adds the entry with the
+same message, origin and rule.  Every occurrence lands in `fired.log` as its
+own record, and the reminder never stops until cancelled.
 
-```bash
-hermes cron create '0 8 * * 2' "Take out the trash" \
-    --name trash-reminder \
-    --deliver telegram
-```
+Build the rule at capture:
 
-Do NOT add a recurring entry to the queue.  The queue is for one-shots only.
-No custom repeat flags on queue entries — recurrence is a cron job's job.
+- "every Tuesday 8am" →
+  `recurring={"kind": "weekly", "weekday": 1, "time": "08:00"}`,
+  first `due_at` = `parse_when("tuesday 8am")` (the parser already rolls to
+  next week if today's occurrence has passed).
+- "every day at 6pm" →
+  `recurring={"kind": "daily", "time": "18:00"}`,
+  first `due_at` = `parse_when("today 6pm")`; if that is already in the past,
+  use `parse_when("tomorrow 6pm")`.
+
+Confirm to the user: "✅ Every Tue 08:00 (first: 2026-08-31 08:00)."
+
+Do NOT create a cron job for recurring reminders — the poller already is the
+scheduler, and queue entries stay on the drift-immune no-agent path (no model
+resolution, no pinning, zero tokens).  Only the poller itself is a registered
+cron job (see Setup).  Catch-up for a missed occurrence follows the fire-late
+default; the next occurrence then re-anchors from the poll tick.
 
 ### 6. List pending reminders
 
@@ -200,7 +219,7 @@ reminders.  This is a one-time setup step:
 
 2. Create the no_agent cron job:
    ```bash
-   hermes cron create 'every 1m' "reminder poller" \
+   hermes cron create '* * * * *' "reminder poller" \
        --name reminder-poller \
        --script reminder_poller.py \
        --no-agent \
