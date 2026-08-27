@@ -206,6 +206,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = _DEFAULT_USER_ID
         self._agent_id = "hermes"
         self._rerank_default = False
+        self._auto_capture = True
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
         self._sync_thread = None
         self._prefetch_thread = None
@@ -258,6 +259,7 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "false", "choices": ["true", "false"]},
+            {"key": "auto_capture", "description": "Extract facts from every turn automatically", "default": "true", "choices": ["true", "false"]},
         ]
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
@@ -362,6 +364,13 @@ class Mem0MemoryProvider(MemoryProvider):
         _rr = self._config.get("rerank", False)
         self._rerank_default = (
             _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
+        )
+        # Per-turn capture. When false, sync_turn() is a no-op and only
+        # explicit mem0_add calls write, so the store holds what the agent
+        # deliberately saved instead of facts extracted from every message.
+        _ac = self._config.get("auto_capture", True)
+        self._auto_capture = (
+            _ac.lower() in ("true", "1", "yes") if isinstance(_ac, str) else bool(_ac)
         )
         self._channel = kwargs.get("platform") or "cli"
         self._backend = self._create_backend()
@@ -478,6 +487,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        if not self._auto_capture:
+            return
         if self._backend is None or self._is_breaker_open():
             return
 

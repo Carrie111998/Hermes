@@ -30,6 +30,7 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 | `user_id` | `hermes-user` | User identifier on Mem0 |
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `false` | Rerank search results for relevance (platform mode only) |
+| `auto_capture` | `true` | Extract facts from every turn automatically. Set to `false` to write only what the agent saves with `mem0_add` |
 
 The plugin has three connection modes:
 
