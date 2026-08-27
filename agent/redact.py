@@ -902,6 +902,8 @@ def redact_sensitive_text(
             # keep it intact instead of replacing it with a reusable mask.
             if value.startswith("«redacted:") and value.endswith("»"):
                 return value
+            if re.fullmatch(r"[A-Za-z0-9_:-]{1,8}\.\.\.[A-Za-z0-9_-]{0,4}", value):
+                return value
             if code_file and not file_read and not _should_redact_code_structured_value(key, value):
                 return value
             return _mask_token_nonreusable(value) if file_read else _mask_token(value)
