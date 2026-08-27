@@ -10,12 +10,16 @@ import {
   getQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import { useBackgroundQueueDrain } from './use-background-queue-drain'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
+
+const OWNER = { connectionId: 'local', profile: 'default' }
+const storageKey = (storedSessionId: string | null) => encodeComposerStorageScopeKey(OWNER, storedSessionId)
 
 const lineageSession = (over: Partial<SessionInfo>): SessionInfo =>
   ({
@@ -39,17 +43,20 @@ const lineageSession = (over: Partial<SessionInfo>): SessionInfo =>
 
 function Harness({
   enabled = true,
+  owner = OWNER,
   runtimeMap,
   selectedStoredSessionId = 'stored-session-b',
   submitText
 }: {
   enabled?: boolean
+  owner?: { connectionId: string; profile: string }
   runtimeMap: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
   submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
 }) {
   useBackgroundQueueDrain({
     enabled,
+    owner,
     runtimeIdByStoredSessionIdRef: runtimeMap,
     selectedStoredSessionId,
     submitText
@@ -78,7 +85,7 @@ describe('useBackgroundQueueDrain', () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'continue in the background', attachments: [] })
+    enqueueQueuedPrompt(storageKey('stored-session-a'), { text: 'continue in the background', attachments: [] })
     clearAllSessionStates()
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
@@ -92,14 +99,37 @@ describe('useBackgroundQueueDrain', () => {
       })
     })
 
-    await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+    await waitFor(() => expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(0))
+  })
+
+  it('drains only its exact owner when profiles share a stored id and submits raw backend ids', async () => {
+    const foreignOwner = { connectionId: 'source-b', profile: 'default' }
+    const localKey = storageKey('stored-shared')
+    const foreignKey = encodeComposerStorageScopeKey(foreignOwner, 'stored-shared')
+    const runtimeMap = { current: new Map([['stored-shared', 'rt-local-shared']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt(localKey, { text: 'local owner turn', attachments: [] })
+    enqueueQueuedPrompt(foreignKey, { text: 'foreign owner turn', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(submitText).toHaveBeenCalledOnce())
+    expect(submitText).toHaveBeenCalledWith('local owner turn', {
+      attachments: [],
+      fromQueue: true,
+      sessionId: 'rt-local-shared',
+      storedSessionId: 'stored-shared'
+    })
+    expect(getQueuedPrompts(localKey)).toHaveLength(0)
+    expect(getQueuedPrompts(foreignKey)).toHaveLength(1)
   })
 
   it('leaves the selected session queue to the mounted ChatBar drainer', async () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'visible queue entry', attachments: [] })
+    enqueueQueuedPrompt(storageKey('stored-session-a'), { text: 'visible queue entry', attachments: [] })
     clearAllSessionStates()
 
     render(<Harness runtimeMap={runtimeMap} selectedStoredSessionId="stored-session-a" submitText={submitText} />)
@@ -107,14 +137,14 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(1)
   })
 
   it('does not drain a background session that is still marked working', async () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'wait for current turn', attachments: [] })
+    enqueueQueuedPrompt(storageKey('stored-session-a'), { text: 'wait for current turn', attachments: [] })
     // Mark the session as working (busy) so the drain should skip it
     publishSessionState('rt-session-a', { ...createClientSessionState('stored-session-a'), busy: true })
 
@@ -123,7 +153,7 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(1)
   })
 
   it('treats a tip working id as busy for a root queue key via lineage', async () => {
@@ -133,7 +163,7 @@ describe('useBackgroundQueueDrain', () => {
     const submitText = vi.fn(async () => true)
 
     setSessions([lineageSession({ id: 'tip-a', _lineage_root_id: 'root-a' })])
-    enqueueQueuedPrompt('root-a', { text: 'wait for tip turn', attachments: [] })
+    enqueueQueuedPrompt(storageKey('root-a'), { text: 'wait for tip turn', attachments: [] })
     publishSessionState('rt-tip-a', { ...createClientSessionState('tip-a'), busy: true })
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
@@ -141,7 +171,7 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('root-a')).toHaveLength(1)
+    expect(getQueuedPrompts(storageKey('root-a'))).toHaveLength(1)
   })
 
   it('leaves a root queue to ChatBar when the selected id is the compression tip', async () => {
@@ -149,7 +179,7 @@ describe('useBackgroundQueueDrain', () => {
     const submitText = vi.fn(async () => true)
 
     setSessions([lineageSession({ id: 'tip-a', _lineage_root_id: 'root-a' })])
-    enqueueQueuedPrompt('root-a', { text: 'visible after tip select', attachments: [] })
+    enqueueQueuedPrompt(storageKey('root-a'), { text: 'visible after tip select', attachments: [] })
     clearAllSessionStates()
 
     render(<Harness runtimeMap={runtimeMap} selectedStoredSessionId="tip-a" submitText={submitText} />)
@@ -157,7 +187,7 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('root-a')).toHaveLength(1)
+    expect(getQueuedPrompts(storageKey('root-a'))).toHaveLength(1)
   })
 
   it('does not drain a parked background session, even when idle', async () => {
@@ -167,8 +197,8 @@ describe('useBackgroundQueueDrain', () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'halted by stop', attachments: [] })
-    parkQueuedPrompts('stored-session-a')
+    enqueueQueuedPrompt(storageKey('stored-session-a'), { text: 'halted by stop', attachments: [] })
+    parkQueuedPrompts(storageKey('stored-session-a'))
     clearAllSessionStates()
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
@@ -176,14 +206,14 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(1)
   })
 
   it('passes a null runtime id so submitText can resume stale background sessions by stored id', async () => {
     const runtimeMap = { current: new Map<string, string>() }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'resume then send', attachments: [] })
+    enqueueQueuedPrompt(storageKey('stored-session-a'), { text: 'resume then send', attachments: [] })
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
@@ -203,7 +233,7 @@ describe('useBackgroundQueueDrain', () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'retry me', attachments: [] })
+    enqueueQueuedPrompt(storageKey('stored-session-a'), { text: 'retry me', attachments: [] })
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
@@ -212,7 +242,7 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(1)
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(1)
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(750)
@@ -220,6 +250,6 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(2)
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+    expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(0)
   })
 })

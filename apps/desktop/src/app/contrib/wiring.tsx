@@ -229,6 +229,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const sessions = useStore($sessions)
   const activeConnectionId = useStore($activeConnectionId)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const backgroundQueueOwner = useMemo(
+    () => ({ connectionId: activeConnectionId?.trim() || 'local', profile: activeGatewayProfile }),
+    [activeConnectionId, activeGatewayProfile]
+  )
   const profileScope = useStore($profileScope)
   const boot = useStore($desktopBoot)
 
@@ -654,6 +658,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // sessions continue once those sessions are idle.
   useBackgroundQueueDrain({
     enabled: gatewayState === 'open',
+    owner: backgroundQueueOwner,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     submitText

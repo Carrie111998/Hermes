@@ -6,12 +6,17 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
-  getQueuedPrompts,
   MAX_AUTO_DRAIN_ATTEMPTS,
   type QueuedPromptEntry,
   removeQueuedPrompt,
   shouldAutoDrain
 } from '@/store/composer-queue'
+import { beginComposerQueueDrain, finishComposerQueueDrain } from '@/store/composer-queue-drain'
+import {
+  type ComposerStorageOwner,
+  decodeComposerStorageScopeKey,
+  normalizeComposerStorageOwner
+} from '@/store/composer-storage-scope'
 import { notify } from '@/store/notifications'
 import { $sessions, idsShareLineage } from '@/store/session'
 import { $workingSessionIds } from '@/store/session-states'
@@ -22,6 +27,7 @@ type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise
 
 interface BackgroundQueueDrainOptions {
   enabled: boolean
+  owner: ComposerStorageOwner
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   submitText: SubmitQueuedPrompt
@@ -39,6 +45,7 @@ const BACKGROUND_DRAIN_RETRY_MS = 750
  */
 export function useBackgroundQueueDrain({
   enabled,
+  owner,
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   submitText
@@ -48,7 +55,6 @@ export function useBackgroundQueueDrain({
   const parkedQueueSessions = useStore($parkedQueueSessions)
   const workingSessionIds = useStore($workingSessionIds)
   const submitTextRef = useRef(submitText)
-  const drainingSessionIdsRef = useRef(new Set<string>())
   const drainFailuresRef = useRef(new Map<string, number>())
   const retryTimersRef = useRef<number[]>([])
   const [retryTick, setRetryTick] = useState(0)
@@ -83,12 +89,12 @@ export function useBackgroundQueueDrain({
   )
 
   const drainSessionQueue = useCallback(
-    (sessionKey: string, entry: QueuedPromptEntry) => {
-      if (drainingSessionIdsRef.current.has(sessionKey)) {
+    (sessionKey: string, storedSessionId: string | null, entry: QueuedPromptEntry) => {
+      const drain = beginComposerQueueDrain(sessionKey, entry.id)
+
+      if (!drain) {
         return
       }
-
-      drainingSessionIdsRef.current.add(sessionKey)
 
       const onFail = () => {
         const failures = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
@@ -108,44 +114,56 @@ export function useBackgroundQueueDrain({
         scheduleRetry()
       }
 
-      void Promise.resolve()
-        .then(async () => {
-          const liveEntry = getQueuedPrompts(sessionKey).find(candidate => candidate.id === entry.id)
+      void (async () => {
+        let acceptedEntry: QueuedPromptEntry | null = null
+        let failed = false
+        let runtimeSessionId: string | null = null
+
+        try {
+          // A migration can hand the lock to another qualified key before this
+          // microtask runs. Entry ids are unique, so resolve the live entry
+          // across the store and let finish() tell us its settled key.
+          const liveEntry = Object.values($queuedPromptsBySession.get())
+            .flat()
+            .find(candidate => candidate.id === entry.id)
 
           if (!liveEntry) {
-            return true
+            return
           }
 
-          const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
+          runtimeSessionId = storedSessionId
+            ? (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ?? null)
+            : null
 
           const accepted = await Promise.resolve(
             submitTextRef.current(liveEntry.text, {
               attachments: liveEntry.attachments,
               fromQueue: true,
               sessionId: runtimeSessionId,
-              storedSessionId: sessionKey
+              storedSessionId
             })
           )
 
           if (accepted === false) {
-            return false
+            failed = true
+            return
           }
 
-          drainFailuresRef.current.delete(liveEntry.id)
-          removeQueuedPrompt(sessionKey, liveEntry.id)
-          resetBrowseState(runtimeSessionId)
+          acceptedEntry = liveEntry
+        } catch {
+          failed = true
+        } finally {
+          const settledKey = finishComposerQueueDrain(drain) ?? sessionKey
 
-          return true
-        })
-        .then(accepted => {
-          if (!accepted) {
+          if (acceptedEntry) {
+            drainFailuresRef.current.delete(acceptedEntry.id)
+            removeQueuedPrompt(settledKey, acceptedEntry.id)
+            resetBrowseState(runtimeSessionId)
+          } else if (failed) {
             onFail()
           }
-        })
-        .catch(onFail)
-        .finally(() => {
-          drainingSessionIdsRef.current.delete(sessionKey)
-        })
+        }
+      })()
     },
     [runtimeIdByStoredSessionIdRef, scheduleRetry, t]
   )
@@ -160,16 +178,31 @@ export function useBackgroundQueueDrain({
     // equality then mis-classifies a busy or selected chat as idle/offscreen.
     const sessions = $sessions.get()
     const working = [...workingSessionIds]
+    const normalizedOwner = normalizeComposerStorageOwner(owner)
 
     for (const [sessionKey, entries] of Object.entries(queuedPromptsBySession)) {
-      const isSelected =
-        Boolean(selectedStoredSessionId) && idsShareLineage(sessionKey, selectedStoredSessionId!, sessions)
+      const target = decodeComposerStorageScopeKey(sessionKey)
 
-      const isBusy = working.some(workingId => idsShareLineage(sessionKey, workingId, sessions))
+      if (
+        !target ||
+        target.owner.connectionId !== normalizedOwner.connectionId ||
+        target.owner.profile !== normalizedOwner.profile
+      ) {
+        continue
+      }
+
+      const storedSessionId = target.storedSessionId
+      const isSelected =
+        storedSessionId === null
+          ? selectedStoredSessionId === null
+          : Boolean(selectedStoredSessionId) && idsShareLineage(storedSessionId, selectedStoredSessionId!, sessions)
+
+      const isBusy = Boolean(
+        storedSessionId && working.some(workingId => idsShareLineage(storedSessionId, workingId, sessions))
+      )
 
       if (
         isSelected ||
-        drainingSessionIdsRef.current.has(sessionKey) ||
         !shouldAutoDrain({
           isBusy,
           parked: Boolean(parkedQueueSessions[sessionKey]),
@@ -185,11 +218,12 @@ export function useBackgroundQueueDrain({
         continue
       }
 
-      drainSessionQueue(sessionKey, entry)
+      drainSessionQueue(sessionKey, storedSessionId, entry)
     }
   }, [
     drainSessionQueue,
     enabled,
+    owner,
     parkedQueueSessions,
     queuedPromptsBySession,
     retryTick,
