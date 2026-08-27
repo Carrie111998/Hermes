@@ -19888,17 +19888,20 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            # HERMES_DESKTOP_SPAWN_STDOUT_FIX: write directly to fd 1 instead of
+            # print() — the Electron desktop spawn matches on a regex against
+            # child.stdout, and an in-process sys.stdout hijack (caused by some
+            # import-side-effect chain inside start_server's setup) was routing
+            # these sentinels to fd 2 (stderr), making every Desktop boot hit the
+            # 90s 'Timed out waiting for Hermes backend port announcement' error
+            # even though the backend was actually up and serving. os.write(1,...)
+            # is fd-level and immune to sys.stdout being replaced.
+            import os as _os
+            _os.write(1, (f"{ready_token} port={actual_port}" + "\n").encode())
             if headless:
-                # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
-                # advertise a paste-and-connect URL, just announce the bind.
-                # flush: on a piped stdout (Desktop spawn) this line is
-                # block-buffered and can surface MINUTES after the flushed
-                # READY sentinel above, which reads as a slow boot in
-                # support bundles when the backend was actually up.
-                print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
+                _os.write(1, (f"  Hermes backend listening on {host}:{actual_port}" + "\n").encode())
             else:
-                print(f"  Hermes Web UI → http://{host}:{actual_port}")
+                _os.write(1, (f"  Hermes Web UI \xe2\x86\x92 http://{host}:{actual_port}" + "\n").encode())
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
