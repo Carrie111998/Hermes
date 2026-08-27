@@ -85,7 +85,10 @@ def test_keepalive_failure_logs_root_cause(monkeypatch, tmp_path, caplog):
             raise _group(BrokenPipeError())
 
     task = _Task("pipey")
-    task._config = {"keepalive_interval": 0.01}
+    task._config = {
+        "url": "https://example.invalid/mcp",
+        "keepalive_interval": 0.01,
+    }
     task.session = object()
 
     monkeypatch.setattr(mcp_tool, "_MIN_KEEPALIVE_INTERVAL", 0.01)
