@@ -22,21 +22,42 @@ function requireTarget() {
 
 /** Build the WS URL the gateway client connects with. OAuth/password gateways
  *  mint a fresh ticket; token gateways embed the long-lived token. */
-export async function getGatewayWsUrl(): Promise<string> {
+export async function getGatewayWsUrl(profile?: null | string): Promise<string> {
   const target = requireTarget()
   if (target.authMode === 'oauth') {
     const ticket = await mintWsTicket(target.baseUrl)
     return buildGatewayWsUrlWithTicket(target.baseUrl, ticket)
   }
-  // token mode: the saved static session token rides in the ws URL (?token=),
-  // matching the desktop's buildGatewayWsUrl(baseUrl, token).
+  // Token mode: the saved static session token rides in the ws URL (?token=),
+  // matching the desktop's buildGatewayWsUrl(baseUrl, token). The current
+  // gateway scopes an explicitly selected profile through subsequent RPCs.
+  void profile
   return buildGatewayWsUrl(target.baseUrl, target.token ?? '')
 }
 
+/** The registry sees one remote mobile gateway, so every owned session route
+ * dials that same endpoint while preserving the requested route identity. */
+export async function getConnectionFor(payload: { connectionId?: null | string; profile?: null | string }): Promise<HermesConnection> {
+  const profile = String(payload.profile ?? '').trim() || 'default'
+  const connection = await getConnection(profile)
+  const connectionId = String(payload.connectionId ?? '').trim()
+
+  return {
+    ...connection,
+    connectionId: connectionId || undefined,
+    profile,
+    registryScoped: Boolean(connectionId),
+  }
+}
+
+export async function getGatewayWsUrlFor(payload: { connectionId?: null | string; profile?: null | string }): Promise<string> {
+  return getGatewayWsUrl(payload.profile)
+}
+
 /** Resolve a full connection descriptor. `wsUrl` is minted fresh so a cached
- *  descriptor is always connectable; the vendored re-mint path also re-calls
- *  getGatewayWsUrl on each connect. */
-export async function getConnection(): Promise<HermesConnection> {
+ * descriptor is always connectable; the vendored re-mint path also re-calls
+ * getGatewayWsUrl on each connect. */
+export async function getConnection(profile?: null | string): Promise<HermesConnection> {
   const target = requireTarget()
   const wsUrl = await getGatewayWsUrl()
   return {
@@ -48,6 +69,7 @@ export async function getConnection(): Promise<HermesConnection> {
     source: 'settings',
     // token gateways carry the static token; oauth authenticates via cookies.
     token: target.authMode === 'token' ? (target.token ?? '') : '',
+    profile: String(profile ?? '').trim() || undefined,
     wsUrl,
     logs: [],
     windowButtonPosition: null,

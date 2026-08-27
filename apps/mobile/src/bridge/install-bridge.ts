@@ -8,7 +8,7 @@
  * contract.
  */
 
-import { getConnection, getGatewayWsUrl } from './connection'
+import { getConnection, getConnectionFor, getGatewayWsUrl, getGatewayWsUrlFor } from './connection'
 import { api } from './http'
 import {
   captureCameraPhoto,
@@ -32,7 +32,9 @@ export function installBridge(): void {
     // Networking — the core of the bridge.
     api,
     getConnection,
+    getConnectionFor,
     getGatewayWsUrl,
+    getGatewayWsUrlFor,
     // Native integrations.
     notify,
     requestNotificationPermission,
