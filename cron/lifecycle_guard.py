@@ -886,9 +886,24 @@ def _shell_command_string(arguments: Sequence[str]) -> Optional[str]:
         if not set(letters) <= _SHELL_SHORT_OPTION_LETTERS:
             index += 1
             continue
+        # ``c`` anywhere in the bundle counts. The shells disagree about a
+        # bundle such as ``-oc``: ksh runs the next token, zsh and bash reject
+        # it. Counting it means scanning a payload that some shells never run,
+        # which costs nothing; not counting it means missing one that ksh does.
         if "c" in letters:
             saw_command_flag = True
-        index += 1 + int("O" in letters or "o" in letters)
+        # ``-o``/``-O`` take a value, and it is attached when anything follows
+        # the letter inside the same token. ``zsh -opipefail`` and
+        # ``ksh -opipefail`` are one token; only ``-euo pipefail`` spends the
+        # next one. Consuming a token that was never the option's value used to
+        # swallow the ``-c`` that followed it, which is how the payload of
+        # ``zsh -opipefail -c '...'`` went unscanned while zsh ran it.
+        consumes_next_token = False
+        for position, letter in enumerate(letters):
+            if letter in ("o", "O"):
+                consumes_next_token = position == len(letters) - 1
+                break
+        index += 1 + int(consumes_next_token)
     if not saw_command_flag or index >= len(arguments):
         return None
     return arguments[index]
