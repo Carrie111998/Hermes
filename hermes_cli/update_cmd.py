@@ -4730,7 +4730,9 @@ def _detect_venv_python_processes(
     tell the user to close the app instead. Returns ``(pid, name, cmdline)``
     tuples; empty off-Windows / without psutil / when nothing matches. The
     calling process and its ancestors are always excluded (a CLI ``hermes
-    update`` itself runs from the venv python). Never raises.
+    update`` itself runs from the venv python). A process-table enumeration
+    failure propagates so update callers can fail closed instead of treating an
+    incomplete scan as clear.
     """
     if not _m()._is_windows():
         return []
@@ -4787,20 +4789,18 @@ def _detect_venv_python_processes(
 
     native_rows = _windows_process_image_rows()
     if native_rows is None:
-        try:
-            # Fail-safe compatibility path for non-Windows tests or an
-            # unavailable Toolhelp API. Keep the base implementation's broad
-            # metadata contract here so a native-enumeration failure cannot
-            # weaken holder detection.
-            proc_rows = []
-            for proc in psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"]):
-                try:
-                    info = {**(proc.info or {}), "_native": False}
-                except Exception:
-                    continue
-                proc_rows.append((proc, info))
-        except Exception:
-            return []
+        # Fail-safe compatibility path for non-Windows tests or an unavailable
+        # Toolhelp API. Keep the base implementation's broad metadata contract
+        # here so a native-enumeration failure cannot weaken holder detection.
+        # Enumeration errors intentionally propagate: callers treat an
+        # unverifiable process table as a blocker rather than a false clear.
+        proc_rows = []
+        for proc in psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"]):
+            try:
+                info = {**(proc.info or {}), "_native": False}
+            except Exception:
+                continue
+            proc_rows.append((proc, info))
     else:
 
         def _native_proc_rows():

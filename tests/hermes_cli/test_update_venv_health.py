@@ -167,7 +167,7 @@ def test_detect_venv_python_native_path_catches_arbitrary_venv_executable(_winp,
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_detect_venv_python_fallback_mid_iteration_error_never_raises(_winp, tmp_path):
+def test_detect_venv_python_fallback_mid_iteration_error_fails_closed(_winp, tmp_path):
     holder = _proc(
         707,
         str(tmp_path / "venv" / "Scripts" / "python.exe"),
@@ -188,7 +188,8 @@ def test_detect_venv_python_fallback_mid_iteration_error_never_raises(_winp, tmp
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
         update_module, "_windows_process_image_rows", return_value=None
     ), patch.dict(sys.modules, {"psutil": fake_psutil}):
-        assert cli_main._detect_venv_python_processes() == []
+        with pytest.raises(OSError, match="process table changed"):
+            cli_main._detect_venv_python_processes()
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
