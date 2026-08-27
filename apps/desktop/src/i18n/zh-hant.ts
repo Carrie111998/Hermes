@@ -738,7 +738,7 @@ export const zhHant = defineLocale({
       imported: '設定已匯入',
       invalidJson: '設定 JSON 無效',
       keepAwakeTitle: '保持電腦喚醒',
-      keepAwakeDesc: '阻止本機睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。'
+      keepAwakeDesc: '在上蓋開啟時阻止閒置睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。無外接顯示器的 MacBook 合蓋仍會進入合蓋睡眠。'
     },
     quickEntry: {
       enabledTitle: '快速輸入',

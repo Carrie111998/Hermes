@@ -86,7 +86,9 @@ This guide walks you through the full setup process — from creating your bot o
 
 Discord REST and the Gateway WebSocket are separate transports. A successful REST response (including `fetch_user()` returning HTTP 200) does not prove that the bot can still receive Gateway events. Hermes therefore combines the ready state, client/socket closure state, socket openness, heartbeat ACK age, and finite heartbeat latency.
 
-After the configured number of consecutive unhealthy samples, the adapter emits one retryable fatal event. The existing gateway reconnect watcher creates a fresh adapter; the Discord adapter does not start a second unbounded reconnect loop.
+Heartbeat ACK age is sampled with a clock that pauses during machine sleep (macOS clamshell sleep included). After a material wall-clock gap where monotonic time did not advance, the adapter treats the pre-sleep WebSocket as stale and forces a reconnect so Discord Gateway session resume can replay sequence-covered events. Process/TCP `ESTABLISHED` state is not used as proof of inbound delivery.
+
+After the configured number of consecutive unhealthy samples, or after a host-suspension gap, the adapter emits one retryable fatal event. The existing gateway reconnect watcher creates a fresh adapter; the Discord adapter does not start a second unbounded reconnect loop.
 
 Configure the non-secret thresholds in `config.yaml`:
 
@@ -96,6 +98,7 @@ discord:
   websocket_liveness_failure_threshold: 2
   websocket_heartbeat_ack_max_age_seconds: 60
   websocket_max_latency_seconds: 30
+  websocket_suspension_gap_seconds: 5
 ```
 
 The old `liveness_interval_seconds` and `liveness_failure_threshold` names remain compatibility aliases only; they no longer mean REST probing.

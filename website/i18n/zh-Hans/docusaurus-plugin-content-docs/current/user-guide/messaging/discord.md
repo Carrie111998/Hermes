@@ -86,7 +86,7 @@ Hermes 按会话键跟踪正在运行的 agent。
 
 Discord REST 与 Gateway WebSocket 是独立传输。REST 请求成功不代表机器人仍能接收 Gateway 事件。Hermes 会组合检查 ready 状态、client/socket 关闭状态、socket 是否打开、heartbeat ACK 年龄和有限 heartbeat latency。
 
-连续异常达到阈值后，适配器只上报一次可重试失败；现有 Gateway 重连器创建新适配器，不会启动第二个无限重连循环。
+连续异常达到阈值后，或主机睡眠造成墙钟与单调时钟出现明显缺口后，适配器只上报一次可重试失败；现有 Gateway 重连器创建新适配器，不会启动第二个无限重连循环。心跳 ACK 年龄使用睡眠时会暂停的时钟，因此合盖睡眠后不能把仍显示 ESTABLISHED 的套接字当作 inbound 仍然存活。
 
 ```yaml
 discord:
@@ -94,6 +94,7 @@ discord:
   websocket_liveness_failure_threshold: 2
   websocket_heartbeat_ack_max_age_seconds: 60
   websocket_max_latency_seconds: 30
+  websocket_suspension_gap_seconds: 5
 ```
 
 旧的 `liveness_interval_seconds` / `liveness_failure_threshold` 仅作为迁移别名保留，不再表示 REST probe。

@@ -27,7 +27,10 @@ _ensure_discord_mock()
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from gateway.config import Platform, PlatformConfig  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    measure_host_suspension_gap,
+)
 
 
 class _LiveBot(FakeBot):
@@ -145,6 +148,7 @@ def test_default_liveness_bounds_trigger_timed_recovery(monkeypatch):
     assert adapter._liveness_failure_threshold == 2
     assert adapter._heartbeat_ack_max_age_seconds == 60.0
     assert adapter._max_latency_seconds == 30.0
+    assert adapter._suspension_gap_seconds == 5.0
 
 
 def test_platform_config_extra_overrides_process_liveness_bridge(monkeypatch):
@@ -299,3 +303,63 @@ async def test_disconnect_cancels_liveness_task(monkeypatch):
     await adapter.disconnect()
     assert task.done()
     assert adapter._liveness_task is None
+    assert adapter._suspension_watch_stop.is_set()
+
+
+def test_measure_host_suspension_gap_detects_sleep_clock_skew():
+    """Clamshell sleep advances wall time while perf_counter stays still."""
+    assert measure_host_suspension_gap(100.0, 10.0, 1.5, 1.0) == 89.5
+    assert measure_host_suspension_gap(25.0, 10.0, 16.0, 1.0) == 0.0
+    assert measure_host_suspension_gap(float("nan"), 0.0, 1.0, 0.0) == 0.0
+
+
+def test_suspension_gap_zero_disables_watch(monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"websocket_suspension_gap_seconds": 0},
+        )
+    )
+    assert adapter._suspension_gap_seconds == 0.0
+    adapter._start_suspension_watch()
+    assert adapter._suspension_watch_thread is None
+
+
+def test_host_suspension_gap_marks_transport_stale_without_ack_age(monkeypatch):
+    """A sleep-shaped clock gap must reconnect even when ACK age still looks fresh."""
+    adapter = _make_adapter(monkeypatch, interval=60, threshold=2, max_ack_age=60.0)
+    adapter._running = True
+    adapter._client = SimpleNamespace(loop=None, ws=_FakeWebSocket(ack_age=0.0))
+    adapter._client.is_ready = lambda: True
+    adapter._client.is_closed = lambda: False
+    adapter._client.latency = 0.05
+
+    healthy, reason = adapter._read_websocket_health(adapter._client)
+    assert healthy is True
+    assert reason == "healthy"
+
+    adapter._trip_host_suspension(90.0)
+    assert adapter.fatal_error_code == "discord_host_suspended"
+    assert adapter.fatal_error_retryable is True
+    assert adapter._disconnecting is True
+
+
+def test_host_suspension_prefers_resume_when_transport_can_be_aborted(monkeypatch):
+    adapter = _make_adapter(monkeypatch, interval=60, threshold=2, max_ack_age=60.0)
+    adapter._running = True
+    transport = Mock()
+    websocket = SimpleNamespace(
+        socket=SimpleNamespace(
+            _response=SimpleNamespace(connection=None),
+            _conn=None,
+            _writer=SimpleNamespace(transport=transport),
+        )
+    )
+    adapter._client = SimpleNamespace(loop=None, ws=websocket)
+
+    adapter._trip_host_suspension(90.0)
+
+    transport.abort.assert_called_once_with()
+    assert adapter.fatal_error_code is None
+    assert adapter._disconnecting is False
