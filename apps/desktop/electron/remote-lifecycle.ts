@@ -735,9 +735,12 @@ async function disconnect(ssh, ownershipId) {
 
 function buildOwnedStaleTerminationCommand(lock, ownershipId) {
   const pid = Number(lock.pid)
-  const expectedPath = shq(expandRemotePath(lock.hermesPath))
-  const expectedHome = lock.hermesHome ? shq(expandRemotePath(lock.hermesHome)) : "''"
-  const expectedToken = shq(expandRemotePath(spawnTokenPath(ownershipId, lock.spawnNonce)))
+  // expandRemotePath returns an already-quoted
+  // shell fragment; wrapping it in shq() again ships literal quotes/"$HOME" to
+  // the remote (broke every SSH backend spawn + made stale cleanup always REFUSE).
+  const expectedPath = expandRemotePath(lock.hermesPath)
+  const expectedHome = lock.hermesHome ? expandRemotePath(lock.hermesHome) : "''"
+  const expectedToken = expandRemotePath(spawnTokenPath(ownershipId, lock.spawnNonce))
   const nonce = shq(lock.spawnNonce)
   const profile = shq(lock.profile || '')
   const command = `$(ps -ww -o command= -p ${pid} 2>/dev/null || true)`
@@ -910,7 +913,8 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
+  // mutexPath is an expandRemotePath fragment — already quoted; do not shq again.
+  return `python3 -c ${shq(script)} ${mutexPath} ${shq(command)}`
 }
 
 /**
@@ -1083,7 +1087,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
 
   return withRemoteUpdateMutex(
     `umask 077 && mkdir -p "$(dirname ${reservation})"; ` +
-      `reservation=${shq(reservation)}; lock=${shq(lockPath)}; owner_file=${shq(ownerPath)}; ` +
+      `reservation=${reservation}; lock=${lockPath}; owner_file=${ownerPath}; ` +
       `reservation_nonce=${shq(reservationNonce)}; ` +
       `i=0; while ! mkdir "$reservation" 2>/dev/null; do ` +
       `owner_data=$(cat "$owner_file" 2>/dev/null || true); owner_pid=${'${owner_data%%:*}'}; ` +
