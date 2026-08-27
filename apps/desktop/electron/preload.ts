@@ -82,6 +82,10 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     begin: request => ipcRenderer.sendSync('hermes:composer-queue-drain:begin', request),
     excluded: request => ipcRenderer.sendSync('hermes:composer-queue-drain:excluded', request),
     handoff: request => ipcRenderer.sendSync('hermes:composer-queue-drain:handoff', request),
+    rollbackHandoff: transactionId =>
+      ipcRenderer.sendSync('hermes:composer-queue-drain:rollback-handoff', transactionId),
+    finalizeHandoff: transactionId =>
+      ipcRenderer.sendSync('hermes:composer-queue-drain:finalize-handoff', transactionId),
     finish: token => ipcRenderer.sendSync('hermes:composer-queue-drain:finish', token)
   },
   // HUD mode: the chrome-free floating chat. A full app renderer (own gateway)

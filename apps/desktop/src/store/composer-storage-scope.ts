@@ -267,19 +267,19 @@ function persistComposerStorageScopeAlias(fromScopeKey: string, toScopeKey: stri
     return
   }
 
-  try {
-    // One immutable source key per alias makes each publication a single atomic
-    // localStorage write. Concurrent migrations of different sources therefore
-    // never replace one another's records.
-    window.localStorage.setItem(`${STORAGE_SCOPE_ALIAS_PREFIX}${fromScopeKey}`, JSON.stringify(toScopeKey))
+  // One immutable source key per alias makes each publication a single atomic
+  // localStorage write. This authoritative commit must surface failure: callers
+  // still have prepared draft/queue state to roll back at this point.
+  window.localStorage.setItem(`${STORAGE_SCOPE_ALIAS_PREFIX}${fromScopeKey}`, JSON.stringify(toScopeKey))
 
-    // Keep the old map as a best-effort downgrade/upgrade bridge. It is never
-    // authoritative once independent records exist.
+  // Keep the old map as a best-effort downgrade/upgrade bridge. It is never
+  // authoritative once independent records exist.
+  try {
     const compatibilityAliases = readPersistedComposerStorageScopeAliases()
     compatibilityAliases.set(fromScopeKey, toScopeKey)
     window.localStorage.setItem(STORAGE_SCOPE_ALIASES_KEY, JSON.stringify(Object.fromEntries(compatibilityAliases)))
   } catch {
-    // Best effort: activation still keeps the alias valid in this renderer.
+    // The independent alias above is already the durable commit.
   }
 }
 

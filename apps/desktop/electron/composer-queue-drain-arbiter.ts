@@ -4,11 +4,33 @@ interface ActiveDrain {
   scopeKey: string
 }
 
+interface DrainHandoffTransaction {
+  fromScopeKey: string
+  toScopeKey: string
+  tokens: number[]
+}
+
 export class ComposerQueueDrainArbiter {
   private nextToken = 1
   private readonly activeByToken = new Map<number, ActiveDrain>()
   private readonly tokenByEntry = new Map<string, number>()
   private readonly tokensByScope = new Map<string, Set<number>>()
+  private readonly handoffsByTransaction = new Map<string, DrainHandoffTransaction>()
+  private readonly reservedScopeCounts = new Map<string, number>()
+
+  private reserveScope(scopeKey: string): void {
+    this.reservedScopeCounts.set(scopeKey, (this.reservedScopeCounts.get(scopeKey) ?? 0) + 1)
+  }
+
+  private releaseScope(scopeKey: string): void {
+    const remaining = (this.reservedScopeCounts.get(scopeKey) ?? 0) - 1
+
+    if (remaining > 0) {
+      this.reservedScopeCounts.set(scopeKey, remaining)
+    } else {
+      this.reservedScopeCounts.delete(scopeKey)
+    }
+  }
 
   private entryClaimKey(scopeKey: string, entryId: string): string {
     return `${scopeKey}\0${entryId}`
@@ -20,7 +42,13 @@ export class ComposerQueueDrainArbiter {
 
     const entryClaimKey = this.entryClaimKey(scope, entry)
 
-    if (!scope || !entry || this.tokensByScope.get(scope)?.size || this.tokenByEntry.has(entryClaimKey)) {
+    if (
+      !scope ||
+      !entry ||
+      this.reservedScopeCounts.has(scope) ||
+      this.tokensByScope.get(scope)?.size ||
+      this.tokenByEntry.has(entryClaimKey)
+    ) {
       return null
     }
 
@@ -40,17 +68,44 @@ export class ComposerQueueDrainArbiter {
     return (
       !scope ||
       !entry ||
+      this.reservedScopeCounts.has(scope) ||
       Boolean(this.tokensByScope.get(scope)?.size) ||
       this.tokenByEntry.has(this.entryClaimKey(scope, entry))
     )
   }
 
-  handoff(fromScopeKey: string, toScopeKey: string): number {
+  handoff(fromScopeKey: string, toScopeKey: string, transactionId?: string): number {
     const from = fromScopeKey.trim()
     const to = toScopeKey.trim()
-    const sourceTokens = this.tokensByScope.get(from)
+    const transaction = transactionId?.trim()
+    const existing = transaction ? this.handoffsByTransaction.get(transaction) : undefined
 
-    if (!from || !to || !sourceTokens?.size) {
+    if (existing) {
+      if (existing.fromScopeKey !== from || existing.toScopeKey !== to) {
+        throw new Error('Composer drain handoff transaction identity collision')
+      }
+
+      return existing.tokens.length
+    }
+
+    if (!from || !to) {
+      return 0
+    }
+
+    const sourceTokens = this.tokensByScope.get(from)
+    const transactionTokens = [...(sourceTokens ?? [])]
+
+    if (transaction) {
+      this.handoffsByTransaction.set(transaction, {
+        fromScopeKey: from,
+        toScopeKey: to,
+        tokens: transactionTokens
+      })
+      this.reserveScope(from)
+      this.reserveScope(to)
+    }
+
+    if (!sourceTokens?.size) {
       return 0
     }
 
@@ -90,6 +145,74 @@ export class ComposerQueueDrainArbiter {
     this.tokensByScope.delete(from)
 
     return moved
+  }
+
+  rollbackHandoff(transactionId: string): number {
+    const transactionKey = transactionId.trim()
+    const transaction = this.handoffsByTransaction.get(transactionKey)
+
+    if (!transaction) {
+      return 0
+    }
+
+    this.handoffsByTransaction.delete(transactionKey)
+    this.releaseScope(transaction.fromScopeKey)
+    this.releaseScope(transaction.toScopeKey)
+    const sourceTokens = this.tokensByScope.get(transaction.toScopeKey)
+    const destinationTokens = this.tokensByScope.get(transaction.fromScopeKey) ?? new Set<number>()
+    let moved = 0
+
+    this.tokensByScope.set(transaction.fromScopeKey, destinationTokens)
+
+    for (const token of transaction.tokens) {
+      const active = this.activeByToken.get(token)
+
+      if (!active || active.scopeKey !== transaction.toScopeKey) {
+        continue
+      }
+
+      const previousEntryClaimKey = this.entryClaimKey(active.scopeKey, active.entryId)
+
+      if (this.tokenByEntry.get(previousEntryClaimKey) === token) {
+        this.tokenByEntry.delete(previousEntryClaimKey)
+      }
+
+      sourceTokens?.delete(token)
+      destinationTokens.add(token)
+      active.scopeKey = transaction.fromScopeKey
+      const nextEntryClaimKey = this.entryClaimKey(active.scopeKey, active.entryId)
+
+      if (!this.tokenByEntry.has(nextEntryClaimKey)) {
+        this.tokenByEntry.set(nextEntryClaimKey, token)
+      }
+
+      moved += 1
+    }
+
+    if (sourceTokens && !sourceTokens.size) {
+      this.tokensByScope.delete(transaction.toScopeKey)
+    }
+
+    if (!destinationTokens.size) {
+      this.tokensByScope.delete(transaction.fromScopeKey)
+    }
+
+    return moved
+  }
+
+  finalizeHandoff(transactionId: string): boolean {
+    const transactionKey = transactionId.trim()
+    const transaction = this.handoffsByTransaction.get(transactionKey)
+
+    if (!transaction) {
+      return false
+    }
+
+    this.handoffsByTransaction.delete(transactionKey)
+    this.releaseScope(transaction.fromScopeKey)
+    this.releaseScope(transaction.toScopeKey)
+
+    return true
   }
 
   finish(token: number, ownerId?: number): string | null {

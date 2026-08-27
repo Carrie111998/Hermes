@@ -1,7 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import type { ComposerPersistenceState, ComposerPersistenceStore } from './composer-queue-drain-ipc'
+import type {
+  ComposerPersistenceMigration,
+  ComposerPersistenceState,
+  ComposerPersistenceStore
+} from './composer-queue-drain-ipc'
 
 function parseState(raw: string): ComposerPersistenceState | null {
   try {
@@ -11,7 +15,7 @@ function parseState(raw: string): ComposerPersistenceState | null {
       return null
     }
 
-    const candidate = parsed as { parks?: unknown; queues?: unknown }
+    const candidate = parsed as { migrations?: unknown; parks?: unknown; queues?: unknown }
 
     if (
       !candidate.parks ||
@@ -24,6 +28,7 @@ function parseState(raw: string): ComposerPersistenceState | null {
       return null
     }
 
+    const migrations: Record<string, ComposerPersistenceMigration> = {}
     const parks: Record<string, true> = {}
     const queues: Record<string, any[]> = {}
 
@@ -39,7 +44,35 @@ function parseState(raw: string): ComposerPersistenceState | null {
       }
     }
 
-    return { parks, queues }
+    if (candidate.migrations && typeof candidate.migrations === 'object' && !Array.isArray(candidate.migrations)) {
+      for (const [transactionId, value] of Object.entries(candidate.migrations)) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+          continue
+        }
+
+        const migration = value as Partial<ComposerPersistenceMigration>
+
+        if (
+          typeof migration.fromScopeKey === 'string' &&
+          typeof migration.toScopeKey === 'string' &&
+          typeof migration.sourceParked === 'boolean' &&
+          typeof migration.targetParked === 'boolean' &&
+          Array.isArray(migration.sourceQueue) &&
+          Array.isArray(migration.targetQueue)
+        ) {
+          migrations[transactionId] = {
+            fromScopeKey: migration.fromScopeKey,
+            sourceParked: migration.sourceParked,
+            sourceQueue: migration.sourceQueue,
+            targetParked: migration.targetParked,
+            targetQueue: migration.targetQueue,
+            toScopeKey: migration.toScopeKey
+          }
+        }
+      }
+    }
+
+    return { migrations, parks, queues }
   } catch {
     return null
   }

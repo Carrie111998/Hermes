@@ -97,6 +97,62 @@ describe('composer queue drain IPC', () => {
     expect(arbiter.excluded('scope-a', 'entry-b')).toBe(false)
   })
 
+  it('rolls back only remotely handed-off source claims', () => {
+    const ipcMain = new FakeIpcMain()
+    const sourceOwner = new FakeSender(11)
+    const targetOwner = new FakeSender(22)
+    const migrator = new FakeSender(33)
+
+    registerComposerQueueDrainIpc(ipcMain)
+
+    const sourceToken = ipcMain.send('hermes:composer-queue-drain:begin', sourceOwner, {
+      entryId: 'source-entry',
+      scopeKey: 'source'
+    })
+
+    const targetToken = ipcMain.send('hermes:composer-queue-drain:begin', targetOwner, {
+      entryId: 'target-entry',
+      scopeKey: 'target'
+    })
+
+    ipcMain.send('hermes:composer-queue-drain:handoff', migrator, {
+      fromScopeKey: 'source',
+      toScopeKey: 'target',
+      transactionId: 'drain-handoff-1'
+    })
+    ipcMain.send('hermes:composer-queue-drain:rollback-handoff', migrator, 'drain-handoff-1')
+
+    expect(ipcMain.send('hermes:composer-queue-drain:finish', sourceOwner, sourceToken)).toBe('source')
+    expect(ipcMain.send('hermes:composer-queue-drain:finish', targetOwner, targetToken)).toBe('target')
+  })
+
+  it('reserves both drain scopes while a handoff transaction is prepared', () => {
+    const ipcMain = new FakeIpcMain()
+    const migrator = new FakeSender(11)
+    const contender = new FakeSender(22)
+
+    registerComposerQueueDrainIpc(ipcMain)
+
+    ipcMain.send('hermes:composer-queue-drain:handoff', migrator, {
+      fromScopeKey: 'source',
+      toScopeKey: 'target',
+      transactionId: 'drain-reservation-1'
+    })
+
+    expect(
+      ipcMain.send('hermes:composer-queue-drain:begin', contender, { entryId: 'source-entry', scopeKey: 'source' })
+    ).toBeNull()
+    expect(
+      ipcMain.send('hermes:composer-queue-drain:begin', contender, { entryId: 'target-entry', scopeKey: 'target' })
+    ).toBeNull()
+
+    ipcMain.send('hermes:composer-queue-drain:rollback-handoff', migrator, 'drain-reservation-1')
+
+    expect(
+      ipcMain.send('hermes:composer-queue-drain:begin', contender, { entryId: 'source-entry', scopeKey: 'source' })
+    ).toEqual(expect.any(Number))
+  })
+
   it('serializes stale enqueue snapshots from two renderer clients', () => {
     const ipcMain = new FakeIpcMain()
     const firstClient = new FakeSender(11)
@@ -191,6 +247,154 @@ describe('composer queue drain IPC', () => {
       'held by peer Stop'
     ])
     expect(migrated.parks).toEqual({ target: true })
+  })
+
+  it('rolls back a committed handoff transaction without disturbing either queue', () => {
+    const coordinator = new ComposerPersistenceCoordinator()
+
+    const seed = {
+      parks: { source: true as const },
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'from source' }],
+        target: [{ attachments: [], id: 'target-entry', queuedAt: 0, text: 'already at target' }]
+      }
+    }
+
+    coordinator.mutate({
+      operation: {
+        fromScopeKey: 'source',
+        toScopeKey: 'target',
+        transactionId: 'handoff-1',
+        type: 'migrate'
+      },
+      seed
+    })
+
+    const rolledBack = coordinator.mutate({
+      operation: { transactionId: 'handoff-1', type: 'rollback-migrate' },
+      seed
+    })
+
+    expect(rolledBack.queues.source?.map((entry: any) => entry.text)).toEqual(['from source'])
+    expect(rolledBack.queues.target?.map((entry: any) => entry.text)).toEqual(['already at target'])
+    expect(rolledBack.parks).toEqual({ source: true })
+  })
+
+  it('refuses rollback rather than clobbering a concurrent target mutation', () => {
+    const coordinator = new ComposerPersistenceCoordinator()
+
+    const seed = {
+      parks: {},
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'from source' }]
+      }
+    }
+
+    coordinator.mutate({
+      operation: {
+        fromScopeKey: 'source',
+        toScopeKey: 'target',
+        transactionId: 'handoff-conflict',
+        type: 'migrate'
+      },
+      seed
+    })
+    coordinator.mutate({
+      operation: {
+        entry: { attachments: [], id: 'concurrent-entry', queuedAt: 2, text: 'concurrent target enqueue' },
+        scopeKey: 'target',
+        type: 'enqueue'
+      },
+      seed
+    })
+
+    expect(() =>
+      coordinator.mutate({
+        operation: { transactionId: 'handoff-conflict', type: 'rollback-migrate' },
+        seed
+      })
+    ).toThrow('changed after the handoff commit')
+
+    const current = coordinator.mutate({ operation: { type: 'read' }, seed })
+    expect(current.queues.target?.map((entry: any) => entry.text)).toEqual([
+      'from source',
+      'concurrent target enqueue'
+    ])
+  })
+
+  it('retains an unfinished handoff transaction across coordinator restart', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-composer-transaction-'))
+    const store = createComposerPersistenceFileStore(path.join(directory, 'composer-persistence.v1.json'))
+
+    const seed = {
+      parks: { source: true as const },
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'restart-safe source' }],
+        target: [{ attachments: [], id: 'target-entry', queuedAt: 0, text: 'restart-safe target' }]
+      }
+    }
+
+    try {
+      const firstMain = new ComposerPersistenceCoordinator(store)
+      firstMain.mutate({
+        operation: {
+          fromScopeKey: 'source',
+          toScopeKey: 'target',
+          transactionId: 'restart-handoff',
+          type: 'migrate'
+        },
+        seed
+      })
+
+      const restartedMain = new ComposerPersistenceCoordinator(store)
+
+      const rolledBack = restartedMain.mutate({
+        operation: { transactionId: 'restart-handoff', type: 'rollback-migrate' },
+        seed: { parks: {}, queues: {} }
+      })
+
+      expect(rolledBack.queues.source?.map((entry: any) => entry.text)).toEqual(['restart-safe source'])
+      expect(rolledBack.queues.target?.map((entry: any) => entry.text)).toEqual(['restart-safe target'])
+      expect(rolledBack.parks).toEqual({ source: true })
+    } finally {
+      fs.rmSync(directory, { force: true, recursive: true })
+    }
+  })
+
+  it('rolls back a failed durable migration and restart retains the source', () => {
+    const persisted = {
+      parks: { source: true as const },
+      queues: {
+        source: [{ attachments: [], id: 'source-entry', queuedAt: 1, text: 'survives failed save' }]
+      }
+    }
+
+    const store = {
+      load: () => structuredClone(persisted),
+      save: () => {
+        throw new Error('injected file save failure')
+      }
+    }
+
+    const coordinator = new ComposerPersistenceCoordinator(store)
+
+    const migration = {
+      operation: { fromScopeKey: 'source', toScopeKey: 'target', type: 'migrate' },
+      seed: { parks: {}, queues: {} }
+    }
+
+    expect(() => coordinator.mutate(migration)).toThrow('injected file save failure')
+
+    const afterFailure = coordinator.mutate({ operation: { type: 'read' }, seed: { parks: {}, queues: {} } })
+    expect(afterFailure.queues.source?.map((entry: any) => entry.text)).toEqual(['survives failed save'])
+    expect(afterFailure.queues.target).toBeUndefined()
+    expect(afterFailure.parks).toEqual({ source: true })
+
+    const restarted = new ComposerPersistenceCoordinator(store)
+    const afterRestart = restarted.mutate({ operation: { type: 'read' }, seed: { parks: {}, queues: {} } })
+    expect(afterRestart.queues.source?.map((entry: any) => entry.text)).toEqual(['survives failed save'])
+    expect(afterRestart.queues.target).toBeUndefined()
+    expect(afterRestart.parks).toEqual({ source: true })
   })
 
   it('restores authoritative queue state after a main-process coordinator restart', () => {

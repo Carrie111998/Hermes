@@ -517,6 +517,114 @@ function persistDraftTexts() {
   }
 }
 
+export interface PreparedSessionDraftHandoff {
+  complete: () => void
+  rollback: () => void
+}
+
+function persistPreparedDraftTexts(nextDrafts: Map<string, SessionDraft>): Set<string> {
+  const entries = [...nextDrafts]
+    .filter(([, draft]) => draft.text)
+    .slice(-MAX_PERSISTED_DRAFTS)
+    .map(([key, draft]) => [key, draft.text] as const)
+
+  if (entries.length === 0) {
+    window.localStorage.removeItem(SESSION_DRAFTS_STORAGE_KEY)
+  } else {
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)))
+  }
+
+  return new Set(entries.map(([key]) => key))
+}
+
+/**
+ * Copy a draft onto its handoff destination without retiring the source. The
+ * caller publishes the storage alias only after every sibling persistence
+ * participant has prepared successfully; rollback restores the exact previous
+ * destination snapshot when a later participant fails.
+ */
+export function prepareSessionDraftHandoff(fromKey: string, toKey: string): PreparedSessionDraftHandoff {
+  const from = draftKey(fromKey)
+  const to = draftKey(toKey)
+  const source = draftsBySession.get(from)
+  const destination = draftsBySession.get(to)
+  const destinationRevision = draftRevisionsBySession.get(to)
+  const destinationTitle = $draftTitles.get()[to] ?? ''
+  let prepared = false
+
+  if (
+    from !== to &&
+    source &&
+    (source.text.trim() || source.attachments.length > 0) &&
+    (!destination || (!destination.text.trim() && destination.attachments.length === 0))
+  ) {
+    const nextDrafts = new Map(draftsBySession)
+    const copied = cloneDraft(source)
+
+    nextDrafts.set(to, copied)
+    const nextPersistedTextKeys = persistPreparedDraftTexts(nextDrafts)
+    draftsBySession.set(to, copied)
+    persistedTextKeys = nextPersistedTextKeys
+    bumpDraftRevision(to)
+    publishDraftTitle(to, deriveDraftTitle(copied.text))
+    prepared = true
+  }
+
+  return {
+    complete: () => {
+      if (!prepared || !draftsBySession.has(from)) {
+        return
+      }
+
+      const nextDrafts = new Map(draftsBySession)
+      nextDrafts.delete(from)
+
+      try {
+        const nextPersistedTextKeys = persistPreparedDraftTexts(nextDrafts)
+        draftsBySession.delete(from)
+        persistedTextKeys = nextPersistedTextKeys
+        draftRevisionsBySession.delete(from)
+        publishDraftTitle(from, '')
+      } catch {
+        // The committed alias makes a retained source copy unreachable. Leave
+        // it for a later recovery pass rather than weakening the commit.
+      }
+    },
+    rollback: () => {
+      if (!prepared) {
+        return
+      }
+
+      const nextDrafts = new Map(draftsBySession)
+
+      if (destination) {
+        nextDrafts.set(to, cloneDraft(destination))
+      } else {
+        nextDrafts.delete(to)
+      }
+
+      const nextPersistedTextKeys = persistPreparedDraftTexts(nextDrafts)
+
+      if (destination) {
+        draftsBySession.set(to, cloneDraft(destination))
+      } else {
+        draftsBySession.delete(to)
+      }
+
+      persistedTextKeys = nextPersistedTextKeys
+
+      if (destinationRevision === undefined) {
+        draftRevisionsBySession.delete(to)
+      } else {
+        draftRevisionsBySession.set(to, destinationRevision)
+      }
+
+      publishDraftTitle(to, destinationTitle)
+      prepared = false
+    }
+  }
+}
+
 export function sessionDraftRevision(scope: string | null | undefined): number {
   return draftRevisionsBySession.get(draftKey(scope)) ?? 0
 }

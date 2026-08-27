@@ -129,38 +129,33 @@ const coordinatedMutation = (operation: Record<string, unknown>): ComposerPersis
     return null
   }
 
-  try {
-    const response = bridge.mutate({ operation, seed: { parks: loadParks(), queues: load() } })
+  const response = bridge.mutate({ operation, seed: { parks: loadParks(), queues: load() } })
 
-    if (!response || typeof response !== 'object') {
-      return null
-    }
-
-    const candidate = response as Partial<ComposerPersistenceResponse>
-
-    if (
-      !candidate.queues ||
-      typeof candidate.queues !== 'object' ||
-      Array.isArray(candidate.queues) ||
-      !candidate.parks ||
-      typeof candidate.parks !== 'object' ||
-      Array.isArray(candidate.parks)
-    ) {
-      return null
-    }
-
-    const coordinated = candidate as ComposerPersistenceResponse
-
-    $queuedPromptsBySession.set(coordinated.queues)
-    $parkedQueueSessions.set(coordinated.parks)
-    save(coordinated.queues)
-    saveParks(coordinated.parks)
-
-    return coordinated
-  } catch {
-    // Compatibility fallback for web/tests and older main-process bridges.
+  if (!response || typeof response !== 'object') {
     return null
   }
+
+  const candidate = response as Partial<ComposerPersistenceResponse>
+
+  if (
+    !candidate.queues ||
+    typeof candidate.queues !== 'object' ||
+    Array.isArray(candidate.queues) ||
+    !candidate.parks ||
+    typeof candidate.parks !== 'object' ||
+    Array.isArray(candidate.parks)
+  ) {
+    return null
+  }
+
+  const coordinated = candidate as ComposerPersistenceResponse
+
+  $queuedPromptsBySession.set(coordinated.queues)
+  $parkedQueueSessions.set(coordinated.parks)
+  save(coordinated.queues)
+  saveParks(coordinated.parks)
+
+  return coordinated
 }
 
 export function reloadPersistedComposerQueue(): void {
@@ -448,12 +443,17 @@ export function clearQueuedPromptsForOwnerLineage(
  * entries enqueued under the old id would otherwise be stranded under a key
  * nothing reads anymore. No-op unless both keys resolve and differ.
  */
-export function migrateQueuedPromptsExact(from: string, to: string): boolean {
+export function migrateQueuedPromptsExact(from: string, to: string, transactionId?: string): boolean {
   if (!from || !to || from === to) {
     return false
   }
 
-  const coordinated = coordinatedMutation({ fromScopeKey: from, toScopeKey: to, type: 'migrate' })
+  const coordinated = coordinatedMutation({
+    fromScopeKey: from,
+    toScopeKey: to,
+    ...(transactionId ? { transactionId } : {}),
+    type: 'migrate'
+  })
 
   if (coordinated) {
     return coordinated.result === true
@@ -486,6 +486,45 @@ export function migrateQueuedPromptsExact(from: string, to: string): boolean {
   }
 
   return true
+}
+
+export interface PreparedQueuedPromptsMigration {
+  changed: boolean
+  complete: () => void
+  rollback: () => void
+}
+
+/** Prepare a reversible queue/park move for the cross-store handoff commit. */
+export function prepareQueuedPromptsMigrationExact(
+  from: string,
+  to: string,
+  transactionId: string
+): PreparedQueuedPromptsMigration {
+  const usesCoordinator = Boolean(typeof window !== 'undefined' && window.hermesDesktop?.composerPersistence)
+  const previousQueues = load()
+  const previousParks = loadParks()
+  const changed = migrateQueuedPromptsExact(from, to, transactionId)
+
+  return {
+    changed,
+    complete: () => {
+      if (usesCoordinator) {
+        coordinatedMutation({ transactionId, type: 'finalize-migrate' })
+      }
+    },
+    rollback: () => {
+      if (usesCoordinator) {
+        coordinatedMutation({ transactionId, type: 'rollback-migrate' })
+
+        return
+      }
+
+      $queuedPromptsBySession.set(previousQueues)
+      $parkedQueueSessions.set(previousParks)
+      save(previousQueues)
+      saveParks(previousParks)
+    }
+  }
 }
 
 export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: string | null | undefined): boolean => {

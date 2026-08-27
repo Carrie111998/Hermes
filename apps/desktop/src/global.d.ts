@@ -101,7 +101,9 @@ declare global {
       composerQueueDrain?: {
         begin: (request: { entryId: string; scopeKey: string }) => number | null
         excluded: (request: { entryId: string; scopeKey: string }) => boolean
-        handoff: (request: { fromScopeKey: string; toScopeKey: string }) => number
+        handoff: (request: { fromScopeKey: string; toScopeKey: string; transactionId?: string }) => number
+        rollbackHandoff?: (transactionId: string) => number
+        finalizeHandoff?: (transactionId: string) => boolean
         finish: (token: number) => null | string
       }
       // HUD mode: the chrome-free floating chat. A FULL app renderer with its

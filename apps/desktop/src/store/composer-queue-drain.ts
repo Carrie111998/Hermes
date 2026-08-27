@@ -4,6 +4,12 @@ export interface ComposerQueueDrainHandle {
   readonly id: number
 }
 
+export interface PreparedComposerQueueDrainHandoff {
+  complete: () => void
+  moved: number
+  rollback: () => void
+}
+
 interface ActiveDrain {
   entryId: string
   remoteToken?: number
@@ -24,6 +30,53 @@ const canonicalScope = (scopeKey: string): string | null => {
   const resolved = resolveComposerStorageScopeKey(scopeKey)
 
   return decodeComposerStorageScopeKey(resolved)?.format === 'canonical' ? resolved : null
+}
+
+function retargetLocalHandles(handleIds: Iterable<number>, from: string, to: string): number {
+  if (from === to) {
+    return handlesByScope.get(from)?.size ?? 0
+  }
+
+  const sourceHandles = handlesByScope.get(from)
+  const targetHandles = handlesByScope.get(to) ?? new Set<number>()
+  let moved = 0
+
+  handlesByScope.set(to, targetHandles)
+
+  for (const handleId of handleIds) {
+    const active = activeByHandle.get(handleId)
+
+    if (!active || active.scopeKey !== from) {
+      continue
+    }
+
+    const previousEntryClaimKey = entryClaimKey(active.scopeKey, active.entryId)
+
+    if (handleByEntry.get(previousEntryClaimKey) === handleId) {
+      handleByEntry.delete(previousEntryClaimKey)
+    }
+
+    sourceHandles?.delete(handleId)
+    targetHandles.add(handleId)
+    active.scopeKey = to
+    const nextEntryClaimKey = entryClaimKey(to, active.entryId)
+
+    if (!handleByEntry.has(nextEntryClaimKey)) {
+      handleByEntry.set(nextEntryClaimKey, handleId)
+    }
+
+    moved += 1
+  }
+
+  if (sourceHandles && !sourceHandles.size) {
+    handlesByScope.delete(from)
+  }
+
+  if (!targetHandles.size) {
+    handlesByScope.delete(to)
+  }
+
+  return moved
 }
 
 /** Atomically claim one qualified queue scope + entry across every drainer. */
@@ -135,6 +188,41 @@ export function handoffComposerQueueDrains(fromScopeKey: string, toScopeKey: str
   handlesByScope.delete(from)
 
   return remoteMoved ?? moved
+}
+
+/** Move exactly the source claims and retain their identity for safe rollback. */
+export function prepareComposerQueueDrainHandoff(
+  fromScopeKey: string,
+  toScopeKey: string,
+  transactionId: string
+): PreparedComposerQueueDrainHandoff {
+  const from = canonicalScope(fromScopeKey)
+  const to = canonicalScope(toScopeKey)
+
+  if (!from || !to) {
+    return { complete: () => undefined, moved: 0, rollback: () => undefined }
+  }
+
+  const sourceHandleIds = [...(handlesByScope.get(from) ?? [])]
+  const arbiter = desktopArbiter()
+  const remoteMoved = arbiter?.handoff({ fromScopeKey: from, toScopeKey: to, transactionId })
+  const localMoved = retargetLocalHandles(sourceHandleIds, from, to)
+
+  return {
+    complete: () => {
+      arbiter?.finalizeHandoff?.(transactionId)
+    },
+    moved: remoteMoved ?? localMoved,
+    rollback: () => {
+      arbiter?.rollbackHandoff?.(transactionId)
+      retargetLocalHandles(sourceHandleIds, to, from)
+    }
+  }
+}
+
+/** Finalize a remotely prepared handoff after recovering an alias commit. */
+export function finalizeComposerQueueDrainHandoff(transactionId: string): void {
+  desktopArbiter()?.finalizeHandoff?.(transactionId)
 }
 
 /** Release a claim and return the qualified key on which it finally settled. */
