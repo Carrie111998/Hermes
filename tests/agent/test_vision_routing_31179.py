@@ -209,13 +209,16 @@ model:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         _fresh_modules()
 
-        monkeypatch.setattr(
-            "agent.anthropic_adapter.resolve_anthropic_token",
-            lambda: "sk-ant-test",
-        )
+        import agent.auxiliary_client as auxiliary_client
 
-        from agent.auxiliary_client import resolve_vision_provider_client
-        provider, client, _model = resolve_vision_provider_client(provider="auto")
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_try_anthropic",
+            lambda **_kwargs: (object(), "claude-sonnet-4-6"),
+        )
+        provider, client, _model = auxiliary_client.resolve_vision_provider_client(
+            provider="auto"
+        )
         assert client is not None
         assert provider == "anthropic"
 
