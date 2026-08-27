@@ -62,9 +62,17 @@ class TestDelegateRequirements(unittest.TestCase):
     def test_schema_valid(self):
         self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertIn("goal", props)
+        # tasks[] is the only advertised spawn shape (single task = one-entry
+        # array); legacy top-level goal/context/output_schema stay
+        # handler-accepted but unadvertised.
         self.assertIn("tasks", props)
-        self.assertIn("context", props)
+        self.assertNotIn("goal", props)
+        self.assertNotIn("context", props)
+        self.assertNotIn("output_schema", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("goal", task_props)
+        self.assertIn("context", task_props)
+        self.assertIn("output_schema", task_props)
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.

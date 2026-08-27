@@ -3580,19 +3580,16 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     """Validate a tasks=[...] batch beyond per-task goal presence.
 
     Returns an actionable error string, or None when the batch is valid.
-    Batch-only by design: the single-`goal` form legitimately uses short
-    goals, so these checks must never run on it.
+
+    A one-entry array is the canonical single-task shape (the advertised
+    interface is tasks-only; legacy top-level `goal` is wrapped into a
+    one-entry batch), so no minimum count is enforced. The placeholder/
+    template checks below still run on every entry.
 
     Duplicate goals are deliberately NOT rejected: identical-goal fan-outs
     are a legitimate pattern (best-of-N / ensemble sampling), and blocking
     them broke real workflows (post-merge audit of #81141).
     """
-    if len(task_list) < 2:
-        return (
-            "Batch mode requires at least 2 tasks. For a single task, use "
-            "the `goal` parameter instead of `tasks`: "
-            'delegate_task(goal="...", context="...").'
-        )
 
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
@@ -3612,7 +3609,11 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 "calling delegate_task — subagents cannot resolve "
                 "placeholders."
             )
-        if len(goal) < _MIN_BATCH_GOAL_LEN:
+        if len(goal) < _MIN_BATCH_GOAL_LEN and len(task_list) >= 2:
+            # Multi-task fan-outs with terse goals are usually unexpanded
+            # templates; a SINGLE task legitimately uses short goals
+            # ("Fix the tests"), so one-entry arrays keep the historical
+            # single-`goal` exemption.
             return (
                 f"Task {i} goal is too short ({goal!r}). Write a specific, "
                 "self-contained goal of at least "
@@ -3772,7 +3773,11 @@ def delegate_task(
             single_task["output_schema"] = output_schema
         task_list = [single_task]
     else:
-        return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+        return tool_error(
+            "No tasks provided. Pass tasks=[{goal: '...', context: '...'}, "
+            "...] — one entry per subagent (a single task is a one-entry "
+            "array)."
+        )
 
     if not task_list:
         return tool_error("No tasks provided.")
@@ -4679,12 +4684,12 @@ def _build_top_level_description() -> str:
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
+        "you. Pass every task in `tasks` — one entry spawns one subagent, "
+        "several run in parallel (limit in the tasks description).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work. While children run, `action` "
+        "transcript paths, and the completed result (one consolidated message, "
+        "results in task order) re-enters the conversation on its own. Do NOT "
+        "wait or poll; continue other work. While children run, `action` "
         "(list/steer/stop) controls them live — steer when a transcript shows "
         "a child drifting.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
@@ -4718,10 +4723,10 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     return (
-        f"Batch mode: tasks to run in parallel (up to {max_children} for this "
-        f"user, set via delegation.max_concurrent_children). Each gets "
-        "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        f"The task(s), up to {max_children} in parallel for this user (set "
+        "via delegation.max_concurrent_children). Each entry spawns one "
+        "subagent with isolated context and terminal session; a single task "
+        "is a one-entry array. Required when spawning."
     )
 
 
@@ -4786,54 +4791,56 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "goal": {
-                "type": "string",
-                "description": (
-                    "What the subagent should accomplish. Be specific and "
-                    "self-contained — the subagent knows nothing about your "
-                    "conversation history. (Same field per-task in tasks[].)"
-                ),
-            },
-            "context": {
-                "type": "string",
-                "description": (
-                    "Background the subagent needs: file paths, error "
-                    "messages, constraints. The more specific, the better it "
-                    "performs. (Same field per-task in tasks[].)"
-                ),
-            },
+            # NOTE: the handler also accepts the legacy single-goal shape —
+            # top-level `goal` (string), `context` (string), `output_schema`
+            # (object) — wrapped into a one-entry batch at dispatch. Legacy,
+            # unadvertised (old transcripts/callers only); tasks=[...] is the
+            # only advertised shape. Do not re-add these to the schema.
             "tasks": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "goal": {"type": "string"},
-                        "context": {"type": "string"},
-                        "output_schema": {"type": "object"},
+                        "goal": {
+                            "type": "string",
+                            "description": (
+                                "What this subagent should accomplish. Be "
+                                "specific and self-contained — it knows "
+                                "nothing about your conversation history."
+                            ),
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": (
+                                "Background THIS child needs: file paths, "
+                                "error messages, constraints. Each child "
+                                "sees only its own context — repeat shared "
+                                "background in every task that needs it."
+                            ),
+                        },
+                        "output_schema": {
+                            "type": "object",
+                            "description": (
+                                "Optional JSON Schema this child's final "
+                                "answer must validate against (told to the "
+                                "child up front; parent validates with one "
+                                "bounded correction retry; result gains "
+                                "schema_valid, plus schema_errors on "
+                                "failure). Keep it forgiving — require only "
+                                "fields you will read."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
                 # No maxItems — the runtime limit is configurable via
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
-                # Item fields carry no sub-descriptions: goal/context/
-                # output_schema have identical semantics to the top-level
-                # params of the same name, taught once there.
                 # NOTE: the handler also accepts a per-task `role` — legacy,
                 # ignored: delegation capability is depth-derived, not
                 # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
-            },
-            "output_schema": {
-                "type": "object",
-                "description": (
-                    "Optional JSON Schema the subagent's final answer must "
-                    "validate against (told to the child up front; parent "
-                    "validates with one bounded correction retry; result "
-                    "gains schema_valid, plus schema_errors on failure). "
-                    "Keep it forgiving — require only fields you will read. "
-                    "Same semantics per-task via tasks[].output_schema."
-                ),
             },
             # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
             # ignored: top-level delegations always run in the background.
