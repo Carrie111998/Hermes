@@ -19874,7 +19874,14 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            # tui_gateway.server reassigns sys.stdout -> sys.stderr at import time
+            # (to keep its stdio JSON-RPC protocol clean). `serve` imports that
+            # module, so a plain print() here would emit the port announcement to
+            # STDERR — but the Desktop's port-waiter parses only STDOUT and would
+            # time out. Route the sentinel to the real stdout (sys.__stdout__),
+            # falling back to stderr if the original was detached.
+            _announce_stream = sys.__stdout__ if sys.__stdout__ is not None else sys.stderr
+            print(f"{ready_token} port={actual_port}", file=_announce_stream, flush=True)
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
