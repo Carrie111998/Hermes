@@ -194,7 +194,7 @@ export const ar = defineLocale({
       inputTitle: 'مطلوب إدخال',
       inputBody: 'ينتظر Hermes ردّك.',
       turnDoneTitle: 'أنهى Hermes',
-      turnDoneBody: '',
+      turnDoneBody: 'اكتملت الرسالة.',
       turnErrorTitle: 'فشلت الجولة',
       backgroundDoneTitle: 'انتهت المهمة في الخلفية',
       backgroundFailedTitle: 'فشلت المهمة في الخلفية'

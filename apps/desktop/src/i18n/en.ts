@@ -190,7 +190,7 @@ export const en: Translations = {
       inputTitle: 'Input needed',
       inputBody: 'Hermes is waiting for your response.',
       turnDoneTitle: 'Hermes finished',
-      turnDoneBody: '',
+      turnDoneBody: 'Message complete.',
       turnErrorTitle: 'Turn failed',
       backgroundDoneTitle: 'Background task finished',
       backgroundFailedTitle: 'Background task failed',
