@@ -84,9 +84,9 @@ Call the exposed `coinbase_*` MCP tools directly. Use the tools' schemas and res
 - Use the quote currency the user specifies. If omitted, inspect balances; if both USD and USDC are available, prefer USDC. Do not silently change products.
 - Native limit and stop orders are durable; do not emulate them with a polling loop.
 - A trade proposal, signal, or strategy is not an authorization to trade. Reconfirm each fund-affecting order action.
-- If an order submission times out, retry only with the same `client_order_id`. Never submit the same trade with a new ID until the prior outcome is known.
+- If an order submission times out, query `coinbase_orders_get` with the same `client_order_id` before retrying. Retry only with that ID if the outcome remains unknown; never submit the same trade with a new ID.
 - x402 accepts only catalog resources; set `max_amount` as a spend ceiling. Never request or expose credentials, raw API keys, or payment details.
 
 ## Verification
 
-Confirm that `coinbase_balance` returns the expected portfolio balances. A successful typed response confirms the MCP connection, OAuth authorization, and brokerage read path.
+Confirm that `coinbase_balance` returns the expected portfolio balances. If the account has no balances yet, use `coinbase_portfolios_list`. A successful typed response confirms the MCP connection, OAuth authorization, and brokerage read path.
