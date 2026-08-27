@@ -39,6 +39,7 @@ from agent.conversation_compression import (
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.certification_runtime import publication_deferred
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -193,6 +194,8 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
     TUI/desktop, ACP) gets identical behavior without each one re-implementing
     the call. Fully defensive: titling is cosmetic and must never break a turn.
     """
+    if publication_deferred(agent):
+        return
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not session_db or not session_id:
@@ -481,9 +484,7 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
-    certification_deferred = bool(
-        getattr(agent, "_certification_persistence_deferred", False)
-    )
+    certification_deferred = publication_deferred(agent)
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -838,7 +839,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        not certification_deferred
+        and agent.compression_enabled
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -916,7 +922,8 @@ def build_turn_context(
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
-        agent.compression_enabled
+        not certification_deferred
+        and agent.compression_enabled
         and not _review_fork_first_request_pending(agent)
         and _should_run_preflight_estimate(
             messages,

@@ -417,6 +417,20 @@ def test_certification_deferral_blocks_full_tool_completion_observers(
     with (
         dispatch_patch,
         patch(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            side_effect=lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args, trace=[]
+            ),
+        ),
+        patch(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            side_effect=lambda _name, args, next_call, **_kwargs: next_call(args),
+        ),
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            return_value=(None, None),
+        ),
+        patch(
             "agent.tool_executor.maybe_persist_tool_result",
             side_effect=lambda **kwargs: kwargs["content"],
         ),
@@ -465,7 +479,20 @@ def test_certification_deferral_blocks_step_and_reasoning_observers():
             )
         )
 
+    middleware_manager = SimpleNamespace(
+        _middleware={
+            "llm_request": [lambda request, **_kwargs: request],
+            "llm_execution": [
+                lambda **kwargs: kwargs["next_call"](kwargs["request"])
+            ]
+        }
+    )
+
     with (
+        patch(
+            "hermes_cli.plugins.get_plugin_manager",
+            return_value=middleware_manager,
+        ),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),

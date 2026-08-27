@@ -14,7 +14,7 @@ import re
 import sqlite3
 import stat
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -275,7 +275,7 @@ def _reserve_run_id(ledger_path: Path, run_id: str, contract_hash: str) -> None:
 
 def _stage_exact_path(path: Path, content: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=".hermes-certification.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(content)
@@ -337,57 +337,94 @@ def _read_regular_file_nofollow(path: Path) -> bytes:
 
 
 def _publish_exact_output(path: Path, content: bytes) -> None:
-    """Create the output exclusively and write only the journaled bytes."""
+    """Create the output relative to a pinned parent directory descriptor."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent_fd = os.open(path.parent, parent_flags)
+    parent_identity = os.fstat(parent_fd)
+    name = path.name
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
+
+    def _parent_is_attached() -> bool:
         try:
-            existing = _read_regular_file_nofollow(path)
-        except OSError as exc:
-            raise RuntimeError(f"certification output path is unsafe: {path}") from exc
-        if existing != content:
-            raise RuntimeError(f"certification output already contains different bytes: {path}")
-        return
-    try:
-        view = memoryview(content)
-        written = 0
-        while written < len(view):
-            written += os.write(fd, view[written:])
-        os.fsync(fd)
-        os.lseek(fd, 0, os.SEEK_SET)
-        committed: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                break
-            committed.append(chunk)
-        if b"".join(committed) != content:
-            raise RuntimeError(f"certification output write mismatch: {path}")
-        opened = os.fstat(fd)
-        current = os.lstat(path)
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
-        ):
-            raise RuntimeError(f"certification output identity changed: {path}")
-    except BaseException:
-        try:
-            current = os.lstat(path)
-            opened = os.fstat(fd)
-            if (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino):
-                os.unlink(path)
+            current = os.lstat(path.parent)
         except OSError:
-            pass
-        raise
-    finally:
-        os.close(fd)
-    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            return False
+        return (
+            stat.S_ISDIR(current.st_mode)
+            and (current.st_dev, current.st_ino)
+            == (parent_identity.st_dev, parent_identity.st_ino)
+        )
+
     try:
-        os.fsync(directory_fd)
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            try:
+                existing_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    opened = os.fstat(existing_fd)
+                    if not stat.S_ISREG(opened.st_mode):
+                        raise OSError("output is not a regular file")
+                    chunks: list[bytes] = []
+                    while True:
+                        chunk = os.read(existing_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    existing = b"".join(chunks)
+                finally:
+                    os.close(existing_fd)
+            except OSError as exc:
+                raise RuntimeError(f"certification output path is unsafe: {path}") from exc
+            if existing != content:
+                raise RuntimeError(
+                    f"certification output already contains different bytes: {path}"
+                )
+            if not _parent_is_attached():
+                raise RuntimeError(f"certification output parent identity changed: {path}")
+            return
+        try:
+            view = memoryview(content)
+            written = 0
+            while written < len(view):
+                written += os.write(fd, view[written:])
+            os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            committed: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                committed.append(chunk)
+            if b"".join(committed) != content:
+                raise RuntimeError(f"certification output write mismatch: {path}")
+            opened = os.fstat(fd)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+                or not _parent_is_attached()
+            ):
+                raise RuntimeError(f"certification output identity changed: {path}")
+            os.fsync(parent_fd)
+        except BaseException:
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(fd)
+                if (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino):
+                    os.unlink(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(fd)
     finally:
-        os.close(directory_fd)
+        os.close(parent_fd)
 
 
 def _evaluate(content: str, criteria: Iterable[ExactCountCriterion]) -> tuple[CriterionResult, ...]:
@@ -404,6 +441,7 @@ def _evaluate(content: str, criteria: Iterable[ExactCountCriterion]) -> tuple[Cr
 
 
 def _row_to_result(row: sqlite3.Row) -> CertificationResult:
+    checks = json.loads(row["checks_json"])
     return CertificationResult(
         run_id=row["run_id"],
         status=row["status"],
@@ -411,9 +449,25 @@ def _row_to_result(row: sqlite3.Row) -> CertificationResult:
         artifact_path=row["artifact_path"],
         contract_hash=row["contract_hash"],
         artifact_hash=row["artifact_hash"],
-        checks=tuple(CriterionResult(**item) for item in json.loads(row["checks_json"])),
+        checks=tuple(CriterionResult(**{"text": "", **item}) for item in checks),
         agent_draft_claimed_pass=bool(row["agent_draft_claimed_pass"]),
         recorded_at=row["recorded_at"],
+    )
+
+
+def _minimized_checks_json(checks: Iterable[CriterionResult]) -> str:
+    """Serialize deterministic counts without retaining private criterion text."""
+    return json.dumps(
+        [
+            {
+                "name": check.name,
+                "expected_count": check.expected_count,
+                "actual_count": check.actual_count,
+                "passed": check.passed,
+            }
+            for check in checks
+        ],
+        sort_keys=True,
     )
 
 
@@ -429,21 +483,53 @@ def _insert_result(conn: sqlite3.Connection, result: CertificationResult) -> Non
             result.run_id,
             result.recorded_at,
             result.status,
-            result.output_path,
-            result.artifact_path,
+            "",
+            "",
             result.contract_hash,
             result.artifact_hash,
-            json.dumps([asdict(check) for check in result.checks], sort_keys=True),
+            _minimized_checks_json(result.checks),
             int(result.agent_draft_claimed_pass),
         ),
     )
 
 
-def _finalize_pending(conn: sqlite3.Connection, row: sqlite3.Row) -> CertificationResult:
+def _hydrate_result(
+    result: CertificationResult, snapshot: _ContractSnapshot
+) -> CertificationResult:
+    """Restore runtime-only data from the wrapper's pinned contract."""
+    criterion_text = {criterion.name: criterion.text for criterion in snapshot.criteria}
+    return replace(
+        result,
+        output_path=snapshot.output_path,
+        artifact_path=str(Path(snapshot.workspace_root) / snapshot.artifact_path),
+        checks=tuple(
+            replace(check, text=criterion_text.get(check.name, ""))
+            for check in result.checks
+        ),
+    )
+
+
+def _finalize_pending(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    output_path: Path,
+) -> CertificationResult:
     result = _row_to_result(row)
-    output_path = Path(result.output_path)
     staged_path_text = row["staged_path"] or ""
-    staged_path = Path(staged_path_text) if staged_path_text else None
+    staged_path = None
+    if staged_path_text:
+        stored_staged_path = Path(staged_path_text)
+        # New rows retain only the private temporary basename. Accept an
+        # absolute value solely for recovery of ledgers written by older code.
+        if stored_staged_path.is_absolute():
+            staged_path = stored_staged_path
+        elif stored_staged_path.name == staged_path_text:
+            staged_path = output_path.parent / stored_staged_path
+        else:
+            raise RuntimeError(
+                f"pending certification {result.run_id} has an unsafe staged path"
+            )
     journaled = row["artifact_bytes"]
     if journaled is None:
         if staged_path is None:
@@ -460,10 +546,12 @@ def _finalize_pending(conn: sqlite3.Connection, row: sqlite3.Row) -> Certificati
         artifact_bytes = bytes(journaled)
     if hashlib.sha256(artifact_bytes).hexdigest() != result.artifact_hash:
         raise RuntimeError(f"pending certification {result.run_id} journaled bytes changed")
-    # Publication owns the output descriptor from its first path lookup through
-    # the write and verification.  Do not preflight the path here and reopen it
-    # later, because the directory entry can change between those operations.
-    _publish_exact_output(output_path, artifact_bytes)
+    if result.status == "PASS":
+        # Publication owns the output descriptor from its first path lookup
+        # through the write and verification. Do not preflight the path here
+        # and reopen it later, because the directory entry can change between
+        # those operations.
+        _publish_exact_output(output_path, artifact_bytes)
     if staged_path is not None and staged_path.exists():
         staged_path.unlink()
 
@@ -472,6 +560,37 @@ def _finalize_pending(conn: sqlite3.Connection, row: sqlite3.Row) -> Certificati
         "DELETE FROM artifact_certification_pending WHERE run_id = ?",
         (result.run_id,),
     )
+    return result
+
+
+def _commit_failure(
+    ledger_path: Path,
+    result: CertificationResult,
+) -> CertificationResult:
+    """Record a deterministic FAIL without staging or retaining artifact bytes."""
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(ledger_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_ledger(conn)
+        recorded = conn.execute(
+            "SELECT * FROM artifact_certifications WHERE run_id = ?", (result.run_id,)
+        ).fetchone()
+        if recorded is not None:
+            return _row_to_result(recorded)
+        pending = conn.execute(
+            "SELECT * FROM artifact_certification_pending WHERE run_id = ?",
+            (result.run_id,),
+        ).fetchone()
+        if pending is not None:
+            # A prior PASS owns this run and must complete crash recovery.
+            # Legacy FAIL rows are finalized without publishing their bytes.
+            return _finalize_pending(
+                conn,
+                pending,
+                output_path=Path(result.output_path),
+            )
+        _insert_result(conn, result)
     return result
 
 
@@ -511,15 +630,15 @@ def _commit_recoverable(
                 """,
                 (
                     result.run_id,
-                    str(staged_path),
+                    staged_path.name,
                     artifact_bytes,
                     result.recorded_at,
                     result.status,
-                    result.output_path,
-                    result.artifact_path,
+                    "",
+                    "",
                     result.contract_hash,
                     result.artifact_hash,
-                    json.dumps([asdict(check) for check in result.checks], sort_keys=True),
+                    _minimized_checks_json(result.checks),
                     int(result.agent_draft_claimed_pass),
                 ),
             )
@@ -544,7 +663,11 @@ def _commit_recoverable(
             if recorded is None:
                 raise RuntimeError(f"certification commit state disappeared: {result.run_id}")
             return _row_to_result(recorded)
-        committed = _finalize_pending(conn, pending)
+        committed = _finalize_pending(
+            conn,
+            pending,
+            output_path=Path(result.output_path),
+        )
     return pending_result or committed
 
 
@@ -607,15 +730,8 @@ class CertifiedArtifactWrapper:
         artifact_bytes = _read_workspace_file(workspace_fd, self._snapshot.artifact_path)
         artifact = artifact_bytes.decode("utf-8")
         output_path = Path(self._snapshot.output_path)
-        try:
-            staged_path = _stage_exact_path(output_path, artifact_bytes)
-        except BaseException:
-            self._reserved_run_ids.discard(run_id)
-            raise
-
         # Evaluate and hash only the bytes read from the pinned workspace
-        # descriptor. The staged pathname is untrusted until commit verifies
-        # it with O_NOFOLLOW against this hash.
+        # descriptor. Failed bytes are never staged or published.
         checks = _evaluate(artifact, self._snapshot.criteria)
         status = "PASS" if all(check.passed for check in checks) else "FAIL"
         result = CertificationResult(
@@ -630,9 +746,14 @@ class CertifiedArtifactWrapper:
             recorded_at=_utc_now(),
         )
         try:
-            return _commit_recoverable(
-                self._ledger_path, result, staged_path, artifact_bytes
-            )
+            if status == "FAIL":
+                committed = _commit_failure(self._ledger_path, result)
+            else:
+                staged_path = _stage_exact_path(output_path, artifact_bytes)
+                committed = _commit_recoverable(
+                    self._ledger_path, result, staged_path, artifact_bytes
+                )
+            return _hydrate_result(committed, self._snapshot)
         except BaseException:
             self._reserved_run_ids.discard(run_id)
             raise

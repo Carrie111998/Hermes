@@ -64,6 +64,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+from agent.certification_runtime import publication_deferred
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -2031,7 +2032,7 @@ class AIAgent:
         # Certified ACP turns are withheld until the runtime has replaced
         # untrusted model prose with the wrapper-owned PASS/FAIL result. This
         # guard precedes both the JSON transcript and SQLite writes.
-        if getattr(self, "_certification_persistence_deferred", False):
+        if publication_deferred(self):
             self._session_messages = messages
             return
         # Scaffolding removal mutates the live list (desired — ephemeral
@@ -2163,7 +2164,7 @@ class AIAgent:
         # "becomes" the curator. Hard-stop before any DB touch.
         if (
             getattr(self, "_persist_disabled", False)
-            or getattr(self, "_certification_persistence_deferred", False)
+            or publication_deferred(self)
         ):
             return None
         if not self._session_db:
@@ -6920,6 +6921,8 @@ class AIAgent:
         }
 
     def _emit_stream_start(self) -> None:
+        if getattr(self, "_certification_persistence_deferred", False):
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -6928,6 +6931,8 @@ class AIAgent:
             logger.debug("on_stream_start plugin hook enqueue failed", exc_info=True)
 
     def _emit_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
+        if getattr(self, "_certification_persistence_deferred", False):
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -6943,6 +6948,11 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        # Certification owns the publication boundary. Until the runtime has
+        # accepted the buffered result, no raw provider delta may escape to a
+        # callback or passive plugin observer.
+        if getattr(self, "_certification_persistence_deferred", False):
+            return
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
@@ -7012,6 +7022,8 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if getattr(self, "_certification_persistence_deferred", False):
+            return
         # Single-writer guard (#65991): fence out a superseded stream's
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():
@@ -8415,9 +8427,6 @@ class AIAgent:
                      tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
                      skip_tool_execution_middleware: bool = False) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
-        if getattr(self, "_certification_persistence_deferred", False) is True:
-            skip_tool_request_middleware = True
-            skip_tool_execution_middleware = True
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
             self,

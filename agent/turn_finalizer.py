@@ -147,9 +147,9 @@ def finalize_turn(
     # observer capable of persisting, indexing, summarizing, exporting, or
     # handing raw model data to a plugin disabled until the wrapper replaces
     # this transcript with its runtime-owned result.
-    _certification_deferred = bool(
-        getattr(agent, "_certification_persistence_deferred", False)
-    )
+    from agent.certification_runtime import publication_deferred
+
+    _certification_deferred = publication_deferred(agent)
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations

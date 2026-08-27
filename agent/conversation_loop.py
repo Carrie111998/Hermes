@@ -98,35 +98,13 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_finalizer import finalize_turn
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
+from agent.certification_runtime import (
+    apply_llm_request,
+    publication_deferred,
+    run_llm_execution,
+    run_relay_llm_execution,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
-
-
-def _run_llm_execution_with_certification_guard(
-    agent,
-    request: dict[str, Any],
-    next_call,
-    **context: Any,
-):
-    """Bypass registered response observers for uncertified model execution."""
-    if getattr(agent, "_certification_persistence_deferred", False) is True:
-        return next_call(request)
-    from hermes_cli.middleware import run_llm_execution_middleware
-
-    return run_llm_execution_middleware(request, next_call, **context)
-
-
-def _run_relay_llm_execution_with_certification_guard(
-    agent,
-    request: dict[str, Any],
-    next_call,
-    **context: Any,
-):
-    """Keep uncertified non-streaming responses out of Relay observers."""
-    if getattr(agent, "_certification_persistence_deferred", False) is True:
-        return next_call(request)
-    from agent import relay_llm
-
-    return relay_llm.execute(request, next_call, **context)
 
 
 from hermes_logging import set_session_context
@@ -1075,9 +1053,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    certification_deferred = bool(
-        getattr(agent, "_certification_persistence_deferred", False)
-    )
+    certification_deferred = publication_deferred(agent)
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         if not certification_deferred:
@@ -1738,7 +1714,7 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
-    if getattr(agent, "_certification_persistence_deferred", False) is True:
+    if publication_deferred(agent):
         return api_messages
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
@@ -3043,32 +3019,29 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                if getattr(agent, "_certification_persistence_deferred", False) is True:
+                try:
+                    _llm_request_mw = apply_llm_request(
+                        agent,
+                        api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                    )
+                    api_kwargs = _llm_request_mw.payload
+                    _original_api_kwargs = _llm_request_mw.original_payload
+                    _llm_middleware_trace = _llm_request_mw.trace
+                except Exception:
+                    if publication_deferred(agent):
+                        raise
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
-                else:
-                    try:
-                        from hermes_cli.middleware import apply_llm_request_middleware
-
-                        _llm_request_mw = apply_llm_request_middleware(
-                            api_kwargs,
-                            task_id=effective_task_id,
-                            turn_id=turn_id,
-                            api_request_id=api_request_id,
-                            session_id=agent.session_id or "",
-                            platform=agent.platform or "",
-                            model=agent.model,
-                            provider=agent.provider,
-                            base_url=agent.base_url,
-                            api_mode=agent.api_mode,
-                            api_call_count=api_call_count,
-                        )
-                        api_kwargs = _llm_request_mw.payload
-                        _original_api_kwargs = _llm_request_mw.original_payload
-                        _llm_middleware_trace = _llm_request_mw.trace
-                    except Exception:
-                        _original_api_kwargs = dict(api_kwargs)
-                        _llm_middleware_trace = []
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -3228,14 +3201,17 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    provider_call = agent._interruptible_api_call
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                        provider_call = lambda request: (
+                            agent._interruptible_streaming_api_call(
+                                request, on_first_delta=_stop_spinner
+                            )
                         )
-                    return _run_relay_llm_execution_with_certification_guard(
+                    return run_relay_llm_execution(
                         agent,
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        provider_call,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),
@@ -3264,7 +3240,7 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = _run_llm_execution_with_certification_guard(
+                    response = run_llm_execution(
                         agent,
                         api_kwargs,
                         _perform_api_call,

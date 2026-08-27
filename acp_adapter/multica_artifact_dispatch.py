@@ -14,7 +14,7 @@ import re
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from agent.artifact_certification import (
     ArtifactContract,
@@ -143,6 +143,15 @@ def prepare_dispatch_certification(
     """Snapshot a required Multica contract before any model call."""
     if not certification_required():
         return None
+    from acp_adapter.certification_policy import (
+        CertificationCapabilityError,
+        require_artifact_certification_capability,
+    )
+
+    try:
+        require_artifact_certification_capability()
+    except CertificationCapabilityError as exc:
+        raise CertificationContractError(str(exc)) from exc
     if not isinstance(user_text, str):
         raise CertificationContractError("Multica artifact certification requires a text prompt")
     if not session_id.strip():
@@ -176,10 +185,9 @@ def prepare_dispatch_certification(
     )
     turn_id = hashlib.sha256(turn_payload.encode("utf-8")).hexdigest()[:32]
     digest = hashlib.sha256(f"{session_id}:{turn_id}".encode("utf-8")).hexdigest()[:16]
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id).strip("._")[:80] or "session"
-    output_path = home / "state" / "multica_artifacts" / f"{slug}-{turn_id}-{digest}.md"
+    output_path = home / "state" / "multica_artifacts" / f"{turn_id}-{digest}.md"
     ledger_path = home / "state" / "artifact_certifications.db"
-    run_id = f"multica:{session_id}:{turn_id}"
+    run_id = f"multica:{turn_id}"
     wrapper = CertifiedArtifactWrapper(
         contract=ArtifactContract(
             output_path=output_path,
@@ -227,10 +235,25 @@ def certify_dispatch_result(
     return _failure_response(result), result
 
 
+def dispatch_execution_failed(result: Mapping[str, Any]) -> bool:
+    """Return whether an ACP result is unsafe to submit for certification."""
+    status = result.get("status")
+    normalized_status = status.strip().lower() if isinstance(status, str) else ""
+    error = result.get("error")
+    has_error = error is not None and (not isinstance(error, str) or bool(error.strip()))
+    return (
+        result.get("failed") is True
+        or result.get("completed") is False
+        or normalized_status in {"partial", "failed", "error", "incomplete"}
+        or has_error
+    )
+
+
 __all__ = [
     "CertificationContractError",
     "PreparedDispatchCertification",
     "certification_required",
     "certify_dispatch_result",
+    "dispatch_execution_failed",
     "prepare_dispatch_certification",
 ]

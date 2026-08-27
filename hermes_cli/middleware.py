@@ -8,6 +8,7 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
 from __future__ import annotations
 
 import logging
+import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
+REQUIRE_LLM_EXECUTION_MIDDLEWARE_ENV = "HERMES_REQUIRE_LLM_EXECUTION_MIDDLEWARE"
 
 TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
@@ -32,6 +34,18 @@ VALID_MIDDLEWARE: set[str] = {
     LLM_REQUEST_MIDDLEWARE,
     LLM_EXECUTION_MIDDLEWARE,
 }
+
+
+class RequiredMiddlewareError(RuntimeError):
+    """Provider execution was refused because required middleware was unavailable."""
+
+
+def llm_execution_middleware_required() -> bool:
+    """Return whether provider execution must pass registered privacy middleware."""
+
+    return os.environ.get(
+        REQUIRE_LLM_EXECUTION_MIDDLEWARE_ENV, ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -76,6 +90,8 @@ def _safe_copy(payload: Any) -> Any:
 
 def apply_llm_request_middleware(
     request: Dict[str, Any],
+    *,
+    required: bool = False,
     **context: Any,
 ) -> RequestMiddlewareResult:
     """Apply registered LLM request middleware.
@@ -84,6 +100,10 @@ def apply_llm_request_middleware(
     provider kwargs before Hermes sends them.
     """
     if not _has_middleware(LLM_REQUEST_MIDDLEWARE):
+        if required:
+            raise RequiredMiddlewareError(
+                "required llm_request middleware is not registered"
+            )
         return RequestMiddlewareResult(
             payload=request,
             original_payload=request,
@@ -95,12 +115,24 @@ def apply_llm_request_middleware(
     current_request = _safe_copy(original_request)
     trace: List[Dict[str, Any]] = []
 
-    for result in _invoke_middleware(
-        LLM_REQUEST_MIDDLEWARE,
+    middleware_kwargs = middleware_payload(
         request=current_request,
         original_request=original_request,
         **context,
-    ):
+    )
+    if required:
+        results = _invoke_required_request_middleware(
+            LLM_REQUEST_MIDDLEWARE, middleware_kwargs
+        )
+    else:
+        results = _invoke_middleware(
+            LLM_REQUEST_MIDDLEWARE,
+            request=current_request,
+            original_request=original_request,
+            **context,
+        )
+
+    for result in results:
         if not isinstance(result, dict):
             continue
         next_request = result.get("request")
@@ -120,6 +152,8 @@ def apply_llm_request_middleware(
 def apply_tool_request_middleware(
     tool_name: str,
     args: Dict[str, Any],
+    *,
+    required: bool = False,
     **context: Any,
 ) -> RequestMiddlewareResult:
     """Apply registered tool request middleware.
@@ -146,6 +180,10 @@ def apply_tool_request_middleware(
             trace.append({"source": "nemo_relay"})
 
     if not _has_middleware(TOOL_REQUEST_MIDDLEWARE):
+        if required:
+            raise RequiredMiddlewareError(
+                "required tool_request middleware is not registered"
+            )
         return RequestMiddlewareResult(
             payload=args if not trace else current_args,
             original_payload=args,
@@ -153,13 +191,26 @@ def apply_tool_request_middleware(
             trace=trace,
         )
 
-    for result in _invoke_middleware(
-        TOOL_REQUEST_MIDDLEWARE,
+    middleware_kwargs = middleware_payload(
         tool_name=tool_name,
         args=current_args,
         original_args=original_args,
         **context,
-    ):
+    )
+    if required:
+        results = _invoke_required_request_middleware(
+            TOOL_REQUEST_MIDDLEWARE, middleware_kwargs
+        )
+    else:
+        results = _invoke_middleware(
+            TOOL_REQUEST_MIDDLEWARE,
+            tool_name=tool_name,
+            args=current_args,
+            original_args=original_args,
+            **context,
+        )
+
+    for result in results:
         if not isinstance(result, dict):
             continue
         next_args = result.get("args")
@@ -187,16 +238,23 @@ def apply_api_request_middleware(
 def run_llm_execution_middleware(
     request: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
+    *,
+    required: bool = False,
     **context: Any,
 ) -> Any:
     """Run provider execution through registered LLM execution middleware."""
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
+        if required:
+            raise RequiredMiddlewareError(
+                "required LLM execution middleware is not registered"
+            )
         return next_call(request)
     return _run_execution_chain(
         LLM_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
+        strict=required,
         request=request,
         original_request=context.pop("original_request", request),
         **context,
@@ -207,16 +265,23 @@ def run_tool_execution_middleware(
     tool_name: str,
     args: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
+    *,
+    required: bool = False,
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
+        if required:
+            raise RequiredMiddlewareError(
+                "required tool_execution middleware is not registered"
+            )
         return next_call(args)
     return _run_execution_chain(
         TOOL_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
+        strict=required,
         tool_name=tool_name,
         args=args,
         original_args=context.pop("original_args", args),
@@ -251,10 +316,29 @@ def _get_middleware_callbacks(kind: str) -> List[Callable]:
     return list(get_plugin_manager()._middleware.get(kind, []))
 
 
+def _invoke_required_request_middleware(
+    kind: str, kwargs: Dict[str, Any]
+) -> List[Any]:
+    """Invoke request middleware without the normal fail-open isolation."""
+
+    results: List[Any] = []
+    for callback in _get_middleware_callbacks(kind):
+        try:
+            result = callback(**kwargs)
+        except Exception as exc:
+            raise RequiredMiddlewareError(
+                f"required '{kind}' middleware failed before execution"
+            ) from exc
+        if result is not None:
+            results.append(result)
+    return results
+
+
 def _run_execution_chain(
     kind: str,
     callbacks: List[Callable],
     terminal_call: Callable[[Any], Any],
+    strict: bool = False,
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
@@ -307,6 +391,12 @@ def _run_execution_chain(
                 getattr(callback, "__name__", repr(callback)),
                 exc,
             )
+            if strict:
+                boundary = "provider" if payload_key == "request" else "tool"
+                timing = "after" if next_succeeded else "before"
+                raise RequiredMiddlewareError(
+                    f"required '{kind}' middleware failed {timing} {boundary} execution"
+                ) from exc
             if next_succeeded:
                 return next_result
             if next_called:

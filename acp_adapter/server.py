@@ -64,6 +64,11 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+from acp_adapter.certification_policy import (
+    artifact_certification_capability,
+    deny_unrendered_edit_approval,
+    deny_unrendered_terminal_approval,
+)
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     make_message_cb,
@@ -76,6 +81,7 @@ from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.multica_artifact_dispatch import (
     CertificationContractError,
     certify_dispatch_result,
+    dispatch_execution_failed,
     prepare_dispatch_certification,
 )
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
@@ -1321,6 +1327,11 @@ class HermesACPAgent(acp.Agent):
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
+                field_meta={
+                    "hermes": {
+                        "artifactCertification": artifact_certification_capability()
+                    }
+                },
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
@@ -2028,16 +2039,26 @@ class HermesACPAgent(acp.Agent):
                 except Exception:
                     logger.debug("Could not create ACP edit approval requester", exc_info=True)
             else:
-                # Both bridges publish model-authored command/edit details over
-                # ACP. Certified turns expose nothing until wrapper verdict.
-                approval_cb = None
-                edit_approval_requester = None
+                # Authorization still executes, but uncertified command and diff
+                # bytes cannot be rendered over ACP. Bind explicit fail-closed
+                # decisions instead of removing the authorization boundary.
+                approval_cb = deny_unrendered_terminal_approval
+                edit_approval_requester = deny_unrendered_edit_approval
         else:
             tool_progress_cb = None
             reasoning_cb = None
             step_cb = None
             stream_delta_cb = None
-            approval_cb = None
+            approval_cb = (
+                deny_unrendered_terminal_approval
+                if prepared_certification is not None
+                else None
+            )
+            edit_approval_requester = (
+                deny_unrendered_edit_approval
+                if prepared_certification is not None
+                else None
+            )
 
         agent = state.agent
         previous_certification_defer = bool(
@@ -2110,12 +2131,23 @@ class HermesACPAgent(acp.Agent):
                 clear_session_vars = None  # type: ignore[assignment]
                 logger.debug("Could not set ACP session context", exc_info=True)
             if approval_cb:
+                _terminal_tool = None
                 try:
                     from tools import terminal_tool as _terminal_tool
                     previous_approval_cb = _terminal_tool._get_approval_callback()
                     _terminal_tool.set_approval_callback(approval_cb)
                 except Exception:
                     logger.debug("Could not set ACP approval callback", exc_info=True)
+                    if prepared_certification is not None:
+                        try:
+                            if _terminal_tool is not None:
+                                _terminal_tool.set_approval_callback(previous_approval_cb)
+                        except Exception:
+                            logger.debug(
+                                "Could not restore ACP approval callback after setup failure",
+                                exc_info=True,
+                            )
+                        raise
             if edit_approval_requester:
                 try:
                     from acp_adapter.edit_approval import set_edit_approval_requester
@@ -2123,6 +2155,18 @@ class HermesACPAgent(acp.Agent):
                     edit_approval_token = set_edit_approval_requester(edit_approval_requester)
                 except Exception:
                     logger.debug("Could not set ACP edit approval requester", exc_info=True)
+                    if prepared_certification is not None:
+                        if approval_cb:
+                            try:
+                                from tools import terminal_tool as _terminal_tool
+
+                                _terminal_tool.set_approval_callback(previous_approval_cb)
+                            except Exception:
+                                logger.debug(
+                                    "Could not restore ACP approval callback after edit setup failure",
+                                    exc_info=True,
+                                )
+                        raise
             # Signal to tools.approval that we have an interactive callback
             # and the non-interactive auto-approve path must not fire. Uses a
             # contextvar (not os.environ) so concurrent executor workers don't
@@ -2156,6 +2200,8 @@ class HermesACPAgent(acp.Agent):
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
+                if prepared_certification is not None:
+                    raise
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
                 # Restore the interactive contextvar for this context.
@@ -2203,6 +2249,7 @@ class HermesACPAgent(acp.Agent):
         )
         pre_turn_hermes_id = getattr(state.agent, "session_id", None)
         worker_future = None
+        certification_execution_failed = False
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
             # can detect a compression-driven session rotation afterwards. The
@@ -2258,23 +2305,40 @@ class HermesACPAgent(acp.Agent):
                 "final_response": f"Runtime execution failed: {type(exc).__name__}: {exc}",
                 "messages": [],
             }
+            certification_execution_failed = True
 
         if prepared_certification is not None:
+            # The conversation loop reports some provider and required-
+            # middleware failures as a normal result so other frontends can
+            # render them. Certification must treat those incomplete turns
+            # exactly like an exception and never inspect a stale workspace
+            # artifact.
+            if dispatch_execution_failed(result):
+                certification_execution_failed = True
             try:
-                raw_final_response = result.get("final_response", "")
-                try:
-                    certified_response, certification = certify_dispatch_result(
-                        prepared_certification,
-                        raw_final_response,
-                    )
-                    result["final_response"] = certified_response
-                    result["artifact_certification"] = certification
-                except Exception as exc:
-                    logger.exception("Artifact certification failed closed for session %s", session_id)
+                if certification_execution_failed:
                     result["final_response"] = (
                         "ARTIFACT CERTIFICATION ERROR\n"
-                        f"Runtime-owned certification could not complete: {type(exc).__name__}: {exc}"
+                        "Runtime execution failed before artifact certification."
                     )
+                    result["artifact_certification"] = None
+                else:
+                    raw_final_response = result.get("final_response", "")
+                    try:
+                        certified_response, certification = certify_dispatch_result(
+                            prepared_certification,
+                            raw_final_response,
+                        )
+                        result["final_response"] = certified_response
+                        result["artifact_certification"] = certification
+                    except Exception as exc:
+                        logger.exception(
+                            "Artifact certification failed closed for session %s", session_id
+                        )
+                        result["final_response"] = (
+                            "ARTIFACT CERTIFICATION ERROR\n"
+                            "Runtime-owned certification could not complete."
+                        )
                 # Force the buffered runtime-owned response over ACP, even if a
                 # provider/plugin marked the original draft as already streamed.
                 result["response_transformed"] = True

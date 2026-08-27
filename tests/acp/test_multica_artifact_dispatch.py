@@ -11,6 +11,10 @@ from typing import Any, cast
 import pytest
 from acp.schema import TextContentBlock
 
+from acp_adapter.multica_artifact_dispatch import (
+    dispatch_execution_failed,
+    prepare_dispatch_certification,
+)
 from acp_adapter.server import HermesACPAgent
 
 
@@ -29,6 +33,37 @@ def _prompt(*criteria: tuple[str, str, int]) -> str:
         f"{json.dumps(payload)}\n"
         "</HERMES_ARTIFACT_CONTRACT>"
     )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": "partial", "final_response": "unfinished"},
+        {"status": "completed", "error": "tool failed"},
+    ],
+)
+def test_partial_or_errored_dispatch_result_fails_certification(result) -> None:
+    assert dispatch_execution_failed(result) is True
+
+
+def test_certification_identifiers_do_not_embed_raw_session_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HERMES_MULTICA_ARTIFACT_CERTIFICATION", "required")
+    session_id = "private-customer-session"
+
+    prepared = prepare_dispatch_certification(
+        user_text=_prompt(("marker", "MARKER", 1)),
+        session_id=session_id,
+        workspace_root=tmp_path,
+        hermes_home=tmp_path,
+    )
+
+    assert prepared is not None
+    assert session_id not in prepared.run_id
+    (tmp_path / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+    result = prepared.wrapper.run(run_id=prepared.run_id, draft="irrelevant")
+    assert session_id not in Path(result.output_path).name
 
 
 @pytest.mark.asyncio
@@ -63,6 +98,307 @@ async def test_acp_required_lane_rejects_missing_contract_without_agent_call(
 
 
 @pytest.mark.asyncio
+async def test_execution_failure_cannot_certify_preexisting_workspace_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import acp_adapter.multica_artifact_dispatch as dispatch
+
+    monkeypatch.setenv("HERMES_MULTICA_ARTIFACT_CERTIFICATION", "required")
+    monkeypatch.setattr(HermesACPAgent, "__abstractmethods__", frozenset())
+    monkeypatch.setattr(dispatch, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+
+    class FailingAgent:
+        model = "test"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+        session_id = "internal-failure"
+        context_compressor = None
+        tools = []
+        _cached_system_prompt = ""
+        _persist_disabled = False
+
+        def run_conversation(self, **_kwargs):
+            raise RuntimeError("private execution detail")
+
+    state = SimpleNamespace(
+        agent=FailingAgent(),
+        session_id="execution-failure",
+        cwd=str(tmp_path),
+        history=[],
+        cancel_event=threading.Event(),
+        runtime_lock=threading.Lock(),
+        is_running=False,
+        current_prompt_text="",
+        interrupted_prompt_text="",
+        queued_prompts=[],
+    )
+    manager = SimpleNamespace(
+        get_session=lambda _session_id: state,
+        save_session=lambda _session_id: None,
+    )
+    updates = []
+
+    class Connection:
+        async def session_update(self, session_id, update):
+            updates.append((session_id, update))
+
+    server = cast(Any, HermesACPAgent)(session_manager=cast(Any, manager))
+    server.on_connect(cast(Any, Connection()))
+    response = await server.prompt(
+        prompt=[TextContentBlock(type="text", text=_prompt(("marker", "MARKER", 1)))],
+        session_id="execution-failure",
+    )
+
+    assert response.stop_reason == "end_turn"
+    emitted = [update.content.text for _sid, update in updates if hasattr(update, "content")]
+    assert emitted == [
+        "ARTIFACT CERTIFICATION ERROR\n"
+        "Runtime execution failed before artifact certification."
+    ]
+    assert "private execution detail" not in emitted[0]
+    ledger = tmp_path / "state" / "artifact_certifications.db"
+    with sqlite3.connect(ledger) as conn:
+        certified = conn.execute(
+            "SELECT COUNT(*) FROM artifact_certifications"
+        ).fetchone()[0]
+    assert certified == 0
+    assert not list((tmp_path / "state" / "multica_artifacts").glob("*.md"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_boundary", ["terminal", "edit"])
+async def test_certified_approval_installation_failure_stops_before_agent_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failing_boundary: str,
+) -> None:
+    import acp_adapter.multica_artifact_dispatch as dispatch
+
+    monkeypatch.setenv("HERMES_MULTICA_ARTIFACT_CERTIFICATION", "required")
+    monkeypatch.setattr(HermesACPAgent, "__abstractmethods__", frozenset())
+    monkeypatch.setattr(dispatch, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+    calls = []
+
+    class NeverRunAgent:
+        model = "test"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+        session_id = "internal-approval-install"
+        context_compressor = None
+        tools = []
+        _cached_system_prompt = ""
+        _persist_disabled = False
+
+        def run_conversation(self, **_kwargs):
+            calls.append("agent")
+            raise AssertionError("agent must not run without approval boundaries")
+
+    state = SimpleNamespace(
+        agent=NeverRunAgent(),
+        session_id="approval-install",
+        cwd=str(tmp_path),
+        history=[],
+        cancel_event=threading.Event(),
+        runtime_lock=threading.Lock(),
+        is_running=False,
+        current_prompt_text="",
+        interrupted_prompt_text="",
+        queued_prompts=[],
+    )
+    manager = SimpleNamespace(
+        get_session=lambda _session_id: state,
+        save_session=lambda _session_id: None,
+    )
+    updates = []
+
+    class Connection:
+        async def session_update(self, session_id, update):
+            updates.append((session_id, update))
+
+    if failing_boundary == "terminal":
+        monkeypatch.setattr(
+            "tools.terminal_tool.set_approval_callback",
+            lambda _callback: (_ for _ in ()).throw(RuntimeError("install failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            "acp_adapter.edit_approval.set_edit_approval_requester",
+            lambda _requester: (_ for _ in ()).throw(RuntimeError("install failed")),
+        )
+
+    server = cast(Any, HermesACPAgent)(session_manager=cast(Any, manager))
+    server.on_connect(cast(Any, Connection()))
+    response = await server.prompt(
+        prompt=[TextContentBlock(type="text", text=_prompt(("marker", "MARKER", 1)))],
+        session_id="approval-install",
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert calls == []
+    emitted = [update.content.text for _sid, update in updates if hasattr(update, "content")]
+    assert emitted == [
+        "ARTIFACT CERTIFICATION ERROR\n"
+        "Runtime execution failed before artifact certification."
+    ]
+    assert not list((tmp_path / "state" / "multica_artifacts").glob("*.md"))
+
+
+@pytest.mark.asyncio
+async def test_failed_result_cannot_certify_preexisting_workspace_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import acp_adapter.multica_artifact_dispatch as dispatch
+
+    monkeypatch.setenv("HERMES_MULTICA_ARTIFACT_CERTIFICATION", "required")
+    monkeypatch.setattr(HermesACPAgent, "__abstractmethods__", frozenset())
+    monkeypatch.setattr(dispatch, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+
+    class FailedResultAgent:
+        model = "test"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+        session_id = "internal-failure-result"
+        context_compressor = None
+        tools = []
+        _cached_system_prompt = ""
+        _persist_disabled = False
+
+        def run_conversation(self, **_kwargs):
+            return {
+                "completed": False,
+                "failed": True,
+                "error": "private middleware failure",
+            }
+
+    state = SimpleNamespace(
+        agent=FailedResultAgent(),
+        session_id="failed-result",
+        cwd=str(tmp_path),
+        history=[],
+        cancel_event=threading.Event(),
+        runtime_lock=threading.Lock(),
+        is_running=False,
+        current_prompt_text="",
+        interrupted_prompt_text="",
+        queued_prompts=[],
+    )
+    manager = SimpleNamespace(
+        get_session=lambda _session_id: state,
+        save_session=lambda _session_id: None,
+    )
+    updates = []
+
+    class Connection:
+        async def session_update(self, session_id, update):
+            updates.append((session_id, update))
+
+    server = cast(Any, HermesACPAgent)(session_manager=cast(Any, manager))
+    server.on_connect(cast(Any, Connection()))
+    response = await server.prompt(
+        prompt=[TextContentBlock(type="text", text=_prompt(("marker", "MARKER", 1)))],
+        session_id="failed-result",
+    )
+
+    assert response.stop_reason == "end_turn"
+    emitted = [update.content.text for _sid, update in updates if hasattr(update, "content")]
+    assert emitted == [
+        "ARTIFACT CERTIFICATION ERROR\n"
+        "Runtime execution failed before artifact certification."
+    ]
+    assert "private middleware failure" not in emitted[0]
+    ledger = tmp_path / "state" / "artifact_certifications.db"
+    with sqlite3.connect(ledger) as conn:
+        certified = conn.execute(
+            "SELECT COUNT(*) FROM artifact_certifications"
+        ).fetchone()[0]
+    assert certified == 0
+    assert not list((tmp_path / "state" / "multica_artifacts").glob("*.md"))
+
+
+@pytest.mark.asyncio
+async def test_partial_errored_result_cannot_certify_preexisting_workspace_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import acp_adapter.multica_artifact_dispatch as dispatch
+
+    monkeypatch.setenv("HERMES_MULTICA_ARTIFACT_CERTIFICATION", "required")
+    monkeypatch.setattr(HermesACPAgent, "__abstractmethods__", frozenset())
+    monkeypatch.setattr(dispatch, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+
+    class PartialResultAgent:
+        model = "test"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+        session_id = "internal-partial-result"
+        context_compressor = None
+        tools = []
+        _cached_system_prompt = ""
+        _persist_disabled = False
+
+        def run_conversation(self, **_kwargs):
+            return {
+                "status": "partial",
+                "error": "tool failed after partial output",
+                "final_response": "uncertified draft",
+            }
+
+    state = SimpleNamespace(
+        agent=PartialResultAgent(),
+        session_id="partial-result",
+        cwd=str(tmp_path),
+        history=[],
+        cancel_event=threading.Event(),
+        runtime_lock=threading.Lock(),
+        is_running=False,
+        current_prompt_text="",
+        interrupted_prompt_text="",
+        queued_prompts=[],
+    )
+    manager = SimpleNamespace(
+        get_session=lambda _session_id: state,
+        save_session=lambda _session_id: None,
+    )
+    updates = []
+
+    class Connection:
+        async def session_update(self, session_id, update):
+            updates.append((session_id, update))
+
+    server = cast(Any, HermesACPAgent)(session_manager=cast(Any, manager))
+    server.on_connect(cast(Any, Connection()))
+    response = await server.prompt(
+        prompt=[TextContentBlock(type="text", text=_prompt(("marker", "MARKER", 1)))],
+        session_id="partial-result",
+    )
+
+    assert response.stop_reason == "end_turn"
+    emitted = [update.content.text for _sid, update in updates if hasattr(update, "content")]
+    assert emitted == [
+        "ARTIFACT CERTIFICATION ERROR\n"
+        "Runtime execution failed before artifact certification."
+    ]
+    ledger = tmp_path / "state" / "artifact_certifications.db"
+    with sqlite3.connect(ledger) as conn:
+        certified = conn.execute(
+            "SELECT COUNT(*) FROM artifact_certifications"
+        ).fetchone()[0]
+    assert certified == 0
+    assert not list((tmp_path / "state" / "multica_artifacts").glob("*.md"))
+
+
+@pytest.mark.asyncio
 async def test_acp_buffers_hostile_draft_and_emits_runtime_failure_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -75,6 +411,33 @@ async def test_acp_buffers_hostile_draft_and_emits_runtime_failure_only(
     monkeypatch.setattr(title_generator, "maybe_auto_title", lambda *_args, **_kwargs: None)
 
     leaked_tool_completions = []
+    provider_requests = []
+
+    def redact_request(request, **_context):
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        safe = {**request, "messages": [{"role": "user", "content": "[REDACTED]"}]}
+        return RequestMiddlewareResult(
+            payload=safe,
+            original_payload=request,
+            changed=True,
+            trace=[{"source": "privacy"}],
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        redact_request,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: SimpleNamespace(
+            _middleware={
+                "llm_execution": [
+                    lambda request, next_call, **_context: next_call(request)
+                ]
+            }
+        ),
+    )
 
     def preexisting_tool_complete_callback(*args):
         leaked_tool_completions.append(args)
@@ -104,8 +467,34 @@ async def test_acp_buffers_hostile_draft_and_emits_runtime_failure_only(
             from acp_adapter.edit_approval import get_edit_approval_requester
             from tools import terminal_tool
 
-            assert terminal_tool._get_approval_callback() is None
-            assert get_edit_approval_requester() is None
+            approval = terminal_tool._get_approval_callback()
+            edit_approval = get_edit_approval_requester()
+            assert approval is not None
+            assert approval("rm -rf /", "uncertified command") == "deny"
+            assert edit_approval is not None
+            assert edit_approval(cast(Any, SimpleNamespace())) is False
+            from acp_adapter.edit_approval import maybe_require_edit_approval
+            from agent.certification_runtime import apply_llm_request, run_llm_execution
+
+            denied_path = tmp_path / "must-not-exist.txt"
+            denied = maybe_require_edit_approval(
+                "write_file",
+                {"path": str(denied_path), "content": "uncertified bytes"},
+            )
+            assert denied is not None
+            assert denied_path.exists() is False
+
+            request = apply_llm_request(
+                self,
+                {"messages": [{"role": "user", "content": "private"}]},
+                session_id="hostile-acp",
+            )
+            run_llm_execution(
+                self,
+                request.payload,
+                lambda payload: provider_requests.append(payload) or "provider response",
+                session_id="hostile-acp",
+            )
             draft = "PASS. AF-004 appears twice: AF-004"
             (tmp_path / "deliverable.md").write_text(draft, encoding="utf-8")
             messages = [
@@ -173,15 +562,67 @@ async def test_acp_buffers_hostile_draft_and_emits_runtime_failure_only(
         "ARTIFACT CERTIFICATION FAIL\n"
         "Runtime-owned verification rejected the agent draft. required heading: expected 1, actual 0; "
         "single marker: expected 1, actual 2\n"
-        "Certification run: multica:hostile-acp:"
+        "Certification run: multica:"
     )
+    assert "hostile-acp" not in emitted[0]
     assert state.history[-1]["content"].startswith("ARTIFACT CERTIFICATION FAIL")
     assert len(state.agent.persisted) == 1
     durable_text = json.dumps(state.agent.persisted[0])
     assert "PASS. AF-004 appears twice" not in durable_text
     assert "SECRET THOUGHT" not in durable_text
     assert leaked_tool_completions == []
+    assert provider_requests == [
+        {"messages": [{"role": "user", "content": "[REDACTED]"}]}
+    ]
     assert state.agent.tool_complete_callback is preexisting_tool_complete_callback
+
+
+@pytest.mark.asyncio
+async def test_windows_required_lane_refuses_before_agent_call_and_advertises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import acp_adapter.certification_policy as policy
+
+    monkeypatch.setenv("HERMES_MULTICA_ARTIFACT_CERTIFICATION", "required")
+    monkeypatch.setattr(policy, "_runtime_platform", lambda: "win32")
+    monkeypatch.setattr(HermesACPAgent, "__abstractmethods__", frozenset())
+
+    class NeverRunAgent:
+        def run_conversation(self, **_kwargs):
+            raise AssertionError("unsupported certification must refuse before model execution")
+
+    state = SimpleNamespace(
+        agent=NeverRunAgent(), session_id="windows", cwd=".", history=[]
+    )
+    manager = SimpleNamespace(get_session=lambda _session_id: state)
+    updates = []
+
+    class Connection:
+        async def session_update(self, session_id, update):
+            updates.append((session_id, update))
+
+    server = cast(Any, HermesACPAgent)(session_manager=cast(Any, manager))
+    server.on_connect(cast(Any, Connection()))
+    initialized = await server.initialize()
+    capability = initialized.agent_capabilities.field_meta["hermes"][
+        "artifactCertification"
+    ]
+
+    assert capability["available"] is False
+    assert capability["reason"] == "unsupported_platform"
+
+    response = await server.prompt(
+        prompt=[
+            TextContentBlock(
+                type="text", text=_prompt(("marker", "MARKER", 1))
+            )
+        ],
+        session_id="windows",
+    )
+
+    assert response.stop_reason == "refusal"
+    assert len(updates) == 1
+    assert "not supported on Windows" in updates[0][1].content.text
 
 
 @pytest.mark.asyncio
@@ -433,6 +874,7 @@ async def test_certified_turns_are_unique_and_overlapping_prompts_never_redirect
         ).fetchall()
     assert len(rows) == 2
     assert rows[0][0] != rows[1][0]
-    assert all(row[0].startswith("multica:overlap-acp:") for row in rows)
+    assert all(row[0].startswith("multica:") for row in rows)
+    assert all("overlap-acp" not in row[0] for row in rows)
     assert [row[1] for row in rows] == ["PASS", "PASS"]
     assert rows[0][2] != rows[1][2]

@@ -40,7 +40,7 @@ def test_hostile_agent_cannot_override_failed_deterministic_criteria(tmp_path):
     artifact.write_text(hostile_test_agent(), encoding="utf-8")
     result = wrapper.run(run_id="hostile-false-pass", draft=hostile_test_agent())
 
-    assert output.read_text(encoding="utf-8") == hostile_test_agent()
+    assert not output.exists()
     assert result.status == "FAIL"
     assert result.agent_draft_claimed_pass is True
     assert [check.actual_count for check in result.checks] == [0, 2]
@@ -51,6 +51,23 @@ def test_hostile_agent_cannot_override_failed_deterministic_criteria(tmp_path):
     assert recorded.status == "FAIL"
     assert recorded.contract_hash == result.contract_hash
     assert recorded.artifact_hash == result.artifact_hash
+
+    with sqlite3.connect(ledger) as conn:
+        pending_count = conn.execute(
+            "SELECT COUNT(*) FROM artifact_certification_pending"
+        ).fetchone()[0]
+        output_path, artifact_path, checks_json = conn.execute(
+            """
+            SELECT output_path, artifact_path, checks_json
+            FROM artifact_certifications WHERE run_id = ?
+            """,
+            ("hostile-false-pass",),
+        ).fetchone()
+    assert pending_count == 0
+    assert output_path == ""
+    assert artifact_path == ""
+    assert "## Required" not in checks_json
+    assert "AF-004" not in checks_json
 
     # Certification rows are append-only. Neither model prose nor a later
     # caller can rewrite the recorded deterministic FAIL into PASS.
@@ -92,6 +109,18 @@ def test_wrapper_owns_exact_path_and_criteria_snapshot(tmp_path):
     assert result.checks[0].expected_count == 1
     assert expected.read_text(encoding="utf-8") == "ONLY_ONCE\n"
     assert not decoy.exists()
+
+    with sqlite3.connect(ledger) as conn:
+        output_path, artifact_path, checks_json = conn.execute(
+            """
+            SELECT output_path, artifact_path, checks_json
+            FROM artifact_certifications WHERE run_id = ?
+            """,
+            ("path-owned-by-wrapper",),
+        ).fetchone()
+    assert output_path == ""
+    assert artifact_path == ""
+    assert "ONLY_ONCE" not in checks_json
 
 
 def test_artifact_hash_covers_exact_on_disk_bytes(tmp_path):
@@ -141,7 +170,11 @@ def test_certified_run_retry_returns_immutable_record_without_replacing_artifact
     recorded = read_certification(tmp_path / "certifications.db", "same-run")
     assert recorded is not None
     assert recorded.status == "PASS"
-    assert retry == recorded
+    assert retry.contract_hash == recorded.contract_hash
+    assert retry.artifact_hash == recorded.artifact_hash
+    assert [check.actual_count for check in retry.checks] == [
+        check.actual_count for check in recorded.checks
+    ]
 
 
 def test_interrupted_commit_is_recovered_without_replacing_original_draft(
@@ -180,6 +213,18 @@ def test_interrupted_commit_is_recovered_without_replacing_original_draft(
         wrapper.run(run_id="recoverable-run", draft="MARKER\n")
 
     assert read_certification(ledger, "recoverable-run") is None
+    with sqlite3.connect(ledger) as conn:
+        staged_path, output_path = conn.execute(
+            """
+            SELECT staged_path, output_path
+            FROM artifact_certification_pending
+            WHERE run_id = ?
+            """,
+            ("recoverable-run",),
+        ).fetchone()
+    assert output_path == ""
+    assert staged_path == Path(staged_path).name
+    assert str(tmp_path) not in staged_path
     artifact.write_text("replacement draft must not win\n", encoding="utf-8")
     result = wrapper.run(
         run_id="recoverable-run",
@@ -188,7 +233,16 @@ def test_interrupted_commit_is_recovered_without_replacing_original_draft(
 
     assert result.status == "PASS"
     assert output.read_text(encoding="utf-8") == "MARKER\n"
-    assert read_certification(ledger, "recoverable-run") == result
+    recorded = read_certification(ledger, "recoverable-run")
+    assert recorded is not None
+    assert recorded.status == result.status
+    assert recorded.contract_hash == result.contract_hash
+    assert recorded.artifact_hash == result.artifact_hash
+    with sqlite3.connect(ledger) as conn:
+        durable_paths = conn.execute(
+            "SELECT output_path, artifact_path FROM artifact_certifications"
+        ).fetchall()
+    assert durable_paths == [("", "")]
 
 
 def test_certification_defer_blocks_json_and_sqlite_persistence_sinks():
@@ -257,7 +311,7 @@ def test_wrapper_certifies_authoritative_artifact_not_model_prose(tmp_path):
     result = wrapper.run(run_id="authoritative-file", draft="MARKER\nPASS")
 
     assert result.status == "FAIL"
-    assert output.read_text(encoding="utf-8") == "WRONG\n"
+    assert not output.exists()
 
 
 def test_crash_after_reservation_before_pending_fails_closed_on_retry(
@@ -337,15 +391,13 @@ def test_certification_fails_closed_on_post_validation_symlink_swap(
     ) is None
 
 
-def test_certification_fails_closed_if_wrapper_staging_path_is_swapped(
+def test_failed_certification_does_not_stage_artifact(
     monkeypatch, tmp_path
 ):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     artifact = workspace / "deliverable.md"
     artifact.write_text("WRONG\n", encoding="utf-8")
-    external = tmp_path / "external.md"
-    external.write_text("MARKER\n", encoding="utf-8")
     ledger = tmp_path / "certifications.db"
     wrapper = CertifiedArtifactWrapper(
         contract=ArtifactContract(
@@ -355,6 +407,37 @@ def test_certification_fails_closed_if_wrapper_staging_path_is_swapped(
             criteria=(ExactCountCriterion("marker", "MARKER", 1),),
         ),
         ledger_path=ledger,
+    )
+    monkeypatch.setattr(
+        "agent.artifact_certification._stage_exact_path",
+        lambda *_args, **_kwargs: pytest.fail("FAIL artifact must not be staged"),
+    )
+
+    result = wrapper.run(run_id="staging-swap", draft="MARKER\nPASS")
+
+    assert result.status == "FAIL"
+    assert not (tmp_path / "certified.md").exists()
+    recorded = read_certification(ledger, "staging-swap")
+    assert recorded is not None
+    assert recorded.status == result.status
+    assert recorded.artifact_hash == result.artifact_hash
+
+
+def test_verified_staging_path_cannot_publish_replacement_bytes(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+    external = tmp_path / "external.md"
+    external.write_text("ATTACKER MARKER\n", encoding="utf-8")
+    output = tmp_path / "certified.md"
+    wrapper = CertifiedArtifactWrapper(
+        contract=ArtifactContract(
+            output_path=output,
+            workspace_root=workspace,
+            artifact_path=Path("deliverable.md"),
+            criteria=(ExactCountCriterion("marker", "MARKER", 1),),
+        ),
+        ledger_path=tmp_path / "certifications.db",
     )
     real_stage = __import__(
         "agent.artifact_certification", fromlist=["_stage_exact_path"]
@@ -370,45 +453,10 @@ def test_certification_fails_closed_if_wrapper_staging_path_is_swapped(
         "agent.artifact_certification._stage_exact_path", swap_staging_path
     )
 
-    result = wrapper.run(run_id="staging-swap", draft="MARKER\nPASS")
+    result = wrapper.run(run_id="publication-race", draft="irrelevant")
 
-    assert result.status == "FAIL"
-    assert read_certification(ledger, "staging-swap") == result
-    assert (tmp_path / "certified.md").read_bytes() == b"WRONG\n"
-
-
-def test_verified_staging_path_cannot_publish_replacement_bytes(monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "deliverable.md").write_text("WRONG\n", encoding="utf-8")
-    output = tmp_path / "certified.md"
-    wrapper = CertifiedArtifactWrapper(
-        contract=ArtifactContract(
-            output_path=output,
-            workspace_root=workspace,
-            artifact_path=Path("deliverable.md"),
-            criteria=(ExactCountCriterion("marker", "MARKER", 1),),
-        ),
-        ledger_path=tmp_path / "certifications.db",
-    )
-    real_replace = os.replace
-
-    def replace_with_attacker_bytes(source, destination):
-        source = Path(source)
-        source.unlink()
-        source.write_text("ATTACKER MARKER\n", encoding="utf-8")
-        return real_replace(source, destination)
-
-    monkeypatch.setattr("agent.artifact_certification.os.replace", replace_with_attacker_bytes)
-
-    try:
-        result = wrapper.run(run_id="publication-race", draft="irrelevant")
-    except RuntimeError:
-        result = None
-
-    assert not output.exists() or output.read_bytes() == b"WRONG\n"
-    if result is not None:
-        assert result.status == "FAIL"
+    assert result.status == "PASS"
+    assert output.read_bytes() == b"MARKER\n"
 
 
 def test_output_is_opened_once_for_check_and_write(monkeypatch, tmp_path):
@@ -430,7 +478,7 @@ def test_output_is_opened_once_for_check_and_write(monkeypatch, tmp_path):
 
     def count_output_opens(path, flags, mode=0o777, *, dir_fd=None):
         nonlocal output_opens
-        if dir_fd is None and os.fspath(path) == os.fspath(output):
+        if dir_fd is not None and os.fspath(path) == output.name:
             output_opens += 1
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
@@ -441,6 +489,54 @@ def test_output_is_opened_once_for_check_and_write(monkeypatch, tmp_path):
     assert result.status == "PASS"
     assert output.read_bytes() == b"MARKER\n"
     assert output_opens == 1
+
+
+def test_output_parent_swap_cannot_redirect_publication(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "deliverable.md").write_text("MARKER\n", encoding="utf-8")
+    safe_parent = tmp_path / "safe"
+    safe_parent.mkdir()
+    displaced_parent = tmp_path / "safe-original"
+    external = tmp_path / "external"
+    external.mkdir()
+    output = safe_parent / "certified.md"
+    wrapper = CertifiedArtifactWrapper(
+        contract=ArtifactContract(
+            output_path=output,
+            workspace_root=workspace,
+            artifact_path=Path("deliverable.md"),
+            criteria=(ExactCountCriterion("marker", "MARKER", 1),),
+        ),
+        ledger_path=tmp_path / "certifications.db",
+    )
+    real_open = os.open
+    swapped = False
+
+    def swap_parent_before_leaf_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        is_output_leaf = (
+            (dir_fd is None and os.fspath(path) == os.fspath(output))
+            or (dir_fd is not None and os.fspath(path) == output.name)
+        )
+        if is_output_leaf and not swapped:
+            safe_parent.rename(displaced_parent)
+            safe_parent.symlink_to(external, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "agent.artifact_certification.os.open", swap_parent_before_leaf_open
+    )
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        wrapper.run(run_id="output-parent-race", draft="irrelevant")
+
+    assert not (displaced_parent / "certified.md").exists()
+    assert not (external / "certified.md").exists()
+    assert read_certification(
+        tmp_path / "certifications.db", "output-parent-race"
+    ) is None
 
 
 def test_same_wrapper_retry_after_pre_pending_failure_cannot_change_bytes(

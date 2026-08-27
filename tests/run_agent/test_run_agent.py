@@ -6026,6 +6026,89 @@ def _make_chunk(content=None, tool_calls=None, finish_reason=None, model="test/m
     return SimpleNamespace(model=model, choices=[choice])
 
 
+def test_certified_streaming_conversation_uses_relay_before_provider(agent):
+    """The production streaming path must not bypass Relay admission/rewrites."""
+
+    agent._certification_persistence_deferred = True
+    agent.max_iterations = 2
+    agent.stream_delta_callback = MagicMock()
+    agent.client.chat.completions.create.return_value = iter(
+        [
+            _make_chunk(content="relay-safe"),
+            _make_chunk(finish_reason="stop"),
+        ]
+    )
+
+    def relay_execute(request, callback, **_context):
+        return callback({**request, "relay_admitted": True})
+
+    def execution_middleware(request, callback, **_context):
+        return callback(request)
+
+    def request_middleware(request, **_context):
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        return RequestMiddlewareResult(
+            payload=request,
+            original_payload=request,
+            changed=False,
+            trace=[],
+        )
+
+    with (
+        patch("agent.relay_llm.execute", side_effect=relay_execute) as relay,
+        patch(
+            "hermes_cli.middleware.apply_llm_request_middleware",
+            side_effect=request_middleware,
+        ),
+        patch(
+            "hermes_cli.middleware.run_llm_execution_middleware",
+            side_effect=execution_middleware,
+        ),
+    ):
+        result = agent.run_conversation("private draft")
+
+    assert result["final_response"].startswith("relay-safe")
+    relay.assert_called_once()
+    provider_kwargs = agent.client.chat.completions.create.call_args.kwargs
+    assert provider_kwargs["stream"] is True
+    assert provider_kwargs["relay_admitted"] is True
+
+
+def test_certified_request_middleware_failure_makes_zero_provider_calls(agent):
+    """The loop must not swallow a certified request-boundary refusal."""
+
+    from hermes_cli.middleware import RequiredMiddlewareError
+
+    agent._certification_persistence_deferred = True
+    agent.max_iterations = 1
+
+    with patch(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        side_effect=RequiredMiddlewareError("required llm_request failed"),
+    ):
+        agent.run_conversation("private draft")
+
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_certification_deferral_suppresses_stream_delta_observers(agent):
+    """Raw uncertified text must not reach callbacks or plugin observers."""
+
+    secret = "UNCERTIFIED SECRET"
+    agent._certification_persistence_deferred = True
+    agent.stream_delta_callback = MagicMock()
+    agent._stream_callback = MagicMock()
+
+    with patch("agent.plugin_stream_hooks.enqueue_plugin_stream_hook") as plugin_hook:
+        agent._fire_stream_delta(secret)
+
+    agent.stream_delta_callback.assert_not_called()
+    agent._stream_callback.assert_not_called()
+    plugin_hook.assert_not_called()
+    assert secret not in getattr(agent, "_current_streamed_assistant_text", "")
+
+
 def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
     """Build a SimpleNamespace mimicking a streaming tool_call delta."""
     func = SimpleNamespace(name=name, arguments=arguments)

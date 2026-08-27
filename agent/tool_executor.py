@@ -33,6 +33,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.certification_runtime import publication_deferred
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -591,9 +592,7 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
-    certification_deferred = bool(
-        getattr(agent, "_certification_persistence_deferred", False)
-    )
+    suppress_publication = publication_deferred(agent)
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -627,7 +626,7 @@ def _run_agent_tool_execution_middleware(
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 display_index=display_index,
-                publish_observers=not certification_deferred,
+                publish_observers=not suppress_publication,
             )
 
         def _advance_start_order(callback=None) -> None:
@@ -639,7 +638,7 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
-        if block_message is None and not certification_deferred:
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
@@ -657,12 +656,19 @@ def _run_agent_tool_execution_middleware(
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
+                        required=suppress_publication,
                     )
                     if modified_args is not None:
                         final_args = modified_args
                         state["args"] = modified_args
                     return block_msg
-                except Exception:
+                except Exception as exc:
+                    if suppress_publication:
+                        from hermes_cli.middleware import RequiredMiddlewareError
+
+                        raise RequiredMiddlewareError(
+                            "required pre_tool_call policy failed before tool dispatch"
+                        ) from exc
                     return None
 
             block_message = (
@@ -736,12 +742,11 @@ def _run_agent_tool_execution_middleware(
             _hb_thread.join(timeout=2.0)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
-        if certification_deferred:
-            return _authorized_dispatch(relay_args)
         request_result = apply_tool_request_middleware(
             function_name,
             relay_args,
             skip_relay=True,
+            required=suppress_publication,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
             tool_call_id=tool_call_id or "",
@@ -761,6 +766,7 @@ def _run_agent_tool_execution_middleware(
             lambda next_args: _authorized_dispatch(
                 next_args if isinstance(next_args, dict) else request_args
             ),
+            required=suppress_publication,
             original_args=function_args,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
@@ -769,21 +775,18 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    if certification_deferred:
-        result = _hermes_pipeline(function_args)
-    else:
-        result, _relay_args = relay_tools.execute(
-            function_name,
-            function_args,
-            _hermes_pipeline,
-            session_id=str(getattr(agent, "session_id", "") or ""),
-            metadata={
-                "task_id": effective_task_id or "",
-                "turn_id": getattr(agent, "_current_turn_id", "") or "",
-                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-                "tool_call_id": tool_call_id or "",
-            },
-        )
+    result, _relay_args = relay_tools.execute(
+        function_name,
+        function_args,
+        _hermes_pipeline,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        metadata={
+            "task_id": effective_task_id or "",
+            "turn_id": getattr(agent, "_current_turn_id", "") or "",
+            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+            "tool_call_id": tool_call_id or "",
+        },
+    )
     return _ManagedToolResult(
         result=result,
         args=state["args"],
