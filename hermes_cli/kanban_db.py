@@ -1335,6 +1335,22 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class RunAccounting:
+    """Canonical per-attempt usage supplied by the worker finalizer."""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    service_tier: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    api_call_count: Optional[int] = None
+    actual_cost_usd: Optional[Any] = None
+    usage_status: str = "reported"
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1498,7 +1514,27 @@ CREATE TABLE IF NOT EXISTS task_runs (
     route_snapshot      TEXT,
     input_tokens        INTEGER,
     output_tokens       INTEGER,
-    cost_usd            REAL
+    cost_usd            REAL,
+    attempt_number      INTEGER NOT NULL DEFAULT 1,
+    run_kind            TEXT NOT NULL DEFAULT 'initial',
+    retry_of_run_id     INTEGER,
+    escalation_of_run_id INTEGER,
+    provider            TEXT,
+    model               TEXT,
+    service_tier        TEXT,
+    routing_complexity  TEXT,
+    cache_read_tokens   INTEGER,
+    cache_write_tokens  INTEGER,
+    reasoning_tokens    INTEGER,
+    api_call_count      INTEGER,
+    estimated_cost_usd  REAL,
+    actual_cost_usd     REAL,
+    usage_status        TEXT,
+    cost_status         TEXT,
+    cost_source         TEXT,
+    policy_version      TEXT,
+    registry_version    TEXT,
+    duration_ms         INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2818,6 +2854,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("input_tokens", "input_tokens INTEGER"),
             ("output_tokens", "output_tokens INTEGER"),
             ("cost_usd", "cost_usd REAL"),
+            ("attempt_number", "attempt_number INTEGER NOT NULL DEFAULT 1"),
+            ("run_kind", "run_kind TEXT NOT NULL DEFAULT 'initial'"),
+            ("retry_of_run_id", "retry_of_run_id INTEGER"),
+            ("escalation_of_run_id", "escalation_of_run_id INTEGER"),
+            ("provider", "provider TEXT"), ("model", "model TEXT"),
+            ("service_tier", "service_tier TEXT"), ("routing_complexity", "routing_complexity TEXT"),
+            ("cache_read_tokens", "cache_read_tokens INTEGER"), ("cache_write_tokens", "cache_write_tokens INTEGER"),
+            ("reasoning_tokens", "reasoning_tokens INTEGER"), ("api_call_count", "api_call_count INTEGER"),
+            ("estimated_cost_usd", "estimated_cost_usd REAL"), ("actual_cost_usd", "actual_cost_usd REAL"),
+            ("usage_status", "usage_status TEXT"), ("cost_status", "cost_status TEXT"),
+            ("cost_source", "cost_source TEXT"), ("policy_version", "policy_version TEXT"),
+            ("registry_version", "registry_version TEXT"), ("duration_ms", "duration_ms INTEGER"),
         ):
             if _name not in run_cols:
                 _add_column_if_missing(conn, "task_runs", _name, _definition)
@@ -4737,6 +4785,41 @@ def _snapshot_claim_route(conn: sqlite3.Connection, task_id: str, status: str) -
     return route
 
 
+def record_run_accounting(
+    conn: sqlite3.Connection, *, task_id: str, run_id: int, accounting: RunAccounting,
+) -> bool:
+    """Persist one run's absolute usage totals and registry-derived estimate."""
+    row = conn.execute("SELECT id FROM task_runs WHERE id=? AND task_id=?", (run_id, task_id)).fetchone()
+    if row is None:
+        return False
+    estimate = None
+    source = status = version = None
+    if accounting.usage_status != "unavailable" and accounting.model:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        usage = CanonicalUsage(
+            input_tokens=accounting.input_tokens or 0, output_tokens=accounting.output_tokens or 0,
+            cache_read_tokens=accounting.cache_read_tokens or 0,
+            cache_write_tokens=accounting.cache_write_tokens or 0,
+            reasoning_tokens=accounting.reasoning_tokens or 0,
+            request_count=accounting.api_call_count or 1,
+        )
+        priced = estimate_usage_cost(accounting.model, usage, provider=accounting.provider)
+        estimate = float(priced.amount_usd) if priced.amount_usd is not None else None
+        status, source, version = priced.status, priced.source, priced.pricing_version
+    conn.execute(
+        """UPDATE task_runs SET provider=?, model=?, service_tier=?, input_tokens=?, output_tokens=?,
+        cache_read_tokens=?, cache_write_tokens=?, reasoning_tokens=?, api_call_count=?,
+        estimated_cost_usd=?, actual_cost_usd=?, usage_status=?, cost_status=?, cost_source=?, registry_version=?
+        WHERE id=? AND task_id=?""",
+        (accounting.provider, accounting.model, accounting.service_tier, accounting.input_tokens,
+         accounting.output_tokens, accounting.cache_read_tokens, accounting.cache_write_tokens,
+         accounting.reasoning_tokens, accounting.api_call_count, estimate,
+         float(accounting.actual_cost_usd) if accounting.actual_cost_usd is not None else None,
+         accounting.usage_status, status, source, version, run_id, task_id),
+    )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4847,6 +4930,16 @@ def claim_task(
             ),
         )
         run_id = run_cur.lastrowid
+        prior = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND id<>? ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        if prior is not None:
+            conn.execute(
+                "UPDATE task_runs SET attempt_number=(SELECT COUNT(*) FROM task_runs WHERE task_id=?), "
+                "run_kind='retry', retry_of_run_id=? WHERE id=?",
+                (task_id, prior["id"], run_id),
+            )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -4951,6 +5044,16 @@ def claim_review_task(
             ),
         )
         run_id = run_cur.lastrowid
+        prior = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND id<>? ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        if prior is not None:
+            conn.execute(
+                "UPDATE task_runs SET attempt_number=(SELECT COUNT(*) FROM task_runs WHERE task_id=?), "
+                "run_kind='retry', retry_of_run_id=? WHERE id=?",
+                (task_id, prior["id"], run_id),
+            )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
