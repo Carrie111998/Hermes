@@ -24,6 +24,7 @@ import {
 } from '@/store/session-request-router'
 import {
   publishSessionState,
+  sessionTileIdentity,
   sessionTileOwnerGeneration,
   sessionTileOwnerRoute,
   setSessionTileDelegate
@@ -91,6 +92,7 @@ export function useSessionTileDelegate({
 }: SessionTileDelegateParams): void {
   useEffect(() => {
     const ownerIdentityByRuntimeId = new Map<string, string>()
+    const tileIdentityByRuntimeId = new Map<string, string>()
 
     // A tile's runtime binding can die the same way the foreground's does
     // (sleep/wake, backend restart). The cache maps stored -> runtime, so walk
@@ -169,9 +171,11 @@ export function useSessionTileDelegate({
       // backend no longer knows. Drop the map so resumeTile's warm path can't
       // re-bind a tile to a dead runtime; live bindings re-record from
       // post-reconnect events and fresh resumes.
-      invalidateRuntimeBindings: preserveStoredSessionIds => {
-        for (const storedSessionId of runtimeIdByStoredSessionIdRef.current.keys()) {
-          if (!preserveStoredSessionIds?.has(storedSessionId)) {
+      invalidateRuntimeBindings: preserveTileIdentities => {
+        for (const [storedSessionId, runtimeId] of runtimeIdByStoredSessionIdRef.current) {
+          const bindingIdentity = tileIdentityByRuntimeId.get(runtimeId) ?? storedSessionId
+
+          if (!preserveTileIdentities?.has(bindingIdentity)) {
             runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           }
         }
@@ -368,6 +372,13 @@ export function useSessionTileDelegate({
         }
 
         ownerIdentityByRuntimeId.set(runtimeId, ownerIdentity)
+        tileIdentityByRuntimeId.set(
+          runtimeId,
+          sessionTileIdentity(
+            storedSessionId,
+            typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+          )
+        )
 
         const info = resumed?.info
 

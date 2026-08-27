@@ -118,7 +118,9 @@ describe('exact-owner dot state', () => {
 
     setSessions([ownerA, ownerB])
     recordSessionEventScope({ connectionId: 'source-a', profile: 'default', session_id: 'runtime-a' })
+    recordSessionEventScope({ connectionId: 'source-b', profile: 'default', session_id: 'runtime-b' })
     publishSessionState('runtime-a', { ...createClientSessionState('shared'), busy: true })
+    publishSessionState('runtime-b', { ...createClientSessionState('shared'), busy: false })
 
     expect($sessionDotStateById.get()[sessionRowIdentity(ownerA)]).toBe('working')
     expect($sessionDotStateById.get()[sessionRowIdentity(ownerB)]).toBeUndefined()

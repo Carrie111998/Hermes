@@ -870,8 +870,18 @@ export function useSessionActions({
       // now-redundant tile so main owns it. Runs before the async awaits below (and
       // before the selection listener homes focus) so the tile is gone the same tick
       // the route takes over; the warm cache/runtime binding survives for main to reuse.
-      if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
-        closeSessionTile(storedSessionId)
+      if (
+        $sessionTiles
+          .get()
+          .some(
+            tile =>
+              tile.storedSessionId === storedSessionId &&
+              (!capturedOwner ||
+                (tile.ownerRoute?.connectionId.trim() === capturedOwner.connectionId.trim() &&
+                  normalizeProfileKey(tile.ownerRoute.profile) === normalizeProfileKey(capturedOwner.profile)))
+          )
+      ) {
+        closeSessionTile(storedSessionId, capturedOwner)
       }
 
       // Optimistically clear any prior resume-failure latch for this session:
@@ -2411,7 +2421,7 @@ export function useSessionActions({
           : runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
 
         if (tiledSession) {
-          closeSessionTile(storedSessionId)
+          closeSessionTile(storedSessionId, capturedOwner ?? tiledSession.ownerRoute)
         }
 
         // Retire every exact runtime owned by the deleted surface. The selected
@@ -2448,7 +2458,8 @@ export function useSessionActions({
           setFreshDraftReady(false)
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
-          const stored = findListedSession(storedSessionId)?.session
+          setPrimarySessionOwnerIntent(selectedOwnerIntent)
+          const stored = findListedSession(storedSessionId, capturedOwner)?.session
 
           if (stored) {
             applyStoredUsage(stored)

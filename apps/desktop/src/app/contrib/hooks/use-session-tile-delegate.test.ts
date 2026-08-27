@@ -7,6 +7,7 @@ import type { SessionOwnerRoute } from '@/store/session-request-router'
 import {
   $sessionTiles,
   sessionTileDelegate,
+  sessionTileIdentity,
   sessionTileOwnerGeneration,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
@@ -374,6 +375,43 @@ describe('useSessionTileDelegate resumeTile', () => {
     expect(next.provider).toBe('openai')
     expect(next.reasoningEffort).toBe('high')
     expect(next.fast).toBe(true)
+  })
+
+  it('preserves a duplicate-id cache binding only for its exact owner identity', async () => {
+    const storedSessionId = 'shared-reconnect-cache'
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
+    const sessionStateByRuntimeIdRef = { current: new Map<string, unknown>() }
+
+    const updateSessionState = vi.fn((runtimeId: string, _updater: unknown, storedId?: string) => {
+      if (storedId) {
+        runtimeIdByStoredSessionIdRef.current.set(storedId, runtimeId)
+      }
+    })
+
+    $sessionTiles.set([
+      { ownerRoute: ownerA, storedSessionId },
+      { ownerRoute: ownerB, storedSessionId }
+    ])
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({ session_id: 'runtime-b' } as never)
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      {
+        runtimeIdByStoredSessionIdRef,
+        sessionStateByRuntimeIdRef,
+        updateSessionState
+      }
+    )
+
+    await sessionTileDelegate()!.resumeTile(
+      storedSessionId,
+      sessionTileOwnerGeneration(storedSessionId, ownerB),
+      ownerB
+    )
+    sessionTileDelegate()!.invalidateRuntimeBindings!(new Set([sessionTileIdentity(storedSessionId, ownerB)]))
+
+    expect(runtimeIdByStoredSessionIdRef.current.get(storedSessionId)).toBe('runtime-b')
   })
 
   it('invalidateRuntimeBindings clears the stored→runtime map so tiles re-resume after reconnect', async () => {

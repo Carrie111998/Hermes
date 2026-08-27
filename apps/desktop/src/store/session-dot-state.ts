@@ -117,8 +117,12 @@ export const $sessionDotStateById = computed(
   (attention, working, stalled, background, delegating, unread, draft, states, sessions, unreadWriteGuard) => {
     const next: Record<string, SessionDotState> = {}
 
-    const claim = (ids: readonly string[], state: SessionDotState) => {
-      for (const identity of sessionStatusMembershipIdentities(ids, states, sessions)) {
+    const claim = (
+      ids: readonly string[],
+      state: SessionDotState,
+      pred?: (sessionState: (typeof states)[string]) => boolean
+    ) => {
+      for (const identity of sessionStatusMembershipIdentities(ids, states, sessions, pred)) {
         next[identity] = state
       }
     }
@@ -170,21 +174,21 @@ export const $sessionDotStateById = computed(
     // claim as background processes — and it yields to `working` below the
     // moment the parent turn itself is live (synchronous orchestrator children).
     claim(delegating, 'background')
-    claim(working, 'working')
+    claim(working, 'working', state => state.busy)
 
     // Stalled REFINES working rather than rivalling it — the turn is still
     // authoritatively running, it has just gone quiet — so it only downgrades a
     // session already claimed as working. The hint outlives its turn by a tick
     // on some paths; without this it could invent a running session.
     for (const id of stalled) {
-      for (const identity of sessionStatusMembershipIdentities([id], states, sessions)) {
+      for (const identity of sessionStatusMembershipIdentities([id], states, sessions, state => state.busy)) {
         if (next[identity] === 'working') {
           next[identity] = 'stalled'
         }
       }
     }
 
-    claim(attention, 'needs-input')
+    claim(attention, 'needs-input', state => state.needsInput)
 
     return (dotStates = stableRecord(dotStates, next))
   }

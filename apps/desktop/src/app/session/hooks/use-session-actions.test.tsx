@@ -41,9 +41,11 @@ import {
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $currentUsage,
   $messages,
   $messagingSessions,
   $newChatWorkspaceTarget,
+  $primarySessionOwnerIntent,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
   $sessions,
@@ -2005,6 +2007,39 @@ describe('resumeSession drops a redundant tile when the session loads into main'
     expect($selectedStoredSessionId.get()).toBe('stored-1')
   })
 
+  it('closes only the resumed exact-owner tile when raw ids collide', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+
+    setSessions([
+      storedSession({ connection_id: ownerA.connectionId, id: 'shared-resume', profile: ownerA.profile }),
+      storedSession({ connection_id: ownerB.connectionId, id: 'shared-resume', profile: ownerB.profile })
+    ])
+    $sessionTiles.set([
+      { ownerRoute: ownerA, storedSessionId: 'shared-resume' },
+      { ownerRoute: ownerB, storedSessionId: 'shared-resume' }
+    ])
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({
+      info: {},
+      messages: [],
+      session_id: 'runtime-a'
+    } as never)
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    let resume:
+      ((storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>) | null =
+      null
+
+    render(<ResumeHarness onReady={next => (resume = next)} requestGateway={vi.fn(async () => ({}) as never)} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    await resume!('shared-resume', true, ownerA)
+
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({ ownerRoute: ownerB, storedSessionId: 'shared-resume' })
+    ])
+  })
+
   it('leaves OTHER sessions tiles untouched', async () => {
     $sessionTiles.set([{ storedSessionId: 'stored-1' }, { storedSessionId: 'stored-2' }])
 
@@ -3904,6 +3939,55 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     expect($sessions.get()).toEqual([sourceB, sourceA])
   })
 
+  it('restores the selected owner intent and owner-matched row usage after duplicate-id rollback', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+
+    const sourceA = storedSession({
+      connection_id: ownerA.connectionId,
+      id: 'shared-selected-rollback',
+      input_tokens: 11,
+      output_tokens: 7,
+      profile: ownerA.profile
+    })
+
+    const sourceB = storedSession({
+      connection_id: ownerB.connectionId,
+      id: 'shared-selected-rollback',
+      input_tokens: 90,
+      output_tokens: 20,
+      profile: ownerB.profile,
+      source: 'telegram'
+    })
+
+    setSessions([sourceA])
+    setMessagingSessions([sourceB])
+    setPrimarySessionOwnerIntent({ ownerRoute: ownerA, storedSessionId: 'shared-selected-rollback' })
+    mockDeleteSession.mockRejectedValue(new Error('backend down'))
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-a"
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        selectedStoredSessionId="shared-selected-rollback"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('shared-selected-rollback', ownerA)
+    })
+
+    expect($primarySessionOwnerIntent.get()).toEqual({
+      ownerRoute: ownerA,
+      storedSessionId: 'shared-selected-rollback'
+    })
+    expect($currentUsage.get()).toMatchObject({ input: 11, output: 7, total: 18 })
+  })
+
   it('uses only owner-proven aliases for raw legacy cleanup', async () => {
     const sourceA = storedSession({
       _lineage_root_id: 'root-a',
@@ -4149,9 +4233,11 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     expect(runtimeStates.current.has('runtime-a')).toBe(true)
   })
 
-  it('closes and evicts only a tile runtime with the deleted exact owner', async () => {
+  it('closes and evicts only the deleted exact-owner tile when raw ids collide', async () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
     const sourceB = { connectionId: 'source-b', profile: 'worker' }
     setSessions([
+      storedSession({ connection_id: sourceA.connectionId, id: 'owned-tile', profile: sourceA.profile }),
       storedSession({ connection_id: sourceB.connectionId, id: 'owned-tile', profile: sourceB.profile })
     ])
 
@@ -4160,10 +4246,16 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     }
 
     const runtimeStates: MutableRefObject<Map<string, ClientSessionState>> = {
-      current: new Map([['runtime-b', createClientSessionState('owned-tile')]])
+      current: new Map([
+        ['runtime-a', createClientSessionState('owned-tile')],
+        ['runtime-b', createClientSessionState('owned-tile')]
+      ])
     }
 
-    $sessionTiles.set([{ ownerRoute: sourceB, runtimeId: 'runtime-b', storedSessionId: 'owned-tile' }])
+    $sessionTiles.set([
+      { ownerRoute: sourceA, runtimeId: 'runtime-a', storedSessionId: 'owned-tile' },
+      { ownerRoute: sourceB, runtimeId: 'runtime-b', storedSessionId: 'owned-tile' }
+    ])
     mockDeleteSession.mockResolvedValue({ ok: true })
 
     let handle: HarnessHandle | null = null
@@ -4181,8 +4273,11 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
       await handle!.removeSession('owned-tile', sourceB)
     })
 
-    expect($sessionTiles.get()).toEqual([])
+    expect($sessionTiles.get()).toEqual([
+      { ownerRoute: sourceA, runtimeId: 'runtime-a', storedSessionId: 'owned-tile' }
+    ])
     expect(runtimeBindings.current.has('owned-tile')).toBe(false)
+    expect(runtimeStates.current.has('runtime-a')).toBe(true)
     expect(runtimeStates.current.has('runtime-b')).toBe(false)
   })
 

@@ -46,6 +46,7 @@ import {
   resetTileRuntimeBindings,
   selectionHomesToWorkspace,
   type SessionTileDelegate,
+  sessionTileIdentity,
   sessionTileOwnerRoute,
   sessionTilePaneId,
   setSessionTileDelegate,
@@ -161,7 +162,9 @@ describe('resetTileRuntimeBindings', () => {
     resetTileRuntimeBindings('work-vps')
 
     expect($sessionTiles.get()[0]?.runtimeId).toBe('runtime-bot')
-    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(new Set(['stored-bot']))
+    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(
+      new Set([sessionTileIdentity('stored-bot', $sessionTiles.get()[0]?.ownerRoute)])
+    )
   })
 
   it('rebinds only the restarted connection while preserving other Bot gateways', () => {
@@ -205,7 +208,42 @@ describe('resetTileRuntimeBindings', () => {
     expect(workBot).toMatchObject({ runtimeId: 'runtime-work-live', storedSessionId: 'stored-work-bot' })
     expect(ordinarySession).toMatchObject({ storedSessionId: 'stored-session' })
     expect(ordinarySession).not.toHaveProperty('runtimeId')
-    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(new Set(['stored-barry-sibling-bot', 'stored-work-bot']))
+    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(
+      new Set([
+        sessionTileIdentity('stored-barry-sibling-bot', barrySibling?.ownerRoute),
+        sessionTileIdentity('stored-work-bot', workBot?.ownerRoute)
+      ])
+    )
+  })
+
+  it('preserves duplicate-id bindings by exact owner identity', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const invalidateRuntimeBindings = vi.fn()
+
+    setSessionTileDelegate({ invalidateRuntimeBindings } as unknown as SessionTileDelegate)
+    $sessionTiles.set([
+      {
+        ownerRoute: ownerA,
+        runtimeId: 'runtime-a-dead',
+        storedSessionId: 'shared-reconnect',
+        workspaceMode: 'bots'
+      },
+      {
+        ownerRoute: ownerB,
+        runtimeId: 'runtime-b-live',
+        storedSessionId: 'shared-reconnect',
+        workspaceMode: 'bots'
+      }
+    ])
+
+    resetTileRuntimeBindings({ connectionId: ownerA.connectionId, profile: ownerA.profile })
+
+    expect($sessionTiles.get()).toEqual([
+      expect.not.objectContaining({ runtimeId: expect.anything() }),
+      expect.objectContaining({ ownerRoute: ownerB, runtimeId: 'runtime-b-live' })
+    ])
+    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(new Set([sessionTileIdentity('shared-reconnect', ownerB)]))
   })
 
   it('unknown restarted identity preserves only Bot runtimes owned by provably-live connections', () => {
@@ -240,7 +278,9 @@ describe('resetTileRuntimeBindings', () => {
     expect(legacyBot).not.toHaveProperty('runtimeId')
     expect(workBot).toMatchObject({ runtimeId: 'runtime-work-live', storedSessionId: 'stored-work-bot' })
     expect(ordinarySession).not.toHaveProperty('runtimeId')
-    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(new Set(['stored-work-bot']))
+    expect(invalidateRuntimeBindings).toHaveBeenCalledWith(
+      new Set([sessionTileIdentity('stored-work-bot', workBot?.ownerRoute)])
+    )
   })
 })
 

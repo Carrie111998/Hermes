@@ -663,7 +663,8 @@ const storedIds = (
 export function sessionStatusMembershipIdentities(
   ids: readonly string[],
   states: Record<string, ClientSessionState>,
-  sessions: readonly SessionInfo[]
+  sessions: readonly SessionInfo[],
+  pred: (state: ClientSessionState) => boolean = () => true
 ): string[] {
   const identities = new Set<string>()
 
@@ -671,7 +672,7 @@ export function sessionStatusMembershipIdentities(
     const ownerRoutes = new Map<string, SessionOwnerRoute>()
 
     for (const [runtimeId, state] of Object.entries(states)) {
-      if (!lineageAliases(state.storedSessionId ?? runtimeId, sessions).includes(id)) {
+      if (!pred(state) || !lineageAliases(state.storedSessionId ?? runtimeId, sessions).includes(id)) {
         continue
       }
 
@@ -1375,7 +1376,7 @@ export function resetTileRuntimeBindings(
     return !reconnected.profile || (route.targetProfile || route.profile) === reconnected.profile
   }
 
-  const preservedStoredIds = new Set(
+  const preservedTileIdentities = new Set(
     tiles
       .filter(
         tile =>
@@ -1383,13 +1384,13 @@ export function resetTileRuntimeBindings(
           Boolean(tile.ownerRoute?.connectionId) &&
           (!(reconnected || liveConnectionIds) || !belongsToReconnectedRuntime(tile))
       )
-      .map(tile => tile.storedSessionId)
+      .map(tileIdentity)
   )
 
-  sessionTileDelegate()?.invalidateRuntimeBindings?.(preservedStoredIds)
+  sessionTileDelegate()?.invalidateRuntimeBindings?.(preservedTileIdentities)
 
-  if (tiles.some(tile => tile.runtimeId && !preservedStoredIds.has(tile.storedSessionId))) {
-    $sessionTiles.set(tiles.map(tile => (preservedStoredIds.has(tile.storedSessionId) ? tile : toStored(tile))))
+  if (tiles.some(tile => tile.runtimeId && !preservedTileIdentities.has(tileIdentity(tile)))) {
+    $sessionTiles.set(tiles.map(tile => (preservedTileIdentities.has(tileIdentity(tile)) ? tile : toStored(tile))))
   }
 }
 
@@ -1440,7 +1441,7 @@ export interface SessionTileDelegate {
    *  recorded before the reconnect is suspect — without this, `resumeTile`'s
    *  warm path re-binds tiles to dead runtime ids (the sleep/wake "empty
    *  right pane" bug). Bindings re-record from live post-reconnect events. */
-  invalidateRuntimeBindings?(preserveStoredSessionIds?: ReadonlySet<string>): void
+  invalidateRuntimeBindings?(preserveTileIdentities?: ReadonlySet<string>): void
   /** Bind a live runtime id for a stored session (resume without touching
    *  the main view). Returns the runtime id, or throws. `refreshTranscript`
    *  forces a REST merge even when a warm cached transcript already exists;
