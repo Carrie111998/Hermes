@@ -838,10 +838,10 @@ const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-p
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
-// Branch we track for self-update. The GUI work has merged to main, so this
-// tracks main. User can also override at runtime via
+// Company-maintained branch we track for self-update. User can still override
+// it at runtime via
 // hermesDesktop.updates.setBranch().
-const DEFAULT_UPDATE_BRANCH = 'main'
+const DEFAULT_UPDATE_BRANCH = 'ascent-foundry'
 // desktop.log lives under HERMES_HOME/logs/ so it sits next to agent.log,
 // errors.log, gateway.log produced by hermes_logging.setup_logging — one log
 // directory per user, regardless of which UI surface produced the line.
@@ -2843,15 +2843,15 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// Self-heal the tracked update branch: if origin no longer publishes it (e.g.
-// bb/gui was merged into main and deleted), fall back to main and persist so
+// Self-heal the tracked update branch: if origin no longer publishes it, fall
+// back to the company default branch and persist so
 // every later check/apply follows main — no manual flip, even for already-
 // installed clients. Read-only ls-remote probe; only flips on a definitive
 // "ref absent" (exit 2), never on a transient network error, so a flaky
 // connection can't strand a user on the wrong branch.
 async function resolveHealedBranch(updateRoot, branch) {
-  if (!branch || branch === 'main') {
-    return branch || 'main'
+  if (!branch || branch === DEFAULT_UPDATE_BRANCH) {
+    return branch || DEFAULT_UPDATE_BRANCH
   }
 
   const originUrl = await getOriginUrl(updateRoot)
@@ -2862,14 +2862,14 @@ async function resolveHealedBranch(updateRoot, branch) {
     return branch
   }
 
-  rememberLog(`[updates] origin/${branch} is gone (merged?); falling back to main`)
+  rememberLog(`[updates] origin/${branch} is gone; falling back to ${DEFAULT_UPDATE_BRANCH}`)
   const config = readDesktopUpdateConfig()
 
-  if (config.branch !== 'main') {
-    writeDesktopUpdateConfig({ ...config, branch: 'main' })
+  if (config.branch !== DEFAULT_UPDATE_BRANCH) {
+    writeDesktopUpdateConfig({ ...config, branch: DEFAULT_UPDATE_BRANCH })
   }
 
-  return 'main'
+  return DEFAULT_UPDATE_BRANCH
 }
 
 async function checkUpdates() {
@@ -4172,9 +4172,9 @@ async function applyUpdatesPosixHandoff(opts: any) {
   // ── Pre-flight state.db integrity guard (#68474) ──
   preflightStateDb(HERMES_HOME, rememberLog)
 
-  // Branch-pin so a non-main checkout doesn't get switched to main (and
-  // self-heal to main when the pinned branch no longer exists on origin).
-  let branch = 'main'
+  // Branch-pin so a checkout doesn't get switched to another branch (and
+  // self-heal to the company branch when the pinned branch disappears).
+  let branch = DEFAULT_UPDATE_BRANCH
 
   try {
     const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })

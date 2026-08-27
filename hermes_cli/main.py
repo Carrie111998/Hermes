@@ -10700,12 +10700,12 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
+    Centralizes the "default to ascent-foundry, accept --branch override, treat empty
     or whitespace-only values as the default" parsing so every consumer of
     ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
     the same answer.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    return (getattr(args, "branch", None) or "ascent-foundry").strip() or "ascent-foundry"
 
 
 def _size_delta_label(saved_mb: float) -> str:
