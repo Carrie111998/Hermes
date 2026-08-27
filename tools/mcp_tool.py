@@ -2992,10 +2992,8 @@ class MCPServerTask:
             # os.kill probe below only runs when psutil is unavailable.
             import psutil
 
-            if not psutil.pid_exists(pid):
-                continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
+            if psutil.pid_exists(pid):
+                return False  # at least one child alive -> not all dead
         return True
 
     async def _watch_stdio_children(self) -> None:
@@ -6136,7 +6134,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        and (inspect.iscoroutinefunction(_watch_children) or callable(_watch_children))
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
