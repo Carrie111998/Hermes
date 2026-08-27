@@ -270,6 +270,7 @@ export interface GatewaySource {
   connectionId: string
   count?: number
   error?: null | string
+  installId?: string
   kind?: string
   label?: string
   reachable?: boolean

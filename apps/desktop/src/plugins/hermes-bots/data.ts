@@ -840,6 +840,27 @@ function mergeMultiSourceRoster(
     }
   }
 
+  // Several connection descriptors may point at the same Hermes install
+  // (for example This Device plus its Tailscale URL). Treat matching install
+  // ids as one source so the rich active row is not cloned as a remote bot.
+  const sources = Array.isArray(union?.sources) ? union.sources : []
+  const activeSourceId =
+    activeId || String(sources.find(source => source?.kind === 'local')?.connectionId || '').trim()
+  const activeInstallId = String(
+    sources.find(source => String(source?.connectionId || '').trim() === activeSourceId)?.installId || ''
+  ).trim()
+  const activeSourceIds = new Set(activeSourceId ? [activeSourceId] : [])
+
+  if (activeInstallId) {
+    for (const source of sources) {
+      if (String(source?.installId || '').trim() === activeInstallId) {
+        const connectionId = String(source?.connectionId || '').trim()
+
+        if (connectionId) activeSourceIds.add(connectionId)
+      }
+    }
+  }
+
   const activeByName = new Map<string, RosterRow>()
 
   // Treat the rich list as one row per active-source profile. Clone every
@@ -889,24 +910,30 @@ function mergeMultiSourceRoster(
     // desktop) would be appended as phantom duplicates — every bot listed
     // twice. Older Electron builds predate the connection ids; fall back to
     // the legacy local-source rule so single-source behavior stays intact.
-    const isActiveSource = activeId ? connectionId === activeId : agent.connectionKind === 'local'
+    const isActiveSource = activeSourceIds.size
+      ? activeSourceIds.has(connectionId)
+      : activeId
+        ? connectionId === activeId
+        : agent.connectionKind === 'local'
     const row = isActiveSource ? activeByName.get(profile) : null
 
     if (row) {
       // Annotate in place: the @name-device handle only differs from the
       // bare name when the profile exists on several sources.
-      row.handle = agent.handle
-      row.connectionId = agent.connectionId
-      row.connectionKind = agent.connectionKind
-      row.connectionLabel = agent.connectionLabel
-      row.targetProfile = agent.targetProfile || profile
-      row.route = {
-        connectionId,
-        mode: agent.connectionKind === 'local' ? 'local' : 'remote',
-        profile,
-        targetProfile: agent.targetProfile || profile
+      if (!row.sourceScoped || connectionId === activeSourceId) {
+        row.handle = agent.handle
+        row.connectionId = agent.connectionId
+        row.connectionKind = agent.connectionKind
+        row.connectionLabel = agent.connectionLabel
+        row.targetProfile = agent.targetProfile || profile
+        row.route = {
+          connectionId,
+          mode: agent.connectionKind === 'local' ? 'local' : 'remote',
+          profile,
+          targetProfile: agent.targetProfile || profile
+        }
+        row.sourceScoped = true
       }
-      row.sourceScoped = true
 
       continue
     }

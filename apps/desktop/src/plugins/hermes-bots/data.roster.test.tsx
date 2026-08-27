@@ -64,7 +64,7 @@ interface UnionAgent {
 interface Union {
   agents: UnionAgent[]
   primaryConnectionId?: string
-  sources?: Array<{ connectionId: string; error?: string; kind: string; reachable?: boolean }>
+  sources?: Array<{ connectionId: string; error?: string; installId?: string; kind: string; reachable?: boolean }>
 }
 
 /** Gateway rows carry a session id on `last_session` that the plugin's
@@ -238,6 +238,55 @@ describe('the active source annotates; other sources append', () => {
     expect(rows[0].last_session?.id).toBe('newest')
     expect(rows[0].handle).toBe('default-this-device')
     expect(rows[1].connectionId).toBe('homelab')
+  })
+
+  it('collapses install-equivalent self-loop descriptors without losing curated rows', async () => {
+    const rows = await mergedRoster(
+      {
+        profiles: [
+          { name: 'default', display_name: 'Hermes' },
+          { name: 'hermes2', display_name: 'Iron Man' }
+        ]
+      },
+      {
+        sources: [
+          { connectionId: 'local', installId: 'studio-install', kind: 'local' },
+          { connectionId: 'tailscale', installId: 'studio-install', kind: 'remote' }
+        ],
+        agents: [
+          { connectionId: 'tailscale', connectionKind: 'remote', handle: 'default-tailscale', profile: 'default' },
+          { connectionId: 'tailscale', connectionKind: 'remote', handle: 'hermes2-tailscale', profile: 'hermes2' },
+          { connectionId: 'local', connectionKind: 'local', handle: 'default-this-device', profile: 'default' },
+          { connectionId: 'local', connectionKind: 'local', handle: 'hermes2', profile: 'hermes2' }
+        ]
+      }
+    )
+
+    expect(rows).toHaveLength(2)
+    expect(rows.map(row => [row.name, row.display_name, row.connectionId])).toEqual([
+      ['default', 'Hermes', 'local'],
+      ['hermes2', 'Iron Man', 'local']
+    ])
+    expect(rows.some(row => row.remoteSource)).toBe(false)
+  })
+
+  it('keeps same-named profiles on distinct installs as separate bots', async () => {
+    const rows = await mergedRoster(
+      { profiles: [{ name: 'default', display_name: 'Hermes' }] },
+      {
+        sources: [
+          { connectionId: 'local', installId: 'studio-install', kind: 'local' },
+          { connectionId: 'northstar', installId: 'northstar-install', kind: 'remote' }
+        ],
+        agents: [
+          { connectionId: 'local', connectionKind: 'local', handle: 'default-this-device', profile: 'default' },
+          { connectionId: 'northstar', connectionKind: 'remote', handle: 'default-northstar', profile: 'default' }
+        ]
+      }
+    )
+
+    expect(rows.filter(row => row.name === 'default')).toHaveLength(2)
+    expect(rows.find(row => row.remoteSource)?.connectionId).toBe('northstar')
   })
 
   it('follows the ACTIVE remote source, so the local twin is the appended one', async () => {
