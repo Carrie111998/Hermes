@@ -3,6 +3,8 @@
 Phase 0 — establish a baseline pin on the current (pre-OAuth) behavior so
 later phases can prove they didn't break loopback mode.
 """
+from types import SimpleNamespace
+
 import pytest
 
 # Phase 5 / Phase 6: these tests mutate ``web_server.app.state.auth_required``
@@ -287,6 +289,166 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
+
+
+def _setup_desktop_ssh_test_env(monkeypatch):
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", web_server._SESSION_TOKEN)
+    monkeypatch.setattr(
+        web_server, "_SSH_OWNER_NONCE", web_server._SSH_OWNER_NONCE
+    )
+    clear_providers()
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    return captured
+
+
+def test_isolated_desktop_ssh_backend_keeps_session_token_auth(monkeypatch, caplog):
+    """A private Desktop SSH child must not inherit public dashboard OAuth.
+
+    Desktop connects to this ephemeral loopback-only backend through an SSH
+    tunnel and authenticates HTTP/WS with the per-launch session token.  The
+    machine may simultaneously expose its regular dashboard at ``public_url``.
+    """
+    captured = _setup_desktop_ssh_test_env(monkeypatch)
+
+    with caplog.at_level("INFO", logger="hermes_cli.web_server"):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=0,
+            open_browser=False,
+            headless=True,
+            ssh_session_token="desktop-session-token",
+            ssh_owner_nonce="desktop-owner-nonce",
+            is_isolated=True,
+        )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+    assert captured["kwargs"].get("proxy_headers") is False
+    assert "Desktop SSH backend active" in caplog.text
+    reason, credential = web_server._ws_auth_reason(
+        SimpleNamespace(query_params={"token": "desktop-session-token"})
+    )
+    assert reason is None
+    assert credential == "token"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"port": 9119},
+        {"host": "0.0.0.0"},
+        {"headless": False},
+        {"ssh_session_token": None},
+        {"ssh_owner_nonce": None},
+        {"ssh_session_token": ""},
+        {"ssh_session_token": "   "},
+        {"ssh_owner_nonce": ""},
+        {"ssh_owner_nonce": "   "},
+        {"is_isolated": False},
+    ],
+)
+def test_desktop_ssh_auth_exception_requires_every_private_marker(
+    monkeypatch, overrides
+):
+    """Dropping or invalidating any private-backend marker keeps the public auth gate on."""
+    _setup_desktop_ssh_test_env(monkeypatch)
+    kwargs = {
+        "host": "127.0.0.1",
+        "port": 0,
+        "open_browser": False,
+        "headless": True,
+        "ssh_session_token": "desktop-session-token",
+        "ssh_owner_nonce": "desktop-owner-nonce",
+        "is_isolated": True,
+    }
+    kwargs.update(overrides)
+
+    with pytest.raises(SystemExit, match=r"no auth providers"):
+        web_server.start_server(**kwargs)
+    assert web_server.app.state.auth_required is True
+
+
+@pytest.mark.parametrize("loopback_host", ["127.0.0.1", "localhost", "::1"])
+def test_desktop_ssh_accepts_all_loopback_hosts(monkeypatch, loopback_host):
+    """Desktop SSH backend accepts all valid loopback host representations."""
+    _setup_desktop_ssh_test_env(monkeypatch)
+    web_server.start_server(
+        host=loopback_host,
+        port=0,
+        open_browser=False,
+        headless=True,
+        ssh_session_token="desktop-session-token",
+        ssh_owner_nonce="desktop-owner-nonce",
+        is_isolated=True,
+    )
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+
+
+def test_desktop_ssh_ws_token_validation_in_isolated_config(monkeypatch):
+    """WS upgrade auth in isolated configuration validates missing, incorrect, and valid tokens."""
+    _setup_desktop_ssh_test_env(monkeypatch)
+    web_server.start_server(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        headless=True,
+        ssh_session_token="desktop-session-token-12345",
+        ssh_owner_nonce="desktop-owner-nonce-67890",
+        is_isolated=True,
+    )
+    assert web_server.app.state.auth_required is False
+
+    # 1. Missing token -> no_credential
+    reason, cred = web_server._ws_auth_reason(SimpleNamespace(query_params={}))
+    assert reason == "no_credential"
+    assert cred == "none"
+
+    # 2. Incorrect token -> token_mismatch
+    reason, cred = web_server._ws_auth_reason(
+        SimpleNamespace(query_params={"token": "wrong-token-value"})
+    )
+    assert reason == "token_mismatch"
+    assert cred == "token"
+
+    # 3. Correct token -> accepted (None)
+    reason, cred = web_server._ws_auth_reason(
+        SimpleNamespace(query_params={"token": "desktop-session-token-12345"})
+    )
+    assert reason is None
+    assert cred == "token"
+
+
+def test_ordinary_serve_or_dashboard_caller_without_isolated_remains_on_public_gate(monkeypatch):
+    """Supplying ssh_session_token / ssh_owner_nonce without --isolated (is_isolated=False)
+    does not trigger the private Desktop auth exception and stays on the public gate.
+    """
+    _setup_desktop_ssh_test_env(monkeypatch)
+
+    with pytest.raises(SystemExit, match=r"no auth providers"):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=0,
+            open_browser=False,
+            headless=True,
+            ssh_session_token="desktop-session-token",
+            ssh_owner_nonce="desktop-owner-nonce",
+            is_isolated=False,
+        )
+    assert web_server.app.state.auth_required is True
 
 
 def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypatch):

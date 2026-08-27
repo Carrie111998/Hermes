@@ -12250,9 +12250,8 @@ def cmd_dashboard(args):
     # fail-closed SystemExit unchanged.
     _maybe_setup_dashboard_auth_interactively(args)
 
-    # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
-    # available — the desktop app and the dashboard's own Chat tab both rely on
-    # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
+    # ``ssh_session_token`` and ``ssh_owner_nonce`` together mark the private
+    # Desktop SSH tunnel transport and must never be set by ordinary serve/dashboard callers.
     start_server(
         host=args.host,
         port=args.port,
@@ -12262,6 +12261,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        is_isolated=getattr(args, "isolated", False) or os.environ.get("HERMES_DESKTOP") == "1",
     )
 
 
