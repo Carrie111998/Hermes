@@ -1027,6 +1027,7 @@ export function useSessionActions({
           // terminal events go to the detached socket while the stale snapshot
           // leaves Desktop showing only the pre-disconnect partial answer.
           const shouldRefreshPersistedTranscript = !isWatchWindow()
+
           const suppressUnprovenWarmTranscript =
             !resumedSameSelectedSession && shouldRefreshPersistedTranscript && !hasValidProvenance
 
@@ -1229,6 +1230,7 @@ export function useSessionActions({
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
                   appliedPersistedDisplayTranscript = true
+
                   // The REST hydration is a newest-tail page; graft it onto any
                   // older pages the previous view already backfilled so
                   // re-activating a scrolled-back session keeps its history.
@@ -1308,11 +1310,11 @@ export function useSessionActions({
                   ...state,
                   messages: visibleActivatedMessages,
                   transcriptProvenance: acceptedPersistedDisplayTranscript
-                    ? expectedProvenance ?? undefined
+                    ? (expectedProvenance ?? undefined)
                     : appliedPersistedDisplayTranscript
                       ? undefined
                       : hasValidProvenance
-                        ? expectedProvenance ?? undefined
+                        ? (expectedProvenance ?? undefined)
                         : undefined,
                   ...(pendingClarifyProjection
                     ? {
@@ -1717,7 +1719,7 @@ export function useSessionActions({
             ...state,
             ...(runtimeInfo ?? {}),
             messages: visibleMessagesForView,
-            transcriptProvenance: acceptedPersistedDisplayTranscript ? expectedProvenance ?? undefined : undefined,
+            transcriptProvenance: acceptedPersistedDisplayTranscript ? (expectedProvenance ?? undefined) : undefined,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.

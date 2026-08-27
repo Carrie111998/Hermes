@@ -1,10 +1,7 @@
 import type { ClientSessionState, PersistedDisplayTranscriptProvenance } from '../../../types'
 
 export type TranscriptProvenanceScope =
-  | string
-  | null
-  | undefined
-  | { connectionId?: string | null; profile?: string | null }
+  string | null | undefined | { connectionId?: string | null; profile?: string | null }
 
 export function createPersistedDisplayTranscriptProvenance({
   lineageRootId,

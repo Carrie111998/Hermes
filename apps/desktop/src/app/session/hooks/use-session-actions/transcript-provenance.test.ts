@@ -64,10 +64,7 @@ describe('transcript provenance', () => {
 
     for (const transcriptProvenance of mismatches) {
       expect(
-        hasPersistedDisplayTranscriptProvenance(
-          { transcriptProvenance: transcriptProvenance as never },
-          expected
-        )
+        hasPersistedDisplayTranscriptProvenance({ transcriptProvenance: transcriptProvenance as never }, expected)
       ).toBe(false)
     }
   })

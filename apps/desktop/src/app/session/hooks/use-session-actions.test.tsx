@@ -2376,9 +2376,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
       return {} as never
     })
+
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
       current: new Map()
     }
+
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
 
     render(
@@ -2440,9 +2442,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
         return {} as never
       })
+
       const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
         current: new Map()
       }
+
       let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
 
       render(
@@ -2483,9 +2487,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
       return {} as never
     })
+
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
       current: new Map()
     }
+
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
 
     render(
@@ -2524,9 +2530,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
       return Promise.resolve({}) as never
     })
+
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
       current: new Map()
     }
+
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
 
     render(
@@ -2833,6 +2841,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       mode: 'remote',
       profile: 'default'
     }
+
     const ownedRow = storedSession({
       _lineage_root_id: 'root-A',
       connection_id: 'remote-A',
@@ -2856,6 +2865,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
       current: new Map([['stored-A', 'rt-A']])
     }
+
     const state = clientState('stored-A')
     state.messages = [
       { id: 'cached-user', parts: [{ text: 'remote prompt', type: 'text' }], role: 'user' },
@@ -2870,6 +2880,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
       current: new Map([['rt-A', state]])
     }
+
     const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
     vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise)
     vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
@@ -2890,6 +2901,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     })
 
     const viewSnapshots: ClientSessionState[] = []
+
     let resume:
       null | ((storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>) =
       null
@@ -2930,6 +2942,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
         current: new Map([['stored-A', 'rt-A']])
       }
+
       const state = clientState('stored-A')
       state.messages = [
         { id: 'cached-user', parts: [{ text: 'cached prompt', type: 'text' }], role: 'user' },
@@ -2939,6 +2952,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
         current: new Map([['rt-A', state]])
       }
+
       setSessions([storedSession({ _lineage_root_id: 'root-A', id: 'stored-A', message_count: 2 })])
 
       const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
@@ -3013,11 +3027,13 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
       current: new Map([['stored-A', 'rt-A']])
     }
+
     const state = clientState('stored-A')
     state.messages = [
       { id: 'cached-user', parts: [{ text: 'active prompt', type: 'text' }], role: 'user' },
       { id: 'cached-assistant', parts: [{ text: 'active answer', type: 'text' }], role: 'assistant' }
     ]
+
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
       current: new Map([['rt-A', state]])
     }

@@ -32,6 +32,7 @@ import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
 import { createPersistedDisplayTranscriptProvenance } from '../use-session-actions/transcript-provenance'
+
 import { clearSingleFlightSessionResumeState } from './single-flight-resume'
 import type { SubmitTextOptions } from './utils'
 
@@ -719,6 +720,7 @@ describe('usePromptActions /compress', () => {
 
   it('clears persisted transcript provenance when manual compression replaces the transcript', async () => {
     const states: Record<string, unknown>[] = []
+
     const provenance = createPersistedDisplayTranscriptProvenance({
       lineageRootId: 'root-A',
       scope: undefined,
