@@ -1,7 +1,7 @@
 manifest_version: 1
 
 name: coinbase
-description: Trade crypto, manage portfolios, and make x402 payments.
+description: Trade crypto and equities, manage portfolios, and make x402 payments.
 source: https://docs.cdp.coinbase.com/coinbase-for-agents/overview
 
 transport:
@@ -15,6 +15,7 @@ suggest:
   keywords:
     - coinbase
     - crypto trade
+    - equities trade
     - x402
     - x402 payments
     - portfolio balance
