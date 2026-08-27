@@ -513,13 +513,21 @@ def _compute_tool_definitions(
     # something a model can reason its way past, and the failure is invisible until somebody reads
     # a transcript. This is the one place the schema list is assembled, so it is the one place the
     # rule has to hold.
-    try:
-        from tools.delegate_routing import filter_tools as _route_filter
+    # DELIBERATELY NOT WRAPPED IN A try/except.
+    #
+    # The first version was, with the comment "a broken routing module must never
+    # cost the user their tools". That is exactly backwards for this switch. Its
+    # entire value is that it cannot be bypassed, so a failure here must not hand
+    # back patch, write_file, terminal and computer_use silently -- which is the
+    # one outcome nobody would notice until a transcript showed Hermes editing a
+    # repository it was configured never to touch.
+    #
+    # Failing loudly costs a turn and is obvious. Failing open costs the
+    # guarantee and is invisible. When this switch is on, losing the tools is the
+    # correct response to not knowing whether we may offer them.
+    from tools.delegate_routing import filter_tools as _route_filter
 
-        tools_to_include = _route_filter(tools_to_include)
-    except Exception:
-        # A broken routing module must never cost the user their tools.
-        pass
+    tools_to_include = _route_filter(tools_to_include)
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
