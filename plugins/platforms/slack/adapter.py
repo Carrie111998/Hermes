@@ -5093,8 +5093,10 @@ class SlackAdapter(BasePlatformAdapter):
             "user_id": user_id,
         }
 
-    def _remember_processed_message_ts(self, ts: str) -> None:
-        """Mark a Slack message ts as claimed by this handler.
+    def _remember_processed_message_ts(
+        self, event: dict, body: Optional[dict], ts: str
+    ) -> None:
+        """Mark a workspace-scoped Slack message as claimed by this handler.
 
         Used by the ``message_changed`` guard to tell "we already took this
         message" from "this is new". Called on ENTRY (so an unfurl arriving
@@ -5104,9 +5106,10 @@ class SlackAdapter(BasePlatformAdapter):
         Bounded by ``_PROCESSED_MESSAGE_TS_MAX``: oldest entries are evicted
         first so a busy workspace cannot grow this map without limit.
         """
-        if not ts:
+        key = self._processed_message_key(event, body, ts)
+        if not key:
             return
-        self._processed_message_ts[ts] = time.time()
+        self._processed_message_ts[key] = time.time()
         if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
             newest_items = sorted(
                 self._processed_message_ts.items(),
@@ -6079,20 +6082,27 @@ class SlackAdapter(BasePlatformAdapter):
         started (the sequential-suppression case) is left untouched.
         """
         _ts = str((event or {}).get("ts") or "")
+        if (event or {}).get("subtype") == "message_changed":
+            _updated_message = (event or {}).get("message")
+            if isinstance(_updated_message, dict):
+                _ts = str(_updated_message.get("ts") or _ts)
+        _claim_key = self._processed_message_key(event or {}, payload, _ts)
         # getattr: bare test doubles (object.__new__) may lack the map.
         _claims = getattr(self, "_processed_message_ts", None)
-        _was_claimed = bool(_ts) and _claims is not None and _ts in _claims
+        _was_claimed = (
+            bool(_claim_key) and _claims is not None and _claim_key in _claims
+        )
         try:
             return await self._handle_slack_message_impl(event, payload)
         except BaseException:
             _claims = getattr(self, "_processed_message_ts", None)
             if (
-                _ts
+                _claim_key
                 and not _was_claimed
                 and _claims is not None
-                and _ts in _claims
+                and _claim_key in _claims
             ):
-                _claims.pop(_ts, None)
+                _claims.pop(_claim_key, None)
                 logger.warning(
                     "[%s] handler failed after claiming ts=%s; claim released "
                     "so a retry or edit can re-drive the turn",
@@ -6259,7 +6269,7 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks,
                 text,
                 bot_uid=self._team_bot_user_ids.get(
-                    dedup_team_id, self._bot_user_id
+                    self._event_team_id(event, payload), self._bot_user_id
                 )
                 or "",
             )
@@ -6624,7 +6634,7 @@ class SlackAdapter(BasePlatformAdapter):
         # enrichment awaits that open the race.
         _claim_ts = str(event.get("ts") or "")
         if _claim_ts:
-            self._remember_processed_message_ts(_claim_ts)
+            self._remember_processed_message_ts(event, payload, _claim_ts)
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -7220,7 +7230,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         if ts:
-            self._remember_processed_message_ts(ts)
+            self._remember_processed_message_ts(event, payload, ts)
 
         await self.handle_message(msg_event)
 

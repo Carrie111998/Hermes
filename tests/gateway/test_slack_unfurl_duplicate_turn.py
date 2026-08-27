@@ -27,7 +27,7 @@ import sys
 import time
 from importlib.machinery import PathFinder
 from types import ModuleType
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -224,21 +224,43 @@ class TestClaimHelperBounded:
         delivered = []
         adapter = _make_adapter(delivered)
         adapter._PROCESSED_MESSAGE_TS_MAX = 10
+        event = _original_event()
 
         for i in range(25):
-            adapter._remember_processed_message_ts(f"{i}.0")
+            adapter._remember_processed_message_ts(event, _body(), f"{i}.0")
             time.sleep(0.001)
 
         assert len(adapter._processed_message_ts) <= 10
         # newest survive, oldest evicted
-        assert "24.0" in adapter._processed_message_ts
-        assert "0.0" not in adapter._processed_message_ts
+        assert adapter._processed_message_key(event, _body(), "24.0") in (
+            adapter._processed_message_ts
+        )
+        assert adapter._processed_message_key(event, _body(), "0.0") not in (
+            adapter._processed_message_ts
+        )
 
     def test_empty_ts_is_ignored(self):
         delivered = []
         adapter = _make_adapter(delivered)
-        adapter._remember_processed_message_ts("")
+        adapter._remember_processed_message_ts(_original_event(), _body(), "")
         assert adapter._processed_message_ts == {}
+
+    def test_claims_are_workspace_and_channel_scoped(self):
+        delivered = []
+        adapter = _make_adapter(delivered)
+        other_team = "T_OTHER"
+        adapter._team_clients = {TEAM: MagicMock(), other_team: MagicMock()}
+        first = _original_event()
+        second = {**first, "team": other_team}
+        second_body = {"team_id": other_team, "event_id": "Ev-other"}
+
+        adapter._remember_processed_message_ts(first, _body(), ORIGINAL_TS)
+        adapter._remember_processed_message_ts(second, second_body, ORIGINAL_TS)
+
+        assert set(adapter._processed_message_ts) == {
+            adapter._processed_message_key(first, _body(), ORIGINAL_TS),
+            adapter._processed_message_key(second, second_body, ORIGINAL_TS),
+        }
 
 
 class TestClaimReleasedOnFailure:
@@ -272,7 +294,10 @@ class TestClaimReleasedOnFailure:
             with pytest.raises(RuntimeError):
                 await adapter._handle_slack_message(_original_event(), _body())
             # The failed invocation must not leave the ts claimed...
-            assert ORIGINAL_TS not in adapter._processed_message_ts
+            claim_key = adapter._processed_message_key(
+                _original_event(), _body(), ORIGINAL_TS
+            )
+            assert claim_key not in adapter._processed_message_ts
             # ...so a user edit of the unanswered message still summons the bot.
             await adapter._handle_slack_message(edit, _body())
 
@@ -287,7 +312,10 @@ class TestClaimReleasedOnFailure:
 
         async def scenario():
             await adapter._handle_slack_message(_original_event(), _body())
-            assert ORIGINAL_TS in adapter._processed_message_ts
+            claim_key = adapter._processed_message_key(
+                _original_event(), _body(), ORIGINAL_TS
+            )
+            assert claim_key in adapter._processed_message_ts
             # A later invocation for the same ts that fails must not strip
             # the claim the successful turn already holds.
             adapter._resolve_user_name = AsyncMock(
@@ -299,7 +327,7 @@ class TestClaimReleasedOnFailure:
                 await adapter._handle_slack_message(second, _body())
             except RuntimeError:
                 pass
-            assert ORIGINAL_TS in adapter._processed_message_ts
+            assert claim_key in adapter._processed_message_ts
 
         asyncio.run(scenario())
         assert len(delivered) == 1
