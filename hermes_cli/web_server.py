@@ -36,6 +36,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -141,6 +142,18 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+
+# Usage analytics can be requested repeatedly by dashboards and external
+# clients. A persistently damaged state.db used to make every request reopen
+# the file and emit a full FastAPI traceback. Keep this circuit process-local:
+# it protects the hot read path without mutating or attempting online repair
+# of the user's database.
+_USAGE_DB_CORRUPT_BACKOFF_SECONDS = 300
+_USAGE_DB_TRANSIENT_BACKOFF_SECONDS = 5
+_USAGE_DB_ERROR_LOG_INTERVAL_SECONDS = 300
+_usage_db_circuit_lock = threading.Lock()
+_usage_db_circuit: Dict[str, Tuple[float, str]] = {}
+_usage_db_last_error_log: Dict[str, float] = {}
 
 
 def _process_start_marker(pid: int) -> str:
@@ -15875,6 +15888,74 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+def _usage_db_circuit_key(profile: Optional[str]) -> str:
+    return profile or "<default>"
+
+
+def _usage_db_circuit_status(profile: Optional[str]) -> Optional[Tuple[int, str]]:
+    """Return the active retry delay/detail for one profile, if any."""
+    key = _usage_db_circuit_key(profile)
+    now = time.monotonic()
+    with _usage_db_circuit_lock:
+        state = _usage_db_circuit.get(key)
+        if state is None:
+            return None
+        retry_at, detail = state
+        if retry_at <= now:
+            _usage_db_circuit.pop(key, None)
+            return None
+        retry_after = max(1, int(retry_at - now + 0.999))
+        return retry_after, detail
+
+
+def _record_usage_db_failure(
+    profile: Optional[str], exc: sqlite3.DatabaseError
+) -> Tuple[int, str]:
+    """Open a bounded analytics circuit and rate-limit the diagnostic log."""
+    from hermes_state import classify_persistence_error
+
+    key = _usage_db_circuit_key(profile)
+    cause = classify_persistence_error(exc)
+    corrupt = cause == "corrupt"
+    retry_after = (
+        _USAGE_DB_CORRUPT_BACKOFF_SECONDS
+        if corrupt
+        else _USAGE_DB_TRANSIENT_BACKOFF_SECONDS
+    )
+    detail = (
+        "state.db is corrupt; usage analytics are paused. Run `hermes doctor` "
+        "to inspect or repair the database. Hermes did not modify the damaged file."
+        if corrupt
+        else "state.db is temporarily unavailable; usage analytics are paused."
+    )
+    now = time.monotonic()
+    should_log = False
+    with _usage_db_circuit_lock:
+        _usage_db_circuit[key] = (now + retry_after, detail)
+        last_log = _usage_db_last_error_log.get(key)
+        if (
+            last_log is None
+            or now - last_log >= _USAGE_DB_ERROR_LOG_INTERVAL_SECONDS
+        ):
+            _usage_db_last_error_log[key] = now
+            should_log = True
+    if should_log:
+        _log.error(
+            "Usage analytics paused for profile %s after state.db %s error; "
+            "retrying after %ss: %s",
+            key,
+            cause,
+            retry_after,
+            exc,
+        )
+    return retry_after, detail
+
+
+def _clear_usage_db_circuit(profile: Optional[str]) -> None:
+    with _usage_db_circuit_lock:
+        _usage_db_circuit.pop(_usage_db_circuit_key(profile), None)
+
+
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
@@ -15956,7 +16037,25 @@ async def get_usage_analytics(
     values would force expensive full-history SQL and InsightsEngine work, or
     produce empty/inverted time windows. The UI only offers 7/30/90-day
     presets."""
-    return await asyncio.to_thread(_get_usage_analytics, days, profile)
+    circuit = _usage_db_circuit_status(profile)
+    if circuit is not None:
+        retry_after, detail = circuit
+        raise HTTPException(
+            status_code=503,
+            detail=detail,
+            headers={"Retry-After": str(retry_after)},
+        )
+    try:
+        result = await asyncio.to_thread(_get_usage_analytics, days, profile)
+    except sqlite3.DatabaseError as exc:
+        retry_after, detail = _record_usage_db_failure(profile, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=detail,
+            headers={"Retry-After": str(retry_after)},
+        ) from None
+    _clear_usage_db_circuit(profile)
+    return result
 
 
 def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
