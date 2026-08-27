@@ -1,15 +1,64 @@
 """Hosted-room JSON-RPC contract.
 
-These methods expose durable room identity and an append-only, monotonic room
-log. They deliberately do not drive Bot turns yet. ``groups.capabilities``
-makes that boundary machine-readable so a hosted-aware Desktop cannot mistake
-the log prototype for a complete gateway-side orchestrator.
+These methods expose durable room identity, replay, and the process-owned
+same-gateway Discussion driver. ``groups.capabilities`` keeps that boundary
+machine-readable so older clients stay on the renderer-owned room path.
 """
 
 from .method_ctx import HandlerRegistry
 
+import os
+import threading
+
 _registry = HandlerRegistry()
 method = _registry.method
+
+_service_lock = threading.Lock()
+_bound_server = None
+_service = None
+
+
+def bind_server(server) -> None:
+    """Bind the fully initialized server module without starting a worker."""
+
+    global _bound_server
+    _bound_server = server
+
+
+def start_hosted_room_service():
+    """Start one process-owned hosted room service idempotently."""
+
+    global _service
+    if _bound_server is None:
+        return None
+    from gateway.hosted_rooms import default_db_path
+    from tui_gateway.hosted_room_service import HostedRoomService
+
+    db_path = default_db_path()
+    with _service_lock:
+        if _service is not None and _service.db_path != db_path:
+            _service.stop(timeout=1.0)
+            _service = None
+        if _service is None:
+            _service = HostedRoomService(_bound_server, db_path=db_path)
+        _service.start()
+        return _service
+
+
+def stop_hosted_room_service(*, timeout: float = 5.0) -> bool:
+    """Stop the process-owned worker without interrupting accepted turns."""
+
+    global _service
+    with _service_lock:
+        service = _service
+        _service = None
+    return True if service is None else service.stop(timeout=timeout)
+
+
+def get_hosted_room_service():
+    """Return the active service, if its lifecycle owner started it."""
+
+    return _service
 
 
 @method("groups.capabilities")
@@ -21,11 +70,14 @@ def _(rid, params: dict) -> dict:
         local_authority_gateway_id,
     )
 
+    service = get_hosted_room_service()
+    driver_ready = bool(service and service.runtime.status()["running"])
     return _ok(
         rid,
         {
             "protocol_version": PROTOCOL_VERSION,
-            "driver": False,
+            "driver": driver_ready,
+            "persistent_process": os.getenv("HERMES_DESKTOP") != "1",
             "authority_gateway_id": local_authority_gateway_id(),
             "features": [
                 "authority_epoch",
@@ -45,6 +97,7 @@ def _(rid, params: dict) -> dict:
                 "groups.send",
                 "groups.log",
                 "groups.disband",
+                "groups.stop",
             ],
             "max_log_limit": MAX_LOG_LIMIT,
         },
@@ -85,12 +138,21 @@ def _(rid, params: dict) -> dict:
     )
 
     try:
-        room = create_room(
-            default_db_path(),
-            room_id=params.get("room_id"),
-            name=params.get("name"),
-            members=params.get("members"),
-            authority_gateway_id=local_authority_gateway_id(),
+        service = get_hosted_room_service()
+        room = (
+            service.create_room(
+                room_id=params.get("room_id"),
+                name=params.get("name"),
+                members=params.get("members"),
+            )
+            if service is not None
+            else create_room(
+                default_db_path(),
+                room_id=params.get("room_id"),
+                name=params.get("name"),
+                members=params.get("members"),
+                authority_gateway_id=local_authority_gateway_id(),
+            )
         )
         return _ok(rid, {"room": room})
     except HostedRoomError as exc:
@@ -105,14 +167,21 @@ def _(rid, params: dict) -> dict:
     from gateway.hosted_rooms import HostedRoomError, default_db_path, room_state
 
     try:
+        room = room_state(
+            default_db_path(),
+            room_id=params.get("room_id"),
+            include_disbanded=params.get("include_disbanded") is True,
+        )
+        service = get_hosted_room_service()
         return _ok(
             rid,
             {
-                "room": room_state(
-                    default_db_path(),
-                    room_id=params.get("room_id"),
-                    include_disbanded=params.get("include_disbanded") is True,
-                )
+                "room": room,
+                **(
+                    {"driver_status": service.status(str(room["room_id"]))}
+                    if service is not None and room.get("disbanded_at") is None
+                    else {}
+                ),
             },
         )
     except HostedRoomError as exc:
@@ -133,20 +202,29 @@ def _(rid, params: dict) -> dict:
     from gateway.hosted_rooms import HostedRoomError, append_event, default_db_path
 
     try:
-        event = append_event(
-            default_db_path(),
-            room_id=params.get("room_id"),
-            event_id=params.get("event_id"),
-            kind="message.user",
-            actor={"kind": "user", "id": "desktop"},
-            payload=params.get("payload"),
+        service = get_hosted_room_service()
+        event = (
+            service.send(
+                room_id=params.get("room_id"),
+                event_id=params.get("event_id"),
+                payload=params.get("payload"),
+            )
+            if service is not None
+            else append_event(
+                default_db_path(),
+                room_id=params.get("room_id"),
+                event_id=params.get("event_id"),
+                kind="message.user",
+                actor={"kind": "user", "id": "desktop"},
+                payload=params.get("payload"),
+            )
         )
         return _ok(
             rid,
             {
                 "event": event,
                 "accepted": True,
-                "driver_started": False,
+                "driver_started": service is not None,
             },
         )
     except HostedRoomError as exc:
@@ -161,6 +239,12 @@ def _(rid, params: dict) -> dict:
     from gateway.hosted_rooms import HostedRoomError, default_db_path, disband_room
 
     try:
+        service = get_hosted_room_service()
+        if service is not None:
+            service.stop_room(
+                str(params.get("room_id") or ""),
+                cancel_id=str(params.get("cancel_id") or "room-disbanded"),
+            )
         tombstone = disband_room(
             default_db_path(),
             room_id=params.get("room_id"),
@@ -170,6 +254,23 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4113, str(exc))
     except Exception as exc:
         return _err(rid, 5114, str(exc))
+
+
+@method("groups.stop")
+def _(rid, params: dict) -> dict:
+    """Durably cancel queued or running work for one hosted room."""
+
+    service = get_hosted_room_service()
+    if service is None:
+        return _err(rid, 4115, "hosted room driver is unavailable")
+    try:
+        count = service.stop_room(
+            str(params.get("room_id") or ""),
+            cancel_id=str(params.get("cancel_id") or "desktop-stop"),
+        )
+        return _ok(rid, {"cancelled": count})
+    except Exception as exc:
+        return _err(rid, 5116, str(exc))
 
 
 @method("groups.log")
