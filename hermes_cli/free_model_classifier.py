@@ -3,7 +3,15 @@
 Determines if a kanban task is eligible to route via free models first
 (OpenCode *-free -> OpenRouter :free -> Haiku fallback) based on:
 1. PROVEN-SKILL: routine deterministic tasks (enumerate, count, file-ops, etc.)
-2. NO-PII: no genealogy identity, no Treva rows, no credentials, no SoT writes
+2. NO-CREDENTIAL: no credentials/secrets, no SoT writes, no Treva-time spend
+
+Genealogy is NOT a gate. That block was invented by an agent, has no git provenance
+(this file is untracked), and contradicts his verbatim law — his genealogy is public
+record, records of dead people. Removed 2026-08-27. See `no-invented-gate`.
+
+All keyword matching is WORD-BOUNDED. Naive substring tests made two-letter and short
+tokens match inside ordinary words ('ls' in "manuals", 'key' in "monkey"), which both
+free-routed work that should not have been and blocked work that was never sensitive.
 """
 
 import re
@@ -41,30 +49,37 @@ PROVEN_SKILL_KEYWORDS = {
 }
 
 # Keywords that indicate a task is PII/sensitive (must stay on Haiku)
+#
+# GENEALOGY TERMS REMOVED 2026-08-27 — they were an INVENTED GATE.
+# This file is untracked in git: no commit, no directive, no AGENTS.md line ever created
+# a genealogy PII block. Christopher's verbatim law (plans/RESEARCH-gecko-bioclip.md:264):
+#   "his genealogy = public record; the commons = opt-in — no PII/security gate needed"
+# Skill `no-invented-gate` names the only three real gates: occupancy.py, no-paid-cloud,
+# don't-fabricate-a-run. These are public-domain records of dead people.
+# Removed: genealogy, genealog, person, identity, pii, personal, private, ancestry, dna,
+#          genetic, family, ancestor, ocr_ground_truth, nara.
 PII_SENSITIVE_KEYWORDS = {
-    # Identity/genealogy
-    'genealogy', 'person', 'identity', 'pii', 'personal', 'private',
-    'genealog', 'ancestry', 'dna', 'genetic', 'family', 'ancestor',
-    
-    # Sensitive data (narrow to actual credentials, not "auth" alone which is too broad)
-    'credential', 'secret', 'password', 'token', 'key', 
+    # Actual credentials (no-paid-cloud — a REAL gate)
+    'credential', 'secret', 'password', 'token', 'key',
     'oauth', 'api-key', 'api_key', 'sensitive',
-    
-    # Source of truth (actual SoT terms, not generic "database")
+
+    # Source of truth — a write here is a genuine risk, not a privacy theory
     'sot', 'source-of-truth', 'source_of_truth', 'canonical',
-    'ocr_ground_truth', 'nara', 'treva',
-    
-    # Reasoning/management (harder to parallelize)
+
+    # A LIVING person's protected time (CARDINAL RULE, workspace/scars.jsonl).
+    # Not PII — his mother's hours are not to be spent on already-done work.
+    'treva',
+
+    # Reasoning/management: capability routing, not privacy. Poor free-model fits.
     'cos', 'chief-of-staff', 'spm', 'senior-project', 'decompose',
     'incident', 'incident-response', 'post-mortem', 'postmortem',
     'reasoning', 'think', 'strategy', 'plan',
 }
 
-# Exact terms to always block from free routing
+# Exact terms to always block from free routing.
+# Same removal: only real gates remain.
 PII_BLOCK_TERMS = {
-    'genealogy', 'ocr_ground_truth', 'nara_transcription', 'treva',
-    'person', 'pii', 'credential', 'secret', 'ocr-genealogy',
-    'genealogy-identity', 'graves-genealogy', 'graves-gps',
+    'credential', 'secret', 'treva',
 }
 
 
@@ -99,26 +114,39 @@ def is_proven_skill(task_id: str, title: Optional[str], body: Optional[str]) -> 
 
 
 def is_pii_or_sensitive(task_id: str, title: Optional[str], body: Optional[str]) -> bool:
-    """Check if task involves PII, genealogy identity, credentials, or SoT writes.
-    
+    """Check if a task must stay off free models.
+
     Returns True if the task should stay on Haiku (no free routing).
+
+    Matching is WORD-BOUNDED for the same reason as is_proven_skill: a substring test
+    made short tokens ('key', 'plan', 'sot') match inside ordinary words — "monkey",
+    "keyword", "planting" — blocking work that was never sensitive.
+
+    Genealogy is NOT a gate here. See PII_SENSITIVE_KEYWORDS above: the genealogy block
+    was invented, has no git provenance, and contradicts his verbatim law. Public-domain
+    records of dead people route free like any other routine work.
     """
     combined = _normalize_text((title or "") + " " + (body or ""))
-    
+
+    def _hit(term: str) -> bool:
+        pattern = r"(?<![a-z0-9])" + re.escape(_normalize_text(term)) + r"(?![a-z0-9])"
+        return re.search(pattern, combined) is not None
+
     # Hard block terms that must NEVER route free
     for term in PII_BLOCK_TERMS:
-        if term in combined:
+        if _hit(term):
             return True
-    
-    # Heuristic: multiple sensitive keywords (genealogy + person, etc.)
-    sensitive_count = sum(1 for kw in PII_SENSITIVE_KEYWORDS if kw in combined)
-    if sensitive_count >= 2:
+
+    # Heuristic: two or more sensitive signals together
+    if sum(1 for kw in PII_SENSITIVE_KEYWORDS if _hit(kw)) >= 2:
         return True
-    
-    # Single strong indicator
-    if any(kw in combined for kw in ['genealogy', 'credential', 'secret', 'sot', 'cos']):
+
+    # Single strong indicator. 'genealogy' removed 2026-08-27 — it was the second,
+    # independent copy of the invented gate and would have kept the lane blocked even
+    # after PII_BLOCK_TERMS was cleaned.
+    if any(_hit(kw) for kw in ('credential', 'secret', 'sot', 'cos')):
         return True
-    
+
     return False
 
 
@@ -129,12 +157,12 @@ def should_route_free_first(task_id: str, title: Optional[str], body: Optional[s
     Returns True if:
     1. Task has no explicit model_override (use free classifier)
     2. Task is PROVEN-SKILL (routine, deterministic)
-    3. Task is NO-PII (no genealogy identity, credentials, SoT writes)
+    3. Task is NO-CREDENTIAL (no secrets, no SoT writes, no Treva-time spend)
     
     Returns False if:
     1. Task has explicit model_override (respect the override)
     2. Task is NOT proven-skill (reasoning-heavy, management)
-    3. Task involves PII/genealogy identity/credentials/SoT (stay on Haiku)
+    3. Task involves credentials/SoT writes/Treva time (stay on Haiku)
     """
     # Respect explicit model overrides
     if model_override:
