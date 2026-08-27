@@ -2957,6 +2957,77 @@ def get_env_prefer_dotenv(key: str) -> str:
     return raw or scoped_value
 
 
+def resolve_env_key_binding(
+    provider: str, requested_provider: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve a provider's env-sourced API-key binding, or ``None``.
+
+    Single source of truth for "which env var(s) hold this provider's key and
+    what is its default endpoint", shared by the refresh consumer in
+    ``run_agent`` and by the env seeder below so the two can never drift.
+
+    Returns a dict with:
+        key_env_vars      ordered candidate env var names, first non-empty wins
+        base_url_env_var  env var name for a base-URL override ("" if none)
+        default_base_url  the provider's default endpoint ("" if unknown)
+
+    or ``None`` when the credential is NOT env-sourced — OAuth singletons
+    (nous, openai-codex, xai-oauth, qwen-oauth, minimax-oauth), inline
+    ``api_key`` config, or pool-only entries. Nothing in ``~/.hermes/.env``
+    to watch for those.
+    """
+    provider = (provider or "").strip().lower()
+
+    # OpenRouter is an aggregator with no PROVIDER_REGISTRY entry (the
+    # registry branch below would miss it) — its OPENROUTER_API_KEY is
+    # env-sourced exactly like a registry api-key provider.
+    if provider == "openrouter":
+        return {
+            "key_env_vars": ("OPENROUTER_API_KEY",),
+            "base_url_env_var": "",
+            "default_base_url": OPENROUTER_BASE_URL,
+        }
+
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if pconfig and getattr(pconfig, "auth_type", "") == AUTH_TYPE_API_KEY and getattr(
+        pconfig, "api_key_env_vars", ()
+    ):
+        env_vars = list(pconfig.api_key_env_vars)
+        if provider == "anthropic":
+            env_vars = [
+                "ANTHROPIC_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+            ]
+        return {
+            "key_env_vars": tuple(env_vars),
+            "base_url_env_var": getattr(pconfig, "base_url_env_var", "") or "",
+            "default_base_url": getattr(pconfig, "inference_base_url", "") or "",
+        }
+
+    # Named custom provider (config ``providers.<name>`` / ``custom_providers``)
+    # whose credential is env-sourced via ``key_env``. Looked up lazily to
+    # avoid a credential_pool → runtime_provider import cycle.
+    if provider == "custom":
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+
+            custom_provider = _get_named_custom_provider(requested_provider or "")
+        except Exception:
+            custom_provider = None
+        if custom_provider:
+            key_env = str(custom_provider.get("key_env") or "").strip()
+            base_url = str(custom_provider.get("base_url") or "").strip().rstrip("/")
+            if key_env:
+                return {
+                    "key_env_vars": (key_env,),
+                    "base_url_env_var": "",
+                    "default_base_url": base_url,
+                }
+
+    return None
+
+
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -3019,44 +3090,21 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             payload["secret_source"] = secret_source
         return payload
 
-    if provider == "openrouter":
-        # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
-        if token:
-            source = "env:OPENROUTER_API_KEY"
-            if _is_source_suppressed(provider, source):
-                return changed, active_sources
-            active_sources.add(source)
-            changed |= _upsert_entry(
-                entries,
-                provider,
-                source,
-                _env_payload(
-                    source=source,
-                    env_var="OPENROUTER_API_KEY",
-                    token=token,
-                    base_url=OPENROUTER_BASE_URL,
-                ),
-            )
-        return changed, active_sources
-
-    pconfig = PROVIDER_REGISTRY.get(provider)
-    if not pconfig or pconfig.auth_type != AUTH_TYPE_API_KEY:
+    # One resolver for every env-sourced api-key credential: openrouter (an
+    # aggregator with no registry entry), registry api-key providers with an
+    # env var (including anthropic's three-token override), and named custom
+    # providers with ``key_env``. Anything else (OAuth singletons, inline
+    # config keys, pool-only) has no env credential to seed — resolver returns
+    # None.
+    binding = resolve_env_key_binding(provider)
+    if not binding:
         return changed, active_sources
 
     env_url = ""
-    if pconfig.base_url_env_var:
-        env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+    if binding["base_url_env_var"]:
+        env_url = _get_env_prefer_dotenv(binding["base_url_env_var"]).rstrip("/")
 
-    env_vars = list(pconfig.api_key_env_vars)
-    if provider == "anthropic":
-        env_vars = [
-            "ANTHROPIC_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ]
-
-    for env_var in env_vars:
+    for env_var in binding["key_env_vars"]:
         # Prefer ~/.hermes/.env over os.environ
         token = _get_env_prefer_dotenv(env_var)
         if not token:
@@ -3065,11 +3113,11 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         if _is_source_suppressed(provider, source):
             continue
         active_sources.add(source)
-        base_url = env_url or pconfig.inference_base_url
+        base_url = env_url or binding["default_base_url"]
         if provider == "kimi-coding":
-            base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = _resolve_kimi_base_url(token, binding["default_base_url"], env_url)
         elif provider == "zai":
-            base_url = _resolve_zai_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = _resolve_zai_base_url(token, binding["default_base_url"], env_url)
         changed |= _upsert_entry(
             entries,
             provider,
