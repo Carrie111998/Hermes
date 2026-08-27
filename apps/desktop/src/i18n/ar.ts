@@ -2243,6 +2243,25 @@ export const ar = defineLocale({
       messagingPlatforms: 'منصات المراسلة'
     },
     statusbar: {
+      contextUsagePanel: {
+        categories: {
+          conversation: 'المحادثة',
+          files: 'الملفات',
+          mcp: 'MCP',
+          memory: 'الذاكرة',
+          rules: 'القواعد',
+          skills: 'المهارات',
+          subagent_definitions: 'تعريفات الوكلاء الفرعيين',
+          system_prompt: 'موجه النظام',
+          tool_definitions: 'تعريفات الأدوات'
+        },
+        categoryCount: count => (count === 1 ? 'ملف واحد' : count === 2 ? 'ملفان' : `${count} ملفات`),
+        empty: 'لا توجد بيانات سياق بعد',
+        loading: 'جارٍ تحميل التفصيل…',
+        percentFull: percent => `ممتلئ ${percent}٪`,
+        title: 'استهلاك السياق',
+        tokenSummary: (used, max) => `${used} / ${max} توكن`
+      },
       unknown: 'غير معروف',
       restart: 'إعادة تشغيل',
       update: 'تحديث',

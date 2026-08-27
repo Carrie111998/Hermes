@@ -55,6 +55,14 @@ export function ContextUsagePanel({ breakdown, loading, usage }: ContextUsagePan
               <span className="size-2 shrink-0 rounded-[2px]" style={{ background: category.color }} />
 
               <span className="truncate text-muted-foreground">{category.label}</span>
+
+              {/* "how many files", the other half of the question this category
+                  answers. Only categories that emit a count render one. */}
+              {typeof category.count === 'number' && category.count > 0 && (
+                <span className="shrink-0 text-[0.625rem] text-muted-foreground/60 tabular-nums">
+                  {copy.categoryCount(category.count)}
+                </span>
+              )}
             </span>
 
             <span className="shrink-0 tabular-nums text-foreground">{compactNumber(category.tokens)}</span>

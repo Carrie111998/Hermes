@@ -114,3 +114,31 @@ describe('ContextUsagePanel', () => {
     expect(screen.getByText('No context data yet')).toBeTruthy()
   })
 })
+
+describe('ContextUsagePanel file count', () => {
+  it('renders the distinct-file count beside the Files category', () => {
+    render(
+      <ContextUsagePanel
+        breakdown={{
+          ...breakdown,
+          categories: [
+            { color: 'var(--context-usage-files)', count: 3, id: 'files', label: 'Files', tokens: 40_000 },
+            { color: 'teal', id: 'conversation', label: 'Conversation', tokens: 10_000 }
+          ]
+        }}
+        loading={false}
+        usage={usage}
+      />
+    )
+
+    expect(screen.getByText('Files')).not.toBeNull()
+    expect(screen.getByText('3 files')).not.toBeNull()
+  })
+
+  it('omits the count for categories that do not carry one', () => {
+    render(<ContextUsagePanel breakdown={breakdown} loading={false} usage={usage} />)
+
+    expect(screen.getByText('Conversation')).not.toBeNull()
+    expect(screen.queryByText(/\bfiles?\b/)).toBeNull()
+  })
+})

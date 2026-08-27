@@ -2900,6 +2900,7 @@ export const en: Translations = {
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
+          files: 'Files',
           mcp: 'MCP',
           memory: 'Memory',
           rules: 'Rules',
@@ -2908,6 +2909,7 @@ export const en: Translations = {
           system_prompt: 'System prompt',
           tool_definitions: 'Tool definitions'
         },
+        categoryCount: count => `${count} file${count === 1 ? '' : 's'}`,
         empty: 'No context data yet',
         loading: 'Loading breakdown…',
         percentFull: percent => `${percent}% Full`,

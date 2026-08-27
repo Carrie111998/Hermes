@@ -763,6 +763,9 @@ export interface StarmapGraph {
 
 export interface ContextUsageCategory {
   color: string
+  /** Per-category extra, emitted only where it means something — today just
+   *  `files`, where it is the number of distinct files in the window. */
+  count?: number
   id: string
   label: string
   tokens: number

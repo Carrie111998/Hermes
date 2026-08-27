@@ -42,13 +42,15 @@ describe('ContextStatusRow', () => {
   afterEach(cleanup)
 
   it('summarises used/max on the row without opening anything', () => {
-    render(<ContextStatusRow breakdown={breakdown} loading={false} usage={contextUsageFromBreakdown(breakdown)} />)
+    const view = render(
+      <ContextStatusRow breakdown={breakdown} loading={false} usage={contextUsageFromBreakdown(breakdown)} />
+    )
 
-    const summary = document.querySelector('[data-slot="context-status-summary"]')
+    const summary = view.container.querySelector('[data-slot="context-status-summary"]')
 
     expect(summary?.textContent).toContain('12k/200k')
     expect(summary?.textContent).toContain('6%')
-    expect(document.querySelector('[data-slot="context-usage-panel"]')).toBeNull()
+    expect(screen.queryByText('Context Usage')).toBeNull()
   })
 
   it('opens the shared breakdown panel when the row is activated', async () => {

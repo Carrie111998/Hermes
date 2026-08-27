@@ -3064,6 +3064,7 @@ export const zh: Translations = {
       contextUsagePanel: {
         categories: {
           conversation: '对话',
+          files: '文件',
           mcp: 'MCP',
           memory: '记忆',
           rules: '规则',
@@ -3072,6 +3073,7 @@ export const zh: Translations = {
           system_prompt: '系统提示词',
           tool_definitions: '工具定义'
         },
+        categoryCount: count => `${count} 个文件`,
         empty: '暂无上下文数据',
         loading: '正在加载明细…',
         percentFull: percent => `已用 ${percent}%`,

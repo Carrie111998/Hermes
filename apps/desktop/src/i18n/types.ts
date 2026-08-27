@@ -2465,6 +2465,7 @@ export interface Translations {
       contextUsagePanel: {
         categories: {
           conversation: string
+          files: string
           mcp: string
           memory: string
           rules: string
@@ -2473,6 +2474,7 @@ export interface Translations {
           system_prompt: string
           tool_definitions: string
         }
+        categoryCount: (count: number) => string
         empty: string
         loading: string
         percentFull: (percent: number) => string

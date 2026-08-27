@@ -16,6 +16,17 @@ _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DO
 
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
 
+# Files carved out of the conversation blob. Names come from the canonical
+# "file" toolset at runtime (``toolsets.TOOLSETS``) so this never drifts from
+# the tool registry; the frozenset is only the offline fallback.
+_FILE_TOOLSET = "file"
+_FILE_TOOL_FALLBACK = frozenset({"read_file", "write_file", "patch", "search_files"})
+
+# The subset whose ``path`` argument names ONE file, so it can be counted.
+# ``search_files`` takes a directory (and ``patch`` in V4A mode takes no path
+# at all) — both still cost file tokens, neither is a countable file.
+_FILE_PATH_TOOL_NAMES = frozenset({"read_file", "write_file", "patch"})
+
 _CATEGORY_COLORS = {
     "system_prompt": "var(--context-usage-system)",
     "tool_definitions": "var(--context-usage-tools)",
@@ -24,6 +35,7 @@ _CATEGORY_COLORS = {
     "mcp": "var(--context-usage-mcp)",
     "subagent_definitions": "var(--context-usage-subagents)",
     "memory": "var(--context-usage-memory)",
+    "files": "var(--context-usage-files)",
     "conversation": "var(--context-usage-conversation)",
 }
 
@@ -78,6 +90,83 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
     return memory_block, user_block
 
 
+def _file_tool_names() -> frozenset:
+    """The live "file" toolset's tool names, or the offline fallback."""
+    try:
+        from toolsets import resolve_toolset
+
+        names = frozenset(resolve_toolset(_FILE_TOOLSET, include_registry=False) or ())
+    except Exception:
+        return _FILE_TOOL_FALLBACK
+    return names or _FILE_TOOL_FALLBACK
+
+
+def _call_arguments(call: Any) -> Dict[str, Any]:
+    """Best-effort decode of a tool call's ``arguments`` (a JSON string)."""
+    fn = call.get("function") if isinstance(call, dict) else None
+    raw = (fn or {}).get("arguments") if isinstance(fn, dict) else None
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _file_context_stats(messages: Sequence[dict]) -> Tuple[int, int]:
+    """Split file I/O out of the conversation blob.
+
+    Returns ``(tokens, distinct_file_count)``. Both halves of a file round-trip
+    are counted: the assistant's ``tool_calls`` entry (which for ``write_file``
+    and ``patch`` carries the whole payload) and the tool result it is answered
+    with. Result messages are matched by ``tool_call_id``, so a tool result is
+    only claimed when its own call was a file tool — never by name-guessing the
+    message.
+
+    Estimated with the same memoized per-message pass the conversation total
+    uses, so the two are directly comparable and the caller can subtract.
+    """
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    names = _file_tool_names()
+    tokens = 0
+    paths: set = set()
+    file_call_ids: set = set()
+
+    for msg in messages or ():
+        if not isinstance(msg, dict):
+            continue
+
+        if msg.get("role") == "tool":
+            call_id = str(msg.get("tool_call_id") or "")
+            if call_id and call_id in file_call_ids:
+                tokens += estimate_messages_tokens_rough([msg])
+            continue
+
+        for call in msg.get("tool_calls") or ():
+            if not isinstance(call, dict):
+                continue
+            name = _tool_name(call)
+            if name not in names:
+                continue
+
+            call_id = str(call.get("id") or "")
+            if call_id:
+                file_call_ids.add(call_id)
+
+            tokens += _json_tokens(call)
+
+            if name in _FILE_PATH_TOOL_NAMES:
+                path = str(_call_arguments(call).get("path") or "").strip()
+                if path:
+                    paths.add(path)
+
+    return tokens, len(paths)
+
+
 def _strip_blocks(text: str, *blocks: str) -> str:
     out = text
     for block in blocks:
@@ -114,6 +203,15 @@ def compute_session_context_breakdown(
 
     conversation_tokens = estimate_messages_tokens_rough(messages or [])
 
+    # File I/O is the single biggest thing people want broken out of
+    # "Conversation" — it answers "how much of my window is files, and how
+    # many". Clamped so the two halves can never sum past the transcript: the
+    # file figure adds a per-call JSON estimate to per-message estimates, which
+    # is close but not identical arithmetic.
+    file_tokens, file_count = _file_context_stats(messages or [])
+    file_tokens = max(0, min(file_tokens, conversation_tokens))
+    conversation_tokens -= file_tokens
+
     categories = [
         ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
         ("tool_definitions", "Tool definitions", _json_tokens(builtin_tools)),
@@ -122,6 +220,7 @@ def compute_session_context_breakdown(
         ("mcp", "MCP", _json_tokens(mcp_tools)),
         ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
         ("memory", "Memory", _chars_to_tokens(memory_text)),
+        ("files", "Files", file_tokens),
         ("conversation", "Conversation", conversation_tokens),
     ]
 
@@ -137,6 +236,11 @@ def compute_session_context_breakdown(
         else 0
     )
 
+    # Per-category extras, merged into the emitted dicts. Only "files" carries
+    # one today (a distinct-file count); the shape stays optional so surfaces
+    # that don't know about it keep rendering the category unchanged.
+    category_counts = {"files": file_count}
+
     return {
         "categories": [
             {
@@ -144,6 +248,7 @@ def compute_session_context_breakdown(
                 "id": category_id,
                 "label": label,
                 "tokens": tokens,
+                **({"count": category_counts[category_id]} if category_id in category_counts else {}),
             }
             for category_id, label, tokens in categories
             if tokens > 0
@@ -170,6 +275,7 @@ _CATEGORY_GLYPHS = {
     "mcp": "▥",
     "subagent_definitions": "▦",
     "memory": "▧",
+    "files": "◧",
     "conversation": "▨",
 }
 _FREE_GLYPH = "·"
