@@ -54,26 +54,9 @@ const readers = new Map<RightRailTabId, PageReader>()
 /** Owning session for each registered reader (tabId -> sessionId). */
 const readerSessions = new Map<RightRailTabId, string>()
 
-/** True when at least one preview tab has a registered live page reader
- *  AND that tab is still open in `$previewTabs` (guards against stale
- *  registrations outliving their tab, e.g. after a tab closes before its
- *  unregister callback runs). Used by the desktop bridge to allow preview
- *  actions from non-active sessions (#95459). */
-export function hasLivePreviewReaders(): boolean {
-  const openIds = new Set($previewTabs.get().map(t => t.id))
-
-  for (const tabId of readers.keys()) {
-    if (openIds.has(tabId)) {
-      return true
-    }
-  }
-
-  return false
-}
-
-/** Session-scoped variant: returns the tab ID of the live preview the given
- *  session owns (or null when the session owns no live reader whose tab is
- *  still open). Every production registration passes a sessionId (see
+/** Session-scoped: returns the tab ID of the live preview the given session
+ *  owns (or null when the session owns no live reader whose tab is still
+ *  open). Every production registration passes a sessionId (see
  *  preview-pane.tsx), so this is the authoritative ownership check. The
  *  returned tab ID is carried into the mutation so admission and effect bind
  *  to the same exact preview identity — a background session can never pass
@@ -101,11 +84,7 @@ export function hasLivePreviewForSession(sessionId: string): boolean {
 }
 
 /** Register a live preview's page reader; returns an idempotent unregister.
- *
- *  When `sessionId` is provided, the registration is session-scoped and
- *  participates in {@link hasLivePreviewForSession}; otherwise it is
- *  treated as a legacy global registration and only counts for
- *  {@link hasLivePreviewReaders}. */
+ *  The session that owns this preview is bound at registration time. */
 export function registerPreviewPageReader(
   tabId: RightRailTabId,
   reader: PageReader,
@@ -138,18 +117,10 @@ function windowText(
   return { ...base, end: to, start: from, text: text.slice(from, to), total_chars: total }
 }
 
-/** Read the ACTIVE preview tab. Null when no tab is open or the global
- *  active-tab ID doesn't match any open tab.
- *
- *  The `?? tabs[0]` fallback is deliberately absent: when the global
- *  active-tab ID is stale (pointing at a closed tab, or desynced across
- *  multiple preview zones — #89272), falling through to `tabs[0]` reads
- *  an arbitrary surface the user is NOT looking at. Returning null is
- *  honest — the agent retries or asks the user instead of narrating the
- *  wrong preview. The multi-tab resolution ladder is owned by #89277. */
+/** Read the ACTIVE preview tab. Null only when no tab is open at all. */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get())
+  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]
 
   if (!tab) {
     return null
