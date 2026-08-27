@@ -822,3 +822,30 @@ class TestProjectScopedMemory:
         store.load_from_disk()
         result = store.format_for_system_prompt("memory", project_scope="myapp")
         assert result is None
+
+    def test_scope_matching_is_case_sensitive(self, store):
+        """[project:MyApp] excluded, [project:myapp] included under scope "myapp"."""
+        # Intentional: scope matching is exact case-sensitive prefix matching.
+        # Do NOT add case-folding — project names are case-sensitive identifiers
+        # and case-insensitive matching would silently include unintended entries
+        # (e.g. "MyApp" matching "myapp" or "MYAPP").
+        filtered = MemoryStore._scoped_entries([
+            "[project:MyApp] note",
+            "[project:myapp] note",
+        ], "myapp")
+        assert "[project:MyApp] note" not in filtered
+        assert "[project:myapp] note" in filtered
+
+    def test_whitespace_variant_is_excluded(self, store):
+        """[project: myapp] (space after colon) excluded under scope "myapp"."""
+        # Intentional: space-tolerant matching is NOT supported. The tag format
+        # is "[project:<name>]" with no space after the colon. A space
+        # produces a different prefix that will not match any project scope.
+        # Adding space tolerance would silently include mistagged entries that
+        # the user did not intend to associate with this project.
+        filtered = MemoryStore._scoped_entries([
+            "[project: myapp] note",
+            "[project:myapp] note",
+        ], "myapp")
+        assert "[project: myapp] note" not in filtered
+        assert "[project:myapp] note" in filtered
