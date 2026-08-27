@@ -6308,78 +6308,15 @@ def run_job(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
-        # Initialize MCP servers so configured mcp_servers are available to
-        # the agent's tool registry before AIAgent is constructed. Without
-        # this, cron jobs never saw any MCP tools — only the gateway / CLI
-        # paths called discover_mcp_tools() at startup. Idempotent: subsequent
-        # ticks short-circuit on already-connected servers inside
-        # register_mcp_servers(). Non-fatal on failure: a broken MCP server
-        # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
-                )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
-
-        # Initialize the SQLite session store so cron job messages are
-        # persisted and discoverable via session_search (same pattern as
-        # gateway/run.py) — only now, after every early-return path
-        # (wake-gate, prompt validation, drift skip) has passed, so a gated
-        # run never opens state.db just to abandon the handle (#96290).
+        # MCP discovery is intentionally skipped for cron jobs. ``no_mcp``
+        # is a tool-allowlist sentinel, but it is too late to prevent the
+        # expensive and side-effectful MCP startup path (including reconnecting
+        # clients). Cron jobs are already constructed with the resolved cron
+        # toolset below.
         #
-        # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT,
-        # which only watches the agent's run_conversation below):
-        # SessionDB.__init__ opens/migrates state.db synchronously and has no
-        # timeout of its own against a wedged sqlite3.connect (e.g. a stale
-        # flock left by a crashed sibling process). An unbounded hang here
-        # would wedge the job's worker thread, so the init is bounded and a
-        # timeout proceeds without a session store instead of blocking the
-        # run forever.
-        _session_db_timeout = _get_session_db_timeout()
-        try:
-            from hermes_state import SessionDB
-
-            if _session_db_timeout > 0:
-                _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                _session_db_future = _session_db_pool.submit(SessionDB)
-                try:
-                    _session_db = _session_db_future.result(timeout=_session_db_timeout)
-                except concurrent.futures.TimeoutError:
-                    # The worker is abandoned (shutdown below doesn't wait for
-                    # it). If SessionDB() later completes inside it, the
-                    # future's result would be orphaned and its SQLite FDs
-                    # (.db, WAL, SHM) leak until process exit.  Register a
-                    # done-callback that retrieves and closes any eventual
-                    # late result (#72782).
-                    _session_db_future.add_done_callback(_close_late_session_db_result)
-                    raise
-                finally:
-                    # Don't wait for a wedged connect() to unwind — abandon the
-                    # worker thread (same pattern as the agent inactivity
-                    # timeout further down) rather than blocking shutdown on
-                    # it too.
-                    _session_db_pool.shutdown(wait=False)
-            else:
-                # 0 = unlimited (legacy behavior, opt-in for debugging)
-                _session_db = SessionDB()
-        except concurrent.futures.TimeoutError:
-            logger.error(
-                "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-                "without a session store for this run instead of blocking it "
-                "forever",
-                job.get("id", "?"), _session_db_timeout,
-            )
-        except Exception as e:
-            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
-
+        # Keep this guard at the scheduler/agent-construction boundary rather
+        # than relying on model_tools import order: this is the boundary that
+        # all LLM cron subprocesses cross before the first model call.
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
