@@ -124,6 +124,7 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+EXHAUSTED_TTL_OVERLOADED_SECONDS = 60        # 1 minute for transient 503/overloaded
 # When a pool has no other credential to rotate to (the offending key is the
 # sole non-DEAD entry), a 1-hour bench means an hour of hard failures with
 # nothing to fall back to. Throttles (429/403/5xx) are transient and reset in
@@ -381,6 +382,8 @@ def _exhausted_ttl(
     """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
+    if failure_reason in ("overloaded", "server_error") or error_code in (500, 502, 503, 504, 529):
+        return EXHAUSTED_TTL_OVERLOADED_SECONDS
     base = EXHAUSTED_TTL_429_SECONDS if error_code == 429 else EXHAUSTED_TTL_DEFAULT_SECONDS
     # Unverified billing (#82154): the same 400 body can be a content-filter
     # rejection of the request itself, in which case the credential is healthy
@@ -2018,9 +2021,7 @@ class CredentialPool:
             return session_dead
         if weekly_dead:
             return weekly_dead
-        if monthly_dead:
-            return monthly_dead
-        return available
+        return []
 
     def select(self) -> Optional[PooledCredential]:
         self._refresh_codex_usage_cache()
@@ -2262,6 +2263,10 @@ class CredentialPool:
 
         if self.provider == "openai-codex" and len(available) > 1:
             available = self._usage_prioritized(available)
+            if not available:
+                self._current_id = None
+                self._log_no_available_entries()
+                return None, pending_refresh
 
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)
