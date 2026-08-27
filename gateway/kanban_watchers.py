@@ -2037,6 +2037,35 @@ class GatewayKanbanWatchersMixin:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        # Decomposition links each new prerequisite TO the
+                        # root. child_ids(root) instead names downstream
+                        # consumers, so it cannot identify a prior fan-out.
+                        # Use the event committed with the original plan;
+                        # ordinary prerequisites alone are not proof either.
+                        try:
+                            with _kb.connect_closing(board=slug) as _guard_conn:
+                                _already_decomposed = _guard_conn.execute(
+                                    "SELECT 1 FROM task_events "
+                                    "WHERE task_id = ? AND kind = 'decomposed' "
+                                    "LIMIT 1",
+                                    (tid,),
+                                ).fetchone() is not None
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban auto-decompose [%s]: %s history "
+                                "unavailable (%s); skipping", slug, tid, exc,
+                            )
+                            continue
+                        if _already_decomposed:
+                            logger.debug(
+                                "kanban auto-decompose [%s]: %s skipped: "
+                                "existing decomposition plan",
+                                slug,
+                                tid,
+                            )
+                            continue
+                        # Protected roots must not consume the attempt budget
+                        # and starve fresh triage work later in the queue.
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
