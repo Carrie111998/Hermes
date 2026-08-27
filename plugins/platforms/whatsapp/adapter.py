@@ -57,6 +57,27 @@ def _wenv(name: str, default: str = "") -> str:
 
 logger = logging.getLogger(__name__)
 
+
+_FALSE_LIKE = {"0", "false", "no", "off", "disabled"}
+
+
+def whatsapp_outbound_block_reason(extra: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Return the active WhatsApp outbound hard-lock reason, if any."""
+    hermes_home = Path(
+        os.environ.get("HERMES_HOME") or Path.home() / ".hermes"
+    ).expanduser()
+    lock_path = hermes_home / "locks/whatsapp-outbound.lock"
+    if lock_path.exists():
+        return f"WhatsApp outbound hard-blocked by lock file: {lock_path}"
+
+    values = extra or {}
+    if "outbound_enabled" in values:
+        configured = str(values.get("outbound_enabled", "")).strip().lower()
+        if configured in _FALSE_LIKE:
+            return "WhatsApp outbound hard-blocked by configuration"
+
+    return None
+
 # Inbound owner-typed WhatsApp text is prefixed at MessageEvent construction so
 # transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
@@ -935,6 +956,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        if reason := whatsapp_outbound_block_reason(getattr(self.config, "extra", None)):
+            return SendResult(success=False, error=reason)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1001,6 +1024,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
+        if reason := whatsapp_outbound_block_reason(getattr(self.config, "extra", None)):
+            return SendResult(success=False, error=reason)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1034,6 +1059,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        if reason := whatsapp_outbound_block_reason(getattr(self.config, "extra", None)):
+            return SendResult(success=False, error=reason)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1088,6 +1115,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         remain gateway-owned and add text fallback plus explicit confirmation
         semantics before approval prompts are ever mapped onto polls.
         """
+        if reason := whatsapp_outbound_block_reason(getattr(self.config, "extra", None)):
+            return SendResult(success=False, error=reason)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1172,6 +1201,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a native WhatsApp location pin via the Baileys bridge."""
+        if reason := whatsapp_outbound_block_reason(getattr(self.config, "extra", None)):
+            return SendResult(success=False, error=reason)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1277,6 +1308,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        if whatsapp_outbound_block_reason(getattr(self.config, "extra", None)):
+            return
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1714,6 +1747,8 @@ async def _standalone_send(
     ``/send`` message beforehand.
     """
     extra = getattr(pconfig, "extra", {}) or {}
+    if reason := whatsapp_outbound_block_reason(extra):
+        return {"error": reason}
     try:
         import aiohttp
     except ImportError:

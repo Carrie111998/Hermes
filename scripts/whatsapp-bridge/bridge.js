@@ -113,6 +113,8 @@ const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const HERMES_HOME = process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes');
+const OUTBOUND_LOCK_PATH = path.join(HERMES_HOME, 'locks', 'whatsapp-outbound.lock');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -810,6 +812,29 @@ app.use((req, res, next) => {
       error: 'Invalid Host header. Bridge accepts loopback hosts only.',
     });
   }
+  next();
+});
+
+// Deployment hard lock: protect every message-sending and typing endpoint.
+const _OUTBOUND_ENDPOINTS = [
+  '/send',
+  '/edit',
+  '/send-media',
+  '/send-poll',
+  '/send-location',
+  '/typing',
+];
+
+function outboundBlockReason() {
+  if (existsSync(OUTBOUND_LOCK_PATH)) {
+    return `WhatsApp outbound hard-blocked by lock file: ${OUTBOUND_LOCK_PATH}`;
+  }
+  return null;
+}
+
+app.use(_OUTBOUND_ENDPOINTS, (req, res, next) => {
+  const reason = outboundBlockReason();
+  if (reason) return res.status(403).json({ error: reason });
   next();
 });
 

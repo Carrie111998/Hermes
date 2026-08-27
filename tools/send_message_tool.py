@@ -427,6 +427,13 @@ def _handle_send(args):
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
+    # Deployment hard lock: keep CLI/tool egress aligned with the live adapter.
+    if platform == Platform.WHATSAPP:
+        from plugins.platforms.whatsapp.adapter import whatsapp_outbound_block_reason
+
+        if reason := whatsapp_outbound_block_reason(getattr(pconfig, "extra", None)):
+            return tool_error(reason)
+
     from gateway.platforms.base import BasePlatformAdapter
 
     # Capture [[as_document]] directive before extract_media strips it.
