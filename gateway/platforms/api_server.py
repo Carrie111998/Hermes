@@ -7166,6 +7166,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        profile: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
     ) -> list:
@@ -7179,6 +7180,13 @@ class APIServerAdapter(BasePlatformAdapter):
         ``async_delivery`` parameter to get wrong; the stateless HTTP path can
         never wake the agent after the turn ends, on ANY route.
 
+        ``profile`` names the multiplex profile serving this request
+        (the ``/p/<profile>/`` prefix, or ``""`` for the default profile).
+        It must reach ``set_session_vars`` so ``HERMES_SESSION_PROFILE`` is
+        bound per request: without it every API-server session collapses to
+        the default container key and org-profile turns can reuse the
+        default profile's sandbox (cross-profile SSH/secret exposure).
+
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
         the turn — a session resumed later on a delivering interface, e.g. the
@@ -7191,6 +7199,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            profile=profile,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
@@ -7268,6 +7277,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    profile=request_profile or "",
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=(
                         request_browser_control_transport_family
