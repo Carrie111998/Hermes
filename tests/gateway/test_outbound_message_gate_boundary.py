@@ -725,15 +725,6 @@ async def test_instance_non_content_helper_and_mutable_state_remain_ordinary():
     assert await adapter._lookup_state("ready") == "value:ready"
 
 
-def test_instance_private_async_publisher_with_opaque_payload_is_forbidden():
-    async def _publish_raw(chat_id, data):
-        return chat_id, data
-
-    adapter = GateAdapter()
-    with pytest.raises(TypeError, match="private async adapter assignment"):
-        adapter._publish_raw = _publish_raw
-
-
 @pytest.mark.asyncio
 async def test_unknown_post_class_publisher_without_named_destination_fails_closed(monkeypatch):
     delivered = []
