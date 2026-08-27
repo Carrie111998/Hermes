@@ -25,15 +25,125 @@ from gateway import hosted_rooms
 MAX_ROOM_CHOICES = 8
 MAX_RECENT_MESSAGES = 5
 MAX_PREVIEW_CHARS = 180
+GROUP_CHAT_SYNC_META_KEY = "hermes-bots-groups"
+
+
+def _projected_desktop_rooms() -> list[dict[str, Any]]:
+    """Read the bounded classic-room projection shared by Desktop clients."""
+
+    try:
+        import yaml
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_meta = Path(get_profile_dir("default")) / "profile.yaml"
+        if not profile_meta.is_file():
+            return []
+        raw = yaml.safe_load(profile_meta.read_text(encoding="utf-8")) or {}
+        ui_meta = raw.get("ui_meta") if isinstance(raw, Mapping) else None
+        snapshot = (
+            ui_meta.get(GROUP_CHAT_SYNC_META_KEY)
+            if isinstance(ui_meta, Mapping)
+            else None
+        )
+        raw_rooms = snapshot.get("rooms") if isinstance(snapshot, Mapping) else None
+    except Exception:
+        return []
+    if not isinstance(raw_rooms, Mapping):
+        return []
+    try:
+        snapshot_version = int(snapshot.get("version") or 0)
+    except (TypeError, ValueError):
+        snapshot_version = 0
+
+    rooms: list[dict[str, Any]] = []
+    for key, raw_room in raw_rooms.items():
+        if not isinstance(raw_room, Mapping):
+            continue
+        hosted = raw_room.get("hosted")
+        if isinstance(hosted, str) and hosted.strip():
+            continue
+        name = _clean_line(raw_room.get("name") or key, limit=200)
+        explicit_room_id = str(raw_room.get("roomId") or "").strip()
+        room_id = (
+            explicit_room_id
+            or (str(key).strip() if snapshot_version >= 3 else f"name:{name}")
+        )
+        if not name or not room_id:
+            continue
+        raw_log = raw_room.get("log")
+        log = [dict(item) for item in raw_log if isinstance(item, Mapping)] if isinstance(raw_log, list) else []
+        raw_members = raw_room.get("members")
+        members = (
+            [dict(item) for item in raw_members if isinstance(item, Mapping)]
+            if isinstance(raw_members, list)
+            else []
+        )
+        updated_at = max(
+            (float(item.get("at") or 0) for item in log),
+            default=float(snapshot.get("updatedAt") or 0) / 1000,
+        )
+        rooms.append(
+            {
+                "room_id": room_id,
+                "name": name,
+                "members": members,
+                "log": log,
+                "created_at": min(
+                    (float(item.get("at") or 0) for item in log),
+                    default=updated_at,
+                ),
+                "updated_at": updated_at,
+                "_room_mode": "desktop",
+            }
+        )
+    return rooms
 
 
 def list_messaging_rooms(service: Any) -> list[dict[str, Any]]:
-    """Return active rooms with gateway-stable numeric messaging references."""
+    """Return hosted and reachable classic rooms with stable short numbers."""
 
-    rooms = hosted_rooms.list_rooms(service.db_path)
+    hosted = [
+        {**room, "_room_mode": "hosted"}
+        for room in hosted_rooms.list_rooms(service.db_path)
+    ]
+    hosted_ids = {str(room["room_id"]) for room in hosted}
+    desktop = [
+        room
+        for room in _projected_desktop_rooms()
+        if str(room["room_id"]) not in hosted_ids
+    ]
+    rooms = hosted + desktop
     if not rooms:
         return []
 
+    from gateway.desktop_room_mailbox import (
+        available_room_ids,
+        default_db_path,
+        latest_command_states,
+    )
+
+    mailbox_db = default_db_path()
+    desktop_ids = [room["room_id"] for room in desktop]
+    available = available_room_ids(mailbox_db, desktop_ids)
+    command_states = latest_command_states(mailbox_db, desktop_ids)
+    rooms = [
+        {
+            **room,
+            **(
+                {
+                    "desktop_available": str(room["room_id"]) in available,
+                    "desktop_command": command_states.get(str(room["room_id"])),
+                }
+                if room.get("_room_mode") == "desktop"
+                else {}
+            ),
+        }
+        for room in rooms
+    ]
+
+    # Keep the numeric reference ledger where #96274 first created it. Moving
+    # it to the compatibility mailbox would silently renumber existing group
+    # chats after upgrade, making `/group 2 send ...` target the wrong chat.
     db_path = Path(service.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=10)
@@ -280,7 +390,7 @@ def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
         ]
         if len(matches) == 1:
             return matches[0]
-        raise RoomControlError(f"No Group Chat is numbered {numeric_ref}.")
+        raise RoomControlError(f"No hosted Bot room is numbered {numeric_ref}.")
 
     if needle.startswith("id:"):
         internal_id = needle.removeprefix("id:")
@@ -291,7 +401,7 @@ def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
         ]
         if len(matches) == 1:
             return matches[0]
-        raise RoomControlError("No Group Chat matches that internal ID.")
+        raise RoomControlError("No hosted Bot room matches that internal ID.")
 
     def _keys(room: Mapping[str, Any]) -> tuple[str, str]:
         return (
@@ -325,10 +435,19 @@ def resolve_room(rooms: list[dict[str, Any]], query: str) -> dict[str, Any]:
             raise RoomControlError(
                 f"That matches several group chats: {names}{suffix}. Enter more of the name."
             )
-    raise RoomControlError(f"No Group Chat matches “{_clean_line(query)}”.")
+    raise RoomControlError(f"No group chat matches “{_clean_line(query)}”.")
 
 
-def _room_status(service: Any, room_id: str) -> str:
+def _room_status(service: Any, room: Mapping[str, Any]) -> str:
+    if room.get("_room_mode") == "desktop":
+        command = room.get("desktop_command")
+        state = str(command.get("state") or "") if isinstance(command, Mapping) else ""
+        if state == "failed":
+            return "needs attention"
+        if state in {"pending", "claimed"} and room.get("desktop_available"):
+            return "applying command"
+        return "ready" if room.get("desktop_available") else "waiting for Desktop"
+    room_id = str(room["room_id"])
     status = service.status(room_id)
     if status.get("blocked"):
         return "needs attention"
@@ -362,7 +481,7 @@ def _room_status(service: Any, room_id: str) -> str:
 
 
 def format_room_list(service: Any, *, rooms_command: str = "/group") -> str:
-    """Render a bounded, scan-friendly hosted-room list."""
+    """Render a bounded, scan-friendly Group Chat list."""
 
     rooms = list_messaging_rooms(service)
     if not rooms:
@@ -376,7 +495,7 @@ def format_room_list(service: Any, *, rooms_command: str = "/group") -> str:
         raw_members = room.get("members")
         members: list[Any] = raw_members if isinstance(raw_members, list) else []
         lines.append(
-            f"{room_reference(room)}. {name} — {_room_status(service, str(room['room_id']))}, "
+            f"{room_reference(room)}. {name} — {_room_status(service, room)}, "
             f"{len(members)} bot{'s' if len(members) != 1 else ''}"
         )
     if len(rooms) > MAX_ROOM_CHOICES:
@@ -428,45 +547,68 @@ def format_room_detail(
             ),
             dict(room),
         )
-    state = hosted_rooms.room_state(service.db_path, room_id=room_id)
-    since = max(0, int(state.get("latest_seq") or 0) - 80)
-    delta = hosted_rooms.read_events(
-        service.db_path,
-        room_id=room_id,
-        since_seq=since,
-        limit=80,
-    )
     raw_members = room.get("members")
     members: list[Any] = raw_members if isinstance(raw_members, list) else []
-    member_names = {
-        str(member.get("member_id") or ""): _clean_line(
-            member.get("display_name") or member.get("handle") or "Bot",
-            limit=48,
+    desktop_mode = room.get("_room_mode") == "desktop"
+    if desktop_mode:
+        visible = [
+            event for event in room.get("log", []) if isinstance(event, Mapping)
+        ][-MAX_RECENT_MESSAGES:]
+        member_names: dict[str, str] = {}
+    else:
+        state = hosted_rooms.room_state(service.db_path, room_id=room_id)
+        since = max(0, int(state.get("latest_seq") or 0) - 80)
+        delta = hosted_rooms.read_events(
+            service.db_path,
+            room_id=room_id,
+            since_seq=since,
+            limit=80,
         )
-        for member in members
-        if isinstance(member, Mapping)
-    }
-    visible = [
-        event
-        for event in delta.get("events", [])
-        if isinstance(event, Mapping)
-        and event.get("kind") in {"message.user", "message.member"}
-    ][-MAX_RECENT_MESSAGES:]
+        member_names = {
+            str(member.get("member_id") or ""): _clean_line(
+                member.get("display_name") or member.get("handle") or "Bot",
+                limit=48,
+            )
+            for member in members
+            if isinstance(member, Mapping)
+        }
+        visible = [
+            event
+            for event in delta.get("events", [])
+            if isinstance(event, Mapping)
+            and event.get("kind") in {"message.user", "message.member"}
+        ][-MAX_RECENT_MESSAGES:]
     name = _clean_line(room.get("name") or room_id, limit=72)
     lines = [
-        f"{name} — {_room_status(service, room_id)}",
+        f"{name} — {_room_status(service, room)}",
         f"{len(members)} bot{'s' if len(members) != 1 else ''}",
     ]
     if visible:
         lines.append("Recent activity")
         for event in visible:
-            payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+            if desktop_mode:
+                source = event.get("from") if isinstance(event.get("from"), Mapping) else {}
+                label = _clean_line(source.get("name") or "You", limit=48)
+                text = event.get("text")
+            else:
+                payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+                label = _event_label(event, member_names)
+                text = payload.get("text")
             lines.append(
-                f"• {_event_label(event, member_names)}: "
-                f"{_clean_line(payload.get('text'))}"
+                f"• {label}: {_clean_line(text)}"
             )
     else:
         lines.append("No messages yet.")
+    command = room.get("desktop_command")
+    if (
+        desktop_mode
+        and isinstance(command, Mapping)
+        and command.get("state") == "failed"
+    ):
+        lines.append(
+            "The latest command could not be applied. Open this room in "
+            "Hermes Desktop, then try again."
+        )
     lines.append(
         f"Send: `{room_command} {room_reference(room)} send <message>`"
     )
@@ -639,10 +781,31 @@ def relay_provenance_is_unknown(event: Any) -> bool:
 
 
 def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -> str:
-    """Append one idempotent user turn and wake the hosted driver."""
+    """Append or hand off one idempotent room turn."""
 
     ensure_text_only(event)
     event_id = messaging_event_id(event)
+    name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
+    if room.get("_room_mode") == "desktop":
+        from gateway.desktop_room_mailbox import enqueue_command, default_db_path
+
+        actor = messaging_actor(
+            event,
+            gateway_id=hosted_rooms.local_authority_gateway_id(),
+        )
+        enqueue_command(
+            default_db_path(),
+            command_id=event_id,
+            room_id=str(room["room_id"]),
+            action="send",
+            payload={
+                "message": text,
+                "actor_display_name": actor.get("display_name") or "Messaging",
+            },
+        )
+        if room.get("desktop_available"):
+            return f"Queued in {name}."
+        return f"Saved for {name}. Open or update Hermes Desktop to continue."
     service.send(
         room_id=str(room["room_id"]),
         event_id=event_id,
@@ -652,7 +815,6 @@ def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -
             gateway_id=str(room["authority_gateway_id"]),
         ),
     )
-    name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
     return f"Queued in {name}."
 
 
@@ -660,6 +822,19 @@ def stop_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
     """Cancel active room tasks using a transport-derived idempotency key."""
 
     cancel_id = f"stop:{messaging_event_id(event)}"
-    service.stop_room(str(room["room_id"]), cancel_id=cancel_id)
     name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
+    if room.get("_room_mode") == "desktop":
+        from gateway.desktop_room_mailbox import enqueue_command, default_db_path
+
+        enqueue_command(
+            default_db_path(),
+            command_id=cancel_id,
+            room_id=str(room["room_id"]),
+            action="stop",
+            payload={},
+        )
+        if room.get("desktop_available"):
+            return f"Stop requested for {name}."
+        return f"Stop saved for {name}. Open or update Hermes Desktop to apply it."
+    service.stop_room(str(room["room_id"]), cancel_id=cancel_id)
     return f"Stop requested for {name}. Active work will stop safely."

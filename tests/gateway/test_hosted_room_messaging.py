@@ -24,6 +24,8 @@ from gateway.hosted_room_messaging import (
     parse_room_command,
     relay_provenance_is_unknown,
     resolve_room,
+    send_to_room,
+    stop_room,
 )
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -222,12 +224,222 @@ def _runner(*, platform: Platform = Platform.SIGNAL, extra=None):
     return runner
 
 
+def _seed_classic_projection(home, *, room_id="classic-room"):
+    import yaml
+
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "profile.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "ui_meta": {
+                    "hermes-bots-groups": {
+                        "version": 3,
+                        "updatedAt": 2000,
+                        "rooms": {
+                            f"id:{room_id}": {
+                                "name": "Desktop planning",
+                                "roomId": room_id,
+                                "hosted": None,
+                                "members": [
+                                    {"name": "default", "handle": "hermes"},
+                                    {"name": "reviewer", "handle": "reviewer"},
+                                ],
+                                "log": [
+                                    {
+                                        "id": "message-1",
+                                        "from": {"kind": "user", "name": "You"},
+                                        "text": "Review the plan",
+                                        "at": 1000,
+                                        "thread": "thread-1",
+                                    },
+                                    {
+                                        "id": "message-2",
+                                        "from": {"kind": "member", "name": "Reviewer"},
+                                        "text": "The rollout needs a rollback step.",
+                                        "at": 2000,
+                                        "thread": "thread-1",
+                                    },
+                                ],
+                            }
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_room_commands_are_gateway_dispatchable_without_interrupting_agent():
     group = resolve_command("group")
     assert group is not None and group.gateway_only and group.busy_policy == "dispatch"
     assert group.subcommands == ()
     assert resolve_command("groups") is None
     assert resolve_command("rooms") is None
+
+
+def test_classic_room_projection_is_listed_with_recent_activity(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    service = _FakeService(tmp_path / "state.db")
+
+    rooms = list_messaging_rooms(service)
+
+    assert len(rooms) == 1
+    assert rooms[0]["_room_mode"] == "desktop"
+    assert rooms[0]["desktop_available"] is False
+    assert "Desktop planning — waiting for Desktop" in format_room_detail(
+        service, rooms[0]
+    )
+    assert "• Reviewer: The rollout needs a rollback step." in format_room_detail(
+        service, rooms[0]
+    )
+    listing = format_room_list(service)
+    assert listing.startswith("Group Chats\n")
+    assert "Commands\nCheck: `/group <number>`" in listing
+    assert "Send: `/group <number> send <message>`" in listing
+    assert "Stop: `/group <number> stop`" in listing
+
+
+def test_legacy_projection_uses_the_same_name_identity_as_new_desktop(tmp_path, monkeypatch):
+    import yaml
+
+    home = tmp_path / "hermes"
+    home.mkdir(parents=True)
+    (home / "profile.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "ui_meta": {
+                    "hermes-bots-groups": {
+                        "version": 2,
+                        "rooms": {
+                            "Legacy planning": {
+                                "name": "Legacy planning",
+                                "members": [{"name": "default"}],
+                                "log": [],
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    room = list_messaging_rooms(_FakeService(tmp_path / "state.db"))[0]
+
+    assert room["room_id"] == "name:Legacy planning"
+
+
+def test_more_than_128_classic_rooms_list_without_disabling_controls(tmp_path, monkeypatch):
+    import yaml
+
+    home = tmp_path / "hermes"
+    home.mkdir(parents=True)
+    rooms = {
+        f"id:room-{index}": {
+            "name": f"Group chat {index}",
+            "roomId": f"room-{index}",
+            "members": [{"name": "default"}],
+            "log": [],
+        }
+        for index in range(260)
+    }
+    (home / "profile.yaml").write_text(
+        yaml.safe_dump(
+            {"ui_meta": {"hermes-bots-groups": {"version": 3, "rooms": rooms}}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    listed = list_messaging_rooms(_FakeService(tmp_path / "state.db"))
+
+    assert len(listed) == 260
+    assert len({room["messaging_ref"] for room in listed}) == 260
+
+
+def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
+    from gateway import desktop_room_mailbox
+
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        hosted_rooms,
+        "local_authority_gateway_id",
+        lambda: "install:test-gateway",
+    )
+    service = _FakeService(tmp_path / "state.db")
+    room = list_messaging_rooms(service)[0]
+
+    sent = send_to_room(
+        service,
+        room,
+        _event("/group 1 send hello", message_id="send-1"),
+        "hello",
+    )
+    stopped = stop_room(
+        service,
+        room,
+        _event("/group 1 stop", message_id="stop-1"),
+    )
+
+    assert sent == "Saved for Desktop planning. Open or update Hermes Desktop to continue."
+    assert stopped == (
+        "Stop saved for Desktop planning. Open or update Hermes Desktop to apply it."
+    )
+    commands = desktop_room_mailbox.claim_commands(
+        desktop_room_mailbox.default_db_path(),
+        consumer_id="desktop:test",
+        room_ids=["classic-room"],
+    )
+    assert [(item["action"], item["payload"]) for item in commands] == [
+        (
+            "send",
+            {"actor_display_name": "Display Name via Signal", "message": "hello"},
+        ),
+        ("stop", {}),
+    ]
+
+
+def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypatch):
+    from gateway import desktop_room_mailbox
+
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db = desktop_room_mailbox.default_db_path()
+    desktop_room_mailbox.enqueue_command(
+        db,
+        command_id="messaging:failed",
+        room_id="classic-room",
+        action="send",
+        payload={"message": "hello"},
+    )
+    claimed = desktop_room_mailbox.claim_commands(
+        db,
+        consumer_id="desktop:test",
+        room_ids=["classic-room"],
+    )[0]
+    desktop_room_mailbox.complete_command(
+        db,
+        consumer_id="desktop:test",
+        command_id="messaging:failed",
+        lease_token=claimed["lease_token"],
+        success=False,
+        result={"message": "route missing"},
+    )
+    service = _FakeService(tmp_path / "state.db")
+    room = list_messaging_rooms(service)[0]
+
+    detail = format_room_detail(service, room)
+
+    assert "Desktop planning — needs attention" in detail
+    assert "The latest command could not be applied." in detail
 
 
 @pytest.mark.parametrize(
@@ -340,7 +552,7 @@ def test_room_resolution_explains_ambiguity_and_missing_names(tmp_path):
     rooms = hosted_rooms.list_rooms(db)
     with pytest.raises(RoomControlError, match="matches several group chats"):
         resolve_room(rooms, "release")
-    with pytest.raises(RoomControlError, match="No Group Chat"):
+    with pytest.raises(RoomControlError, match="No group chat"):
         resolve_room(rooms, "missing")
 
 
