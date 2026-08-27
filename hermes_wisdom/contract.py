@@ -35,7 +35,7 @@ CONTRACT_PIN = ContractPin(
     manifest_schema_sha256="64d0010eada1d79fa16309e9fd715faf77b6186360ea0b095182b2bdaeec5714",
     canonical_vectors_sha256="e2b28c708f69e99b342de1df48498d96efde68867857391590bc964a609a730b",
     requirements_pr="NousResearch/gateway-gateway#215",
-    requirements_commit="600bbf5f181a89e5e54f8ed494c94aa8f8687b01",
+    requirements_commit="d51078fd30ed461542dfbbf25a5b810b6b512036",
 )
 
 PACKAGE_MANIFEST_SCHEMA_VERSION = 1
