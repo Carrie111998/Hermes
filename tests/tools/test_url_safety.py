@@ -7,6 +7,8 @@ import httpx
 
 from tools.url_safety import (
     is_safe_url,
+    is_safe_browser_url,
+    _is_internal_hostname,
     async_is_safe_url,
     is_always_blocked_url,
     normalize_url_for_request,
@@ -88,6 +90,122 @@ class TestIsSafeUrl:
             monkeypatch.delenv(var, raising=False)
         with patch("socket.getaddrinfo", side_effect=socket.gaierror("Name resolution failed")):
             assert is_safe_url("https://nonexistent.example.com") is False
+
+
+class TestIsSafeBrowserUrl:
+    """Browser-navigation classification (is_safe_browser_url).
+
+    Regression for #95544: DNS-level ad/parental filters (AdGuard Home,
+    pi-hole, NextDNS, some ISP resolvers) answer public social domains
+    (tiktok.com / instagram.com / …) with 0.0.0.0, 127.x or private-range
+    addresses — or NXDOMAIN.  Browsers resolve DNS themselves, so the
+    agent-side resolver must not decide the fate of a public registrable
+    domain; only literal private IPs and machine-local/internal names are
+    blocked.  The fetch-oriented is_safe_url() (where agent-side DNS IS the
+    connection's DNS) is intentionally unchanged.
+    """
+
+    @pytest.mark.parametrize("url", [
+        # the exact #95544 repro URLs, incl. the short-link and app hosts
+        "https://www.tiktok.com/@user/video/7212345678901234567",
+        "https://vt.tiktok.com/ZS1AbCdEf/",
+        "https://tiktok.com",
+        "https://www.instagram.com/p/CabcDEF123/",
+        "https://www.instagram.com/reel/CabcDEF123/",
+        "https://instagram.com",
+        # control
+        "https://example.com",
+    ])
+    def test_public_domains_allowed_even_with_filtered_resolver(self, url):
+        # Poisoned answer (loopback / private IP) — the browser would load
+        # the site fine, so the guard must not block.
+        with _resolves_to("127.0.0.1"):
+            assert is_safe_browser_url(url) is True
+        with _resolves_to("10.0.0.1"):
+            assert is_safe_browser_url(url) is True
+        # NXDOMAIN from the filter — same story.
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("filtered")):
+            assert is_safe_browser_url(url) is True
+
+    @pytest.mark.parametrize("url", [
+        # literal private / loopback / link-local / CGNAT / metadata IPs
+        "http://127.0.0.1:8080/secret",
+        "http://10.0.0.1/admin",
+        "http://192.168.1.1/",
+        "http://172.16.5.5/",
+        "http://100.64.0.1/x",                    # CGNAT (RFC 6598)
+        "http://169.254.169.254/latest/meta-data/",
+        "http://169.254.170.2/v2/credentials",
+        "http://100.100.100.200/latest/meta-data/",
+        "http://[::1]:8080/",
+        # machine-local / internal-reserved hostnames
+        "http://localhost:3000/",
+        "http://router/",                          # single-label host
+        "http://myservice.local/",
+        "http://nas.internal/",
+        "http://printer.home/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+    ])
+    def test_internal_targets_still_blocked(self, url):
+        with _resolves_to("127.0.0.1"):
+            assert is_safe_browser_url(url) is False
+
+    def test_suffix_match_requires_dot_boundary(self):
+        """Public domains that merely contain an internal suffix as a
+        substring (foo.example.com vs .example) must not be treated as
+        internal."""
+        assert _is_internal_hostname("example.com") is False
+        assert _is_internal_hostname("foo.example.com") is False
+        assert _is_internal_hostname("host.local") is True
+        assert _is_internal_hostname("localhost") is True
+
+    def test_wildcard_dns_match_requires_dot_boundary(self):
+        """A bare substring of a wildcard-DNS apex (mynip.io vs .nip.io) is a
+        different registrable domain — only the apex itself and real
+        subdomains qualify."""
+        assert _is_internal_hostname("nip.io") is True
+        assert _is_internal_hostname("127.0.0.1.nip.io") is True
+        assert _is_internal_hostname("foo.localtest.me") is True
+        assert _is_internal_hostname("mynip.io") is False
+        assert _is_internal_hostname("evil-nip.io") is False
+        assert _is_internal_hostname("sslip.io.example.com") is False
+
+    @pytest.mark.parametrize("url", [
+        # Wildcard-DNS services: the hostname itself encodes a
+        # private/loopback/metadata target (127.0.0.1.nip.io → 127.0.0.1,
+        # 10.0.0.5.sslip.io → 10.0.0.5, *.localtest.me → 127.0.0.1), so the
+        # shape-based public-domain allowance must NOT apply — the browser
+        # would rebind the navigation to the local machine (SSRF).
+        "http://127.0.0.1.nip.io/",
+        "http://10.0.0.5.nip.io:8080/admin",
+        "http://192.168.1.10.sslip.io/",
+        "http://169.254.169.254.nip.io/latest/meta-data/",
+        "http://10.0.0.5.xip.io/",
+        "http://localtest.me/",
+        "http://foo.localtest.me/",
+        "http://api.lvh.me/",
+        "http://10.0.0.5.vcap.me/",
+        "http://traefik.me/",
+    ])
+    def test_wildcard_dns_services_blocked(self, url):
+        # The agent resolver answers loopback — the fail-closed resolution
+        # path must reject, exactly as it does for *.local / *.internal.
+        with _resolves_to("127.0.0.1"):
+            assert is_safe_browser_url(url) is False
+        # And when the resolver is unreachable (NXDOMAIN / filtered), the
+        # wildcard-DNS shape still routes to fail-closed, not the
+        # public-domain fast path.
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("filtered")):
+            assert is_safe_browser_url(url) is False
+
+    @pytest.mark.parametrize("url", [
+        "ftp://example.com/file.txt",
+        "example.com/path",
+        "http://",
+        "",
+    ])
+    def test_unusable_urls_blocked(self, url):
+        assert is_safe_browser_url(url) is False
 
 
 class TestProxyEnvironmentDnsDelegation:

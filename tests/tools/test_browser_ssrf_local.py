@@ -64,6 +64,32 @@ class TestPreNavigationSsrf:
         assert result["success"] is False
         assert "private or internal address" in result["error"]
 
+    def test_cloud_allows_public_social_domains_despite_filtered_dns(
+        self, monkeypatch, _common_patches
+    ):
+        """Regression for #95544: DNS-level filters (AdGuard/pihole/NextDNS)
+        that answer public social domains with loopback/private IPs must not
+        block browser navigation — the browser resolves DNS itself."""
+        import socket as _socket
+
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            h = host.lower().rstrip(".")
+            if h in ("www.tiktok.com", "vt.tiktok.com", "www.instagram.com"):
+                return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+            raise _socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+        for url in (
+            "https://www.tiktok.com/@user/video/7212345678901234567",
+            "https://vt.tiktok.com/ZS1AbCdEf/",
+            "https://www.instagram.com/p/CabcDEF123/",
+        ):
+            result = json.loads(browser_tool.browser_navigate(url))
+            assert result["success"] is True, (url, result)
+
     def test_cloud_allows_private_url_when_setting_true(self, monkeypatch, _common_patches):
         """Private URLs pass in cloud mode when allow_private_urls is True."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)

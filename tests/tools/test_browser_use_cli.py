@@ -13,6 +13,7 @@ Covers the three seams the integration relies on:
 """
 import json
 import os
+import socket
 import stat
 import time
 
@@ -888,6 +889,57 @@ class TestBrowserExec:
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
         assert "timed out" in result["error"]
+
+
+class TestBrowserExecUrlGuard:
+    """browser_exec's pre-flight URL guard (``_blocked_url_in_code``).
+
+    Regression for #95544: the guard must not false-positive public social
+    domains (tiktok.com / instagram.com) as "private or internal address"
+    when the agent-side resolver is filtered — browsers resolve DNS
+    themselves.  Literal private IPs, machine-local names, and cloud
+    metadata endpoints must stay blocked on non-local backends.
+    """
+
+    @pytest.fixture
+    def _cloud_mode(self, monkeypatch):
+        """Activate the SSRF guard: non-local backend, private URLs off."""
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(bt, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(bt, "check_website_access", lambda url: None)
+
+    def test_public_social_domains_pass_despite_filtered_dns(self, _cloud_mode, monkeypatch):
+        """DNS filter answers social domains with loopback (AdGuard/pihole/
+        NextDNS-style poisoning) and NXDOMAIN for everything else — the
+        exact #95544 repro URLs must still pass the guard."""
+        def fake_getaddrinfo(host, *args, **kwargs):
+            h = host.lower().rstrip(".")
+            if h in ("www.tiktok.com", "vt.tiktok.com", "tiktok.com",
+                     "www.instagram.com", "instagram.com"):
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+            raise socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        code = (
+            'new_tab("https://www.tiktok.com/@user/video/7212345678901234567")\n'
+            'new_tab("https://vt.tiktok.com/ZS1AbCdEf/")\n'
+            'new_tab("https://www.instagram.com/p/CabcDEF123/")\n'
+        )
+        assert bu_cli._blocked_url_in_code(code) is None
+
+    @pytest.mark.parametrize(("code", "expect"), [
+        ('new_tab("http://127.0.0.1:8080/x")', "private or internal address"),
+        ('new_tab("http://10.0.0.1/x")', "private or internal address"),
+        ('new_tab("http://192.168.1.1/admin")', "private or internal address"),
+        ('new_tab("http://169.254.169.254/latest/meta-data/")', "cloud metadata endpoint"),
+        ('new_tab("http://metadata.google.internal/computeMetadata/v1/")', "cloud metadata endpoint"),
+    ])
+    def test_private_and_metadata_targets_still_blocked(self, _cloud_mode, code, expect):
+        err = bu_cli._blocked_url_in_code(code)
+        assert err is not None
+        assert expect in err
 
 
 class TestFindCliManagedBin:

@@ -209,6 +209,65 @@ _MAX_SSRF_CONNECT_IPS = 8
 # VPNs, and some cloud internal networks.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
+# Hostname shapes that are never public internet targets.  Used by the
+# browser navigation guard (``is_safe_browser_url``) to decide which
+# hostnames deserve a full agent-side resolution check: machine-local names
+# (``localhost``), mDNS/LAN conventions, and ICANN-reserved / special-use
+# TLDs (RFC 6761 / RFC 6762 / RFC 7686 / RFC 8375) never host public sites.
+_INTERNAL_HOSTNAME_SUFFIXES = (
+    ".localhost",   # RFC 6761 — this machine
+    ".local",       # RFC 6762 — mDNS / zero-config LAN
+    ".internal",    # ICANN-reserved — split-horizon / corp networks
+    ".lan",         # common LAN convention
+    ".home",        # common home-network convention
+    ".corp",        # legacy corporate convention
+    ".home.arpa",   # RFC 8375 — home networking
+    ".test",        # RFC 6761 — testing only
+    ".invalid",     # RFC 6761 — never resolvable
+    ".example",     # RFC 6761 — documentation only
+    ".onion",       # RFC 7686 — Tor hidden services
+)
+
+# Wildcard-DNS services: the hostname itself encodes the target address, so
+# a public-looking name can still point at the local machine
+# (``127.0.0.1.nip.io`` → 127.0.0.1, ``10.0.0.5.sslip.io`` → 10.0.0.5,
+# ``*.localtest.me`` → 127.0.0.1).  A shape-only public-domain classification
+# would let these sail through and the browser's navigation rebind to
+# private/loopback — an SSRF bypass.  They get the same treatment as
+# ``*.local`` / ``*.internal``: full fail-closed resolution check.
+_WILDCARD_DNS_APEXES = (
+    "nip.io",        # <ip>.nip.io → that IP (also <ip-with-dashes>)
+    "sslip.io",      # successor of nip.io, same scheme
+    "xip.io",        # older <ip>.xip.io wildcard
+    "localtest.me",  # *.localtest.me → 127.0.0.1
+    "lvh.me",        # *.lvh.me → 127.0.0.1
+    "vcap.me",       # *.vcap.me → 127.0.0.1
+    "traefik.me",    # *.traefik.me → 127.0.0.1
+)
+
+
+def _is_internal_hostname(hostname: str) -> bool:
+    """Return True for machine-local / internal-reserved hostname shapes.
+
+    Single-label hostnames (``localhost``, ``router``, ``nas``) are never
+    public internet names, and the special-use suffixes above never carry
+    public sites.  Matching is suffix-only (leading dot), so public domains
+    like ``example.com`` or ``example.net`` never match ``.example``.
+    Wildcard-DNS services (``*.nip.io`` family) encode the target address
+    in the name itself, so their apexes and real subdomains are treated the
+    same way — a bare substring (``mynip.io``) is a different registrable
+    domain and must NOT match.
+    """
+    if not hostname:
+        return True
+    if "." not in hostname:
+        return True
+    if hostname.endswith(_INTERNAL_HOSTNAME_SUFFIXES):
+        return True
+    return hostname in _WILDCARD_DNS_APEXES or any(
+        hostname.endswith(f".{apex}") for apex in _WILDCARD_DNS_APEXES
+    )
+
 # ---------------------------------------------------------------------------
 # Global toggle: allow private/internal IP resolution
 # ---------------------------------------------------------------------------
@@ -516,6 +575,87 @@ def is_safe_url(url: str) -> bool:
         # Fail closed on unexpected errors — don't let parsing edge cases
         # become SSRF bypass vectors
         logger.warning("Blocked request — URL safety check error for %s: %s", url, exc)
+        return False
+
+
+def is_safe_browser_url(url: str) -> bool:
+    """Return True when *url* is an acceptable browser navigation target.
+
+    Browsers — especially cloud backends — resolve DNS themselves, so the
+    agent-side resolver must never decide the fate of a public hostname.
+    DNS-level ad/parental filters (AdGuard Home, pi-hole, NextDNS, some ISP
+    resolvers) commonly answer public social domains such as
+    tiktok.com / instagram.com with ``0.0.0.0``, ``127.x`` or private-range
+    addresses (or NXDOMAIN), which makes the fetch-oriented
+    :func:`is_safe_url` fail closed and blocks perfectly legitimate browser
+    navigation with a misleading "private or internal address" error
+    (#95544).
+
+    Classification is by URL shape, not by what the agent's resolver
+    happens to return:
+
+    * literal IP targets → full private/loopback/link-local/CGNAT and
+      cloud-metadata IP checks (no DNS involved, fail-closed);
+    * always-blocked metadata hostnames (``metadata.google.internal``, …);
+    * machine-local / internal-reserved names (``localhost``, single-label
+      hosts, ``*.local``, ``*.internal``, ``*.lan``, ``*.home``, …) and
+      wildcard-DNS services (``*.nip.io``, ``*.sslip.io``,
+      ``*.localtest.me``, … — the name itself encodes a private/loopback
+      target, so a public-looking shape must not skip the check) → full
+      fail-closed resolution check;
+    * any other DNS hostname (a public registrable domain) → allowed; the
+      browser's own DNS resolution decides reachability.
+
+    Web-tool HTTP fetches must keep using :func:`is_safe_url` — there the
+    agent's resolver *is* the resolver the connection actually uses.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        scheme = (parsed.scheme or "").strip().lower()
+        if scheme not in {"http", "https"}:
+            logger.warning(
+                "Blocked browser request — unsupported URL scheme: %s",
+                scheme or "<empty>",
+            )
+            return False
+        if not hostname:
+            return False
+
+        # Always-blocked floor: cloud metadata hostnames are denied for
+        # every target shape, regardless of routing or config toggles.
+        if hostname in _BLOCKED_HOSTNAMES:
+            logger.warning("Blocked browser request to internal hostname: %s", hostname)
+            return False
+
+        # Literal IP (no DNS involved) or machine-local / internal name →
+        # full fail-closed classification.  Literal IPs must be checked
+        # BEFORE the internal-name shape test: dotted-quad private ranges
+        # (127.0.0.1, 10.0.0.0/8, …) would otherwise read as "public
+        # registrable domains" and sail through.
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            is_literal_ip = False
+        else:
+            is_literal_ip = True
+
+        if is_literal_ip or _is_internal_hostname(hostname):
+            return is_safe_url(url)
+
+        # Public registrable domain — the browser resolves DNS itself, so
+        # agent-side resolution (which may be filtered/poisoned for specific
+        # brands) must not gate the navigation.
+        return True
+
+    except Exception as exc:
+        # Fail closed on unexpected errors — don't let parsing edge cases
+        # become SSRF bypass vectors
+        logger.warning(
+            "Blocked browser request — URL safety check error for %s: %s",
+            url,
+            exc,
+        )
         return False
 
 
