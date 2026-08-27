@@ -8033,8 +8033,9 @@ def _bootstrap_worktree_environments(repo_root: Path, target: Path) -> None:
     """Link project-local ignored environments into a child worktree when absent.
 
     Environment contents are deliberately never copied.  A symlinked source is
-    accepted only when its resolved target remains inside the project root; a
-    pre-existing destination, including a broken symlink, is left untouched.
+    accepted only when its resolved target remains inside the project checkout
+    or the verified main checkout of the same Git repository. A pre-existing
+    destination, including a broken symlink, is left untouched.
     """
     try:
         source_root = repo_root.resolve(strict=True)
@@ -8062,6 +8063,18 @@ def _bootstrap_worktree_environments(repo_root: Path, target: Path) -> None:
         except ValueError:
             source_is_project_local = False
             destination_is_worktree_local = False
+        if not source_is_project_local:
+            # A board anchor can itself be a linked worktree whose .venv
+            # points back to the main checkout. Verify that checkout through
+            # Git's common directory, not the symlink's arbitrary parent.
+            common_dir = _git_common_dir(source_root)
+            if common_dir is not None:
+                main_root = common_dir.parent
+                source_is_project_local = (
+                    resolved_source.is_relative_to(main_root)
+                    and _git_toplevel(resolved_source) == main_root
+                    and _git_common_dir(main_root) == common_dir
+                )
         if not source_is_project_local or not destination_is_worktree_local:
             _log.warning("worktree environment bootstrap refused unsafe %s", environment_name)
             continue
@@ -8161,6 +8174,16 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            # Retry missing bootstrap links on already-materialized tasks.
+            # Never borrow an environment from an unrelated enclosing repo.
+            bootstrap_root = _repo_root_for_worktree_target(requested.parent)
+            requested_common = _git_common_dir(requested)
+            if (
+                bootstrap_root is not None
+                and requested_common is not None
+                and _git_common_dir(bootstrap_root) == requested_common
+            ):
+                _bootstrap_worktree_environments(bootstrap_root, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
