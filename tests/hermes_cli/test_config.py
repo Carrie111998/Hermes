@@ -1590,3 +1590,48 @@ def test_default_config_has_no_duplicate_top_level_keys():
             if "model" in keys and "kanban" in keys:  # the DEFAULT_CONFIG literal
                 dupes = {k for k in keys if keys.count(k) > 1}
                 assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"
+
+
+# ---------------------------------------------------------------------------
+# get_config_origin — per-key origins tracking (Codex loader semantic)
+# ---------------------------------------------------------------------------
+
+class TestGetConfigOrigin:
+    def test_unknown_key_is_unset(self):
+        from hermes_cli.config import get_config_origin
+        assert get_config_origin("no.such.key.anywhere") == "unset"
+
+    def test_default_key_when_not_user_set(self, tmp_path, monkeypatch):
+        from hermes_cli.config import get_config_origin, get_config_path
+        monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: tmp_path / "config.yaml")
+        # No user file → a key present in DEFAULT_CONFIG is "default".
+        assert get_config_origin("agent.max_turns") == "default"
+
+    def test_user_key_when_written(self, tmp_path, monkeypatch):
+        from hermes_cli import config as cfg_mod
+        monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: tmp_path / "config.yaml")
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text("agent:\n  max_turns: 42\n", encoding="utf-8")
+        assert cfg_mod.get_config_origin("agent.max_turns") == "user"
+
+    def test_managed_key_wins_over_user(self, tmp_path, monkeypatch):
+        from hermes_cli import config as cfg_mod
+        monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: tmp_path / "config.yaml")
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text("agent:\n  max_turns: 42\n", encoding="utf-8")
+        with patch(
+            "hermes_cli.managed_scope.is_key_managed",
+            return_value=True,
+        ):
+            assert cfg_mod.get_config_origin("agent.max_turns") == "managed"
+
+    def test_env_key_reports_env_when_set(self, monkeypatch):
+        from hermes_cli import config as cfg_mod
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+        assert cfg_mod.get_config_origin("OPENROUTER_API_KEY") == "env"
+
+    def test_get_config_value_origin_flag(self, capsys):
+        from hermes_cli.config import get_config_value
+        get_config_value("no.such.key", origin=True)
+        out = capsys.readouterr().out.strip()
+        assert out == "unset"
