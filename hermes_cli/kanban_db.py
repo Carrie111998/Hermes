@@ -8651,6 +8651,16 @@ class DispatchResult:
     Surfaces the auto-assignment to telemetry / CLI / dashboard so the
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
+    refused_confinement: list[str] = field(default_factory=list)
+    """Task ids refused by the confinement preflight BEFORE anything was
+    created. Invariant C1: no claim, no ``task_runs`` row, no session, no
+    worker — the task stays dispatchable and is retried next tick once the
+    operator fixes its workspace. Distinct from ``spawn_failed``, which means a
+    worker was attempted and something went wrong after claiming."""
+    unverified_launch: list[str] = field(default_factory=list)
+    """Task ids whose worker started but whose launch directory could NOT be
+    observed. These are explicitly **not** confirmed confined; the audit column
+    stays NULL rather than recording an assumption."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -10844,6 +10854,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        # C1: decide the launch directory BEFORE claiming. Claiming creates
+        # the task_runs row, so a refusal after it would leave a spawn_failed
+        # run behind for a worker that never existed.
+        if not _confinement_preflight_or_refuse(
+            conn, row["id"], board=board, result=result
+        ):
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -10866,31 +10883,11 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Fail closed before a worker exists. Raising here lands in the
-            # `except` below, which records a spawn failure — the task is
-            # released and counted rather than started in an arbitrary
-            # directory. `_default_spawn` re-runs this check at the spawn site
-            # so a caller that skips it still cannot inherit a directory.
-            launch_cwd = dispatch_preflight(claimed, str(workspace))
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, launch_cwd, board=board)
-                else:
-                    pid = _spawn(claimed, launch_cwd)
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, launch_cwd)
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # Where the worker actually started, recorded after the spawn
-            # returned so the row describes a process that existed.
-            record_observed_cwd(conn, claimed.current_run_id, launch_cwd)
+            pid = _spawn_verified(
+                conn, claimed, workspace,
+                board=board, spawn_fn=spawn_fn, result=result,
+            )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10980,6 +10977,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
+        # C1: decide the launch directory BEFORE claiming. Claiming creates
+        # the task_runs row, so a refusal after it would leave a spawn_failed
+        # run behind for a worker that never existed.
+        if not _confinement_preflight_or_refuse(
+            conn, row["id"], board=board, result=result
+        ):
+            continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -11010,19 +11014,14 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            # SAME path as the ready lane. This lane used to call the spawner
+            # directly, so a custom review spawn_fn bypassed every confinement
+            # check — the review-lane bypass an independent review found.
+            pid = _spawn_verified(
+                conn, claimed, workspace,
+                board=board, spawn_fn=spawn_fn, result=result,
+            )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -11332,93 +11331,211 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-class DispatchPreflightError(RuntimeError):
-    """Raised when a dispatch fails its pre-spawn checks. Fail-closed."""
+# Re-exported so callers keep one exception type across the confinement
+# surface. ``dispatch_confinement.PreflightRefusal`` is the definition.
+from hermes_cli.dispatch_confinement import (  # noqa: E402
+    PreflightRefusal as DispatchPreflightError,
+)
 
 
 def dispatch_preflight(task: "Task", workspace: str) -> str:
-    """Resolve the directory a worker must be launched in, or refuse.
+    """Spawn-site confinement check. Returns the directory to launch in.
 
-    WHAT THIS IS
-    ------------
-    A workflow-safety guard, not a security boundary. It runs in the
-    dispatcher, before any worker process is created, and it either returns an
-    absolute directory to launch in or raises. There is no warn tier and no
-    override flag: a gate that can be waived is not a gate.
+    A WORKFLOW-SAFETY GUARD, NOT A SECURITY BOUNDARY. It protects against
+    accidental escape and cooperative execution, not arbitrary malicious
+    same-UID activity: a running worker can ``chdir``, read elsewhere, or write
+    the database directly.
 
-    WHAT IT IS NOT — read before describing it
-    ------------------------------------------
-    This does **not** constrain a worker once it is running, and it is **not**
-    protection against arbitrary same-user execution. A worker runs as the same
-    OS user with filesystem access; it can change directory, read outside its
-    workspace, and ignore every convention this establishes. What this fixes is
-    the *launch* defect: a worker starting somewhere nobody chose.
+    This is the SECOND of two checks. The dispatcher runs
+    :func:`_confinement_preflight_or_refuse` before claiming a task, which is
+    what satisfies invariant C1. This one runs at the spawn site so a caller
+    that reaches ``_default_spawn`` by another route still cannot inherit the
+    dispatcher's directory — the failure that let a worker escape into a live
+    production checkout during M2a.
 
-    THE FAILURE IT EXISTS FOR
-    -------------------------
-    ``_default_spawn`` passed ``cwd=workspace if os.path.isdir(workspace) else
-    None`` to ``Popen``. ``cwd=None`` means "inherit the parent's directory", so
-    a task whose workspace was missing, relative, or empty launched its worker
-    in **the dispatcher's** directory — silently, with no error and nothing
-    recorded.
-
-    That is not hypothetical. During M2a a worker launched from the wrong
-    directory did not find its test command, searched the filesystem, located a
-    live production checkout whose default branch auto-deploys, and ran a
-    command there. Read-only, no damage, verified — and luck. Path denials were
-    added and the issue declared closed; a later run still *started* in the
-    wrong directory, because denials bound the blast radius without fixing the
-    launch.
-
-    So the rule here is: **never fall back to inheriting a directory.** A
-    workspace that cannot be resolved refuses the dispatch instead of guessing,
-    and the caller records a spawn failure rather than starting a worker
-    somewhere arbitrary.
+    No warn tier and no override argument: a gate that can be waived is not a
+    gate.
     """
-    raw = "" if workspace is None else str(workspace).strip()
-    if not raw:
-        raise DispatchPreflightError(
-            f"task {task.id} has no workspace; refusing to launch a worker in "
-            f"the dispatcher's own directory"
-        )
-    if not os.path.isabs(raw):
-        raise DispatchPreflightError(
-            f"task {task.id} workspace is not absolute ({raw!r}); a relative "
-            f"path resolves against whatever directory the dispatcher happens "
-            f"to be in"
-        )
-    if not os.path.isdir(raw):
-        raise DispatchPreflightError(
-            f"task {task.id} workspace does not exist or is not a directory "
-            f"({raw!r}); refusing to launch a worker in the dispatcher's own "
-            f"directory"
-        )
-    # realpath so the recorded value is the directory the child actually gets,
-    # not a symlink alias of it — an audit trail that needs interpreting is not
-    # much of an audit trail.
-    return os.path.realpath(raw)
+    from hermes_cli import dispatch_confinement as _dc
+
+    intended = _dc.preflight_workspace(task.id, workspace)
+    # At the spawn site the directory must exist and is pinned by identity, so
+    # a symlink retargeted after provisioning is caught rather than followed.
+    authorized = _dc.authorize_workspace(task.id, intended)
+    _dc.revalidate_at_spawn(task.id, authorized)
+    return authorized.path
 
 
 def record_observed_cwd(
     conn: sqlite3.Connection, run_id: Optional[int], cwd: Optional[str]
 ) -> None:
-    """Record the directory a run was launched in.
+    """Record the VERIFIED directory a run was observed to start in.
 
-    Best-effort and non-fatal: a missing audit value must never take down a
-    dispatch that has already succeeded. Callers that need the value to exist
-    should read it back.
+    Raises on failure. It used to swallow every error "best-effort", which meant
+    a successful launch could end up with no audit record while the dispatcher
+    reported success — auditability claimed but not delivered. If this value
+    cannot be persisted, the caller must fail the dispatch closed rather than
+    claim a confined launch it cannot evidence.
+
+    The value must come from :func:`dispatch_confinement.verify_launch`, never
+    from the path handed to the spawner. That distinction is the whole point:
+    a spawner that ignores its workspace argument is only detectable by
+    observing the process.
     """
-    if not run_id or not cwd:
-        return
+    if not run_id:
+        raise ValueError("cannot record observed_cwd without a run id")
+    if not cwd:
+        raise ValueError("cannot record an empty observed_cwd")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET observed_cwd = ? WHERE id = ?",
+            (str(cwd), int(run_id)),
+        )
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"observed_cwd was not recorded for run {run_id} "
+            f"(no such run row)"
+        )
+
+
+def _record_confinement_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict
+) -> None:
+    """Append a confinement event in its own transaction.
+
+    Deliberately event-only: a refusal must not create a run row (C1), and an
+    unverified launch must not be dressed up as a confined one.
+    """
     try:
         with write_txn(conn):
-            conn.execute(
-                "UPDATE task_runs SET observed_cwd = ? WHERE id = ?",
-                (str(cwd), int(run_id)),
-            )
+            _append_event(conn, task_id, kind, payload)
     except Exception:
-        _log.debug("could not record observed_cwd for run %s", run_id,
-                   exc_info=True)
+        _log.warning("could not record %s for task %s", kind, task_id,
+                     exc_info=True)
+
+
+def _confinement_preflight_or_refuse(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    result: "DispatchResult",
+) -> bool:
+    """Decide a task's launch directory BEFORE claiming it. True to proceed.
+
+    This runs ahead of ``claim_task`` / ``claim_review_task`` on purpose.
+    Claiming creates the ``task_runs`` row, so a refusal afterwards leaves a
+    ``spawn_failed`` run behind — which is exactly what invariant C1 forbids and
+    what commit 7 did. Refusing here creates nothing: no claim, no run row, no
+    session, no worker. The task stays ``ready``/``review`` and is retried next
+    tick once its workspace is fixed.
+
+    The refusal event says only that a dispatch was refused and why. It does not
+    claim the task is contained.
+    """
+    from hermes_cli import dispatch_confinement as _dc
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    try:
+        intended = _dc.plan_workspace_path(task, board=board)
+        _dc.preflight_workspace(task_id, intended)
+    except _dc.PreflightRefusal as exc:
+        _record_confinement_event(
+            conn, task_id, "confinement_refused",
+            {"reason": str(exc), "stage": "preflight"},
+        )
+        result.refused_confinement.append(task_id)
+        return False
+    except Exception as exc:                      # pragma: no cover - defensive
+        _record_confinement_event(
+            conn, task_id, "confinement_refused",
+            {"reason": f"workspace could not be planned: {exc}",
+             "stage": "preflight"},
+        )
+        result.refused_confinement.append(task_id)
+        return False
+    return True
+
+
+def _spawn_verified(
+    conn: sqlite3.Connection,
+    claimed: "Task",
+    workspace,
+    *,
+    board: Optional[str],
+    spawn_fn,
+    result: "DispatchResult",
+):
+    """Spawn a worker and prove where it actually started.
+
+    ONE path for both dispatch lanes. The review lane previously called the
+    spawner directly, so a custom review spawner bypassed every check — the
+    guard is no longer something a lane remembers to call.
+
+    Returns the pid. Raises to the caller's spawn-failure handler when the
+    worker cannot be confirmed to have started where it was authorized to, after
+    terminating it.
+    """
+    from hermes_cli import dispatch_confinement as _dc
+
+    authorized = _dc.authorize_workspace(claimed.id, workspace)
+    # Re-check identity immediately before the spawn: a symlink retargeted (or a
+    # directory swapped) after provisioning leaves the path string identical.
+    _dc.revalidate_at_spawn(claimed.id, authorized)
+
+    _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    # Back-compat: older spawn_fn signatures accept only (task, workspace).
+    import inspect
+    try:
+        sig = inspect.signature(_spawn)
+        supports_board = "board" in sig.parameters
+    except (TypeError, ValueError):
+        supports_board = False
+    if supports_board:
+        raw = _spawn(claimed, authorized.path, board=board)
+    else:
+        raw = _spawn(claimed, authorized.path)
+
+    pid, reported_cwd = _dc.normalize_spawn_result(raw)
+    verification = _dc.verify_launch(claimed.id, authorized, pid, reported_cwd)
+
+    if verification.status == _dc.MISMATCH:
+        # A spawner that launched elsewhere. Stop the worker, then fail the
+        # dispatch closed through the caller's handler, which releases the claim.
+        _dc.terminate_escaped_worker(pid)
+        _record_confinement_event(
+            conn, claimed.id, "confinement_violation",
+            {"reason": verification.detail,
+             "observed_cwd": verification.observed_cwd,
+             "authorized_cwd": authorized.path},
+        )
+        raise _dc.LaunchVerificationError(verification.detail)
+
+    if pid:
+        _set_worker_pid(conn, claimed.id, int(pid))
+
+    if verification.status == _dc.VERIFIED:
+        # Mandatory: a confined launch that cannot be evidenced is not one.
+        run_id = claimed.current_run_id
+        if run_id is None:
+            row = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (claimed.id,)
+            ).fetchone()
+            run_id = row["current_run_id"] if row else None
+        record_observed_cwd(conn, run_id, verification.observed_cwd)
+    else:
+        # Unobservable. Explicitly NOT confined: observed_cwd stays NULL rather
+        # than recording the path we asked for, and the task is reported so the
+        # gap is visible instead of silently passing as verified.
+        _record_confinement_event(
+            conn, claimed.id, "confinement_unverified",
+            {"reason": verification.detail,
+             "authorized_cwd": authorized.path},
+        )
+        result.unverified_launch.append(claimed.id)
+    return pid
 
 
 
