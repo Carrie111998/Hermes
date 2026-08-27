@@ -3139,31 +3139,22 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def _wrap_outbound_method(method_name: str, implementation):
-        accepts_metadata = "metadata" in inspect.signature(implementation).parameters
+        signature = inspect.signature(implementation)
 
-        async def _wrapped(
-            self,
-            chat_id: str,
-            *args,
-            content: Optional[str] = None,
-            metadata: Optional[Dict[str, Any]] = None,
-            **kwargs,
-        ) -> SendResult:
-            positional = list(args)
-            if content is None and positional:
-                if method_name == "edit_message":
-                    if len(positional) >= 2:
-                        content = positional[1]
-                else:
-                    content = positional[0]
-            original_content = str(content or "")
+        async def _wrapped(self, *args, **kwargs) -> SendResult:
+            # Bind exactly as the implementation would.  Besides preserving
+            # positional compatibility, this gives the gate one canonical map
+            # to inspect and mutate without injecting duplicate keyword values.
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            chat_id = str(bound.arguments.get("chat_id") or "")
+            metadata = bound.arguments.get("metadata")
+            original_content = str(bound.arguments.get("content") or "")
             try:
                 from hermes_cli.lifecycle import has_hook, invoke_hook
 
                 platform_name = _platform_name(getattr(self, "platform", ""))
-                required = _outbound_gate_required_for_target(
-                    platform_name, str(chat_id)
-                )
+                required = _outbound_gate_required_for_target(platform_name, chat_id)
                 if required and not has_hook("pre_gateway_send"):
                     return SendResult(
                         success=False,
@@ -3173,7 +3164,7 @@ class BasePlatformAdapter(ABC):
                 decisions = invoke_hook(
                     "pre_gateway_send",
                     platform=platform_name,
-                    chat_id=str(chat_id),
+                    chat_id=chat_id,
                     content=original_content,
                     metadata=metadata,
                     operation="edit" if method_name == "edit_message" else "send",
@@ -3219,19 +3210,8 @@ class BasePlatformAdapter(ABC):
                         error=f"pre_gateway_send policy returned unsupported action: {action}",
                     )
 
-            if method_name == "edit_message":
-                if len(positional) >= 2:
-                    positional[1] = gated_content
-                else:
-                    kwargs["content"] = gated_content
-            else:
-                if positional:
-                    positional[0] = gated_content
-                else:
-                    kwargs["content"] = gated_content
-            if accepts_metadata:
-                kwargs["metadata"] = metadata
-            return await implementation(self, chat_id, *positional, **kwargs)
+            bound.arguments["content"] = gated_content
+            return await implementation(*bound.args, **bound.kwargs)
 
         functools.update_wrapper(_wrapped, implementation)
         setattr(_wrapped, "_hermes_outbound_gate_wrapped", True)

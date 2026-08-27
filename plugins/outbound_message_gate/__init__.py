@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import threading
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -21,7 +22,12 @@ _URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\[\]{}\"']+", re.IGNORECA
 _RECEIPT_RE = re.compile(r"(?mi)^Receipt:\s*([^\n]+)\s*$")
 _OUTPUT_RE = re.compile(r"(?mi)^Passing output:\s*([^\n]+)\s*$")
 _DEFAULT_SUCCESS_TERMS = (
-    "fixed", "working", "resolved", "live", "ready", "deployed", "verified"
+    "fixed", "working", "resolved", "live", "ready", "deployed", "verified",
+    "done", "complete", "completed", "operational",
+)
+_REQUIRED_SUCCESS_PATTERNS = (
+    re.compile(r"\b(?:the\s+)?(?:bug|defect|issue|problem)\s+no\s+longer\s+(?:occurs|happens|reproduces)\b", re.I),
+    re.compile(r"\ball\s+(?:checks|tests|ratchets|journeys)\s+pass(?:ed)?\b", re.I),
 )
 _LIVE_BUILD_RE = re.compile(r"(?:\bBUILD_ID\s*=\s*\S+|\blive build\s+\S+)", re.IGNORECASE)
 _PASS_RE = re.compile(r"(?:\bPASS\b|\bpassed\b|\bsuccess\b|\bexit_code\s*[=:]\s*0\b)", re.IGNORECASE)
@@ -130,21 +136,43 @@ def fetch_url_live(url: str, timeout: float = 10.0) -> dict[str, Any]:
     }
 
 
+def normalize_target(platform: str, chat_id: str | None = None) -> str:
+    """Canonical target identity: case-insensitive platform, opaque recipient id."""
+    if chat_id is None:
+        raw = str(platform or "").strip()
+        if ":" not in raw:
+            raise ValueError("protected target must be '<platform>:<chat_id>'")
+        platform, chat_id = raw.split(":", 1)
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_chat_id = str(chat_id or "").strip()
+    if not normalized_platform or not normalized_chat_id:
+        raise ValueError("protected target must include platform and chat id")
+    return f"{normalized_platform}:{normalized_chat_id}"
+
+
 def _target_is_protected(platform: str, chat_id: str, settings: Mapping[str, Any]) -> bool:
-    target = f"{str(platform).lower()}:{chat_id}"
     raw = settings.get("protected_targets", [])
-    return isinstance(raw, list) and target in {str(item).lower() for item in raw}
+    if not isinstance(raw, list):
+        raise ValueError("protected_targets must be a list")
+    target = normalize_target(platform, chat_id)
+    return target in {normalize_target(str(item)) for item in raw}
 
 
 def _contains_success_claim(content: str, settings: Mapping[str, Any]) -> bool:
-    terms = settings.get("success_terms", list(_DEFAULT_SUCCESS_TERMS))
-    if not isinstance(terms, list):
-        terms = list(_DEFAULT_SUCCESS_TERMS)
-    return any(
-        re.search(rf"(?<![A-Za-z]){re.escape(str(term))}(?![A-Za-z])", content, re.IGNORECASE)
+    # Normalize compatibility characters (full-width letters, ligatures) and
+    # remove Markdown emphasis delimiters so ``com**plete**`` is inspected as
+    # the visible word the recipient sees.
+    visible = unicodedata.normalize("NFKC", str(content or ""))
+    visible = re.sub(r"[`*_~]", "", visible)
+    configured = settings.get("success_terms", [])
+    additive = configured if isinstance(configured, list) else []
+    terms = {str(term).strip() for term in (*_DEFAULT_SUCCESS_TERMS, *additive) if str(term).strip()}
+    if any(
+        re.search(rf"(?<![A-Za-z]){re.escape(term)}(?![A-Za-z])", visible, re.IGNORECASE)
         for term in terms
-        if str(term).strip()
-    )
+    ):
+        return True
+    return any(pattern.search(visible) for pattern in _REQUIRED_SUCCESS_PATTERNS)
 
 
 def _safe_dead_url_label(url: str) -> str:
