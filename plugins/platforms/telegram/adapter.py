@@ -1186,17 +1186,32 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        # Prefer set_authorization_check: it routes to the runner auth chain
+        # and survives multiplex_profiles wrapping. The bound-handler
+        # ``__self__`` lookup is None when the primary handler is a profile
+        # closure, which used to skip straight to env fail-closed and deny
+        # allowlisted staff taps (#87132 / plugin callback dispatch).
+        has_callback = getattr(self, "_authorization_check", None) is not None
+        if has_callback:
+            decision = self._is_sender_authorized(
+                normalized_user_id,
+                chat_type=normalized_chat_type,
+                chat_id=str(chat_id) if chat_id is not None else None,
+            )
+            if decision is not None:
+                return bool(decision)
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1946,12 +1961,80 @@ class TelegramAdapter(BasePlatformAdapter):
             parsed = min(parsed, max_value)
         return parsed
 
-    def _link_preview_kwargs(self) -> Dict[str, Any]:
-        if not getattr(self, "_disable_link_previews", False):
+    def _link_preview_disabled(self, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Return whether this send should disable Telegram link previews.
+
+        ``metadata["disable_link_preview"]`` overrides the adapter-level
+        ``disable_link_previews`` extra when the key is present.
+        """
+        if metadata is not None and "disable_link_preview" in metadata:
+            return bool(metadata.get("disable_link_preview"))
+        return bool(getattr(self, "_disable_link_previews", False))
+
+    def _link_preview_kwargs(self, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not self._link_preview_disabled(metadata):
             return {}
         if LinkPreviewOptions is not None:
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
+
+    def _coerce_send_reply_markup(self, value: Any) -> Any:
+        """Turn send() metadata ``reply_markup`` into an InlineKeyboardMarkup.
+
+        Accepts an already-built markup object, Telegram's
+        ``{"inline_keyboard": [...]}`` shape, or structured rows of button
+        dicts (``text`` plus ``callback_data`` and/or ``url``).
+        """
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            rows = value
+        elif isinstance(value, dict) and "inline_keyboard" in value:
+            rows = value.get("inline_keyboard")
+        else:
+            return value
+        if not isinstance(rows, (list, tuple)):
+            return None
+        built: List[List[Any]] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                continue
+            buttons: List[Any] = []
+            for btn in row:
+                if isinstance(InlineKeyboardButton, type) and isinstance(
+                    btn, InlineKeyboardButton
+                ):
+                    buttons.append(btn)
+                    continue
+                if not isinstance(btn, dict):
+                    continue
+                text = btn.get("text")
+                if not text:
+                    continue
+                kwargs: Dict[str, Any] = {}
+                if btn.get("callback_data") is not None:
+                    kwargs["callback_data"] = str(btn["callback_data"])
+                if btn.get("url") is not None:
+                    kwargs["url"] = str(btn["url"])
+                if not kwargs:
+                    continue
+                buttons.append(InlineKeyboardButton(str(text), **kwargs))
+            if buttons:
+                built.append(buttons)
+        if not built:
+            return None
+        return InlineKeyboardMarkup(built)
+
+    def _send_reply_markup_kwargs(
+        self, metadata: Optional[Dict[str, Any]], chunk_index: int
+    ) -> Dict[str, Any]:
+        """Attach inline keyboard markup to the first chunk only."""
+        if chunk_index != 0 or not metadata:
+            return {}
+        markup = self._coerce_send_reply_markup(metadata.get("reply_markup"))
+        if markup is None:
+            return {}
+        return {"reply_markup": markup}
 
     # ------------------------------------------------------------------
     # Bot API 10.1 Rich Messages (sendRichMessage)
@@ -2083,6 +2166,10 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_attempt_rich(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
+        # sendRichMessage does not carry plugin inline keyboards. Skip rich
+        # so the legacy path can attach reply_markup instead of dropping it.
+        if (metadata or {}).get("reply_markup"):
+            return False
         return bool(
             not (metadata or {}).get("expect_edits")
             and self._rich_eligible(content)
@@ -2258,7 +2345,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # which must not be sent as a stray field on the raw endpoint.
         payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
         payload.update(self._notification_kwargs(metadata))
-        if getattr(self, "_disable_link_previews", False):
+        if self._link_preview_disabled(metadata):
             payload["link_preview_options"] = {"is_disabled": True}
         if reply_to_id is not None:
             # Spec: sendRichMessage takes reply_parameters (ReplyParameters
@@ -4379,7 +4466,7 @@ class TelegramAdapter(BasePlatformAdapter):
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message
         ))
-        # Handle inline keyboard button callbacks (update prompts)
+        # Handle inline keyboard button callbacks (built-in + plugin prefixes)
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker (@botname <query>) — searchable, uncapped
         # access to every command/skill. Inert until the bot owner enables
@@ -5432,7 +5519,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
-                                **self._link_preview_kwargs(),
+                                **self._link_preview_kwargs(metadata),
+                                **self._send_reply_markup_kwargs(metadata, i),
                                 **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
@@ -5446,7 +5534,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
-                                    **self._link_preview_kwargs(),
+                                    **self._link_preview_kwargs(metadata),
+                                    **self._send_reply_markup_kwargs(metadata, i),
                                     **self._notification_kwargs(metadata),
                                 )
                             else:
@@ -7296,6 +7385,90 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] inline picker answer failed", self.name, exc_info=True)
 
+    def _match_plugin_callback_handler(self, data: str):
+        """Return the longest-prefix plugin handler for ``data``, or None."""
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            handlers = get_plugin_manager().get_telegram_callback_handlers()
+        except Exception as exc:
+            logger.debug(
+                "[%s] Could not load plugin Telegram callback handlers: %s",
+                self.name,
+                exc,
+            )
+            return None
+
+        match = None
+        match_len = -1
+        for prefix, callback, plugin_name in handlers:
+            if (
+                isinstance(prefix, str)
+                and data.startswith(prefix)
+                and len(prefix) > match_len
+            ):
+                match = (prefix, callback, plugin_name)
+                match_len = len(prefix)
+        return match
+
+    async def _dispatch_plugin_callback_query(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> bool:
+        """Dispatch a callback_query to a plugin handler.
+
+        Returns True when a plugin prefix matched (authorized or not).
+        Always answers the query on a match so the client spinner clears.
+        """
+        match = self._match_plugin_callback_handler(data)
+        if match is None:
+            return False
+
+        _prefix, callback, plugin_name = match
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            try:
+                await query.answer(text="⛔ You are not authorized to use this button.")
+            except Exception:
+                pass
+            return True
+
+        try:
+            await query.answer()
+        except Exception:
+            logger.debug(
+                "[%s] query.answer() failed for plugin '%s' callback",
+                self.name,
+                plugin_name,
+                exc_info=True,
+            )
+
+        try:
+            result = callback(query, data)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.error(
+                "[%s] Plugin '%s' Telegram callback handler raised: %s",
+                self.name,
+                plugin_name,
+                exc,
+                exc_info=True,
+            )
+        return True
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7638,8 +7811,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return
 
-        # --- Update prompt callbacks ---
+        # --- Plugin-registered callback prefixes ---
+        # Built-in prefixes above take precedence. Unknown prefixes used to
+        # return silently here; try plugin handlers before giving up.
         if not data.startswith("update_prompt:"):
+            await self._dispatch_plugin_callback_query(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
             return
         answer = data.split(":", 1)[1]  # "y" or "n"
         caller_id = str(getattr(query.from_user, "id", ""))
