@@ -153,8 +153,9 @@ def test_windows_manager_lifecycle_delegates(monkeypatch: pytest.MonkeyPatch) ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("resolution_error", [OSError("io"), RuntimeError("loop")])
 def test_s6_test_isolation_denies_when_scandir_identity_cannot_be_resolved(
-    monkeypatch, tmp_path, fake_subprocess_run
+    monkeypatch, tmp_path, fake_subprocess_run, resolution_error
 ):
     scandir = tmp_path / "uncertain-scandir"
     scandir.mkdir()
@@ -164,7 +165,7 @@ def test_s6_test_isolation_denies_when_scandir_identity_cannot_be_resolved(
     )
 
     def fail_resolve(self, *args, **kwargs):
-        raise OSError("identity unavailable")
+        raise resolution_error
 
     monkeypatch.setattr(Path, "resolve", fail_resolve)
     manager = S6ServiceManager(scandir=scandir)
@@ -246,6 +247,26 @@ def test_s6_test_isolation_binds_safe_scandir_before_unregister(
     assert canonical_service.is_dir()
     assert not safe_service.exists()
     assert manager.scandir == safe.resolve()
+
+
+def test_s6_test_isolation_denies_resolved_alias_of_canonical_scandir(
+    monkeypatch, tmp_path, fake_subprocess_run
+):
+    canonical = tmp_path / "canonical-service"
+    canonical.mkdir()
+    sentinel = canonical / "sentinel"
+    sentinel.write_text("untouched")
+    alias = tmp_path / "canonical-alias"
+    alias.symlink_to(canonical, target_is_directory=True)
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test")
+    monkeypatch.setattr(service_manager_module, "S6_DYNAMIC_SCANDIR", canonical)
+    manager = S6ServiceManager(scandir=alias)
+
+    with pytest.raises(S6TestIsolationError):
+        manager.unregister_profile_gateway("coder")
+
+    assert sentinel.read_text() == "untouched"
+    assert fake_subprocess_run == []
 
 
 @pytest.fixture

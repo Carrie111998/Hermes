@@ -619,7 +619,7 @@ def _refuse_live_s6_mutation_under_test(
     try:
         resolved_scandir = scandir.resolve()
         resolved_live = S6_DYNAMIC_SCANDIR.resolve()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise S6TestIsolationError(
             "refusing s6 mutation under test isolation: could not prove "
             "the target scandir is separate from the live canonical scandir",
