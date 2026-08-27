@@ -823,29 +823,41 @@ class TestProjectScopedMemory:
         result = store.format_for_system_prompt("memory", project_scope="myapp")
         assert result is None
 
-    def test_scope_matching_is_case_sensitive(self, store):
-        """[project:MyApp] excluded, [project:myapp] included under scope "myapp"."""
-        # Intentional: scope matching is exact case-sensitive prefix matching.
-        # Do NOT add case-folding — project names are case-sensitive identifiers
-        # and case-insensitive matching would silently include unintended entries
-        # (e.g. "MyApp" matching "myapp" or "MYAPP").
+    def test_bullet_prefixed_tags_match(self, store):
+        """Bullet-prefixed [project:other] excluded, [project:myapp] included under scope 'myapp'.
+
+        The original strict prefix match treated '- [project:other] note' as
+        untagged (the '-' prefix made startswith('[project:') false), leaking
+        other-project entries into the filtered prompt.
+        """
+        filtered = MemoryStore._scoped_entries([
+            "- [project:other] note",
+            "- [project:myapp] note",
+        ], "myapp")
+        assert "- [project:other] note" not in filtered
+        assert "- [project:myapp] note" in filtered
+
+    def test_tag_matching_is_case_insensitive(self, store):
+        """[project:MyApp] is INCLUDED under scope 'myapp' (case-insensitive)."""
         filtered = MemoryStore._scoped_entries([
             "[project:MyApp] note",
             "[project:myapp] note",
         ], "myapp")
-        assert "[project:MyApp] note" not in filtered
+        assert "[project:MyApp] note" in filtered
         assert "[project:myapp] note" in filtered
 
-    def test_whitespace_variant_is_excluded(self, store):
-        """[project: myapp] (space after colon) excluded under scope "myapp"."""
-        # Intentional: space-tolerant matching is NOT supported. The tag format
-        # is "[project:<name>]" with no space after the colon. A space
-        # produces a different prefix that will not match any project scope.
-        # Adding space tolerance would silently include mistagged entries that
-        # the user did not intend to associate with this project.
+    def test_whitespace_prefixed_tag_is_included(self, store):
+        """Leading whitespace before tag is stripped for matching."""
         filtered = MemoryStore._scoped_entries([
-            "[project: myapp] note",
-            "[project:myapp] note",
+            "  [project:myapp] note",
         ], "myapp")
-        assert "[project: myapp] note" not in filtered
-        assert "[project:myapp] note" in filtered
+        assert "  [project:myapp] note" in filtered
+
+    def test_mid_text_project_tag_is_untagged(self, store):
+        """Mid-text occurrence 'note [project:other] here' is treated as untagged."""
+        filtered = MemoryStore._scoped_entries([
+            "note [project:other] here",
+            "[project:myapp] real tag",
+        ], "myapp")
+        assert "note [project:other] here" in filtered
+        assert "[project:myapp] real tag" in filtered

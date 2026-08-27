@@ -190,3 +190,46 @@ class TestMemoryBlockProjectScope:
         assert "other note" in volatile, \
             "[project:other] entry must survive config read failure (fail-open)"
         assert "proj note" in volatile
+
+    def test_scope_pinned_across_rebuilds(self, store_and_agent, monkeypatch):
+        """Scope is pinned on the agent at first build; rebuilds reuse it.
+
+        Build the prompt twice with scoping enabled and resolve_project_scope
+        monkeypatched to return different values between calls → the memory
+        block is IDENTICAL both times (proves the per-session pin).
+        """
+        store, agent = store_and_agent
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"memory": {"project_scoping": True}},
+        )
+
+        calls = {"n": 0}
+
+        def oscillating_scope():
+            calls["n"] += 1
+            # Return "proj" on first call, "other" on second, "third" on third
+            return ["proj", "other", "third"][min(calls["n"] - 1, 2)]
+
+        monkeypatch.setattr(
+            "agent.runtime_cwd.resolve_project_scope", oscillating_scope,
+        )
+
+        # First build — should use oscillating_scope (returns "proj")
+        parts1 = _build(agent)
+        volatile1 = parts1.get("volatile", "")
+
+        # Second build — should reuse pinned value, NOT oscillating_scope
+        parts2 = _build(agent)
+        volatile2 = parts2.get("volatile", "")
+
+        assert volatile1 == volatile2, (
+            "Memory block changed between rebuilds — scope pin is not working"
+        )
+        assert "proj note" in volatile1, (
+            "First build should contain [project:proj] entry (scope='proj')"
+        )
+        assert "other note" not in volatile1, (
+            "First build should filter out [project:other] entry (scope='proj')"
+        )

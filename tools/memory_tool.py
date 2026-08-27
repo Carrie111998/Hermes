@@ -716,13 +716,29 @@ class MemoryStore:
         - ``[project:<name>]`` entries survive only when ``project_scope == <name>``.
         - All entries survive when ``project_scope`` is empty (backward compatible).
 
+        Tag matching is case-insensitive and strips Markdown list markers (``-``, ``*``)
+        and leading whitespace before testing the tag prefix. The ORIGINAL entry text is
+        always what is rendered in the memory block.
+
         An entry is included iff:
-          NOT entry.startswith("[project:") OR entry.startswith(f"[project:{project_scope}]")
+          NOT clean.lower().startswith("[project:") OR clean.lower().startswith(tag.lower())
+        where ``clean`` is the entry with leading whitespace and ``-``/``*`` list markers
+        stripped.
         """
         if not project_scope:
             return list(entries)
-        tag = f"[project:{project_scope}]"
-        return [e for e in entries if not e.startswith("[project:") or e.startswith(tag)]
+        tag = f"[project:{project_scope.lower()}]"
+        out = []
+        for e in entries:
+            clean = e.lstrip()
+            while clean[:1] in ("-", "*"):
+                clean = clean[1:].lstrip()
+            if clean.lower().startswith("[project:"):
+                if clean.lower().startswith(tag):
+                    out.append(e)
+            else:
+                out.append(e)
+        return out
 
     def format_for_system_prompt(self, target: str, project_scope: str = "") -> Optional[str]:
         """

@@ -200,3 +200,23 @@ class TestResolveProjectScope:
         monkeypatch.chdir(str(empty))
 
         assert rt.resolve_project_scope() == ""
+
+    def test_walk_stops_at_home(self, monkeypatch, tmp_path):
+        """Marker in a parent of $HOME is NOT found because the walk breaks at $HOME.
+
+        Create a fake home /x/home with a marker at /x/AGENTS.md, and cwd at
+        /x/home/proj. The walk reaches /x/home (home) and breaks, never
+        reaching /x where the marker sits → scope is empty.
+        """
+        home = tmp_path / "x" / "home"
+        home.mkdir(parents=True)
+        # Marker in /x (parent of home)
+        (tmp_path / "x" / "AGENTS.md").write_text("marker")
+        # cwd inside /x/home
+        proj = home / "proj"
+        proj.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setenv("TERMINAL_CWD", str(proj))
+
+        assert rt.resolve_project_scope() == ""

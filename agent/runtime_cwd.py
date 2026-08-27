@@ -118,8 +118,11 @@ def resolve_project_scope() -> str:
     for depth, parent in enumerate([current, *current.parents]):
         if depth > 6:
             break
+        # Stop the walk at $HOME or the shared temp root — their parents are
+        # never project roots, so continuing past them is wasted work and can
+        # produce false positives from unrelated markers in parent directories.
         if parent == home or (temp_root is not None and parent == temp_root):
-            continue
+            break
         for marker in _PROJECT_SCOPE_MARKERS:
             try:
                 if (parent / marker).exists():
