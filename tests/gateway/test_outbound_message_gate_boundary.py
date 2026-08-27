@@ -649,6 +649,25 @@ async def test_unknown_async_native_publisher_added_after_class_creation_is_gate
 
 
 @pytest.mark.asyncio
+async def test_unknown_post_class_publisher_without_named_destination_fails_closed(monkeypatch):
+    delivered = []
+
+    async def publish_opaque(self, payload):
+        delivered.append(payload)
+        return True
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_final_gateway_send_policy",
+        lambda **_kwargs: {"action": "rewrite", "content": "SAFE"},
+    )
+    monkeypatch.setattr(GateAdapter, "publish_opaque", publish_opaque, raising=False)
+
+    assert await GateAdapter().publish_opaque("fixed https://127.0.0.1/admin") is True
+    assert delivered == ["SAFE"]
+
+
+@pytest.mark.asyncio
 async def test_unknown_safe_non_content_method_added_after_class_creation_is_unchanged(monkeypatch):
     calls = []
 

@@ -486,6 +486,22 @@ def test_loaded_module_identity_rejects_module_file_mismatch(tmp_path):
         )
 
 
+def test_runtime_inventory_validation_rejects_ast_violation(tmp_path, monkeypatch):
+    source = tmp_path / "gateway" / "delivery.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("async def bypass(): pass\n")
+    snapshots = mod._capture_source_snapshots(
+        root=tmp_path, source_paths=("gateway/delivery.py",),
+    )
+    monkeypatch.setattr(
+        "outbound_transport_inventory.scan_terminal_transport_inventory",
+        lambda *_args, **_kwargs: ["gateway/delivery.py:1:bypass:send"],
+    )
+
+    with pytest.raises(RuntimeError, match="terminal transport inventory violation"):
+        mod._validate_terminal_transport_inventory(snapshots)
+
+
 def test_bare_oauth_callback_requires_narrow_configured_status_exception():
     resolver = lambda *_args, **_kwargs: [
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))

@@ -126,6 +126,7 @@ GATE_BUILD_SOURCE_PATHS = (
     "hermes_cli/lifecycle.py",
     "hermes_cli/outbound_policy.py",
     "hermes_cli/plugins.py",
+    "outbound_transport_inventory.py",
     "plugins/outbound_message_gate/__init__.py",
     "plugins/platforms/a2a/adapter.py",
     "plugins/platforms/buzz/adapter.py",
@@ -186,7 +187,7 @@ def _security_source_inventory(root: Path) -> set[str]:
         "gateway/delivery.py", "gateway/platform_registry.py", "gateway/relay/adapter.py",
         "gateway/run.py", "hermes_cli/lifecycle.py", "hermes_cli/outbound_policy.py",
         "hermes_cli/plugins.py", "plugins/outbound_message_gate/__init__.py",
-        "tools/send_message_tool.py",
+        "outbound_transport_inventory.py", "tools/send_message_tool.py",
     ):
         if (root / relative).exists():
             found.add(relative)
@@ -290,11 +291,32 @@ def _assert_source_snapshots(
                 _assert_loaded_module_identity(module_name, module, snapshot)
 
 
+def _validate_terminal_transport_inventory(
+    snapshots: Mapping[str, _SourceSnapshot],
+) -> None:
+    from outbound_transport_inventory import scan_terminal_transport_inventory
+
+    violations: list[str] = []
+    for relative, snapshot in snapshots.items():
+        try:
+            source = snapshot.source_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"security source is not UTF-8: {relative}") from exc
+        violations.extend(
+            scan_terminal_transport_inventory(source, relative_path=relative)
+        )
+    if violations:
+        raise RuntimeError(
+            "terminal transport inventory violation: " + ", ".join(sorted(violations))
+        )
+
+
 _GATE_ROOT = _gate_repo_root()
 _validate_gate_build_manifest(GATE_BUILD_SOURCE_PATHS, root=_GATE_ROOT)
 _STARTUP_SOURCE_SNAPSHOTS = _capture_source_snapshots(
     root=_GATE_ROOT, source_paths=GATE_BUILD_SOURCE_PATHS,
 )
+_validate_terminal_transport_inventory(_STARTUP_SOURCE_SNAPSHOTS)
 
 
 def _assert_runtime_build_identity() -> None:
