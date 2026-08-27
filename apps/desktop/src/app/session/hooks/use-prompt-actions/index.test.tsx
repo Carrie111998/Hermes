@@ -756,6 +756,7 @@ describe('usePromptActions /compress', () => {
     await handle!.submitText('/compress')
 
     expect(JSON.stringify(states.at(-1)?.messages)).toContain('compressed runtime prompt')
+    expect(states.at(-1)?.transcriptAuthorityEpoch).toBe(1)
     expect(states.at(-1)?.transcriptProvenance).toBeUndefined()
   })
 
@@ -2732,6 +2733,77 @@ describe('usePromptActions restoreToMessage', () => {
       1_800_000
     )
     expect((lastState.messages as { id: string }[]).map(m => m.id)).toEqual(['u1'])
+  })
+})
+
+describe('usePromptActions transcript provenance invalidation', () => {
+  const persistedMessages = [
+    { id: 'u1', role: 'user' as const, parts: [textPart('first prompt')] },
+    { id: 'a1', role: 'assistant' as const, parts: [textPart('first answer')] },
+    { id: 'u2', role: 'user' as const, parts: [textPart('second prompt')] },
+    { id: 'a2', role: 'assistant' as const, parts: [textPart('second answer')] }
+  ]
+
+  const rewriteCases: { invoke: (handle: HarnessHandle) => Promise<void>; name: string }[] = [
+    {
+      invoke: handle => handle.reloadFromMessage('u1'),
+      name: 'regenerate'
+    },
+    {
+      invoke: handle => handle.restoreToMessage('u1'),
+      name: 'restore'
+    },
+    {
+      invoke: handle =>
+        handle.editMessage({
+          content: [{ text: 'edited prompt', type: 'text' }],
+          parentId: null,
+          role: 'user',
+          sourceId: 'u1'
+        } as never),
+      name: 'edit'
+    }
+  ]
+
+  beforeEach(() => {
+    $busy.set(false)
+    setMessages(persistedMessages)
+  })
+
+  afterEach(() => {
+    cleanup()
+    $busy.set(false)
+    setMessages([])
+    vi.restoreAllMocks()
+  })
+
+  it.each(rewriteCases)('clears persisted transcript provenance before $name rewrites history', async ({ invoke }) => {
+    const provenance = createPersistedDisplayTranscriptProvenance({
+      lineageRootId: 'root-A',
+      scope: undefined,
+      storedSessionId: RUNTIME_SESSION_ID
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let lastState: Record<string, unknown> = {}
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        onSeedState={state => (lastState = state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={persistedMessages}
+        seedTranscriptProvenance={provenance}
+      />
+    )
+
+    await invoke(handle!)
+
+    expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    expect(lastState.transcriptAuthorityEpoch).toBe(1)
+    expect(lastState.transcriptProvenance).toBeUndefined()
   })
 })
 

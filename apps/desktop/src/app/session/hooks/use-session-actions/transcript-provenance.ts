@@ -52,6 +52,14 @@ export function withoutTranscriptProvenance(state: ClientSessionState): ClientSe
   return withoutProvenance
 }
 
+export function invalidatePersistedDisplayTranscriptAuthority(state: ClientSessionState): ClientSessionState {
+  return {
+    ...state,
+    transcriptAuthorityEpoch: (state.transcriptAuthorityEpoch ?? 0) + 1,
+    transcriptProvenance: undefined
+  }
+}
+
 export function suppressTranscriptForView(state: ClientSessionState, suppress: boolean): ClientSessionState {
   if (!suppress || state.messages.length === 0) {
     return state

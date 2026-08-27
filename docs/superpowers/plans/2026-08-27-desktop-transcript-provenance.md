@@ -530,6 +530,58 @@ Also run the exact existing test file(s) owning any modified stream/gateway writ
 
 If the audit proves there is no runtime-only full replacement outside the already modified resume paths, make no code change and record the evidence. If it discovers a writer outside the named files whose ownership test is not already identified above, pause execution and amend this plan with that exact production path, exact test path, RED command, and expected failure before modifying it. Do not create an empty commit.
 
+### Review hardening amendment
+
+The pre-PR independent review expanded the writer and publication audit. The
+following exact boundaries are part of Task 5 rather than a new feature:
+
+- `use-prompt-actions/index.ts` regenerate, restore, and edit optimistic
+  rewrites;
+- `app/chat/session-tile-actions.ts` regenerate, restore, and edit optimistic
+  rewrites;
+- every active-view publication from `use-session-state-cache.ts` while a warm
+  cross-session resume is waiting for persisted authority;
+- compatibility and transient `session.activate` failures;
+- concurrent rewrite or stored-id rotation while REST hydration is pending;
+- a proven cache faced with a backend that returns runtime messages despite
+  `omit_messages: true`.
+
+Add the exact RED tests beside their owners and run:
+
+```powershell
+npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-prompt-actions/index.test.tsx -t "transcript provenance invalidation"
+npm run test:ui --workspace apps/desktop -- src/app/chat/session-tile-actions.test.ts -t "transcript provenance invalidation"
+npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-session-state-cache.test.tsx -t "transcript view gate"
+npm run test:ui --workspace apps/desktop -- src/app/session/hooks/use-session-actions.test.tsx -t "activation fails with|activation and REST both fail|older REST proof|proven persisted base"
+```
+
+Expected RED evidence:
+
+- all six primary/tile rewrites retain the prior proof;
+- the real state cache publishes cached messages and a later live delta while
+  authority is pending;
+- activation timeout returns before REST/fallback and leaves the suppressed
+  view blank;
+- an older REST response re-mints proof after a rewrite or stored-id rotation;
+- runtime activation messages replace a proven persisted base when REST fails.
+
+The narrow implementation contract is:
+
+- use a token-safe per-runtime view hold in `use-session-state-cache.ts`, so
+  internal cache and live-event ingestion remain complete while every foreground
+  publication is suppressed until the authority attempt settles;
+- use an optional monotonic `transcriptAuthorityEpoch` on
+  `ClientSessionState`; increment it at all durable rewrite and identity-rotation
+  boundaries and require the captured epoch plus current stored id to match
+  before applying or minting an older REST result;
+- on missing-RPC or transient activation failure, attempt identity-validated
+  REST and then release either the proven result or the current unproven cache;
+- when a cache already has valid persisted proof, retain that persisted base
+  and append only explicit live projection while REST refresh is unavailable.
+
+This remains Desktop-internal. It does not add a backend/public protocol field,
+change watch/same-selected behavior, or modify an installed runtime.
+
 ## Task 6: Regression and quality verification
 
 **Files:**

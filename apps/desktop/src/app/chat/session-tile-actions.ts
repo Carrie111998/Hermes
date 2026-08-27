@@ -64,6 +64,7 @@ import {
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from '../session/hooks/use-prompt-actions/utils'
+import { invalidatePersistedDisplayTranscriptAuthority } from '../session/hooks/use-session-actions/transcript-provenance'
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
 
 import type { ComposerScope } from './composer/scope'
@@ -504,7 +505,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         return
       }
 
-      update(current => applyReloadOptimistic(current, plan))
+      update(current => invalidatePersistedDisplayTranscriptAuthority(applyReloadOptimistic(current, plan)))
 
       try {
         // Recovery for a dead runtime id rides inside submitRewind →
@@ -544,7 +545,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         sessionId
       })
 
-      update(state => applyRewindOptimistic(state, plan.sourceIndex))
+      update(state => invalidatePersistedDisplayTranscriptAuthority(applyRewindOptimistic(state, plan.sourceIndex)))
 
       try {
         applySurvivorRowIds(
@@ -593,7 +594,11 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         sessionId
       })
 
-      update(state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
+      update(state =>
+        invalidatePersistedDisplayTranscriptAuthority(
+          applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage)
+        )
+      )
 
       try {
         applySurvivorRowIds(

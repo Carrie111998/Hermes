@@ -166,6 +166,7 @@ interface SessionActionsOptions {
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   getRoutedStoredSessionId: () => null | string
+  holdSessionTranscriptView?: (runtimeId: string) => () => void
   navigate: NavigateFunction
   onFreshDraftRouteIntent?: () => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -308,6 +309,7 @@ export function useSessionActions({
   ensureSessionState,
   getRouteToken,
   getRoutedStoredSessionId,
+  holdSessionTranscriptView,
   navigate,
   onFreshDraftRouteIntent,
   requestGateway,
@@ -1031,6 +1033,87 @@ export function useSessionActions({
           const suppressUnprovenWarmTranscript =
             !resumedSameSelectedSession && shouldRefreshPersistedTranscript && !hasValidProvenance
 
+          const transcriptAuthorityEpochAtStart = cachedViewState.transcriptAuthorityEpoch ?? 0
+
+          let releaseHeldTranscriptView = suppressUnprovenWarmTranscript
+            ? holdSessionTranscriptView?.(cachedRuntimeId)
+            : undefined
+
+          const releaseTranscriptView = () => {
+            releaseHeldTranscriptView?.()
+            releaseHeldTranscriptView = undefined
+          }
+
+          const settleWarmWithoutActivation = async (): Promise<void> => {
+            const persisted = shouldRefreshPersistedTranscript
+              ? await getLatestSessionMessages(storedSessionId, sessionRestScope).catch(() => null)
+              : null
+
+            if (!isCurrentResume()) {
+              return
+            }
+
+            const currentState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
+
+            if (!currentState || currentState.storedSessionId !== storedSessionId) {
+              releaseTranscriptView()
+
+              return
+            }
+
+            const currentStored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+
+            const currentExpectedProvenance = currentStored
+              ? createPersistedDisplayTranscriptProvenance({
+                  lineageRootId: currentStored._lineage_root_id ?? null,
+                  scope: sessionRestScope,
+                  storedSessionId
+                })
+              : null
+
+            const authorityEpochUnchanged =
+              (currentState.transcriptAuthorityEpoch ?? 0) === transcriptAuthorityEpochAtStart
+
+            const acceptedPersistedDisplayTranscript = Boolean(
+              persisted &&
+              persisted.session_id === storedSessionId &&
+              expectedProvenance &&
+              currentExpectedProvenance &&
+              authorityEpochUnchanged &&
+              hasPersistedDisplayTranscriptProvenance(
+                { transcriptProvenance: expectedProvenance },
+                currentExpectedProvenance
+              ) &&
+              (persisted.messages.length || currentState.messages.length === 0)
+            )
+
+            let persistedMessagesForCache: ChatMessage[] | null = null
+            let compatMessages = currentState.messages
+
+            if (acceptedPersistedDisplayTranscript && persisted) {
+              persistedMessagesForCache = graftRefreshedTailOntoBackfill(
+                toChatMessages(persisted.messages),
+                cachedViewState.messages
+              )
+              compatMessages = overlayConcurrentMessageChanges(
+                persistedMessagesForCache,
+                cachedViewState.messages,
+                currentState.messages
+              )
+            }
+
+            releaseTranscriptView()
+            updateSessionState(cachedRuntimeId, state => ({
+              ...state,
+              messages: compatMessages,
+              transcriptProvenance: acceptedPersistedDisplayTranscript ? (expectedProvenance ?? undefined) : undefined
+            }))
+
+            if (acceptedPersistedDisplayTranscript && persistedMessagesForCache) {
+              saveTranscriptTail(storedSessionId, persistedMessagesForCache, sessionRestScope)
+            }
+          }
+
           setFreshDraftReady(false)
           clearNotifications()
           setSelectedStoredSessionId(storedSessionId)
@@ -1081,6 +1164,8 @@ export function useSessionActions({
                 setCurrentUsage(current => ({ ...current, ...usage }))
               }
 
+              await settleWarmWithoutActivation()
+
               return
             }
 
@@ -1121,16 +1206,22 @@ export function useSessionActions({
               // HUD mode is exactly that) collapsed the whole conversation down
               // to the in-flight prompt until the turn finished and the
               // post-turn hydrate restored it.
-              let activatedMessages = activated.messages_omitted
+              let activatedMessages = hasValidProvenance
                 ? appendLiveSessionProjection(cachedViewState.messages, activated)
-                : activated.messages.length || activated.inflight || activated.queued
-                  ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
-                  : cachedViewState.messages
+                : activated.messages_omitted
+                  ? appendLiveSessionProjection(cachedViewState.messages, activated)
+                  : activated.messages.length || activated.inflight || activated.queued
+                    ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
+                    : cachedViewState.messages
 
               // #70449: never let the activate snapshot's stale running:false
               // rewind a turn that started while the RPC was in flight — read
               // the freshest cache entry, not the pre-await cachedViewState.
               const latestCachedState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
+
+              if (!latestCachedState || latestCachedState.storedSessionId !== storedSessionId) {
+                return
+              }
 
               const busyChangedWhileActivating = Boolean(
                 latestCachedState?.busy &&
@@ -1154,7 +1245,7 @@ export function useSessionActions({
               // Once the attached transport reports a later terminal event,
               // that live state is authoritative and must not be overwritten
               // by the older `running` value after the REST request resolves.
-              const activatedLivenessState = updateSessionState(
+              updateSessionState(
                 cachedRuntimeId,
                 state => ({
                   ...state,
@@ -1180,10 +1271,6 @@ export function useSessionActions({
               busyRef.current = running
               setBusy(running)
               setAwaitingResponse(running && !pendingClarify)
-              syncSessionStateToView(
-                cachedRuntimeId,
-                suppressTranscriptForView(activatedLivenessState, suppressUnprovenWarmTranscript)
-              )
 
               // session.activate is the ordering barrier for reconnect recovery:
               // it atomically rebinds a running turn before returning. If the
@@ -1204,12 +1291,24 @@ export function useSessionActions({
               let acceptedPersistedDisplayTranscript = false
               let appliedPersistedDisplayTranscript = false
 
+              let authorityEpochUnchanged =
+                (latestCachedState.transcriptAuthorityEpoch ?? 0) === transcriptAuthorityEpochAtStart
+
               if (persistedTranscriptPromise) {
                 const persisted = await persistedTranscriptPromise
 
                 if (!isCurrentResume()) {
                   return
                 }
+
+                const currentAuthorityState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
+
+                if (!currentAuthorityState || currentAuthorityState.storedSessionId !== storedSessionId) {
+                  return
+                }
+
+                authorityEpochUnchanged =
+                  (currentAuthorityState.transcriptAuthorityEpoch ?? 0) === transcriptAuthorityEpochAtStart
 
                 const activatedStoredSessionId = activated.session_key || activated.resumed
 
@@ -1226,6 +1325,7 @@ export function useSessionActions({
                 // already prevents for the activate payload itself).
                 if (
                   persisted &&
+                  authorityEpochUnchanged &&
                   persistedMatchesActivatedSession &&
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
@@ -1273,15 +1373,29 @@ export function useSessionActions({
                       { transcriptProvenance: expectedProvenance },
                       currentExpectedProvenance
                     ) &&
+                    authorityEpochUnchanged &&
                     persisted.session_id === storedSessionId &&
                     activatedStoredSessionId === storedSessionId
                   )
                 }
               }
 
-              const currentMessages = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages
+              const currentAuthorityState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
 
-              if (currentMessages) {
+              if (!currentAuthorityState || currentAuthorityState.storedSessionId !== storedSessionId) {
+                return
+              }
+
+              authorityEpochUnchanged =
+                (currentAuthorityState.transcriptAuthorityEpoch ?? 0) === transcriptAuthorityEpochAtStart
+
+              const currentMessages = currentAuthorityState.messages
+
+              if (!authorityEpochUnchanged) {
+                activatedMessages = currentMessages
+                acceptedPersistedDisplayTranscript = false
+                appliedPersistedDisplayTranscript = false
+              } else {
                 activatedMessages = overlayConcurrentMessageChanges(
                   activatedMessages,
                   cachedViewState.messages,
@@ -1304,48 +1418,46 @@ export function useSessionActions({
               const visibleActivatedMessages =
                 pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? activatedMessages
 
-              const activatedState = updateSessionState(
-                cachedRuntimeId,
-                state => ({
-                  ...state,
-                  messages: visibleActivatedMessages,
-                  transcriptProvenance: acceptedPersistedDisplayTranscript
-                    ? (expectedProvenance ?? undefined)
-                    : appliedPersistedDisplayTranscript
-                      ? undefined
-                      : hasValidProvenance
-                        ? (expectedProvenance ?? undefined)
-                        : undefined,
-                  ...(pendingClarifyProjection
-                    ? {
-                        awaitingResponse: false,
-                        sawAssistantPayload: true,
-                        streamId: pendingClarifyProjection.streamId
-                      }
-                    : {}),
-                  ...(clearedClarifyProjection
-                    ? {
-                        streamId: state.busy ? (clearedClarifyProjection.streamId ?? state.streamId) : null
-                      }
-                    : {})
-                }),
-                storedSessionId
-              )
+              releaseTranscriptView()
+              updateSessionState(cachedRuntimeId, state => ({
+                ...state,
+                messages: visibleActivatedMessages,
+                transcriptProvenance: acceptedPersistedDisplayTranscript
+                  ? (expectedProvenance ?? undefined)
+                  : appliedPersistedDisplayTranscript
+                    ? undefined
+                    : hasValidProvenance && authorityEpochUnchanged
+                      ? (expectedProvenance ?? undefined)
+                      : undefined,
+                ...(pendingClarifyProjection
+                  ? {
+                      awaitingResponse: false,
+                      sawAssistantPayload: true,
+                      streamId: pendingClarifyProjection.streamId
+                    }
+                  : {}),
+                ...(clearedClarifyProjection
+                  ? {
+                      streamId: state.busy ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                    }
+                  : {})
+              }))
 
-              syncSessionStateToView(cachedRuntimeId, activatedState)
               // Cache backend transcript truth only. The pending/running bit and
               // any synthetic clarify row are a live resume projection and must
               // not survive after the server-side request expires.
-              saveTranscriptTail(
-                storedSessionId,
-                stripPendingClarifyProjectionForCache(
-                  activatedMessages,
-                  pendingClarify?.requestId ??
-                    pendingClarifyState.cleared?.requestId ??
-                    $clarifyRequests.get()[cachedRuntimeId]?.requestId
-                ),
-                sessionRestScope
-              )
+              if (authorityEpochUnchanged) {
+                saveTranscriptTail(
+                  storedSessionId,
+                  stripPendingClarifyProjectionForCache(
+                    activatedMessages,
+                    pendingClarify?.requestId ??
+                      pendingClarifyState.cleared?.requestId ??
+                      $clarifyRequests.get()[cachedRuntimeId]?.requestId
+                  ),
+                  sessionRestScope
+                )
+              }
 
               return
             }
@@ -1362,12 +1474,16 @@ export function useSessionActions({
             }
 
             if (!isSessionGoneError(error)) {
+              await settleWarmWithoutActivation()
+
               return
             }
 
             runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
             sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
             dropSessionState(cachedRuntimeId)
+          } finally {
+            releaseTranscriptView()
           }
         }
       }
@@ -1898,6 +2014,7 @@ export function useSessionActions({
       activeSessionIdRef,
       busyRef,
       copy,
+      holdSessionTranscriptView,
       requestGateway,
       resetViewSync,
       runtimeIdByStoredSessionIdRef,

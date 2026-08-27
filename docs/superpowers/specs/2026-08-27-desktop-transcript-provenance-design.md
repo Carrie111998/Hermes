@@ -130,6 +130,14 @@ Provenance must be cleared, or considered invalid at the read gate, when:
 
 The implementation plan must audit all direct `ClientSessionState.messages` replacement sites in the warm/resume and stream paths. Unknown writers fail closed; no writer may infer proof from non-emptiness, message count, or runtime identity.
 
+Pre-PR review identified a response-order race that identity fields alone cannot
+detect: a valid REST request may start before a concurrent durable rewrite and
+finish afterward. Phase 1 therefore carries an optional monotonic
+`transcriptAuthorityEpoch` beside the state. Durable rewrite and stored-id
+rotation boundaries increment it; a hydration may mint proof only when the
+captured epoch and current stored id still match. The epoch is an internal
+invalidation token, not positive provenance and not a backend/public contract.
+
 ## Warm Resume Publication Flow
 
 For a switch to a different warm session:
@@ -138,7 +146,7 @@ For a switch to a different warm session:
 2. Validate `transcriptProvenance` against the selected owner, stored session, and current lineage.
 3. If valid, retain the current immediate warm paint and background persisted refresh.
 4. If invalid or absent, keep the cached messages in the internal session state for reconciliation, but construct a view-only pre-authority state with no transcript messages.
-5. Use that same view-only message policy for both the immediate sync and the post-activate liveness sync. The second sync must not leak the internal cached messages.
+5. Hold a token-safe per-runtime view gate until the authority attempt settles. Every active-view publication, including post-activate liveness and concurrent live events, uses the view-only message policy; internal cache state remains complete.
 6. For an unproven cache, after a valid persisted hydration, reconcile the persisted display base with current live changes, mint provenance on the reconciled state, and perform the first transcript-bearing publication once.
 
 For a same-selected-session re-resume, Phase 1 does not blank or suppress the already visible transcript. The user may be watching or submitting into that live state; existing concurrent-overlay protections remain authoritative.
@@ -173,6 +181,9 @@ Required RED/GREEN vectors:
 8. REST failure triggers delayed degraded fallback and does not mint provenance.
 9. A runtime-only replacement clears or invalidates prior provenance.
 10. Existing empty-REST race, attachment preservation, pending clarify, and compressed running-session regressions remain green.
+11. A rewrite or stored-id rotation during REST hydration prevents the older response from applying or minting proof.
+12. Missing-RPC and transient activation failures continue to validated REST or a delayed unproven fallback instead of leaving the view blank.
+13. A proven persisted base is not replaced by runtime messages when a backend ignores `omit_messages` and REST is unavailable.
 
 Verification gates:
 

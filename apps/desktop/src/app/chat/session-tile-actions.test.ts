@@ -2,12 +2,18 @@ import { renderHook } from '@testing-library/react'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { ClientSessionState } from '@/app/types'
+import { textPart } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
+
+import { createPersistedDisplayTranscriptProvenance } from '../session/hooks/use-session-actions/transcript-provenance'
+
 import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 
 const requestGatewayMock = vi.hoisted(() => vi.fn())
 
 const { $activeSessionId, $sessions, setSessions } = await import('@/store/session')
-const { $sessionTiles, setSessionTileDelegate } = await import('@/store/session-states')
+const { $sessionStates, $sessionTiles, setSessionTileDelegate } = await import('@/store/session-states')
 const { listTileSessionRow, useSessionTileActions } = await import('./session-tile-actions')
 
 const RUNTIME_SESSION_ID = 'rt-tile-current'
@@ -204,5 +210,86 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
     expect($activeSessionId.get()).toBe('foreground-runtime')
+  })
+})
+
+describe('useSessionTileActions transcript provenance invalidation', () => {
+  const persistedMessages = [
+    { id: 'u1', role: 'user' as const, parts: [textPart('first prompt')] },
+    { id: 'a1', role: 'assistant' as const, parts: [textPart('first answer')] },
+    { id: 'u2', role: 'user' as const, parts: [textPart('second prompt')] },
+    { id: 'a2', role: 'assistant' as const, parts: [textPart('second answer')] }
+  ]
+
+  const rewriteCases: {
+    invoke: (actions: ReturnType<typeof useSessionTileActions>) => Promise<void>
+    name: string
+  }[] = [
+    {
+      invoke: actions => actions.reloadFromMessage('u1'),
+      name: 'regenerate'
+    },
+    {
+      invoke: actions => actions.restoreToMessage('u1'),
+      name: 'restore'
+    },
+    {
+      invoke: actions =>
+        actions.editMessage({
+          content: [{ text: 'edited prompt', type: 'text' }],
+          parentId: null,
+          role: 'user',
+          sourceId: 'u1'
+        } as never),
+      name: 'edit'
+    }
+  ]
+
+  let currentState: ClientSessionState
+
+  beforeEach(() => {
+    currentState = createClientSessionState(STORED_SESSION_ID)
+    currentState.messages = persistedMessages
+    currentState.transcriptProvenance = createPersistedDisplayTranscriptProvenance({
+      lineageRootId: 'root-A',
+      scope: undefined,
+      storedSessionId: STORED_SESSION_ID
+    })
+
+    $sessionStates.set({ [RUNTIME_SESSION_ID]: currentState })
+    $sessionTiles.set([{ runtimeId: RUNTIME_SESSION_ID, storedSessionId: STORED_SESSION_ID }])
+    setSessionTileDelegate({
+      archiveSession: vi.fn(async () => undefined),
+      branchSession: vi.fn(async () => undefined),
+      deleteSession: vi.fn(async () => undefined),
+      executeSlash: vi.fn(async () => undefined),
+      interruptSession: vi.fn(async () => undefined),
+      resumeTile: vi.fn(async () => RUNTIME_SESSION_ID),
+      submitToSession: vi.fn(async () => undefined),
+      updateSession: vi.fn((_runtimeId, updater) => {
+        currentState = updater(currentState)
+        $sessionStates.set({ [RUNTIME_SESSION_ID]: currentState })
+
+        return currentState
+      })
+    })
+    requestGatewayMock.mockResolvedValue({})
+  })
+
+  afterEach(() => {
+    $sessionStates.set({})
+    $sessionTiles.set([])
+    requestGatewayMock.mockReset()
+    vi.restoreAllMocks()
+  })
+
+  it.each(rewriteCases)('clears persisted transcript provenance before tile $name rewrites history', async entry => {
+    const { result } = renderTileActions()
+
+    await act(async () => entry.invoke(result.current))
+
+    expect(requestGatewayMock).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    expect(currentState.transcriptAuthorityEpoch).toBe(1)
+    expect(currentState.transcriptProvenance).toBeUndefined()
   })
 })

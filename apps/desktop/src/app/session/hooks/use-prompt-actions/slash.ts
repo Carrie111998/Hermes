@@ -60,6 +60,7 @@ import type {
   SessionTitleResponse,
   SlashExecResponse
 } from '../../../types'
+import { invalidatePersistedDisplayTranscriptAuthority } from '../use-session-actions/transcript-provenance'
 
 import { resolveTargetSessionId } from './resolve-target-session'
 import {
@@ -582,11 +583,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             if (Array.isArray(result?.messages)) {
               updateSessionState(
                 sessionId,
-                state => ({
-                  ...state,
-                  messages: toChatMessages(result.messages!),
-                  transcriptProvenance: undefined
-                }),
+                state =>
+                  invalidatePersistedDisplayTranscriptAuthority({
+                    ...state,
+                    messages: toChatMessages(result.messages!)
+                  }),
                 storedSessionId
               )
             }

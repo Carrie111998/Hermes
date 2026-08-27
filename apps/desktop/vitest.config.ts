@@ -1,6 +1,9 @@
 import type { TestProjectConfiguration } from 'vitest/config'
 import { defineConfig } from 'vitest/config'
 
+const uiColdStartLimits =
+  process.platform === 'win32' ? { maxWorkers: 4, testTimeout: 30_000 } : { testTimeout: 15_000 }
+
 const reactUi: TestProjectConfiguration = {
   extends: './vite.config.ts',
   test: {
@@ -13,9 +16,9 @@ const reactUi: TestProjectConfiguration = {
     // On Windows the larger renderer graphs can exceed 15s cold, and Vitest's
     // default all-core fan-out (32 workers on common desktops) turns that into
     // transform starvation. Bound parallelism and leave enough cold-start
-    // headroom without disabling the timeout for genuinely hung tests.
-    maxWorkers: 4,
-    testTimeout: 30_000
+    // headroom without slowing other platforms or disabling the timeout for
+    // genuinely hung tests.
+    ...uiColdStartLimits
   }
 }
 

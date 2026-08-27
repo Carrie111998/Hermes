@@ -182,6 +182,7 @@ export interface PersistedDisplayTranscriptProvenance {
 
 export interface ClientSessionState {
   storedSessionId: string | null
+  transcriptAuthorityEpoch?: number
   transcriptProvenance?: PersistedDisplayTranscriptProvenance
   messages: ChatMessage[]
   branch: string

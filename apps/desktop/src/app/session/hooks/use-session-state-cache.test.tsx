@@ -1,4 +1,4 @@
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { type MutableRefObject, useLayoutEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -110,6 +110,7 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
 
     expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')).toMatchObject({
       storedSessionId: 'stored-A-next',
+      transcriptAuthorityEpoch: 1,
       transcriptProvenance: undefined
     })
   })
@@ -484,6 +485,40 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
 
     expect($messages.get().map(message => message.id)).toEqual(['user-b', 'assistant-b'])
     expect($messages.get().some(message => message.error === 'Out of funds')).toBe(false)
+  })
+
+  it('retains full cache state while the transcript view gate suppresses liveness and live deltas', async () => {
+    $messages.set([])
+    let cache!: Cache
+    render(<ViewHarness activeSessionId="thread-A" onReady={value => (cache = value)} />)
+
+    const transcript = [userMessage('user-a', 'proven only after refresh')]
+    const release = cache.holdSessionTranscriptView('thread-A')
+
+    act(() => {
+      cache.updateSessionState('thread-A', state => ({ ...state, busy: false, messages: transcript }), 'stored-A')
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('thread-A')?.messages).toEqual(transcript)
+    expect($messages.get()).toEqual([])
+
+    act(() => {
+      cache.updateSessionState('thread-A', state => ({
+        ...state,
+        busy: true,
+        messages: [...state.messages, assistantText('assistant-live', 'live delta')]
+      }))
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('thread-A')?.messages).toHaveLength(2)
+    expect($messages.get()).toEqual([])
+
+    act(() => {
+      release()
+      cache.syncSessionStateToView('thread-A', cache.sessionStateByRuntimeIdRef.current.get('thread-A')!)
+    })
+
+    await waitFor(() => expect($messages.get().map(message => message.id)).toEqual(['user-a', 'assistant-live']))
   })
 
   it('still preserves a same-session local error a heartbeat dropped', () => {

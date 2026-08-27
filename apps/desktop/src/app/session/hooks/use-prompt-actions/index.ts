@@ -53,6 +53,7 @@ import type {
   ImageAttachResponse,
   SessionRedirectResponse
 } from '../../../types'
+import { invalidatePersistedDisplayTranscriptAuthority } from '../use-session-actions/transcript-provenance'
 
 import {
   appendMidTurnUserMessage,
@@ -916,7 +917,9 @@ export function usePromptActions({
       }
 
       clearNotifications()
-      updateSessionState(sessionId, state => applyReloadOptimistic(state, plan))
+      updateSessionState(sessionId, state =>
+        invalidatePersistedDisplayTranscriptAuthority(applyReloadOptimistic(state, plan))
+      )
 
       try {
         const survivorRowIds = await submitRewindPrompt(
@@ -985,7 +988,9 @@ export function usePromptActions({
       setMutableRef(busyRef, true)
       setBusy(true)
       setAwaitingResponse(true)
-      updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
+      updateSessionState(sessionId, state =>
+        invalidatePersistedDisplayTranscriptAuthority(applyRewindOptimistic(state, plan.sourceIndex))
+      )
 
       try {
         const survivorRowIds = await submitRewindPrompt(
@@ -1052,7 +1057,11 @@ export function usePromptActions({
       setMutableRef(busyRef, true)
       setBusy(true)
       setAwaitingResponse(true)
-      updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
+      updateSessionState(sessionId, state =>
+        invalidatePersistedDisplayTranscriptAuthority(
+          applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage)
+        )
+      )
 
       const isStaleTargetError = (err: unknown) =>
         /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
