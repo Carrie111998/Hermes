@@ -119,6 +119,41 @@ def _spawn_serve(port: int, tmp_path: Path) -> subprocess.Popen:
     )
 
 
+def _spawn_serve_separate_streams(port: int, tmp_path: Path) -> subprocess.Popen:
+    """Like ``_spawn_serve`` but keeps stdout and stderr separate.
+
+    The desktop spawn's ``waitForDashboardPort`` reads *only* child stdout
+    for the ``HERMES_BACKEND_READY``/``HERMES_DASHBOARD_READY`` sentinel.
+    Merging the streams (as ``_spawn_serve`` does with
+    ``stderr=subprocess.STDOUT``) hides regressions where the sentinel is
+    printed to stderr instead — exactly what #96282's stdout redirect caused.
+    """
+    home = tmp_path / "hermes_home"
+    home.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    env.update(
+        HERMES_HOME=str(home),
+        HERMES_SERVE_HEADLESS="1",
+        PYTHONUNBUFFERED="1",
+    )
+    for k in ("HERMES_DESKTOP", "HERMES_PARENT_PID", "HERMES_PARENT_START_MARKER",
+              "HERMES_PARENT_NONCE"):
+        env.pop(k, None)
+    code = (
+        "from hermes_cli.web_server import start_server\n"
+        f"start_server(host='127.0.0.1', port={port}, open_browser=False, "
+        "headless=True)\n"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def _read_until(proc: subprocess.Popen, token: str, timeout: float = 120.0):
     """Collect stdout lines until ``token`` appears, process exits, or timeout."""
     lines: list[str] = []
@@ -195,6 +230,35 @@ def test_ephemeral_port_zero_unaffected(tmp_path):
         announced = int(ready_line.strip().rsplit("port=", 1)[1])
         assert announced > 0
         assert "BACKEND_PORT_IN_USE" not in out
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_ready_sentinel_on_stdout_for_desktop(tmp_path):
+    """#96282 regression: READY sentinel must land on *stdout*.
+
+    The Electron desktop spawn watches only child stdout for the port
+    announcement. A serve-path stdout redirect (``tui_gateway.server``
+    mutating ``sys.stdout`` at import time) pushed the sentinel to stderr,
+    so a healthy backend was SIGTERMed after the 90s desktop timeout. With
+    streams kept separate, this test fails if the sentinel ever stops
+    appearing on stdout again.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    proc = _spawn_serve_separate_streams(port, tmp_path)
+    try:
+        ready, out_lines = _read_until(proc, "HERMES_BACKEND_READY")
+        stdout_text = "".join(out_lines)
+        assert ready, f"no READY sentinel on stdout; stdout:\n{stdout_text}"
+        assert f"HERMES_BACKEND_READY port={port}" in stdout_text
     finally:
         proc.terminate()
         try:

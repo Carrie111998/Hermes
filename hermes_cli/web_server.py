@@ -19889,6 +19889,15 @@ def start_server(
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
             print(f"{ready_token} port={actual_port}", flush=True)
+            # Desktop spawn listens on stdout for this sentinel; a serve-path
+            # stdout redirect can push it to stderr, so also write it to the
+            # real fd 1 (sys.__stdout__) to guarantee the Electron handshake.
+            try:
+                import sys as _sys
+                _sys.__stdout__.write(f"{ready_token} port={actual_port}\n")
+                _sys.__stdout__.flush()
+            except Exception:
+                pass
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
