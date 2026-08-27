@@ -155,6 +155,12 @@ export async function requestModelOptions({
       params.explicit_only = true
     }
 
+    const profileKey = (profile ?? '').trim()
+
+    if (profileKey) {
+      params.profile = profileKey
+    }
+
     let gatewayError: unknown
     let gatewayOptions: ModelOptionsResponse | undefined
 

@@ -119,6 +119,19 @@ describe('requestModelOptions', () => {
     expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true })
   })
 
+  it('passes the catalog owner profile through the shared gateway RPC', async () => {
+    const gateway = {
+      request: vi.fn(() => Promise.resolve(globalOptions))
+    }
+
+    await requestModelOptions({ gateway: gateway as never, profile: 'fred-work' })
+
+    expect(gateway.request).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      profile: 'fred-work'
+    })
+  })
+
   it('falls back to REST when no gateway is connected', async () => {
     await requestModelOptions({ refresh: true })
 

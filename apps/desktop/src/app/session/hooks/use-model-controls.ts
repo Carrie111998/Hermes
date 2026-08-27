@@ -111,6 +111,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       }
 
       const profileRefreshEpoch = profileRefreshEpochRef.current
+      const profile = $activeGatewayProfile.get()
 
       try {
         if ($activeSessionId.get()) {
@@ -142,7 +143,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         // that lands while getGlobalModelInfo is in flight wins over this older
         // default — value comparisons alone miss re-selecting the same row.
         const selectionGeneration = getComposerSelectionGeneration()
-        const result = await getGlobalModelInfo()
+        const result = await getGlobalModelInfo(profile)
 
         if (
           profileRefreshEpochRef.current !== profileRefreshEpoch ||

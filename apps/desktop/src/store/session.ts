@@ -5,7 +5,7 @@ import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
+import { activeConnectionScopeSuffix, connectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
 import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
@@ -21,13 +21,18 @@ const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 // The composer's model/effort/fast is sticky UI state, NOT the profile default
 // (that lives in Settings → Model). Persisting it in localStorage makes a pick
 // follow across Cmd+N and app restarts instead of snapping back to the default.
-// It's deliberately global (not per-profile): a profile switch force-reseeds to
-// that profile's default, while within a profile new chats keep your last pick.
+// Model/provider/source are scoped to the remote (connection, profile) owner so
+// a provider authenticated on one profile cannot contaminate another profile's
+// session.create. Local/single-backend users retain the historical bare keys.
 const COMPOSER_MODEL_KEY = 'hermes.desktop.composer.model'
 const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_MODEL_SOURCE_KEY = 'hermes.desktop.composer.model-source'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
+
+function composerSelectionKey(base: string, connection: HermesConnection | null = $connection.get()): string {
+  return `${base}${connectionScopeSuffix(connection)}`
+}
 
 // The last chat the user had open, so a relaunch lands back on it instead of an
 // empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
@@ -908,8 +913,8 @@ export function getSessionOwnerHint(
 // clears it and resets the retry counter. Null whenever the active route has a
 // healthy, in-flight, or still-auto-retrying resume.
 export const $resumeExhaustedSessionId = atom<string | null>(null)
-export const $currentModel = atom(storedString(COMPOSER_MODEL_KEY) ?? '')
-export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
+export const $currentModel = atom(storedString(composerSelectionKey(COMPOSER_MODEL_KEY)) ?? '')
+export const $currentProvider = atom(storedString(composerSelectionKey(COMPOSER_PROVIDER_KEY)) ?? '')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
@@ -966,6 +971,7 @@ export const $modelPickerOpen = atom(false)
 export const $sessionPickerOpen = atom(false)
 
 export const setConnection = (next: Updater<HermesConnection | null>) => {
+  const previousComposerScope = connectionScopeSuffix($connection.get())
   updateAtom($connection, next)
   // Repoint connection-scoped persistence (pins, manual session order,
   // remembered navigation) at the new backend's storage scope before any
@@ -973,6 +979,12 @@ export const setConnection = (next: Updater<HermesConnection | null>) => {
   // keeps the current scope.
   rescopeConnectionScopedStores($connection.get())
   syncCronModelImpactConnection($connection.get())
+
+  if (connectionScopeSuffix($connection.get()) !== previousComposerScope) {
+    $currentModel.set(storedString(composerSelectionKey(COMPOSER_MODEL_KEY)) ?? '')
+    $currentProvider.set(storedString(composerSelectionKey(COMPOSER_PROVIDER_KEY)) ?? '')
+    $currentModelSource.set(getCurrentModelSource())
+  }
 }
 
 export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($gatewayState, next)
@@ -1097,16 +1109,16 @@ export const setAwaitingResponse = (next: Updater<boolean>) => updateAtom($await
 
 export const setCurrentModel = (next: Updater<string>) => {
   updateAtom($currentModel, next)
-  persistString(COMPOSER_MODEL_KEY, $currentModel.get() || null)
+  persistString(composerSelectionKey(COMPOSER_MODEL_KEY), $currentModel.get() || null)
 }
 
 export const setCurrentProvider = (next: Updater<string>) => {
   updateAtom($currentProvider, next)
-  persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
+  persistString(composerSelectionKey(COMPOSER_PROVIDER_KEY), $currentProvider.get() || null)
 }
 
 export const getCurrentModelSource = (): ComposerModelSource => {
-  const source = storedString(COMPOSER_MODEL_SOURCE_KEY)
+  const source = storedString(composerSelectionKey(COMPOSER_MODEL_SOURCE_KEY))
 
   return source === 'default' || source === 'manual' ? source : ''
 }
@@ -1117,7 +1129,7 @@ export const getCurrentModelSource = (): ComposerModelSource => {
 export const $currentModelSource = atom<ComposerModelSource>(getCurrentModelSource())
 
 export const setCurrentModelSource = (source: ComposerModelSource) => {
-  persistString(COMPOSER_MODEL_SOURCE_KEY, source || null)
+  persistString(composerSelectionKey(COMPOSER_MODEL_SOURCE_KEY), source || null)
   $currentModelSource.set(source)
 }
 

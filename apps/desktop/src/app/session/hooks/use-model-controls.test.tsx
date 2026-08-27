@@ -491,6 +491,23 @@ describe('useModelControls', () => {
     expect($currentModel.get()).toBe('openai/gpt-5.5')
   })
 
+  it('reads a forced profile reseed from that concrete profile', async () => {
+    $activeGatewayProfile.set('fred-work')
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'local/model', provider: 'custom:local' })
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient: new QueryClient(),
+        requestGateway: vi.fn()
+      })
+    )
+
+    await result.current.refreshCurrentModel(true)
+
+    expect(getGlobalModelInfo).toHaveBeenCalledWith('fred-work')
+    expect($currentProvider.get()).toBe('custom:local')
+  })
+
   it('reseeds a sticky manual pick that was removed from the catalog', async () => {
     vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai-codex' })
 

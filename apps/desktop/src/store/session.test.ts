@@ -22,6 +22,8 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
+  $currentModel,
+  $currentProvider,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
@@ -43,8 +45,12 @@ import {
   resolveComposerSessionKey,
   sessionBelongsToProfile,
   sessionPinId,
+  setConnection,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentProvider,
   setRememberedRoute,
   setRememberedSessionId,
   setSelectedStoredSessionId,
@@ -62,6 +68,44 @@ import {
 } from './session-states'
 
 const session = (over: Partial<SessionInfo>): SessionInfo => makeSessionInfo({ id: 'live', ...over })
+
+describe('composer model persistence scope', () => {
+  const local = { baseUrl: '', connectionId: 'local', mode: 'local' } as never
+
+  beforeEach(() => {
+    window.localStorage.clear()
+    setConnection(local)
+    setCurrentModel('')
+    setCurrentProvider('')
+    setCurrentModelSource('')
+  })
+
+  afterEach(() => {
+    setConnection(local)
+    window.localStorage.clear()
+  })
+
+  it('keeps manual model selections isolated by remote connection and profile', () => {
+    const remote = (profile: string) =>
+      ({ baseUrl: 'https://aibox.example', connectionId: 'aibox', mode: 'remote', profile }) as never
+
+    setConnection(remote('fred'))
+    setCurrentModel('grok-4')
+    setCurrentProvider('xai-oauth')
+    setCurrentModelSource('manual')
+
+    setConnection(remote('fred-work'))
+    expect($currentModel.get()).toBe('')
+    expect($currentProvider.get()).toBe('')
+
+    setCurrentModel('local/model')
+    setCurrentProvider('custom:local')
+    setConnection(remote('fred'))
+
+    expect($currentModel.get()).toBe('grok-4')
+    expect($currentProvider.get()).toBe('xai-oauth')
+  })
+})
 
 describe('session owner hints', () => {
   afterEach(() => {
