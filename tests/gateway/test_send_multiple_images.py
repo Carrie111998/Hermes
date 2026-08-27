@@ -14,7 +14,6 @@ Signal's native implementation is covered by test_signal.py.
 
 import asyncio
 import sys
-import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -158,7 +157,7 @@ class TestDiscordMultiImage:
 
 
     def test_url_batch_follows_safe_redirect_location_header(self, adapter, monkeypatch):
-        """Redirect handling preserves aiohttp's case-insensitive Location behavior."""
+        """Redirect handling preserves case-insensitive Location behavior."""
         import plugins.platforms.discord.adapter as discord_adapter
 
         public_url = "https://cdn.example.test/image.png"
@@ -166,7 +165,7 @@ class TestDiscordMultiImage:
         requested_urls = []
 
         class RedirectResponse:
-            status = 302
+            status_code = 302
             headers = {"Location": redirected_url}
 
             async def __aenter__(self):
@@ -175,11 +174,13 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def read(self):
+            async def aiter_bytes(self):
+                if False:
+                    yield b""
                 raise AssertionError("redirect responses must not be read")
 
         class ImageResponse:
-            status = 200
+            status_code = 200
             headers = {"Content-Type": "image/png"}
 
             async def __aenter__(self):
@@ -188,27 +189,28 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def read(self):
-                return b"\x89PNG"
+            async def aiter_bytes(self):
+                yield b"\x89PNG"
 
-        class FakeSession:
-            def get(self, url, **kwargs):
-                assert kwargs.get("allow_redirects") is False
+        class FakeClient:
+            def stream(self, method, url, **kwargs):
+                assert method == "GET"
+                assert kwargs.get("follow_redirects") is False
                 requested_urls.append(url)
                 if url == public_url:
                     return RedirectResponse()
                 assert url == redirected_url
                 return ImageResponse()
 
-            async def close(self):
+            async def aclose(self):
                 return None
 
-        fake_aiohttp = types.SimpleNamespace(
-            ClientSession=lambda **kwargs: FakeSession(),
-            ClientTimeout=lambda **kwargs: kwargs,
-        )
-        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
         monkeypatch.setattr(discord_adapter, "is_safe_url", lambda url: True)
+        monkeypatch.setattr(
+            discord_adapter,
+            "_create_discord_image_http_client",
+            lambda _proxy: FakeClient(),
+        )
 
         mock_channel = MagicMock()
         mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
@@ -227,7 +229,7 @@ class TestDiscordMultiImage:
         private_url = "http://169.254.169.254/latest/meta-data/"
 
         class FakeResponse:
-            status = 302
+            status_code = 302
             headers = {"Location": private_url}
 
             async def __aenter__(self):
@@ -236,29 +238,32 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def read(self):
-                return b"metadata-secret"
+            async def aiter_bytes(self):
+                if False:
+                    yield b""
+                raise AssertionError("redirect responses must not be read")
 
-        class FakeSession:
+        class FakeClient:
             async def __aenter__(self):
                 return self
 
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            def get(self, url, **kwargs):
-                assert kwargs.get("allow_redirects") is False
+            def stream(self, method, url, **kwargs):
+                assert method == "GET"
+                assert kwargs.get("follow_redirects") is False
                 return FakeResponse()
 
-        fake_aiohttp = types.SimpleNamespace(
-            ClientSession=lambda **kwargs: FakeSession(),
-            ClientTimeout=lambda **kwargs: kwargs,
-        )
-        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
         monkeypatch.setattr(
             discord_adapter,
             "is_safe_url",
             lambda url: not str(url).startswith("http://169.254.169.254"),
+        )
+        monkeypatch.setattr(
+            discord_adapter,
+            "_create_discord_image_http_client",
+            lambda _proxy: FakeClient(),
         )
         adapter._is_forum_parent = MagicMock(return_value=False)
         mock_channel = MagicMock()
@@ -404,5 +409,3 @@ class TestEmailMultiImage:
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
-
-

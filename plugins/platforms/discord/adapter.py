@@ -172,11 +172,11 @@ from gateway.platforms.base import (
     utf16_len,
     validate_inbound_media_size,
 )
-from tools.url_safety import is_safe_url
+from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
 
 async def _read_url_image_with_redirect_guard(
-    session: Any,
+    client: Any,
     url: str,
     *,
     timeout: Any,
@@ -188,15 +188,16 @@ async def _read_url_image_with_redirect_guard(
         if not is_safe_url(current_url):
             raise ValueError("Blocked unsafe image URL redirect")
 
-        async with session.get(
+        async with client.stream(
+            "GET",
             current_url,
             timeout=timeout,
-            allow_redirects=False,
+            follow_redirects=False,
             **request_kwargs,
         ) as resp:
             raw_headers = getattr(resp, "headers", {}) or {}
             headers = {str(key).lower(): value for key, value in dict(raw_headers).items()}
-            status = int(getattr(resp, "status", 0))
+            status = int(getattr(resp, "status_code", getattr(resp, "status", 0)))
             if status in _DISCORD_IMAGE_REDIRECT_STATUSES:
                 location = headers.get("location")
                 if not location:
@@ -212,6 +213,21 @@ async def _read_url_image_with_redirect_guard(
             ), headers
 
     raise ValueError("Too many image URL redirects")
+
+
+def _create_discord_image_http_client(proxy_url: Optional[str] = None) -> Any:
+    """Create the SSRF-safe client used for outbound Discord image fetches."""
+    client_kwargs: Dict[str, Any] = {
+        "timeout": 30.0,
+        "follow_redirects": False,
+        # ``resolve_proxy_url`` explicitly applies DISCORD_PROXY, generic
+        # proxy variables, and the macOS system proxy.  Avoid httpx selecting
+        # a second proxy policy from the environment behind its back.
+        "trust_env": False,
+    }
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    return create_ssrf_safe_async_client(**client_kwargs)
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -4085,7 +4101,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             files: List[Any] = []
             captions: List[str] = []
-            aiohttp_session = None
+            image_http_client = None
             try:
                 for image_url, alt_text in chunk:
                     if alt_text:
@@ -4102,17 +4118,15 @@ class DiscordAdapter(BasePlatformAdapter):
                             continue
                         # Download to BytesIO so it renders inline
                         try:
-                            import aiohttp as _aiohttp
-                            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-                            _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-                            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-                            if aiohttp_session is None:
-                                aiohttp_session = _aiohttp.ClientSession(**_sess_kw)
+                            from gateway.platforms.base import resolve_proxy_url
+                            if image_http_client is None:
+                                _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+                                image_http_client = _create_discord_image_http_client(_proxy)
                             status, data, headers = await _read_url_image_with_redirect_guard(
-                                aiohttp_session,
+                                image_http_client,
                                 image_url,
-                                timeout=_aiohttp.ClientTimeout(total=30),
-                                request_kwargs=_req_kw,
+                                timeout=30.0,
+                                request_kwargs={},
                             )
                             if status != 200:
                                 logger.warning(
@@ -4159,9 +4173,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
             finally:
-                if aiohttp_session is not None:
+                if image_http_client is not None:
                     try:
-                        await aiohttp_session.close()
+                        await image_http_client.aclose()
                     except Exception:
                         pass
 
@@ -5415,8 +5429,6 @@ class DiscordAdapter(BasePlatformAdapter):
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
         try:
-            import aiohttp
-
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -5425,15 +5437,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
-            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+            from gateway.platforms.base import resolve_proxy_url
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-            async with aiohttp.ClientSession(**_sess_kw) as session:
+            async with _create_discord_image_http_client(_proxy) as client:
                 status, image_data, headers = await _read_url_image_with_redirect_guard(
-                    session,
+                    client,
                     image_url,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    request_kwargs=_req_kw,
+                    timeout=30.0,
+                    request_kwargs={},
                 )
                 if status != 200:
                     raise Exception(f"Failed to download image: HTTP {status}")
@@ -5466,7 +5477,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except ImportError:
             logger.warning(
-                "[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp",
+                "[%s] httpx not installed, falling back to URL. Run: pip install httpx",
                 self.name,
                 exc_info=True,
             )
@@ -5497,8 +5508,6 @@ class DiscordAdapter(BasePlatformAdapter):
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
 
         try:
-            import aiohttp
-
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -5507,15 +5516,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Download the GIF and send as a Discord file attachment
             # (Discord renders .gif attachments as auto-playing animations inline)
-            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+            from gateway.platforms.base import resolve_proxy_url
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-            async with aiohttp.ClientSession(**_sess_kw) as session:
+            async with _create_discord_image_http_client(_proxy) as client:
                 status, animation_data, _headers = await _read_url_image_with_redirect_guard(
-                    session,
+                    client,
                     animation_url,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    request_kwargs=_req_kw,
+                    timeout=30.0,
+                    request_kwargs={},
                 )
                 if status != 200:
                     raise Exception(f"Failed to download animation: HTTP {status}")
@@ -5538,7 +5546,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except ImportError:
             logger.warning(
-                "[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp",
+                "[%s] httpx not installed, falling back to URL. Run: pip install httpx",
                 self.name,
                 exc_info=True,
             )
@@ -9878,7 +9886,7 @@ def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
 
 
 async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
-    """Read an aiohttp response body with an aggregate byte limit."""
+    """Read an httpx streaming response body with an aggregate byte limit."""
     headers = getattr(resp, "headers", {}) or {}
     declared_length = None
     for header_name in ("Content-Length", "content-length"):
@@ -9894,19 +9902,21 @@ async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
                 pass
             break
 
-    def close_response() -> None:
-        for method_name in ("close", "release"):
+    async def close_response() -> None:
+        for method_name in ("aclose", "close", "release"):
             method = getattr(resp, method_name, None)
             if not callable(method):
                 continue
             try:
-                method()
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
-                pass
+                continue
             break
 
     if declared_length is not None and declared_length > limit_bytes:
-        close_response()
+        await close_response()
         raise ValueError(
             f"Response body exceeded {limit_bytes} bytes "
             f"({declared_length} bytes declared)"
@@ -9914,13 +9924,10 @@ async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
 
     chunks = []
     total_bytes = 0
-    while True:
-        chunk = await resp.content.read(limit_bytes - total_bytes + 1)
-        if not chunk:
-            break
+    async for chunk in resp.aiter_bytes():
         total_bytes += len(chunk)
         if total_bytes > limit_bytes:
-            close_response()
+            await close_response()
             raise ValueError(
                 f"Response body exceeded {limit_bytes} bytes "
                 f"({total_bytes} bytes read)"

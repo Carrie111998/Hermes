@@ -6,6 +6,7 @@ in the Discord adapter that were left unbounded.
 """
 
 import asyncio
+import socket
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -13,13 +14,18 @@ import pytest
 
 import plugins.platforms.discord.adapter as discord_adapter
 from plugins.platforms.discord.adapter import (
+    _create_discord_image_http_client,
     _read_response_bytes_bounded,
     _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
+)
+from tools.url_safety import (
+    SSRFConnectionBlocked,
+    _reset_allow_private_cache,
 )
 
 
 class _CaseInsensitiveHeaders(dict[str, str]):
-    """Small aiohttp ``CIMultiDict``-like header mapping for the fake response."""
+    """Small case-insensitive header mapping for the fake response."""
 
     def __init__(self, values: dict[str, str]):
         super().__init__((str(key).lower(), value) for key, value in values.items())
@@ -29,7 +35,7 @@ class _CaseInsensitiveHeaders(dict[str, str]):
 
 
 class _FakeResponseContent:
-    """Deterministic stream that returns one available chunk per read."""
+    """Deterministic byte source that returns one available chunk per read."""
 
     def __init__(self, chunks: tuple[bytes, ...]):
         self._chunks = chunks
@@ -72,8 +78,12 @@ class _FakeResponse:
     async def __aexit__(self, *_args: object) -> bool:
         return False
 
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        async for chunk in self.content.iter_chunked(64 * 1024):
+            yield chunk
+
     async def read(self) -> bytes:
-        """Model aiohttp's unbounded ``ClientResponse.read()`` behavior."""
+        """Model an unbounded response read for the regression assertion."""
         self.read_called = True
         chunks = []
         async for chunk in self.content.iter_chunked(64 * 1024):
@@ -94,6 +104,10 @@ class _ReleaseOnlyResponse:
         self.content = _FakeResponseContent(chunks)
         self.release_called = 0
 
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        async for chunk in self.content.iter_chunked(64 * 1024):
+            yield chunk
+
     def release(self) -> None:
         self.release_called += 1
 
@@ -103,7 +117,8 @@ class _FakeSession:
         self.response = response
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def get(self, url: str, **kwargs: Any) -> _FakeResponse:
+    def stream(self, method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        assert method == "GET"
         self.calls.append((url, kwargs))
         return self.response
 
@@ -126,8 +141,82 @@ def _read_url_image(response: _FakeResponse) -> tuple[int, bytes, dict[str, str]
     requested_url, request_kwargs = session.calls[0]
     assert requested_url == _IMAGE_URL
     assert request_kwargs["timeout"] is timeout
-    assert request_kwargs["allow_redirects"] is False
+    assert request_kwargs["follow_redirects"] is False
     return result
+
+
+@pytest.mark.asyncio
+async def test_url_fetch_blocks_dns_rebinding_before_raw_connect(monkeypatch):
+    """The Discord fetch path must validate the IP immediately before connect."""
+    from httpcore._backends.auto import AutoBackend
+
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(proxy_var, raising=False)
+    monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+    _reset_allow_private_cache()
+
+    resolution_results: list[str] = []
+
+    def rebinding_getaddrinfo(host, port, *args, **kwargs):
+        del host, args, kwargs
+        ip = "93.184.216.34" if not resolution_results else "10.0.0.8"
+        resolution_results.append(ip)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))]
+
+    raw_connect_attempts: list[tuple[str, int]] = []
+
+    async def raw_connect_tcp(
+        self,
+        host,
+        port,
+        timeout=None,
+        local_address=None,
+        socket_options=None,
+    ):
+        del self, timeout, local_address, socket_options
+        raw_connect_attempts.append((host, port))
+        raise AssertionError("raw network backend must not be called")
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+    monkeypatch.setattr(AutoBackend, "connect_tcp", raw_connect_tcp)
+
+    async with discord_adapter._create_discord_image_http_client() as client:
+        with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+            await discord_adapter._read_url_image_with_redirect_guard(
+                client,
+                _IMAGE_URL,
+                timeout=1.0,
+                request_kwargs={},
+            )
+
+    assert resolution_results == ["93.184.216.34", "10.0.0.8"]
+    assert raw_connect_attempts == []
+
+
+def test_image_client_passes_explicit_proxy_to_ssrf_safe_client(monkeypatch):
+    captured_kwargs: dict[str, Any] = {}
+    sentinel_client = object()
+
+    def fake_create(**kwargs: Any) -> object:
+        captured_kwargs.update(kwargs)
+        return sentinel_client
+
+    monkeypatch.setattr(discord_adapter, "create_ssrf_safe_async_client", fake_create)
+
+    result = _create_discord_image_http_client("http://discord-proxy.test:8080")
+
+    assert result is sentinel_client
+    assert captured_kwargs["proxy"] == "http://discord-proxy.test:8080"
+    assert captured_kwargs["trust_env"] is False
+    assert captured_kwargs["follow_redirects"] is False
+    assert captured_kwargs["timeout"] == 30.0
 
 
 class TestReadResponseBytesBounded:
@@ -233,6 +322,29 @@ def test_multi_chunk_response_at_exact_limit_is_returned_intact(monkeypatch):
     assert response.content.consumed_chunks == 2
     assert response.read_called is False
     assert response.close_called == 0
+
+
+def test_redirect_guard_keeps_ten_redirect_limit_and_disables_auto_follow(monkeypatch):
+    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    response = _FakeResponse((b"must not be read",), {"Location": _IMAGE_URL})
+    response.status = 302
+    session = _FakeSession(response)
+
+    with pytest.raises(ValueError, match="Too many image URL redirects"):
+        asyncio.run(
+            discord_adapter._read_url_image_with_redirect_guard(
+                session,
+                _IMAGE_URL,
+                timeout=30.0,
+                request_kwargs={},
+            )
+        )
+
+    assert len(session.calls) == 11
+    assert all(
+        request_kwargs["follow_redirects"] is False
+        for _url, request_kwargs in session.calls
+    )
 
 
 class TestImageDownloadLimits:
