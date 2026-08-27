@@ -219,6 +219,12 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Internal, wire-INVISIBLE Telegram Business authorization proof. The
+    # plugin adapter sets this only after enabled-config, chat-scope, trigger,
+    # actor, and connection-id checks pass. It is deliberately omitted from
+    # ``to_dict``/``from_dict`` so persisted or relayed input cannot forge it.
+    authorized_via_telegram_business: bool = False
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -1103,9 +1109,12 @@ def build_session_key(
     multiplexing gateway passes a non-default profile.
 
     DM rules:
-      - Slack ``scope_id`` identifies the workspace before chat/user ids. Other
-        platforms retain their existing key format; in particular, Discord
-        guild scope is intentionally not added here as a compatibility change.
+      - Slack ``scope_id`` identifies the workspace before chat/user ids.
+        Telegram Business sources use a ``telegram-business:`` scope to isolate
+        delegated-inbox conversations from ordinary bot DMs and from another
+        connected Business account. Other platforms retain their existing key
+        format; in particular, Discord guild scope is intentionally not added
+        here as a compatibility change.
       - DMs include chat_id when present, so each private conversation is isolated.
       - thread_id further differentiates threaded DMs within the same DM chat.
       - Without chat_id, thread_id is used as a best-effort fallback.
@@ -1132,6 +1141,16 @@ def build_session_key(
         if source.platform == Platform.SLACK and source.scope_id
         else None
     )
+    telegram_scope = getattr(source, "scope_id", None)
+    telegram_business_scope_id = (
+        str(telegram_scope)
+        if (
+            source.platform == Platform.TELEGRAM
+            and telegram_scope
+            and str(telegram_scope).startswith("telegram-business:")
+        )
+        else None
+    )
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -1140,6 +1159,8 @@ def build_session_key(
         dm_parts = [ns, platform, "dm"]
         if slack_scope_id:
             dm_parts.append(slack_scope_id)
+        elif telegram_business_scope_id:
+            dm_parts.append(telegram_business_scope_id)
         if dm_chat_id:
             dm_parts.append(dm_chat_id)
             if source.thread_id:

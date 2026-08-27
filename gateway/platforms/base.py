@@ -131,7 +131,11 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
+def _thread_metadata_for_source(
+    source,
+    reply_to_message_id: str | None = None,
+    event_metadata: dict | None = None,
+) -> dict | None:
     """Build platform-aware thread metadata for adapter sends.
 
     Most platforms route threaded sends with a generic ``thread_id`` metadata
@@ -143,6 +147,27 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    # Telegram Business send-as-account is deliberately event-bound. Merely
+    # carrying a business_connection_id is not permission to impersonate the
+    # connected human/business account: the trusted inbound adapter must opt in
+    # explicitly, and its route must match the source's isolated scope. Async or
+    # synthetic sends that only retain SessionSource therefore use bot identity.
+    if _platform_name(getattr(source, "platform", None)) == "telegram":
+        business_connection_id = str(
+            (event_metadata or {}).get("business_connection_id") or ""
+        ).strip()
+        expected_scope = f"telegram-business:{business_connection_id}"
+        if (
+            (event_metadata or {}).get("allow_business_send_as_account") is True
+            and business_connection_id
+            and str(getattr(source, "scope_id", "") or "") == expected_scope
+        ):
+            metadata.update(
+                {
+                    "allow_business_send_as_account": True,
+                    "business_connection_id": business_connection_id,
+                }
+            )
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -155,9 +180,10 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         return None
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
         metadata["telegram_dm_topic_reply_fallback"] = True
-        tid = str(thread_id)
-        if tid and tid not in {"", "1"}:
-            metadata["direct_messages_topic_id"] = tid
+        if thread_id is not None:
+            tid = str(thread_id)
+            if tid and tid != "1":
+                metadata["direct_messages_topic_id"] = tid
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
@@ -6193,7 +6219,11 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        thread_meta = _thread_metadata_for_source(
+            event.source,
+            _reply_anchor_for_event(event),
+            event.metadata,
+        )
 
         try:
             response = await self._message_handler(event)
@@ -6335,7 +6365,11 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    _thread_meta = _thread_metadata_for_source(
+                        event.source,
+                        _reply_anchor_for_event(event),
+                        event.metadata,
+                    )
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
@@ -6387,7 +6421,9 @@ class BasePlatformAdapter(ABC):
                     )
                     try:
                         _thread_meta = _thread_metadata_for_source(
-                            event.source, _reply_anchor_for_event(event)
+                            event.source,
+                            _reply_anchor_for_event(event),
+                            event.metadata,
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
@@ -6510,7 +6546,11 @@ class BasePlatformAdapter(ABC):
         # Gated per-platform: when typing_indicator=False the refresh loop is
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
-        _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        _thread_metadata = _thread_metadata_for_source(
+            event.source,
+            _reply_anchor_for_event(event),
+            event.metadata,
+        )
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
@@ -7111,7 +7151,11 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _thread_metadata = _thread_metadata_for_source(
+                    event.source,
+                    _reply_anchor_for_event(event),
+                    event.metadata,
+                )
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(

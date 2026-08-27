@@ -1606,9 +1606,14 @@ class TelegramAdapter(BasePlatformAdapter):
         DM topic fallback sends while preserving the ``message_thread_id`` so
         the message still lands in the correct topic.
         """
+        business_kwargs = cls._business_kwargs(metadata)
+
+        def routed(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+            return {**kwargs, **business_kwargs}
+
         if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
             if reply_to_mode == "off":
-                return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
+                return routed({"message_thread_id": cls._message_thread_id_for_send(thread_id)})
             if reply_to_message_id is None:
                 reply_to_message_id = cls._metadata_reply_to_message_id(metadata)
             if reply_to_message_id is None:
@@ -1620,22 +1625,116 @@ class TelegramAdapter(BasePlatformAdapter):
                 # runs in.
                 thread_message_id = cls._message_thread_id_for_send(thread_id)
                 if thread_message_id is not None:
-                    return {"message_thread_id": thread_message_id}
+                    return routed({"message_thread_id": thread_message_id})
                 direct_topic_id = cls._metadata_direct_messages_topic_id(metadata)
                 if direct_topic_id is not None:
-                    return {
+                    return routed({
                         "message_thread_id": None,
                         "direct_messages_topic_id": int(direct_topic_id),
-                    }
-                return {}
-            return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
+                    })
+                return routed({})
+            return routed({"message_thread_id": cls._message_thread_id_for_send(thread_id)})
         direct_topic_id = cls._metadata_direct_messages_topic_id(metadata)
         if direct_topic_id is not None:
-            return {
+            return routed({
                 "message_thread_id": None,
                 "direct_messages_topic_id": int(direct_topic_id),
+            })
+        return routed({"message_thread_id": cls._message_thread_id_for_send(thread_id)})
+
+    @staticmethod
+    def _business_kwargs(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Return delegated-account routing only for an exact trusted opt-in."""
+        if (metadata or {}).get("allow_business_send_as_account") is not True:
+            return {}
+        connection_id = str((metadata or {}).get("business_connection_id") or "").strip()
+        return {"business_connection_id": connection_id} if connection_id else {}
+
+    def _business_config(self) -> Dict[str, Any]:
+        extra = getattr(self.config, "extra", None)
+        raw = extra.get("business", {}) if isinstance(extra, dict) else {}
+        return _normalize_business_config(raw)
+
+    def _business_trigger_text(self, message: Message) -> Optional[str]:
+        """Return customer text after an explicit configured trigger."""
+        text = (
+            getattr(message, "text", None)
+            or getattr(message, "caption", None)
+            or ""
+        ).strip()
+        if not text:
+            return None
+        for word in self._business_config()["trigger_words"]:
+            match = re.match(
+                rf"^{re.escape(word)}(?=$|[\s,.:;!?—–-])"
+                rf"[\s,.:;!?—–-]*(.*)$",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if match:
+                return match.group(1).strip()
+        return None
+
+    async def _handle_business_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Route explicitly-triggered Telegram Business customer messages.
+
+        Business traffic is disabled by default, isolated from ordinary bot
+        DMs by connection scope, denied gateway-control authority, and allowed
+        to send as the connected account only on the immediate trusted reply.
+        """
+        del context
+        cfg = self._business_config()
+        if not cfg["enabled"] or not cfg["trigger_words"]:
+            return
+        message = getattr(update, "business_message", None)
+        connection_id = str(
+            getattr(message, "business_connection_id", "") or ""
+        ).strip()
+        if message is None or not connection_id:
+            return
+        actor = getattr(message, "from_user", None)
+        sender_business_bot = getattr(message, "sender_business_bot", None)
+        if (
+            actor is None
+            or bool(getattr(actor, "is_bot", False))
+            or sender_business_bot is not None
+        ):
+            # Bot-authored Business updates are delivery echoes, never new
+            # customer input. Re-enqueueing them creates a reply loop.
+            return
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        if not chat_id or (cfg["allowed_chats"] and chat_id not in cfg["allowed_chats"]):
+            return
+        text = self._business_trigger_text(message)
+        if text is None:
+            return
+
+        event = self._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=getattr(update, "update_id", None),
+        )
+        event.text = text
+        event.source.scope_id = f"telegram-business:{connection_id}"
+        event.source.chat_type = "dm"
+        event.source.authorized_via_telegram_business = True
+        event.metadata = dict(event.metadata or {})
+        event.metadata.update(
+            {
+                "allow_business_send_as_account": cfg[
+                    "allow_business_send_as_account"
+                ],
+                "business_connection_id": connection_id,
             }
-        return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
+        )
+        # External customers can converse, but cannot invoke gateway lifecycle
+        # or administrative controls through the delegated inbox.
+        event.allow_gateway_control = False
+        self._enqueue_text_event(event)
 
     def _thread_kwargs_for_draft(
         self,
@@ -2363,6 +2462,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "message_id": int(message_id),
             "rich_message": self._rich_message_payload(content),
         }
+        payload.update(self._business_kwargs(metadata))
         # Edits target an existing message by chat_id + message_id. Topic
         # routing belongs only on send endpoints; forwarding message_thread_id
         # or direct_messages_topic_id makes Telegram reject this rich edit and
@@ -4439,6 +4539,14 @@ class TelegramAdapter(BasePlatformAdapter):
         the ``gateway_platform_event`` observer (group 99) in lockstep with the
         core handlers.
         """
+        business_filter = getattr(
+            getattr(filters, "UpdateType", None), "BUSINESS_MESSAGE", None
+        )
+        if business_filter is not None:
+            app.add_handler(TelegramMessageHandler(
+                business_filter,
+                self._handle_business_message,
+            ))
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message
@@ -5608,7 +5716,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                                 reply_to_id = None
                                 if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
-                                    thread_kwargs = {}
+                                    # Drop only the stale reply/topic route. Keep
+                                    # the trusted Business identity on the retry.
+                                    thread_kwargs = self._business_kwargs(metadata)
                                     effective_thread_id = None
                                 else:
                                     thread_kwargs = self._thread_kwargs_for_send(
@@ -5844,12 +5954,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # edit later.
             self._last_overflow_preview.pop(_preview_key, None)
 
+        business_kwargs = self._business_kwargs(metadata)
         try:
             if not finalize:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    **business_kwargs,
                 )
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
@@ -5862,6 +5974,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    **business_kwargs,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -5879,6 +5992,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=_plain,
+                    **business_kwargs,
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -5907,6 +6021,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=truncated,
+                    **business_kwargs,
                 )
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
@@ -5928,6 +6043,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=content,
+                        **business_kwargs,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -6022,6 +6138,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Step 1 — edit the existing message with the first chunk.
         first_chunk = chunks[0]
+        business_kwargs = self._business_kwargs(metadata)
         try:
             if finalize:
                 # Use format_message + parse_mode for the final chunk;
@@ -6035,6 +6152,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         message_id=int(message_id),
                         text=formatted,
                         parse_mode=ParseMode.MARKDOWN_V2,
+                        **business_kwargs,
                     )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
@@ -6047,12 +6165,14 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_id=int(message_id),
                             text=_strip_mdv2(first_chunk),
+                            **business_kwargs,
                         )
             else:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=first_chunk,
+                    **business_kwargs,
                 )
         except Exception as e:
             err_str = str(e).lower()
@@ -6114,7 +6234,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # topic fallback needs the anchor and topic id together;
                         # forum topics can still safely keep message_thread_id.
                         retry_thread_kwargs = (
-                            {}
+                            self._business_kwargs(metadata)
                             if metadata and metadata.get("telegram_dm_topic_reply_fallback")
                             else self._thread_kwargs_for_send(
                                 chat_id, thread_id, metadata, reply_to_message_id=None
@@ -6239,6 +6359,11 @@ class TelegramAdapter(BasePlatformAdapter):
         ``rich_message`` parameter; when that edit is rejected, the fallback
         formatter permanently turns tables into bullet lists.
         """
+        if self._business_kwargs(metadata):
+            # Bot API sendMessageDraft has no business_connection_id parameter.
+            # Business replies must use the edit-based stream path, whose send
+            # and edit endpoints preserve delegated-account identity.
+            return False
         if not self._bot or not hasattr(self._bot, "send_message_draft"):
             return False
         return (chat_type or "").lower() in {"dm", "private"}
@@ -6264,6 +6389,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+        if self._business_kwargs(metadata):
+            return SendResult(success=False, error="business_draft_unsupported")
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final
@@ -8640,6 +8767,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
+        business_kwargs = self._business_kwargs(metadata)
         try:
             _typing_thread = self._metadata_thread_id(metadata)
             _is_dm_topic = bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
@@ -8648,6 +8776,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=normalize_telegram_chat_id(chat_id),
                 action="typing",
                 message_thread_id=message_thread_id,
+                **business_kwargs,
             )
             self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         except Exception as e:
@@ -8659,6 +8788,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self._bot.send_chat_action(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         action="typing",
+                        **business_kwargs,
                     )
                     self._telegram_typing_cooldown_until.pop(str(chat_id), None)
                     return
@@ -11144,6 +11274,38 @@ def interactive_setup() -> None:
     _setup_mod._setup_telegram()
 
 
+def _normalize_business_config(raw: Any) -> Dict[str, Any]:
+    """Normalize opt-in Telegram Business routing configuration."""
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _items(value: Any) -> List[str]:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        return [
+            normalized
+            for item in values
+            if item is not None and (normalized := str(item).strip())
+        ]
+
+    enabled = raw.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        enabled = bool(enabled)
+    allow_send_as_account = raw.get("allow_business_send_as_account", False)
+    if isinstance(allow_send_as_account, str):
+        allow_send_as_account = allow_send_as_account.strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    else:
+        allow_send_as_account = bool(allow_send_as_account)
+    return {
+        "enabled": enabled,
+        "allow_business_send_as_account": allow_send_as_account,
+        "allowed_chats": _items(raw.get("allowed_chats", [])),
+        "trigger_words": _items(raw.get("trigger_words", [])),
+    }
+
+
 def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     """Translate config.yaml telegram: keys into TELEGRAM_* env vars and
     PlatformConfig.extra entries.
@@ -11155,6 +11317,9 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     """
     import json as _json
     extras: dict = {}
+    extras["business"] = _normalize_business_config(
+        telegram_cfg.get("business")
+    )
 
     # Under multiplex, a secondary profile's config loads inside its runtime
     # scope; its authorization gate values must NOT be written to the
