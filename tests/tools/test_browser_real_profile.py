@@ -222,6 +222,117 @@ class TestRealProfileCdpLaunch:
         assert not bt._cdp_on_data_dir("http://127.0.0.1:9999", str(tmp_path))
 
 
+class TestRealProfileCrossProfileScope:
+    """A multiplexed gateway must never hand one profile's real-profile
+    copy-browser session (real, signed-in cookies) to another profile.
+
+    _real_profile_cdp_cache and the agent-browser --session name it drives
+    are process-global, but browser_tool is shared across profiles' turns via
+    the hermes_home_key()/get_hermes_home_override() ContextVar (same
+    mechanism _get_cloud_provider already scopes by above in this file).
+    """
+
+    def _reset(self):
+        import tools.browser_tool as bt
+        bt._real_profile_cdp_cache.clear()
+
+    def _run_launch(self, tmp_path, cdp_url):
+        """Drive one full _real_profile_cdp() launch under the active profile
+        scope. Returns (cdp, err, launch_argv, session_names_seen)."""
+        import tools.browser_tool as bt
+        proc = Mock(returncode=0, stdout="", stderr="")
+        seen_sessions = []
+
+        def fake_get_cdp(session_name):
+            seen_sessions.append(session_name)
+            # 1st call is the pre-snapshot reuse probe (no live session yet);
+            # 2nd call is the post-launch discovery of the browser just started.
+            return None if len(seen_sessions) == 1 else cdp_url
+
+        captured = {}
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            return proc
+
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile",
+                   return_value=(str(tmp_path), None)), \
+             patch.object(bt, "_agent_browser_get_cdp", side_effect=fake_get_cdp), \
+             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "run", side_effect=fake_run):
+            cdp, err = bt._real_profile_cdp()
+        return cdp, err, captured.get("argv"), seen_sessions
+
+    def test_two_profiles_get_distinct_sessions_and_caches(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        self._reset()
+
+        token_a = set_hermes_home_override(str(tmp_path / "profile-a"))
+        try:
+            cdp_a, err_a, argv_a, sessions_a = self._run_launch(
+                tmp_path / "copy-a", "http://127.0.0.1:40001"
+            )
+        finally:
+            reset_hermes_home_override(token_a)
+        assert err_a is None
+        assert cdp_a == "http://127.0.0.1:40001"
+
+        token_b = set_hermes_home_override(str(tmp_path / "profile-b"))
+        try:
+            cdp_b, err_b, argv_b, sessions_b = self._run_launch(
+                tmp_path / "copy-b", "http://127.0.0.1:40002"
+            )
+        finally:
+            reset_hermes_home_override(token_b)
+        assert err_b is None
+        assert cdp_b == "http://127.0.0.1:40002"
+
+        import tools.browser_tool as bt
+
+        # Without profile scoping, the process-global cache holds a single
+        # "cdp" entry: profile B's write would silently overwrite (or, had
+        # _cdp_http_ready() reported it live, be served) profile A's cached
+        # endpoint. With scoping, both profiles' entries must coexist.
+        assert len(bt._real_profile_cdp_cache) == 2
+        assert cdp_a in bt._real_profile_cdp_cache.values()
+        assert cdp_b in bt._real_profile_cdp_cache.values()
+        assert cdp_a != cdp_b
+
+        # The --session name driving each copy-browser must differ per
+        # profile — a shared name means B's launch/close targets A's live,
+        # signed-in copy-browser session (agent-browser sessions are looked
+        # up by this name, external to our cache dict entirely).
+        assert "--session" in argv_a and "--session" in argv_b
+        session_arg_a = argv_a[argv_a.index("--session") + 1]
+        session_arg_b = argv_b[argv_b.index("--session") + 1]
+        assert session_arg_a != session_arg_b
+        assert sessions_a[0] == session_arg_a
+        assert sessions_b[0] == session_arg_b
+
+        self._reset()
+
+    def test_second_call_same_profile_reuses_cache(self, tmp_path):
+        """Sanity check: the fix must not break same-profile cache reuse."""
+        import tools.browser_tool as bt
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        self._reset()
+
+        token = set_hermes_home_override(str(tmp_path / "profile-single"))
+        try:
+            cdp1, err1, _, _ = self._run_launch(tmp_path / "copy", "http://127.0.0.1:40003")
+            assert err1 is None
+            with patch.object(bt, "_use_real_profile", return_value=True), \
+                 patch.object(bt, "_cdp_http_ready", return_value=True):
+                cdp2, err2 = bt._real_profile_cdp()
+        finally:
+            reset_hermes_home_override(token)
+        assert err2 is None
+        assert cdp2 == cdp1  # same profile, same call → cache hit, no relaunch
+        self._reset()
+
+
 class TestConsentConfigRead:
     """Unmocked config read: _use_real_profile against a real config.yaml."""
 
