@@ -913,7 +913,11 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
+  // mutexPath arrives already shell-quoted via expandRemotePath at the call
+  // site; wrapping it in shq() again stores literal quote characters in the
+  // path, so the remote python makedirs/flocks a bogus "$HOME/' tree instead
+  // of the real sidecar — a mutex that silently serializes nothing (#96188).
+  return `python3 -c ${shq(script)} ${mutexPath} ${shq(command)}`
 }
 
 /**
@@ -1108,8 +1112,12 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
       // ${var//pat/rep} is a bashism — this payload runs under plain sh (dash
       // on Ubuntu), which aborts the whole script on it with "Bad
       // substitution" AFTER the child was spawned, orphaning the backend and
-      // skipping the lockfile publication. Substitute with sed instead.
-      `lock_json=$(printf '%s' ${shq(metadata)} | sed "s/__PID__/\${child}/"); ` +
+      // skipping the lockfile publication. Substitute with sed instead, and
+      // replace the QUOTED placeholder ("__PID__") so the published record
+      // carries a real JSON number pid: readLockfile requires an integer
+      // (malformed-pid skew fails closed otherwise) and the reuse regex only
+      // matches "pid":<digits>.
+      `lock_json=$(printf '%s' ${shq(metadata)} | sed "s/\\"__PID__\\"/\${child}/"); ` +
       `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
       `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
       `echo "$child"`,
