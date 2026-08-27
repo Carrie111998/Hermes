@@ -159,7 +159,7 @@ class TestDiscordMultiImage:
 
     def test_url_batch_follows_safe_redirect_location_header(self, adapter, monkeypatch):
         """Redirect handling preserves case-insensitive Location behavior."""
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         public_url = "https://cdn.example.test/image.png"
         redirected_url = "https://assets.example.test/image.png"
@@ -206,11 +206,16 @@ class TestDiscordMultiImage:
             async def aclose(self):
                 return None
 
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: FakeClient(),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=MagicMock()),
         )
 
         mock_channel = MagicMock()
@@ -224,7 +229,7 @@ class TestDiscordMultiImage:
         mock_channel.send.assert_awaited_once()
 
     def test_send_image_blocks_private_redirect_before_send(self, adapter, monkeypatch):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_image_globals = DiscordAdapter.send_image.__globals__
 
         public_url = "https://cdn.example.test/image.png"
         private_url = "http://169.254.169.254/latest/meta-data/"
@@ -256,15 +261,20 @@ class TestDiscordMultiImage:
                 assert kwargs.get("follow_redirects") is False
                 return FakeResponse()
 
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_image_globals,
             "is_safe_url",
             lambda url: not str(url).startswith("http://169.254.169.254"),
         )
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_image_globals,
             "_create_discord_image_http_client",
             lambda _proxy: FakeClient(),
+        )
+        monkeypatch.setitem(
+            send_image_globals,
+            "discord",
+            SimpleNamespace(File=MagicMock()),
         )
         adapter._is_forum_parent = MagicMock(return_value=False)
         mock_channel = MagicMock()
@@ -289,7 +299,7 @@ class TestDiscordMultiImage:
     def test_url_batch_uses_image_magic_bytes_for_filename(
         self, adapter, monkeypatch, body, extension
     ):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         class ImageResponse:
             status_code = 200
@@ -320,13 +330,17 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(adapter.send_multiple_images("67890", [("https://cdn.example.test/asset.png", "")]))
 
@@ -336,7 +350,7 @@ class TestDiscordMultiImage:
     def test_url_batch_does_not_upload_invalid_body_to_forum_starter(
         self, adapter, monkeypatch
     ):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         class ImageResponse:
             status_code = 200
@@ -365,13 +379,17 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=True)
         adapter._forum_post_file = AsyncMock()
 
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(adapter.send_multiple_images("67890", [("https://cdn.example.test/asset.jpg", "")]))
 
@@ -382,7 +400,7 @@ class TestDiscordMultiImage:
         self, adapter, monkeypatch
     ):
         """The remote budget is shared by the 10-image chunks, not reset per chunk."""
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         body = b"GIF89a"
         urls = [f"https://cdn.example.test/{index}.gif" for index in range(11)]
@@ -430,19 +448,22 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             len(body) * 10,
-            raising=False,
         )
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(adapter.send_multiple_images("67890", [(url, "") for url in urls]))
 
@@ -461,7 +482,7 @@ class TestDiscordMultiImage:
     def test_url_batch_budget_counts_rejected_remote_bodies(
         self, adapter, monkeypatch, status, body, headers
     ):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         later_body = b"GIF89a"
         first_url = "https://cdn.example.test/rejected"
@@ -506,19 +527,22 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             10,
-            raising=False,
         )
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(
             adapter.send_multiple_images(
@@ -535,7 +559,7 @@ class TestDiscordMultiImage:
     def test_url_batch_overdeclared_length_does_not_burn_remaining_budget(
         self, adapter, monkeypatch
     ):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         body = b"GIF89a"
         first_url = "https://cdn.example.test/first.gif"
@@ -584,19 +608,22 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             16,
-            raising=False,
         )
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(
             adapter.send_multiple_images(
@@ -616,7 +643,7 @@ class TestDiscordMultiImage:
     def test_url_batch_missing_and_underreported_lengths_cannot_bypass_budget(
         self, adapter, monkeypatch
     ):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         body = b"GIF89a"
         urls = [
@@ -665,19 +692,22 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             10,
-            raising=False,
         )
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(adapter.send_multiple_images("67890", [(url, "") for url in urls]))
 
@@ -689,7 +719,7 @@ class TestDiscordMultiImage:
 
     def test_url_batch_fallback_reuses_cumulative_budget(self, adapter, monkeypatch):
         """A failed native upload must not re-upload the URL as a second file."""
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
         image_url = "https://cdn.example.test/fallback.png"
         body = b"\x89PNG\r\n\x1a\n"
@@ -754,7 +784,7 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=False)
         adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
 
-        budget_cls = discord_adapter._DiscordImageDownloadBudget
+        budget_cls = send_multiple_images_globals["_DiscordImageDownloadBudget"]
         budgets = []
 
         def make_budget(limit):
@@ -762,20 +792,27 @@ class TestDiscordMultiImage:
             budgets.append(budget)
             return budget
 
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             batch_budget,
-            raising=False,
         )
-        monkeypatch.setattr(discord_adapter, "_DiscordImageDownloadBudget", make_budget)
-        monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
-        monkeypatch.setattr(
-            discord_adapter,
+        monkeypatch.setitem(
+            send_multiple_images_globals,
+            "_DiscordImageDownloadBudget",
+            make_budget,
+        )
+        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals,
             "_create_discord_image_http_client",
             lambda _proxy: client,
         )
-        monkeypatch.setattr(discord_adapter.discord, "File", file_cls)
+        monkeypatch.setitem(
+            sys.modules,
+            "discord",
+            SimpleNamespace(File=file_cls),
+        )
 
         _run(adapter.send_multiple_images("67890", [(image_url, "")]))
 
@@ -804,9 +841,12 @@ class TestDiscordMultiImage:
         )
 
     def test_batch_remote_download_budget_is_100_mib(self):
-        import plugins.platforms.discord.adapter as discord_adapter
+        send_multiple_images_globals = DiscordAdapter.send_multiple_images.__globals__
 
-        assert discord_adapter._DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES == 100 * 1024 * 1024
+        assert (
+            send_multiple_images_globals["_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES"]
+            == 100 * 1024 * 1024
+        )
 
 
 # ---------------------------------------------------------------------------
