@@ -207,13 +207,53 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         self.assertEqual(second["kernel"]["reused"], True)
 
     def test_sessions_are_isolated_from_each_other(self):
-        # Same task id, different sessions (a delegated subagent runs under
-        # its own session key): no state may cross.
+        # Same task id, different sessions: no state may cross.
         with _kernel_config():
             self._run_as("conv-a", "x = 41", task_id="turn-1")
             other = self._run_as("conv-b", "print(x + 1)", task_id="turn-1")
         self.assertEqual(other["status"], "error", other)
         self.assertIn("NameError", other.get("error", ""))
+
+    def test_delegated_children_get_their_own_kernels(self):
+        """A delegated child runs in a COPY of the parent's context and
+        inherits the parent's approval session key — the naive owner
+        resolution attached the child to the parent's kernel and leaked
+        in-memory state across the delegation boundary (both directions,
+        verified live). The owner must be qualified for child contexts."""
+        from agent.delegation_context import delegated_child_context
+
+        with _kernel_config():
+            self._run_as("conv-a", "parent_secret = 'p'", task_id="turn-1")
+            with delegated_child_context("child-1"):
+                leak = self._run_as(
+                    "conv-a",
+                    "print(globals().get('parent_secret', 'ISOLATED'))",
+                    task_id="child-task",
+                )
+                self._run_as("conv-a", "child_secret = 'c'", task_id="child-task")
+            back = self._run_as(
+                "conv-a",
+                "print(globals().get('child_secret', 'ISOLATED'))",
+                task_id="turn-2",
+            )
+        self.assertIn("ISOLATED", leak.get("output", ""), leak)
+        self.assertIn("ISOLATED", back.get("output", ""), back)
+
+    def test_two_delegated_children_are_isolated_from_each_other(self):
+        """Sibling children in one batch must not share a kernel either —
+        each child context carries its own delegation session id."""
+        from agent.delegation_context import delegated_child_context
+
+        with _kernel_config():
+            with delegated_child_context("child-A"):
+                self._run_as("conv-a", "sibling_secret = 'A'", task_id="t")
+            with delegated_child_context("child-B"):
+                peek = self._run_as(
+                    "conv-a",
+                    "print(globals().get('sibling_secret', 'ISOLATED'))",
+                    task_id="t",
+                )
+        self.assertIn("ISOLATED", peek.get("output", ""), peek)
 
     def test_session_clear_disposes_the_owners_kernels(self):
         from tools.approval import clear_session

@@ -286,12 +286,18 @@ def _resolve_owner(task_id: str) -> str:
     """The stable identity a session kernel belongs to.
 
     The conversation's approval session key — context-propagated, stable
-    across turns of one conversation, and distinct per session (delegated
-    subagent sessions carry their own keys, which is what isolates their
-    kernels). ``run_agent`` mints a fresh task id per top-level turn, so a
-    task-keyed kernel would neither survive the next user turn nor ever be
-    torn down with anything; the task id is only the last-resort owner for
-    embeds and tests that run with no session context at all.
+    across turns of one conversation, and distinct per session. ``run_agent``
+    mints a fresh task id per top-level turn, so a task-keyed kernel would
+    neither survive the next user turn nor ever be torn down with anything;
+    the task id is only the last-resort owner for embeds and tests that run
+    with no session context at all.
+
+    Delegated children run in a copy of the parent's context and therefore
+    INHERIT the parent's approval session key — without the qualifier below,
+    a child's execute_code would attach to the parent's kernel and read its
+    in-memory state (verified live: parent-planted globals were readable
+    from a delegated_child_context, both directions). Children get their own
+    kernels, keyed by their delegation session id.
     """
     try:
         from tools.approval import get_current_session_key
@@ -299,7 +305,21 @@ def _resolve_owner(task_id: str) -> str:
         session_key = get_current_session_key(default="")
     except Exception:
         session_key = ""
-    return session_key or (task_id or "")
+
+    owner = session_key or (task_id or "")
+
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            from gateway.session_context import get_session_env
+
+            child_id = get_session_env("HERMES_SESSION_ID", "") or (task_id or "")
+            owner = f"{owner}::child::{child_id}"
+    except Exception:
+        pass
+
+    return owner
 
 
 def _kernel_key(owner: str, mode: str, child_python: str, child_cwd: str,
