@@ -844,6 +844,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    terminally_gated=False,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -897,12 +898,20 @@ async def _send_via_adapter(
                     and _current_loop is not gateway_loop
                 )
 
+                send_method = adapter.send
+                if terminally_gated:
+                    wrapped = getattr(type(adapter), "send", None)
+                    original = getattr(wrapped, "_hermes_outbound_original", None)
+                    if original is not None:
+                        async def send_method(**send_kwargs):
+                            return await original(adapter, **send_kwargs)
+
                 if _need_cross_loop:
                     if not gateway_loop.is_running():
                         return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
                     from agent.async_utils import safe_schedule_threadsafe
                     fut = safe_schedule_threadsafe(
-                        adapter.send(chat_id=chat_id, content=chunk, metadata=metadata),
+                        send_method(chat_id=chat_id, content=chunk, metadata=metadata),
                         gateway_loop,
                         logger=logger,
                         log_message="send_message: failed to schedule on gateway loop",
@@ -919,7 +928,7 @@ async def _send_via_adapter(
                     result = await asyncio.shield(asyncio.wrap_future(fut))
                 else:
                     # Same loop or no gateway loop (CLI, tests) — direct await.
-                    result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                    result = await send_method(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -937,6 +946,17 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            if not terminally_gated:
+                from gateway.platforms.base import apply_terminal_outbound_text_policy
+
+                standalone_metadata = {"thread_id": thread_id} if thread_id else None
+                chunk = apply_terminal_outbound_text_policy(
+                    platform=platform_name,
+                    chat_id=str(chat_id),
+                    content=str(chunk),
+                    metadata=standalone_metadata,
+                    operation="standalone_sender",
+                )
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
@@ -983,6 +1003,35 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
 
     media_files = media_files or []
+
+    # One canonical envelope protects every direct/standalone branch below,
+    # including early-return native helpers and plugin handlers.  Evaluate all
+    # recipient-visible text and media labels/URLs together; if policy rewrites
+    # any part, suppress attachments and deliver only the safe replacement.
+    from gateway.platforms.base import (
+        apply_terminal_outbound_text_policy,
+        extract_user_visible_strings,
+        replace_user_visible_strings,
+    )
+
+    visible = extract_user_visible_strings({
+        "content": message,
+        "media": media_files,
+    })
+    envelope = "\n".join(item for item in visible if item)
+    gated_envelope = envelope if platform == Platform.MATRIX else apply_terminal_outbound_text_policy(
+        platform=platform_name,
+        chat_id=str(chat_id),
+        content=envelope,
+        metadata={"thread_id": thread_id} if thread_id else None,
+        operation="send_message_tool",
+    )
+    if gated_envelope != envelope:
+        message = gated_envelope
+        media_files = []
+        if isinstance(args, dict):
+            args = replace_user_visible_strings(args, gated_envelope)
+            args["message"] = gated_envelope
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
@@ -1302,6 +1351,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                terminally_gated=True,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1321,6 +1371,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else None,
                 force_document=force_document,
+                terminally_gated=True,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1389,6 +1440,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                terminally_gated=True,
             )
 
         if isinstance(result, dict) and result.get("error"):

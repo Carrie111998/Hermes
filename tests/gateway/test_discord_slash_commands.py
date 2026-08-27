@@ -346,6 +346,65 @@ async def test_handle_thread_create_slash_falls_back_to_seed_message(adapter):
     interaction.followup.send.assert_awaited()
 
 
+@pytest.mark.asyncio
+async def test_create_thread_terminal_boundary_gates_name_and_starter_message(adapter, monkeypatch):
+    unsafe = "fixed https://127.0.0.1/admin"
+    calls = []
+    created_thread = SimpleNamespace(id=555, name="SAFE", send=AsyncMock())
+    parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), send=AsyncMock())
+    interaction = SimpleNamespace(
+        channel=SimpleNamespace(parent=parent_channel),
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_final_gateway_send_policy",
+        lambda **kwargs: calls.append(kwargs) or {"action": "rewrite", "content": "SAFE"},
+    )
+
+    result = await adapter._create_thread(interaction, name=unsafe, message=unsafe)
+
+    assert result["success"] is True
+    parent_channel.create_thread.assert_awaited_once_with(
+        name="SAFE", auto_archive_duration=1440,
+        reason="Requested by Jezza via /thread",
+    )
+    created_thread.send.assert_awaited_once_with("SAFE")
+    assert calls[-1]["operation"] == "discord_create_thread"
+    assert unsafe in calls[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_create_thread_terminal_boundary_gates_fallback_parent_send(adapter, monkeypatch):
+    unsafe = "fixed https://127.0.0.1/admin"
+    created_thread = SimpleNamespace(id=555, name="SAFE")
+    seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread))
+    parent_channel = SimpleNamespace(
+        create_thread=AsyncMock(side_effect=RuntimeError("direct failed")),
+        send=AsyncMock(return_value=seed_message),
+    )
+    interaction = SimpleNamespace(
+        channel=parent_channel,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_final_gateway_send_policy",
+        lambda **_kwargs: {"action": "rewrite", "content": "SAFE"},
+    )
+
+    result = await adapter._create_thread(interaction, name=unsafe, message=unsafe)
+
+    assert result["success"] is True
+    parent_channel.send.assert_awaited_once_with("SAFE")
+    seed_message.create_thread.assert_awaited_once_with(
+        name="SAFE", auto_archive_duration=1440,
+        reason="Requested by Jezza via /thread",
+    )
+
+
 # ------------------------------------------------------------------
 # _dispatch_thread_session — builds correct event and routes it
 # ------------------------------------------------------------------

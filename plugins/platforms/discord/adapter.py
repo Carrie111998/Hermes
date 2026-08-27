@@ -169,6 +169,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
+    apply_terminal_outbound_text_policy,
     utf16_len,
     validate_inbound_media_size,
 )
@@ -7163,6 +7164,17 @@ class DiscordAdapter(BasePlatformAdapter):
         display_name = getattr(getattr(interaction, "user", None), "display_name", None) or "unknown user"
         reason = f"Requested by {display_name} via /thread"
         starter_message = (message or "").strip()
+        original_envelope = "\n".join(part for part in (name, starter_message) if part)
+        gated_envelope = apply_terminal_outbound_text_policy(
+            platform="discord",
+            chat_id=str(getattr(interaction, "channel_id", "") or ""),
+            content=original_envelope,
+            operation="discord_create_thread",
+        )
+        if gated_envelope != original_envelope:
+            name = gated_envelope
+            if starter_message:
+                starter_message = gated_envelope
 
         try:
             thread = await parent_channel.create_thread(

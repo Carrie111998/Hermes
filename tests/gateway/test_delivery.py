@@ -253,6 +253,30 @@ async def test_named_telegram_private_topic_is_created_before_delivery(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_named_telegram_private_topic_crosses_terminal_boundary_before_creation(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_final_gateway_send_policy",
+        lambda **kwargs: calls.append(kwargs) or {"action": "rewrite", "content": "SAFE"},
+    )
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+
+    await router._deliver_to_platform(
+        DeliveryTarget.parse("telegram:722341991:fixed https://127.0.0.1/admin"),
+        "hello",
+        metadata=None,
+    )
+
+    assert adapter.ensure_dm_topic_calls == [
+        {"chat_id": "722341991", "topic_name": "SAFE", "force_create": False}
+    ]
+    assert calls[-1]["operation"] == "telegram_create_forum_topic"
+
+
+@pytest.mark.asyncio
 async def test_explicit_telegram_private_thread_uses_reply_fallback_with_anchor(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
     adapter = RecordingAdapter()

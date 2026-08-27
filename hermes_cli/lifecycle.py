@@ -22,6 +22,13 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
+def invoke_final_gateway_send_policy(**kwargs: Any) -> dict[str, Any]:
+    """Invoke only the loader-owned bundled outbound policy."""
+    from hermes_cli import plugins
+
+    return plugins.invoke_final_gateway_send_policy(**kwargs)
+
+
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
     try:
