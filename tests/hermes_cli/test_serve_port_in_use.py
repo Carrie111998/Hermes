@@ -91,7 +91,7 @@ def test_exit_code_is_distinct_tempfail():
 # ---------------------------------------------------------------------------
 
 
-def _spawn_serve(port: int, tmp_path: Path) -> subprocess.Popen:
+def _spawn_serve(port: int, tmp_path: Path, separate_stderr: bool = False) -> subprocess.Popen:
     home = tmp_path / "hermes_home"
     home.mkdir(exist_ok=True)
     env = dict(os.environ)
@@ -114,7 +114,7 @@ def _spawn_serve(port: int, tmp_path: Path) -> subprocess.Popen:
         cwd=str(REPO_ROOT),
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
         text=True,
     )
 
@@ -195,6 +195,70 @@ def test_ephemeral_port_zero_unaffected(tmp_path):
         announced = int(ready_line.strip().rsplit("port=", 1)[1])
         assert announced > 0
         assert "BACKEND_PORT_IN_USE" not in out
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_ready_sentinel_lands_on_stdout_only(tmp_path):
+    """Regression for #96282: the desktop port waiter watches child.stdout ONLY.
+
+    Since 6d4e851d8 the serve startup path imports ``tui_gateway.server``
+    (``install_exit_flush_signal_handlers``), whose module-level
+    ``sys.stdout = sys.stderr`` rebind redirects a plain ``print()`` of the
+    READY sentinel to stderr. The Electron shell then times out after 90s even
+    though the backend is healthy. The sentinel must be written to the real
+    stdout (fd 1), which the rebind never touches.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    proc = _spawn_serve(port, tmp_path, separate_stderr=True)
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    ready = threading.Event()
+
+    def _pump_out():
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_lines.append(line)
+            if "HERMES_BACKEND_READY" in line:
+                ready.set()
+                return
+
+    def _pump_err():
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            err_lines.append(line)
+
+    t_out = threading.Thread(target=_pump_out, daemon=True)
+    t_err = threading.Thread(target=_pump_err, daemon=True)
+    t_out.start()
+    t_err.start()
+    ready.wait(120)
+    try:
+        out = "".join(out_lines)
+        err = "".join(err_lines)
+        assert ready.is_set(), (
+            f"no READY sentinel on stdout; stdout:\n{out}\nstderr:\n{err}"
+        )
+        assert f"HERMES_BACKEND_READY port={port}" in out
+        assert "BACKEND_PORT_IN_USE" not in out
+        # Give the stderr pump a moment to collect anything the bug would have
+        # written there (the sentinel and "listening" line land together right
+        # after the bind).
+        import time as _time
+
+        _time.sleep(0.5)
+        assert "HERMES_BACKEND_READY" not in err, (
+            "READY sentinel leaked onto stderr; the desktop waits on stdout "
+            f"only:\n{err}"
+        )
     finally:
         proc.terminate()
         try:

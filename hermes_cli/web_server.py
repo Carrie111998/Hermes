@@ -19874,7 +19874,15 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            # MUST go to the REAL stdout: importing tui_gateway.server (e.g. via
+            # install_exit_flush_signal_handlers below) rebinds sys.stdout to
+            # stderr at module level so stray print()s can't corrupt the
+            # gateway's JSON-RPC stdout. The Electron desktop waits for this
+            # sentinel on child.stdout only — if it lands on stderr the shell
+            # times out after 90s and the GUI never boots. sys.__stdout__ is the
+            # interpreter's original stdout and is unaffected by that rebind.
+            _sentinel_stream = getattr(sys, "__stdout__", None) or sys.stdout
+            print(f"{ready_token} port={actual_port}", file=_sentinel_stream, flush=True)
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
