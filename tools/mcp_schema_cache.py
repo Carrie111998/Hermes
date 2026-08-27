@@ -64,6 +64,20 @@ def _save_all(data: Dict[str, Any]) -> None:
     atomic_json_write(_cache_path(), data, mode=0o600)
 
 
+def _entry_is_fresh(entry: Any, fingerprint: str) -> bool:
+    """True when *entry* is a dict whose fingerprint matches and TTL holds."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("fingerprint") != fingerprint:
+        return False
+    ttl_ms = entry.get("ttl_ms")
+    written_at = entry.get("written_at")
+    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
+        if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
+            return False
+    return True
+
+
 def get_cached_entry(
     server_name: str,
     fingerprint: str,
@@ -90,16 +104,37 @@ def get_cached_entry(
     )
     with _cache_lock:
         entry = _load_all().get(key)
-    if not isinstance(entry, dict):
-        return None
-    if entry.get("fingerprint") != fingerprint:
-        return None
-    ttl_ms = entry.get("ttl_ms")
-    written_at = entry.get("written_at")
-    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
-        if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
-            return None
-    return entry
+    return entry if _entry_is_fresh(entry, fingerprint) else None
+
+
+def get_startup_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
+    """Return a schema-cache entry suitable for process-start tool publication.
+
+    Tries the unscoped/public key first, then any requester-scoped entry
+    for this logical server whose fingerprint and TTL still match.
+
+    This is schemas only — tool *names* are process-global in memory so the
+    model can see them after a gateway restart. It must never be used to
+    select OAuth credentials or a live connection.
+    """
+    unscoped = get_cached_entry(server_name, fingerprint)
+    if unscoped is not None:
+        return unscoped
+
+    from tools.mcp_oauth_identity import is_registry_key_for_server
+
+    with _cache_lock:
+        data = _load_all()
+    for key, entry in data.items():
+        if not isinstance(key, str):
+            continue
+        if key == server_name:
+            continue
+        if not is_registry_key_for_server(key, server_name):
+            continue
+        if _entry_is_fresh(entry, fingerprint):
+            return entry
+    return None
 
 
 def has_cached_entry(

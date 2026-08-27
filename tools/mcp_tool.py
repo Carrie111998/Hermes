@@ -4467,10 +4467,36 @@ class MCPServerTask:
         reconnect budget is exhausted, so a dead server never leaves phantom
         tool definitions bloating the prompt cache and producing "not
         connected" errors on every turn.
+
+        Names still served by another live connection for this logical
+        server, or by the cache-backed lazy template, stay registered.
         """
         from tools.registry import registry
 
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
+        mine = list(getattr(self, "_registered_tool_names", []) or [])
+        if not mine:
+            return
+
+        # Tool names are process-global. Alice exhausting her reconnect
+        # budget must not yank a name Bob's live connection (or the
+        # cache-backed lazy template) still serves.
+        from tools.mcp_oauth_identity import is_registry_key_for_server
+
+        logical = self.name
+        keep = set(_lazy_server_tool_names.get(logical) or [])
+        for key, other in list(_servers.items()):
+            if other is self:
+                continue
+            if not (
+                is_registry_key_for_server(key, logical)
+                or getattr(other, "name", None) == logical
+            ):
+                continue
+            keep.update(getattr(other, "_registered_tool_names", None) or [])
+
+        for tool_name in mine:
+            if tool_name in keep:
+                continue
             registry.deregister(tool_name)
             _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
@@ -7845,7 +7871,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
 
 def _stash_per_user_oauth_without_principal(deferred: Dict[str, dict]) -> tuple:
-    """Register unscoped cache tools for OAuth servers lacking a principal.
+    """Register cached tool names for OAuth servers lacking a principal.
 
     ``deferred`` is already the fail-closed set (per_user OAuth, no bound
     requester). Does not re-resolve identity. Returns
@@ -7855,24 +7881,29 @@ def _stash_per_user_oauth_without_principal(deferred: Dict[str, dict]) -> tuple:
         return 0, 0
 
     try:
-        from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
+        from tools.mcp_schema_cache import (
+            config_fingerprint,
+            get_startup_cached_entry,
+        )
     except Exception:
         config_fingerprint = None  # type: ignore[assignment]
-        get_cached_entry = None  # type: ignore[assignment]
+        get_startup_cached_entry = None  # type: ignore[assignment]
 
     tools = 0
     count = 0
     for name, cfg in deferred.items():
         already_lazy = name in _lazy_server_configs
         with _lock:
-            _lazy_server_configs.setdefault(name, dict(cfg))
+            # Refresh the template so a later /reload-mcp auth-mode change
+            # is not stuck on the original oauth/header setting.
+            _lazy_server_configs[name] = dict(cfg)
         if (
             config_fingerprint is not None
-            and get_cached_entry is not None
+            and get_startup_cached_entry is not None
             and name not in _lazy_server_tool_names
         ):
             try:
-                entry = get_cached_entry(name, config_fingerprint(cfg))
+                entry = get_startup_cached_entry(name, config_fingerprint(cfg))
             except Exception:
                 entry = None
             if entry:
@@ -7931,6 +7962,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         for srv_name, srv_cfg in servers.items():
             if server_uses_oauth(srv_cfg):
                 _oauth_protected_servers.add(srv_name)
+            else:
+                # Auth-mode changes in this batch must not keep a stale
+                # oauth classification from a previous register/reload.
+                _oauth_protected_servers.discard(srv_name)
         new_servers: Dict[str, dict] = {}
         resolved_keys: Dict[str, str] = {}
         for k, v in servers.items():
@@ -7944,7 +7979,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 continue
             resolved_keys[k] = rk
             if k in _lazy_server_configs:
-                continue
+                _lazy_server_configs[k] = dict(v)
+                if k in _lazy_server_tool_names:
+                    continue
+                # Bound requester, tools never published: fall through so
+                # this pass can load *their* schema cache (or connect).
             if rk in _servers or rk in connecting:
                 continue
             if _connect_cooldown_active(rk):
@@ -7999,15 +8038,34 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # refreshes the cache for next time).
     eager_servers: Dict[str, dict] = dict(new_servers)
     try:
-        from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
+        from tools.mcp_schema_cache import (
+            config_fingerprint,
+            get_startup_cached_entry,
+        )
+        from tools.mcp_oauth_identity import (
+            IDENTITY_MODE_PER_USER,
+            configured_identity_mode,
+        )
     except Exception:  # pragma: no cover - cache module missing
         config_fingerprint = None  # type: ignore[assignment]
-        get_cached_entry = None  # type: ignore[assignment]
-    if config_fingerprint is not None and get_cached_entry is not None:
+        get_startup_cached_entry = None  # type: ignore[assignment]
+        IDENTITY_MODE_PER_USER = None  # type: ignore[assignment]
+        configured_identity_mode = None  # type: ignore[assignment]
+    if config_fingerprint is not None and get_startup_cached_entry is not None:
+        per_user_oauth = (
+            configured_identity_mode is not None
+            and configured_identity_mode() == IDENTITY_MODE_PER_USER
+        )
         for name, cfg in new_servers.items():
-            if not _resolve_server_lazy(name, cfg):
+            is_lazy = _resolve_server_lazy(name, cfg)
+            is_oauth = _mcp_server_uses_oauth(name, config=cfg)
+            # Shared-mode oauth still eager-connects unless marked lazy.
+            # per_user oauth is implicitly lazy for *schema* publication so
+            # a bound /reload-mcp can republish names from a scoped cache
+            # without spawning.
+            if not is_lazy and not (per_user_oauth and is_oauth):
                 continue
-            entry = get_cached_entry(name, config_fingerprint(cfg))
+            entry = get_startup_cached_entry(name, config_fingerprint(cfg))
             if not entry:
                 continue
             with _lock:
@@ -8631,6 +8689,10 @@ def shutdown_mcp_servers():
     """
     with _lock:
         servers_snapshot = list(_servers.values())
+        # Auth classification is rebuilt on the next register/discover pass.
+        # Clearing here so a reload that drops ``auth: oauth`` (or removes
+        # the server) cannot keep serving requester-scoped connections.
+        _oauth_protected_servers.clear()
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
