@@ -49,7 +49,13 @@ from agent.credential_pool import (
 )
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import (
+    atomic_json_write,
+    base_url_host_matches,
+    base_url_hostname,
+    env_var_enabled,
+    is_copilot_api_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2679,7 +2685,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # missing Copilot headers here closes the whole class. We only ADD missing
     # keys — never override headers a caller deliberately set.
     try:
-        if base_url_host_matches(str(client_kwargs.get("base_url", "")), "githubcopilot.com"):
+        if is_copilot_api_base_url(str(client_kwargs.get("base_url", ""))):
             from hermes_cli.models import copilot_default_headers
             existing = dict(client_kwargs.get("default_headers") or {})
             existing_lower = {k.lower() for k in existing}

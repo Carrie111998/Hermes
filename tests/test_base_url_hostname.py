@@ -8,7 +8,7 @@ tests/agent/test_direct_provider_url_detection.py.
 
 from __future__ import annotations
 
-from utils import base_url_hostname, base_url_host_matches
+from utils import base_url_hostname, base_url_host_matches, is_copilot_api_base_url
 
 
 # ─── base_url_hostname ────────────────────────────────────────────────────
@@ -86,6 +86,20 @@ class TestBaseUrlHostMatchesEdgeCases:
         assert base_url_host_matches("", "openrouter.ai") is False
         assert base_url_host_matches(None, "openrouter.ai") is False  # type: ignore[arg-type]
 
+
+class TestCopilotApiBaseUrl:
+    def test_recognizes_ghec_copilot_api_host(self):
+        assert is_copilot_api_base_url(
+            "https://copilot-api.acme.ghe.com/v1"
+        ) is True
+
+    def test_rejects_ghec_lookalikes(self):
+        assert is_copilot_api_base_url(
+            "https://copilot-api.acme.ghe.com.evil.test/v1"
+        ) is False
+        assert is_copilot_api_base_url(
+            "https://evil.test/copilot-api.acme.ghe.com/v1"
+        ) is False
 
 
 

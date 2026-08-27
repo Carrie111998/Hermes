@@ -922,3 +922,15 @@ def base_url_host_matches(base_url: str, domain: str) -> bool:
     if not domain:
         return False
     return hostname == domain or hostname.endswith("." + domain)
+
+
+def is_copilot_api_base_url(base_url: str) -> bool:
+    """Return whether *base_url* targets a Copilot inference API host."""
+    hostname = base_url_hostname(base_url)
+    if not hostname:
+        return False
+    if hostname == "githubcopilot.com" or hostname.endswith(".githubcopilot.com"):
+        return True
+    if hostname.startswith("copilot-api.") and hostname.endswith(".ghe.com"):
+        return True
+    return False

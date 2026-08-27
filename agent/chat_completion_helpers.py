@@ -46,7 +46,13 @@ from agent.message_sanitization import (
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
-from utils import base_url_host_matches, base_url_hostname, env_float, env_int
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    env_float,
+    env_int,
+    is_copilot_api_base_url,
+)
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
@@ -1880,7 +1886,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _ct = agent._get_transport()
         is_github_responses = (
             base_url_host_matches(agent.base_url, "models.github.ai")
-            or base_url_host_matches(agent.base_url, "githubcopilot.com")
+            or is_copilot_api_base_url(agent.base_url)
         )
         is_codex_backend = (
             agent.provider == "openai-codex"
@@ -1965,7 +1971,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     _is_or = agent._is_openrouter_url()
     _is_gh = (
         base_url_host_matches(agent._base_url_lower, "models.github.ai")
-        or base_url_host_matches(agent._base_url_lower, "githubcopilot.com")
+        or is_copilot_api_base_url(agent._base_url_lower)
     )
     _is_nous = base_url_host_matches(agent._base_url_lower, "nousresearch.com")
     _is_nvidia = base_url_host_matches(agent._base_url_lower, "integrate.api.nvidia.com")
