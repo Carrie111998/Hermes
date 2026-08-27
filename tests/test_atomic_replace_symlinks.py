@@ -27,6 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import utils
 from utils import (
     atomic_json_write,
     atomic_replace,
@@ -106,6 +107,59 @@ def test_atomic_json_write_preserves_symlink(tmp_path: Path) -> None:
     assert link.is_symlink()
     loaded = json.loads(real.read_text(encoding="utf-8"))
     assert loaded == {"hello": "world"}
+
+
+def test_atomic_json_write_uses_physical_parent_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows, mkstemp must receive the parent's physical directory, not a
+    junction spelling of it (#95559).
+
+    A Windows filesystem filter can report a false EEXIST for a random
+    mkstemp name when the call traverses a directory junction. CPython treats
+    every EEXIST as a real name collision and retries up to TMP_MAX, so that
+    single false result turns into an effectively unbounded retry loop that
+    pins a worker thread. The fix resolves the parent through
+    ``os.path.realpath`` before handing it to ``mkstemp`` when running on
+    Windows.
+
+    A junction can't be created on this platform, so a plain symlinked
+    directory stands in for it here: the code path under test only calls
+    ``os.path.realpath()`` on the parent, which resolves either kind of
+    reparse point identically, and ``_IS_WINDOWS`` is monkeypatched directly
+    rather than mocking ``sys.platform`` so the real POSIX filesystem calls
+    still run underneath.
+    """
+    if os.name != "posix":
+        pytest.skip("uses a POSIX symlink to stand in for a Windows junction")
+
+    physical_dir = tmp_path / "physical"
+    physical_dir.mkdir()
+    junction_dir = tmp_path / "junction"
+    junction_dir.symlink_to(physical_dir, target_is_directory=True)
+
+    target = junction_dir / "cache.json"
+
+    mkstemp_dirs: list[str] = []
+    real_mkstemp = utils.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        mkstemp_dirs.append(kwargs.get("dir"))
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(utils, "_IS_WINDOWS", True)
+    monkeypatch.setattr(utils.tempfile, "mkstemp", tracking_mkstemp)
+
+    atomic_json_write(target, {"hello": "world"})
+
+    assert mkstemp_dirs == [str(physical_dir)], (
+        f"mkstemp must be called with the physical parent, got {mkstemp_dirs}"
+    )
+    loaded = json.loads((physical_dir / "cache.json").read_text(encoding="utf-8"))
+    assert loaded == {"hello": "world"}
+    # The caller-visible path stays a junction/symlink — publication targets
+    # the caller's own spelling, only the temp file's parent is resolved.
+    assert junction_dir.is_symlink()
 
 
 @pytest.mark.require_symlinks
