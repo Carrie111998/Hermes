@@ -51,7 +51,8 @@ import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionR
 import {
   publishResolvedSessionForRestore,
   resolveStoredSessionForRestore,
-  type RestoreLookupResult
+  type RestoreLookupResult,
+  type RestoreLookupTarget
 } from '../../session/hooks/use-session-actions/utils'
 
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'connection_id' | 'id' | 'profile'>
@@ -108,7 +109,7 @@ function restoreDelay(control: RestoreAttemptControl, milliseconds: number): Pro
 
 async function resolveRememberedConversation(
   sessionId: string,
-  scope: ConversationRestoreScope,
+  target: RestoreLookupTarget,
   control: RestoreAttemptControl,
   isValid: () => boolean
 ): Promise<RestoreLookupResult | null> {
@@ -124,11 +125,7 @@ async function resolveRememberedConversation(
       return null
     }
 
-    last = await resolveStoredSessionForRestore(sessionId, {
-      connectionId: scope.connectionId,
-      profile: scope.profile,
-      storageSuffix: scope.storageSuffix
-    })
+    last = await resolveStoredSessionForRestore(sessionId, target)
 
     if (control.cancelled || !isValid() || last.status !== 'inconclusive') {
       return control.cancelled || !isValid() ? null : last
@@ -383,7 +380,12 @@ export function useDesktopIntegrations({
       }
 
       const valid = () => exactScopeStillCurrent(captured) && !$profileConversationRestore.get()
-      const result = await resolveRememberedConversation(candidate, captured, control, valid)
+      const lookupTarget: RestoreLookupTarget = {
+        connectionId: captured.connectionId,
+        profile: captured.profile,
+        storageSuffix: captured.storageSuffix
+      }
+      const result = await resolveRememberedConversation(candidate, lookupTarget, control, valid)
 
       if (!result || !valid()) {
         return
@@ -392,7 +394,7 @@ export function useDesktopIntegrations({
       restoredRef.current = true
 
       if (result.status === 'found') {
-        publishResolvedSessionForRestore(result.session, candidate, captured)
+        publishResolvedSessionForRestore(result.session, candidate, lookupTarget)
         setRememberedConversation({ kind: 'session', sessionId: candidate, version: 1 }, captured.profile)
         requestSessionResume(candidate, result.ownerRoute, { forceCold: true })
         clearAppliedFreshDraftProvenance()
@@ -479,7 +481,12 @@ export function useDesktopIntegrations({
       }
 
       const candidate = remembered.sessionId
-      const result = await resolveRememberedConversation(candidate, captured, control, valid)
+      const lookupTarget: RestoreLookupTarget = {
+        connectionId: request.target.connectionId,
+        profile: normalizeProfileKey(request.target.profile),
+        storageSuffix: captured.storageSuffix
+      }
+      const result = await resolveRememberedConversation(candidate, lookupTarget, control, valid)
 
       if (!result || !valid()) {
         return
@@ -490,7 +497,7 @@ export function useDesktopIntegrations({
           return
         }
 
-        publishResolvedSessionForRestore(result.session, candidate, captured)
+        publishResolvedSessionForRestore(result.session, candidate, lookupTarget)
         setRememberedConversation({ kind: 'session', sessionId: candidate, version: 1 }, captured.profile)
         requestSessionResume(candidate, result.ownerRoute, { forceCold: true })
         navigate(sessionRoute(candidate), { replace: true })

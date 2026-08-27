@@ -32,7 +32,7 @@ import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $hydrationSyncProfile, $profiles } from '@/store/profile'
-import { $profileConversationRestore } from '@/store/profile-conversation-restore'
+import { $appliedFreshDraftProvenance, $profileConversationRestore } from '@/store/profile-conversation-restore'
 import {
   $connection,
   $contextSuggestions,
@@ -65,7 +65,7 @@ import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from 
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
-import { shouldShowIntro } from './intro-visibility'
+import { shouldShowConversationRestoreLoading, shouldShowIntro } from './intro-visibility'
 import { ProfileTag } from './profile-tag'
 import { isRouteSessionMismatch } from './route-session-state'
 import { useRuntimeMessageRepository } from './runtime-repository'
@@ -437,6 +437,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const sessions = useStore($sessions)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const profileConversationRestore = useStore($profileConversationRestore)
+  const appliedFreshDraftProvenance = useStore($appliedFreshDraftProvenance)
 
   // Durable composer/queue scope (lineage root) so auto-compression tip rotation
   // does not wipe an in-progress draft or orphan /queue entries. For the
@@ -482,7 +483,11 @@ const ChatViewContent = memo(function ChatViewContent({
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
-  const restoringConversation = isPrimary && profileConversationRestore !== null
+  const restoringConversation = shouldShowConversationRestoreLoading({
+    primary: isPrimary,
+    provenance: appliedFreshDraftProvenance,
+    restore: profileConversationRestore
+  })
 
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame

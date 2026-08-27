@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { shouldShowIntro } from './intro-visibility'
+import { shouldShowConversationRestoreLoading, shouldShowIntro } from './intro-visibility'
 
 const showing = {
   activeSessionId: null,
@@ -13,6 +13,99 @@ const showing = {
   routedSessionView: false,
   selectedSessionId: null
 } as const
+
+describe('shouldShowConversationRestoreLoading', () => {
+  const profileRestore = {
+    origin: 'profile-switch',
+    phase: 'activating',
+    sequence: 7,
+    target: { connectionId: null, profile: 'work' }
+  } as const
+  const connectionRestore = {
+    origin: 'connection-switch',
+    phase: 'activating',
+    sequence: 9,
+    target: { connectionId: 'homelab', profile: 'default' }
+  } as const
+  const matchingProvenance = {
+    cause: 'connection-switch',
+    freshSequence: 12,
+    kind: 'automatic',
+    restoreSequence: 9
+  } as const
+
+  it('masks profile restores from activation through navigation', () => {
+    expect(shouldShowConversationRestoreLoading({ primary: true, provenance: null, restore: profileRestore })).toBe(
+      true
+    )
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: null,
+        restore: { ...profileRestore, phase: 'committed' }
+      })
+    ).toBe(true)
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: null,
+        restore: { ...profileRestore, phase: 'navigating', sessionId: 'work-last' }
+      })
+    ).toBe(true)
+  })
+
+  it('keeps the current transcript visible while a connection switch is only dialing', () => {
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: matchingProvenance,
+        restore: connectionRestore
+      })
+    ).toBe(false)
+  })
+
+  it('masks committed and navigating connection restores only for their matching automatic draft', () => {
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: matchingProvenance,
+        restore: { ...connectionRestore, phase: 'committed' }
+      })
+    ).toBe(true)
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: matchingProvenance,
+        restore: { ...connectionRestore, phase: 'navigating', sessionId: 'remote-last' }
+      })
+    ).toBe(true)
+
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: { ...matchingProvenance, restoreSequence: 8 },
+        restore: { ...connectionRestore, phase: 'committed' }
+      })
+    ).toBe(false)
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: true,
+        provenance: { cause: 'new-chat', freshSequence: 13, kind: 'explicit' },
+        restore: { ...connectionRestore, phase: 'committed' }
+      })
+    ).toBe(false)
+  })
+
+  it('never masks a non-primary chat surface', () => {
+    expect(
+      shouldShowConversationRestoreLoading({
+        primary: false,
+        provenance: matchingProvenance,
+        restore: { ...connectionRestore, phase: 'committed' }
+      })
+    ).toBe(false)
+  })
+})
 
 describe('shouldShowIntro', () => {
   it('shows on a fresh draft in the primary window', () => {

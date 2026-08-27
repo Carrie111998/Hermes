@@ -239,8 +239,36 @@ describe('resolveStoredSessionForRestore exact target lookup', () => {
       storageSuffix: ''
     })
 
-    expect(mockGetSession).toHaveBeenCalledWith('s1', 'meta')
+    expect(mockGetSession).toHaveBeenCalledWith('s1', { connectionId: null, profile: 'meta' })
     expect(result).toEqual({ status: 'found', session: expect.objectContaining({ id: 's1', profile: 'meta' }) })
+  })
+
+  it('keeps a profile-door lookup ownerless and preserves same-id registry twins when publishing', async () => {
+    const profileTarget = { connectionId: null, profile: 'meta', storageSuffix: '' }
+    $sessions.set([
+      session({ connection_id: 'local', id: 's1', profile: 'meta' }),
+      session({ connection_id: 'source-b', id: 's1', profile: 'meta' })
+    ])
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
+
+    const result = await resolveStoredSessionForRestore('s1', profileTarget)
+
+    expect(mockGetSession).toHaveBeenCalledWith('s1', { connectionId: null, profile: 'meta' })
+    expect(result).toEqual({
+      status: 'found',
+      session: expect.objectContaining({ connection_id: undefined, id: 's1', profile: 'meta' })
+    })
+
+    if (result.status !== 'found') {
+      throw new Error('expected found restore candidate')
+    }
+
+    publishResolvedSessionForRestore(result.session, 's1', profileTarget)
+    expect($sessions.get().filter(row => row.id === 's1')).toEqual([
+      expect.objectContaining({ connection_id: undefined, profile: 'meta' }),
+      expect.objectContaining({ connection_id: 'local', profile: 'meta' }),
+      expect.objectContaining({ connection_id: 'source-b', profile: 'meta' })
+    ])
   })
 
   it('returns not-found only for a target-scoped session-gone response', async () => {

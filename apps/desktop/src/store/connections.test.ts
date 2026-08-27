@@ -57,12 +57,14 @@ const endGatewaySwitch = vi.fn((token?: number) => {
 })
 
 const recoverActiveSourceAfterFailedGatewaySwitch = vi.fn()
+const isCurrentGatewaySwitch = vi.fn((token: number) => token === latestSwitchToken)
 
 vi.mock('@/store/session', () => ({ $connection }))
 vi.mock('@/store/gateway-switch', () => ({
   $gatewaySwitching,
   beginGatewaySwitch,
   endGatewaySwitch,
+  isCurrentGatewaySwitch,
   recoverActiveSourceAfterFailedGatewaySwitch,
   wipeSessionListsForGatewaySwitch
 }))
@@ -137,6 +139,7 @@ beforeEach(() => {
   beginGatewaySwitch.mockClear()
   endGatewaySwitch.mockClear()
   recoverActiveSourceAfterFailedGatewaySwitch.mockClear()
+  isCurrentGatewaySwitch.mockClear()
   wipeSessionListsForGatewaySwitch.mockClear()
   $activeSessionId.set(null)
   $gatewaySwitching.set(false)
@@ -434,6 +437,47 @@ describe('selectConnection', () => {
     expect($newChatProfile.get()).toBeNull()
     expect($pendingConnectionId.get()).toBeNull()
     expect($connection.get()?.connectionId).toBe('local')
+  })
+
+  it('recovers a source wiped by a superseded switch when the newer dial fails before acquiring a token', async () => {
+    const firstActivation = deferred()
+
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    $activeSessionId.set('a93bb39d')
+    ensureGatewayAgent.mockImplementationOnce(async (_connectionId, _profile, options) => {
+      options?.beforeActivate?.()
+      await firstActivation.promise
+    })
+    openGatewayAgent.mockImplementation(async connectionId => {
+      if (connectionId === 'work-vps') {
+        throw new Error('newer dial offline')
+      }
+    })
+
+    const superseded = selectConnection('homelab')
+    await vi.waitFor(() => expect(beginGatewaySwitch).toHaveBeenCalledTimes(1))
+    const wipedToken = beginGatewaySwitch.mock.results[0]?.value
+    expect($activeSessionId.get()).toBeNull()
+
+    await expect(selectConnection('work-vps')).rejects.toThrow('newer dial offline')
+    expect($profileConversationRestore.get()).toBeNull()
+
+    firstActivation.reject(new Error('superseded commit failed'))
+    await expect(superseded).resolves.toBeUndefined()
+
+    // The newer request never reached its commit point, so the older token is
+    // still the latest token and remains responsible for repainting the source
+    // it wiped. Because that request no longer owns user intent, it must not
+    // also navigate to a recovery draft.
+    expect(recoverActiveSourceAfterFailedGatewaySwitch).toHaveBeenCalledTimes(1)
+    expect(recoverActiveSourceAfterFailedGatewaySwitch).toHaveBeenCalledWith(wipedToken)
+    expect(requestFreshSession).not.toHaveBeenCalledWith({
+      cause: 'switch-recovery',
+      persistence: 'automatic'
+    })
+    expect($connection.get()?.connectionId).toBe('local')
+    expect($pendingConnectionId.get()).toBeNull()
   })
 
   it("#93937: severs the previous source's runtime session binding BEFORE the new source is published, behind the barrier", async () => {

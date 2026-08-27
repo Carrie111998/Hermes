@@ -8,6 +8,7 @@ import {
   beginGatewaySwitch,
   endGatewaySwitch,
   type GatewaySwitchToken,
+  isCurrentGatewaySwitch,
   recoverActiveSourceAfterFailedGatewaySwitch
 } from '@/store/gateway-switch'
 import {
@@ -484,23 +485,36 @@ export async function selectConnection(connectionId: string, options: SelectConn
       await refreshActiveProfile()
     }
   } catch (error) {
-    if (ownsSwitchIntent()) {
-      if (restoreSequence !== null && !targetLanded) {
-        cancelProfileConversationRestore(
-          restoreSequence,
-          token === null ? 'connection-dial-failed' : 'connection-commit-failed'
-        )
-      }
+    const ownsIntent = ownsSwitchIntent()
+    const recoveryToken = token
+    // Capture ownership before scheduling recovery. A newer intent can begin
+    // between this catch and the helper's microtask; the helper re-checks the
+    // token before every publication, while this snapshot decides whether the
+    // failed owner may also paint a recovery draft.
+    const tokenWasCurrent = recoveryToken !== null && !targetLanded && isCurrentGatewaySwitch(recoveryToken)
 
-      if (token !== null && !targetLanded) {
-        // This switch wiped for a commit that never landed. The previous
-        // source is still the active one, and nothing reactive re-pulls its
-        // lists (no scope moved): repaint it and land on a fresh draft there,
-        // matching what a failed Settings apply leaves behind.
-        recoverActiveSourceAfterFailedGatewaySwitch(token)
+    if (ownsIntent && restoreSequence !== null && !targetLanded) {
+      cancelProfileConversationRestore(
+        restoreSequence,
+        token === null ? 'connection-dial-failed' : 'connection-commit-failed'
+      )
+    }
+
+    if (recoveryToken !== null && !targetLanded) {
+      // Acquiring a token means this switch synchronously wiped the outgoing
+      // source. Recovery is therefore an obligation of the token, not of the
+      // still-current click. A superseding intent may fail before acquiring a
+      // token of its own; in that case this older request remains responsible
+      // for repainting the source it wiped. The token-aware helper safely
+      // declines once a newer commit has actually taken ownership.
+      recoverActiveSourceAfterFailedGatewaySwitch(recoveryToken)
+
+      if (ownsIntent && tokenWasCurrent) {
         requestFreshSession({ cause: 'switch-recovery', persistence: 'automatic' })
       }
+    }
 
+    if (ownsIntent) {
       throw error
     }
   } finally {

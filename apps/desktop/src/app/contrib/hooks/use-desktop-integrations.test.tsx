@@ -560,7 +560,12 @@ describe('useDesktopIntegrations', () => {
 
       await waitFor(() => expect(navigate).toHaveBeenCalledWith('/local-last', { replace: true }))
       expect(restoreLookupMock).toHaveBeenCalledWith('local-last', {
-        connectionId: 'local',
+        connectionId: null,
+        profile: 'work',
+        storageSuffix: ''
+      })
+      expect(publishRestoreMock).toHaveBeenCalledWith(expect.objectContaining({ id: 'local-last' }), 'local-last', {
+        connectionId: null,
         profile: 'work',
         storageSuffix: ''
       })

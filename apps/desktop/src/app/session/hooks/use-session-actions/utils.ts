@@ -852,8 +852,8 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
 
   const turnAlreadyStructured = Boolean(
     liveAssistantOfCurrentTurn &&
-      hasStructuralParts(liveAssistantOfCurrentTurn) &&
-      isLiveTailRow(liveAssistantOfCurrentTurn)
+    hasStructuralParts(liveAssistantOfCurrentTurn) &&
+    isLiveTailRow(liveAssistantOfCurrentTurn)
   )
 
   const wantsAssistantRow = Boolean(
@@ -1412,6 +1412,10 @@ export function publishResolvedSessionForRestore(
   setSessions(prev => [published, ...prev.filter(existing => !(sameOwner(existing) && sameConversation(existing)))])
 }
 
+/** Canonical backend identity for restore RPCs. This is intentionally
+ * distinct from any observed descriptor used only to prove readiness: a null
+ * connection is the profile-door route and must remain null even when that
+ * route currently resolves through an explicit local descriptor. */
 export interface RestoreLookupTarget {
   connectionId: string | null
   profile: string
@@ -1459,7 +1463,7 @@ export async function resolveStoredSessionForRestore(
   }
 
   try {
-    const scope = connectionId ? { connectionId, profile: targetProfile } : targetProfile
+    const scope = { connectionId, profile: targetProfile }
     const candidate = await getSession(durableId, scope)
 
     if (!candidate || typeof candidate !== 'object') {
