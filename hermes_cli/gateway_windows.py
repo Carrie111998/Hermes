@@ -9,12 +9,13 @@ dropper when Scheduled Task creation is denied (locked-down corporate boxes).
 Design notes
 ------------
 * ``schtasks /Create /SC ONLOGON /RL LIMITED`` means the task runs at the
-  CURRENT USER's next logon without any elevation prompt. Manual starts and
-  install ``--start-now`` use the direct hidden-console launcher instead
-  of ``schtasks /Run`` so start/restart behavior is consistent.
+  CURRENT USER's next logon without any elevation prompt. When that task is
+  installed, manual starts and install ``--start-now`` route through it so
+  Task Scheduler remains the gateway's restart owner.
 * We write a shared ``gateway.cmd`` wrapper plus a console-less ``gateway.vbs``
   launcher. Scheduled Task and Startup-folder persistence both route through
-  VBS/wscript; immediate manual starts route through direct ``subprocess`` spawn.
+  VBS/wscript; direct ``subprocess`` spawn is reserved for the fallback path
+  where no Scheduled Task is installed.
 * Status = merge of "is the schtasks entry registered?" + "is the startup
   login item present?" + "is there a gateway process running?" so the status
   command keeps working regardless of which install path was taken.
@@ -473,8 +474,10 @@ def _build_gateway_vbs_script(
     by every console-subsystem descendant (git, gh, node, …) so none of them
     allocate a visible flashing conhost (#54220/#56747; the previous
     console-less pythonw.exe gateway forced exactly that per-descendant
-    flash). No cmd.exe anywhere in the chain. Mirrors
-    ``_build_gateway_cmd_script`` (same env + argv via
+    flash). No cmd.exe anywhere in the chain. The launcher waits for Python
+    and returns its exit code so Task Scheduler's ``RestartOnFailure`` policy
+    supervises the actual gateway instead of an already-completed bootstrap.
+    Mirrors ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
     """
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
@@ -494,7 +497,7 @@ def _build_gateway_vbs_script(
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, exit_code",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
@@ -510,10 +513,11 @@ def _build_gateway_vbs_script(
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async. The
-        # console python's one console is created hidden and inherited by all
-        # descendants, so nothing ever flashes.
-        f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
+        # Window style 0 = hidden; bWaitOnReturn True keeps wscript (and thus
+        # the Scheduled Task) alive for the gateway's lifetime. Propagating
+        # Python's result makes RestartOnFailure observe real gateway crashes.
+        f"exit_code = sh.Run({_quote_vbs_string(command_line)}, 0, True)",
+        "WScript.Quit exit_code",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -675,7 +679,8 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
         # the final error if creation also fails.
     user = _resolve_task_user()
     # The Scheduled Task launches the console-less .vbs (issue #45599 fix A), not
-    # the .cmd. Immediate manual starts use _spawn_detached().
+    # the .cmd. The VBS remains attached to Python so task failure policy owns
+    # the complete gateway lifetime.
     launcher_path = script_path.with_suffix(".vbs")
     xml_path = _write_scheduled_task_xml(task_name, launcher_path, user)
     base = ["/Create", "/F", "/TN", task_name, "/XML", str(xml_path)]
@@ -1115,8 +1120,7 @@ def install(
             if running_pids:
                 print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
             else:
-                pid = _spawn_detached()
-                _report_gateway_start(f"direct spawn (PID {pid})")
+                _start_via_scheduled_task()
         else:
             print("ℹ Gateway not started now.")
             print("  Start manually with: hermes gateway start")
@@ -1190,6 +1194,37 @@ def _wait_for_gateway_ready(timeout_s: float = 6.0, interval_s: float = 0.4) -> 
             return pids
         time.sleep(interval_s)
     return []
+
+
+def _start_via_scheduled_task() -> list[int]:
+    """Start the installed task and verify its profile gateway appears.
+
+    The generated VBS remains alive while Python runs, so routing starts
+    through ``schtasks /Run`` makes Task Scheduler the real process owner and
+    lets its ``RestartOnFailure`` policy observe a later crash. If no gateway
+    is currently detectable, ending a stale task instance first is safe and
+    avoids ``MultipleInstancesPolicy=IgnoreNew`` silently discarding the run.
+    """
+    _assert_windows()
+    task_name = get_task_name()
+    _exec_schtasks(["/End", "/TN", task_name])
+    code, out, err = _exec_schtasks(["/Run", "/TN", task_name])
+    if code != 0:
+        detail = (err or out or f"exit code {code}").strip()
+        raise RuntimeError(f"Could not start Windows gateway task {task_name}: {detail}")
+
+    pids = _wait_for_gateway_ready(timeout_s=30.0)
+    if not pids:
+        raise RuntimeError(
+            f"Windows gateway task {task_name} started, but no gateway process "
+            "was detected after 30s. Check logs/gateway.log and "
+            "logs/gateway-stdio.log."
+        )
+    print(
+        f"✓ Gateway started via Scheduled Task {task_name} "
+        f"(PID: {', '.join(map(str, pids))})"
+    )
+    return pids
 
 
 def _report_gateway_start(via: str) -> None:
@@ -1486,7 +1521,7 @@ def status(deep: bool = False) -> None:
 
 
 def start() -> None:
-    """Start the gateway using the canonical detached Windows launch path."""
+    """Start the gateway through its installed Windows persistence owner."""
     _assert_windows()
     running_pids = _gateway_pids()
     if running_pids:
@@ -1511,9 +1546,13 @@ def start() -> None:
             print("  If a UAC prompt opened, approve it, then run: hermes gateway start")
             return
 
-    # Manual starts use the same console-less direct spawn path as restart()
-    # and install --start-now. Scheduled Task / Startup entries are only login
-    # persistence mechanisms.
+    if task_installed:
+        _start_via_scheduled_task()
+        return
+
+    # The Startup-folder fallback has no always-running supervisor. Preserve
+    # the hidden-console direct spawn for locked-down machines where the task
+    # could not be installed.
     pid = _spawn_detached()
     _report_gateway_start(f"direct spawn (PID {pid})")
 

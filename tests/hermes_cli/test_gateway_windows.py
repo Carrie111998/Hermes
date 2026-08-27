@@ -2,6 +2,8 @@
 
 import logging
 import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -314,9 +316,8 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "cmd.exe" not in xml_seen["text"]
 
 
-def test_gateway_vbs_script_is_console_less(monkeypatch):
-    """The .vbs launcher must avoid cmd.exe entirely and Run pythonw hidden
-    (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A)."""
+def test_gateway_vbs_script_is_console_less_and_supervised(monkeypatch):
+    """The VBS stays hidden but waits so Scheduler observes Python's exit."""
     monkeypatch.setattr(
         gateway_windows,
         "_resolve_detached_python",
@@ -333,11 +334,187 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     assert "pythonw.exe" in content
     assert "hermes_cli.main" in content
     assert "gateway run" in content
-    assert ", 0, False" in content  # hidden window, detached/async
+    assert ", 0, True)" in content  # hidden window, wait for gateway
+    assert "exit_code = sh.Run(" in content
+    assert "WScript.Quit exit_code" in content
+    assert ", 0, False" not in content
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
     assert "--profile" in content and "work" in content
     assert content.endswith("\r\n")
+
+
+@pytest.mark.windows_only
+def test_gateway_vbs_waits_for_real_child_and_propagates_exit(monkeypatch, tmp_path):
+    project = tmp_path / "fake-project"
+    package = project / "hermes_cli"
+    hermes_home = tmp_path / "hermes-home"
+    marker = hermes_home / "child-started"
+    release = hermes_home / "release-child"
+    package.mkdir(parents=True)
+    hermes_home.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "main.py").write_text(
+        "import os\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "home = Path(os.environ['HERMES_HOME'])\n"
+        "(home / 'child-started').write_text('ready')\n"
+        "deadline = time.monotonic() + 30\n"
+        "while not (home / 'release-child').exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "raise SystemExit(23)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gateway_windows, "__file__", str(package / "gateway_windows.py")
+    )
+    launcher = tmp_path / "gateway.vbs"
+    launcher.write_text(
+        gateway_windows._build_gateway_vbs_script(
+            sys.executable, str(tmp_path), str(hermes_home), ""
+        ),
+        encoding="utf-8",
+        newline="",
+    )
+
+    process = subprocess.Popen(
+        ["wscript.exe", "//B", "//Nologo", str(launcher)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert marker.read_text(encoding="utf-8") == "ready"
+        assert process.poll() is None
+        release.write_text("go", encoding="utf-8")
+        assert process.wait(timeout=10) == 23
+    finally:
+        release.touch(exist_ok=True)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.windows_only
+def test_install_start_now_uses_new_scheduled_task_as_restart_owner(
+    monkeypatch, tmp_path
+):
+    calls = []
+    script_path = tmp_path / "Hermes_Gateway_alice.cmd"
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda *args, **kwargs: (True, True),
+    )
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: True)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_scheduled_task",
+        lambda task_name, path: (True, "Installed Windows Scheduled Task"),
+    )
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(
+        gateway_windows,
+        "_start_via_scheduled_task",
+        lambda: calls.append("scheduled-task") or [12345],
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda: pytest.fail("the newly installed task must own the gateway start"),
+    )
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
+
+    gateway_windows.install(start_now=True, start_on_login=True)
+
+    assert calls == ["scheduled-task"]
+
+
+@pytest.mark.windows_only
+def test_install_without_login_task_keeps_direct_start_fallback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda *args, **kwargs: (True, False),
+    )
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda: calls.append("direct") or 12345,
+    )
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_start_via_scheduled_task",
+        lambda: pytest.fail("no Scheduled Task was requested"),
+    )
+
+    gateway_windows.install(start_now=True, start_on_login=False)
+
+    assert calls == ["direct"]
+
+
+@pytest.mark.windows_only
+def test_start_uses_scheduled_task_as_restart_owner(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: False)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_start_via_scheduled_task",
+        lambda: calls.append("scheduled-task") or [12345],
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda: pytest.fail("an installed task must own the gateway start"),
+    )
+
+    gateway_windows.start()
+
+    assert calls == ["scheduled-task"]
+
+
+@pytest.mark.windows_only
+def test_start_via_scheduled_task_clears_stale_instance_and_verifies(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+
+    def fake_exec(args):
+        calls.append(tuple(args))
+        return (0, "SUCCESS", "")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_exec)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_ready",
+        lambda timeout_s=6.0, interval_s=0.4: [23456],
+    )
+
+    assert gateway_windows._start_via_scheduled_task() == [23456]
+    assert calls == [
+        ("/End", "/TN", "Hermes_Gateway_alice"),
+        ("/Run", "/TN", "Hermes_Gateway_alice"),
+    ]
+
+
+@pytest.mark.windows_only
+def test_start_via_scheduled_task_fails_without_gateway(monkeypatch):
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: (0, "SUCCESS", ""))
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **kwargs: [])
+
+    with pytest.raises(RuntimeError, match="no gateway process was detected after 30s"):
+        gateway_windows._start_via_scheduled_task()
 
 
 
@@ -362,10 +539,6 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
-
-
-
-
 
 
 

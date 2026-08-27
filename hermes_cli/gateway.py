@@ -8454,9 +8454,9 @@ def _gateway_command_inner(args):
             elif is_windows():
                 from hermes_cli import gateway_windows
 
-                # On Windows, even without a registered Scheduled Task / Startup
-                # entry, gateway_windows.start() uses the safe detached
-                # pythonw.exe launcher.  Do not fall back to run_gateway() here:
+                # On Windows, gateway_windows.start() uses the installed
+                # Scheduled Task when available, otherwise its safe detached
+                # hidden-console launcher. Do not fall back to run_gateway() here:
                 # when invoked from a gateway-hosted agent/tool call, foreground
                 # run_gateway() is tied to the very gateway process we just
                 # stopped and can die before the replacement is stable.
