@@ -21,6 +21,7 @@ from gateway.hosted_room_peer import (
     select_room_link,
     verify_room_grant,
 )
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
 SECRET = b"s" * 32
@@ -60,6 +61,55 @@ def test_room_link_endpoint_reads_supported_config_with_env_override(
     assert local_room_link_endpoint()["url"] == (
         "https://override.example.test/hermes"
     )
+
+
+def test_named_profile_inherits_gateway_room_link_endpoint(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "reviewer"
+    profile.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "gateway:\n  room_link_url: https://gateway.example.test/hermes\n",
+        encoding="utf-8",
+    )
+    (profile / "config.yaml").write_text("gateway: {}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("HERMES_ROOM_LINK_URL", raising=False)
+
+    token = set_hermes_home_override(profile)
+    try:
+        assert local_room_link_endpoint() == {
+            "available": True,
+            "url": "https://gateway.example.test/hermes",
+            "transport_security": "tls",
+        }
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_named_profile_room_link_override_wins_over_gateway_root(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "reviewer"
+    profile.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "gateway:\n  room_link_url: https://gateway.example.test/hermes\n",
+        encoding="utf-8",
+    )
+    (profile / "config.yaml").write_text(
+        "gateway:\n  room_link_url: https://profile.example.test/hermes\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("HERMES_ROOM_LINK_URL", raising=False)
+
+    token = set_hermes_home_override(profile)
+    try:
+        assert local_room_link_endpoint()["url"] == (
+            "https://profile.example.test/hermes"
+        )
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _dispatch(**overrides):

@@ -335,8 +335,20 @@ def local_room_link_endpoint(value: Any | None = None) -> dict[str, Any]:
 def _room_link_url_from_config(home: str) -> str | None:
     """Read the restart-scoped user setting without polling config on probes."""
     from gateway.config import load_gateway_config
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
 
-    value = load_gateway_config().room_link_url
+    if str(get_hermes_home()) == home:
+        value = load_gateway_config().room_link_url
+    else:
+        token = set_hermes_home_override(home)
+        try:
+            value = load_gateway_config().room_link_url
+        finally:
+            reset_hermes_home_override(token)
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
@@ -345,9 +357,21 @@ def _configured_room_link_url() -> str | None:
     override = os.getenv("HERMES_ROOM_LINK_URL")
     if override is not None:
         return override
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_default_hermes_root, get_hermes_home
 
-    return _room_link_url_from_config(str(get_hermes_home()))
+    home = get_hermes_home()
+    configured = _room_link_url_from_config(str(home))
+    if configured:
+        return configured
+
+    # RoomLink is a gateway reachability property, not a Bot personality
+    # setting. Named profiles may override it, but otherwise inherit the
+    # process gateway's root endpoint so adding a Bot does not require
+    # repeating network configuration in every profile.
+    root = get_default_hermes_root()
+    if root != home:
+        return _room_link_url_from_config(str(root))
+    return None
 
 
 def validate_room_link_url(value: Any) -> tuple[str, TransportSecurity]:
