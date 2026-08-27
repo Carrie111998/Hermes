@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   clearSessionDraft,
@@ -35,6 +35,7 @@ const key = (owner: typeof OWNER_A, storedSessionId: string | null, newChatGener
 
 describe('composer storage migration', () => {
   beforeEach(() => {
+    vi.restoreAllMocks()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
     _resetComposerQueueDrainsForTests()
@@ -65,6 +66,27 @@ describe('composer storage migration', () => {
     expect(resolveComposerStorageScopeKey(from)).toBe(to)
     expect(beginComposerQueueDrain(from, 'late-entry-on-retired-scope')).toBeNull()
     expect(finishComposerQueueDrain(drain!)).toBe(to)
+  })
+
+  it('publishes the shared alias before the migrated queue snapshot', () => {
+    const from = key(OWNER_A, null, 9)
+    const to = key(OWNER_A, 'stored-live')
+
+    enqueueQueuedPrompt(from, { attachments: [], text: 'queued before handoff' })
+
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+
+    expect(migrateComposerStorageScope(from, to)).toBe(true)
+
+    const relevantKeys = setItem.mock.calls
+      .map(([storageKey]) => storageKey)
+      .filter(storageKey =>
+        ['hermes.desktop.composerStorageScopeAliases.v1', 'hermes.desktop.composerQueue.v1'].includes(storageKey)
+      )
+
+    expect(relevantKeys.indexOf('hermes.desktop.composerStorageScopeAliases.v1')).toBeLessThan(
+      relevantKeys.indexOf('hermes.desktop.composerQueue.v1')
+    )
   })
 
   it('fails closed across owners without registering an alias or moving state', () => {

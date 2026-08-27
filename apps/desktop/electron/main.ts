@@ -87,7 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { ComposerQueueDrainArbiter } from './composer-queue-drain-arbiter'
+import { registerComposerQueueDrainIpc } from './composer-queue-drain-ipc'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -14484,44 +14484,7 @@ const hudIpc = registerHudIpc({
   }
 })
 
-const composerQueueDrainArbiter = new ComposerQueueDrainArbiter()
-const composerQueueDrainRendererIds = new Set()
-
-ipcMain.on('hermes:composer-queue-drain:begin', (event, request) => {
-  const ownerId = event.sender.id
-
-  if (!composerQueueDrainRendererIds.has(ownerId)) {
-    composerQueueDrainRendererIds.add(ownerId)
-    event.sender.once('destroyed', () => {
-      composerQueueDrainRendererIds.delete(ownerId)
-      composerQueueDrainArbiter.releaseOwner(ownerId)
-    })
-  }
-
-  event.returnValue = composerQueueDrainArbiter.begin(
-    typeof request?.scopeKey === 'string' ? request.scopeKey : '',
-    typeof request?.entryId === 'string' ? request.entryId : '',
-    ownerId
-  )
-})
-
-ipcMain.on('hermes:composer-queue-drain:excluded', (event, request) => {
-  event.returnValue = composerQueueDrainArbiter.excluded(
-    typeof request?.scopeKey === 'string' ? request.scopeKey : '',
-    typeof request?.entryId === 'string' ? request.entryId : ''
-  )
-})
-
-ipcMain.on('hermes:composer-queue-drain:handoff', (event, request) => {
-  event.returnValue = composerQueueDrainArbiter.handoff(
-    typeof request?.fromScopeKey === 'string' ? request.fromScopeKey : '',
-    typeof request?.toScopeKey === 'string' ? request.toScopeKey : ''
-  )
-})
-
-ipcMain.on('hermes:composer-queue-drain:finish', (event, token) => {
-  event.returnValue = composerQueueDrainArbiter.finish(typeof token === 'number' ? token : -1)
-})
+registerComposerQueueDrainIpc(ipcMain)
 
 ipcMain.handle('hermes:bootstrap:reset', async () => {
   // Renderer's "Reload and retry" path. Clear the latched failure and

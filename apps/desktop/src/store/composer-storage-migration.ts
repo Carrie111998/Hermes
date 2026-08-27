@@ -1,9 +1,11 @@
 import { claimSessionDraft, handoffEmptySessionDraftRevision } from './composer'
-import { migrateQueuedPrompts } from './composer-queue'
+import { migrateQueuedPromptsExact } from './composer-queue'
 import { handoffComposerQueueDrains } from './composer-queue-drain'
 import {
   _resetComposerStorageScopeAliasesForTests,
+  activateComposerStorageScopeAlias,
   decodeComposerStorageScopeKey,
+  publishComposerStorageScopeAlias,
   registerComposerStorageScopeAlias,
   resolveComposerStorageScopeKey
 } from './composer-storage-scope'
@@ -33,10 +35,11 @@ export function migrateComposerStorageScope(fromScopeKey: string, toScopeKey: st
   }
 
   handoffComposerQueueDrains(from, to)
+  publishComposerStorageScopeAlias(from, to)
   claimSessionDraft(from, to)
   handoffEmptySessionDraftRevision(from, to)
-  migrateQueuedPrompts(from, to)
-  registerComposerStorageScopeAlias(from, to)
+  migrateQueuedPromptsExact(from, to)
+  activateComposerStorageScopeAlias(from, to)
 
   if (fromScopeKey !== from) {
     registerComposerStorageScopeAlias(fromScopeKey, to)

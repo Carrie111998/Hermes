@@ -10,7 +10,8 @@ import {
   getQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
-import { encodeComposerStorageScopeKey } from '@/store/composer-storage-scope'
+import { _resetComposerStorageMigrationsForTests } from '@/store/composer-storage-migration'
+import { encodeComposerStorageScopeKey, registerComposerStorageScopeAlias } from '@/store/composer-storage-scope'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -21,6 +22,7 @@ import type { SubmitTextOptions } from './use-prompt-actions/utils'
 const OWNER = { connectionId: 'local', profile: 'default' }
 const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
 const PARK_STORAGE_KEY = 'hermes.desktop.composerQueueParks.v1'
+const originalDesktop = window.hermesDesktop
 const storageKey = (storedSessionId: string | null) => encodeComposerStorageScopeKey(OWNER, storedSessionId)
 
 const lineageSession = (over: Partial<SessionInfo>): SessionInfo =>
@@ -74,6 +76,8 @@ describe('useBackgroundQueueDrain', () => {
     window.localStorage.removeItem(PARK_STORAGE_KEY)
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    _resetComposerStorageMigrationsForTests()
+    window.hermesDesktop = originalDesktop
     clearAllSessionStates()
   })
 
@@ -84,6 +88,8 @@ describe('useBackgroundQueueDrain', () => {
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
     $sessions.set([])
+    _resetComposerStorageMigrationsForTests()
+    window.hermesDesktop = originalDesktop
     clearAllSessionStates()
   })
 
@@ -106,6 +112,41 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     await waitFor(() => expect(getQueuedPrompts(storageKey('stored-session-a'))).toHaveLength(0))
+  })
+
+  it('decodes the live migrated scope before selecting stored and runtime ids', async () => {
+    const retiredKey = storageKey('stored-retired')
+    const liveKey = storageKey('stored-live')
+
+    const runtimeMap = {
+      current: new Map([
+        ['stored-retired', 'rt-retired'],
+        ['stored-live', 'rt-live']
+      ])
+    }
+
+    const submitText = vi.fn(async () => true)
+    const entry = enqueueQueuedPrompt(retiredKey, { text: 'follow the live handoff', attachments: [] })!
+
+    // Alias delivery precedes the queue storage event. This renderer is still
+    // rendering the retired atom key, while the fresh persisted snapshot and
+    // every RPC identity already belong to the live destination.
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [liveKey]: [entry] }))
+    registerComposerStorageScopeAlias(retiredKey, liveKey)
+    window.hermesDesktop = { ...originalDesktop, composerQueueDrain: undefined } as never
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() =>
+      expect(submitText).toHaveBeenCalledWith('follow the live handoff', {
+        attachments: [],
+        fromQueue: true,
+        sessionId: 'rt-live',
+        storedSessionId: 'stored-live'
+      })
+    )
+    expect(getQueuedPrompts(liveKey)).toHaveLength(0)
+    expect(getQueuedPrompts(retiredKey)).toHaveLength(0)
   })
 
   it('drains only its exact owner when profiles share a stored id and submits raw backend ids', async () => {

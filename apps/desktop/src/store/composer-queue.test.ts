@@ -52,6 +52,16 @@ describe('composer queue store', () => {
     expect(dequeueQueuedPrompt(SESSION_KEY)).toBeNull()
   })
 
+  it('dequeues the head from a fresh persisted snapshot', () => {
+    const staleHead = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'stale local head' })!
+    const externalHead = { ...staleHead, id: 'external-head', text: 'new persisted head' }
+
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [SESSION_KEY]: [externalHead, staleHead] }))
+
+    expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('new persisted head')
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['stale local head'])
+  })
+
   it('reloads a queue removal written by another BrowserWindow', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'already sent elsewhere' })
     window.localStorage.removeItem(QUEUE_STORAGE_KEY)
@@ -59,6 +69,21 @@ describe('composer queue store', () => {
     reloadPersistedComposerQueue()
 
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('appends from one fresh persisted snapshot when another window enqueues first', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first window entry' })!
+    const external = { ...first, id: 'external-entry', text: 'other window entry' }
+
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [SESSION_KEY]: [first, external] }))
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'local follow-up' })
+
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual([
+      'first window entry',
+      'other window entry',
+      'local follow-up'
+    ])
   })
 
   it('persists Stop parks so another BrowserWindow cannot drain them as unparked', () => {
@@ -106,6 +131,17 @@ describe('composer queue store', () => {
     expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['draft two'])
   })
 
+  it('removes from one fresh persisted snapshot without resurrecting another window removal', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'removed in other window' })!
+    const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'remove locally' })!
+    const external = { ...first, id: 'external-entry', text: 'added in other window' }
+
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [SESSION_KEY]: [second, external] }))
+
+    expect(removeQueuedPrompt(SESSION_KEY, second.id)).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['added in other window'])
+  })
+
   it('promotes a queued entry to the front', () => {
     const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })
     const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second' })
@@ -118,6 +154,17 @@ describe('composer queue store', () => {
     expect(promoteQueuedPrompt(SESSION_KEY, third!.id)).toBe(true)
     expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['third', 'first', 'second'])
     expect(promoteQueuedPrompt(SESSION_KEY, third!.id)).toBe(false)
+  })
+
+  it('promotes within a fresh persisted snapshot', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })!
+    const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second' })!
+    const external = { ...first, id: 'external-entry', text: 'added elsewhere' }
+
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [SESSION_KEY]: [external, first, second] }))
+
+    expect(promoteQueuedPrompt(SESSION_KEY, second.id)).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['second', 'added elsewhere', 'first'])
   })
 
   it('updates queued text and attachment snapshot', () => {
@@ -138,6 +185,17 @@ describe('composer queue store', () => {
     expect(queue[0]?.attachments[0]).not.toBe(editedAttachments[0])
   })
 
+  it('updates within a fresh persisted snapshot', () => {
+    const stale = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'removed elsewhere' })!
+    const target = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'edit me' })!
+    const external = { ...stale, id: 'external-entry', text: 'added elsewhere' }
+
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [SESSION_KEY]: [target, external] }))
+
+    expect(updateQueuedPromptText(SESSION_KEY, target.id, 'edited')).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['edited', 'added elsewhere'])
+  })
+
   it('clears queue state for a session', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [attachment('img-1', 'image')], text: 'queued' })
 
@@ -146,6 +204,16 @@ describe('composer queue store', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
     expect($queuedPromptsBySession.get()[SESSION_KEY]).toBeUndefined()
     expect(window.localStorage.getItem(QUEUE_STORAGE_KEY)).toBeNull()
+  })
+
+  it('clears a fresh persisted scope even when the local atom has not received the storage event', () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'external queue' })
+    $queuedPromptsBySession.set({})
+
+    clearQueuedPrompts(SESSION_KEY)
+
+    expect(window.localStorage.getItem(QUEUE_STORAGE_KEY)).toBeNull()
+    expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
   })
 
   it('persists queue entries into local storage', () => {
@@ -182,6 +250,26 @@ describe('migrateQueuedPrompts', () => {
     migrateQueuedPrompts('rt-old', 'rt-new')
 
     expect(getQueuedPrompts('rt-new').map(e => e.text)).toEqual(['already here', 'migrated'])
+  })
+
+  it('migrates from one fresh persisted snapshot without losing interleaved source or target writes', () => {
+    const source = enqueueQueuedPrompt('rt-old', { attachments: [], text: 'source first' })!
+    const staleTarget = enqueueQueuedPrompt('rt-new', { attachments: [], text: 'target removed elsewhere' })!
+    const sourceExternal = { ...source, id: 'source-external', text: 'source added elsewhere' }
+    const targetExternal = { ...staleTarget, id: 'target-external', text: 'target added elsewhere' }
+
+    window.localStorage.setItem(
+      QUEUE_STORAGE_KEY,
+      JSON.stringify({ 'rt-old': [source, sourceExternal], 'rt-new': [targetExternal] })
+    )
+
+    expect(migrateQueuedPrompts('rt-old', 'rt-new')).toBe(true)
+    expect(getQueuedPrompts('rt-old')).toEqual([])
+    expect(getQueuedPrompts('rt-new').map(entry => entry.text)).toEqual([
+      'target added elsewhere',
+      'source first',
+      'source added elsewhere'
+    ])
   })
 
   it('is a no-op when source is empty or keys match', () => {
@@ -245,6 +333,14 @@ describe('parked queue sessions', () => {
     expect(isQueueParked(SESSION_KEY)).toBe(false)
 
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'held back' })
+
+    expect(parkQueuedPrompts(SESSION_KEY)).toBe(true)
+    expect(isQueueParked(SESSION_KEY)).toBe(true)
+  })
+
+  it('parks a fresh persisted queue before the local storage event arrives', () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'external queue' })
+    $queuedPromptsBySession.set({})
 
     expect(parkQueuedPrompts(SESSION_KEY)).toBe(true)
     expect(isQueueParked(SESSION_KEY)).toBe(true)

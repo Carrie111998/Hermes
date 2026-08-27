@@ -6,6 +6,7 @@ const CANONICAL_PREFIX = 'hermes-composer-scope:v2:'
 const LEGACY_SEPARATOR = '\0'
 const LEGACY_NEW_CHAT = '__new__'
 const MAX_ALIAS_DEPTH = 64
+const STORAGE_SCOPE_ALIASES_KEY = 'hermes.desktop.composerStorageScopeAliases.v1'
 const composerStorageScopeAliases = new Map<string, string>()
 
 export type ComposerStorageOwner = Pick<SessionOwnerRoute, 'connectionId' | 'profile'>
@@ -199,12 +200,124 @@ export function resolveComposerStorageScopeKey(scopeKey: string): string {
   return scopeKey
 }
 
+function validAlias(fromScopeKey: string, toScopeKey: string): boolean {
+  const from = decodeComposerStorageScopeKey(fromScopeKey)
+  const to = decodeComposerStorageScopeKey(toScopeKey)
+
+  return Boolean(
+    from &&
+    to &&
+    fromScopeKey !== toScopeKey &&
+    from.owner.connectionId === to.owner.connectionId &&
+    from.owner.profile === to.owner.profile
+  )
+}
+
+function readPersistedComposerStorageScopeAliases(): Map<string, string> {
+  const aliases = new Map<string, string>()
+
+  if (typeof window === 'undefined') {
+    return aliases
+  }
+
+  try {
+    const raw = window.localStorage.getItem(STORAGE_SCOPE_ALIASES_KEY)
+    const parsed: unknown = raw ? JSON.parse(raw) : null
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return aliases
+    }
+
+    for (const [from, to] of Object.entries(parsed)) {
+      if (typeof to === 'string' && validAlias(from, to)) {
+        aliases.set(from, to)
+      }
+    }
+  } catch {
+    return aliases
+  }
+
+  return aliases
+}
+
+function persistComposerStorageScopeAliases(aliases: Map<string, string>): void {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  try {
+    if (aliases.size === 0) {
+      window.localStorage.removeItem(STORAGE_SCOPE_ALIASES_KEY)
+    } else {
+      window.localStorage.setItem(STORAGE_SCOPE_ALIASES_KEY, JSON.stringify(Object.fromEntries(aliases)))
+    }
+  } catch {
+    // Best effort: aliases remain valid inside this renderer.
+  }
+}
+
+function reloadComposerStorageScopeAliases(): void {
+  const persisted = readPersistedComposerStorageScopeAliases()
+
+  composerStorageScopeAliases.clear()
+
+  for (const [from, to] of persisted) {
+    composerStorageScopeAliases.set(from, to)
+  }
+}
+
+/** Publish before migrated state so peer renderers retire the source first. */
+export function publishComposerStorageScopeAlias(fromScopeKey: string, toScopeKey: string): boolean {
+  const target = resolveComposerStorageScopeKey(toScopeKey)
+
+  if (!validAlias(fromScopeKey, target)) {
+    return false
+  }
+
+  const persisted = readPersistedComposerStorageScopeAliases()
+
+  persisted.set(fromScopeKey, target)
+  persistComposerStorageScopeAliases(persisted)
+
+  return true
+}
+
+/** Activate an already-published alias in this renderer after local state moves. */
+export function activateComposerStorageScopeAlias(fromScopeKey: string, toScopeKey: string): void {
+  const target = resolveComposerStorageScopeKey(toScopeKey)
+
+  if (validAlias(fromScopeKey, target)) {
+    composerStorageScopeAliases.set(fromScopeKey, target)
+  }
+}
+
 /** @internal — callers must validate exact same-owner canonical scopes first. */
 export function registerComposerStorageScopeAlias(fromScopeKey: string, toScopeKey: string): void {
-  composerStorageScopeAliases.set(fromScopeKey, resolveComposerStorageScopeKey(toScopeKey))
+  if (publishComposerStorageScopeAlias(fromScopeKey, toScopeKey)) {
+    activateComposerStorageScopeAlias(fromScopeKey, toScopeKey)
+  }
 }
 
 /** @internal */
 export function _resetComposerStorageScopeAliasesForTests(): void {
   composerStorageScopeAliases.clear()
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.removeItem(STORAGE_SCOPE_ALIASES_KEY)
+  }
+}
+
+/** @internal */
+export function _reloadComposerStorageScopeAliasesForTests(): void {
+  reloadComposerStorageScopeAliases()
+}
+
+reloadComposerStorageScopeAliases()
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', event => {
+    if (event.key === STORAGE_SCOPE_ALIASES_KEY) {
+      reloadComposerStorageScopeAliases()
+    }
+  })
 }

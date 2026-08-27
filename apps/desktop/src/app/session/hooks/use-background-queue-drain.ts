@@ -91,7 +91,7 @@ export function useBackgroundQueueDrain({
   )
 
   const drainSessionQueue = useCallback(
-    (sessionKey: string, storedSessionId: string | null, entry: QueuedPromptEntry) => {
+    (sessionKey: string, entry: QueuedPromptEntry) => {
       const drain = beginComposerQueueDrain(sessionKey, entry.id)
 
       if (!drain) {
@@ -125,14 +125,22 @@ export function useBackgroundQueueDrain({
           // microtask runs. Resolve that scope, then match the entry only inside
           // its exact owner namespace: entry ids are not an ownership boundary.
           const liveScopeKey = resolveComposerStorageScopeKey(sessionKey)
+          const liveTarget = decodeComposerStorageScopeKey(liveScopeKey)
+
+          if (!liveTarget) {
+            return
+          }
+
           const liveEntry = getLatestQueuedPrompts(liveScopeKey).find(candidate => candidate.id === entry.id)
 
           if (!liveEntry) {
             return
           }
 
-          runtimeSessionId = storedSessionId
-            ? (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ?? null)
+          const liveStoredSessionId = liveTarget.storedSessionId
+
+          runtimeSessionId = liveStoredSessionId
+            ? (runtimeIdByStoredSessionIdRef.current.get(liveStoredSessionId) ?? null)
             : null
 
           const accepted = await Promise.resolve(
@@ -140,7 +148,7 @@ export function useBackgroundQueueDrain({
               attachments: liveEntry.attachments,
               fromQueue: true,
               sessionId: runtimeSessionId,
-              storedSessionId
+              storedSessionId: liveStoredSessionId
             })
           )
 
@@ -220,7 +228,7 @@ export function useBackgroundQueueDrain({
         continue
       }
 
-      drainSessionQueue(sessionKey, storedSessionId, entry)
+      drainSessionQueue(sessionKey, entry)
     }
   }, [
     drainSessionQueue,

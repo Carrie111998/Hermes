@@ -295,6 +295,28 @@ describe('useComposerSubmit rejection restoration', () => {
 
     expect(takeSessionDraft('session-a').text).toBe('newer stashed A draft')
   })
+
+  it('does not clear a newer cross-window draft when an older submission is accepted late', async () => {
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const { hook, onSubmit } = renderSubmitHook({ sessionKey: 'session-a' })
+
+    onSubmit.mockImplementationOnce(() => pending)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('older submitted A')
+    })
+
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ 'session-a': 'newer window B draft' }))
+
+    await act(async () => settle?.(true))
+
+    expect(takeSessionDraft('session-a').text).toBe('newer window B draft')
+  })
 })
 
 describe('useComposerSubmit external request routing', () => {

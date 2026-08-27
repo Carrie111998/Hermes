@@ -41,6 +41,9 @@ import { uploadComposerAttachment, usePromptActions } from '.'
 // never-settling in-flight promise from one test into the next.
 beforeEach(() => {
   clearSingleFlightSessionResumeState()
+  window.localStorage.removeItem('hermes.desktop.composerQueue.v1')
+  window.localStorage.removeItem('hermes.desktop.composerQueueParks.v1')
+  $queuedPromptsBySession.set({})
 })
 
 vi.mock('@/hermes', () => ({

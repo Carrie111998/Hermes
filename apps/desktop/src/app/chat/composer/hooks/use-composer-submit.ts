@@ -179,6 +179,10 @@ export function useComposerSubmit({
         if (accepted === false) {
           restore()
         } else if (clearSubmittedDraft && clearedRevision !== null) {
+          // Acceptance settles against the same shared snapshot as rejection:
+          // a peer BrowserWindow may have replaced the draft before its async
+          // storage event reaches this renderer.
+          reloadPersistedDrafts()
           clearSessionDraftIfRevision(submittedScope, submittedRevision)
         }
       })

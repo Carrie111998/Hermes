@@ -92,10 +92,10 @@ export class ComposerQueueDrainArbiter {
     return moved
   }
 
-  finish(token: number): string | null {
+  finish(token: number, ownerId?: number): string | null {
     const active = this.activeByToken.get(token)
 
-    if (!active) {
+    if (!active || (ownerId !== undefined && active.ownerId !== ownerId)) {
       return null
     }
 

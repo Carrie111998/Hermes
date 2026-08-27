@@ -1,9 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  _reloadComposerStorageScopeAliasesForTests,
+  _resetComposerStorageScopeAliasesForTests,
   decodeComposerStorageScopeKey,
   encodeComposerStorageScopeKey,
-  legacyComposerStorageScopeKey
+  legacyComposerStorageScopeKey,
+  registerComposerStorageScopeAlias,
+  resolveComposerStorageScopeKey
 } from './composer-storage-scope'
 
 const remoteOwner = { connectionId: ' source-a ', profile: ' omar ' }
@@ -74,5 +78,28 @@ describe('composer storage scope codec', () => {
     expect(encodeComposerStorageScopeKey(owner, 'stored-a', 7)).toBe(
       encodeComposerStorageScopeKey(owner, 'stored-a', 0)
     )
+  })
+})
+
+describe('composer storage scope aliases', () => {
+  afterEach(() => {
+    _resetComposerStorageScopeAliasesForTests()
+  })
+
+  it('reloads a same-owner migration alias persisted by another renderer window', () => {
+    const owner = { connectionId: 'source-a', profile: 'omar' }
+    const retired = encodeComposerStorageScopeKey(owner, null, 7)
+    const live = encodeComposerStorageScopeKey(owner, 'stored-live')
+
+    registerComposerStorageScopeAlias(retired, live)
+    const persisted = window.localStorage.getItem('hermes.desktop.composerStorageScopeAliases.v1')
+
+    expect(persisted).toBeTruthy()
+
+    _resetComposerStorageScopeAliasesForTests()
+    window.localStorage.setItem('hermes.desktop.composerStorageScopeAliases.v1', String(persisted))
+    _reloadComposerStorageScopeAliasesForTests()
+
+    expect(resolveComposerStorageScopeKey(retired)).toBe(live)
   })
 })

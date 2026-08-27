@@ -150,8 +150,7 @@ if (typeof window !== 'undefined') {
   })
 }
 
-const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
-  const current = load()
+const writeSessionSnapshot = (current: QueueState, sid: string, queue: QueuedPromptEntry[]) => {
   const next = { ...current }
 
   if (queue.length === 0) {
@@ -165,6 +164,18 @@ const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
 
   $queuedPromptsBySession.set(next)
   save(next)
+}
+
+const mutateSession = <T>(
+  sid: string,
+  mutation: (queue: QueuedPromptEntry[]) => { next: QueuedPromptEntry[]; result: T }
+): T => {
+  const current = load()
+  const { next, result } = mutation(current[sid] ?? [])
+
+  writeSessionSnapshot(current, sid, next)
+
+  return result
 }
 
 const sidOf = (key: string | null | undefined): null | string => {
@@ -209,7 +220,7 @@ export const enqueueQueuedPrompt = (
     queuedAt: Date.now()
   }
 
-  writeSession(sid, [...queueFor(sid), entry])
+  mutateSession(sid, queue => ({ next: [...queue, entry], result: undefined }))
   // Queueing a new prompt is fresh intent to keep the conversation moving —
   // a park from an earlier Stop must not hold this (or the entries ahead of
   // it) back.
@@ -225,15 +236,11 @@ export const dequeueQueuedPrompt = (key: string | null | undefined): null | Queu
     return null
   }
 
-  const [head, ...rest] = queueFor(sid)
+  return mutateSession(sid, queue => {
+    const [head, ...rest] = queue
 
-  if (!head) {
-    return null
-  }
-
-  writeSession(sid, rest)
-
-  return head
+    return { next: head ? rest : queue, result: head ?? null }
+  })
 }
 
 export const removeQueuedPrompt = (key: string | null | undefined, id: string): boolean => {
@@ -243,16 +250,11 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
     return false
   }
 
-  const queue = queueFor(sid)
-  const next = queue.filter(e => e.id !== id)
+  return mutateSession(sid, queue => {
+    const next = queue.filter(entry => entry.id !== id)
 
-  if (next.length === queue.length) {
-    return false
-  }
-
-  writeSession(sid, next)
-
-  return true
+    return { next, result: next.length !== queue.length }
+  })
 }
 
 export const promoteQueuedPrompt = (key: string | null | undefined, id: string): boolean => {
@@ -262,17 +264,17 @@ export const promoteQueuedPrompt = (key: string | null | undefined, id: string):
     return false
   }
 
-  const queue = queueFor(sid)
-  const index = queue.findIndex(e => e.id === id)
+  return mutateSession(sid, queue => {
+    const index = queue.findIndex(entry => entry.id === id)
 
-  if (index <= 0) {
-    return false
-  }
+    if (index <= 0) {
+      return { next: queue, result: false }
+    }
 
-  const entry = queue[index]!
-  writeSession(sid, [entry, ...queue.slice(0, index), ...queue.slice(index + 1)])
+    const entry = queue[index]!
 
-  return true
+    return { next: [entry, ...queue.slice(0, index), ...queue.slice(index + 1)], result: true }
+  })
 }
 
 export const updateQueuedPrompt = (
@@ -286,37 +288,32 @@ export const updateQueuedPrompt = (
     return false
   }
 
-  const queue = queueFor(sid)
-  let changed = false
+  return mutateSession(sid, queue => {
+    let changed = false
 
-  const next = queue.map(entry => {
-    if (entry.id !== id) {
-      return entry
-    }
+    const next = queue.map(entry => {
+      if (entry.id !== id) {
+        return entry
+      }
 
-    const attachments = update.attachments ? cloneAttachments(update.attachments) : entry.attachments
+      const attachments = update.attachments ? cloneAttachments(update.attachments) : entry.attachments
 
-    if (entry.text === update.text && !update.attachments) {
-      return entry
-    }
+      if (entry.text === update.text && !update.attachments) {
+        return entry
+      }
 
-    changed = true
+      changed = true
 
-    // The user rewrote the text, so any display projection it carried (a
-    // `/skill` invocation standing in for the expanded body) no longer
-    // describes it — what they typed is now what sends.
-    const { displayText: _dropped, ...rest } = entry
+      // The user rewrote the text, so any display projection it carried (a
+      // `/skill` invocation standing in for the expanded body) no longer
+      // describes it — what they typed is now what sends.
+      const { displayText: _dropped, ...rest } = entry
 
-    return { ...rest, text: update.text, attachments }
+      return { ...rest, text: update.text, attachments }
+    })
+
+    return { next, result: changed }
   })
-
-  if (!changed) {
-    return false
-  }
-
-  writeSession(sid, next)
-
-  return true
 }
 
 export const updateQueuedPromptText = (key: string | null | undefined, id: string, text: string): boolean =>
@@ -325,11 +322,11 @@ export const updateQueuedPromptText = (key: string | null | undefined, id: strin
 export const clearQueuedPrompts = (key: string | null | undefined) => {
   const sid = sidOf(key)
 
-  if (!sid || !(sid in $queuedPromptsBySession.get())) {
+  if (!sid) {
     return
   }
 
-  writeSession(sid, [])
+  mutateSession(sid, () => ({ next: [], result: undefined }))
 }
 
 export function clearQueuedPromptsForOwnerLineage(
@@ -361,23 +358,23 @@ export function clearQueuedPromptsForOwnerLineage(
  * entries enqueued under the old id would otherwise be stranded under a key
  * nothing reads anymore. No-op unless both keys resolve and differ.
  */
-export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: string | null | undefined): boolean => {
-  const from = sidOf(fromKey)
-  const to = sidOf(toKey)
-
+export function migrateQueuedPromptsExact(from: string, to: string): boolean {
   if (!from || !to || from === to) {
     return false
   }
 
-  const pending = queueFor(from)
+  const current = load()
+  const pending = current[from] ?? []
 
   if (pending.length === 0) {
+    $queuedPromptsBySession.set(current)
+
     return false
   }
 
-  const next = { ...$queuedPromptsBySession.get() }
+  const next = { ...current }
   delete next[from]
-  next[to] = [...queueFor(to), ...pending]
+  next[to] = [...(current[to] ?? []), ...pending]
 
   $queuedPromptsBySession.set(next)
   save(next)
@@ -393,6 +390,13 @@ export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: 
   return true
 }
 
+export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: string | null | undefined): boolean => {
+  const from = sidOf(fromKey)
+  const to = sidOf(toKey)
+
+  return from && to ? migrateQueuedPromptsExact(from, to) : false
+}
+
 /**
  * Park a session's queue after an explicit user halt (Stop / Esc): entries stay
  * visible in the panel but neither auto-drain path sends them. No-op for a
@@ -402,10 +406,13 @@ export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: 
 export const parkQueuedPrompts = (key: string | null | undefined): boolean => {
   const sid = sidOf(key)
 
-  if (!sid || queueFor(sid).length === 0) {
+  const current = sid ? load() : null
+
+  if (!sid || !current || (current[sid] ?? []).length === 0) {
     return false
   }
 
+  $queuedPromptsBySession.set(current)
   setParked(sid, true)
 
   return true
