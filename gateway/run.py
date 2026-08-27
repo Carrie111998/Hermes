@@ -11370,6 +11370,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
 
+    @staticmethod
+    def _validate_restart_failure_counts(counts) -> None:
+        """Reject ledgers whose retry evidence cannot be interpreted safely."""
+        if not isinstance(counts, dict):
+            raise ValueError("restart failure ledger must be a JSON object")
+        if any(
+            not isinstance(key, str)
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for key, value in counts.items()
+        ):
+            raise ValueError("restart failure ledger contains an invalid count")
+
     def _increment_restart_failure_counts(self, active_session_keys: set) -> None:
         """Increment restart-failure counters for sessions active at shutdown.
 
@@ -11426,8 +11440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         path = _hermes_home / self._STUCK_LOOP_FILE
         try:
             counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            if not isinstance(counts, dict):
-                raise ValueError("restart failure ledger must be a JSON object")
+            self._validate_restart_failure_counts(counts)
         except Exception:
             logger.warning(
                 "Refusing startup auto-resume for %s: restart failure ledger "
@@ -11437,15 +11450,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
-        previous = counts.get(session_key, 0)
-        if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
-            logger.warning(
-                "Refusing startup auto-resume for %s: restart failure count "
-                "is invalid",
-                session_key,
-            )
-            return False
-        counts[session_key] = previous + 1
+        counts[session_key] = counts.get(session_key, 0) + 1
         try:
             atomic_json_write(path, counts, indent=None)
             self.__dict__.setdefault("_startup_resume_attempt_keys", set()).add(
@@ -11475,7 +11480,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             counts = json.loads(path.read_text(encoding="utf-8"))
+            self._validate_restart_failure_counts(counts)
         except Exception:
+            logger.warning(
+                "Could not evaluate restart failure ledger; preserving it unchanged",
+                exc_info=True,
+            )
             return 0
 
         suspended = 0

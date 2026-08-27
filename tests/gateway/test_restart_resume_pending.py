@@ -1075,6 +1075,41 @@ class TestStuckLoopEscalation:
         assert counts_file.read_text(encoding="utf-8") == malformed
 
     @pytest.mark.asyncio
+    async def test_startup_resume_rejects_malformed_sibling_count(
+        self, tmp_path, monkeypatch
+    ):
+        """One poisoned row must not disable another session's retry bound."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="malformed-sibling")
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:malformed-sibling",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+        adapter.handle_message = AsyncMock()
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        malformed_counts = {"poisoned-session": "invalid", entry.session_key: 2}
+        counts_file.write_text(json.dumps(malformed_counts), encoding="utf-8")
+
+        assert runner._suspend_stuck_loop_sessions() == 0
+        assert runner._schedule_resume_pending_sessions() == 0
+        adapter.handle_message.assert_not_awaited()
+        assert json.loads(counts_file.read_text(encoding="utf-8")) == malformed_counts
+
+    @pytest.mark.asyncio
     async def test_startup_resume_dispatches_after_persisted_attempt(
         self, tmp_path, monkeypatch
     ):
