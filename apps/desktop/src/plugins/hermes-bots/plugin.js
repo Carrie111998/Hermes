@@ -1698,12 +1698,25 @@ async function withHostedRoomProbeTimeout(task, timeoutMs = 3000) {
   }
 }
 
-function hostedMemberDescriptors(room, connectionId, connectionLabel, sources = []) {
+function hostedMemberDescriptors(room, connectionId, connectionLabel, sources = [], capabilities = {}) {
+  const sourceRows = Array.isArray(sources) ? sources : []
+  const byConnection = new Map(sourceRows.map(source => [String(source?.connectionId || ''), source]))
   const byInstall = new Map(
-    (Array.isArray(sources) ? sources : [])
-      .filter(source => source?.installId)
-      .map(source => [String(source.installId), source])
+    sourceRows.filter(source => source?.installId).map(source => [String(source.installId), source])
   )
+
+  // Registered gateway rows do not own installation ids. Those ids are part
+  // of the authenticated RoomLink catalog, so join the two maps by the local
+  // connection id before resolving peer descriptors. Without this bridge a
+  // live peer is mirrored as both its real roster row and an unavailable ghost.
+  for (const [sourceConnectionId, capability] of Object.entries(capabilities || {})) {
+    const installId = capability?.roomLink?.catalog?.installationId
+    const source = byConnection.get(String(sourceConnectionId || ''))
+
+    if (installId && source) {
+      byInstall.set(String(installId), source)
+    }
+  }
   return (Array.isArray(room?.members) ? room.members : []).map(member => {
     const target = member?.target
     const peer = target?.kind === 'peer'
@@ -1897,7 +1910,8 @@ async function refreshHostedRooms() {
               roomState,
               connectionId,
               label,
-              [...sources.values()]
+              [...sources.values()],
+              capabilities
             ),
             log: mergeGroupChatSyncEntries(room.log || [], replayState.messages || []).map(
               entry => (groupChatSyncSequence(entry) !== null ? { ...entry, pending: false } : entry)

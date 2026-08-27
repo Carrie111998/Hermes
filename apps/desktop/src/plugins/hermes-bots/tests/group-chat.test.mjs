@@ -2560,7 +2560,7 @@ test('outbox acknowledgement cannot overwrite a command enqueued in flight', () 
   )
 })
 
-test('hosted member descriptors preserve the authority member id for approvals', () => {
+test('hosted member descriptors preserve identity and resolve peers through negotiated catalogs', () => {
   const gc = load(() => '(pass)')
   const [member] = gc.hostedMemberDescriptors(
     {
@@ -2579,11 +2579,17 @@ test('hosted member descriptors preserve the authority member id for approvals',
     },
     'home-connection',
     'Home',
-    [{ installId: 'install-peer', connectionId: 'peer-connection', label: 'Peer' }]
+    [{ connectionId: 'peer-connection', label: 'Peer' }],
+    {
+      'peer-connection': {
+        roomLink: { catalog: { installationId: 'install-peer' } }
+      }
+    }
   )
 
   assert.equal(member.memberId, 'member-2-reviewer')
   assert.equal(member.connectionId, 'peer-connection')
+  assert.equal(member.sourceMissing, false)
 })
 
 test('durableGroupChatRooms excludes tombstoned rooms — the remote-merge persist path\'s own durable-map builder, independent of updateGroupChat\'s inline one', () => {
