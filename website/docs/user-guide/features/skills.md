@@ -602,6 +602,17 @@ reviewed with the same familiar approve/deny flow as dangerous commands:
 /skills approval on         # turn the gate on (or 'off') and persist it
 ```
 
+New proposals record the exact target state they were based on. Approval
+rechecks that state **at the write itself** (under a per-skill cross-process
+lease shared with the Desktop editor) and refuses the write if the skill
+changed meanwhile; conflicted records remain pending for diff review or
+rejection. If a security scan later rejects a write, Hermes restores the
+previous bytes only when it still owns what it published — a newer Desktop
+edit that landed during the scan is left in place. Legacy records created
+without a target-state precondition also remain reviewable and rejectable,
+but fail closed on approval because Hermes cannot prove that replaying them
+would preserve newer work.
+
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or
 in the pending JSON file). Memory writes have the same gate under

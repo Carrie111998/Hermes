@@ -112,7 +112,8 @@ def _pending_dir(subsystem: str) -> Path:
 
 
 def stage_write(subsystem: str, payload: Dict[str, Any],
-                *, summary: str, origin: str) -> Dict[str, Any]:
+                *, summary: str, origin: str,
+                precondition: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
 
     Args:
@@ -124,6 +125,9 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
             For skills this is the LLM/heuristic gist; for memory it can be the
             entry text itself.
         origin: ``foreground`` or ``background_review`` — recorded for audit.
+        precondition: optional snapshot of the target state that must still
+            match when the write is approved. Skill writes always provide one;
+            older records without one are intentionally treated as unsafe.
 
     Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
     logs and still returns a record (the write is simply lost, which is the
@@ -139,6 +143,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    if precondition is not None:
+        record["precondition"] = precondition
     try:
         d = _pending_dir(subsystem)
         d.mkdir(parents=True, exist_ok=True)
@@ -395,7 +401,7 @@ def skill_gist(action: str, name: str, *, content: str = "",
     dashboard/file). For create/edit it pulls the frontmatter ``description:``;
     for patch/write_file it describes the size of the change.
     """
-    if action in {"create", "edit"} and content:
+    if (action in {"create", "edit"} or action == "patch") and content:
         desc = _frontmatter_description(content)
         size = f"{len(content) // 1024 + 1} KB" if len(content) >= 1024 else f"{len(content)} chars"
         verb = "create" if action == "create" else "rewrite"
@@ -468,7 +474,7 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
             except Exception:
                 current = ""
 
-    if action == "edit":
+    if action == "edit" or (action == "patch" and payload.get("content") is not None):
         new = payload.get("content") or ""
     elif action == "patch":
         old_s = payload.get("old_string") or ""

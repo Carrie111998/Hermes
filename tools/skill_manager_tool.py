@@ -34,9 +34,9 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
-import threading
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,69 +50,24 @@ from agent.skill_utils import (
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT,
 )
+from tools import skill_mutation_authority as _mutation_authority
+from tools.skill_review_context import (
+    background_review_has_read as _background_review_has_read,
+    mark_background_review_skill_read,
+    reset_background_review_read_marks as _reset_background_review_read_marks,
+)
+
+
+_skill_mutation_lease = _mutation_authority.skill_mutation_lease
+_mutation_lock_timeout_error = _mutation_authority.mutation_lock_timeout_error
+_snapshot_path_state = _mutation_authority.snapshot_path_state
+_logical_skill_name_identity = _mutation_authority.logical_skill_name_identity
+_security_scan_rejection = _mutation_authority.security_scan_rejection
+_fire_during_skill_security_scan = _mutation_authority.fire_during_skill_security_scan
+_rollback_path_if_still_published = _mutation_authority.rollback_path_if_still_published
+_rollback_created_tree_if_still_published = _mutation_authority.rollback_created_tree_if_still_published
 
 logger = logging.getLogger(__name__)
-
-class _BackgroundReviewReadMarks:
-    """Read marks shared by copied tool contexts within one review run."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._paths: set[str] = set()
-
-    def add(self, path: str) -> None:
-        with self._lock:
-            self._paths.add(path)
-
-    def contains(self, path: str) -> bool:
-        with self._lock:
-            return path in self._paths
-
-
-_background_review_read_paths: (
-    "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]"
-) = _ctxvars.ContextVar("background_review_read_paths", default=None)
-
-
-def mark_background_review_skill_read(path: Path) -> None:
-    """Record that the active background-review fork has read a skill file.
-
-    The autonomous review fork is allowed to evolve skills, but it must not
-    patch or rewrite content it has only inferred from the transcript.  The
-    skill_view tool calls this after returning file content to the model; write
-    paths below require the corresponding target path to be present when the
-    current origin is ``background_review``.
-    """
-    try:
-        from tools.skill_provenance import is_background_review
-        if not is_background_review():
-            return
-    except Exception:
-        return
-
-    try:
-        resolved = str(path.resolve())
-    except Exception:
-        resolved = str(path)
-    marks = _background_review_read_paths.get()
-    if marks is None:
-        marks = _BackgroundReviewReadMarks()
-        _background_review_read_paths.set(marks)
-    marks.add(resolved)
-
-
-def _background_review_has_read(path: Path) -> bool:
-    try:
-        resolved = str(path.resolve())
-    except Exception:
-        resolved = str(path)
-    marks = _background_review_read_paths.get()
-    return marks is not None and marks.contains(resolved)
-
-
-def _reset_background_review_read_marks() -> None:
-    """Start a fresh, isolated read set for the current review context."""
-    _background_review_read_paths.set(_BackgroundReviewReadMarks())
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
@@ -967,20 +922,43 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
 
-    # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
-    skill_dir.mkdir(parents=True, exist_ok=True)
+    with _skill_mutation_lease(_logical_skill_name_identity(name)) as admitted:
+        if not admitted:
+            return _mutation_lock_timeout_error()
+        existing = _find_skill(name)
+        if existing:
+            return {
+                "success": False,
+                "error": f"A skill named '{name}' already exists at {existing['path']}."
+            }
+        with _skill_mutation_lease(skill_dir) as target_admitted:
+            if not target_admitted:
+                return _mutation_lock_timeout_error()
+            stale = _refuse_if_pending_precondition_stale()
+            if stale:
+                return stale
+            existing = _find_skill(name)
+            if existing:
+                return {
+                    "success": False,
+                    "error": (
+                        f"A skill named '{name}' already exists at "
+                        f"{existing['path']}."
+                    ),
+                }
 
-    # Write instructional documents with a readable mode while preserving
-    # the mode of an existing file across the atomic replacement.
-    skill_md = skill_dir / "SKILL.md"
-    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
-
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
-    if scan_error:
-        shutil.rmtree(skill_dir, ignore_errors=True)
-        return {"success": False, "error": scan_error}
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            skill_md = skill_dir / "SKILL.md"
+            atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
+            published_state = _snapshot_path_state(skill_dir)
+            _fire_during_skill_security_scan()
+            scan_error = _security_scan_skill(skill_dir)
+            if scan_error:
+                settlement = _rollback_created_tree_if_still_published(
+                    skill_dir, published_state
+                )
+                return _security_scan_rejection(scan_error, settlement)
 
     # Extract description from frontmatter for verbose notifications
     _desc = ""
@@ -1059,22 +1037,33 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         return guard
 
     skill_md = existing["path"] / "SKILL.md"
+    skill_dir = existing["path"]
     read_guard = _background_review_read_before_write_guard(
         name, skill_md, "edit", "SKILL.md"
     )
     if read_guard:
         return read_guard
 
-    # Back up original content for rollback
-    original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
-
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
-        if original_content is not None:
-            atomic_write_text(skill_md, original_content, preserve_mode=True)
-        return {"success": False, "error": scan_error}
+    with _skill_mutation_lease(skill_dir) as admitted:
+        if not admitted:
+            return _mutation_lock_timeout_error()
+        stale = _refuse_if_pending_precondition_stale()
+        if stale:
+            return stale
+        original_state = _snapshot_path_state(skill_md)
+        original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+        atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
+        published_state = _snapshot_path_state(skill_md)
+        _fire_during_skill_security_scan()
+        scan_error = _security_scan_skill(skill_dir)
+        if scan_error:
+            settlement = _rollback_path_if_still_published(
+                skill_md,
+                published_state,
+                original_content,
+                original_state,
+            )
+            return _security_scan_rejection(scan_error, settlement)
 
     # Extract description from new content for verbose notifications
     _desc = ""
@@ -1142,67 +1131,90 @@ def _patch_skill(
         # Patching SKILL.md
         target = skill_dir / "SKILL.md"
 
-    if not target.exists():
-        return {"success": False, "error": f"File not found: {target.relative_to(skill_dir)}"}
-
-    read_guard = _background_review_read_before_write_guard(
-        name,
-        target,
-        "patch",
-        "SKILL.md" if not file_path else file_path,
-    )
-    if read_guard:
-        return read_guard
-
-    content = target.read_text(encoding="utf-8")
-
-    # Use the same fuzzy matching engine as the file patch tool.
-    # This handles whitespace normalization, indentation differences,
-    # escape sequences, and block-anchor matching — saving the agent
-    # from exact-match failures on minor formatting mismatches.
-    from tools.fuzzy_match import fuzzy_find_and_replace
-
-    new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
-        content, old_string, new_string, replace_all
-    )
-    if match_error:
-        # Show a short preview of the file so the model can self-correct
-        preview = content[:500] + ("..." if len(content) > 500 else "")
-        err_msg = match_error
-        try:
-            from tools.fuzzy_match import format_no_match_hint
-            err_msg += format_no_match_hint(match_error, match_count, old_string, content)
-        except Exception:
-            pass
-        return {
-            "success": False,
-            "error": err_msg,
-            "file_preview": preview,
-        }
-
-    # Check size limit on the result
     target_label = "SKILL.md" if not file_path else file_path
-    err = _validate_content_size(new_content, label=target_label)
-    if err:
-        return {"success": False, "error": err}
+    with _skill_mutation_lease(skill_dir) as admitted:
+        if not admitted:
+            return _mutation_lock_timeout_error()
+        stale = _refuse_if_pending_precondition_stale()
+        if stale:
+            return stale
 
-    # If patching SKILL.md, validate frontmatter is still intact
-    if not file_path:
-        err = _validate_frontmatter(new_content)
-        if err:
+        # The lease covers the complete read-modify-write transaction.  A
+        # targeted patch derived before admission can overwrite a successful
+        # concurrent patch even when publication itself is serialized.
+        if not target.exists():
             return {
                 "success": False,
-                "error": f"Patch would break SKILL.md structure: {err}",
+                "error": f"File not found: {target.relative_to(skill_dir)}",
             }
 
-    original_content = content  # for rollback
-    atomic_write_text(target, new_content, preserve_mode=True, create_mode=0o644)
+        read_guard = _background_review_read_before_write_guard(
+            name,
+            target,
+            "patch",
+            target_label,
+        )
+        if read_guard:
+            return read_guard
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
-    if scan_error:
-        atomic_write_text(target, original_content, preserve_mode=True)
-        return {"success": False, "error": scan_error}
+        content = target.read_text(encoding="utf-8")
+
+        # Use the same fuzzy matching engine as the file patch tool.
+        # This handles whitespace normalization, indentation differences,
+        # escape sequences, and block-anchor matching — saving the agent
+        # from exact-match failures on minor formatting mismatches.
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
+            content, old_string, new_string, replace_all
+        )
+        if match_error:
+            # Show a short preview of the file so the model can self-correct
+            preview = content[:500] + ("..." if len(content) > 500 else "")
+            err_msg = match_error
+            try:
+                from tools.fuzzy_match import format_no_match_hint
+
+                err_msg += format_no_match_hint(
+                    match_error, match_count, old_string, content
+                )
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "error": err_msg,
+                "file_preview": preview,
+            }
+
+        err = _validate_content_size(new_content, label=target_label)
+        if err:
+            return {"success": False, "error": err}
+
+        if not file_path:
+            err = _validate_frontmatter(new_content)
+            if err:
+                return {
+                    "success": False,
+                    "error": f"Patch would break SKILL.md structure: {err}",
+                }
+
+        original_content = content
+        original_skill_state = _snapshot_path_state(skill_dir)
+        original_state = _snapshot_path_state(target)
+        atomic_write_text(target, new_content, preserve_mode=True, create_mode=0o644)
+        published_state = _snapshot_path_state(target)
+        _fire_during_skill_security_scan()
+        scan_error = _security_scan_skill(skill_dir)
+        if scan_error:
+            settlement = _rollback_path_if_still_published(
+                target,
+                published_state,
+                original_content,
+                original_state,
+                verification_root=skill_dir,
+                original_root_state=original_skill_state,
+            )
+            return _security_scan_rejection(scan_error, settlement)
 
     result = {
         "success": True,
@@ -1311,12 +1323,18 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             message += f" Content absorbed into '{absorbed_target}'."
         return {"success": True, "message": message, "_archived": True}
 
-    shutil.rmtree(skill_dir)
+    with _skill_mutation_lease(skill_dir) as admitted:
+        if not admitted:
+            return _mutation_lock_timeout_error()
+        stale = _refuse_if_pending_precondition_stale()
+        if stale:
+            return stale
+        shutil.rmtree(skill_dir)
 
-    # Clean up empty category directories (don't remove the skills root itself)
-    parent = skill_dir.parent
-    if parent != skills_root and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
+        # Clean up empty category directories (don't remove the skills root itself)
+        parent = skill_dir.parent
+        if parent != skills_root and parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
 
     message = f"Skill '{name}' deleted."
     if is_consolidation:
@@ -1372,19 +1390,31 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         )
         if read_guard:
             return read_guard
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Back up for rollback
-    original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    atomic_write_text(target, file_content, preserve_mode=True, create_mode=0o644)
-
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
-        if original_content is not None:
-            atomic_write_text(target, original_content, preserve_mode=True)
-        else:
-            target.unlink(missing_ok=True)
-        return {"success": False, "error": scan_error}
+    skill_dir = existing["path"]
+    with _skill_mutation_lease(skill_dir) as admitted:
+        if not admitted:
+            return _mutation_lock_timeout_error()
+        stale = _refuse_if_pending_precondition_stale()
+        if stale:
+            return stale
+        original_skill_state = _snapshot_path_state(skill_dir)
+        original_state = _snapshot_path_state(target)
+        original_content = target.read_text(encoding="utf-8") if target.exists() else None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, file_content, preserve_mode=True, create_mode=0o644)
+        published_state = _snapshot_path_state(target)
+        _fire_during_skill_security_scan()
+        scan_error = _security_scan_skill(skill_dir)
+        if scan_error:
+            settlement = _rollback_path_if_still_published(
+                target,
+                published_state,
+                original_content,
+                original_state,
+                verification_root=skill_dir,
+                original_root_state=original_skill_state,
+            )
+            return _security_scan_rejection(scan_error, settlement)
 
     result = {
         "success": True,
@@ -1438,12 +1468,18 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     if read_guard:
         return read_guard
 
-    target.unlink()
+    with _skill_mutation_lease(skill_dir) as admitted:
+        if not admitted:
+            return _mutation_lock_timeout_error()
+        stale = _refuse_if_pending_precondition_stale()
+        if stale:
+            return stale
+        target.unlink()
 
-    # Clean up empty subdirectories
-    parent = target.parent
-    if parent != skill_dir and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
+        # Clean up empty subdirectories
+        parent = target.parent
+        if parent != skill_dir and parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
 
     return {
         "success": True,
@@ -1457,68 +1493,105 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 
 # ContextVar bypass: set while replaying an already-approved staged skill write
 # so skill_manage() does not re-gate (and re-stage) it.
-import contextvars as _ctxvars
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False
 )
 
+def _refuse_if_pending_precondition_stale() -> Optional[Dict[str, Any]]:
+    return _mutation_authority.refuse_if_pending_precondition_stale(
+        _capture_pending_skill_precondition
+    )
+
+
+def _pending_skill_target(
+    action: str,
+    name: str,
+    *,
+    content: Optional[str] = None,
+    category: Optional[str] = None,
+    file_path: Optional[str] = None,
+) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve the exact filesystem target a pending mutation can replace."""
+    err = _validate_name(name)
+    if err:
+        return None, err
+
+    existing = _find_skill(name)
+    if action == "create":
+        err = _validate_category(category)
+        if err:
+            return None, err
+        if existing:
+            target = existing["path"]
+        elif category:
+            target = _resolve_skill_dir(name, category)
+        else:
+            target = _resolve_skill_dir(name)
+        return target, None
+
+    if not existing:
+        # Capture absence by logical skill name. A newly-created skill anywhere
+        # in the active search roots will resolve to a different target/state
+        # when the precondition is checked at approval time.
+        return _skills_dir() / name, None
+
+    skill_dir = existing["path"]
+    if action == "delete":
+        return skill_dir, None
+    if action == "edit" or (action == "patch" and content is not None):
+        return skill_dir / "SKILL.md", None
+    if action == "patch" and not file_path:
+        return skill_dir / "SKILL.md", None
+
+    if not file_path:
+        return None, "file_path is required."
+    err = _validate_file_path(file_path)
+    if err:
+        return None, err
+    target, err = _resolve_skill_target(skill_dir, file_path)
+    return target, err
+
+
+def _capture_pending_skill_precondition(
+    action: str,
+    name: str,
+    **payload_kwargs,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    target, err = _pending_skill_target(
+        action,
+        name,
+        content=payload_kwargs.get("content"),
+        category=payload_kwargs.get("category"),
+        file_path=payload_kwargs.get("file_path"),
+    )
+    if err or target is None:
+        return None, err or "could not resolve the pending skill target"
+    return _mutation_authority.capture_pending_precondition(target)
+
 
 def _apply_skill_write_gate(action, name, **payload_kwargs):
-    """Evaluate the skill write gate. Returns a JSON tool-result string when the
-    write should NOT proceed (blocked or staged), or None to perform the real
-    write. Bypassed during approved-pending replay.
-    """
-    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
-        return None
-    if _skill_gate_bypass.get():
-        return None
-
-    try:
-        from tools import write_approval as wa
-    except Exception:
-        return None  # fail open
-
-    decision = wa.evaluate_gate(wa.SKILLS)
-    if decision.allow:
-        return None
-    if decision.blocked:
-        return tool_error(decision.message, success=False)
-
-    # stage — record the full skill_manage kwargs so approval can replay it.
-    payload = {"action": action, "name": name}
-    payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
-    gist = wa.skill_gist(
-        action, name,
-        content=payload_kwargs.get("content") or "",
-        file_path=payload_kwargs.get("file_path") or "",
-        old_string=payload_kwargs.get("old_string") or "",
-        new_string=payload_kwargs.get("new_string") or "",
-    )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "gist": gist, "message": decision.message},
-        ensure_ascii=False,
+    return _mutation_authority.stage_or_allow_skill_write(
+        action,
+        name,
+        payload_kwargs,
+        bypass=_skill_gate_bypass.get(),
+        capture_pending_precondition=_capture_pending_skill_precondition,
     )
 
 
-def apply_skill_pending(payload: Dict[str, Any]) -> str:
-    """Replay a staged skill write, bypassing the gate. Returns the tool result
-    JSON string. Called by the /skills approve handler.
-    """
+def apply_skill_pending(
+    payload: Dict[str, Any],
+    *,
+    precondition: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Replay a staged skill write through the mutation authority."""
     token = _skill_gate_bypass.set(True)
     try:
-        return skill_manage(
-            action=payload.get("action", ""),
-            name=payload.get("name", ""),
-            content=payload.get("content"),
-            category=payload.get("category"),
-            file_path=payload.get("file_path"),
-            file_content=payload.get("file_content"),
-            old_string=payload.get("old_string"),
-            new_string=payload.get("new_string"),
-            replace_all=payload.get("replace_all", False),
-            absorbed_into=payload.get("absorbed_into"),
+        return _mutation_authority.apply_pending_skill_write(
+            payload,
+            precondition,
+            capture_pending_precondition=_capture_pending_skill_precondition,
+            mutate=skill_manage,
         )
     finally:
         _skill_gate_bypass.reset(token)
