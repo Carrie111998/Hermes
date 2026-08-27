@@ -491,6 +491,10 @@ def test_crash_recovery_harvests_existing_terminal_receipt(db: Path):
 
 def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
     identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,
@@ -498,7 +502,7 @@ def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
         authority_epoch=BINDING.authority_epoch,
         process_generation="old-process",
         ttl_seconds=0.2,
-        clock=time.time,
+        clock=clock,
     )
     _admit(db, identity)
     state.start_task(
@@ -506,7 +510,7 @@ def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
         identity,
         old_lease,
         expected_cancel_generation=0,
-        clock=time.time,
+        clock=clock,
     )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(
@@ -522,8 +526,8 @@ def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
             }
         ],
     )
-    time.sleep(0.22)
-    runtime = _runtime(db, rpc)
+    now[0] = 101.0
+    runtime = _runtime(db, rpc, clock=clock)
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
@@ -537,6 +541,10 @@ def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
 
 def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
     identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,
@@ -544,7 +552,7 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
         authority_epoch=BINDING.authority_epoch,
         process_generation="old-process",
         ttl_seconds=0.2,
-        clock=time.time,
+        clock=clock,
     )
     _admit(db, identity)
     old_attempt = state.start_task(
@@ -552,9 +560,9 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
         identity,
         old_lease,
         expected_cancel_generation=0,
-        clock=time.time,
+        clock=clock,
     )
-    time.sleep(0.22)
+    now[0] = 101.0
     current_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,
@@ -562,18 +570,18 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
         authority_epoch=BINDING.authority_epoch,
         process_generation="manual-recovery",
         ttl_seconds=30,
-        clock=time.time,
+        clock=clock,
     )
-    state.recover_room(db, current_lease, clock=time.time)
+    state.recover_room(db, current_lease, clock=clock)
     state.requeue_indeterminate_task(
         db,
         identity,
         current_lease,
         expected_execution_generation=old_attempt.execution_generation,
         expected_cancel_generation=old_attempt.cancel_generation,
-        clock=time.time,
+        clock=clock,
     )
-    state.release_lease(db, current_lease, clock=time.time)
+    state.release_lease(db, current_lease, clock=clock)
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(
         task_id=identity.task_id,
@@ -588,7 +596,7 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
             }
         ],
     )
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(db, rpc, clock=clock)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -634,6 +642,10 @@ def test_active_recovered_turn_is_never_resubmitted(db: Path):
 
 def test_ambiguous_recovery_remains_indeterminate(db: Path):
     identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,
@@ -641,7 +653,7 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
         authority_epoch=BINDING.authority_epoch,
         process_generation="old-process",
         ttl_seconds=0.2,
-        clock=time.time,
+        clock=clock,
     )
     _admit(db, identity)
     state.start_task(
@@ -649,12 +661,12 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
         identity,
         old_lease,
         expected_cancel_generation=0,
-        clock=time.time,
+        clock=clock,
     )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(active=False, task_id=identity.task_id)
-    time.sleep(0.22)
-    runtime = _runtime(db, rpc)
+    now[0] = 101.0
+    runtime = _runtime(db, rpc, clock=clock)
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "indeterminate")
