@@ -11559,6 +11559,75 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_LOCAL_KANBAN_PROVIDERS = frozenset({"ollama", "ollama-launch", "local"})
+
+
+def _local_route_candidates(raw: Any) -> list[Mapping[str, Any]]:
+    """Normalize a profile's configured model-route list for local selection."""
+    if isinstance(raw, Mapping):
+        return [raw]
+    if isinstance(raw, (list, tuple)):
+        return [item for item in raw if isinstance(item, Mapping)]
+    return []
+
+
+def _resolve_local_first_route(
+    profile_config: Optional[Mapping[str, Any]],
+) -> Optional[tuple[str, str]]:
+    """Return the first usable local route from a profile configuration.
+
+    Kanban workers receive task-owned paths, attachments, and tool results. A
+    remote primary therefore often cannot be authorized by the egress policy;
+    waiting for that rejection and then falling back wastes a full model turn.
+    When the operator enables ``kanban.local_first``, choose the profile's
+    already-configured local route before spawning. This function is pure so
+    route precedence is testable without starting a worker or contacting a
+    provider. Unknown providers are deliberately ignored.
+    """
+    if not isinstance(profile_config, Mapping):
+        return None
+
+    candidates: list[Mapping[str, Any]] = []
+    primary = profile_config.get("model")
+    candidates.extend(_local_route_candidates(primary))
+    # ``fallback_model`` is the effective profile fallback schema in current
+    # installs. ``fallback_providers`` remains supported for older profiles.
+    candidates.extend(_local_route_candidates(profile_config.get("fallback_model")))
+    candidates.extend(
+        _local_route_candidates(profile_config.get("fallback_providers"))
+    )
+    for entry in candidates:
+        provider = str(entry.get("provider") or "").strip().lower()
+        model = str(entry.get("model") or entry.get("default") or "").strip()
+        if provider in _LOCAL_KANBAN_PROVIDERS and model:
+            return provider, model
+
+    providers = profile_config.get("providers")
+    if isinstance(providers, Mapping):
+        for provider, raw_provider in providers.items():
+            provider_name = str(provider or "").strip().lower()
+            if provider_name not in _LOCAL_KANBAN_PROVIDERS:
+                continue
+            if not isinstance(raw_provider, Mapping):
+                continue
+            model = str(raw_provider.get("default_model") or "").strip()
+            if model:
+                return provider_name, model
+    return None
+
+
+def _kanban_local_first_enabled() -> bool:
+    """Read the explicit operator opt-in for local-first Kanban spawning."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return False
+    kanban = cfg.get("kanban") if isinstance(cfg, Mapping) else None
+    return bool(isinstance(kanban, Mapping) and kanban.get("local_first"))
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -11630,6 +11699,7 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    parsed_profile: Optional[Mapping[str, Any]] = None
     try:
         profile_home = resolve_profile_env(profile_arg)
         env["HERMES_HOME"] = profile_home
@@ -11644,7 +11714,9 @@ def _default_spawn(
             import yaml
 
             try:
-                parsed_profile = yaml.safe_load(profile_config.read_text(encoding="utf-8"))
+                parsed_profile = yaml.safe_load(
+                    profile_config.read_text(encoding="utf-8")
+                )
             except (OSError, yaml.YAMLError) as exc:
                 raise ValueError(
                     f"invalid profile config for {profile_arg}: {profile_config}: {exc}"
@@ -11807,7 +11879,25 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
+    local_first_route = (
+        _resolve_local_first_route(parsed_profile)
+        if _kanban_local_first_enabled()
+        else None
+    )
+    if local_first_route is not None:
+        # A task-level remote override is still subject to the operator's
+        # local-first policy. This avoids a guaranteed egress rejection for
+        # protected task context while preserving the configured profile route
+        # and fail-closed firewall for any later fallback attempt.
+        local_provider, local_model = local_first_route
+        _log.info(
+            "kanban worker %s: local-first route %s/%s selected before spawn",
+            task.id,
+            local_provider,
+            local_model,
+        )
+        cmd.extend(["-m", local_model, "--provider", local_provider])
+    elif task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
