@@ -31,14 +31,15 @@ import {
 
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter
+  stderr: EventEmitter
 }
 
-// A minimal stand-in for a spawned child process: an EventEmitter with a
-// stdout EventEmitter, matching the surface waitForDashboardPort consumes
-// (child.stdout.on('data'), child.on('exit'|'error') + the .off() teardown).
+// A minimal stand-in for a spawned child process: an EventEmitter with stdout
+// and stderr streams, matching the surface waitForDashboardPort consumes.
 function makeFakeChild(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
   child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
 
   return child
 }
@@ -92,11 +93,13 @@ test('resolves with the announced port', async () => {
   assert.equal(await p, 54321)
 })
 
-test('resolves with a HERMES_BACKEND_READY port (headless `serve`)', async () => {
+test('resolves with a HERMES_BACKEND_READY port emitted on stderr', async () => {
   const child = makeFakeChild()
   const p = waitForDashboardPort(child, 1000)
-  child.stdout.emit('data', 'HERMES_BACKEND_READY port=43210\n')
+  child.stderr.emit('data', 'HERMES_BACKEND_READY port=43210\r\n')
   assert.equal(await p, 43210)
+  assert.equal(child.stdout.listenerCount('data'), 0)
+  assert.equal(child.stderr.listenerCount('data'), 0)
 })
 
 test('parses the port even when the line arrives split across chunks', async () => {
@@ -105,6 +108,22 @@ test('parses the port even when the line arrives split across chunks', async () 
   child.stdout.emit('data', 'HERMES_DASHBOARD_READY po')
   child.stdout.emit('data', 'rt=8080\n')
   assert.equal(await p, 8080)
+})
+
+test('parses a stderr announcement split across chunks', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'HERMES_BACKEND_READY po')
+  child.stderr.emit('data', 'rt=8081\r\n')
+  assert.equal(await p, 8081)
+})
+
+test('does not combine fragments from stdout and stderr', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 20)
+  child.stdout.emit('data', 'HERMES_BACKEND_READY po')
+  child.stderr.emit('data', 'rt=8082\n')
+  await assert.rejects(p, /Timed out/)
 })
 
 test('rejects when the child exits before announcing', async () => {
@@ -132,10 +151,13 @@ test('rejects with the timeout message after the deadline', async () => {
 test('a late announcement after timeout does not throw (listeners torn down)', async () => {
   const child = makeFakeChild()
   await assert.rejects(waitForDashboardPort(child, 20), /Timed out/)
+  assert.equal(child.stdout.listenerCount('data'), 0)
+  assert.equal(child.stderr.listenerCount('data'), 0)
   // The orphaned backend may still print its READY line later; the watcher
   // must have detached so this emit is a no-op rather than a double-settle.
   assert.doesNotThrow(() => {
     child.stdout.emit('data', 'HERMES_DASHBOARD_READY port=9999\n')
+    child.stderr.emit('data', 'HERMES_BACKEND_READY port=9998\n')
   })
 })
 

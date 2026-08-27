@@ -35,7 +35,7 @@ function resolvePortAnnounceTimeoutMs(env = process.env) {
 }
 
 /**
- * Watch a child process's stdout for the `HERMES_(BACKEND|DASHBOARD)_READY
+ * Watch a child process's stdout and stderr for the `HERMES_(BACKEND|DASHBOARD)_READY
  * port=<N>` line that web_server.py prints after uvicorn binds its socket.
  *
  * Returns the parsed port. Rejects if:
@@ -53,7 +53,8 @@ function resolvePortAnnounceTimeoutMs(env = process.env) {
  */
 function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(), describeOutputTail = () => '') {
   return new Promise((resolve, reject) => {
-    let buf = ''
+    let stdoutBuf = ''
+    let stderrBuf = ''
     let done = false
 
     function cleanup() {
@@ -63,18 +64,24 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
 
       done = true
       clearTimeout(timer)
-      child.stdout.off('data', onData)
+      child.stdout.off('data', onStdoutData)
+      child.stderr.off('data', onStderrData)
       child.off('exit', onExit)
       child.off('error', onError)
     }
 
-    function onData(chunk) {
-      buf += chunk.toString()
-      let nl
+    function consume(chunk, stream) {
+      const combined = (stream === 'stdout' ? stdoutBuf : stderrBuf) + chunk.toString()
+      const lines = combined.split('\n')
+      const remainder = lines.pop() ?? ''
 
-      while ((nl = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, nl)
-        buf = buf.slice(nl + 1)
+      if (stream === 'stdout') {
+        stdoutBuf = remainder
+      } else {
+        stderrBuf = remainder
+      }
+
+      for (const line of lines) {
         const m = line.match(_READY_RE)
 
         if (m) {
@@ -84,6 +91,14 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
           return
         }
       }
+    }
+
+    function onStdoutData(chunk) {
+      consume(chunk, 'stdout')
+    }
+
+    function onStderrData(chunk) {
+      consume(chunk, 'stderr')
     }
 
     function onExit(code, signal) {
@@ -101,7 +116,8 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
       reject(new Error(`Timed out waiting for Hermes backend port announcement (${timeoutMs}ms)`))
     }, timeoutMs)
 
-    child.stdout.on('data', onData)
+    child.stdout.on('data', onStdoutData)
+    child.stderr.on('data', onStderrData)
     child.on('exit', onExit)
     child.on('error', onError)
   })
