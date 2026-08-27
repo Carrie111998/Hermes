@@ -649,7 +649,13 @@ describe('assistant-ui streaming renderer', () => {
     // instead of chaining it to the thread viewport.
     const { container, settle } = renderSettlingReasoning()
 
-    // Collapse the live preview first, then manually expand it (userOpen=true, isPreview=false).
+    // Settle the turn first — the "Thought" button only exists after settling.
+    settle()
+    await waitFor(() => {
+      expect(within(container).getByRole('button', { name: /thought/i })).toBeTruthy()
+    })
+
+    // Collapse the preview, then manually expand it (userOpen=true, isPreview=false).
     const toggle = within(container).getByRole('button', { name: /thought/i })
     fireEvent.click(toggle)
     await waitFor(() => {
