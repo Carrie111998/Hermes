@@ -176,6 +176,39 @@ class TestHonestRunSkipMessages:
         assert "paused" in (res["error"] or "").lower()
         assert "already being fired" not in (res["error"] or "").lower()
 
+    def test_paused_refusal_names_the_reason(self):
+        """The WHY, at the point of refusal (2026-08-26).
+
+        "Job is paused" alone sends the operator to jobs.json to find out
+        whether they hit a routine pause or a containment barrier — and the
+        barrier is exactly the case where guessing costs the most. On
+        2026-08-25 a Gate-2 barrier on jobflow-matcher was lifted and the job
+        published 20 score-bearing updates before the gate had landed.
+        """
+        from tools.cronjob_tools import _execute_job_now
+        from cron.jobs import pause_job
+
+        job = create_job(name="held job", schedule="0 7 * * *", prompt="x")
+        pause_job(job["id"], reason="Gate-2 containment barrier")
+
+        res = _execute_job_now(get_job(job["id"]))
+
+        assert res["claimed"] is False
+        assert "Gate-2 containment barrier" in (res["error"] or "")
+
+    def test_paused_refusal_says_so_when_no_reason_was_recorded(self):
+        """Silence about the reason must not read as "there wasn't one"."""
+        from tools.cronjob_tools import _execute_job_now
+        from cron.jobs import pause_job
+
+        job = create_job(name="held anonymously", schedule="0 7 * * *", prompt="x")
+        pause_job(job["id"])
+
+        res = _execute_job_now(get_job(job["id"]))
+
+        assert res["claimed"] is False
+        assert "no reason recorded" in (res["error"] or "").lower()
+
     def test_missing_job_not_reported_as_already_firing(self):
         from tools.cronjob_tools import _execute_job_now
 

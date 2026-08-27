@@ -25,11 +25,12 @@ record alone cannot tell you and each has its own test below:
     shape to the record after a first pause; only the event distinguishes
     them, and "was this eight pauses or one?" was the churn investigation's
     first unanswerable question.
-  * ``trigger_job`` implicitly ends a pause (it sets ``enabled: True`` and
-    clears the pause fields). Without an event on that path a reader joining
-    CRON_PAUSED to CRON_RESUMED sees an unterminated pause on a job that has
-    been running for days — worse than no trail, because it reads as a job
-    still contained.
+  * ``trigger_job`` used to implicitly end a pause (setting ``enabled: True``
+    and clearing the pause fields), which left a reader joining CRON_PAUSED to
+    CRON_RESUMED looking at an unterminated pause on a job that had been
+    running for days. Since 2026-08-26 it refuses a paused job outright, so
+    the span cannot be left open by that path at all — the tests below pin
+    the refusal rather than the compensating event.
   * A bus failure must never break a pause. The emit is best-effort in the
     same sense as ``emit_cron_triggered_safe``: the state mutation is already
     durable, so a bus outage costs an audit record and nothing else.
@@ -323,60 +324,116 @@ class TestResumeEmits:
 # ---------------------------------------------------------------------------
 
 
-class TestTriggerJobUnpause:
-    def test_triggering_a_paused_job_records_the_resume(self, store, bus):
+class TestTriggerJobRefusesAPausedJob:
+    """"Run this now" must not also mean "and lift the hold on your way past".
+
+    Live case, 2026-08-25: jobflow-matcher sat under an explicit Gate-2
+    containment barrier. The barrier came off and the job published 20
+    score-bearing PIPELINE_UPDATEs before Gate 2 had landed. That particular
+    un-pause turned out to be a deliberate ``hermes cron resume`` — the bus
+    says ``caller="hermes_cli:cron_resume"``, 82s before the run — so these
+    tests do NOT pin a regression. They close the door the investigation
+    opened by looking: the two HTTP run-now surfaces really could have done it
+    silently, and one of them is a dashboard button.
+
+    The CLI has refused all along (``cronjob_tools._execute_job_now`` →
+    ``claim_job_for_fire``, which rejects paused/disabled jobs). These pin the
+    remaining surfaces onto the same answer.
+    """
+
+    def test_triggering_a_paused_job_raises_job_paused(self, store, bus):
         job = _mk()
         J.pause_job(job["id"], reason="contained", caller="test:pause")
-        paused_at = J.get_job(job["id"])["paused_at"]
 
-        J.trigger_job(job["id"], caller="hermes_cli:cron_run", reason="operator override")
+        with pytest.raises(J.JobPaused) as exc_info:
+            J.trigger_job(
+                job["id"], caller="http_api:api_server", reason="operator override"
+            )
 
-        payloads = _payloads(bus, EventType.CRON_RESUMED)
-        assert len(payloads) == 1
-        assert payloads[0]["caller"] == "hermes_cli:cron_run"
-        # The pause's reason, not the trigger's — the two are different facts
-        # and the trigger's own reason already rides on CRON_TRIGGERED.
-        assert payloads[0]["reason"] == "contained"
-        assert payloads[0]["paused_at"] == paused_at
-        assert payloads[0]["previous_state"] == "paused"
+        # The WHY travels with the refusal. A caller that learns only
+        # "refused" has to go read jobs.json to find out whether it hit a
+        # routine pause or a containment barrier.
+        assert exc_info.value.paused_reason == "contained"
+        assert exc_info.value.job_id == job["id"]
+        assert exc_info.value.paused_at == J.get_job(job["id"])["paused_at"]
+        assert "contained" in str(exc_info.value)
 
-    def test_triggering_a_running_job_records_no_resume(self, store, bus):
-        """Only a job that WAS paused gets a resume. Otherwise every routine
-        `cron run` would manufacture a resume event for a pause that never
-        happened, and the pause/resume pairing would stop meaning anything."""
+    def test_a_refused_trigger_writes_nothing_at_all(self, store, bus):
+        """Refuse BEFORE the write, so there is nothing to reconcile after.
+
+        Both halves matter. The RECORD must be untouched — a half-applied
+        trigger that bumped ``next_run_at`` past a barrier would be the same
+        bug wearing a smaller hat. And the BUS must be silent: a CRON_RESUMED
+        for a resume that did not happen, or a CRON_TRIGGERED for a fire that
+        did not happen, is worse than no record at all.
+        """
+        job = _mk()
+        J.pause_job(job["id"], reason="contained", caller="test:pause")
+        before = J.get_job(job["id"])
+
+        with pytest.raises(J.JobPaused):
+            J.trigger_job(job["id"], caller="http_api:web_server")
+
+        assert J.get_job(job["id"]) == before
+        assert _payloads(bus, EventType.CRON_RESUMED) == []
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
+
+    def test_triggering_a_running_job_still_fires(self, store, bus):
+        """The refusal is scoped to held jobs; the ordinary path is unchanged."""
         job = _mk()
         J.trigger_job(job["id"], caller="test:run", reason="just run it")
 
         assert bus.query(event_type=EventType.CRON_RESUMED) == []
         assert len(bus.query(event_type=EventType.CRON_TRIGGERED)) == 1
+        assert J.get_job(job["id"])["state"] == "scheduled"
 
-    def test_triggering_a_disabled_job_records_the_resume(self, store, bus):
-        """``enabled: False`` without ``state: "paused"`` is the same
-        operator-visible transition — trigger_job revives it either way."""
+    def test_triggering_a_disabled_job_is_refused_too(self, store, bus):
+        """``enabled: False`` without ``state: "paused"`` is the same hold.
+
+        A job disabled by some other path is just as deliberately out of the
+        schedule, and reviving it is the same operator-visible transition —
+        so it gets the same answer, carrying the empty reason it actually has.
+        """
         job = _mk()
         J.update_job(job["id"], {"enabled": False})
 
-        J.trigger_job(job["id"], caller="test:run")
+        with pytest.raises(J.JobPaused) as exc_info:
+            J.trigger_job(job["id"], caller="test:run")
 
-        assert len(bus.query(event_type=EventType.CRON_RESUMED)) == 1
+        assert exc_info.value.paused_reason is None
+        assert "no reason recorded" in str(exc_info.value)
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
 
-    def test_a_legacy_record_without_enabled_is_not_reported_as_resumed(self, store):
+    def test_a_legacy_record_without_enabled_is_still_triggerable(self, store, bus):
         """``job.get("enabled", True)`` matches the due scan's default.
 
-        A record predating the ``enabled`` key is runnable, so treating a
-        missing key as "disabled" would emit a spurious resume on every
-        trigger of such a record.
+        A record predating the ``enabled`` key is runnable by the scheduler, so
+        reading a missing key as "disabled" would make ``trigger_job`` refuse a
+        job that ticks fine — the guard failing CLOSED against exactly the
+        records it should ignore.
         """
         assert J._is_paused({"state": "scheduled"}) is False
         assert J._is_paused({}) is False
         assert J._is_paused({"enabled": False}) is True
         assert J._is_paused({"state": "paused"}) is True
 
-    def test_resume_is_emitted_before_the_trigger(self, store, monkeypatch):
-        """Cause order: the job came out of its pause, then it was scheduled.
+        job = _mk()
+        stored = J.load_jobs()
+        for row in stored:
+            if row["id"] == job["id"]:
+                row.pop("enabled", None)
+        J.save_jobs(stored)
 
-        Read the other way round, a CRON_TRIGGERED preceding its CRON_RESUMED
-        says a paused job was fired and only afterwards un-paused.
+        J.trigger_job(job["id"], caller="test:run")
+        assert len(bus.query(event_type=EventType.CRON_TRIGGERED)) == 1
+
+    def test_trigger_emits_no_lifecycle_event_on_any_path(self, store, monkeypatch):
+        """``trigger_job`` left the lifecycle table on 2026-08-26.
+
+        It reported an implicit ``"resumed"`` while it still un-paused. It
+        cannot revive anything now, so a lifecycle emit from here would record
+        a transition that did not occur — the same reason ``request_run``
+        stays out (see ``TestEveryPathClaim``).
         """
         order = []
         monkeypatch.setattr(
@@ -387,11 +444,14 @@ class TestTriggerJobUnpause:
         )
 
         job = _mk()
+        J.trigger_job(job["id"], caller="test:run")
+        assert order == ["triggered"]
+
         J.pause_job(job["id"], reason="x", caller="test:pause")
         order.clear()
-        J.trigger_job(job["id"], caller="test:run")
-
-        assert order == ["resumed", "triggered"]
+        with pytest.raises(J.JobPaused):
+            J.trigger_job(job["id"], caller="test:run")
+        assert order == []
 
 
 # ---------------------------------------------------------------------------
@@ -611,14 +671,13 @@ class TestEmitter:
 _EMIT_PATHS = (
     "pause_job",
     "resume_job",
-    "trigger_job",
     "pause_jobs_cas",
     "restore_jobs_cas",
 )
 
 
 class TestEveryPathClaim:
-    """``emit_cron_lifecycle_safe``'s docstring enumerates five call sites.
+    """``emit_cron_lifecycle_safe``'s docstring enumerates four call sites.
 
     The trigger emitter's docstring made the same "shared by every path" claim
     while two of its three paths emitted nothing, and two investigations read
@@ -634,7 +693,7 @@ class TestEveryPathClaim:
 
     def test_every_named_path_actually_calls_the_emitter(self):
         fns = (
-            J.pause_job, J.resume_job, J._trigger_job_admitted,
+            J.pause_job, J.resume_job,
             J.pause_jobs_cas, J.restore_jobs_cas,
         )
         assert len(fns) == len(_EMIT_PATHS)
@@ -663,6 +722,18 @@ class TestEveryPathClaim:
         assert "emit_cron_lifecycle_safe(" not in inspect.getsource(
             J._request_run_admitted
         )
+
+    def test_trigger_job_deliberately_does_not(self):
+        """``trigger_job`` was the fifth row here until 2026-08-26.
+
+        It refuses a paused job instead of reviving it, so it makes no
+        lifecycle transition to report. Pinned because the emit is easy to
+        re-add out of symmetry with ``resume_job`` — and re-adding it
+        would mean the un-pause had come back with it.
+        """
+        src = inspect.getsource(J._trigger_job_admitted)
+        assert "emit_cron_lifecycle_safe(" not in src
+        assert "_unpause_updates(" not in src
 
 
 # ---------------------------------------------------------------------------
