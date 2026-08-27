@@ -16,6 +16,7 @@ profile create/delete hooks (Phase 4) and the s6 dispatch path in
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
@@ -557,6 +558,10 @@ class S6Error(RuntimeError):
         self.service = service
 
 
+class S6TestIsolationError(S6Error):
+    """Raised before a test process can mutate the live s6 scandir."""
+
+
 class GatewayNotRegisteredError(S6Error):
     """Raised when a lifecycle method targets a slot that doesn't exist.
 
@@ -596,6 +601,29 @@ class S6CommandError(S6Error):
         if stderr.strip():
             message += f": {stderr.strip()}"
         super().__init__(message, service=service)
+
+
+def _refuse_live_s6_mutation_under_test(
+    scandir: Path, *, operation: str, profile: str
+) -> None:
+    """Fail before effects when test isolation targets the live scandir."""
+    if not os.environ.get("HERMES_TEST_ISOLATION"):
+        return
+    is_live = scandir == S6_DYNAMIC_SCANDIR
+    if not is_live:
+        try:
+            is_live = scandir.resolve() == S6_DYNAMIC_SCANDIR.resolve()
+        except OSError:
+            # Lexical equality was checked above. Resolution failures for a
+            # different path do not make it the canonical live scandir.
+            is_live = False
+    if is_live:
+        service = f"{S6_SERVICE_PREFIX}{profile}"
+        raise S6TestIsolationError(
+            f"refusing to {operation} {service!r} in the live s6 scandir "
+            "while Hermes test isolation is active",
+            service=service,
+        )
 
 
 class S6ServiceManager:
@@ -965,6 +993,10 @@ class S6ServiceManager:
                 directory already exists.
             RuntimeError: if ``s6-svscanctl`` fails.
         """
+        _refuse_live_s6_mutation_under_test(
+            self.scandir, operation="register", profile=profile
+        )
+
         import shutil
         import subprocess
 
@@ -1065,6 +1097,10 @@ class S6ServiceManager:
         rmtree races s6-supervise on a set of root-owned files inside
         the supervise dir and the dir is left half-removed.
         """
+        _refuse_live_s6_mutation_under_test(
+            self.scandir, operation="unregister", profile=profile
+        )
+
         import shutil
         import subprocess
         import time

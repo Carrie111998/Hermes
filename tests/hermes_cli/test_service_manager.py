@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import pytest
 
+from hermes_cli import service_manager as service_manager_module
 from hermes_cli.service_manager import (
     LaunchdServiceManager,
+    S6Error,
     S6ServiceManager,
+    S6TestIsolationError,
     ServiceManager,
     ServiceManagerKind,
     SystemdServiceManager,
@@ -154,6 +157,75 @@ def s6_scandir(tmp_path):
     d = tmp_path / "service"
     d.mkdir()
     return d
+
+
+def test_s6_register_refuses_canonical_scandir_under_test_isolation_before_write(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, fake_subprocess_run
+) -> None:
+    canonical_scandir = tmp_path / "canonical-service"
+    canonical_scandir.mkdir()
+    monkeypatch.setattr(
+        service_manager_module, "S6_DYNAMIC_SCANDIR", canonical_scandir
+    )
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test-register")
+    manager = S6ServiceManager(scandir=canonical_scandir)
+
+    with pytest.raises(S6TestIsolationError, match="test isolation"):
+        manager.register_profile_gateway("coder", start_now=False)
+
+    assert not (canonical_scandir / "gateway-coder").exists()
+    assert fake_subprocess_run == []
+
+
+def test_s6_unregister_refuses_canonical_scandir_under_test_isolation_before_effect(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, fake_subprocess_run
+) -> None:
+    canonical_scandir = tmp_path / "canonical-service"
+    service_dir = canonical_scandir / "gateway-coder"
+    service_dir.mkdir(parents=True)
+    sentinel = service_dir / "sentinel"
+    sentinel.write_bytes(b"owned-before-test")
+    monkeypatch.setattr(
+        service_manager_module, "S6_DYNAMIC_SCANDIR", canonical_scandir
+    )
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test-unregister")
+    manager = S6ServiceManager(scandir=canonical_scandir)
+
+    with pytest.raises(S6TestIsolationError, match="test isolation"):
+        manager.unregister_profile_gateway("coder")
+
+    assert sentinel.read_bytes() == b"owned-before-test"
+    assert fake_subprocess_run == []
+
+
+def test_s6_test_isolation_guard_allows_noncanonical_tmp_scandir(
+    tmp_path, s6_scandir, monkeypatch: pytest.MonkeyPatch, fake_subprocess_run
+) -> None:
+    canonical_scandir = tmp_path / "canonical-service"
+    canonical_scandir.mkdir()
+    monkeypatch.setattr(
+        service_manager_module, "S6_DYNAMIC_SCANDIR", canonical_scandir
+    )
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "run:test-temp")
+    manager = S6ServiceManager(scandir=s6_scandir)
+
+    manager.register_profile_gateway("coder", start_now=False)
+
+    assert (s6_scandir / "gateway-coder").is_dir()
+    assert fake_subprocess_run == [["s6-svscanctl", "-a", str(s6_scandir)]]
+
+
+def test_s6_live_guard_is_inactive_outside_test_context(
+    s6_scandir, monkeypatch: pytest.MonkeyPatch, fake_subprocess_run
+) -> None:
+    monkeypatch.setattr(service_manager_module, "S6_DYNAMIC_SCANDIR", s6_scandir)
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    manager = S6ServiceManager(scandir=s6_scandir)
+
+    manager.register_profile_gateway("coder", start_now=False)
+
+    assert (s6_scandir / "gateway-coder").is_dir()
+    assert fake_subprocess_run == [["s6-svscanctl", "-a", str(s6_scandir)]]
 
 
 @pytest.fixture
