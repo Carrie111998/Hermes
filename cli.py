@@ -8269,8 +8269,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ]
         if title:
             lines.append(f"Title: {title}")
+        rc = getattr(self, "reasoning_config", None)
+        if not isinstance(rc, dict):
+            rc = getattr(agent, "reasoning_config", None)
+        if not isinstance(rc, dict):
+            try:
+                from hermes_constants import resolve_reasoning_config
+                rc = resolve_reasoning_config(CLI_CONFIG, model)
+            except Exception:
+                rc = None
+        if not isinstance(rc, dict):
+            effort = "medium"
+        elif rc.get("enabled") is False:
+            effort = "none"
+        else:
+            effort = str(rc.get("effort") or "medium")
+
         lines.extend([
             f"Model: {model} ({provider})",
+            f"Reasoning: {effort}",
             f"Created: {created_at.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated_at.strftime('%Y-%m-%d %H:%M')}",
             f"Tokens: {total_tokens:,}",
