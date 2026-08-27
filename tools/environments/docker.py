@@ -880,6 +880,64 @@ def _ensure_docker_available() -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# In-container process-group teardown (issue #84967)
+# ---------------------------------------------------------------------------
+#
+# ``docker exec`` only ever reports the host-side client PID, so the inherited
+# ``BaseEnvironment._kill_process`` reaches nothing inside the container: the
+# exec'd shell and everything it started are children of containerd-shim and
+# outlive every timed-out command, not just the ones that called ``setsid``.
+# Repeated timeouts exhaust the container's pids cgroup.
+#
+# Each exec is therefore launched in its own session and records that session's
+# PGID in a file named after a per-exec UUID. Teardown reads the PGID back and
+# signals the group from *inside* the container with ``kill -- -<pgid>``.
+
+_PGID_FILE_PREFIX = "/tmp/.hermes-exec-pgid-"
+
+# Seconds the in-container group gets between SIGTERM and SIGKILL. Matches the
+# local backend's 1.0s group grace (local.py::_kill_process) so a script that
+# traps SIGTERM gets the same window on either backend.
+_CONTAINER_KILL_GRACE = 1
+
+# Hard ceiling on the teardown exec itself: cleanup must never outlive the
+# command it is cleaning up after by more than the grace window.
+_CONTAINER_KILL_TIMEOUT = 10
+
+# Probing ``setsid -w`` costs one exec per container, so the result is cached.
+_SETSID_PROBE_TIMEOUT = 10
+
+# POSIX sh, so this runs on busybox images too. Every stage is best-effort:
+# a missing file, a recycled PGID or an already-dead group all exit 0, because
+# teardown runs on the timeout path where raising would mask the real error.
+#
+# ``kill -<sig> -<pgid>`` is deliberately written without a ``--`` separator
+# and without ``-s``. On Debian-family images /bin/sh is dash, whose *builtin*
+# kill supports neither: both ``kill -TERM -- -123`` and ``kill -s TERM -123``
+# fail with "Illegal number: -" (rc 2) and signal nothing at all. Combined with
+# the 2>/dev/null below that failure is completely silent, so this reads as
+# working while leaking every process it was meant to kill. Verified against
+# dash in python:3.11-slim. The ``--`` is unnecessary anyway: the case guard
+# above proves $pgid is digits, so -$pgid can only ever be -<number>.
+_TREE_KILL_SCRIPT = """
+pgid_file=$1
+pgid=$(cat "$pgid_file" 2>/dev/null) || exit 0
+rm -f "$pgid_file" 2>/dev/null
+# Refuse anything that is not a plain positive integer: "kill -TERM -0" would
+# signal the caller's own group, and a partially written file is possible
+# because the wrapper races the command it is about to exec.
+case "$pgid" in
+    ''|0|*[!0-9]*) exit 0 ;;
+esac
+kill -TERM -"$pgid" 2>/dev/null || exit 0
+sleep {grace}
+kill -0 -"$pgid" 2>/dev/null || exit 0
+kill -KILL -"$pgid" 2>/dev/null || true
+exit 0
+""".format(grace=_CONTAINER_KILL_GRACE)
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -1658,12 +1716,129 @@ class DockerEnvironment(BaseEnvironment):
 
         cmd.extend([self._container_id])
 
-        if login:
-            cmd.extend(["bash", "-l", "-c", cmd_string])
-        else:
-            cmd.extend(["bash", "-c", cmd_string])
+        bash_args = ["bash", "-l", "-c"] if login else ["bash", "-c"]
 
-        return _popen_bash(cmd, stdin_data)
+        # Give the command its own session so teardown can signal the whole
+        # tree with one ``kill -- -<pgid>`` (issue #84967). ``setsid`` forks
+        # when the caller is already a group leader, so ``-w`` is required —
+        # without it the exec'd client would return before the command ran,
+        # truncating output and reporting the wrong exit code.
+        pgid_file = ""
+        if self._setsid_supported():
+            pgid_file = _PGID_FILE_PREFIX + uuid.uuid4().hex
+            quoted = shlex.quote(pgid_file)
+            # Record the session leader's PID (== its PGID, post-setsid) before
+            # handing control to the command, and clear the file on a normal
+            # exit so /tmp does not accumulate one entry per command. A command
+            # installing its own EXIT trap overrides this; teardown removes the
+            # file too, so that only costs a stale byte or two.
+            cmd_string = (
+                f"trap 'rm -f {quoted} 2>/dev/null' EXIT\n"
+                f"echo $$ >{quoted} 2>/dev/null || true\n"
+                f"{cmd_string}"
+            )
+            cmd.extend(["setsid", "-w"])
+
+        cmd.extend([*bash_args, cmd_string])
+
+        proc = _popen_bash(cmd, stdin_data)
+        if pgid_file:
+            # Stashed on the handle for _kill_process to read back, the same
+            # way local.py carries _hermes_pgid. Guarded because a slot-based
+            # or wrapped handle rejects new attributes, and teardown must
+            # never be able to break command execution: the miss just costs
+            # the in-container sweep, leaving the previous host-side kill.
+            try:
+                proc._hermes_pgid_file = pgid_file  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                logger.debug("could not record PGID file on process handle")
+        return proc
+
+    # ------------------------------------------------------------------
+    # In-container process-group teardown (issue #84967)
+    # ------------------------------------------------------------------
+
+    def _setsid_supported(self) -> bool:
+        """Return True if the image provides ``setsid -w``, probing once.
+
+        ``setsid`` lives in util-linux and is absent from some minimal images;
+        busybox ships it without ``-w``. Both cases must degrade to the
+        previous behaviour rather than break command execution, so the probe
+        runs the real invocation and caches whatever it finds.
+        """
+        cached = getattr(self, "_setsid_ok", None)
+        if cached is not None:
+            return cached
+
+        ok = False
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "exec", self._container_id,
+                 "setsid", "-w", "true"],
+                capture_output=True, text=True, encoding='utf-8',
+                errors='replace', timeout=_SETSID_PROBE_TIMEOUT, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            ok = result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("setsid probe failed, tree-kill disabled: %s", e)
+
+        if not ok:
+            logger.debug(
+                "container %s has no usable 'setsid -w'; in-container tree "
+                "kill on timeout is disabled",
+                (self._container_id or "")[:12],
+            )
+        self._setsid_ok = ok
+        return ok
+
+    def _kill_process(self, proc):
+        """Kill the host-side client, then the process group it left running.
+
+        ``docker exec`` never reports the in-container PID to its client, so
+        the inherited ``proc.kill()`` only removes the host-side half: the
+        exec'd shell and its descendants are children of containerd-shim and
+        survive. This adds a second exec that signals the recorded session
+        from inside the container.
+
+        The host kill happens first so the caller's read loop unblocks
+        immediately and teardown latency is never on the critical path.
+        """
+        pgid_file = getattr(proc, "_hermes_pgid_file", "")
+
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+        if pgid_file:
+            self._kill_container_group(pgid_file)
+
+    def _kill_container_group(self, pgid_file: str) -> None:
+        """TERM then KILL the session recorded in *pgid_file*, best-effort.
+
+        Every failure mode here is expected in normal operation — the
+        container can be gone, the daemon down, or the command may have exited
+        before writing the file — and this runs on the timeout path, where
+        raising would mask the error the caller is already reporting. So
+        nothing propagates; failures are logged at debug.
+        """
+        if not self._container_id:
+            return
+        try:
+            subprocess.run(
+                [self._docker_exe, "exec", self._container_id,
+                 "sh", "-c", _TREE_KILL_SCRIPT, "sh", pgid_file],
+                capture_output=True, text=True, encoding='utf-8',
+                errors='replace',
+                timeout=_CONTAINER_KILL_TIMEOUT + _CONTAINER_KILL_GRACE,
+                check=False, stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug(
+                "in-container tree kill failed for %s: %s",
+                (self._container_id or "")[:12], e,
+            )
 
     # ------------------------------------------------------------------
     # "No such container" recovery (issue #36266)
