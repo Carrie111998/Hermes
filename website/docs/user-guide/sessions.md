@@ -215,7 +215,6 @@ Session IDs follow the format `YYYYMMDD_HHMMSS_<hex>` — CLI/TUI sessions use a
 :::
 
 ## Session Naming
-## Session Naming
 
 Give sessions human-readable titles so you can find and resume them easily.
 

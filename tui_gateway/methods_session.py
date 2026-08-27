@@ -1540,7 +1540,6 @@ def _(rid, params: dict) -> dict:
 
 
 @method("session.usage")
-@method("session.usage")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:

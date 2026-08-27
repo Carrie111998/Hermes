@@ -1735,10 +1735,6 @@ describe('usePromptActions desktop slash pickers', () => {
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
   })
-
-})
-
-describe('usePromptActions submit
 })
 
 describe('usePromptActions submit / queue drain semantics', () => {

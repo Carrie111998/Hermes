@@ -749,7 +749,6 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
-        // /profile selects
         // /profile selects which profile new chats open in — no app relaunch.
         // A profile is per-session now, so an existing thread can't change its
         // profile mid-stream; `/profile <name>` points the next new chat (and

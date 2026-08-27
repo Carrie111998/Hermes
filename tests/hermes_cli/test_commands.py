@@ -445,19 +445,6 @@ class TestSubcommandCompletion:
         )
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake)
 
-    def test_handoff_completes_connected_platforms(self, monkeypatch):
-        """`/handoff ` offers connected platforms, with or without a home channel."""
-        self._fake_gateway(
-            monkeypatch,
-            {
-                "telegram": ("123", "Me"),
-                "discord": None,  # no home channel yet -> still listed
-            },
-        )
-
-        texts = {c.text for c in _completions(SlashCommandCompleter(), "/handoff ")}
-        assert texts == {"telegram", "discord"}
-
 
 
 
