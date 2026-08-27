@@ -182,6 +182,7 @@ const renderRow = (session: SessionInfo, extra?: { card?: boolean }) =>
 describe('SidebarSessionRow running arc', () => {
   afterEach(() => {
     clearAllSessionStates()
+    $sessions.set([])
   })
 
   const arc = (container: HTMLElement) => container.querySelector('.arc-row')
@@ -193,9 +194,12 @@ describe('SidebarSessionRow running arc', () => {
   })
 
   it('paints the arc while the session is running', () => {
+    const session = makeSession({ title: 'Running' })
+
+    $sessions.set([session])
     publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
 
-    const { container } = renderRow(makeSession({ title: 'Running' }))
+    const { container } = renderRow(session)
 
     expect(arc(container)).toBeTruthy()
   })
@@ -204,9 +208,12 @@ describe('SidebarSessionRow running arc', () => {
   // and nothing else — not its siblings, and not the list around them. Rows
   // render once per fiber, so counting `sessionTitle` counts repaints.
   it('repaints only the session whose turn started', () => {
+    const sessions = [makeSession({ id: 's1', title: 'One' }), makeSession({ id: 's2', title: 'Two' })]
+
+    $sessions.set(sessions)
     render(
       <>
-        {[makeSession({ id: 's1', title: 'One' }), makeSession({ id: 's2', title: 'Two' })].map(session => (
+        {sessions.map(session => (
           <SidebarSessionRow
             isPinned={false}
             isSelected={false}

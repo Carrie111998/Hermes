@@ -210,7 +210,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     let finishOwnerA!: (value: { session_id: string }) => void
 
     $sessionTiles.set([{ ownerRoute: ownerA, storedSessionId }])
-    const generationA = sessionTileOwnerGeneration(storedSessionId)
+    const generationA = sessionTileOwnerGeneration(storedSessionId, ownerA)
     const updateSessionState = vi.fn()
 
     vi.mocked(requestGatewayForAgent).mockReturnValueOnce(
@@ -224,7 +224,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       ownerRoute: ownerA
     })
 
-    setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' })
+    setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' }, ownerA)
     finishOwnerA({ session_id: 'runtime-owner-a' })
 
     await expect(resumed).resolves.toBe('runtime-owner-a')
@@ -244,24 +244,26 @@ describe('useSessionTileDelegate resumeTile', () => {
           session_id: connectionId === 'source-a' ? 'runtime-owner-a' : 'runtime-owner-b'
         }) as never
     )
-    $sessionTiles.set([{ ownerRoute: ownerA, storedSessionId }])
+    $sessionTiles.set([
+      { ownerRoute: ownerA, storedSessionId },
+      { ownerRoute: ownerB, storedSessionId }
+    ])
     renderTile(vi.fn(), { updateSessionState })
 
-    const resumedA = sessionTileDelegate()!.resumeTile(
-      storedSessionId,
-      { ownerGeneration: sessionTileOwnerGeneration(storedSessionId), ownerRoute: ownerA }
-    )
+    const resumedA = sessionTileDelegate()!.resumeTile(storedSessionId, {
+      ownerGeneration: sessionTileOwnerGeneration(storedSessionId, ownerA),
+      ownerRoute: ownerA
+    })
 
-    setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' })
-
-    const resumedB = sessionTileDelegate()!.resumeTile(
-      storedSessionId,
-      { ownerGeneration: sessionTileOwnerGeneration(storedSessionId), ownerRoute: ownerB }
-    )
+    const resumedB = sessionTileDelegate()!.resumeTile(storedSessionId, {
+      ownerGeneration: sessionTileOwnerGeneration(storedSessionId, ownerB),
+      ownerRoute: ownerB
+    })
 
     await expect(Promise.all([resumedA, resumedB])).resolves.toEqual(['runtime-owner-a', 'runtime-owner-b'])
     expect(requestGatewayForAgent).toHaveBeenCalledTimes(2)
-    expect(updateSessionState).toHaveBeenCalledTimes(1)
+    expect(updateSessionState).toHaveBeenCalledTimes(2)
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-owner-a', expect.any(Function), storedSessionId)
     expect(updateSessionState).toHaveBeenCalledWith('runtime-owner-b', expect.any(Function), storedSessionId)
   })
 

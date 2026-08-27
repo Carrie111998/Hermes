@@ -356,7 +356,13 @@ export function useSessionTileDelegate({
         // re-homed. Do not publish owner A into owner B's cache/binding.
         if (
           ownerGeneration !== undefined &&
-          sessionTileOwnerGeneration(storedSessionId) !== ownerGeneration
+          (sessionTileOwnerGeneration(storedSessionId, capturedOwnerRoute) !== ownerGeneration ||
+            (capturedOwnerIdentity &&
+              (() => {
+                const currentOwner = sessionTileOwnerRoute(storedSessionId, capturedOwnerRoute)
+
+                return !currentOwner || coordinationIdentity(storedSessionId, currentOwner) !== capturedOwnerIdentity
+              })()))
         ) {
           return runtimeId
         }
