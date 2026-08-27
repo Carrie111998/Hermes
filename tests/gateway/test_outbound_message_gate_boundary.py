@@ -856,6 +856,138 @@ def test_sealed_external_transport_exemption_requires_terminal_policy_in_named_c
         validate_sealed_transport_exemptions(sources)
 
 
+def _without_send_tool_terminal_policy(source: str) -> str:
+    tree = ast.parse(source)
+    function = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_send_to_platform"
+    )
+    call = next(
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "apply_terminal_outbound_text_policy"
+    )
+    assignment = next(
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Assign) and call in ast.walk(node)
+    )
+    lines = source.splitlines(keepends=True)
+    replacement = [
+        "    gated_envelope = envelope\n",
+        "    'apply_terminal_outbound_text_policy'  # inert policy text\n",
+    ]
+    assert assignment.end_lineno is not None
+    replacement.extend("\n" for _ in range(assignment.end_lineno - assignment.lineno - 1))
+    lines[assignment.lineno - 1:assignment.end_lineno] = replacement
+    mutated = "".join(lines)
+    assert len(mutated.splitlines()) == len(source.splitlines())
+    mutated_tree = ast.parse(mutated)
+    mutated_function = next(
+        node for node in ast.walk(mutated_tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_send_to_platform"
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "apply_terminal_outbound_text_policy"
+        for node in ast.walk(mutated_function)
+    )
+    return mutated
+
+
+def test_exact_fingerprint_substitution_is_rejected():
+    source = "\n" * 5910 + """async def _deliver_bg_review_message(message):
+    marker = 1
+    marker = 2
+    marker = 3
+    await client.send(message)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="gateway/run.py"
+    ) == ["gateway/run.py:5915:_deliver_bg_review_message:send"]
+
+
+def test_inert_policy_text_fails_inventory_and_sealed_validation():
+    root = Path(__file__).resolve().parents[2]
+    relative = "tools/send_message_tool.py"
+    mutated = _without_send_tool_terminal_policy((root / relative).read_text())
+
+    assert scan_terminal_transport_inventory(mutated, relative_path=relative)
+    with pytest.raises(RuntimeError, match="sealed transport caller is not terminally gated"):
+        validate_sealed_transport_exemptions({relative: mutated.encode()})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        """    await client.send_message(chat_id=chat_id, text=message)
+    gated = apply_terminal_outbound_text_policy(content=message)
+    message = gated
+""",
+        """    if enabled:
+        gated = apply_terminal_outbound_text_policy(content=message)
+        message = gated
+    await client.send_message(chat_id=chat_id, text=message)
+""",
+        """    apply_terminal_outbound_text_policy(content=message)
+    await client.send_message(chat_id=chat_id, text=message)
+""",
+    ],
+    ids=["policy-after-transport", "sibling-branch", "ignored-result"],
+)
+def test_sealed_caller_requires_policy_result_to_dominate_transport(body):
+    relative = "tools/send_message_tool.py"
+    source = "async def _send_to_platform(client, chat_id, message, enabled=True):\n" + body
+
+    assert scan_terminal_transport_inventory(source, relative_path=relative)
+    with pytest.raises(RuntimeError, match="sealed transport caller is not terminally gated"):
+        validate_sealed_transport_exemptions({relative: source.encode()})
+
+
+def test_compile_time_constant_lifecycle_message_contract_passes():
+    root = Path(__file__).resolve().parents[2]
+    relative = "gateway/run.py"
+    source = (root / relative).read_text()
+
+    assert "♻ Gateway restarted successfully. Your session continues." in source
+    assert scan_terminal_transport_inventory(source, relative_path=relative) == []
+
+
+def test_current_send_tool_and_all_canonical_exemptions_pass():
+    from plugins import outbound_message_gate as gate_mod
+
+    root = Path(__file__).resolve().parents[2]
+    sources = {
+        relative: (root / relative).read_bytes()
+        for relative in gate_mod.GATE_BUILD_SOURCE_PATHS
+    }
+    validate_sealed_transport_exemptions(sources)
+    assert [
+        violation
+        for relative, raw in sources.items()
+        for violation in scan_terminal_transport_inventory(
+            raw.decode("utf-8"), relative_path=relative
+        )
+    ] == []
+
+
+def test_exemption_body_mutation_without_contract_digest_update_fails():
+    root = Path(__file__).resolve().parents[2]
+    relative = "gateway/run.py"
+    source = (root / relative).read_text()
+    mutated = source.replace(
+        "if not ctx._status_adapter or not ctx._run_still_current():\n                return\n            safe_schedule_threadsafe(\n                ctx._status_adapter.send(",
+        "if ctx._status_adapter and not ctx._run_still_current():\n                return\n            safe_schedule_threadsafe(\n                ctx._status_adapter.send(",
+        1,
+    )
+    assert mutated != source
+
+    assert "gateway/run.py:5915:_deliver_bg_review_message:send" in (
+        scan_terminal_transport_inventory(mutated, relative_path=relative)
+    )
+
+
 def test_terminal_transport_inventory_ignores_private_non_content_helper():
     source = """
 class SafeAdapter(BasePlatformAdapter):

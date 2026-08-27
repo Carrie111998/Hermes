@@ -1019,7 +1019,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         "media": media_files,
     })
     envelope = "\n".join(item for item in visible if item)
-    gated_envelope = envelope if platform == Platform.MATRIX else apply_terminal_outbound_text_policy(
+    gated_envelope = apply_terminal_outbound_text_policy(
         platform=platform_name,
         chat_id=str(chat_id),
         content=envelope,
