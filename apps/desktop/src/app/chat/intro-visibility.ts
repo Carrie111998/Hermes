@@ -16,6 +16,7 @@ export function shouldShowIntro(input: {
   freshDraftReady: boolean
   messagesEmpty: boolean
   primary: boolean
+  restoringConversation: boolean
   routedSessionView: boolean
   selectedSessionId: null | string
 }): boolean {
@@ -23,6 +24,7 @@ export function shouldShowIntro(input: {
     input.enabled &&
     input.primary &&
     !input.auxiliaryWindow &&
+    !input.restoringConversation &&
     input.freshDraftReady &&
     !input.routedSessionView &&
     !input.selectedSessionId &&

@@ -28,10 +28,12 @@ import {
   _resetLegacyDiscardForTests,
   _resetSessionOwnerHintsForTests,
   applyConfiguredDefaultProjectDir,
+  clearRememberedConversationIfSession,
   commitWorkspaceCwdForSelectedSession,
   ensureDefaultWorkspaceCwd,
   forgetSessionOwnerHintsForConnection,
   getConfiguredDefaultProjectDir,
+  getRememberedConversation,
   getRememberedRoute,
   getRememberedSessionId,
   getSessionOwnerHint,
@@ -45,6 +47,7 @@ import {
   sessionPinId,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setRememberedConversation,
   setRememberedRoute,
   setRememberedSessionId,
   setSelectedStoredSessionId,
@@ -1098,6 +1101,81 @@ describe('remembered route (per profile)', () => {
     expect(getRememberedRoute('default')).toBeNull()
     expect(getRememberedSessionId('default')).toBeNull()
     expect(getRememberedRoute('ai-engineer')).toBe('/session/stored-1')
+  })
+})
+
+describe('remembered conversation (per profile)', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    _resetLegacyDiscardForTests()
+  })
+
+  afterEach(() => localStorage.clear())
+
+  it('round-trips session, explicit blank, and absence', () => {
+    expect(getRememberedConversation('work')).toBeNull()
+
+    setRememberedConversation({ kind: 'session', sessionId: 'root-1', version: 1 }, 'work')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'root-1', version: 1 })
+
+    setRememberedConversation({ kind: 'blank', version: 1 }, 'work')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'blank', version: 1 })
+  })
+
+  it('falls back from malformed or unknown records to legacy scoped candidates', () => {
+    const key = 'hermes.desktop.lastConversation.profile.work'
+
+    setRememberedSessionId('legacy-id', 'work')
+    localStorage.setItem(key, '{bad json')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'legacy-id', version: 1 })
+
+    localStorage.setItem(key, JSON.stringify({ kind: 'blank', version: 2 }))
+    setRememberedRoute('/route-id', 'work')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'route-id', version: 1 })
+  })
+
+  it('prefers a legacy session route, but never treats / as a blank sentinel', () => {
+    setRememberedSessionId('fallback-id', 'work')
+    setRememberedRoute('/route-id', 'work')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'route-id', version: 1 })
+
+    setRememberedRoute('/', 'work')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'fallback-id', version: 1 })
+
+    setRememberedSessionId(null, 'work')
+    expect(getRememberedConversation('work')).toBeNull()
+  })
+
+  it('dual-writes sessions and makes explicit blanks rollback-safe', () => {
+    setRememberedConversation({ kind: 'session', sessionId: 'root-1', version: 1 }, 'work')
+    expect(getRememberedSessionId('work')).toBe('root-1')
+    expect(getRememberedRoute('work')).toBe('/root-1')
+
+    setRememberedConversation({ kind: 'blank', version: 1 }, 'work')
+    expect(getRememberedSessionId('work')).toBeNull()
+    expect(getRememberedRoute('work')).toBe('/')
+  })
+
+  it('conditionally clears only matching session-shaped state', () => {
+    setRememberedConversation({ kind: 'session', sessionId: 'root-1', version: 1 }, 'work')
+    clearRememberedConversationIfSession('work', 'other')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'root-1', version: 1 })
+
+    clearRememberedConversationIfSession('work', 'root-1')
+    expect(getRememberedConversation('work')).toBeNull()
+
+    setRememberedConversation({ kind: 'blank', version: 1 }, 'work')
+    clearRememberedConversationIfSession('work', 'root-1')
+    expect(getRememberedConversation('work')).toEqual({ kind: 'blank', version: 1 })
+  })
+
+  it('uses the established encoded profile namespace', () => {
+    setRememberedConversation({ kind: 'session', sessionId: 'ops-root', version: 1 }, 'research/ops')
+
+    expect(localStorage.getItem('hermes.desktop.lastConversation.profile.research%2Fops')).toBe(
+      JSON.stringify({ kind: 'session', sessionId: 'ops-root', version: 1 })
+    )
+    expect(getRememberedConversation('research')).toBeNull()
   })
 })
 

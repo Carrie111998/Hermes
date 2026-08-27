@@ -28,6 +28,11 @@ vi.mock('./routes', () => ({
 }))
 
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import {
+  $profileConversationRestore,
+  _resetProfileConversationRestoreForTests,
+  beginProfileConversationRestore
+} from '@/store/profile-conversation-restore'
 
 import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
 
@@ -94,11 +99,14 @@ describe('openSession', () => {
     setSessionTileWorkspaceScope.mockReset()
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
+    _resetProfileConversationRestoreForTests()
   })
 
   it('in-place focuses an existing tile and does not navigate', () => {
+    beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
     focusOpenSession.mockReturnValue('tile')
     openSession('s1', navigate)
+    expect($profileConversationRestore.get()).toBeNull()
     expect(focusOpenSession).toHaveBeenCalledWith('s1', { workspaceMode: 'sessions' })
     expect(navigate).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()

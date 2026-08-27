@@ -136,6 +136,7 @@ interface GatewayRegistryState {
   primaryProfile: string
   activeKey: string
   activationEpoch: number
+  $activationEpoch: ReturnType<typeof atom<number>>
   secondaries: Map<string, Secondary>
   /** Scopes that opened in this renderer generation, even if later pruned. */
   openedSecondaryScopes?: Set<string>
@@ -157,7 +158,8 @@ function createRegistryState(): GatewayRegistryState {
     primaryProfile: 'default',
     activeKey: 'default',
     activationEpoch: 0,
-    secondaries: new Map<string, Secondary>(),
+    $activationEpoch: atom(0),
+    secondaries: new Map(),
     openedSecondaryScopes: new Set<string>(),
     turnLeases: new Map<string, () => void>(),
     turnLeaseReleaseTimers: new Map<string, ReturnType<typeof setTimeout>>(),
@@ -190,6 +192,7 @@ function gatewayState(): GatewayRegistryState {
     // Existing dev-HMR containers predate whole-turn leases.
     store[STATE_KEY].turnLeases ??= new Map()
     store[STATE_KEY].turnLeaseReleaseTimers ??= new Map()
+    store[STATE_KEY].$activationEpoch ??= atom(store[STATE_KEY].activationEpoch ?? 0)
 
     return store[STATE_KEY]
   }
@@ -215,6 +218,8 @@ export const $gateway = g.$gateway
 // surfaces (store/profile.ts's $activeGatewayProfile) mirror this atom
 // instead of writing their own copy.
 export const $activeGatewayRoute = g.$activeProfile
+/** Monotonic active-route generation, including same-route reactivations. */
+export const $gatewayActivationEpoch = g.$activationEpoch
 
 /** Bare profile name the active gateway serves (never a composite scope). */
 export function activeGatewayProfileKey(): string {
@@ -381,6 +386,7 @@ function setActive(profile: string): void {
 
 function beginGatewayActivation(): number {
   g.activationEpoch = gatewayActivationEpoch() + 1
+  g.$activationEpoch.set(g.activationEpoch)
 
   return g.activationEpoch
 }

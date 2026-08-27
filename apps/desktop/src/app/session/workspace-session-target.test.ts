@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { FreshSessionDraftOptions } from '@/app/session/hooks/use-session-actions'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $currentBranch,
   $currentCwd,
   $newChatWorkspaceTarget,
-  type NewChatWorkspaceTarget,
   setCurrentBranch,
   setCurrentCwd,
   setNewChatWorkspaceTarget
@@ -36,9 +36,9 @@ describe('startWorkspaceSession', () => {
 
     const activeSessionIdRef = { current: null }
 
-    const startFreshSessionDraft = vi.fn((options?: { workspaceTarget: NewChatWorkspaceTarget }) => {
-      setNewChatWorkspaceTarget(options?.workspaceTarget)
-      setCurrentCwd(options?.workspaceTarget || '')
+    const startFreshSessionDraft = vi.fn((options: FreshSessionDraftOptions) => {
+      setNewChatWorkspaceTarget(options.workspaceTarget)
+      setCurrentCwd(options.workspaceTarget || '')
     })
 
     const followActiveSessionCwd = vi.fn()
@@ -90,9 +90,9 @@ describe('startWorkspaceSession', () => {
     const requestGateway = vi.fn()
     const activeSessionIdRef = { current: null }
 
-    const startFreshSessionDraft = vi.fn((options?: { workspaceTarget: NewChatWorkspaceTarget }) => {
-      setNewChatWorkspaceTarget(options?.workspaceTarget)
-      setCurrentCwd(options?.workspaceTarget || '')
+    const startFreshSessionDraft = vi.fn((options: FreshSessionDraftOptions) => {
+      setNewChatWorkspaceTarget(options.workspaceTarget)
+      setCurrentCwd(options.workspaceTarget || '')
     })
 
     startWorkspaceSession({
@@ -102,7 +102,10 @@ describe('startWorkspaceSession', () => {
       startFreshSessionDraft
     })
 
-    expect(startFreshSessionDraft).toHaveBeenCalledWith({ workspaceTarget: null })
+    expect(startFreshSessionDraft).toHaveBeenCalledWith({
+      intent: expect.objectContaining({ cause: 'new-project-chat', persistence: 'explicit' }),
+      workspaceTarget: null
+    })
     expect(requestGateway).not.toHaveBeenCalled()
     expect($newChatWorkspaceTarget.get()).toBeNull()
     expect($currentCwd.get()).toBe('')

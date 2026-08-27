@@ -2,6 +2,7 @@ import { cleanup, render } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { FreshSessionDraftOptions } from '@/app/session/hooks/use-session-actions'
 import { $resumeExhaustedSessionId, setResumeExhaustedSessionId } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import { markSelectionRestore } from '@/store/session-states'
@@ -21,15 +22,25 @@ interface HarnessProps {
   freshDraftReady: boolean
   gatewayState: string
   locationPathname: string
-  resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
+  resumeSession: (
+    sessionId: string,
+    focus: boolean,
+    ownerRoute?: SessionProfileRoute,
+    options?: { forceCold?: boolean }
+  ) => Promise<unknown>
   resumeFailedSessionId?: null | string
   resumeExhaustedSessionId?: null | string
-  sessionResumeRequest?: null | { ownerRoute?: SessionProfileRoute; sequence: number; sessionId: string }
+  sessionResumeRequest?: null | {
+    forceCold?: boolean
+    ownerRoute?: SessionProfileRoute
+    sequence: number
+    sessionId: string
+  }
   routedSessionId: null | string
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: null | string
   selectedStoredSessionIdRef: MutableRefObject<null | string>
-  startFreshSessionDraft: (focus: boolean) => unknown
+  startFreshSessionDraft: (options: FreshSessionDraftOptions) => unknown
 }
 
 function RouteResumeHarness({
@@ -343,6 +354,111 @@ describe('useRouteResume', () => {
 
     expect(resumeSession).toHaveBeenCalledTimes(1)
     expect(resumeSession).toHaveBeenCalledWith('session-1', true)
+  })
+
+  it('forwards owner routing and forceCold only from the matching monotonic request', () => {
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-1' }
+    const creatingSessionRef = { current: false }
+    const runtimeIdByStoredSessionIdRef = { current: new Map([['session-1', 'runtime-1']]) }
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
+    const ownerRoute: SessionProfileRoute = { connectionId: 'source-a', profile: 'worker' }
+
+    const props = {
+      activeSessionId: 'runtime-1',
+      activeSessionIdRef,
+      creatingSessionRef,
+      currentView: 'chat',
+      freshDraftReady: false,
+      gatewayState: 'open',
+      locationPathname: '/session-1',
+      resumeSession,
+      routedSessionId: 'session-1',
+      runtimeIdByStoredSessionIdRef,
+      selectedStoredSessionId: 'session-1',
+      selectedStoredSessionIdRef,
+      startFreshSessionDraft
+    }
+
+    const { rerender } = render(<RouteResumeHarness {...props} />)
+
+    rerender(
+      <RouteResumeHarness
+        {...props}
+        sessionResumeRequest={{ forceCold: true, ownerRoute, sequence: 1, sessionId: 'session-1' }}
+      />
+    )
+
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true, ownerRoute, { forceCold: true })
+    resumeSession.mockClear()
+
+    // The same sequence has already been consumed. A later pathname edge must
+    // not inherit either its owner or its forced-cold cache policy.
+    rerender(
+      <RouteResumeHarness
+        {...props}
+        locationPathname="/session-2"
+        routedSessionId="session-2"
+        sessionResumeRequest={{ forceCold: true, ownerRoute, sequence: 1, sessionId: 'session-1' }}
+      />
+    )
+
+    expect(resumeSession).toHaveBeenCalledWith('session-2', true)
+  })
+
+  it('preserves exact owner routing and forceCold across a failed restore retry', () => {
+    vi.useFakeTimers()
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-collision' }
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
+    const ownerRoute: SessionProfileRoute = { connectionId: 'source-a', profile: 'worker' }
+    const props = {
+      activeSessionId: 'runtime-collision',
+      activeSessionIdRef,
+      creatingSessionRef: { current: false },
+      currentView: 'chat',
+      freshDraftReady: false,
+      gatewayState: 'open',
+      locationPathname: '/session-1',
+      resumeSession,
+      routedSessionId: 'session-1',
+      runtimeIdByStoredSessionIdRef: { current: new Map([['session-1', 'runtime-collision']]) },
+      selectedStoredSessionId: 'session-1',
+      selectedStoredSessionIdRef,
+      startFreshSessionDraft
+    }
+
+    const request = { forceCold: true, ownerRoute, sequence: 1, sessionId: 'session-1' }
+    const { rerender } = render(<RouteResumeHarness {...props} sessionResumeRequest={request} />)
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true, ownerRoute, { forceCold: true })
+
+    resumeSession.mockClear()
+    activeSessionIdRef.current = null
+    rerender(
+      <RouteResumeHarness
+        {...props}
+        activeSessionId={null}
+        gatewayState="closed"
+        resumeFailedSessionId="session-1"
+        sessionResumeRequest={request}
+      />
+    )
+    rerender(
+      <RouteResumeHarness
+        {...props}
+        activeSessionId={null}
+        gatewayState="open"
+        resumeFailedSessionId="session-1"
+        sessionResumeRequest={request}
+      />
+    )
+
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true, ownerRoute, { forceCold: true })
+    resumeSession.mockClear()
+    vi.advanceTimersByTime(1_000)
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true, ownerRoute, { forceCold: true })
   })
 
   it('does not reuse a stale plugin owner route after pathname navigation', () => {

@@ -24,6 +24,11 @@ import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/stor
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
 import { $pinnedSessionIds } from '@/store/layout'
+import {
+  $appliedFreshDraftProvenance,
+  $profileConversationRestore,
+  beginProfileConversationRestore
+} from '@/store/profile-conversation-restore'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, $profiles, ensureGatewayProfile } from '@/store/profile'
 import {
   $projectScope,
@@ -523,11 +528,61 @@ describe('startFreshSessionDraft', () => {
     render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
     await waitFor(() => expect(handle).not.toBeNull())
 
-    act(() => handle!.startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null }))
+    act(() =>
+      handle!.startFreshSessionDraft({
+        intent: { cause: 'gateway-transition', persistence: 'automatic', sequence: 1 },
+        preserveRoute: true,
+        workspaceTarget: null
+      })
+    )
 
+    expect($appliedFreshDraftProvenance.get()).toEqual({
+      cause: 'gateway-transition',
+      freshSequence: 1,
+      kind: 'automatic'
+    })
     expect(navigate).not.toHaveBeenCalled()
     expect($currentCwd.get()).toBe('')
     expect($newChatWorkspaceTarget.get()).toBeNull()
+  })
+
+  it('cancels a pending restore and applies explicit provenance before clearing state', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+    beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+
+    act(() =>
+      handle!.startFreshSessionDraft({
+        intent: { cause: 'new-chat', persistence: 'explicit', sequence: 2 }
+      })
+    )
+
+    expect($profileConversationRestore.get()).toBeNull()
+    expect($appliedFreshDraftProvenance.get()).toEqual({
+      cause: 'new-chat',
+      freshSequence: 2,
+      kind: 'explicit'
+    })
+
+    act(() =>
+      handle!.startFreshSessionDraft({
+        intent: {
+          cause: 'profile-switch',
+          persistence: 'automatic',
+          restoreSequence: 1,
+          sequence: 1
+        }
+      })
+    )
+
+    expect($appliedFreshDraftProvenance.get()).toEqual({
+      cause: 'new-chat',
+      freshSequence: 2,
+      kind: 'explicit'
+    })
   })
 
   it('fronts the workspace without closing a terminal that is merely behind a tab', async () => {
@@ -548,7 +603,13 @@ describe('startFreshSessionDraft', () => {
     render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
     await waitFor(() => expect(handle).not.toBeNull())
 
-    act(() => handle!.startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null }))
+    act(() =>
+      handle!.startFreshSessionDraft({
+        intent: { cause: 'gateway-transition', persistence: 'automatic', sequence: 1 },
+        preserveRoute: true,
+        workspaceTarget: null
+      })
+    )
 
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
     expect($terminalTakeover.get()).toBe(true)
@@ -737,7 +798,12 @@ function ResumeHarness({
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
   onReady: (
-    resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
+    resume: (
+      storedSessionId: string,
+      replaceRoute?: boolean,
+      ownerRoute?: SessionProfileRoute,
+      options?: { forceCold?: boolean }
+    ) => Promise<unknown>
   ) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
@@ -769,6 +835,10 @@ function ResumeHarness({
       // turnStartedAt behave as in production state updates.
       const current = stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
       const next = updater(current)
+
+      if (storedSessionId) {
+        runtimeMapRef.current.set(storedSessionId, sessionId)
+      }
 
       stateMapRef.current.set(sessionId, next)
       onStateUpdate?.(sessionId, next)
@@ -1410,8 +1480,11 @@ describe('resumeSession failure recovery', () => {
     })
 
     expect(requestGateway).not.toHaveBeenCalledWith('session.usage', { session_id: 'runtime-stale' })
-    expect(runtimeIdByStoredSessionIdRef.current.has('stored-1')).toBe(false)
+    // The stale runtime is evicted, then the successful cold resume immediately
+    // installs the fresh binding for subsequent warm resumes.
+    expect(runtimeIdByStoredSessionIdRef.current.get('stored-1')).toBe('runtime-1')
     expect(sessionStateByRuntimeIdRef.current.has('runtime-stale')).toBe(false)
+    expect(sessionStateByRuntimeIdRef.current.get('runtime-1')?.storedSessionId).toBe('stored-1')
     expect($activeSessionId.get()).toBe('runtime-1')
     expect($messages.get().length).toBe(1)
   })
@@ -2184,6 +2257,94 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
+  it('forceCold bypasses a colliding warm runtime without deleting background state', async () => {
+    const ownerRoute: SessionProfileRoute = { connectionId: 'source-a', profile: 'default' }
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([
+        ['stored-shared', 'runtime-other-owner'],
+        ['stored-sibling', 'runtime-sibling']
+      ])
+    }
+    const otherOwnerState = clientState('stored-shared')
+    const siblingState = clientState('stored-sibling')
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([
+        ['runtime-other-owner', otherOwnerState],
+        ['runtime-sibling', siblingState]
+      ])
+    }
+
+    setSessions([storedSession({ connection_id: 'source-a', id: 'stored-shared', profile: 'default' })])
+    $sessionTiles.set([
+      { ownerRoute, storedSessionId: 'stored-shared' },
+      {
+        ownerRoute: { connectionId: 'source-b', profile: 'default' },
+        storedSessionId: 'stored-shared'
+      }
+    ])
+    setMessages([{ id: 'foreign', role: 'assistant', parts: [{ type: 'text', text: 'other owner transcript' }] }])
+    vi.mocked(getSession).mockResolvedValue(
+      storedSession({
+        connection_id: 'source-a',
+        id: 'stored-shared',
+        profile: 'default'
+      })
+    )
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-shared' } as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method, params) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          messages: [],
+          resumed: params?.session_id,
+          session_id: 'runtime-target'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    let resume:
+      | null
+      | ((
+          storedSessionId: string,
+          replaceRoute?: boolean,
+          ownerRoute?: SessionProfileRoute,
+          options?: { forceCold?: boolean }
+        ) => Promise<unknown>) = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={ambientRequest}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionId="stored-shared"
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    await resume!('stored-shared', true, ownerRoute, { forceCold: true })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'default',
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-shared' })
+    )
+    expect(vi.mocked(requestGatewayForAgent).mock.calls.some(call => call[2] === 'session.activate')).toBe(false)
+    expect(runtimeIdByStoredSessionIdRef.current.get('stored-shared')).toBe('runtime-target')
+    expect(runtimeIdByStoredSessionIdRef.current.get('stored-sibling')).toBe('runtime-sibling')
+    expect(sessionStateByRuntimeIdRef.current.get('runtime-other-owner')).toBe(otherOwnerState)
+    expect(sessionStateByRuntimeIdRef.current.get('runtime-sibling')).toBe(siblingState)
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({ ownerRoute: { connectionId: 'source-b', profile: 'default' } })
+    ])
+    expect($messages.get()).toEqual([])
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
   it('keeps a registry-tagged cached session on its owning connection without an explicit route', async () => {
     setSessions([
       storedSession({
@@ -2272,9 +2433,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
     })
     expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
 
-    // The corrupt mapping was purged so it can't mis-resolve again.
-    expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
+    // The cross-wired runtime was purged so it can't mis-resolve again, then
+    // the successful full resume installed the correct fresh binding.
+    expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A-fresh')
     expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
+    expect(sessionStateByRuntimeIdRef.current.get('rt-A-fresh')?.storedSessionId).toBe('stored-A')
   })
 
   it('paints the bounded latest transcript after the deferred resume acknowledgement', async () => {
@@ -3504,7 +3667,10 @@ describe('createBackendSessionForSend workspace target', () => {
         $activeGatewayProfile.set('default')
       },
       handle => {
-        handle.startFreshSessionDraft({ workspaceTarget: null })
+        handle.startFreshSessionDraft({
+          intent: { cause: 'new-project-chat', persistence: 'explicit', sequence: 2 },
+          workspaceTarget: null
+        })
         $currentCwd.set('/project-open-in-file-browser')
       }
     )
@@ -3519,7 +3685,10 @@ describe('createBackendSessionForSend workspace target', () => {
         $activeGatewayProfile.set('default')
       },
       handle => {
-        handle.startFreshSessionDraft({ workspaceTarget: '/clicked-workspace' })
+        handle.startFreshSessionDraft({
+          intent: { cause: 'new-project-chat', persistence: 'explicit', sequence: 3 },
+          workspaceTarget: '/clicked-workspace'
+        })
         $currentCwd.set('/project-open-in-file-browser')
       }
     )

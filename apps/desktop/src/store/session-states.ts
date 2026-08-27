@@ -1495,14 +1495,24 @@ export function reuseBlankDraftTile(
 const closedTilesByProfile: Record<string, SessionTile[]> = {}
 const closedStack = (): SessionTile[] => (closedTilesByProfile[profileKey()] ??= [])
 
-export function closeSessionTile(storedSessionId: string) {
-  const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)
+export function closeSessionTile(
+  storedSessionId: string,
+  ownerScope?: { connectionId: string | null; profile: string; targetProfile?: string }
+) {
+  const ownerMatches = (tile: SessionTile) =>
+    !ownerScope ||
+    (ownerScope.connectionId === null
+      ? !tile.ownerRoute
+      : tile.ownerRoute?.connectionId === ownerScope.connectionId &&
+        tile.ownerRoute?.profile === ownerScope.profile &&
+        tile.ownerRoute?.targetProfile === ownerScope.targetProfile)
+  const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId && ownerMatches(t))
 
   if (tile) {
     closedStack().push(toStored(tile))
   }
 
-  saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
+  saveTiles($sessionTiles.get().filter(t => !(t.storedSessionId === storedSessionId && ownerMatches(t))))
 
   // A settled session may never publish again, so the publish-time eviction
   // in publishSessionState can't reach it — drop its cached state here. A

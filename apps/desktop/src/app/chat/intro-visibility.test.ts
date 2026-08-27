@@ -9,6 +9,7 @@ const showing = {
   freshDraftReady: true,
   messagesEmpty: true,
   primary: true,
+  restoringConversation: false,
   routedSessionView: false,
   selectedSessionId: null
 } as const
@@ -40,6 +41,7 @@ describe('shouldShowIntro', () => {
     expect(shouldShowIntro({ ...showing, primary: false })).toBe(false)
     expect(shouldShowIntro({ ...showing, auxiliaryWindow: true })).toBe(false)
     expect(shouldShowIntro({ ...showing, freshDraftReady: false })).toBe(false)
+    expect(shouldShowIntro({ ...showing, restoringConversation: true })).toBe(false)
     expect(shouldShowIntro({ ...showing, routedSessionView: true })).toBe(false)
     expect(shouldShowIntro({ ...showing, selectedSessionId: 'session-1' })).toBe(false)
     expect(shouldShowIntro({ ...showing, activeSessionId: 'session-1' })).toBe(false)

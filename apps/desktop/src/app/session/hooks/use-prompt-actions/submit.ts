@@ -21,6 +21,7 @@ import {
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
+import { promoteAutomaticFreshDraftToExplicit } from '@/store/profile-conversation-restore'
 import { isStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $sessions,
@@ -178,6 +179,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         return false
       }
 
+      // The first real user send owns an automatic isolation blank immediately.
+      // Promote before credential checks, attachment sync, resume, or backend
+      // creation so even an early failure cannot resurrect the previous chat.
+      if (
+        !options?.fromQueue &&
+        !options?.sessionId &&
+        !options?.storedSessionId &&
+        !activeSessionIdRef.current &&
+        !selectedStoredSessionIdRef.current
+      ) {
+        promoteAutomaticFreshDraftToExplicit()
+      }
+
       // Typing barge-in: a new send silences any in-flight spoken reply.
       if (isVoicePlaybackActive()) {
         markVoicePlaybackInterrupted()
@@ -282,9 +296,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const routedSessionNeedsResume = Boolean(
         routedStoredSessionId &&
-        (selectedStoredSessionId !== routedStoredSessionId ||
-          !startingActiveSessionId ||
-          startingActiveSessionId !== routedRuntimeId)
+          (selectedStoredSessionId !== routedStoredSessionId ||
+            !startingActiveSessionId ||
+            startingActiveSessionId !== routedRuntimeId)
       )
 
       // For an ordinary foreground submit, the durable route is the authority

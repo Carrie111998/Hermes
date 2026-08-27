@@ -3,6 +3,7 @@ import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import type { FreshSessionDraftOptions } from '@/app/session/hooks/use-session-actions'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
@@ -26,6 +27,7 @@ import { requestGatewayForAgent } from '@/store/gateway'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
+import { promoteAutomaticFreshDraftToExplicit } from '@/store/profile-conversation-restore'
 import {
   $busy,
   $connection,
@@ -243,7 +245,7 @@ interface PromptActionsOptions {
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
-  startFreshSessionDraft: () => void
+  startFreshSessionDraft: (options: FreshSessionDraftOptions) => void
   sttEnabled: boolean
   updateSessionState: (
     sessionId: string,
@@ -641,6 +643,18 @@ export function usePromptActions({
         await executeSlashCommand(visibleText, options?.sessionId ? { sessionId: options.sessionId } : undefined)
 
         return true
+      }
+
+      if (
+        (visibleText || attachments.length) &&
+        !options?.fromQueue &&
+        !options?.sessionId &&
+        !options?.storedSessionId &&
+        !options?.displayKind &&
+        !activeSessionIdRef.current &&
+        !selectedStoredSessionIdRef.current
+      ) {
+        promoteAutomaticFreshDraftToExplicit()
       }
 
       return await submitPromptText(rawText, options)

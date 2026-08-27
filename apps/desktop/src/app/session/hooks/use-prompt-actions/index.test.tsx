@@ -14,6 +14,11 @@ import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
+  $appliedFreshDraftProvenance,
+  _resetProfileConversationRestoreForTests,
+  applyFreshDraftProvenance
+} from '@/store/profile-conversation-restore'
+import {
   $busy,
   $connection,
   $currentCwd,
@@ -40,6 +45,7 @@ import { uploadComposerAttachment, usePromptActions } from '.'
 // never-settling in-flight promise from one test into the next.
 beforeEach(() => {
   clearSingleFlightSessionResumeState()
+  _resetProfileConversationRestoreForTests()
 })
 
 vi.mock('@/hermes', () => ({
@@ -4022,6 +4028,36 @@ describe('usePromptActions sleep/wake session recovery', () => {
       { session_id: RECOVERED_SESSION_ID, text: 'retry after recovery' },
       1_800_000
     )
+  })
+
+  it('promotes an automatic blank before failed prompt and skill session creation', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const createBackendSessionForSend = vi.fn(async () => null)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        storedSessionId={null}
+      />
+    )
+
+    applyFreshDraftProvenance({ cause: 'profile-switch', freshSequence: 1, kind: 'automatic' })
+    const prompt = handle!.submitText('first message')
+    expect($appliedFreshDraftProvenance.get()).toMatchObject({ kind: 'explicit' })
+    await expect(prompt).resolves.toBe(false)
+
+    applyFreshDraftProvenance({ cause: 'profile-switch', freshSequence: 2, kind: 'automatic' })
+    const skill = handle!.submitText('/my-skill')
+    expect($appliedFreshDraftProvenance.get()).toMatchObject({ kind: 'explicit' })
+    await skill
+
+    expect(createBackendSessionForSend).toHaveBeenCalledTimes(2)
   })
 
   it('still creates a new session for a genuine new-chat draft (no stored session selected)', async () => {

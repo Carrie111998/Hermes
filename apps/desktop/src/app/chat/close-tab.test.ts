@@ -21,7 +21,7 @@ vi.mock('@/store/profile', () => ({
   // The layout store reads the sidebar's profile scope; this suite only cares
   // about the fresh-session call.
   $showAllProfiles: atom(false),
-  requestFreshSession: () => requestFreshSession(),
+  requestFreshSession: (intent: unknown) => requestFreshSession(intent),
   setShowAllProfiles: () => {}
 }))
 
@@ -106,7 +106,7 @@ describe('closeWorkspaceTab', () => {
     loadedMainOnly()
 
     expect(closeWorkspaceTab(vi.fn())).toBe(true)
-    expect(requestFreshSession).toHaveBeenCalledTimes(1)
+    expect(requestFreshSession).toHaveBeenCalledWith({ cause: 'close-chat', persistence: 'explicit' })
   })
 
   it('empties main even with no session loader wired', () => {

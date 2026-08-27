@@ -88,6 +88,8 @@ const {
   selectConnection,
   setConnectionsRegistry
 } = await import('./connections')
+const { $profileConversationRestore, _resetProfileConversationRestoreForTests, cancelProfileConversationRestore } =
+  await import('./profile-conversation-restore')
 
 const registry: DesktopConnectionsRegistry = {
   connections: [
@@ -106,6 +108,7 @@ const setLastUsed = vi.fn(async (id: string) => ({ ok: true, registry: { ...regi
 beforeEach(() => {
   localStorage.clear()
   _resetConnectionsForTests()
+  _resetProfileConversationRestoreForTests()
   $connectionsRegistry.set(null)
   $connection.set(null)
   $activeGatewayProfile.set('default')
@@ -163,6 +166,8 @@ describe('connection registry cache', () => {
     expect(ensureGatewayAgent).toHaveBeenCalledTimes(1)
     expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
     expect(setLastUsed).toHaveBeenCalledWith('homelab')
+    expect($profileConversationRestore.get()).toBeNull()
+    expect(requestFreshSession).toHaveBeenCalledWith({ cause: 'boot-transition', persistence: 'automatic' })
   })
 
   it('preserves the established Primary-source launch behavior by default', async () => {
@@ -226,11 +231,35 @@ describe('selectConnection', () => {
     expect(openGatewayAgent).toHaveBeenCalledWith('homelab', 'default')
     expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
     expect(beforeConnectionSwitch).toHaveBeenCalledTimes(1)
-    expect(requestFreshSession).toHaveBeenCalledTimes(1)
+    expect(requestFreshSession).toHaveBeenCalledWith({
+      cause: 'connection-switch',
+      persistence: 'automatic',
+      restoreSequence: $profileConversationRestore.get()?.sequence
+    })
+    expect($profileConversationRestore.get()).toMatchObject({
+      origin: 'connection-switch',
+      phase: 'committed',
+      target: { connectionId: 'homelab', profile: 'default' }
+    })
     expect(wipeSessionListsForGatewaySwitch).toHaveBeenCalledTimes(1)
     expect($newChatProfile.get()).toBe('default')
     expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
     expect(setLastUsed).toHaveBeenCalledWith('homelab')
+  })
+
+  it('treats a first user click with no adopted descriptor as user intent, not boot', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set(null)
+
+    await selectConnection('homelab')
+
+    expect($profileConversationRestore.get()).toMatchObject({
+      phase: 'committed',
+      target: { connectionId: 'homelab', profile: 'default' }
+    })
+    expect(requestFreshSession).toHaveBeenCalledWith(
+      expect.objectContaining({ cause: 'connection-switch', persistence: 'automatic' })
+    )
   })
 
   it('does not reset or dial when the active source/profile is selected again', async () => {
@@ -250,6 +279,25 @@ describe('selectConnection', () => {
     await selectConnection('local')
 
     expect(ensureGatewayAgent).toHaveBeenCalledWith('local', 'default', expect.anything())
+  })
+
+  it('does not commit a pending dial after another context action cancels its restore ownership', async () => {
+    const dial = deferred()
+
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    openGatewayAgent.mockImplementationOnce(() => dial.promise)
+
+    const switching = selectConnection('homelab')
+    await vi.waitFor(() => expect(openGatewayAgent).toHaveBeenCalledTimes(1))
+    cancelProfileConversationRestore(undefined, 'all-profiles')
+    dial.resolve()
+    await switching
+
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect(beginGatewaySwitch).not.toHaveBeenCalled()
+    expect(requestFreshSession).not.toHaveBeenCalled()
+    expect($connection.get()?.connectionId).toBe('local')
   })
 
   it('lets a later source choice win while an earlier dial is still pending', async () => {
@@ -355,6 +403,7 @@ describe('selectConnection', () => {
     expect($activeSessionId.get()).toBe('a93bb39d')
     expect($gatewaySwitching.get()).toBe(false)
     expect(requestFreshSession).not.toHaveBeenCalled()
+    expect($profileConversationRestore.get()).toBeNull()
     expect($newChatProfile.get()).toBeNull()
     expect($pendingConnectionId.get()).toBeNull()
     expect(setLastUsed).not.toHaveBeenCalled()
@@ -379,7 +428,8 @@ describe('selectConnection', () => {
     // The lists were wiped for a commit that never happened; the source that
     // is still active gets repainted and the user lands on a fresh draft there.
     expect(recoverActiveSourceAfterFailedGatewaySwitch).toHaveBeenCalledTimes(1)
-    expect(requestFreshSession).toHaveBeenCalledTimes(1)
+    expect(requestFreshSession).toHaveBeenCalledWith({ cause: 'switch-recovery', persistence: 'automatic' })
+    expect($profileConversationRestore.get()).toBeNull()
     expect(setLastUsed).not.toHaveBeenCalled()
     expect($newChatProfile.get()).toBeNull()
     expect($pendingConnectionId.get()).toBeNull()
@@ -584,7 +634,12 @@ describe('selectConnection', () => {
       expect($connection.get()?.connectionId).toBe('homelab')
       expect($gatewaySwitching.get()).toBe(false)
       expect(setLastUsed).toHaveBeenCalledWith('homelab')
-      expect(requestFreshSession).toHaveBeenCalledTimes(1)
+      expect(requestFreshSession).toHaveBeenCalledWith({
+        cause: 'connection-switch',
+        persistence: 'automatic',
+        restoreSequence: $profileConversationRestore.get()?.sequence
+      })
+      expect($profileConversationRestore.get()?.phase).toBe('committed')
       expect(recoverActiveSourceAfterFailedGatewaySwitch).not.toHaveBeenCalled()
       expect($pendingConnectionId.get()).toBeNull()
     } finally {
@@ -812,6 +867,26 @@ describe('selectConnection', () => {
 
     expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
     expect($showAllProfiles.get()).toBe(false)
+  })
+
+  it('restores synchronously when leaving All Profiles onto the already-active exact pair', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local', profile: 'default', registryScoped: true })
+    $activeGatewayProfile.set('default')
+    $showAllProfiles.set(true)
+
+    await selectConnection('local')
+
+    expect(openGatewayAgent).not.toHaveBeenCalled()
+    expect($profileConversationRestore.get()).toMatchObject({
+      phase: 'committed',
+      target: { connectionId: 'local', profile: 'default' }
+    })
+    expect(requestFreshSession).toHaveBeenCalledWith({
+      cause: 'connection-switch',
+      persistence: 'automatic',
+      restoreSequence: $profileConversationRestore.get()?.sequence
+    })
   })
 
   it('never re-homes a live connection the registry cannot name', async () => {

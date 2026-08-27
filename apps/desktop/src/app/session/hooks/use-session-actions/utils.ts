@@ -852,8 +852,8 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
 
   const turnAlreadyStructured = Boolean(
     liveAssistantOfCurrentTurn &&
-    hasStructuralParts(liveAssistantOfCurrentTurn) &&
-    isLiveTailRow(liveAssistantOfCurrentTurn)
+      hasStructuralParts(liveAssistantOfCurrentTurn) &&
+      isLiveTailRow(liveAssistantOfCurrentTurn)
   )
 
   const wantsAssistantRow = Boolean(
@@ -1385,6 +1385,124 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
       return (existing._lineage_root_id ?? existing.id) !== lineage
     })
   ])
+}
+
+/** Publish a restore candidate only after its caller has revalidated the exact
+ * activation generation. Replacement is owner-qualified so same-id rows from
+ * another connection/profile remain available to their own workspace. */
+export function publishResolvedSessionForRestore(
+  session: SessionInfo,
+  storedSessionId: string,
+  target: RestoreLookupTarget
+): void {
+  const targetProfile = normalizeProfileKey(target.profile)
+  const targetConnectionId = target.connectionId?.trim() || null
+  const published: SessionInfo = {
+    ...session,
+    profile: targetProfile,
+    ...(targetConnectionId ? { connection_id: targetConnectionId } : { connection_id: undefined })
+  }
+  const publishedLineage = published._lineage_root_id ?? published.id
+  const sameOwner = (existing: SessionInfo) =>
+    normalizeProfileKey(existing.profile) === targetProfile &&
+    (existing.connection_id?.trim() || null) === targetConnectionId
+  const sameConversation = (existing: SessionInfo) =>
+    sessionMatchesStoredId(existing, storedSessionId) || (existing._lineage_root_id ?? existing.id) === publishedLineage
+
+  setSessions(prev => [published, ...prev.filter(existing => !(sameOwner(existing) && sameConversation(existing)))])
+}
+
+export interface RestoreLookupTarget {
+  connectionId: string | null
+  profile: string
+  storageSuffix: string
+}
+
+export type RestoreLookupResult =
+  | { status: 'found'; session: SessionInfo; ownerRoute?: SessionProfileRoute }
+  | { status: 'not-found' }
+  | { status: 'inconclusive'; reason: string }
+
+export type SessionLookupErrorClassification = 'not-found' | 'inconclusive'
+
+/** Shared classification for authoritative session reads. Only a target-scoped
+ * session-gone response is deletion proof; every other failure keeps durable
+ * navigation state intact so callers can retry or recover later. */
+export function classifySessionLookupError(error: unknown): SessionLookupErrorClassification {
+  if (!isSessionGoneError(error)) {
+    return 'inconclusive'
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  // A generic HTTP/proxy/endpoint 404 is not proof that the session row is
+  // gone. Require the backend's session-specific absence wording before a
+  // restore caller is allowed to clear durable navigation.
+  return /session(?:[_ -]?id)?[^\n]*not found|session gone/i.test(message) ? 'not-found' : 'inconclusive'
+}
+
+/**
+ * Resolve one remembered durable id against exactly one already-proven target.
+ * Unlike resolveStoredSession(), this never accepts the renderer's bare-id
+ * caches as ownership evidence and never probes another profile/source.
+ */
+export async function resolveStoredSessionForRestore(
+  storedSessionId: string,
+  target: RestoreLookupTarget
+): Promise<RestoreLookupResult> {
+  const durableId = storedSessionId.trim()
+  const targetProfile = normalizeProfileKey(target.profile)
+  const connectionId = target.connectionId?.trim() || null
+
+  if (!durableId) {
+    return { status: 'inconclusive', reason: 'missing stored session id' }
+  }
+
+  try {
+    const scope = connectionId ? { connectionId, profile: targetProfile } : targetProfile
+    const candidate = await getSession(durableId, scope)
+
+    if (!candidate || typeof candidate !== 'object') {
+      return { status: 'inconclusive', reason: 'malformed session response' }
+    }
+
+    const candidateId = typeof candidate.id === 'string' ? candidate.id.trim() : ''
+    const lineageId = typeof candidate._lineage_root_id === 'string' ? candidate._lineage_root_id.trim() : ''
+
+    if (!candidateId || (candidateId !== durableId && lineageId !== durableId)) {
+      return { status: 'inconclusive', reason: 'session response does not match requested lineage' }
+    }
+
+    const returnedConnectionId = candidate.connection_id?.trim() || null
+
+    if (returnedConnectionId && returnedConnectionId !== connectionId) {
+      return { status: 'inconclusive', reason: 'session response belongs to another connection' }
+    }
+
+    // Return an isolated candidate. The caller owns generation/scope validation
+    // after this await and is the only place allowed to publish it globally.
+    const resolved: SessionInfo = {
+      ...candidate,
+      profile: targetProfile,
+      ...(connectionId ? { connection_id: connectionId } : { connection_id: undefined })
+    }
+    const ownerRoute = connectionId ? { connectionId, profile: targetProfile } : undefined
+
+    return {
+      status: 'found',
+      session: resolved,
+      ...(ownerRoute ? { ownerRoute } : {})
+    }
+  } catch (error) {
+    const classification = classifySessionLookupError(error)
+
+    return classification === 'not-found'
+      ? { status: 'not-found' }
+      : {
+          status: 'inconclusive',
+          reason: error instanceof Error ? error.message : String(error ?? 'session lookup failed')
+        }
+  }
 }
 
 export async function resolveStoredSession(
