@@ -118,17 +118,23 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
-    """Distinguish iLink stale-session responses from genuine rate limits."""
+    """True for the precise iLink responses known to mean a stale session."""
     if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
         return True
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    message = " ".join((errmsg or "").lower().replace("_", " ").split())
-    return (
-        message == "unknown error"
-        or "session" in message
-        or "context token" in message
-    )
+    return (errmsg or "").strip().lower() == "unknown error"
+
+
+def _is_stale_context_token_ret(
+    ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
+) -> bool:
+    """True when an outbound send reports a stale ``context_token``."""
+    if _is_stale_session_ret(ret, errcode, errmsg):
+        return True
+    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+        return False
+    return (errmsg or "").strip().lower() == "prepare failed"
 
 
 MEDIA_IMAGE = 1
@@ -336,6 +342,14 @@ class ContextTokenStore:
     def set(self, account_id: str, user_id: str, token: str) -> None:
         self._cache[self._key(account_id, user_id)] = token
         self._persist(account_id)
+
+    def delete(self, account_id: str, user_id: str, expected_token: str) -> bool:
+        key = self._key(account_id, user_id)
+        if self._cache.get(key) != expected_token:
+            return False
+        self._cache.pop(key, None)
+        self._persist(account_id)
+        return True
 
     def _persist(self, account_id: str) -> None:
         prefix = f"{account_id}:"
@@ -1799,17 +1813,16 @@ class WeixinAdapter(BasePlatformAdapter):
         *,
         chat_id: str,
         chunk: str,
-        context_token: Optional[str],
         client_id: str,
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff.
 
-        On session-expired errors (errcode -14), automatically retries
-        *without* ``context_token`` — iLink accepts tokenless sends as a
-        degraded fallback, which keeps cron-initiated push messages working
-        even when no user message has refreshed the session recently.
+        On session-expired or stale-context errors, automatically retries
+        *without* ``context_token``.  The recovery send does not consume the
+        configured transient retry budget.
         """
         async with self._send_text_gate:
+            context_token = self._token_store.get(self._account_id, chat_id)
             await self._send_text_chunk_locked(
                 chat_id=chat_id,
                 chunk=chunk,
@@ -1827,8 +1840,8 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> None:
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
-        retried_without_token = False
-        for attempt in range(self._send_chunk_retries + 1):
+        attempt = 0
+        while attempt <= self._send_chunk_retries:
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
             try:
@@ -1846,15 +1859,19 @@ class WeixinAdapter(BasePlatformAdapter):
                     ret = resp.get("ret")
                     errcode = resp.get("errcode")
                     if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
-                        is_session_expired = _is_stale_session_ret(
-                            ret, errcode, resp.get("errmsg") or resp.get("msg")
+                        is_session_expired = _is_stale_context_token_ret(
+                            ret,
+                            errcode,
+                            resp.get("errmsg") or resp.get("msg"),
                         )
                         # Session expired — strip token and retry once
-                        if is_session_expired and not retried_without_token and context_token:
-                            retried_without_token = True
+                        if is_session_expired and context_token:
+                            stale_token = context_token
                             context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
+                            self._token_store.delete(
+                                self._account_id,
+                                chat_id,
+                                stale_token,
                             )
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
@@ -1864,7 +1881,7 @@ class WeixinAdapter(BasePlatformAdapter):
                         if is_session_expired:
                             errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
                             last_error = RuntimeError(
-                                "iLink session expired: "
+                                "iLink stale session: "
                                 f"ret={ret} errcode={errcode} errmsg={errmsg}; "
                                 "ask the user to message the bot in WeChat to refresh the session, "
                                 "then retry (or re-run iLink login)"
@@ -1894,6 +1911,7 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self.name, _safe_id(chat_id), wait,
                             )
                             await asyncio.sleep(wait)
+                            attempt += 1
                             continue
                         errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
                         raise RuntimeError(
@@ -1917,6 +1935,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 )
                 if wait > 0:
                     await asyncio.sleep(wait)
+                attempt += 1
         assert last_error is not None
         raise last_error
 
@@ -1929,7 +1948,6 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
-        context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
 
         # Extract MEDIA: tags and bare local file paths before text delivery.
@@ -1976,7 +1994,6 @@ class WeixinAdapter(BasePlatformAdapter):
                 await self._send_text_chunk(
                     chat_id=chat_id,
                     chunk=chunk,
-                    context_token=context_token,
                     client_id=client_id,
                 )
                 last_message_id = client_id
