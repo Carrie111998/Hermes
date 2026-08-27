@@ -31,7 +31,7 @@ Comprehensive management, operation, diagnostics, and orchestration toolkit for 
 * **Home Directory:** `/home/orca`
 * **Configuration & SQLite DB:** `/home/orca/.config/orca/` (`orchestration.db`, sockets, runtime config)
 * **Projects & Workspaces:** `/home/orca/orca/projects/` & `/home/orca/orca/workspaces/`
-* **Service Manager:** `orca-serve.service` (systemd unit running port `6768`, WebSocket `wss://orca.xvix.com.br`)
+* **Service Manager:** `orca-serve.service` (systemd unit running port `6768`, WebSocket `ws://127.0.0.1:6768` or `wss://<your-domain>`)
 * **Global CLI Entrypoint:** `/usr/local/bin/orca` (wraps Node execution of unpacked Orca CLI engine with `HOME=/home/orca`)
 
 ---
