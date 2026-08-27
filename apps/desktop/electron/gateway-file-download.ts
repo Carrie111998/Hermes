@@ -5,10 +5,11 @@
 // The transport wrappers (token / OAuth) live in main.ts because they need
 // main-process singletons (https/http, electronNet, the OAuth session). They
 // delegate the byte-moving to `pumpStreamToFile` here, which streams the
-// response to a user-selected destination with backpressure and cleans up a
-// partial file on error — so a large download never has to be buffered whole in
-// the native process.
+// response to an operation-owned temporary file with backpressure and only
+// replaces the user-selected destination after the stream finishes.
 
+import { randomUUID } from 'node:crypto'
+import { rename as renameFile } from 'node:fs/promises'
 import path from 'node:path'
 
 // Minimal shape of the response objects we consume. Both Node's
@@ -33,6 +34,8 @@ export interface WriteStreamLike {
 export interface PumpDeps {
   createWriteStream: (destPath: string) => WriteStreamLike
   unlink: (destPath: string) => Promise<unknown>
+  rename?: (sourcePath: string, destPath: string) => Promise<unknown>
+  temporaryPath?: (destPath: string) => string
 }
 
 export interface GatewayFileBackendDeps<T> {
@@ -79,13 +82,14 @@ export async function resolveGatewayFileBackend<T>(
   return { connection, connectionId, profile }
 }
 
-// Stream `res` into `destPath`, honoring backpressure. On any read/write error
-// the write stream is torn down and the (partial) destination file is removed
-// before the returned promise rejects, so a failed download never leaves a
-// truncated file behind.
+// Stream `res` into an operation-owned sibling file, honoring backpressure.
+// Only after the stream closes successfully do we rename that staging file onto
+// `destPath`. Failures clean up only the staging file, so an existing destination
+// can never be truncated or deleted by a failed gateway transfer.
 export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: PumpDeps): Promise<void> {
   return new Promise((resolve, reject) => {
-    const ws = deps.createWriteStream(destPath)
+    const partialPath = deps.temporaryPath?.(destPath) ?? `${destPath}.${randomUUID()}.download`
+    const ws = deps.createWriteStream(partialPath)
     let failed = false
 
     const fail = (err: Error) => {
@@ -107,7 +111,7 @@ export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: Pump
         // best effort
       }
 
-      Promise.resolve(deps.unlink(destPath))
+      Promise.resolve(deps.unlink(partialPath))
         .catch(() => {})
         .then(() => reject(err))
     }
@@ -140,7 +144,11 @@ export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: Pump
         return
       }
 
-      ws.end(() => resolve())
+      ws.end(() => {
+        const rename = deps.rename ?? renameFile
+
+        Promise.resolve(rename(partialPath, destPath)).then(() => resolve(), error => fail(error as Error))
+      })
     })
   })
 }
