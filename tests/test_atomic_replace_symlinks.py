@@ -15,6 +15,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -34,6 +35,17 @@ from utils import (
     atomic_roundtrip_yaml_update,
     atomic_yaml_write,
 )
+
+
+def _make_directory_junction(link: Path, target: Path) -> None:
+    """Create a Windows directory junction without symlink privileges."""
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        pytest.skip(detail or f"mklink /J failed: {result.returncode}")
 
 
 # ─── Direct helper ────────────────────────────────────────────────────────────
@@ -106,6 +118,43 @@ def test_atomic_json_write_preserves_symlink(tmp_path: Path) -> None:
     assert link.is_symlink()
     loaded = json.loads(real.read_text(encoding="utf-8"))
     assert loaded == {"hello": "world"}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_provider_models_cache_uses_canonical_junction_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider cache temp files use the physical directory behind a junction."""
+    from hermes_cli import models
+    import utils
+
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    junction_home = tmp_path / "junction-home"
+    _make_directory_junction(junction_home, physical_home)
+
+    cache_path = junction_home / "provider_models_cache.json"
+    monkeypatch.setattr(models, "_provider_models_cache_path", lambda: cache_path)
+
+    mkstemp_dirs: list[str] = []
+    real_mkstemp = utils.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        mkstemp_dirs.append(str(kwargs["dir"]))
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(utils.tempfile, "mkstemp", tracking_mkstemp)
+
+    models._save_provider_models_cache({"openrouter": {"models": ["test/model"]}})
+
+    physical_cache = physical_home / "provider_models_cache.json"
+    assert json.loads(physical_cache.read_text(encoding="utf-8")) == {
+        "openrouter": {"models": ["test/model"]}
+    }
+    assert len(mkstemp_dirs) == 1
+    assert os.path.normcase(os.path.abspath(mkstemp_dirs[0])) == os.path.normcase(
+        os.path.realpath(physical_home)
+    )
 
 
 @pytest.mark.require_symlinks

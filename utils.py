@@ -373,8 +373,15 @@ def atomic_json_write(
     original_mode = None if mode is not None else _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
 
+    # Windows filesystem filters can report false name collisions when
+    # ``mkstemp`` traverses a junction spelling. CPython treats EEXIST as a
+    # random-name collision and retries up to TMP_MAX, turning that false
+    # result into an effectively unbounded CPU loop. Create the sibling temp
+    # through the physical parent spelling instead; the published target keeps
+    # its caller-visible path and final-component symlink semantics.
+    temp_parent = Path(os.path.realpath(path.parent)) if _IS_WINDOWS else path.parent
     fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
+        dir=str(temp_parent),
         prefix=f".{path.stem}_",
         suffix=".tmp",
     )
