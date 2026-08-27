@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFile } from 'node:fs/promises'
+
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Mock fs/promises before importing the module under test
 vi.mock('node:fs/promises', () => ({
@@ -8,8 +9,7 @@ vi.mock('node:fs/promises', () => ({
 
 import {
   detectLocalGatewayRunning,
-  invalidateLocalGatewayCache,
-  type GatewayLiveness
+  invalidateLocalGatewayCache
 } from './local-gateway-detect'
 
 // vi.mocked() is the canonical typed cast for a module-mocked function.
@@ -23,7 +23,9 @@ const mockReadFile = vi.mocked(readFile)
  */
 function statLine(field22: number): string {
   const fields: string[] = ['0', '(sleep)', 'S']
-  for (let i = 3; i <= 20; i++) fields.push('0') // fields 4..21
+  for (let i = 3; i <= 20; i++) {
+    fields.push('0') // fields 4..21
+  }
   fields.push(String(field22)) // field 22 = starttime (clock ticks)
   return fields.join(' ')
 }
@@ -139,7 +141,9 @@ describe('detectLocalGatewayRunning', () => {
     const field22 = 4_567_890
     mockReadFile.mockImplementation(async (path) => {
       const file = String(path)
-      if (file.startsWith('/proc/')) return statLine(field22)
+      if (file.startsWith('/proc/')) {
+          return statLine(field22)
+        }
       return JSON.stringify({
         gateway_state: 'running',
         pid: process.pid, // our own (known-live) PID
@@ -160,7 +164,9 @@ describe('detectLocalGatewayRunning', () => {
     // PID was recycled. Field 22 differs from the recorded start_time.
     mockReadFile.mockImplementation(async (path) => {
       const file = String(path)
-      if (file.startsWith('/proc/')) return statLine(9_999_999) // live value differs
+      if (file.startsWith('/proc/')) {
+          return statLine(9_999_999) // live value differs
+        }
       return JSON.stringify({
         gateway_state: 'running',
         pid: process.pid, // known-live PID number...
@@ -179,7 +185,9 @@ describe('detectLocalGatewayRunning', () => {
     // guard abstains and a live PID is accepted — never a false pid-reused.
     mockReadFile.mockImplementation(async (path) => {
       const file = String(path)
-      if (file.startsWith('/proc/')) throw new Error('ENOENT')
+      if (file.startsWith('/proc/')) {
+          throw new Error('ENOENT')
+        }
       return JSON.stringify({
         gateway_state: 'running',
         pid: process.pid,

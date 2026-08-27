@@ -124,7 +124,6 @@ import {
   withTransientRetries
 } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
-import { detectLocalGatewayRunning, type GatewayLiveness } from './local-gateway-detect'
 import {
   backendScopeKey,
   backendScopePrefix,
@@ -227,6 +226,7 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import { detectLocalGatewayRunning, type GatewayLiveness } from './local-gateway-detect'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   assertManagedUpdatePreflightClear,

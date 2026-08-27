@@ -63,9 +63,13 @@ type GatewayStateRecord = {
 
 function hermesHome(): string | null {
   const home = process.env.HERMES_HOME
-  if (home && home.trim()) return home.trim()
+  if (home && home.trim()) {
+    return home.trim()
+  }
   const fallback = process.env.HOME || process.env.USERPROFILE
-  if (fallback && fallback.trim()) return fallback.trim()
+  if (fallback && fallback.trim()) {
+    return fallback.trim()
+  }
   return null
 }
 
@@ -143,10 +147,14 @@ async function isPidAlive(
 /** Recorded `start_time` as a number, or `null` when absent/unusable. */
 function recordedStartTime(record: GatewayStateRecord): number | null {
   const raw = record.start_time
-  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return raw
+  }
   if (typeof raw === 'string' && raw.trim()) {
     const parsed = Number(raw)
-    if (Number.isFinite(parsed)) return parsed
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
   }
   return null
 }
@@ -221,12 +229,16 @@ function extractGatewayPort(record: GatewayStateRecord): number | null {
       const arg = String(argv[i])
       if ((arg === '--port' || arg === '-p') && i + 1 < argv.length) {
         const n = Number(argv[i + 1])
-        if (Number.isFinite(n) && n > 0 && n < 65536) return n
+        if (Number.isFinite(n) && n > 0 && n < 65536) {
+          return n
+        }
       }
       // Also accept `--port=N` form.
       if (arg.startsWith('--port=')) {
         const n = Number(arg.slice('--port='.length))
-        if (Number.isFinite(n) && n > 0 && n < 65536) return n
+        if (Number.isFinite(n) && n > 0 && n < 65536) {
+          return n
+        }
       }
     }
   }
