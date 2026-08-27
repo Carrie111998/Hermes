@@ -59,9 +59,13 @@ def test_escape_match_arg_preserves_backslashes():
 
 
 def test_escape_shell_arg_still_translates_windows_paths(monkeypatch):
+    from tools.environments import local as _local_env
     from tools.file_operations import ShellFileOperations
 
-    monkeypatch.setattr("sys.platform", "win32")
+    # _bash_safe_path gates on the module-level _IS_WINDOWS (computed once at
+    # import), not sys.platform — patch the flag the code actually reads so the
+    # translation runs on any host (Linux CI included), not just real Win11.
+    monkeypatch.setattr(_local_env, "_IS_WINDOWS", True)
     env = ShellFileOperations.__new__(ShellFileOperations)
     quoted = env._escape_shell_arg("C:\\Users\\x\\file.py")
     assert "\\" not in quoted
