@@ -115,6 +115,26 @@ def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     )
 
 
+def test_list_authenticated_providers_numeric_current_provider_does_not_crash(
+    monkeypatch,
+):
+    """Unquoted YAML `provider: 2070` must not 500 GET /api/model/options."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *a, **k: [])
+
+    providers = list_authenticated_providers(
+        current_provider=2070,
+        current_base_url="http://192.168.1.10:8082/v1",
+        current_model="Qwen3.5-9B-Q4_K_M.gguf",
+        user_providers={},
+        custom_providers=[],
+        max_models=0,
+        probe_custom_providers=False,
+    )
+
+    assert isinstance(providers, list)
+
 
 def test_providers_singular_model_does_not_suppress_ollama_native_discovery(monkeypatch):
     """A saved selection in ``providers:`` is not an explicit catalog."""

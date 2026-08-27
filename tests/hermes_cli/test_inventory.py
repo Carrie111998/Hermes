@@ -40,6 +40,30 @@ def _cfg(model=None, providers=None, custom_providers=None) -> dict:
     }
 
 
+def test_load_picker_context_coerces_numeric_yaml_provider():
+    """PyYAML parses unquoted `provider: 2070` as int; picker context must be str.
+
+    Desktop GET /api/model/options crashed with AttributeError: 'int' object
+    has no attribute 'strip' when a custom endpoint was named after a GPU.
+    """
+    cfg = _cfg(
+        model={
+            "provider": 2070,
+            "default": "Qwen3.5-9B-Q4_K_M.gguf",
+            "base_url": "http://192.168.1.10:8082/v1",
+        }
+    )
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+        "hermes_cli.config.get_compatible_custom_providers", return_value=[]
+    ):
+        ctx = load_picker_context()
+    assert ctx.current_provider == "2070"
+    assert isinstance(ctx.current_provider, str)
+    assert ctx.current_model == "Qwen3.5-9B-Q4_K_M.gguf"
+    assert ctx.current_base_url == "http://192.168.1.10:8082/v1"
+
+
+
 
 
 
