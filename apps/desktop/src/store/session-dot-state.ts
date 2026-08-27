@@ -25,6 +25,7 @@
 
 import { computed } from 'nanostores'
 
+import { ownerQualifiedSessionIdentity, sessionRowIdentity } from '@/lib/session-row-identity'
 import { stableArray, stableRecord } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
@@ -34,7 +35,8 @@ import {
   $draftSessionIds,
   $sessionStates,
   $stalledSessionIds,
-  $workingSessionIds
+  $workingSessionIds,
+  sessionStatusMembershipIdentities
 } from './session-states'
 import { $unreadWriteGuard, UNREAD_WRITE_GUARD_MS } from './session-unread-remote'
 import { $subagentsBySession, activeSubagentCount } from './subagents'
@@ -108,17 +110,16 @@ export const $sessionDotStateById = computed(
     $delegatingSessionIds,
     $unreadFinishedSessionIds,
     $draftSessionIds,
+    $sessionStates,
     $sessions,
     $unreadWriteGuard
   ],
-  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
+  (attention, working, stalled, background, delegating, unread, draft, states, sessions, unreadWriteGuard) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
-      for (const id of ids) {
-        for (const alias of lineageAliases(id, sessions)) {
-          next[alias] = state
-        }
+      for (const identity of sessionStatusMembershipIdentities(ids, states, sessions)) {
+        next[identity] = state
       }
     }
 
@@ -137,25 +138,31 @@ export const $sessionDotStateById = computed(
     // something here you haven't opened". A list page that predates one of
     // our own writes is fenced out by the write guard: keep OUR value until a
     // page confirms it or the guard expires.
-    const persistedUnread: string[] = []
+    const persistedUnreadRows = []
 
-    for (const s of sessions) {
-      const entry = unreadWriteGuard.get(s.id)
+    for (const session of sessions) {
+      const entry = unreadWriteGuard.get(session.id)
 
       if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {
         if (entry.value) {
-          persistedUnread.push(s.id)
+          persistedUnreadRows.push(session)
         }
 
         continue
       }
 
-      if (s.unread === true) {
-        persistedUnread.push(s.id)
+      if (session.unread === true) {
+        persistedUnreadRows.push(session)
       }
     }
 
-    claim(persistedUnread, 'unread')
+    for (const session of persistedUnreadRows) {
+      next[sessionRowIdentity(session)] = 'unread'
+
+      if (sessions.filter(candidate => candidate.id === session.id).length === 1) {
+        next[session.id] = 'unread'
+      }
+    }
 
     claim(background, 'background')
     // Async delegation: the parent turn has ended but its subagents are still
@@ -170,9 +177,9 @@ export const $sessionDotStateById = computed(
     // session already claimed as working. The hint outlives its turn by a tick
     // on some paths; without this it could invent a running session.
     for (const id of stalled) {
-      for (const alias of lineageAliases(id, sessions)) {
-        if (next[alias] === 'working') {
-          next[alias] = 'stalled'
+      for (const identity of sessionStatusMembershipIdentities([id], states, sessions)) {
+        if (next[identity] === 'working') {
+          next[identity] = 'stalled'
         }
       }
     }
@@ -187,13 +194,27 @@ export const $sessionDotStateById = computed(
  *  `$sessionDotStateById` are ignored unless they are themselves a listed row. */
 export function unreadSessionCount(
   byId: Readonly<Record<string, SessionDotState>>,
-  ...lists: Array<readonly { archived?: boolean; id: string }[]>
+  ...lists: Array<
+    readonly {
+      _lineage_root_id?: null | string
+      archived?: boolean
+      connection_id?: null | string
+      id: string
+      profile?: null | string
+    }[]
+  >
 ): number {
   let n = 0
 
   for (const rows of lists) {
     for (const row of rows) {
-      if (!row.archived && byId[row.id] === 'unread') {
+      const identity = ownerQualifiedSessionIdentity(
+        row.connection_id,
+        row.profile,
+        row._lineage_root_id?.trim() || row.id
+      )
+
+      if (!row.archived && (byId[identity] === 'unread' || byId[row.id] === 'unread')) {
         n++
       }
     }

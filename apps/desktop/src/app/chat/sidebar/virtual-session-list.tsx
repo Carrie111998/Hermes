@@ -149,9 +149,10 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       branchStem,
       card,
       isPinned: pinned,
-      isSelected: activeSessionIdentity
-        ? sessionRowIdentity(session) === activeSessionIdentity
-        : session.id === activeSessionId,
+      isSelected:
+        activeSessionIdentity !== undefined
+          ? activeSessionIdentity !== null && sessionRowIdentity(session) === activeSessionIdentity
+          : session.id === activeSessionId,
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id, sessionRowOwnerRoute(session)),

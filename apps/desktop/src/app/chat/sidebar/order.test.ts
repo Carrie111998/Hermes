@@ -79,12 +79,13 @@ describe('rankSessions', () => {
     expect(rankSessions(sessions, [])).toBe(sessions)
   })
 
-  it('applies the active sort key to a lane the flat list never renders', () => {
-    expect(rankSessions(sessions, ['oldest', 'newest', 'middle']).map(s => s.id)).toEqual([
-      'oldest',
-      'newest',
-      'middle'
-    ])
+  it('ranks duplicate raw ids by owner-qualified identity', () => {
+    const ownerA = { connection_id: 'source-a', id: 'shared', profile: 'worker' } as SessionInfo
+    const ownerB = { connection_id: 'source-b', id: 'shared', profile: 'worker' } as SessionInfo
+
+    expect(
+      rankSessions([ownerA, ownerB], [sessionRowIdentity(ownerB), sessionRowIdentity(ownerA)])
+    ).toEqual([ownerB, ownerA])
   })
 })
 

@@ -7,7 +7,8 @@ import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
-  instanceWindowBounds
+  instanceWindowBounds,
+  sessionWindowRegistryKey
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
@@ -89,6 +90,23 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
 })
 
+test('buildSessionWindowUrl carries the exact owner before the hash', () => {
+  const url = buildSessionWindowUrl('shared', {
+    devServer: 'http://localhost:5173',
+    ownerRoute: {
+      connectionId: 'source b',
+      mode: 'remote',
+      profile: 'profile/b',
+      targetProfile: 'backend b'
+    }
+  })
+
+  assert.equal(
+    url,
+    'http://localhost:5173/?win=secondary&connection=source+b&profile=profile%2Fb&targetProfile=backend+b&mode=remote#/shared'
+  )
+})
+
 test('buildInstanceWindowUrl marks a full peer without selecting a specialized renderer', () => {
   const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5173/' })
 
@@ -132,6 +150,14 @@ test('registry opens one window per session and focuses on re-open', () => {
   assert.equal(first, second)
   assert.equal(registry.size, 1)
   assert.equal(win.calls.focus, 1, 'second open focuses the existing window')
+})
+
+test('session window registry keys distinguish duplicate ids by exact owner', () => {
+  const ownerA = { connectionId: 'source-a', profile: 'default' }
+  const ownerB = { connectionId: 'source-b', profile: 'default' }
+
+  assert.notEqual(sessionWindowRegistryKey('shared', ownerA), sessionWindowRegistryKey('shared', ownerB))
+  assert.equal(sessionWindowRegistryKey('shared'), 'shared')
 })
 
 test('registry restores + shows a minimized/hidden window on re-open', () => {

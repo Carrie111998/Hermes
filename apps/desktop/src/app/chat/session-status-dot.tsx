@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 
 import { type Translations, useI18n } from '@/i18n'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $sessionColorById, sessionColorFor } from '@/store/session-color'
@@ -133,8 +134,10 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
 
   // Selector, not a plain useStore: the map is rebuilt whenever any session's
   // status changes, but a given dot only repaints when ITS OWN state flips.
+  const statusIdentity = session ? sessionRowIdentity(session) : storedSessionId
+
   const dotState = useStoreSelector($sessionDotStateById, states =>
-    storedSessionId ? (states[storedSessionId] ?? 'idle') : 'draft'
+    statusIdentity ? (states[statusIdentity] ?? 'idle') : 'draft'
   )
 
   const variant = DOT_VARIANTS[dotState]

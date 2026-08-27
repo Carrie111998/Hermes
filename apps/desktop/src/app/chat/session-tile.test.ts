@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { registry } from '@/contrib/registry'
 import { clearSessionDraft, stashSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
@@ -7,7 +8,7 @@ import { $connection, $sessions, setPrimarySessionOwnerIntent } from '@/store/se
 import {
   $sessionTiles,
   sessionTileOwnerGeneration,
-  setSessionTileWorkspaceScope
+  sessionTilePaneId
 } from '@/store/session-states'
 
 import {
@@ -15,7 +16,8 @@ import {
   sessionTabDeleteOwnerRoute,
   sessionTileDraftScope,
   sessionTileResumeFailure,
-  tileDragPayload
+  tileDragPayload,
+  watchSessionTiles
 } from './session-tile'
 
 afterEach(() => {
@@ -60,20 +62,46 @@ describe('sessionTileResumeFailure', () => {
 })
 
 describe('tile resume owner generation', () => {
-  it('rejects owner A resume result after the tile is re-homed to owner B', () => {
+  it('commits a resume result only to its exact-owner duplicate tile', () => {
     const storedSessionId = 'shared-owner-id'
     const ownerA = { connectionId: 'source-a', profile: 'default' }
     const ownerB = { connectionId: 'source-b', profile: 'default' }
 
-    $sessionTiles.set([{ ownerRoute: ownerA, storedSessionId }])
-    const ownerGeneration = sessionTileOwnerGeneration(storedSessionId)
+    $sessionTiles.set([
+      { ownerRoute: ownerA, storedSessionId },
+      { ownerRoute: ownerB, storedSessionId }
+    ])
+    const ownerGeneration = sessionTileOwnerGeneration(storedSessionId, ownerA)
 
-    expect(
-      setSessionTileWorkspaceScope(storedSessionId, { ownerRoute: ownerB, workspaceMode: 'sessions' })
-    ).toBe(true)
-    expect(commitSessionTileResume(storedSessionId, ownerGeneration, 'runtime-from-owner-a')).toBe(false)
-    expect($sessionTiles.get()[0]).toMatchObject({ ownerRoute: ownerB })
-    expect($sessionTiles.get()[0]?.runtimeId).toBeUndefined()
+    expect(commitSessionTileResume(storedSessionId, ownerGeneration, 'runtime-from-owner-a', ownerA)).toBe(true)
+    expect($sessionTiles.get()[0]).toEqual(
+      expect.objectContaining({ ownerRoute: ownerA, runtimeId: 'runtime-from-owner-a' })
+    )
+    expect($sessionTiles.get()[1]).toEqual(expect.objectContaining({ ownerRoute: ownerB }))
+    expect($sessionTiles.get()[1]?.runtimeId).toBeUndefined()
+  })
+})
+
+describe('exact-owner tile panes', () => {
+  it('registers separate panes for duplicate stored ids on different owners', () => {
+    const ownerA = { connectionId: 'source-a', profile: 'default' }
+    const ownerB = { connectionId: 'source-b', profile: 'default' }
+
+    $sessionTiles.set([
+      { ownerRoute: ownerA, storedSessionId: 'shared-pane-id' },
+      { ownerRoute: ownerB, storedSessionId: 'shared-pane-id' }
+    ])
+    watchSessionTiles()
+
+    const paneIds = registry
+      .getArea('panes')
+      .map(entry => entry.id)
+      .filter(id => id.includes('shared-pane-id'))
+
+    expect(paneIds).toEqual([
+      sessionTilePaneId('shared-pane-id', ownerA),
+      sessionTilePaneId('shared-pane-id', ownerB)
+    ])
   })
 })
 

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -21,7 +22,7 @@ import {
   showsRunningArc,
   unreadSessionCount
 } from './session-dot-state'
-import { clearAllSessionStates, publishSessionState } from './session-states'
+import { clearAllSessionStates, publishSessionState, recordSessionEventScope } from './session-states'
 import { $unreadWriteGuard } from './session-unread-remote'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 
@@ -104,6 +105,25 @@ describe('$delegatingSessionIds', () => {
 
 const storedRow = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
+
+describe('exact-owner dot state', () => {
+  afterEach(() => {
+    clearAllSessionStates()
+    $sessions.set([])
+  })
+
+  it('does not paint a duplicate row from another owner as working', () => {
+    const ownerA = storedRow('shared', { connection_id: 'source-a', profile: 'default' })
+    const ownerB = storedRow('shared', { connection_id: 'source-b', profile: 'default' })
+
+    setSessions([ownerA, ownerB])
+    recordSessionEventScope({ connectionId: 'source-a', profile: 'default', session_id: 'runtime-a' })
+    publishSessionState('runtime-a', { ...createClientSessionState('shared'), busy: true })
+
+    expect($sessionDotStateById.get()[sessionRowIdentity(ownerA)]).toBe('working')
+    expect($sessionDotStateById.get()[sessionRowIdentity(ownerB)]).toBeUndefined()
+  })
+})
 
 describe('persisted unread (backend watermark)', () => {
   beforeEach(() => {

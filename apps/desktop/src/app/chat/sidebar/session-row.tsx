@@ -272,10 +272,15 @@ function SidebarSessionRowImpl({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
+
   // The same resolved state the row's dot paints, so the arc and the dot cannot
   // contradict each other. A selector, not a plain useStore: the map is rebuilt
   // whenever any session's status changes, but a row only repaints on its own.
-  const dotState = useStoreSelector($sessionDotStateById, states => states[session.id] ?? 'idle')
+  const dotState = useStoreSelector(
+    $sessionDotStateById,
+    states => states[sessionRowIdentity(session)] ?? 'idle'
+  )
+
   const liveTurn = hasLiveTurn(dotState)
 
   // Card header line: the workspace this belongs to — the project when it

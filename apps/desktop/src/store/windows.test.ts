@@ -7,7 +7,8 @@ import {
   isPeerInstanceWindow,
   openBrowserInNewWindow,
   openNewWindow,
-  openSessionInNewWindow
+  openSessionInNewWindow,
+  windowSessionOwnerRoute
 } from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -66,6 +67,25 @@ describe('isPeerInstanceWindow', () => {
     expect(isPeerInstanceWindow('?peer=0')).toBe(false)
     expect(isPeerInstanceWindow('?win=secondary')).toBe(false)
     expect(isPeerInstanceWindow('')).toBe(false)
+  })
+})
+
+describe('windowSessionOwnerRoute', () => {
+  it('reconstructs the exact owner from a session-window URL', () => {
+    expect(
+      windowSessionOwnerRoute(
+        '?win=secondary&connection=source-b&profile=profile-b&targetProfile=backend-b&mode=remote'
+      )
+    ).toEqual({
+      connectionId: 'source-b',
+      mode: 'remote',
+      profile: 'profile-b',
+      targetProfile: 'backend-b'
+    })
+  })
+
+  it('preserves the legacy ownerless shape', () => {
+    expect(windowSessionOwnerRoute('?win=secondary')).toBeNull()
   })
 })
 

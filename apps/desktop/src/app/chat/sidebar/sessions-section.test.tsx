@@ -106,6 +106,30 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
     expect(getByTestId('session-row-source-b-shared').getAttribute('data-selected')).toBe('true')
   })
 
+  it('treats explicit null identity as selecting no regular row', () => {
+    const session = makeSession('shared')
+
+    const { getByTestId } = render(
+      <SidebarSessionsSection
+        activeSessionId="shared"
+        activeSessionIdentity={null}
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open
+        pinned={false}
+        sessions={[session]}
+      />
+    )
+
+    expect(getByTestId('session-row-local-shared').getAttribute('data-selected')).toBe('false')
+  })
+
   it('passes the clicked same-id row exact owner to deletion', () => {
     const onDeleteSession = vi.fn()
     const sourceB = { ...makeSession('shared'), connection_id: 'source-b', profile: 'worker-b' }

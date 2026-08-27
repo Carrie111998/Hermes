@@ -76,7 +76,7 @@ import {
   recordSessionEventScope,
   resetTileRuntimeBindings
 } from '@/store/session-states'
-import { windowProfileOverride } from '@/store/windows'
+import { windowProfileOverride, windowSessionOwnerRoute } from '@/store/windows'
 import type { RpcEvent } from '@/types/hermes'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
@@ -196,6 +196,28 @@ export function useGatewayBoot({
 
       return () => void (cancelled = true)
     }
+
+    const windowOwnerRoute = windowSessionOwnerRoute()
+    const windowProfile = windowOwnerRoute?.profile ?? windowProfileOverride()
+
+    const getWindowConnection = () =>
+      windowOwnerRoute && desktop.getConnectionFor
+        ? desktop.getConnectionFor({
+            connectionId: windowOwnerRoute.connectionId,
+            profile: windowOwnerRoute.profile
+          })
+        : desktop.getConnection(windowProfile ?? undefined)
+
+    const windowGatewayWsDeps =
+      windowOwnerRoute && desktop.getGatewayWsUrlFor
+        ? {
+            getGatewayWsUrl: () =>
+              desktop.getGatewayWsUrlFor?.({
+                connectionId: windowOwnerRoute.connectionId,
+                profile: windowOwnerRoute.profile
+              }) ?? Promise.reject(new Error('Exact-owner WebSocket URL bridge is unavailable'))
+          }
+        : desktop
 
     // Store-driven switches (Sessions switcher → selectConnection) commit
     // through beginGatewaySwitch(), which runs this window's machine-context
@@ -323,7 +345,7 @@ export function useGatewayBoot({
         // this primary socket at a secondary profile's backend after a live swap.
         // Secondaries reconnect via reconnectSecondaryGateways().
         const conn = await withTimeout(
-          desktop.getConnection(),
+          getWindowConnection(),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
@@ -350,7 +372,7 @@ export function useGatewayBoot({
         // this reconnect loop. For local/token gateways the URL carries a
         // long-lived token and the re-mint is a cheap no-op.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveGatewayWsUrl(windowGatewayWsDeps, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out re-minting the gateway WebSocket URL'
         )
@@ -523,7 +545,7 @@ export function useGatewayBoot({
     // default profile's last session (#82285). The override wins over the
     // stored preference; absent, behavior is unchanged.
     async function adoptPrimaryProfile(shouldPublish: () => boolean = () => true): Promise<boolean> {
-      const override = windowProfileOverride()
+      const override = windowProfile
 
       try {
         const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
@@ -605,7 +627,7 @@ export function useGatewayBoot({
         // shared backend-boot budget rather than the reconnect budget because
         // ensureBackend may cold-spawn a pooled helper backend here.
         const conn = await withTimeout(
-          desktop.getConnection(windowProfileOverride() ?? undefined),
+          getWindowConnection(),
           BACKEND_BOOT_WAIT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
@@ -620,7 +642,7 @@ export function useGatewayBoot({
         // Bounded for the same reason as attemptReconnect() (#93454): a wedged
         // ticket mint would otherwise hang the gateway switch forever.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveGatewayWsUrl(windowGatewayWsDeps, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out re-minting the gateway WebSocket URL'
         )
@@ -977,7 +999,7 @@ export function useGatewayBoot({
         // rides out a full backend cold spawn, so it gets the shared 45s
         // backend-boot budget, not the 20s reconnect budget.
         const conn = await withTimeout(
-          desktop.getConnection(windowProfileOverride() ?? undefined),
+          getWindowConnection(),
           BACKEND_BOOT_WAIT_TIMEOUT_MS,
           'Timed out connecting to Hermes backend'
         )
@@ -1015,7 +1037,7 @@ export function useGatewayBoot({
         // path (#93454) so a wedged mint fails into boot retry instead of
         // hanging "Starting Hermes…" forever.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveGatewayWsUrl(windowGatewayWsDeps, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out minting the gateway WebSocket URL'
         )

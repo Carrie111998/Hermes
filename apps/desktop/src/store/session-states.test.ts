@@ -11,7 +11,13 @@ import {
   workspaceScopeKey
 } from '@/components/pane-shell/workspace-scope'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $activeSessionId, $connection, $selectedStoredSessionId, setSessions } from '@/store/session'
+import {
+  $activeSessionId,
+  $connection,
+  $selectedStoredSessionId,
+  setPrimarySessionOwnerIntent,
+  setSessions
+} from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import type { SessionTile } from '@/store/session-states'
 import type * as SessionStatesModule from '@/store/session-states'
@@ -22,6 +28,7 @@ import {
   blankDraftTile,
   clearAllSessionStates,
   closeAllOpenSessionTiles,
+  closeSessionTile,
   focusedSessionNeedsRoute,
   focusOpenSession,
   focusWorkspaceOwnerSessionTile,
@@ -40,6 +47,7 @@ import {
   selectionHomesToWorkspace,
   type SessionTileDelegate,
   sessionTileOwnerRoute,
+  sessionTilePaneId,
   setSessionTileDelegate,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
@@ -241,6 +249,7 @@ describe('SessionTile workspace scope', () => {
     $activeGatewayProfile.set('default')
     $layoutTree.set(null)
     $selectedStoredSessionId.set(null)
+    setPrimarySessionOwnerIntent(null)
     $sessionTiles.set([])
   })
 
@@ -268,17 +277,77 @@ describe('SessionTile workspace scope', () => {
     ])
   })
 
-  it('re-homes a duplicate stored id to the new exact owner without reusing its runtime', () => {
+  it('keeps duplicate stored ids as distinct exact-owner tiles', () => {
     const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
     const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
 
     openSessionTile('shared-id', 'right', undefined, undefined, { ownerRoute: ownerA, workspaceMode: 'sessions' })
-    patchSessionTile('shared-id', { runtimeId: 'runtime-owner-a' })
     openSessionTile('shared-id', 'right', undefined, undefined, { ownerRoute: ownerB, workspaceMode: 'sessions' })
 
     expect($sessionTiles.get()).toEqual([
-      expect.objectContaining({ ownerRoute: ownerB, runtimeId: undefined, storedSessionId: 'shared-id' })
+      expect.objectContaining({ ownerRoute: ownerA, storedSessionId: 'shared-id' }),
+      expect.objectContaining({ ownerRoute: ownerB, storedSessionId: 'shared-id' })
     ])
+  })
+
+  it('focuses the exact-owner pane when duplicate stored ids coexist', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const paneA = sessionTilePaneId('shared-focus-id', ownerA)
+    const paneB = sessionTilePaneId('shared-focus-id', ownerB)
+
+    openSessionTile('shared-focus-id', 'right', undefined, undefined, {
+      ownerRoute: ownerA,
+      workspaceMode: 'sessions'
+    })
+    openSessionTile('shared-focus-id', 'right', undefined, undefined, {
+      ownerRoute: ownerB,
+      workspaceMode: 'sessions'
+    })
+    $layoutTree.set(group([paneA, paneB], { active: paneA, id: 'owners' }))
+
+    expect(
+      focusOpenSession('shared-focus-id', {
+        ownerRoute: ownerB,
+        workspaceMode: 'sessions'
+      })
+    ).toBe('tile')
+    expect(findGroupOfPane($layoutTree.get()!, paneB)?.active).toBe(paneB)
+  })
+
+  it('closes only the requested exact-owner duplicate tile', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    openSessionTile('shared-close-id', 'right', undefined, undefined, {
+      ownerRoute: ownerA,
+      workspaceMode: 'sessions'
+    })
+    openSessionTile('shared-close-id', 'right', undefined, undefined, {
+      ownerRoute: ownerB,
+      workspaceMode: 'sessions'
+    })
+
+    closeSessionTile('shared-close-id', ownerB)
+
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({ ownerRoute: ownerA, storedSessionId: 'shared-close-id' })
+    ])
+  })
+
+  it('does not focus duplicate-id main owned by another exact route', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    $selectedStoredSessionId.set('shared-main-id')
+    setPrimarySessionOwnerIntent({ ownerRoute: ownerA, storedSessionId: 'shared-main-id' })
+
+    expect(
+      focusOpenSession('shared-main-id', {
+        ownerRoute: ownerB,
+        workspaceMode: 'sessions'
+      })
+    ).toBeNull()
   })
 
   it('does not focus a duplicate-id tile owned by another exact route', () => {

@@ -218,6 +218,19 @@ describe('openSession', () => {
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 
+  it('window carries the exact session owner into the pop-out', () => {
+    const ownerRoute = {
+      connectionId: 'source-b',
+      mode: 'remote' as const,
+      profile: 'profile-b',
+      targetProfile: 'backend-b'
+    }
+
+    openSession('shared-id', navigate, 'window', { ownerRoute, workspaceMode: 'sessions' })
+
+    expect(openSessionInNewWindow).toHaveBeenCalledWith('shared-id', { ownerRoute })
+  })
+
   it('window falls back to a tab when pop-out is unavailable', () => {
     canOpenSessionWindow.mockReturnValue(false)
     focusOpenSession.mockReturnValue(null)

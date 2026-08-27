@@ -64,8 +64,19 @@ vi.mock('./chrome', () => ({
 }))
 
 vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({ onDelete }: { onDelete: () => void }) => (
-    <button data-testid="virtual-delete" onClick={onDelete} type="button" />
+  SidebarSessionRow: ({
+    isSelected,
+    onDelete
+  }: {
+    isSelected: boolean
+    onDelete: () => void
+  }) => (
+    <button
+      data-selected={isSelected ? 'true' : 'false'}
+      data-testid="virtual-delete"
+      onClick={onDelete}
+      type="button"
+    />
   )
 }))
 
@@ -110,13 +121,41 @@ describe('VirtualSessionList', () => {
     expect(sortableIds).toEqual(virtualIds)
   })
 
+  it('treats explicit null identity as selecting no virtual row', () => {
+    const session = { id: 'shared', profile: 'default' } as SessionInfo
+
+    const sessionRows: SidebarListRow[] = [
+      { key: 'today', kind: 'divider', label: 'Today' },
+      { entry: { session }, kind: 'session' }
+    ]
+
+    const { getByTestId } = render(
+      <VirtualSessionList
+        activeSessionId="shared"
+        activeSessionIdentity={null}
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        pinned={false}
+        rows={sessionRows}
+        sortable={false}
+      />
+    )
+
+    expect(getByTestId('virtual-delete').getAttribute('data-selected')).toBe('false')
+  })
+
   it('passes a virtualized row exact owner to deletion', () => {
     const onDeleteSession = vi.fn()
+
     const session = {
       connection_id: 'source-b',
       id: 'shared',
       profile: 'worker-b'
     } as SessionInfo
+
     const sessionRows: SidebarListRow[] = [
       { key: 'today', kind: 'divider', label: 'Today' },
       { entry: { session }, kind: 'session' }

@@ -334,6 +334,7 @@ afterEach(() => {
   vi.useRealTimers()
   ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
+  window.history.replaceState({}, '', '/')
   window.localStorage.removeItem('hermes.desktop.workspace-cwd')
   $currentCwd.set('')
   $busy.set(false)
@@ -357,6 +358,33 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('boots a session pop-out on its exact owner connection', async () => {
+    window.history.replaceState(
+      {},
+      '',
+      '/?win=secondary&connection=source-b&profile=profile-b&targetProfile=backend-b&mode=remote#/shared'
+    )
+
+    const desktop = fakeDesktop() as ReturnType<typeof fakeDesktop> & {
+      getConnectionFor: ReturnType<typeof vi.fn>
+    }
+
+    desktop.getConnectionFor = vi.fn(async ({ connectionId, profile }: { connectionId: string; profile: string }) => ({
+      ...coderConn,
+      connectionId,
+      profile
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(desktop.getConnectionFor).toHaveBeenCalledWith({ connectionId: 'source-b', profile: 'profile-b' })
+    expect(desktop.getConnection).not.toHaveBeenCalled()
+    expect($activeGatewayProfile.get()).toBe('profile-b')
+    expect($connection.get()?.connectionId).toBe('source-b')
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

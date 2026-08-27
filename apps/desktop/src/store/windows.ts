@@ -1,4 +1,5 @@
 import { notifyError } from './notifications'
+import type { SessionOwnerRoute } from './session-request-router'
 
 // Window flag set by the Electron main process when it opens a standalone
 // session window (see electron/main.ts buildSessionWindowUrl). It rides in the
@@ -125,6 +126,32 @@ export function isPeerInstanceWindow(search = typeof window === 'undefined' ? ''
   }
 }
 
+export function windowSessionOwnerRoute(
+  search = typeof window === 'undefined' ? '' : window.location.search
+): SessionOwnerRoute | null {
+  try {
+    const params = new URLSearchParams(search)
+    const connectionId = params.get('connection')?.trim() || ''
+    const profile = params.get('profile')?.trim() || ''
+
+    if (params.get('win') !== SECONDARY_WINDOW_FLAG || !connectionId || !profile) {
+      return null
+    }
+
+    const modeParam = params.get('mode')
+    const targetProfile = params.get('targetProfile')?.trim() || ''
+
+    return {
+      connectionId,
+      ...(modeParam === 'local' || modeParam === 'remote' ? { mode: modeParam } : {}),
+      profile,
+      ...(targetProfile ? { targetProfile } : {})
+    }
+  } catch {
+    return null
+  }
+}
+
 // The profile a helper window (the HUD) was asked to boot against, carried in
 // the query string by the main process (see hudUrl). The HUD is a full app
 // renderer that otherwise adopts the PRIMARY backend's profile — wrong the
@@ -186,10 +213,15 @@ async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage:
   }
 }
 
+export interface SessionWindowOptions {
+  ownerRoute?: SessionOwnerRoute
+  watch?: boolean
+}
+
 // Open (or focus) a standalone OS window for a single chat session. No-ops
 // gracefully outside Electron so callers can wire it unconditionally.
 // `watch: true` opens a spectator window (lazy resume, live-mirror stream).
-export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
+export async function openSessionInNewWindow(sessionId: string, opts?: SessionWindowOptions): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }

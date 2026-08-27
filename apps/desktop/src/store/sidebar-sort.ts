@@ -1,6 +1,7 @@
 import { computed, type ReadableAtom } from 'nanostores'
 
 import type { SessionInfo } from '@/hermes'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 
 import { $sidebarOrdering, type SidebarOrdering } from './layout'
 import { $sessions } from './session'
@@ -23,7 +24,7 @@ function rankBy(
       return session => -session.started_at
 
     case 'status':
-      return session => sessionStatusRank(dotStates[session.id])
+      return session => sessionStatusRank(dotStates[sessionRowIdentity(session)])
 
     case 'tokens':
       return session => -(session.input_tokens + session.output_tokens)
@@ -57,6 +58,6 @@ export const $sidebarSessionRankIds: ReadableAtom<string[]> = computed(
       return UNRANKED
     }
 
-    return [...sessions].sort((a, b) => rank(a) - rank(b)).map(session => session.id)
+    return [...sessions].sort((a, b) => rank(a) - rank(b)).map(sessionRowIdentity)
   }
 )

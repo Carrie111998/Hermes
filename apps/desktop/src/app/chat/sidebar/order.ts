@@ -1,5 +1,6 @@
 import type { SidebarListRow } from '@/lib/session-date-groups'
 import { sessionRowIdentity } from '@/lib/session-row-identity'
+import type { SessionInfo } from '@/types/hermes'
 
 /**
  * Fold ids absent from the persisted order back in, on the side they belong.
@@ -121,7 +122,31 @@ export function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: 
  * this on their own lane so a sort key reaches rows the flat list never renders.
  */
 export function rankSessions<T extends { id: string }>(sessions: T[], rankIds?: string[]): T[] {
-  return rankIds?.length ? orderByIds(sessions, session => session.id, rankIds) : sessions
+  if (!rankIds?.length) {
+    return sessions
+  }
+
+  const identityBySession = new Map(sessions.map(session => [session, sessionRowIdentity(session as unknown as SessionInfo)]))
+  const identities = new Set(identityBySession.values())
+  const byRawId = new Map<string, string[]>()
+
+  for (const session of sessions) {
+    const ids = byRawId.get(session.id) ?? []
+    ids.push(identityBySession.get(session)!)
+    byRawId.set(session.id, ids)
+  }
+
+  const normalizedRankIds = rankIds.map(id => {
+    if (identities.has(id)) {
+      return id
+    }
+
+    const matches = byRawId.get(id)
+
+    return matches?.length === 1 ? matches[0] : id
+  })
+
+  return orderByIds(sessions, session => identityBySession.get(session)!, normalizedRankIds)
 }
 
 /** Reconcile a persisted order against the live id set. */

@@ -64,17 +64,63 @@ function chatWindowWebPreferences(preloadPath: string) {
 // onboarding overlays and the global session sidebar. `watch=1` marks a
 // spectator window (e.g. a running subagent's session): the renderer resumes it
 // lazily so the gateway never builds an agent just to stream into it.
-function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath, watch }: any = {}) {
-  const query = `?win=secondary${watch ? '&watch=1' : ''}`
+function normalizeSessionWindowOwnerRoute(ownerRoute: any) {
+  const connectionId = typeof ownerRoute?.connectionId === 'string' ? ownerRoute.connectionId.trim() : ''
+  const profile = typeof ownerRoute?.profile === 'string' ? ownerRoute.profile.trim() : ''
+
+  if (!connectionId || !profile) {
+    return null
+  }
+
+  const targetProfile = typeof ownerRoute.targetProfile === 'string' ? ownerRoute.targetProfile.trim() : ''
+  const mode = ownerRoute.mode === 'local' || ownerRoute.mode === 'remote' ? ownerRoute.mode : undefined
+
+  return {
+    connectionId,
+    ...(mode ? { mode } : {}),
+    profile,
+    ...(targetProfile ? { targetProfile } : {})
+  }
+}
+
+function buildSessionWindowUrl(sessionId: string, { devServer, ownerRoute, rendererIndexPath, watch }: any = {}) {
+  const query = new URLSearchParams({ win: 'secondary' })
+
+  if (watch) {
+    query.set('watch', '1')
+  }
+
+  const owner = normalizeSessionWindowOwnerRoute(ownerRoute)
+
+  if (owner) {
+    query.set('connection', owner.connectionId)
+    query.set('profile', owner.profile)
+
+    if (owner.targetProfile) {
+      query.set('targetProfile', owner.targetProfile)
+    }
+
+    if (owner.mode) {
+      query.set('mode', owner.mode)
+    }
+  }
+
   const route = `#/${encodeURIComponent(sessionId)}`
+  const queryString = `?${query.toString()}`
 
   if (devServer) {
     const base = devServer.endsWith('/') ? devServer.slice(0, -1) : devServer
 
-    return `${base}/${query}${route}`
+    return `${base}/${queryString}${route}`
   }
 
-  return `${pathToFileURL(rendererIndexPath).toString()}${query}${route}`
+  return `${pathToFileURL(rendererIndexPath).toString()}${queryString}${route}`
+}
+
+function sessionWindowRegistryKey(sessionId: string, ownerRoute?: any) {
+  const owner = normalizeSessionWindowOwnerRoute(ownerRoute)
+
+  return owner ? JSON.stringify([owner.connectionId, owner.profile, sessionId.trim()]) : sessionId.trim()
 }
 
 // Full peer windows render the ordinary app shell, so they deliberately do
@@ -182,6 +228,8 @@ export {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  normalizeSessionWindowOwnerRoute,
   SESSION_WINDOW_MIN_HEIGHT,
-  SESSION_WINDOW_MIN_WIDTH
+  SESSION_WINDOW_MIN_WIDTH,
+  sessionWindowRegistryKey
 }

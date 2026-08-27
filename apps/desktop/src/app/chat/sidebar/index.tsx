@@ -508,7 +508,10 @@ export function ChatSidebar({
   // membership in the filtered set.
   const sessionMatchesFilters = useCallback(
     (session: SessionInfo) => {
-      if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[session.id]))) {
+      if (
+        statusFilter.length &&
+        !statusFilter.includes(sessionStatusBucket(dotStates[sessionRowIdentity(session)]))
+      ) {
         return false
       }
 

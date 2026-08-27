@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
+import { sessionRowIdentity } from '@/lib/session-row-identity'
 
 import { resetSidebarView, setSidebarOrdering } from './layout'
 import { $sessions } from './session'
@@ -23,7 +24,19 @@ describe('$sidebarSessionRankIds', () => {
     ])
     setSidebarOrdering('cost')
 
-    expect($sidebarSessionRankIds.get()).toEqual(['dear', 'estimated', 'cheap'])
+    expect($sidebarSessionRankIds.get()).toEqual(
+      ['dear', 'estimated', 'cheap'].map(id => sessionRowIdentity(session(id, {})))
+    )
+  })
+
+  it('keeps duplicate raw ids as distinct owner-qualified rank keys', () => {
+    const ownerA = session('shared', { actual_cost_usd: 1, connection_id: 'source-a', profile: 'worker' })
+    const ownerB = session('shared', { actual_cost_usd: 2, connection_id: 'source-b', profile: 'worker' })
+
+    $sessions.set([ownerA, ownerB])
+    setSidebarOrdering('cost')
+
+    expect($sidebarSessionRankIds.get()).toEqual([sessionRowIdentity(ownerB), sessionRowIdentity(ownerA)])
   })
 
   it('ranks by total tokens, both halves counted', () => {
@@ -33,14 +46,18 @@ describe('$sidebarSessionRankIds', () => {
     ])
     setSidebarOrdering('tokens')
 
-    expect($sidebarSessionRankIds.get()).toEqual(['big', 'small'])
+    expect($sidebarSessionRankIds.get()).toEqual(
+      ['big', 'small'].map(id => sessionRowIdentity(session(id, {})))
+    )
   })
 
   it('ranks by creation, newest first — the sidebar orders by recency elsewhere', () => {
     $sessions.set([session('older', { started_at: 1 }), session('newer', { started_at: 9 })])
     setSidebarOrdering('created')
 
-    expect($sidebarSessionRankIds.get()).toEqual(['newer', 'older'])
+    expect($sidebarSessionRankIds.get()).toEqual(
+      ['newer', 'older'].map(id => sessionRowIdentity(session(id, {})))
+    )
   })
 
   it('leaves the default view unranked, and hands back the same array each time', () => {
