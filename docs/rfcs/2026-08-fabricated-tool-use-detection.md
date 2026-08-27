@@ -1,5 +1,7 @@
 # Fabricated tool-use detection in `run_conversation()`
 
+**Status: Implemented** (branch `feat/fabricated-tool-use-detection`).
+
 ## Problem
 
 Under certain conditions (observed live: a search backend that's registered as "available" but
