@@ -254,6 +254,30 @@ class TestJsonFields:
 
 class TestAuthHeaders:
 
+    @pytest.mark.parametrize(
+        "placeholder",
+        ["${MCP_SKILLS_API_KEY}", r"\${MCP_SKILLS_API_KEY}"],
+    )
+    def test_env_placeholder_preserved(self, placeholder):
+        text = f"Authorization: Bearer {placeholder}"
+        assert redact_sensitive_text(text, force=True, file_read=True) == text
+
+    def test_auth_header_pattern_source_preserved(self):
+        text = r'r"((?:Proxy-)?Authorization:\s*)([^\s\"\']+)"'
+        assert redact_sensitive_text(text, force=True, code_file=True) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Authorization: Bearer opaque-provider-token-123456789",
+            "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        ],
+    )
+    def test_literal_credentials_remain_redacted(self, text):
+        result = redact_sensitive_text(text, force=True, file_read=True)
+        assert result != text
+        assert text.rsplit(" ", 1)[-1] not in result
+
 
 
 

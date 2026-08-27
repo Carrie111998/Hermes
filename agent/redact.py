@@ -334,9 +334,15 @@ _JSON_FIELD_RE = re.compile(
 # corruption — the closing quote vanishes and the command/string no longer parses
 # (unterminated quote → shell EOF / Python SyntaxError). Real credentials never
 # contain ``"`` or ``'``, so excluding them is safe. See #43083.
+# The negative lookahead excludes a literal regex whitespace fragment (``\s*``
+# etc.), preventing this pattern from matching its own source representation.
 _AUTH_HEADER_RE = re.compile(
-    r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)",
+    r"((?:Proxy-)?Authorization:\s*)(?!\\s[*+?])([A-Za-z][\w.+-]*\s+)?([^\s\"']+)",
     re.IGNORECASE,
+)
+
+_ENV_PLACEHOLDER_RE = re.compile(
+    r"\\?\$\{[A-Za-z_][A-Za-z0-9_.-]*\}",
 )
 
 # API-key style auth headers carrying a single opaque value (no scheme word).
@@ -920,8 +926,14 @@ def redact_sensitive_text(
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
+        def _redact_auth_header(m):
+            credential = m.group(3)
+            if _ENV_PLACEHOLDER_RE.fullmatch(credential):
+                return m.group(0)
+            return m.group(1) + (m.group(2) or "") + _mask_token(credential)
+
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
+            _redact_auth_header,
             text,
         )
 
