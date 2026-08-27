@@ -26,9 +26,8 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
-from contextvars import ContextVar
 from typing import Callable, Dict, List, Optional, Any, Tuple
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -98,12 +97,6 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
     "non_conversational_history",
 })
-_DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT = ContextVar(
-    "discord_image_download_budget",
-    default=None,
-)
-_DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
-_DISCORD_IMAGE_MAX_REDIRECTS = 10
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
 # non-conversational message-ID set populated from explicitly marked sends
 # (metadata["non_conversational"]). These regexes exist solely to recognize
@@ -179,6 +172,19 @@ from gateway.platforms.base import (
 )
 from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
+from .outbound_image_fetch import (
+    _DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES,
+    _DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT,
+    _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
+    _DISCORD_IMAGE_MAX_REDIRECTS,
+    _DISCORD_IMAGE_REDIRECT_STATUSES,
+    _DiscordImageDownloadBudget,
+    _discord_image_extension_from_bytes,
+    _read_response_bytes_bounded,
+    _create_discord_image_http_client as _create_discord_image_http_client_impl,
+    _read_url_image_with_redirect_guard as _read_url_image_with_redirect_guard_impl,
+)
+
 
 async def _read_url_image_with_redirect_guard(
     client: Any,
@@ -188,67 +194,27 @@ async def _read_url_image_with_redirect_guard(
     request_kwargs: Dict[str, Any],
     download_budget: Any = None,
 ) -> Tuple[int, bytes, Dict[str, str]]:
-    """Read an image URL while re-checking every redirect target for SSRF."""
-    current_url = url
-    for _ in range(_DISCORD_IMAGE_MAX_REDIRECTS + 1):
-        if not is_safe_url(current_url):
-            raise ValueError("Blocked unsafe image URL redirect")
-
-        async with client.stream(
-            "GET",
-            current_url,
-            timeout=timeout,
-            follow_redirects=False,
-            **request_kwargs,
-        ) as resp:
-            raw_headers = getattr(resp, "headers", {}) or {}
-            headers = {str(key).lower(): value for key, value in dict(raw_headers).items()}
-            status = int(getattr(resp, "status_code", getattr(resp, "status", 0)))
-            if status in _DISCORD_IMAGE_REDIRECT_STATUSES:
-                location = headers.get("location")
-                if not location:
-                    return status, b"", headers
-                next_url = urljoin(current_url, str(location))
-                if not is_safe_url(next_url):
-                    raise ValueError("Blocked redirect to private/internal address")
-                current_url = next_url
-                continue
-
-            return status, await _read_response_bytes_bounded(
-                resp,
-                _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
-                download_budget=download_budget,
-            ), headers
-
-    raise ValueError("Too many image URL redirects")
-
-
-def _discord_image_extension_from_bytes(data: bytes) -> Optional[str]:
-    """Return the supported image extension based on the body magic bytes."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "jpg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "webp"
-    return None
+    """Compatibility wrapper retaining adapter-level patch seams."""
+    return await _read_url_image_with_redirect_guard_impl(
+        client,
+        url,
+        timeout=timeout,
+        request_kwargs=request_kwargs,
+        download_budget=download_budget,
+        is_safe_url_fn=is_safe_url,
+        max_bytes=_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
+        read_response_bytes_fn=_read_response_bytes_bounded,
+        redirect_statuses=_DISCORD_IMAGE_REDIRECT_STATUSES,
+        max_redirects=_DISCORD_IMAGE_MAX_REDIRECTS,
+    )
 
 
 def _create_discord_image_http_client(proxy_url: Optional[str] = None) -> Any:
-    """Create the SSRF-safe client used for outbound Discord image fetches."""
-    client_kwargs: Dict[str, Any] = {
-        "timeout": 30.0,
-        "follow_redirects": False,
-        # ``resolve_proxy_url`` explicitly applies DISCORD_PROXY, generic
-        # proxy variables, and the macOS system proxy.  Avoid httpx selecting
-        # a second proxy policy from the environment behind its back.
-        "trust_env": False,
-    }
-    if proxy_url:
-        client_kwargs["proxy"] = proxy_url
-    return create_ssrf_safe_async_client(**client_kwargs)
+    """Compatibility wrapper retaining the adapter-level factory seam."""
+    return _create_discord_image_http_client_impl(
+        proxy_url,
+        client_factory=create_ssrf_safe_async_client,
+    )
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -9960,117 +9926,10 @@ if DISCORD_AVAILABLE:
 _DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES = 1 * 1024 * 1024
 _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
-_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # generous limit for images/animations
-_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
-
-
-class _DiscordImageDownloadBudget:
-    """Track remote response bytes across one outbound image batch."""
-
-    def __init__(self, limit_bytes: int):
-        self.limit_bytes = limit_bytes
-        self.bytes_read = 0
-
-    def _raise_exhausted(self, detail: str = "") -> None:
-        suffix = f" ({detail})" if detail else ""
-        raise ValueError(
-            f"Cumulative image response body exceeded {self.limit_bytes} bytes{suffix}"
-        )
-
-    def check_response(self, declared_length: Optional[int]) -> None:
-        """Reject a response that cannot fit without consuming its iterator."""
-        if self.bytes_read >= self.limit_bytes:
-            self._raise_exhausted()
-        if (
-            declared_length is not None
-            and declared_length > self.limit_bytes - self.bytes_read
-        ):
-            # The body was not read, so leave cumulative accounting unchanged.
-            self._raise_exhausted(f"{declared_length} bytes declared")
-
-    def account(self, byte_count: int) -> None:
-        """Account a streamed chunk before callers can retain or upload it."""
-        if byte_count <= 0:
-            return
-        if self.bytes_read >= self.limit_bytes:
-            self._raise_exhausted()
-        self.bytes_read += byte_count
-        if self.bytes_read > self.limit_bytes:
-            self._raise_exhausted(f"{self.bytes_read} bytes read")
 
 
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
     _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
-
-
-async def _read_response_bytes_bounded(
-    resp: Any,
-    limit_bytes: int,
-    *,
-    download_budget: Any = None,
-) -> bytes:
-    """Read an httpx streaming response body with an aggregate byte limit."""
-    headers = getattr(resp, "headers", {}) or {}
-    declared_length = None
-    for header_name in ("Content-Length", "content-length"):
-        try:
-            raw_length = headers.get(header_name)
-        except (AttributeError, TypeError):
-            raw_length = None
-        if raw_length is not None:
-            try:
-                if isinstance(raw_length, (str, bytes, bytearray, int)):
-                    declared_length = int(raw_length)
-            except (TypeError, ValueError):
-                pass
-            break
-
-    async def close_response() -> None:
-        for method_name in ("aclose", "close", "release"):
-            method = getattr(resp, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                result = method()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                continue
-            break
-
-    if declared_length is not None and declared_length > limit_bytes:
-        await close_response()
-        raise ValueError(
-            f"Response body exceeded {limit_bytes} bytes "
-            f"({declared_length} bytes declared)"
-        )
-
-    if download_budget is not None:
-        try:
-            download_budget.check_response(declared_length)
-        except ValueError:
-            await close_response()
-            raise
-
-    chunks = []
-    total_bytes = 0
-    async for chunk in resp.aiter_bytes():
-        if download_budget is not None:
-            try:
-                download_budget.account(len(chunk))
-            except ValueError:
-                await close_response()
-                raise
-        total_bytes += len(chunk)
-        if total_bytes > limit_bytes:
-            await close_response()
-            raise ValueError(
-                f"Response body exceeded {limit_bytes} bytes "
-                f"({total_bytes} bytes read)"
-            )
-        chunks.append(chunk)
-
-    return b"".join(chunks)
 
 
 def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
