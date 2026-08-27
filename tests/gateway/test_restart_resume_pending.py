@@ -233,6 +233,21 @@ class TestClearResumePending:
         # Not marked
         assert store.clear_resume_pending(entry.session_key) is False
 
+    def test_save_failure_restores_pending_marker(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        assert store.mark_resume_pending(entry.session_key, reason="shutdown_timeout")
+        marked_at = entry.last_resume_marked_at
+        store._save = MagicMock(side_effect=OSError("disk full"))
+
+        with pytest.raises(OSError, match="disk full"):
+            store.clear_resume_pending(entry.session_key)
+
+        assert entry.resume_pending is True
+        assert entry.resume_reason == "shutdown_timeout"
+        assert entry.last_resume_marked_at == marked_at
+
 
 # ---------------------------------------------------------------------------
 # SessionStore.get_or_create_session resume_pending behaviour
@@ -1198,6 +1213,32 @@ class TestStuckLoopEscalation:
             retained_key: 1,
             admitted_key: 1,
         }
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_marker_clear_preserves_retry_count(
+        self, tmp_path, monkeypatch
+    ):
+        """Retry evidence survives until resume_pending is durably cleared."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, _adapter = make_restart_runner()
+        session_key = "agent:main:telegram:dm:marker-save-failure"
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        counts_file.write_text(json.dumps({session_key: 2}), encoding="utf-8")
+        runner._startup_resume_attempt_keys = {session_key}
+        runner._async_session_store = MagicMock()
+        runner._async_session_store._store = runner.session_store
+        runner._async_session_store.clear_resume_pending = AsyncMock(
+            side_effect=OSError("disk full")
+        )
+
+        await runner._clear_completed_resume_state(session_key)
+
+        assert json.loads(counts_file.read_text(encoding="utf-8")) == {session_key: 2}
+        assert runner._startup_resume_attempt_keys == {session_key}
 
     @pytest.mark.asyncio
     async def test_startup_resume_dispatches_after_persisted_attempt(

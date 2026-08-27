@@ -11579,6 +11579,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.to_thread(self._clear_restart_failure_count_sync, session_key)
 
+    async def _clear_completed_resume_state(self, session_key: str) -> None:
+        """Clear a completed recovery marker before consuming retry evidence."""
+        try:
+            await self.async_session_store.clear_resume_pending(session_key)
+        except Exception as exc:
+            logger.warning(
+                "Preserving restart failure count for %s because the completed "
+                "resume marker could not be persisted: %s",
+                session_key,
+                exc,
+            )
+            return
+        await self._clear_restart_failure_count(session_key)
+
     async def _launch_detached_restart_command(self) -> None:
         import shutil
         import subprocess
@@ -20956,14 +20970,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
-                await self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
+                await self._clear_completed_resume_state(session_key)
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
