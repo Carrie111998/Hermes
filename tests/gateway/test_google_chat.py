@@ -1881,3 +1881,41 @@ class TestKiraApprovalGate:
         if os.name != "nt":
             assert adapter._approval_store._path.stat().st_mode & 0o777 == 0o600
 
+
+class TestKiraExactEmailApprovalCard:
+    @pytest.mark.asyncio
+    async def test_card_has_only_exact_draft_actions_and_click_is_durable(self, adapter, tmp_path):
+        adapter._kira_email_gate_home = tmp_path
+        adapter._kira_email_ops_space = "spaces/gtr-ops"
+        adapter._kira_email_approvers = {"richard@goldentouchremodeling.com"}
+        adapter.send_card = AsyncMock(return_value=_gc_mod.SendResult(success=True, message_id="chat-card-1"))
+        adapter.send = AsyncMock(return_value=_gc_mod.SendResult(success=True))
+
+        status = await adapter.create_kira_email_draft(
+            recipient="vendor@example.com", subject="Quote", body="Please quote this work.",
+        )
+
+        assert adapter.send_card.await_args.args[0] == "spaces/gtr-ops"
+        buttons = adapter.send_card.await_args.args[1]["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
+        assert [button["text"] for button in buttons] == ["Approve exact draft", "Reject draft"]
+        assert all(button["onClick"]["action"]["function"] == "hermes_kira_email_approval" for button in buttons)
+        rendered = repr(adapter.send_card.await_args.args[1])
+        assert "vendor@example.com" not in rendered
+        assert "Please quote this work." not in rendered
+
+        await adapter._handle_kira_email_card_click({
+            "id": "card-event-1",
+            "chat": {"cardClickedPayload": {
+                "space": {"name": "spaces/gtr-ops"},
+                "user": {"email": "richard@goldentouchremodeling.com"},
+                "action": {"function": "hermes_kira_email_approval", "parameters": [
+                    {"key": "draft_id", "value": status["id"]},
+                    {"key": "payload_sha256", "value": status["payload_sha256"]},
+                    {"key": "decision", "value": "approve"},
+                ]},
+            }},
+        })
+
+        assert adapter.get_kira_email_draft_status(status["id"])["state"] == "APPROVED"
+        adapter.send.assert_awaited_once()
+
