@@ -5217,7 +5217,8 @@ def check_all_command_guards(command: str, env_type: str,
 
 
 def check_execute_code_guard(code: str, env_type: str,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False, *,
+                             assume_single_query_context: bool = False) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
     execute_code runs arbitrary local Python — the script can call
@@ -5263,7 +5264,13 @@ def check_execute_code_guard(code: str, env_type: str,
 
     # Single-query (-q): no user is present to approve arbitrary code. Mirrors
     # the cron branch below so the -q escape-hatch no longer auto-approves.
-    if _is_single_query_approval_context():
+    # The explicit input is one-way: a caller may force the stricter -q branch
+    # for a policy probe, but cannot pass False to override a real -q context.
+    is_single_query = (
+        bool(assume_single_query_context)
+        or _is_single_query_approval_context()
+    )
+    if is_single_query:
         if _get_single_query_approval_mode() == "deny":
             return {
                 "approved": False,

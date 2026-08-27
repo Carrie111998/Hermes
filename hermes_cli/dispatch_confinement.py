@@ -61,7 +61,10 @@ wrong place is ``mismatch`` and fails closed.
 
 from __future__ import annotations
 
+import json
 import os
+import secrets
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -76,8 +79,11 @@ REPORTED_ONLY = "reported-only"
 # How long a sandbox worker waits to be released before giving up. A worker
 # that is never released must exit rather than sit forever holding a claim.
 START_BARRIER_TIMEOUT_SECONDS = 120
+START_BARRIER_ACK_TIMEOUT_SECONDS = 30
 START_BARRIER_ENV = "HERMES_KANBAN_START_BARRIER"
+START_BARRIER_TOKEN_ENV = "HERMES_KANBAN_START_BARRIER_TOKEN"
 _BARRIER_GO = "GO"
+_BARRIER_WAITING = "WAITING"
 
 
 class PreflightRefusal(RuntimeError):
@@ -590,32 +596,90 @@ class StartBarrier:
     this is a workflow-safety mechanism rather than a sandbox.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, token: str) -> None:
         self.path = path
+        self.token = token
         self._released = False
 
     @classmethod
     def create(cls, directory: str, task_id: str) -> "StartBarrier":
         os.makedirs(directory, exist_ok=True)
-        return cls(os.path.join(directory, f"{task_id}.barrier"))
+        safe_task = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in str(task_id)
+        )[:80] or "task"
+        # A task can be retried. The barrier identity therefore belongs to this
+        # dispatch attempt, never to the durable task id. Exclusive creation
+        # makes a stale successful GO file unusable by a later attempt.
+        for _ in range(10):
+            token = secrets.token_hex(32)
+            path = os.path.join(directory, f"{safe_task}-{token[:20]}.barrier")
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:  # pragma: no cover - cryptographic collision
+                continue
+            try:
+                payload = json.dumps({"version": 1, "token": token})
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
+            return cls(path, token)
+        raise PreflightRefusal("could not allocate a unique worker start barrier")
+
+    @property
+    def waiting_path(self) -> str:
+        return f"{self.path}.waiting"
+
+    @property
+    def release_path(self) -> str:
+        return f"{self.path}.go"
 
     def env(self) -> dict:
-        return {START_BARRIER_ENV: self.path}
+        return {
+            START_BARRIER_ENV: self.path,
+            START_BARRIER_TOKEN_ENV: self.token,
+        }
+
+    def wait_until_waiting(
+        self, pid: int, *, timeout_seconds: int = START_BARRIER_ACK_TIMEOUT_SECONDS,
+        _sleep=None,
+    ) -> bool:
+        """Require a worker acknowledgement bound to this attempt and pid."""
+        sleep = _sleep or time.sleep
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        while time.monotonic() < deadline:
+            if self.is_waiting(pid):
+                return True
+            sleep(0.05)
+        return False
+
+    def is_waiting(self, pid: int) -> bool:
+        """True only while this attempt's worker still advertises WAITING."""
+        try:
+            with open(self.waiting_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            return (
+                payload.get("state") == _BARRIER_WAITING
+                and payload.get("token") == self.token
+                and int(payload.get("pid")) == int(pid)
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
 
     def release(self) -> None:
         """Let the worker start. Called only after every check has passed."""
-        tmp = f"{self.path}.tmp"
+        tmp = f"{self.release_path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(_BARRIER_GO)
-        os.replace(tmp, self.path)
+            json.dump({"state": _BARRIER_GO, "token": self.token}, fh)
+        os.replace(tmp, self.release_path)
         self._released = True
 
     def abort(self) -> None:
         """Remove the barrier without releasing it: the worker will time out."""
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
+        for path in (self.release_path, self.waiting_path, self.path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     @property
     def released(self) -> bool:
@@ -632,20 +696,63 @@ def wait_for_start_barrier(
     the caller exits non-zero rather than starting work Hermes never authorized.
     No barrier configured means no barrier: open-mode boards are unaffected.
     """
-    import time
-
     env = _env if _env is not None else os.environ
     path = (env.get(START_BARRIER_ENV) or "").strip()
-    if not path:
+    token = (env.get(START_BARRIER_TOKEN_ENV) or "").strip()
+    if not path and not token:
         return True
-    sleep = _sleep or time.sleep
-    deadline = time.time() + max(1, int(timeout_seconds))
-    while time.time() < deadline:
+    if not path or not token:
+        return False
+    waiting_path = f"{path}.waiting"
+    release_path = f"{path}.go"
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            request = json.load(fh)
+        if request.get("version") != 1 or request.get("token") != token:
+            return False
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+    acknowledgement = json.dumps({
+        "state": _BARRIER_WAITING,
+        "token": token,
+        "pid": os.getpid(),
+    }).encode("utf-8")
+    try:
+        fd = os.open(waiting_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                if fh.read().strip() == _BARRIER_GO:
+            os.write(fd, acknowledgement)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+    sleep = _sleep or time.sleep
+    deadline = time.monotonic() + max(1, int(timeout_seconds))
+    while time.monotonic() < deadline:
+        if not os.path.exists(path):
+            try:
+                os.unlink(waiting_path)
+            except OSError:
+                pass
+            return False
+        try:
+            with open(release_path, "r", encoding="utf-8") as fh:
+                release = json.load(fh)
+                if (release.get("state") == _BARRIER_GO
+                        and release.get("token") == token):
+                    for cleanup in (release_path, waiting_path, path):
+                        try:
+                            os.unlink(cleanup)
+                        except OSError:
+                            pass
                     return True
-        except OSError:
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
         sleep(0.1)
+    try:
+        os.unlink(waiting_path)
+    except OSError:
+        pass
     return False

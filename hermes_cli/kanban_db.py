@@ -10858,7 +10858,7 @@ def _dispatch_once_locked(
         # the task_runs row, so a refusal after it would leave a spawn_failed
         # run behind for a worker that never existed.
         if not _confinement_preflight_or_refuse(
-            conn, row["id"], board=board, result=result
+            conn, row["id"], board=board, spawn_fn=spawn_fn, result=result
         ):
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -10981,7 +10981,7 @@ def _dispatch_once_locked(
         # the task_runs row, so a refusal after it would leave a spawn_failed
         # run behind for a worker that never existed.
         if not _confinement_preflight_or_refuse(
-            conn, row["id"], board=board, result=result
+            conn, row["id"], board=board, spawn_fn=spawn_fn, result=result
         ):
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -11399,7 +11399,8 @@ def record_observed_cwd(
 
 
 def _record_confinement_event(
-    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict, *,
+    required: bool = False,
 ) -> None:
     """Append a confinement event in its own transaction.
 
@@ -11410,6 +11411,8 @@ def _record_confinement_event(
         with write_txn(conn):
             _append_event(conn, task_id, kind, payload)
     except Exception:
+        if required:
+            raise
         _log.warning("could not record %s for task %s", kind, task_id,
                      exc_info=True)
 
@@ -11419,6 +11422,7 @@ def _confinement_preflight_or_refuse(
     task_id: str,
     *,
     board: Optional[str],
+    spawn_fn,
     result: "DispatchResult",
 ) -> bool:
     """Decide a task's launch directory BEFORE claiming it. True to proceed.
@@ -11451,7 +11455,14 @@ def _confinement_preflight_or_refuse(
         # what a worker may do.
         from hermes_cli import workspace_policy as _wp
 
-        _wp.enforce(task_id, intended, board=board)
+        policy = _wp.resolve_policy(board)
+        if policy.is_sandbox and spawn_fn is not None:
+            raise _dc.PreflightRefusal(
+                f"task {task_id}: sandbox mode does not accept custom "
+                f"spawners; the start-barrier handshake is available only "
+                f"through the shipped worker launcher"
+            )
+        _wp.enforce(task_id, intended, board=board, policy=policy)
     except _dc.PreflightRefusal as exc:
         _record_confinement_event(
             conn, task_id, "confinement_refused",
@@ -11521,6 +11532,17 @@ def _spawn_verified(
         spawn_env = barrier.env()
 
     _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    if sandbox and spawn_fn is not None:
+        # A callable accepting **kwargs does not prove it passes the barrier to
+        # the process it returns. Until spawners have an authenticated launch
+        # capability, sandbox boards use the one shipped path whose worker-side
+        # acknowledgement is defined and tested.
+        barrier.abort()
+        raise _dc.PreflightRefusal(
+            f"task {claimed.id}: sandbox mode does not accept custom spawners; "
+            f"the start-barrier handshake is available only through the "
+            f"shipped worker launcher"
+        )
     import inspect
     try:
         params = inspect.signature(_spawn).parameters
@@ -11543,6 +11565,7 @@ def _spawn_verified(
             )
 
     owned = None
+    final_report = None
     try:
         raw = _spawn(claimed, authorized.path, **kwargs)
         pid, reported_cwd = _dc.normalize_spawn_result(raw)
@@ -11560,6 +11583,12 @@ def _spawn_verified(
                 f"task {claimed.id}: the spawned process could not be bound to "
                 f"an owned handle (pid={pid}); it cannot be verified or cleaned "
                 f"up"
+            )
+
+        if sandbox and not barrier.wait_until_waiting(owned.pid):
+            raise _dc.LaunchVerificationError(
+                f"task {claimed.id}: worker never acknowledged the run-unique "
+                f"start barrier; the spawner may have ignored env_vars"
             )
 
         verification = _dc.verify_launch(
@@ -11589,11 +11618,6 @@ def _spawn_verified(
                     f"satisfied for the final workspace: "
                     f"{final_report.summary()}"
                 )
-            _record_confinement_event(
-                conn, claimed.id, "confinement_verified",
-                final_report.summary(),
-            )
-
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
 
@@ -11614,6 +11638,30 @@ def _spawn_verified(
             )
             result.unverified_launch.append(claimed.id)
 
+        if sandbox:
+            # Final liveness/handshake check: policy evaluation can be slower
+            # than the worker-side timeout. Never write GO for a process that
+            # already exited or stopped advertising that it is waiting.
+            if not owned.is_alive() or not barrier.is_waiting(owned.pid):
+                raise _dc.LaunchVerificationError(
+                    f"task {claimed.id}: worker exited or its start-barrier "
+                    f"acknowledgement disappeared before release"
+                )
+            _record_confinement_event(
+                conn, claimed.id, "confinement_verified",
+                final_report.summary(), required=True,
+            )
+            if not owned.is_alive() or not barrier.is_waiting(owned.pid):
+                raise _dc.LaunchVerificationError(
+                    f"task {claimed.id}: worker exited or its start-barrier "
+                    f"acknowledgement disappeared after audit persistence"
+                )
+
+        # Release remains inside the owned cleanup boundary. A failed release
+        # must abort and terminate the worker rather than strand it waiting.
+        if barrier is not None:
+            barrier.release()
+
     except Exception as exc:
         # A process may already exist. Every failure after that point owns the
         # cleanup: reporting a dispatch closed while a worker keeps running is
@@ -11633,9 +11681,6 @@ def _spawn_verified(
         )
         raise type(exc)(detail) if isinstance(exc, _dc.LaunchVerificationError) else exc
 
-    # Everything passed. Only now may the worker begin.
-    if barrier is not None:
-        barrier.release()
     return pid
 
 

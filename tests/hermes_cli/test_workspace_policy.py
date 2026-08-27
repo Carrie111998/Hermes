@@ -160,6 +160,24 @@ def test_a_malformed_policy_is_reported_not_defaulted():
     assert status["contract_satisfied"] is False
 
 
+def test_an_unknown_mode_is_refused_instead_of_treated_as_open(tmp_path):
+    with pytest.raises(PreflightRefusal, match="unknown.*mode"):
+        wp.assert_policy_wellformed(_policy(tmp_path, mode="sandox"))
+    with pytest.raises(PreflightRefusal, match="unknown.*mode"):
+        wp.resolve_policy("eval", config={
+            "kanban": {"workspace_policy": {"mode": "sandox"}}
+        })
+
+
+def test_a_config_load_failure_refuses_instead_of_downgrading(monkeypatch):
+    def _boom():
+        raise RuntimeError("unreadable config")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+    with pytest.raises(PreflightRefusal, match="could not be loaded"):
+        wp.resolve_policy("configured-sandbox")
+
+
 @pytest.mark.parametrize("bad", [
     {"kanban": {"workspace_policy": []}},
     {"kanban": {"workspace_policy": {"boards": []}}},
@@ -193,7 +211,7 @@ def test_there_is_no_switch_to_disable_a_mandatory_check():
     fields = set(wp.WorkspacePolicy.__dataclass_fields__)
     for gone in ("require_origin_less", "require_no_alternates",
                  "require_no_secrets", "require_no_untracked_source",
-                 "require_single_query_deny"):
+                 "require_single_query_deny", "require_attestation"):
         assert gone not in fields, f"{gone} can still disable a mandatory check"
 
 
@@ -498,11 +516,18 @@ def test_assertion_20_calls_hermes_own_execute_code_guard(guards):
     assert wp.shipped_guard_refuses_execute_code(wp.GUARD_PROBE_CODE) is True
 
 
-def test_the_execute_code_probe_restores_the_session_env(guards):
+def test_the_execute_code_probe_never_mutates_process_env(guards):
     key = "HERMES_SINGLE_QUERY_SESSION"
     before = os.environ.get(key)
     wp.shipped_guard_refuses_execute_code(wp.GUARD_PROBE_CODE)
     assert os.environ.get(key) == before
+
+
+def test_explicit_single_query_probe_ignores_unrelated_process_env(guards,
+                                                                   monkeypatch):
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    assert wp.shipped_guard_refuses_execute_code(wp.GUARD_PROBE_CODE) is True
+    assert "HERMES_SINGLE_QUERY_SESSION" not in os.environ
 
 
 def test_a_config_that_does_not_block_pushes_fails_the_matrix(tmp_path, monkeypatch):
@@ -555,6 +580,20 @@ def test_a_fully_compliant_sandbox_board_passes_all_twenty(tmp_path, guards,
     assert report.contract_satisfied is True, report.summary()
     assert report.passed == wp.REQUIRED_ASSERTION_IDS
     assert not report.skipped and not report.failed and not report.missing
+
+
+def test_config_switch_cannot_disable_fixture_attestation(tmp_path, guards):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    fx = _fixture(root / "fixtures" / "app", attest=False)
+    home = root / "hermes-home"
+    home.mkdir()
+    policy = _policy(root, hermes_home_root=str(root))
+    with pytest.raises(PreflightRefusal, match="attestation"):
+        wp.enforce_final(
+            "t", str(fx), policy=policy, launch=_Launch(fx),
+            pinned_roots=wp.pin_allowed_roots(policy), home=str(home),
+        )
 
 
 def test_an_unverified_launch_fails_assertion_one(tmp_path, guards):

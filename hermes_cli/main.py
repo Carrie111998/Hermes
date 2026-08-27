@@ -13117,22 +13117,29 @@ def main():
     #
     # No barrier configured means no wait, so ordinary CLI use and open-mode
     # boards are entirely unaffected.
-    try:
-        from hermes_cli.dispatch_confinement import wait_for_start_barrier
+    barrier_requested = bool(
+        os.environ.get("HERMES_KANBAN_START_BARRIER")
+        or os.environ.get("HERMES_KANBAN_START_BARRIER_TOKEN")
+    )
+    if barrier_requested:
+        try:
+            from hermes_cli.dispatch_confinement import wait_for_start_barrier
 
-        if not wait_for_start_barrier():
+            released = wait_for_start_barrier()
+        except Exception as exc:
+            print(
+                "hermes: refusing to start — the dispatcher barrier could not "
+                f"be evaluated: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(70) from exc
+        if not released:
             print(
                 "hermes: refusing to start — the dispatcher never released "
                 "this worker's confinement barrier.",
                 file=sys.stderr,
             )
             raise SystemExit(70)
-    except SystemExit:
-        raise
-    except Exception:
-        # A barrier that cannot be evaluated must not brick the CLI for every
-        # other caller; the dispatcher fails the dispatch closed on its side.
-        pass
 
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.

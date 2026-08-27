@@ -119,7 +119,6 @@ class WorkspacePolicy:
     prohibited_commands: tuple = ()
     allowed_commands: tuple = ()
     forbidden_key_sha256: tuple = ()
-    require_attestation: bool = True
 
     @property
     def is_sandbox(self) -> bool:
@@ -215,8 +214,10 @@ def resolve_policy(board: Optional[str] = None, *, config: Any = None) -> Worksp
             from hermes_cli.config import load_config
 
             config = load_config()
-        except Exception:
-            config = {}
+        except Exception as exc:
+            raise PreflightRefusal(
+                f"workspace policy configuration could not be loaded: {exc}"
+            ) from exc
     kanban_cfg = (config or {}).get("kanban") or {}
     if not isinstance(kanban_cfg, dict):
         raise PreflightRefusal("kanban config is malformed (expected a mapping)")
@@ -243,7 +244,7 @@ def resolve_policy(board: Optional[str] = None, *, config: Any = None) -> Worksp
     def pick(key, default=None):
         return board_cfg[key] if key in board_cfg else root.get(key, default)
 
-    return WorkspacePolicy(
+    policy = WorkspacePolicy(
         board=slug,
         mode=str(pick("mode", MODE_OPEN)).strip().lower() or MODE_OPEN,
         allowed_roots=_as_tuple(pick("allowed_roots")),
@@ -253,8 +254,13 @@ def resolve_policy(board: Optional[str] = None, *, config: Any = None) -> Worksp
         prohibited_commands=_as_tuple(pick("prohibited_commands")),
         allowed_commands=_as_tuple(pick("allowed_commands")),
         forbidden_key_sha256=_as_tuple(pick("forbidden_key_sha256")),
-        require_attestation=bool(pick("require_attestation", True)),
     )
+    if policy.mode not in {MODE_OPEN, MODE_SANDBOX}:
+        raise PreflightRefusal(
+            f"board {policy.board!r} declares unknown workspace-policy mode "
+            f"{policy.mode!r}; expected 'open' or 'sandbox'"
+        )
+    return policy
 
 
 def assert_policy_wellformed(policy: WorkspacePolicy) -> None:
@@ -266,6 +272,11 @@ def assert_policy_wellformed(policy: WorkspacePolicy) -> None:
     board that needs relaxations is an ``open`` board, and open never claims the
     contract.
     """
+    if policy.mode not in {MODE_OPEN, MODE_SANDBOX}:
+        raise PreflightRefusal(
+            f"board {policy.board!r} declares unknown workspace-policy mode "
+            f"{policy.mode!r}; expected 'open' or 'sandbox'"
+        )
     if not policy.is_sandbox:
         return
     required = {
@@ -701,22 +712,15 @@ def shipped_guard_refuses_execute_code(code: str) -> bool:
     it without that condition would measure a session shape no worker ever has,
     and report a refusal that never happens.
 
-    ``HERMES_SINGLE_QUERY_SESSION`` is therefore set for the duration of the
-    probe and restored immediately. The dispatcher runs no tools of its own, so
-    the window affects nothing else.
+    The condition is passed explicitly to the guard. It must not be expressed
+    through ``os.environ``: the dispatcher can share a process with concurrent
+    sessions, and process-global state would transiently taint them.
     """
     from tools.approval import check_execute_code_guard
 
-    key = "HERMES_SINGLE_QUERY_SESSION"
-    previous = os.environ.get(key)
-    os.environ[key] = "1"
-    try:
-        result = check_execute_code_guard(code, "local")
-    finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+    result = check_execute_code_guard(
+        code, "local", assume_single_query_context=True
+    )
     return not bool((result or {}).get("approved", True))
 
 
@@ -855,9 +859,7 @@ def enforce_final(task_id: str, workspace: str, *,
     _check(report, 12, lambda: assert_path_authorized(task_id, workspace, policy))
     _check(report, 13, lambda: revalidate_allowed_roots(
         task_id, workspace, policy, pinned_roots))
-    _check(report, 14, lambda: (
-        verify_fixture_attestation(task_id, workspace)
-        if policy.require_attestation else None))
+    _check(report, 14, lambda: verify_fixture_attestation(task_id, workspace))
     _check(report, 16, lambda: assert_prohibited_matrix(task_id, policy))
     _check(report, 17, lambda: assert_allowed_matrix(task_id, policy))
     _check(report, 18, lambda: _require(

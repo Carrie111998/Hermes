@@ -21,6 +21,8 @@ WHAT COMMIT 7 GOT WRONG — every defect below has a test named after it:
 
 import os
 import subprocess
+import sys
+import threading
 import time
 
 import pytest
@@ -199,13 +201,15 @@ def test_the_launch_directory_is_read_from_the_process(tmp_path):
     """Not from the path we asked for — that is the whole distinction."""
     ws = tmp_path / "ws"
     ws.mkdir()
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 3"], cwd=str(ws))
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "read x"], stdin=subprocess.PIPE, cwd=str(ws)
+    )
     try:
         observed = dc.observe_process_cwd(proc.pid)
         assert observed is not None, "cannot observe a child; test is meaningless"
         assert os.path.realpath(observed) == os.path.realpath(ws)
     finally:
-        proc.kill()
+        proc.stdin.close()
         proc.wait()
 
 
@@ -214,14 +218,16 @@ def test_a_spawner_that_launches_elsewhere_is_detected(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     authorized = dc.authorize_workspace("t", str(ws))
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 3"], cwd="/")
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "read x"], stdin=subprocess.PIPE, cwd="/"
+    )
     try:
         v = dc.verify_launch("t", authorized, proc.pid)
         assert v.status == dc.MISMATCH, v
         assert not v.is_verified
         assert "/" in (v.observed_cwd or "")
     finally:
-        proc.kill()
+        proc.stdin.close()
         proc.wait()
 
 
@@ -229,13 +235,15 @@ def test_a_correct_launch_verifies(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     authorized = dc.authorize_workspace("t", str(ws))
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 3"], cwd=str(ws))
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "read x"], stdin=subprocess.PIPE, cwd=str(ws)
+    )
     try:
         v = dc.verify_launch("t", authorized, proc.pid)
         assert v.status == dc.VERIFIED, v
         assert os.path.realpath(v.observed_cwd) == authorized.path
     finally:
-        proc.kill()
+        proc.stdin.close()
         proc.wait()
 
 
@@ -355,6 +363,17 @@ def test_a_write_failure_is_not_swallowed():
         kb.record_observed_cwd(_Broken(), 1, "/tmp/x")
 
 
+def test_required_confinement_event_failure_is_not_swallowed():
+    class _Broken:
+        def execute(self, *a, **k):
+            raise RuntimeError("event store is gone")
+
+    with pytest.raises(Exception):
+        kb._record_confinement_event(
+            _Broken(), "t", "confinement_verified", {}, required=True
+        )
+
+
 def test_historical_runs_keep_null_rather_than_a_guess(tmp_path):
     conn = kb.connect(db_path=tmp_path / "k.db")
     try:
@@ -429,7 +448,10 @@ def test_both_lanes_verify_the_launch(dispatchable, monkeypatch, status):
         procs = []
 
         def _spawn(task, workspace, **kwargs):
-            p = subprocess.Popen(["/bin/sh", "-c", "sleep 5"], cwd=workspace)
+            p = subprocess.Popen(
+                ["/bin/sh", "-c", "read x"], stdin=subprocess.PIPE,
+                cwd=workspace,
+            )
             procs.append(p)
             return p.pid
 
@@ -443,13 +465,14 @@ def test_both_lanes_verify_the_launch(dispatchable, monkeypatch, status):
             assert row["observed_cwd"] == os.path.realpath(ws)
         finally:
             for p in procs:
-                p.kill()
+                p.stdin.close()
                 p.wait()
     finally:
         conn.close()
 
 
 @pytest.mark.parametrize("status", ["ready", "review"])
+@pytest.mark.live_system_guard_bypass
 def test_both_lanes_detect_a_spawner_that_launches_elsewhere(
     dispatchable, monkeypatch, status
 ):
@@ -463,7 +486,10 @@ def test_both_lanes_detect_a_spawner_that_launches_elsewhere(
         escaped = {}
 
         def _escaping_spawn(task, workspace, **kwargs):
-            p = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], cwd="/")
+            p = subprocess.Popen(
+                ["/bin/sh", "-c", "read x"], stdin=subprocess.PIPE,
+                cwd="/", start_new_session=True,
+            )
             escaped["proc"] = p
             return p.pid
 
@@ -526,6 +552,60 @@ def test_a_refusal_creates_no_run_row_and_leaves_the_task_dispatchable(
         conn.close()
 
 
+def test_sandbox_custom_spawner_is_refused_before_claim(dispatchable, monkeypatch):
+    """Accepting env_vars is not proof a custom launcher passes the barrier."""
+    from hermes_cli import workspace_policy as wp
+
+    tmp_path = dispatchable
+    policy = wp.WorkspacePolicy(
+        board="eval", mode=wp.MODE_SANDBOX,
+        allowed_roots=(str(tmp_path),), protected_paths=("*/protected*",),
+        hermes_home_root=str(tmp_path), required_deny_globs=("*git*push*",),
+        prohibited_commands=("git push",), allowed_commands=("git status",),
+    )
+    monkeypatch.setattr(wp, "resolve_policy", lambda *a, **k: policy)
+    conn = kb.connect(db_path=tmp_path / "kanban.db")
+    try:
+        tid, _ws = _ready_task(conn, tmp_path)
+        called = []
+
+        def _custom(task, workspace, **kwargs):
+            called.append((task, workspace, kwargs))
+            pytest.fail("custom sandbox spawner ran before a trusted handshake")
+
+        result = kb.dispatch_once(conn, spawn_fn=_custom)
+        assert tid in result.refused_confinement
+        assert called == []
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_runs WHERE task_id = ?", (tid,)
+        ).fetchone()["c"] == 0
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_policy_load_failure_refuses_before_claim(dispatchable, monkeypatch):
+    tmp_path = dispatchable
+    conn = kb.connect(db_path=tmp_path / "policy-load-failure.db")
+    try:
+        tid, _ws = _ready_task(conn, tmp_path)
+
+        def _boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *a, **k: pytest.fail("worker spawned")
+        )
+        assert tid in result.refused_confinement
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_runs WHERE task_id = ?", (tid,)
+        ).fetchone()["c"] == 0
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
+
+
 def test_an_unobservable_launch_is_reported_not_assumed(dispatchable, monkeypatch):
     """A legacy spawner whose process cannot be inspected."""
     tmp_path = dispatchable
@@ -565,12 +645,23 @@ import contextlib
 @contextlib.contextmanager
 def _held_child(cwd, *, own_session=True, spawn_descendant=False):
     """A child that lives until its stdin closes. No signals required."""
-    script = "read x" if not spawn_descendant else "sleep 300 & read x"
-    proc = subprocess.Popen(
-        ["/bin/sh", "-c", script],
-        stdin=subprocess.PIPE, cwd=str(cwd),
-        start_new_session=own_session,
-    )
+    if spawn_descendant:
+        script = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import sys;sys.stdin.read()'],"
+            "stdin=subprocess.PIPE); print(p.pid, flush=True); sys.stdin.read()"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True, cwd=str(cwd),
+            start_new_session=own_session,
+        )
+        proc._hermes_test_descendant_pid = int(proc.stdout.readline().strip())
+    else:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", "read x"], stdin=subprocess.PIPE, cwd=str(cwd),
+            start_new_session=own_session,
+        )
     try:
         yield proc
     finally:
@@ -644,15 +735,20 @@ def test_termination_takes_the_whole_tree_not_just_the_leader(tmp_path):
     behaviour under test.
     """
     with _held_child(tmp_path, spawn_descendant=True) as proc:
-        time.sleep(0.4)
+        time.sleep(0.2)
         owned = dc.own_process(proc.pid)
-        descendants = [c.pid for c in dc._descendants(proc.pid)]
-        assert descendants, "no descendant was created; test proves nothing"
+        descendant_pid = proc._hermes_test_descendant_pid
+        assert dc._process_matches(descendant_pid, None), (
+            "the announced descendant is not alive; test proves nothing")
 
         result = dc.terminate_worker_tree(owned)
         assert result.ok, result.detail
-        assert dc._descendants(proc.pid) == []
         assert not owned.is_alive()
+        deadline = time.time() + 3
+        while time.time() < deadline and dc._process_matches(descendant_pid, None):
+            time.sleep(0.05)
+        assert not dc._process_matches(descendant_pid, None), (
+            "the worker descendant survived process-group termination")
 
 
 @pytest.mark.live_system_guard_bypass
@@ -670,16 +766,165 @@ def test_termination_never_signals_the_dispatchers_own_group(tmp_path, monkeypat
 
 def test_the_barrier_holds_until_released(tmp_path):
     barrier = dc.StartBarrier.create(str(tmp_path), "t1")
-    assert dc.wait_for_start_barrier(timeout_seconds=1, _env=barrier.env()) is False
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        dc.wait_for_start_barrier(timeout_seconds=3, _env=barrier.env())))
+    worker.start()
+    assert barrier.wait_until_waiting(os.getpid(), timeout_seconds=2)
+    assert result == []
     barrier.release()
-    assert dc.wait_for_start_barrier(timeout_seconds=1, _env=barrier.env()) is True
+    worker.join(timeout=3)
+    assert result == [True]
+    assert not os.path.exists(barrier.path)
 
 
 def test_an_aborted_barrier_never_releases(tmp_path):
     barrier = dc.StartBarrier.create(str(tmp_path), "t1")
-    barrier.release()
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        dc.wait_for_start_barrier(timeout_seconds=10, _env=barrier.env())))
+    worker.start()
+    assert barrier.wait_until_waiting(os.getpid(), timeout_seconds=2)
     barrier.abort()
-    assert dc.wait_for_start_barrier(timeout_seconds=1, _env=barrier.env()) is False
+    worker.join(timeout=2)
+    assert result == [False]
+
+
+def test_a_stale_success_cannot_release_a_later_attempt(tmp_path):
+    first = dc.StartBarrier.create(str(tmp_path), "same-task")
+    first.release()  # Simulate a crash before the worker consumed success.
+    second = dc.StartBarrier.create(str(tmp_path), "same-task")
+    assert first.path != second.path
+
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        dc.wait_for_start_barrier(timeout_seconds=3, _env=second.env())))
+    worker.start()
+    assert second.wait_until_waiting(os.getpid(), timeout_seconds=2)
+    time.sleep(0.2)
+    assert result == [], "the second attempt consumed the first attempt's GO"
+    second.release()
+    worker.join(timeout=3)
+    assert result == [True]
+    first.abort()
+
+
+def test_barrier_acknowledgement_is_bound_to_the_worker_pid(tmp_path):
+    barrier = dc.StartBarrier.create(str(tmp_path), "t1")
+    with open(barrier.waiting_path, "w", encoding="utf-8") as fh:
+        import json
+        json.dump({"state": "WAITING", "token": barrier.token,
+                   "pid": os.getpid() + 1000}, fh)
+    assert not barrier.wait_until_waiting(os.getpid(), timeout_seconds=1)
+    barrier.abort()
+
+
+def test_partial_or_malformed_barrier_configuration_refuses(tmp_path):
+    assert dc.wait_for_start_barrier(
+        timeout_seconds=1, _env={dc.START_BARRIER_ENV: str(tmp_path / "x")}
+    ) is False
+    assert dc.wait_for_start_barrier(
+        timeout_seconds=1,
+        _env={dc.START_BARRIER_ENV: str(tmp_path / "missing"),
+              dc.START_BARRIER_TOKEN_ENV: "wrong"},
+    ) is False
+
+
+def test_requested_barrier_evaluation_error_exits_nonzero(monkeypatch):
+    import importlib
+
+    main_mod = importlib.import_module("hermes_cli.main")
+    monkeypatch.setenv(dc.START_BARRIER_ENV, "/unreadable/barrier")
+    monkeypatch.setenv(dc.START_BARRIER_TOKEN_ENV, "token")
+
+    def _boom():
+        raise RuntimeError("barrier evaluator failed")
+
+    monkeypatch.setattr(dc, "wait_for_start_barrier", _boom)
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+    assert exc.value.code == 70
+
+
+@pytest.mark.live_system_guard_bypass
+def test_release_failure_terminates_the_acknowledged_worker(
+    dispatchable, monkeypatch
+):
+    """GO-write failure stays inside the owned cleanup boundary."""
+    from hermes_cli import workspace_policy as wp
+
+    tmp_path = dispatchable
+    ws = tmp_path / "ws-release-failure"
+    ws.mkdir()
+    conn = kb.connect(db_path=tmp_path / "release-failure.db")
+    processes = []
+    try:
+        tid = kb.create_task(
+            conn, title="w", assignee="coder", workspace_kind="dir",
+            workspace_path=str(ws),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+        policy = wp.WorkspacePolicy(
+            board="eval", mode=wp.MODE_SANDBOX,
+            allowed_roots=(str(tmp_path),), protected_paths=("*/protected*",),
+            hermes_home_root=str(tmp_path),
+            required_deny_globs=("*git*push*",),
+            prohibited_commands=("git push",), allowed_commands=("git status",),
+        )
+        report = wp.PolicyReport(board="eval", mode=wp.MODE_SANDBOX)
+        for assertion_id in range(1, 21):
+            report.record(assertion_id, wp.PASS)
+
+        monkeypatch.setattr(wp, "resolve_policy", lambda *a, **k: policy)
+        monkeypatch.setattr(wp, "pin_allowed_roots", lambda *a, **k: {})
+        monkeypatch.setattr(wp, "revalidate_allowed_roots", lambda *a, **k: None)
+        monkeypatch.setattr(wp, "enforce_final", lambda *a, **k: report)
+
+        def _shipped(task, workspace, *, board=None, env_vars=None):
+            env = dict(os.environ)
+            env.update(env_vars or {})
+            script = (
+                "from hermes_cli.dispatch_confinement import "
+                "wait_for_start_barrier; "
+                "raise SystemExit(0 if wait_for_start_barrier(timeout_seconds=10) "
+                "else 70)"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script], cwd=workspace, env=env,
+                start_new_session=True,
+            )
+            processes.append(proc)
+            return proc.pid
+
+        monkeypatch.setattr(kb, "_default_spawn", _shipped)
+
+        def _release_error(self):
+            raise OSError("cannot write GO")
+
+        monkeypatch.setattr(dc.StartBarrier, "release", _release_error)
+        with pytest.raises(OSError, match="cannot write GO"):
+            kb._spawn_verified(
+                conn, claimed, str(ws), board="eval", spawn_fn=None,
+                result=kb.DispatchResult(),
+            )
+        assert processes
+        processes[0].wait(timeout=10)
+        assert processes[0].returncode is not None
+        kinds = [row["kind"] for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+        )]
+        assert "confinement_violation" in kinds
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    proc.wait(timeout=3)
+        conn.close()
 
 
 def test_no_barrier_configured_means_no_wait():
@@ -708,7 +953,9 @@ def test_no_work_happens_before_the_barrier_is_released(tmp_path):
         stdout=open(marker, "w"), stderr=subprocess.STDOUT,
     )
     try:
-        time.sleep(2.5)
+        assert barrier.wait_until_waiting(proc.pid, timeout_seconds=30), (
+            "real hermes worker never acknowledged waiting")
+        time.sleep(0.5)
         assert proc.poll() is None, "worker ran before the barrier was released"
         assert marker.stat().st_size == 0, "worker produced output before release"
 
