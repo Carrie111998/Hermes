@@ -161,6 +161,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
+from agent.llm_egress_firewall import EgressBlocked
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
@@ -443,6 +444,8 @@ class _AuxiliaryCancellationDecision:
 # call topology — the aux call and its stream consumption run synchronously
 # on the thread that installed the hook.
 _aux_progress = threading.local()
+_aux_dispatch = threading.local()
+_aux_provider_response = threading.local()
 
 
 def _notify_aux_progress() -> None:
@@ -454,6 +457,27 @@ def _notify_aux_progress() -> None:
         hook()
     except Exception:
         logger.debug("aux progress hook failed", exc_info=True)
+
+
+def _notify_aux_dispatch() -> None:
+    """Record an actual provider dispatch without claiming response progress."""
+    hook = getattr(_aux_dispatch, "hook", None)
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            logger.debug("aux dispatch hook failed", exc_info=True)
+
+
+def _notify_aux_provider_response() -> None:
+    """Record a provider response/chunk, then preserve the liveness signal."""
+    hook = getattr(_aux_provider_response, "hook", None)
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            logger.debug("aux provider response hook failed", exc_info=True)
+    _notify_aux_progress()
 
 
 def _aux_progress_active() -> bool:
@@ -473,6 +497,17 @@ def aux_progress_hook(hook):
         yield
     finally:
         _aux_progress.hook = prev
+
+
+@contextlib.contextmanager
+def _aux_timing_hook(local: threading.local, hook):
+    """Install one content-free timing hook and restore its prior value."""
+    previous = getattr(local, "hook", None)
+    local.hook = hook if callable(hook) else previous
+    try:
+        yield
+    finally:
+        local.hook = previous
 
 
 def _run_protected_sync_provider_call(
@@ -1859,7 +1894,7 @@ class _CodexCompletionsAdapter:
                 # Each SSE event is also forward progress for hosts watching
                 # a progress hook (gateway session hygiene): a reasoning
                 # model streaming a long summary must not look hung.
-                _notify_aux_progress()
+                _notify_aux_provider_response()
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -2218,7 +2253,7 @@ class _AnthropicCompletionsAdapter:
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
             on_stream_event=(
-                (lambda _event: _notify_aux_progress())
+                (lambda _event: _notify_aux_provider_response())
                 if _aux_progress_active() else None
             ),
         )
@@ -2343,7 +2378,7 @@ class _BedrockCompletionsAdapter:
                 "stream); caller downgrades to non-streaming.",
                 model,
             )
-        return call_converse(
+        response = call_converse(
             region=self._region,
             model=model,
             messages=messages,
@@ -2361,6 +2396,11 @@ class _BedrockCompletionsAdapter:
             top_p=kwargs.get("top_p"),
             stop_sequences=stop,
         )
+        # Converse is a complete-response API in this shim. Mark provider
+        # progress only after the response returns so TTFP reflects real
+        # Bedrock latency rather than dispatch/setup activity.
+        _notify_aux_provider_response()
+        return response
 
 
 class _BedrockChatShim:
@@ -3315,6 +3355,112 @@ _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_relay_call", default=None)
 )
 
+_AUX_EGRESS_PROVIDERS = frozenset({"anthropic", "openai-codex", "nous"})
+
+
+def _auxiliary_egress_binding(
+    client: Any,
+    *,
+    provider: str | None,
+    model: str | None,
+    api_mode: str | None,
+) -> tuple[Any, Any] | None:
+    """Build the complete identity and route for protected auxiliary calls."""
+    normalized_provider = _normalize_aux_provider(provider)
+    if normalized_provider not in _AUX_EGRESS_PROVIDERS:
+        return None
+    from agent.source_provenance import DEFAULT_POLICY_DIGEST
+
+    runtime = _normalize_main_runtime(None)
+    raw_runtime = _RUNTIME_MAIN_CONTEXT.get() or {}
+    relay = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    request_id = str(relay.get("request_id") or f"aux-{uuid.uuid4().hex}")
+    session_id = str(
+        runtime.get("session_id")
+        or raw_runtime.get("session_id")
+        or f"aux-session:{request_id}"
+    )
+    turn_id = str(
+        raw_runtime.get("turn_id")
+        or f"{session_id}:aux:{str(relay.get('task') or 'call')}"
+    )
+    policy_digest = str(
+        raw_runtime.get("policy_digest")
+        or raw_runtime.get("llm_egress_policy_digest")
+        or DEFAULT_POLICY_DIGEST
+    )
+    candidate_base_url = getattr(client, "base_url", "")
+    if not isinstance(candidate_base_url, str) or not candidate_base_url.startswith(
+        ("http://", "https://")
+    ):
+        candidate_base_url = raw_runtime.get("base_url")
+    if not isinstance(candidate_base_url, str) or not candidate_base_url.startswith(
+        ("http://", "https://")
+    ):
+        if normalized_provider == "openai-codex":
+            candidate_base_url = "https://chatgpt.com/backend-api/codex"
+        elif normalized_provider == "anthropic":
+            candidate_base_url = "https://api.anthropic.com/v1"
+        else:
+            candidate_base_url = _NOUS_DEFAULT_BASE_URL
+    base_url = candidate_base_url
+    resolved_api_mode = str(
+        api_mode
+        or (
+            "codex_responses"
+            if normalized_provider == "openai-codex"
+            else "chat_completions"
+        )
+    )
+    agent_attrs = {
+        "provider": normalized_provider,
+        "model": str(model or ""),
+        "base_url": base_url,
+        "api_mode": resolved_api_mode,
+        "session_id": session_id,
+        "_current_turn_id": turn_id,
+        "_current_api_request_id": request_id,
+        "_llm_egress_policy_digest": policy_digest,
+        "_llm_egress_state_dir": Path(get_hermes_home()) / "egress",
+    }
+    if str(relay.get("task") or "") == "compression":
+        agent_attrs.update(
+            _llm_egress_max_serialized_bytes=2_000_000,
+            _llm_egress_max_conservative_tokens=666_667,
+            _llm_egress_max_sanitized_bytes=2_000_000,
+            _llm_egress_max_sanitized_segment_bytes=32_768,
+            _llm_egress_max_granted_serialized_bytes=2_000_000,
+            _llm_egress_max_granted_conservative_tokens=666_667,
+        )
+    agent = SimpleNamespace(**agent_attrs)
+    route = SimpleNamespace(
+        provider=normalized_provider,
+        model=str(model or ""),
+        base_url=base_url,
+        api_mode=resolved_api_mode,
+    )
+    return agent, route
+
+
+def _dispatch_auxiliary_request(
+    client: Any,
+    request: dict[str, Any],
+    callback: Callable[[dict[str, Any]], Any],
+    *,
+    provider: str | None,
+    model: str | None,
+    api_mode: str | None,
+) -> Any:
+    binding = _auxiliary_egress_binding(
+        client, provider=provider, model=model or request.get("model"), api_mode=api_mode
+    )
+    if binding is None:
+        return callback(request)
+    from agent.llm_egress_runtime import dispatch_authorized_agent_request
+
+    agent, route = binding
+    return dispatch_authorized_agent_request(agent, request, callback, route=route)
+
 
 def _relay_auxiliary_call(callback):
     """Give every physical retry in one auxiliary call a shared Relay identity."""
@@ -3423,6 +3569,15 @@ def _relay_sync_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
+    raw_callback = callback
+    callback = lambda request: _dispatch_auxiliary_request(
+        client,
+        request,
+        raw_callback,
+        provider=provider,
+        model=request.get("model"),
+        api_mode=api_mode,
+    )
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
@@ -3451,6 +3606,29 @@ async def _relay_async_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
+    raw_callback = callback
+
+    async def _authorized_callback(request: dict[str, Any]) -> Any:
+        binding = _auxiliary_egress_binding(
+            client,
+            provider=provider,
+            model=request.get("model"),
+            api_mode=api_mode,
+        )
+        if binding is None:
+            return await raw_callback(request)
+        from agent.llm_egress_runtime import dispatch_authorized_agent_request
+
+        agent, route = binding
+        result = dispatch_authorized_agent_request(
+            agent,
+            request,
+            raw_callback,
+            route=route,
+        )
+        return await result if inspect.isawaitable(result) else result
+
+    callback = _authorized_callback
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -3474,15 +3652,23 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    callback = lambda request: _dispatch_auxiliary_request(
+        client,
+        request,
+        lambda authorized: client.chat.completions.create(**authorized),
+        provider=provider,
+        model=kwargs.get("model"),
+        api_mode=api_mode,
+    )
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return callback(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        callback,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,
@@ -4040,7 +4226,13 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider",
+    "session_id",
+    "turn_id",
+    "policy_digest",
+    "llm_egress_policy_digest",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4373,6 +4565,20 @@ def _is_transient_transport_error(exc: Exception) -> bool:
         getattr(exc, "response", None), "status_code", None
     )
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+
+
+def _is_safe_egress_fallback_candidate(client: Any, provider: str, model: str) -> bool:
+    """Permit a blocked remote request to fall back only to local execution.
+
+    A blocked payload must never be retried against another remote provider;
+    only an explicitly local/loopback fallback is eligible, and its callback
+    still receives a fresh request copy at the local boundary.
+    """
+    from agent.llm_egress_firewall import DestinationClass, classify_destination
+
+    base_url = str(getattr(client, "base_url", "") or "")
+    destination = classify_destination(provider, base_url, "chat_completions")
+    return destination in {DestinationClass.LOCAL_PROCESS, DestinationClass.LOOPBACK}
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
@@ -5273,6 +5479,19 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
+    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
+        task,
+        actual_provider=destination.provider,
+        actual_model=destination.model,
+        requested_provider=fallback_entry.get("provider"),
+        requested_model=fallback_entry.get("model"),
+        route_config=fallback_entry,
+        leak_guard_config=task_config,
+        max_tokens=max_tokens,
+        extra_body=effective_extra_body,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5280,10 +5499,14 @@ def _call_fallback_candidate_sync(
     )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
-        temperature=temperature, max_tokens=max_tokens,
+        temperature=temperature, max_tokens=fallback_max_tokens,
         tools=fallback_tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    if fallback_max_tokens is not None and max_tokens is None:
+        fb_kwargs.update(
+            auxiliary_max_tokens_param(fallback_max_tokens, model=destination.model)
+        )
     try:
         return _validate_llm_response(
             _relay_sync_completion(
@@ -5291,6 +5514,14 @@ def _call_fallback_candidate_sync(
                 fb_kwargs,
                 provider=destination.provider,
                 api_mode=destination.api_mode,
+                create=lambda request: _create_with_progress(
+                    fb_client,
+                    request,
+                    task,
+                    force_stream=_provider_requires_stream(
+                        destination.provider, destination.base_url
+                    ),
+                ),
             ),
             task,
         )
@@ -5320,15 +5551,32 @@ def _call_fallback_candidate_sync(
                     tools,
                     destination=retry_destination,
                 )
+                retry_max_tokens, retry_extra_body = _compression_fast_lane_controls(
+                    task,
+                    actual_provider=retry_destination.provider,
+                    actual_model=retry_destination.model,
+                    requested_provider=fallback_entry.get("provider"),
+                    requested_model=fallback_entry.get("model"),
+                    route_config=fallback_entry,
+                    leak_guard_config=task_config,
+                    max_tokens=max_tokens,
+                    extra_body=effective_extra_body,
+                )
                 retry_kwargs = _build_call_kwargs(
                     retry_destination.provider,
                     retry_destination.model,
                     retry_messages,
-                    temperature=temperature, max_tokens=max_tokens,
+                    temperature=temperature, max_tokens=retry_max_tokens,
                     tools=retry_tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=retry_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
+                if retry_max_tokens is not None and max_tokens is None:
+                    retry_kwargs.update(
+                        auxiliary_max_tokens_param(
+                            retry_max_tokens, model=retry_destination.model
+                        )
+                    )
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -5336,6 +5584,15 @@ def _call_fallback_candidate_sync(
                             retry_kwargs,
                             provider=retry_destination.provider,
                             api_mode=retry_destination.api_mode,
+                            create=lambda request: _create_with_progress(
+                                retry_client,
+                                request,
+                                task,
+                                force_stream=_provider_requires_stream(
+                                    retry_destination.provider,
+                                    retry_destination.base_url,
+                                ),
+                            ),
                         ),
                         task,
                     )
@@ -8349,6 +8606,106 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+class CompressionFastLane(NamedTuple):
+    """Explicit, non-reasoning compression route safe for a bounded summary."""
+
+    certified_non_reasoning: bool
+    max_tokens: Optional[int]
+    reasoning_config: Optional[Dict[str, Any]]
+
+
+def resolve_compression_fast_lane(
+    actual_provider: str,
+    actual_model: Optional[str],
+    *,
+    requested_provider: Optional[str] = None,
+    requested_model: Optional[str] = None,
+    route_config: Optional[Dict[str, Any]] = None,
+) -> CompressionFastLane:
+    """Certify the opt-in fast lane against one already-resolved route.
+
+    A cap is safe only when the operator has selected a concrete auxiliary
+    provider/model, explicitly certified it as non-reasoning, and that exact
+    route is the one Hermes will call. A requested model covers a compressor
+    summary-model override. Auto/inherited and drifted routes stay uncapped.
+    """
+    config = (
+        route_config
+        if route_config is not None
+        else _get_auxiliary_task_config("compression")
+    )
+    provider = str(requested_provider or config.get("provider") or "").strip().lower()
+    model = str(requested_model or config.get("model") or "").strip()
+    effort = str(config.get("reasoning_effort") or "").strip().lower()
+    explicit_route = provider not in {"", "auto"} and model.lower() not in {"", "auto"}
+    provider_matches = _normalize_aux_provider(
+        _fallback_provider_from_label(str(actual_provider or ""))
+    ) == _normalize_aux_provider(provider)
+    model_matches = str(actual_model or "").strip().lower() == model.lower()
+    certified = explicit_route and provider_matches and model_matches and effort == "none"
+    if not certified:
+        return CompressionFastLane(False, None, None)
+    raw_cap = config.get("max_output_tokens")
+    try:
+        cap = 0 if isinstance(raw_cap, bool) else int(raw_cap)
+    except (TypeError, ValueError):
+        cap = 0
+    return CompressionFastLane(
+        True,
+        cap if cap > 0 else None,
+        {"enabled": False, "effort": "none"},
+    )
+
+
+def _compression_config_claims_fast_lane(config: Dict[str, Any]) -> bool:
+    """Whether task config declares fast-only controls that cannot leak."""
+    provider = str(config.get("provider") or "").strip().lower()
+    model = str(config.get("model") or "").strip().lower()
+    effort = str(config.get("reasoning_effort") or "").strip().lower()
+    raw_cap = config.get("max_output_tokens")
+    try:
+        cap = 0 if isinstance(raw_cap, bool) else int(raw_cap or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    return (
+        provider not in {"", "auto"}
+        and model not in {"", "auto"}
+        and effort == "none"
+        and cap > 0
+    )
+
+
+def _compression_fast_lane_controls(
+    task: str | None,
+    *,
+    actual_provider: str,
+    actual_model: str | None,
+    requested_provider: str | None,
+    requested_model: str | None,
+    route_config: Dict[str, Any],
+    leak_guard_config: Dict[str, Any],
+    max_tokens: int | None,
+    extra_body: Dict[str, Any],
+) -> tuple[int | None, Dict[str, Any]]:
+    """Apply the certified compression controls to one resolved route."""
+    body = dict(extra_body)
+    if task != "compression" or max_tokens is not None:
+        return max_tokens, body
+    lane = resolve_compression_fast_lane(
+        actual_provider,
+        actual_model,
+        requested_provider=requested_provider,
+        requested_model=requested_model,
+        route_config=route_config,
+    )
+    if lane.reasoning_config is not None:
+        if "reasoning" not in body:
+            body["reasoning"] = lane.reasoning_config
+    elif _compression_config_claims_fast_lane(leak_guard_config):
+        body.pop("reasoning", None)
+    return lane.max_tokens, body
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -9126,9 +9483,13 @@ def _create_with_progress(
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_progress()  # request dispatched counts as progress
+    _notify_aux_dispatch()
+    _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        return client.chat.completions.create(**kwargs)
+        response = client.chat.completions.create(**kwargs)
+        if not _client_streams_internally(client):
+            _notify_aux_provider_response()
+        return response
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
     stream_kwargs = dict(kwargs)
@@ -9157,12 +9518,15 @@ def _create_with_progress(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
-        return client.chat.completions.create(**kwargs)
+        _notify_aux_dispatch()
+        response = client.chat.completions.create(**kwargs)
+        _notify_aux_provider_response()
+        return response
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
     if hasattr(chunks, "choices"):
-        _notify_aux_progress()
+        _notify_aux_provider_response()
         return chunks
     return _aggregate_chat_stream(
         chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
@@ -9218,7 +9582,7 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
+        _notify_aux_provider_response()
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -9370,38 +9734,73 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
-    try:
-        response = _call_llm_impl(
-            task=task,
-            provider=provider,
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            main_runtime=main_runtime,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            timeout=timeout,
-            extra_body=extra_body,
-            reasoning_config=reasoning_config,
-            extra_headers=extra_headers,
-            api_mode=api_mode,
-            stream=stream,
-            stream_options=stream_options,
-            route_info=route_info,
+    request_started_at = time.monotonic()
+    if latency_info is not None:
+        latency_info["queue_wait_ms"] = max(
+            0, int((request_started_at - queue_started_at) * 1000)
         )
+    prior_progress_hook = getattr(_aux_progress, "hook", None)
+
+    def _timed_response() -> None:
+        if latency_info is not None and "time_to_first_progress_ms" not in latency_info:
+            latency_info["time_to_first_progress_ms"] = max(
+                0, int((time.monotonic() - request_started_at) * 1000)
+            )
+
+    def _timed_dispatch() -> None:
+        if latency_info is not None and "provider_dispatch_ms" not in latency_info:
+            latency_info["provider_dispatch_ms"] = max(
+                0, int((time.monotonic() - request_started_at) * 1000)
+            )
+
+    try:
+        with (
+            scoped_runtime_main(main_runtime),
+            aux_progress_hook(
+                prior_progress_hook
+                if callable(prior_progress_hook)
+                else ((lambda: None) if latency_info is not None else None)
+            ),
+            _aux_timing_hook(_aux_dispatch, _timed_dispatch),
+            _aux_timing_hook(_aux_provider_response, _timed_response),
+        ):
+            response = _call_llm_impl(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+                extra_headers=extra_headers,
+                api_mode=api_mode,
+                stream=stream,
+                stream_options=stream_options,
+                route_info=route_info,
+            )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
             semaphore = None
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
+        if latency_info is not None:
+            latency_info["summary_generation_ms"] = max(
+                0, int((time.monotonic() - request_started_at) * 1000)
+            )
         if semaphore is not None:
             semaphore.release()
 
@@ -9574,6 +9973,20 @@ def _call_llm_impl(
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
+    compression_config = (
+        _get_auxiliary_task_config("compression") if task == "compression" else {}
+    )
+    fast_compression_cap, effective_extra_body = _compression_fast_lane_controls(
+        task,
+        actual_provider=request_provider,
+        actual_model=final_model,
+        requested_provider=provider,
+        requested_model=model,
+        route_config=compression_config,
+        leak_guard_config=compression_config,
+        max_tokens=max_tokens,
+        extra_body=effective_extra_body,
+    )
     _set_relay_auxiliary_route(
         request_provider,
         final_model,
@@ -9599,6 +10012,12 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
+    if fast_compression_cap is not None:
+        # Normal auxiliary calls intentionally omit a cap on most
+        # OpenAI-compatible/local providers.  This is the narrow exception:
+        # the configured compression route is concrete and certified
+        # non-reasoning, so a bounded summary request is intentional.
+        kwargs.update(auxiliary_max_tokens_param(fast_compression_cap, model=final_model))
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -9628,7 +10047,14 @@ def _call_llm_impl(
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
             # boundary.
-            return client.chat.completions.create(**kwargs)
+            return _dispatch_auxiliary_request(
+                client,
+                kwargs,
+                lambda authorized: client.chat.completions.create(**authorized),
+                provider=request_provider,
+                model=final_model,
+                api_mode=resolved_api_mode,
+            )
         return _relay_sync_stream(
             client,
             kwargs,
@@ -10045,6 +10471,40 @@ def _call_llm_impl(
         # auxiliary task on the floor (silent compression failure /
         # message loss). Auth is NOT a capacity error: it only bypasses
         # the explicit-provider gate when the user is in auto mode.
+        # A blocked remote payload is terminal for every remote destination.
+        # Give only a configured/local fallback one immediate chance, without
+        # entering retry/backoff or the general remote provider chain.
+        if isinstance(first_err, EgressBlocked):
+            local_candidates = (
+                _try_configured_fallback_chain(
+                    task, resolved_provider or "auto", reason="egress blocked",
+                    failed_model=final_model,
+                ),
+                _try_main_agent_model_fallback(
+                    resolved_provider, task, reason="egress blocked",
+                    failed_model=final_model,
+                ),
+            )
+            for fb_client, fb_model, fb_label in local_candidates:
+                if fb_client is None or not _is_safe_egress_fallback_candidate(
+                    fb_client, _fallback_provider_from_label(fb_label), str(fb_model or "")
+                ):
+                    continue
+                _record_route_info(
+                    route_info, _fallback_provider_from_label(fb_label), fb_model
+                )
+                fb_resp = _call_fallback_candidate_sync(
+                    fb_client, fb_model, fb_label,
+                    task=task, messages=messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if fb_resp is not None:
+                    return fb_resp
+            raise
+
         should_fallback = (
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
@@ -10265,22 +10725,23 @@ async def async_call_llm(
     if semaphore is not None:
         await semaphore.acquire()
     try:
-        return await _async_call_llm_impl(
-            task=task,
-            provider=provider,
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            main_runtime=main_runtime,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            timeout=timeout,
-            extra_body=extra_body,
-            reasoning_config=reasoning_config,
-            route_info=route_info,
-        )
+        with scoped_runtime_main(main_runtime):
+            return await _async_call_llm_impl(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+                route_info=route_info,
+            )
     finally:
         if semaphore is not None:
             semaphore.release()
