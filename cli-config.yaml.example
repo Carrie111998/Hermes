@@ -1218,6 +1218,11 @@ platform_toolsets:
 #       # Omit either key to preserve Slack's default for that preview type.
 #       unfurl_links: false
 #       unfurl_media: false
+#   whatsapp:
+#     extra:
+#       # Suppress Hermes messages and typing while leaving inbound collection
+#       # running. Defaults to true. See the WhatsApp docs for the hard lock.
+#       outbound_enabled: true
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under
