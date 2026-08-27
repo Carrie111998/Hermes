@@ -2079,3 +2079,300 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+def test_manual_codex_account_does_not_adopt_singleton_or_revert_external_order(
+    tmp_path, monkeypatch
+):
+    """Independent Codex OAuth entries must not inherit singleton credentials.
+
+    A long-lived pool can retain an older priority order while another process
+    promotes a manual account. Syncing that independent account from the
+    singleton must neither clobber its identity nor write the stale order back.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "pro-access",
+                        "refresh_token": "pro-refresh",
+                    },
+                    "last_refresh": "2026-08-24T10:00:00Z",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "free",
+                        "label": "codex-free",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "free-access",
+                        "refresh_token": "free-refresh",
+                    },
+                    {
+                        "id": "pro",
+                        "label": "codex-pro",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "pro-access",
+                        "refresh_token": "pro-refresh",
+                    },
+                    {
+                        "id": "team",
+                        "label": "codex-team",
+                        "auth_type": "oauth",
+                        "priority": 2,
+                        "source": "manual:device_code",
+                        "access_token": "team-access",
+                        "refresh_token": "team-refresh",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    stale_pool = load_pool("openai-codex")
+    team_entry = next(entry for entry in stale_pool.entries() if entry.id == "team")
+
+    current_entries = read_credential_pool("openai-codex")
+    current: dict[str, dict] = {
+        str(item.get("id")): dict(item)
+        for item in current_entries
+        if isinstance(item, dict)
+    }
+    promoted: list[dict] = [
+        current[entry_id] for entry_id in ("team", "pro", "free")
+    ]
+    for priority, entry in enumerate(promoted):
+        entry["priority"] = priority
+    write_credential_pool("openai-codex", promoted)
+
+    synced = stale_pool._sync_codex_entry_from_auth_store(team_entry)
+
+    assert synced.access_token == "team-access"
+    assert synced.refresh_token == "team-refresh"
+    persisted = read_credential_pool("openai-codex")
+    assert [entry["id"] for entry in persisted] == ["team", "pro", "free"]
+
+
+def test_manual_codex_singleton_alias_adopts_refresh_without_reverting_order(
+    tmp_path, monkeypatch
+):
+    """A true manual singleton alias still adopts a refreshed token pair."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "old-singleton-access",
+                        "refresh_token": "old-singleton-refresh",
+                    },
+                    "last_refresh": "2026-08-24T10:00:00Z",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "legacy-alias",
+                        "label": "legacy-alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "old-singleton-access",
+                        "refresh_token": "old-singleton-refresh",
+                    },
+                    {
+                        "id": "independent",
+                        "label": "independent",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "independent-access",
+                        "refresh_token": "independent-refresh",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import (
+        _save_codex_tokens,
+        read_credential_pool,
+        write_credential_pool,
+    )
+
+    stale_pool = load_pool("openai-codex")
+    alias_entry = next(
+        entry for entry in stale_pool.entries() if entry.id == "legacy-alias"
+    )
+
+    _save_codex_tokens(
+        {
+            "access_token": "fresh-singleton-access",
+            "refresh_token": "fresh-singleton-refresh",
+        },
+        last_refresh="2026-08-24T11:00:00Z",
+    )
+    current_entries = read_credential_pool("openai-codex")
+    current: dict[str, dict] = {
+        str(item.get("id")): dict(item)
+        for item in current_entries
+        if isinstance(item, dict)
+    }
+    singleton_id = next(
+        entry_id
+        for entry_id, item in current.items()
+        if item.get("source") == "device_code"
+    )
+    promoted: list[dict] = [
+        current[entry_id]
+        for entry_id in ("independent", "legacy-alias", singleton_id)
+    ]
+    for priority, entry in enumerate(promoted):
+        entry["priority"] = priority
+    write_credential_pool("openai-codex", promoted)
+
+    synced = stale_pool._sync_codex_entry_from_auth_store(alias_entry)
+
+    assert synced.access_token == "fresh-singleton-access"
+    assert synced.refresh_token == "fresh-singleton-refresh"
+    persisted = read_credential_pool("openai-codex")
+    assert [entry["id"] for entry in persisted] == [
+        "independent",
+        "legacy-alias",
+        singleton_id,
+    ]
+
+
+def test_manual_codex_refresh_adopts_complete_persisted_pool_before_persist(
+    tmp_path, monkeypatch
+):
+    """A manual refresh must not overwrite an external reorder with stale memory."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": entry_id,
+                        "label": entry_id,
+                        "auth_type": "oauth",
+                        "priority": priority,
+                        "source": "manual:device_code",
+                        "access_token": f"{entry_id}-access",
+                        "refresh_token": f"{entry_id}-refresh",
+                    }
+                    for priority, entry_id in enumerate(("free", "other", "team"))
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    pool = load_pool("openai-codex")
+    current = {
+        entry["id"]: dict(entry)
+        for entry in read_credential_pool("openai-codex")
+    }
+    reordered = [current[entry_id] for entry_id in ("team", "other", "free")]
+    for priority, entry in enumerate(reordered):
+        entry["priority"] = priority
+    write_credential_pool("openai-codex", reordered)
+
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": "team-final-access",
+            "refresh_token": "team-final-refresh",
+            "last_refresh": "2026-08-27T02:00:00Z",
+        }
+
+    monkeypatch.setattr(
+        "agent.credential_pool.auth_mod.refresh_codex_oauth_pure",
+        _refresh,
+    )
+
+    refreshed = pool.try_refresh_matching(credential_id="team")
+
+    assert refreshed is not None
+    assert refresh_calls == [("team-access", "team-refresh")]
+    persisted = read_credential_pool("openai-codex")
+    assert [entry["id"] for entry in persisted] == ["team", "other", "free"]
+    assert persisted[0]["access_token"] == "team-final-access"
+    assert persisted[0]["refresh_token"] == "team-final-refresh"
+
+
+def test_dead_manual_codex_alias_refreshed_on_disk_is_selectable(
+    tmp_path, monkeypatch
+):
+    """Public selection must recover a DEAD manual alias from its fresh same-ID row."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "legacy-alias",
+                        "label": "legacy-alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "stale-access",
+                        "refresh_token": "stale-refresh",
+                        "last_status": "dead",
+                        "last_status_at": time.time(),
+                        "last_error_code": 401,
+                        "last_error_reason": "token_invalidated",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    pool = load_pool("openai-codex")
+    refreshed_alias = dict(read_credential_pool("openai-codex")[0])
+    refreshed_alias.update(
+        access_token="fresh-access",
+        refresh_token="fresh-refresh",
+        last_status=None,
+        last_status_at=None,
+        last_error_code=None,
+        last_error_reason=None,
+    )
+    write_credential_pool("openai-codex", [refreshed_alias])
+
+    selected = pool.select()
+
+    assert selected is not None
+    assert selected.id == "legacy-alias"
+    assert selected.access_token == "fresh-access"
+    assert selected.refresh_token == "fresh-refresh"

@@ -1059,11 +1059,48 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above.  The singleton-seeded
+        ``device_code`` entry syncs from provider state.  A
+        ``manual:device_code`` entry may be an independent account or a legacy
+        singleton alias; the write-side alias check updates only true aliases
+        in their exact persisted rows.  Runtime manual entries therefore adopt
+        their authoritative persisted pool before any later write can restore
+        stale in-memory order or state.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex" or entry.source not in (
+            "device_code",
+            SOURCE_MANUAL_DEVICE_CODE,
+        ):
+            return entry
+        if entry.source == SOURCE_MANUAL_DEVICE_CODE:
+            try:
+                persisted_entries = [
+                    PooledCredential.from_dict(self.provider, payload)
+                    for payload in read_credential_pool(self.provider)
+                    if isinstance(payload, dict)
+                ]
+                with self._lock:
+                    persisted = next(
+                        (
+                            candidate
+                            for candidate in persisted_entries
+                            if candidate.id == entry.id
+                        ),
+                        None,
+                    )
+                    if persisted is None or persisted_entries == self._entries:
+                        return entry
+                    logger.debug(
+                        "Pool entry %s: adopting authoritative persisted Codex pool",
+                        entry.id,
+                    )
+                    self._entries = persisted_entries
+                    return persisted
+            except Exception as exc:
+                logger.debug(
+                    "Failed to sync manual Codex entry from credential pool: %s",
+                    exc,
+                )
             return entry
         try:
             with _auth_store_lock():
@@ -2228,7 +2265,7 @@ class CredentialPool:
             # frozen behind last_error_reset_at (can be hours in the
             # future for ChatGPT weekly windows).
             if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
+                    and entry.source in ("device_code", SOURCE_MANUAL_DEVICE_CODE)
                     and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
