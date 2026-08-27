@@ -273,6 +273,17 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'mixed'
   },
+  // /review ships on CLI/gateway/TUI via agent/review_engine.py (#93339) and
+  // tui_gateway already live-dispatches it. Without a curated row it still
+  // appears as an extension/skill-shaped entry; promote it to a first-class
+  // Command with free-text args so the composer expands for optional
+  // instructions instead of chipping bare `/review` as a no-arg skill.
+  {
+    name: '/review',
+    description: 'Spawn an independent reviewer subagent for the work just discussed',
+    surface: exec(),
+    argumentMode: 'text'
+  },
   {
     name: '/personality',
     description: 'Switch personality for this session',

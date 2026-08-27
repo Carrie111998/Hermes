@@ -155,6 +155,7 @@ describe('desktop slash command curation', () => {
       '/personality',
       '/queue',
       '/retry',
+      '/review',
       '/rollback',
       '/tools',
       '/undo',
@@ -166,10 +167,24 @@ describe('desktop slash command curation', () => {
     }
   })
 
+  it('surfaces /review in the popover and routes it through the slash worker', () => {
+    // Backend /review (#93339) is live on tui_gateway. Curating the row makes
+    // it a first-class Command with free-text arg expansion (not a no-arg skill chip).
+    expect(isDesktopSlashSuggestion('/review')).toBe(true)
+    expect(isDesktopSlashCommand('/review')).toBe(true)
+    expect(resolveDesktopCommand('/review')?.surface).toEqual({ kind: 'exec' })
+    expect(desktopSlashCommandArgumentMode('/review')).toBe('text')
+    expect(desktopSlashUnavailableMessage('/review')).toBeNull()
+    expect(desktopSlashDescription('/review', 'backend desc')).toBe(
+      'Spawn an independent reviewer subagent for the work just discussed'
+    )
+  })
+
   it('distinguishes free prose from finite slash option lists', () => {
     expect(desktopSlashCommandArgumentMode('/goal')).toBe('mixed')
     expect(desktopSlashCommandArgumentMode('/steer')).toBe('text')
     expect(desktopSlashCommandArgumentMode('/queue')).toBe('text')
+    expect(desktopSlashCommandArgumentMode('/review')).toBe('text')
     expect(desktopSlashCommandArgumentMode('/personality')).toBe('options')
     expect(desktopSlashCommandArgumentMode('/handoff')).toBe('options')
     expect(desktopSlashCommandArgumentMode('/version')).toBeNull()
