@@ -12,12 +12,16 @@ finish_reason="incomplete") ever saw this: a finish_reason="stop" text
 finish never entered either guard.
 
 The fix keys on the turn's own content (a JSON tool-call shape, or
-affirmative self-claiming language) independent of finish_reason and
-provider, and re-prompts, bounded to 3 consecutive stalls, with the budget
-resetting after any successful tool round — the same recovery discipline
-already proven for the dropped-tool-call case. A genuine clean answer, an
-honest disclaimer, or a real tool call's own summary text are all
-unaffected. See docs/rfcs/2026-08-fabricated-tool-use-detection.md.
+affirmative self-claiming language) independent of provider and of the
+specific value of finish_reason -- other than "tool_calls", which is the
+dropped-tool-call check's own territory and is deliberately excluded here
+so the two checks' retry budgets can't compound (see
+test_tool_calls_finish_reason_does_not_compound_both_budgets below). It
+re-prompts, bounded to 3 consecutive stalls, with the budget resetting
+after any successful tool round — the same recovery discipline already
+proven for the dropped-tool-call case. A genuine clean answer, an honest
+disclaimer, or a real tool call's own summary text are all unaffected.
+See docs/rfcs/2026-08-fabricated-tool-use-detection.md.
 """
 
 from __future__ import annotations

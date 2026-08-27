@@ -26,7 +26,7 @@ This is not a new failure class for this codebase. `agent/codex_responses_adapte
 `finish_reason` becomes `"incomplete"` after that adapter's own processing. Its own comment names
 the exact risk: *"the parent sees a confident-looking summary with no audit trail (empty
 tool_trace) and no tools actually ran."* A second, sibling mechanism — the "dropped tool call"
-retry in `agent/conversation_loop.py:8039-8079` — recovers when `finish_reason == "tool_calls"`
+retry in `agent/conversation_loop.py:8102-8134` — recovers when `finish_reason == "tool_calls"`
 but `tool_calls` came back empty. Neither covers a genuinely `stop`-style completion, which is
 this bug's actual shape; the dropped-toolcall code's own surrounding comment says so explicitly
 (`conversation_loop.py:8036`): *"finish_reason='stop' text finishes never enter this guard."*
@@ -41,7 +41,7 @@ recovering via the same retry mechanism already proven for the dropped-toolcall 
 **Explicitly out of scope:**
 - Replacing or modifying the existing Codex-specific leak-recovery path
   (`codex_responses_adapter.py:1585-1611`) or the existing dropped-toolcall path
-  (`conversation_loop.py:8039-8079`). Both keep working exactly as they do today; this is a new,
+  (`conversation_loop.py:8102-8134`). Both keep working exactly as they do today; this is a new,
   third sibling check, not a refactor of the other two.
 - Detecting a hallucination that reads as ordinary, ungrounded prose with **no** structural JSON
   marker and **no** self-claiming language at all (e.g. a wrong fact stated as flatly as a
@@ -59,7 +59,7 @@ recovering via the same retry mechanism already proven for the dropped-toolcall 
 ### Where it lives
 
 A new `elif` branch alongside the existing dropped-toolcall check, inside `run_conversation()`
-in `agent/conversation_loop.py` (~line 8039). Both checks read from the same normalized,
+in `agent/conversation_loop.py` (~line 8157). Both checks read from the same normalized,
 provider-agnostic `assistant_message`/`finish_reason` produced once per turn by
 `_transport.normalize_response(response)` (`conversation_loop.py:6637-6639`) — the one call site
 all four transports (`anthropic`, `codex`, `chat_completions`, `bedrock`) funnel through
@@ -108,14 +108,31 @@ turn, since it's just delivering the final text) can legitimately contain the sa
 language the detector looks for — e.g. *"the search returned $2,650/oz"* while accurately
 summarizing a real tool result from an earlier round in the same turn. The existing
 dropped-toolcall check avoids this by construction (it's gated on `finish_reason == "tool_calls"`,
-which a normal summary never has); this new check deliberately does not gate on `finish_reason`,
-so it needs its own guard.
+which a normal summary never has); this new check needs its own guard.
 
 Fix: a new agent attribute, `agent._landed_real_tool_call_this_turn`, set `True` at the same point
 `agent._dropped_toolcall_retries` already gets reset after a successful tool round
 (`conversation_loop.py:~7234`), and reset to `False` alongside the other counters at genuine turn
 end (`~8079`). The new check additionally requires
 `not getattr(agent, "_landed_real_tool_call_this_turn", False)`.
+
+### Second refinement, found during code review: the two retry budgets could compound
+
+Because this check does not gate on `finish_reason` the way the dropped-toolcall check does, an
+overlap case is possible: a stall with `finish_reason == "tool_calls"` and empty `tool_calls`,
+whose narration text ALSO happens to match the fabrication pattern (a plausible variant of the
+same provider-contract violation the dropped-toolcall check exists for). Without a fix, once the
+dropped-toolcall check's own 3-retry budget is exhausted, control would fall through to this new
+check, which — not gating on `finish_reason` — would grant 3 *more* retries, silently doubling the
+effective bound to 6 for that one overlap case, contradicting the "bounded to 3" invariant stated
+above.
+
+Fix: the check additionally requires `finish_reason != "tool_calls"` — that value is squarely the
+dropped-toolcall check's own territory (it's the condition that check exists for), so once its
+budget is exhausted for that finish_reason, the turn now correctly falls through to genuine turn
+end instead of getting a second budget from this check. This does not narrow the check's actual
+target: `finish_reason="stop"` (and every other non-`"tool_calls"` value) — the gap this whole
+design exists to close — is completely unaffected by the exclusion.
 
 Accepted tradeoff: once any real tool call has landed anywhere in a turn's multi-round loop, later
 text in that same turn is never checked again for fabrication, even if it's a distinct, unrelated
@@ -168,6 +185,14 @@ Cases:
    retries), mirroring `test_persistent_dropped_tool_calls_are_bounded`.
 8. **Ephemeral scaffolding.** The nudge pair does not survive into `result["messages"]` after a
    successful retry, mirroring `test_nudge_pair_is_ephemeral_scaffolding`.
+9. **Flag does not leak across turns.** Added during implementation once the
+   `_landed_real_tool_call_this_turn` refinement above was written: a real tool call in one
+   `run_conversation()` call must not permanently suppress detection in a later, separate call on
+   the same long-lived agent — proves the flag resets at genuine turn end, not just within a turn.
+10. **The two retry budgets don't compound.** Added after code review caught the gap described in
+    "Second refinement" above: a stall that is simultaneously `finish_reason == "tool_calls"` (with
+    empty `tool_calls`) and fabrication-shaped must cap at 4 total calls (the dropped-toolcall
+    check's own budget), not 7 (both budgets stacked).
 
 `scripts/run_tests.sh tests/run_agent/` must stay green throughout, alongside the full existing
 `test_dropped_tool_call_recovery.py` suite (unmodified, still passing — this is additive, not a
