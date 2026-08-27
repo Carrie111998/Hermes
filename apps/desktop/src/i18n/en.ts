@@ -2481,6 +2481,9 @@ export const en: Translations = {
     stop: 'Stop',
     dismiss: 'Dismiss',
     exit: code => `exit ${code}`,
+    context: {
+      label: 'Context'
+    },
     coding: {
       title: 'Working tree',
       noBranch: 'No branch',

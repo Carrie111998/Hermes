@@ -1932,6 +1932,9 @@ export const ar = defineLocale({
     stop: 'إيقاف',
     dismiss: 'تجاهل',
     exit: code => `خروج ${code}`,
+    context: {
+      label: 'السياق'
+    },
     coding: {
       title: 'شجرة العمل',
       noBranch: 'لا يوجد فرع',

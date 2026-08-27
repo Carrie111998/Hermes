@@ -2095,6 +2095,9 @@ export interface Translations {
     stop: string
     dismiss: string
     exit: (code: number) => string
+    context: {
+      label: string
+    }
     coding: {
       title: string
       noBranch: string

@@ -1,9 +1,10 @@
 import { useStore } from '@nanostores/react'
-import { type ReactNode, useEffect, useMemo } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router'
 
 import { blurComposerInput } from '@/app/chat/composer/focus'
 import { AGENTS_ROUTE } from '@/app/routes'
+import { useContextBreakdown } from '@/app/shell/hooks/use-context-breakdown'
 import { BillingBanner } from '@/components/billing-banner'
 import { composerDockCard } from '@/components/chat/composer-dock'
 import { StatusSection } from '@/components/chat/status-section'
@@ -11,7 +12,9 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
+import type { HermesGateway } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
+import { usageContextLabel } from '@/lib/statusbar'
 import { useSessionSlice } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $billingBlock } from '@/store/billing-block'
@@ -30,6 +33,7 @@ import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
+import { ContextStatusRow, contextUsageFromBreakdown } from './context-row'
 import { PreviewStatusRow } from './preview-row'
 import { StatusItemRow } from './status-row'
 
@@ -75,6 +79,10 @@ const hasRunningTodo = (group: StatusGroup) =>
   group.type === 'todo' && group.items.some(item => item.todoStatus === 'in_progress' && item.state === 'running')
 
 interface ComposerStatusStackProps {
+  /** Live turn — gates the context estimate (see {@link ContextStatusRow}). */
+  busy?: boolean
+  /** This surface's gateway, for the context row's read-only breakdown RPC. */
+  gateway?: HermesGateway | null
   /** The queue, built by the composer (it owns the queue's callbacks). Rendered
    *  as the last group so it stays fused to the composer like before. */
   queue: ReactNode
@@ -86,7 +94,7 @@ interface ComposerStatusStackProps {
  * every session-scoped status — subagents, background tasks, queue — grouped by
  * type and separated by light dividers. Collapses to nothing when empty.
  */
-export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackProps) {
+export function ComposerStatusStack({ busy = false, gateway, queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   // Subscribe to THIS session's slice only. Both maps churn on other
@@ -101,6 +109,25 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const billing = useStore($billingBlock)
 
   const groups = useMemo(() => groupStatusItems(items), [items])
+
+  // Fetched here, not in the row: the card only renders when it has sections,
+  // so the stack has to know whether the gauge has anything to say before it
+  // decides to open. Same read-only chars/4 RPC the statusbar gauge uses — no
+  // provider call, no prompt-cache impact.
+  const requestGateway = useCallback(
+    <T,>(method: string, params?: Record<string, unknown>): Promise<T> =>
+      gateway ? gateway.request<T>(method, params) : Promise.reject(new Error('gateway unavailable')),
+    [gateway]
+  )
+
+  const { breakdown: contextBreakdown, loading: contextBreakdownLoading } = useContextBreakdown({
+    busy,
+    enabled: Boolean(gateway),
+    requestGateway,
+    sessionId
+  })
+
+  const contextUsage = useMemo(() => contextUsageFromBreakdown(contextBreakdown), [contextBreakdown])
 
   // Seed from the registry on session open; event-driven refreshes (terminal /
   // process tool completions) live in use-message-stream.
@@ -157,6 +184,21 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   // (not as a composer-disable) so slash commands stay usable.
   if (billing && sessionId && billing.sessionId === sessionId) {
     sections.push({ key: 'billing', node: <BillingBanner sessionId={sessionId} /> })
+  }
+
+  // Directly under the transcript and above every transient row, so the gauge
+  // keeps ONE position as subagent/background/preview rows come and go. Gated
+  // on the session actually reporting a context window — otherwise a fresh app
+  // would hold the card open for an empty gauge.
+  if (usageContextLabel(contextUsage)) {
+    sections.push({
+      key: 'context',
+      node: (
+        <div className="px-1 py-0.5">
+          <ContextStatusRow breakdown={contextBreakdown} loading={contextBreakdownLoading} usage={contextUsage} />
+        </div>
+      )
+    })
   }
 
   for (const group of groups) {

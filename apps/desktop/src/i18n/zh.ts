@@ -2661,6 +2661,9 @@ export const zh: Translations = {
     stop: '停止',
     dismiss: '关闭',
     exit: code => `退出码 ${code}`,
+    context: {
+      label: '上下文'
+    },
     coding: {
       title: '工作区',
       noBranch: '无分支',
