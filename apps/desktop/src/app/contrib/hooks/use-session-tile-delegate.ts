@@ -8,7 +8,6 @@ import {
 } from '@/hermes'
 import { translateNow } from '@/i18n/runtime'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
-import { ownerQualifiedSessionIdentity } from '@/lib/session-row-identity'
 import { notify } from '@/store/notifications'
 import {
   isReadOnlyRuntimeId,
