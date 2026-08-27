@@ -59,7 +59,10 @@ export function ContextUsagePanel({ breakdown, loading, usage }: ContextUsagePan
               {/* "how many files", the other half of the question this category
                   answers. Only categories that emit a count render one. */}
               {typeof category.count === 'number' && category.count > 0 && (
-                <span className="shrink-0 text-[0.625rem] text-muted-foreground/60 tabular-nums">
+                <span
+                  className="shrink-0 text-[0.625rem] text-muted-foreground/60 tabular-nums"
+                  data-slot="context-category-count"
+                >
                   {copy.categoryCount(category.count)}
                 </span>
               )}

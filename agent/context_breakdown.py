@@ -122,9 +122,15 @@ def _file_context_stats(messages: Sequence[dict]) -> Tuple[int, int]:
     Returns ``(tokens, distinct_file_count)``. Both halves of a file round-trip
     are counted: the assistant's ``tool_calls`` entry (which for ``write_file``
     and ``patch`` carries the whole payload) and the tool result it is answered
-    with. Result messages are matched by ``tool_call_id``, so a tool result is
-    only claimed when its own call was a file tool — never by name-guessing the
-    message.
+    with.
+
+    A result is identified by its own ``name`` / ``tool_name`` — every producer
+    stamps one (``tool_dispatch_helpers._build_tool_message`` and the four
+    synthetic paths in ``conversation_loop``). That matters: pairing a result to
+    its call by ``tool_call_id`` breaks the moment compaction drops the
+    assistant turn but keeps the result, which is exactly when the window is
+    full and someone opens the panel. ``tool_call_id`` stays as the fallback for
+    transcripts whose results carry no name.
 
     Estimated with the same memoized per-message pass the conversation total
     uses, so the two are directly comparable and the caller can subtract.
@@ -141,8 +147,10 @@ def _file_context_stats(messages: Sequence[dict]) -> Tuple[int, int]:
             continue
 
         if msg.get("role") == "tool":
+            result_name = str(msg.get("name") or msg.get("tool_name") or "").strip()
             call_id = str(msg.get("tool_call_id") or "")
-            if call_id and call_id in file_call_ids:
+            claimed = result_name in names if result_name else (bool(call_id) and call_id in file_call_ids)
+            if claimed:
                 tokens += estimate_messages_tokens_rough([msg])
             continue
 

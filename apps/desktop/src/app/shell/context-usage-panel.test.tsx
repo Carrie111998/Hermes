@@ -117,7 +117,7 @@ describe('ContextUsagePanel', () => {
 
 describe('ContextUsagePanel file count', () => {
   it('renders the distinct-file count beside the Files category', () => {
-    render(
+    const view = render(
       <ContextUsagePanel
         breakdown={{
           ...breakdown,
@@ -131,14 +131,17 @@ describe('ContextUsagePanel file count', () => {
       />
     )
 
+    const counts = view.container.querySelectorAll('[data-slot="context-category-count"]')
+
     expect(screen.getByText('Files')).not.toBeNull()
-    expect(screen.getByText('3 files')).not.toBeNull()
+    expect(counts).toHaveLength(1)
+    expect(counts[0]?.textContent).toBe('3 files')
   })
 
   it('omits the count for categories that do not carry one', () => {
-    render(<ContextUsagePanel breakdown={breakdown} loading={false} usage={usage} />)
+    const view = render(<ContextUsagePanel breakdown={breakdown} loading={false} usage={usage} />)
 
     expect(screen.getByText('Conversation')).not.toBeNull()
-    expect(screen.queryByText(/\bfiles?\b/)).toBeNull()
+    expect(view.container.querySelectorAll('[data-slot="context-category-count"]')).toHaveLength(0)
   })
 })

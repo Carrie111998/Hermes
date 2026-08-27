@@ -278,3 +278,37 @@ def test_malformed_tool_call_arguments_never_raise():
 
     assert files["tokens"] > 0
     assert files["count"] == 0
+
+
+def test_orphaned_file_result_is_still_billed_to_files():
+    # Compaction drops the assistant turn but keeps its result. Pairing by
+    # tool_call_id alone would silently bill a 100k read_file to Conversation
+    # exactly when the window is full — the moment the panel gets opened.
+    history = [
+        {"role": "user", "content": "carry on"},
+        {"role": "tool", "name": "read_file", "tool_call_id": "gone", "content": "x" * 8_000},
+    ]
+
+    data = _breakdown_for(history)
+    files = _category(data, "files")
+
+    assert files is not None
+    assert files["tokens"] > 1_000
+    # No call survived, so there is no path to count — tokens without a count
+    # is the honest answer, not a fabricated 1.
+    assert files["count"] == 0
+
+
+def test_result_name_wins_over_a_recycled_call_id():
+    # `tool_name` is the canonical stamp from _build_tool_message; `name` is
+    # what the synthetic conversation_loop paths write. Either identifies the
+    # result on its own.
+    history = [
+        {"role": "tool", "tool_name": "read_file", "tool_call_id": "c1", "content": "x" * 4_000},
+        {"role": "tool", "name": "terminal", "tool_call_id": "c2", "content": "y" * 4_000},
+    ]
+
+    data = _breakdown_for(history)
+
+    assert _category(data, "files")["tokens"] > 0
+    assert _category(data, "conversation")["tokens"] > 0
