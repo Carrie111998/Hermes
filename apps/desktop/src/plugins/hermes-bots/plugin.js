@@ -798,6 +798,11 @@ function groupChatSyncEntryKey(entry) {
   if (entry?.id) {
     return `id:${String(entry.id)}`
   }
+
+  return groupChatSyncFallbackKey(entry)
+}
+
+function groupChatSyncFallbackKey(entry) {
   return JSON.stringify([
     Number(entry?.at || 0),
     String(entry?.from?.kind || ''),
@@ -850,6 +855,7 @@ function mergeGroupChatSyncEntries(...logs) {
   const entries = []
   const byId = new Map()
   const bySeq = new Map()
+  const byFallback = new Map()
 
   const remember = (entry, index) => {
     const id = groupChatSyncEventId(entry)
@@ -862,6 +868,8 @@ function mergeGroupChatSyncEntries(...logs) {
     if (seq !== null) {
       bySeq.set(seq, index)
     }
+
+    byFallback.set(groupChatSyncFallbackKey(entry), index)
   }
 
   for (const entry of logs.flat()) {
@@ -871,6 +879,10 @@ function mergeGroupChatSyncEntries(...logs) {
 
     if (index === undefined && seq !== null) {
       index = bySeq.get(seq)
+    }
+
+    if (index === undefined) {
+      index = byFallback.get(groupChatSyncFallbackKey(entry))
     }
 
     if (index === undefined) {

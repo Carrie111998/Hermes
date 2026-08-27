@@ -1133,6 +1133,24 @@ test('hosted replay acknowledges the optimistic event id without duplicating it'
   assert.equal(merged[0].pending, false)
 })
 
+test('hosted replay heals repeated identity-free projection rows with the authoritative event', () => {
+  const gc = load(() => '(pass)')
+  const legacy = {
+    from: { kind: 'member', name: 'research', source: 'gateway-a' },
+    text: 'done',
+    thread: 'thread-1',
+    at: 1000
+  }
+  const merged = gc.mergeGroupChatSyncEntries(
+    Array.from({ length: 96 }, () => ({ ...legacy })),
+    [{ ...legacy, eventId: 'event-7', seq: 7 }]
+  )
+
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0].eventId, 'event-7')
+  assert.equal(merged[0].seq, 7)
+})
+
 test('empty runtime rooms are omitted from the gateway mirror', () => {
   const gc = load(() => '(pass)')
   const snapshot = gc.groupChatSyncSnapshot({
