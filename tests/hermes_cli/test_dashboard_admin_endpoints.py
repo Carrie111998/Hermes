@@ -209,15 +209,13 @@ class TestCredentialPoolEndpoints:
         sources = sorted(e.source for e in load_pool("openrouter").entries())
         assert sources == ["env:OPENROUTER_API_KEY", "manual"]
 
-    def test_oauth_account_rename_and_delete_keep_route_lifecycle_in_sync(self):
+    def test_oauth_account_rename_and_delete_update_pool_entries(self):
         from agent.credential_pool import (
             AUTH_TYPE_OAUTH,
             PooledCredential,
             SOURCE_MANUAL_DEVICE_CODE,
             load_pool,
         )
-        from hermes_cli.config import load_config
-        from hermes_cli.web_server import _save_credential_route
 
         pool = load_pool("openai-codex")
         first = PooledCredential(
@@ -242,16 +240,10 @@ class TestCredentialPoolEndpoints:
         )
         pool.add_entry(first)
         pool.add_entry(second)
-        _save_credential_route("openai-codex", first.id, first.label)
-        _save_credential_route("openai-codex", second.id, second.label)
-
         listed = self.client.get("/api/credentials/pool")
         assert listed.status_code == 200
         entries = listed.json()["providers"][0]["entries"]
-        assert [entry["credential_route"] for entry in entries] == [
-            "openai-codex-acct-a",
-            "openai-codex-acct-b",
-        ]
+        assert [entry["label"] for entry in entries] == ["Personal", "Work"]
 
         renamed = self.client.patch(
             "/api/credentials/pool/openai-codex/acct-b",
@@ -262,13 +254,6 @@ class TestCredentialPoolEndpoints:
             "Personal",
             "Client work",
         ]
-        route = load_config()["credential_routes"]["openai-codex-acct-b"]
-        assert route == {
-            "provider": "openai-codex",
-            "credential": "acct-b",
-            "display_name": "Client work",
-        }
-
         removed = self.client.delete(
             "/api/credentials/pool/openai-codex/id/acct-a"
         )
@@ -276,10 +261,6 @@ class TestCredentialPoolEndpoints:
         assert [entry.id for entry in load_pool("openai-codex").entries()] == [
             "acct-b"
         ]
-        assert "openai-codex-acct-a" not in load_config().get(
-            "credential_routes", {}
-        )
-        assert "openai-codex-acct-b" in load_config()["credential_routes"]
 
     def test_pool_strategy_is_profile_scoped_and_rejects_unknown_values(self):
         from agent.credential_pool import (

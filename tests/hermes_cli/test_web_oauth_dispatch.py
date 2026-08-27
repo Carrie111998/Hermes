@@ -204,12 +204,11 @@ def test_oauth_start_stores_requested_account_label(tmp_path, monkeypatch):
         ws._oauth_sessions.pop(session_id, None)
 
 
-def test_dashboard_oauth_pool_entries_are_distinct_named_routes(
+def test_dashboard_oauth_pool_entries_are_distinct_named_subscriptions(
     _isolate_hermes_home,
 ):
     from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
     from hermes_cli import web_server as ws
-    from hermes_cli.config import load_config
 
     first = ws._save_dashboard_oauth_pool_entry(
         provider="openai-codex",
@@ -230,9 +229,6 @@ def test_dashboard_oauth_pool_entries_are_distinct_named_routes(
         ("Personal Codex", AUTH_TYPE_OAUTH),
         ("Work Codex", AUTH_TYPE_OAUTH),
     ]
-    routes = load_config()["credential_routes"]
-    assert routes[f"openai-codex-{first.id}"]["credential"] == first.id
-    assert routes[f"openai-codex-{second.id}"]["credential"] == second.id
 
 
 
@@ -557,6 +553,18 @@ def test_xai_oauth_listed_as_device_code_flow():
     assert "xai-oauth" in providers
     assert providers["xai-oauth"]["flow"] == "device_code"
     assert "grok" in providers["xai-oauth"]["name"].lower()
+
+
+def test_oauth_catalog_advertises_multiple_subscriptions_only_when_dashboard_persists_them():
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+
+    assert providers["openai-codex"]["supports_multiple_subscriptions"] is True
+    assert providers["anthropic"]["supports_multiple_subscriptions"] is False
+    assert providers["minimax-oauth"]["supports_multiple_subscriptions"] is False
+    assert providers["nous"]["supports_multiple_subscriptions"] is False
+    assert providers["xai-oauth"]["supports_multiple_subscriptions"] is False
 
 
 def test_accounts_offers_every_oauth_provider_from_catalog():

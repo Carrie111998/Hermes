@@ -150,10 +150,13 @@ describe('ProvidersSettings', () => {
     expect(removeCredentialPoolEntry).not.toHaveBeenCalled()
   })
 
-  it('adds another account from the existing provider subscription group', async () => {
+  it('adds another account only when the backend confirms independent dashboard persistence', async () => {
+    listOAuthProviders.mockResolvedValue({
+      providers: [provider('openai-codex', true, { supports_multiple_subscriptions: true })]
+    })
     getCredentialPool.mockResolvedValue({
       providers: [{
-        provider: 'nous',
+        provider: 'openai-codex',
         entries: [{
           auth_type: 'oauth',
           has_refresh: true,
@@ -190,9 +193,15 @@ describe('ProvidersSettings', () => {
 
     expect(startManualProviderOAuth).toHaveBeenCalledTimes(1)
     const [id, , , label] = startManualProviderOAuth.mock.calls[0]
-    expect(id).toBe('nous')
+    expect(id).toBe('openai-codex')
     expect(label).toBe('Personal')
     expect(removeCredentialPoolEntry).not.toHaveBeenCalled()
+  })
+
+  it('does not offer another account for a singleton dashboard OAuth flow', async () => {
+    await renderProvidersSettings()
+
+    expect(screen.queryByRole('button', { name: 'Add another account' })).toBeNull()
   })
 
   it('shows the pool strategy on the provider head, not a separate top-level section', async () => {

@@ -119,6 +119,99 @@ def test_resolve_runtime_provider_pins_an_explicit_pool_credential(monkeypatch):
     assert resolved["credential_pool_pinned"] is True
 
 
+def test_resolve_runtime_provider_pinned_credential_ignores_explicit_runtime_key(monkeypatch):
+    entry = SimpleNamespace(
+        id="work-account",
+        access_token="work-token",
+        runtime_api_key="work-token",
+        runtime_base_url="https://chatgpt.com/backend-api/codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        source="manual",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select_matching_id(self, credential_id):
+            assert credential_id == "work-account"
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-codex",
+        credential_id="work-account",
+        explicit_api_key="other-account-token",
+        explicit_base_url="https://other-account.invalid/v1",
+    )
+
+    assert resolved["api_key"] == "work-token"
+    assert resolved["credential_pool_entry_id"] == "work-account"
+
+
+def test_resolve_runtime_provider_rejects_explicit_runtime_when_pinned_entry_is_missing(monkeypatch):
+    from hermes_cli.auth import AuthError
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select_matching_id(self, credential_id):
+            assert credential_id == "removed-entry"
+            return None
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    with pytest.raises(AuthError, match="Pinned credential 'removed-entry' is unavailable"):
+        rp.resolve_runtime_provider(
+            requested="openai-codex",
+            credential_id="removed-entry",
+            explicit_api_key="explicit-token",
+            explicit_base_url="https://example.invalid/v1",
+        )
+
+
+def test_pinned_credential_bypasses_azure_anthropic_explicit_runtime(monkeypatch):
+    entry = SimpleNamespace(
+        id="work-anthropic",
+        runtime_api_key="work-token",
+        access_token="work-token",
+        runtime_base_url="https://api.anthropic.com/v1",
+        base_url="https://api.anthropic.com/v1",
+    )
+
+    class _Pool:
+        provider = "anthropic"
+
+        def has_credentials(self):
+            return True
+
+        def select_matching_id(self, credential_id):
+            assert credential_id == "work-anthropic"
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_resolve_runtime_from_pool_entry",
+        lambda **kwargs: {"provider": "anthropic", "api_key": "work-token", "source": "pool"},
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        credential_id="work-anthropic",
+        explicit_api_key="azure-token",
+        explicit_base_url="https://resource.azure.com/anthropic",
+    )
+
+    assert resolved["api_key"] == "work-token"
+    assert resolved["source"] == "pool"
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth

@@ -28,6 +28,8 @@ import { ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu
 export { ModelMenuCloseContext } from './model-catalog-menu'
 
 export interface ModelSelection {
+  /** Non-secret pool-entry id when the user selected a named subscription. */
+  credentialId?: string
   model: string
   provider: string
   /** Runtime id of the surface that opened the menu. When set, the switch
@@ -201,7 +203,12 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     // scopes the switch to that session; with none it's UI state shipped on the
     // next session.create. Always stamp sessionId from this surface so a tile
     // switch never hits the primary (busy) session by accident.
-    select: (model, provider) => onSelectModel({ model, provider, sessionId: activeSessionId || null }),
+    select: (model, provider, credentialId) => onSelectModel({
+      ...(credentialId ? { credentialId } : {}),
+      model,
+      provider,
+      sessionId: activeSessionId || null
+    }),
 
     setOptions: (patch, row) => {
       // Editing always records the model's global preset (keyed by

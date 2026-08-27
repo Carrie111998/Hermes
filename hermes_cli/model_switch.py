@@ -628,7 +628,6 @@ class ModelSwitchResult:
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
     credential_id: str = ""
-    route_provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -1499,20 +1498,6 @@ def switch_model(
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     resolved_alias = ""
-    route_provider = ""
-    if explicit_provider.strip().lower().startswith("credential-route:"):
-        from hermes_cli.config import load_config
-
-        route_provider = explicit_provider.strip()
-        route_id = route_provider.split(":", 1)[1].strip()
-        routes = load_config().get("credential_routes") or {}
-        route = routes.get(route_id) if isinstance(routes, dict) else None
-        if not isinstance(route, dict):
-            return ModelSwitchResult(success=False, error_message=f"Credential route {route_id!r} is not configured.")
-        explicit_provider = str(route.get("provider") or "").strip()
-        credential_id = credential_id or str(route.get("credential") or "").strip()
-        if not explicit_provider or not credential_id:
-            return ModelSwitchResult(success=False, error_message=f"Credential route {route_id!r} is incomplete.")
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
@@ -2219,7 +2204,6 @@ def switch_model(
         model_info=model_info,
         is_global=is_global,
         credential_id=credential_id,
-        route_provider=route_provider,
     )
 
 

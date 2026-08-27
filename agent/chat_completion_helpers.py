@@ -2471,6 +2471,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if str(getattr(agent, "_pinned_credential_pool_entry_id", "") or "").strip():
+        # A session-selected subscription is a hard account boundary. The
+        # credential-pool recovery path may refresh that exact entry, but no
+        # provider/model fallback may substitute another account mid-turn.
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

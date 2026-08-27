@@ -40,11 +40,12 @@ const GOOGLE_PROVIDER = {
 }
 
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
-const ROUTE_PROVIDER = {
+const POOL_SUBSCRIPTION_PROVIDER = {
+  credential_id: 'work-openai',
   models: ['gpt-5-codex', 'gpt-5.1-codex', 'o3'],
   name: 'WORK — ChatGPT / Codex',
-  slug: 'credential-route:work-codex',
-  credential_route: 'work-codex'
+  selection_provider: 'openai-codex',
+  slug: 'credential-pool:openai-codex:work-openai'
 }
 
 beforeEach(() => {
@@ -407,23 +408,39 @@ describe('ModelMenuPanel provider collapse', () => {
   })
 
 
-describe('ModelMenuPanel credential routes', () => {
-  it('renders a credential route as its own provider group, separate from other providers', async () => {
+describe('ModelMenuPanel pooled subscriptions', () => {
+  it('renders a pooled subscription as its own provider group, separate from other providers', async () => {
     getGlobalModelOptions.mockResolvedValue({
-      providers: [DEEPSEEK_PROVIDER, ROUTE_PROVIDER]
+      providers: [DEEPSEEK_PROVIDER, POOL_SUBSCRIPTION_PROVIDER]
     })
 
     const { content } = renderPanel()
     const { findByText } = content
 
-    // The route appears as a distinct group head...
     expect(await findByText('WORK — ChatGPT / Codex')).toBeTruthy()
-    // ...and is NOT merged into DeepSeek — that provider's own group is present too.
     expect(await findByText('DeepSeek')).toBeTruthy()
-    // The two are distinct groups (different slugs), so the route is its own section.
-    const routeGroup = screen.getByText('WORK — ChatGPT / Codex').closest('[role="group"]')
+    const subscriptionGroup = screen.getByText('WORK — ChatGPT / Codex').closest('[role="group"]')
     const deepseekGroup = screen.getByText('DeepSeek').closest('[role="group"]')
-    expect(routeGroup).not.toBe(deepseekGroup)
+    expect(subscriptionGroup).not.toBe(deepseekGroup)
+  })
+
+  it('commits a pooled subscription with its canonical provider and credential pin', async () => {
+    getGlobalModelOptions.mockResolvedValue({ providers: [POOL_SUBSCRIPTION_PROVIDER] })
+    const { content, onSelectModel } = renderPanel()
+
+    await content.findByText('WORK — ChatGPT / Codex')
+    const input = screen.getByRole('textbox', { name: 'Search models' })
+    fireEvent.change(input, { target: { value: 'gpt-5-codex' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await vi.waitFor(() => {
+      expect(onSelectModel).toHaveBeenCalledWith({
+        credentialId: 'work-openai',
+        model: 'gpt-5-codex',
+        provider: 'openai-codex',
+        sessionId: 'runtime-1'
+      })
+    })
   })
 })
 })

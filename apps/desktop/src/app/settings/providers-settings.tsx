@@ -294,7 +294,9 @@ function OAuthAccountRows({
           </div>
         )
           })}
-          {oauthProvider && <Button className="justify-self-start" onClick={() => onAdd(oauthProvider)} size="xs" variant="text">Add another account</Button>}
+          {oauthProvider?.supports_multiple_subscriptions && (
+            <Button className="justify-self-start" onClick={() => onAdd(oauthProvider)} size="xs" variant="text">Add another account</Button>
+          )}
         </div>
       })}
     </section>

@@ -10854,6 +10854,10 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "id": "openai-codex",
         "name": "ChatGPT or Codex Subscription",
         "flow": "device_code",
+        # The dashboard worker persists every successful login as an
+        # independent manual pool entry, so a second login cannot replace the
+        # first account's refresh chain.
+        "supports_multiple_subscriptions": True,
         "cli_command": "hermes auth add openai-codex",
         "docs_url": "https://platform.openai.com/docs",
         "status_fn": None,  # dispatched via auth.get_codex_auth_status
@@ -11138,6 +11142,9 @@ async def list_oauth_providers(profile: Optional[str] = None):
                     "id": p["id"],
                     "name": p["name"],
                     "flow": p["flow"],
+                    "supports_multiple_subscriptions": bool(
+                        p.get("supports_multiple_subscriptions")
+                    ),
                     "cli_command": p["cli_command"],
                     "docs_url": p["docs_url"],
                     "disconnect_hint": disconnect_hint,
@@ -11340,30 +11347,13 @@ def _save_anthropic_oauth_creds(
     expires_at_ms: int,
     label: Optional[str] = None,
 ) -> None:
-    """Persist Anthropic PKCE creds to both Hermes file AND credential pool.
+    """Persist a dashboard Anthropic PKCE login as one owned pool entry.
 
-    Mirrors what auth_commands.add_command does so the dashboard flow leaves
-    the system in the same state as ``hermes auth add anthropic``.
+    ``hermes auth add anthropic`` is already pool-only.  Writing the legacy
+    ``hermes_pkce`` singleton as well would make the newest dashboard account
+    appear twice when pool seeding reads that file, with the same rotating
+    refresh token in two entries.
     """
-    from agent.anthropic_adapter import _get_hermes_oauth_file
-    oauth_file = _get_hermes_oauth_file()
-    payload = {
-        "accessToken": access_token,
-        "refreshToken": refresh_token,
-        "expiresAt": expires_at_ms,
-    }
-    # atomic_json_write creates the temp with mode 0o600 (via mkstemp) *before*
-    # any content is written, then fsyncs and atomically replaces the target.
-    # The previous os.replace + post-hoc chmod left a TOCTOU window in which the
-    # OAuth token file was world-readable at the default umask (0o644 on most
-    # hosts) between the rename and the chmod. atomic_json_write also preserves
-    # the existing file's owner and cleans up its temp on failure.
-    from utils import atomic_json_write
-
-    atomic_json_write(oauth_file, payload, indent=2, mode=0o600)
-    # Best-effort credential-pool insert. Failure here doesn't invalidate
-    # the file write — pool registration only matters for the rotation
-    # strategy, not for runtime credential resolution.
     try:
         _save_dashboard_oauth_pool_entry(
             provider="anthropic",
@@ -11375,32 +11365,6 @@ def _save_anthropic_oauth_creds(
         )
     except Exception as e:
         _log.warning("anthropic pool add (dashboard) failed: %s", e)
-
-
-def _save_credential_route(provider: str, credential_id: str, display_name: str) -> None:
-    """Expose a newly added account as a pinned, named model-picker row."""
-    from hermes_cli.config import load_config, save_config
-
-    config = load_config()
-    routes = config.setdefault("credential_routes", {})
-    route_id = f"{provider}-{credential_id}"
-    routes[route_id] = {
-        "provider": provider,
-        "credential": credential_id,
-        "display_name": display_name,
-    }
-    save_config(config)
-
-
-def _delete_credential_route(provider: str, credential_id: str) -> None:
-    from hermes_cli.config import load_config, save_config
-
-    config = load_config()
-    routes = config.get("credential_routes")
-    route_id = f"{provider}-{credential_id}"
-    if isinstance(routes, dict) and route_id in routes:
-        routes.pop(route_id)
-        save_config(config)
 
 
 def _save_dashboard_oauth_pool_entry(
@@ -11434,9 +11398,7 @@ def _save_dashboard_oauth_pool_entry(
         refresh_token=refresh_token,
         expires_at_ms=expires_at_ms,
     )
-    entry = pool.add_entry(entry)
-    _save_credential_route(provider, entry.id, entry.label)
-    return entry
+    return pool.add_entry(entry)
 
 
 def _start_anthropic_pkce(profile: Optional[str] = None) -> Dict[str, Any]:
@@ -14203,14 +14165,9 @@ async def stop_gateway(profile: Optional[str] = None):
 # ---------------------------------------------------------------------------
 
 
-def _pool_entry_summary(
-    entry: Any,
-    index: int,
-    routes: Optional[dict] = None,
-) -> Dict[str, Any]:
+def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
     """Redacted, display-safe view of one PooledCredential."""
     token = getattr(entry, "access_token", "") or ""
-    route_id = f"{getattr(entry, 'provider', '')}-{getattr(entry, 'id', '')}"
     return {
         "index": index,
         "id": getattr(entry, "id", None),
@@ -14222,7 +14179,6 @@ def _pool_entry_summary(
         "request_count": getattr(entry, "request_count", 0),
         "token_preview": redact_key(token) if token else "",
         "has_refresh": bool(getattr(entry, "refresh_token", None)),
-        "credential_route": route_id if route_id in (routes or {}) else None,
     }
 
 
@@ -14236,7 +14192,6 @@ async def list_credential_pool(profile: Optional[str] = None):
     strategies = {}
     with _profile_scope(_oauth_profile_name(profile)):
         raw_pool = read_credential_pool()
-        routes = load_config().get("credential_routes") or {}
     for provider_id in sorted(raw_pool.keys()):
         try:
             with _profile_scope(_oauth_profile_name(profile)):
@@ -14251,7 +14206,7 @@ async def list_credential_pool(profile: Optional[str] = None):
         providers.append({
             "provider": provider_id,
             "entries": [
-                _pool_entry_summary(e, i, routes)
+                _pool_entry_summary(e, i)
                 for i, e in enumerate(entries, start=1)
             ],
         })
@@ -14301,7 +14256,6 @@ async def rename_credential_pool_entry(
         renamed = load_pool(provider).rename_entry(credential_id, label)
         if renamed is None:
             raise HTTPException(status_code=404, detail="Credential not found")
-        _save_credential_route(provider, credential_id, label)
     return {"ok": True, "provider": provider, "id": credential_id, "label": label}
 
 
@@ -14318,7 +14272,6 @@ async def remove_credential_pool_entry_by_id(
         removed = pool.remove_entry(credential_id)
         if removed is None:
             raise HTTPException(status_code=404, detail="Credential not found")
-        _delete_credential_route(provider, credential_id)
         count = len(pool.entries())
     return {"ok": True, "provider": provider, "id": credential_id, "count": count}
 

@@ -3967,6 +3967,7 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
         api_mode="chat_completions",
         reasoning_config={"enabled": True, "effort": "high"},
         service_tier="priority",
+        _pinned_credential_pool_entry_id="work-openai",
         _session_db=FakeDB(),
     )
 
@@ -3981,11 +3982,36 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
             "provider": "openai-codex",
             "base_url": "https://custom.example/v1",
             "api_mode": "chat_completions",
+            "credential_id": "work-openai",
             "reasoning_config": {"enabled": True, "effort": "high"},
             "service_tier": "priority",
         },
         "gpt-5.4",
     )
+    assert server._stored_session_runtime_overrides(
+        {"model": "gpt-5.4", "model_config": updates["meta"][1]}
+    )["model_override"]["credential_id"] == "work-openai"
+
+
+def test_persisted_session_runtime_restores_subscription_pin_for_fail_closed_resume():
+    """A resumed pool subscription must retain its selected non-secret entry id."""
+    agent = types.SimpleNamespace(
+        model="gpt-5.4",
+        provider="openai-codex",
+        base_url=None,
+        api_mode=None,
+        reasoning_config=None,
+        service_tier=None,
+        _pinned_credential_pool_entry_id="work-openai",
+    )
+
+    persisted = server._runtime_model_config(agent)
+    overrides = server._stored_session_runtime_overrides(
+        {"model": "gpt-5.4", "model_config": persisted}
+    )
+
+    assert persisted["credential_id"] == "work-openai"
+    assert overrides["model_override"]["credential_id"] == "work-openai"
 
 
 def test_persist_live_session_runtime_preserves_explicit_normal_tier():
@@ -9077,6 +9103,33 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
     assert resp["result"]["value"] == "new/model"
     assert resp["result"]["warning"] == "catalog unreachable"
     assert seen["args"] == ("sid", "session-key", "new/model")
+
+
+def test_config_set_model_forwards_subscription_pin(monkeypatch):
+    server._sessions["sid"] = _session()
+    seen = {}
+
+    def _fake_apply(sid, session, raw, **kwargs):
+        seen.update(kwargs)
+        return {"value": "gpt-5", "warning": ""}
+
+    monkeypatch.setattr(server, "_apply_model_switch", _fake_apply)
+    try:
+        response = server.handle_request({
+            "id": "1",
+            "method": "config.set",
+            "params": {
+                "session_id": "sid",
+                "key": "model",
+                "value": "gpt-5 --provider openai-codex --session",
+                "credential_id": "work-openai",
+            },
+        })
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["value"] == "gpt-5"
+    assert seen["credential_id"] == "work-openai"
 
 
 def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch):
@@ -15156,6 +15209,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -18594,6 +18651,43 @@ class TestResolveRuntimeWithFallback:
         assert resolution.runtime == fallback_runtime
         assert resolution.selected_model == "deepseek-v4-pro"
         assert resolution.used_fallback is True
+
+    def test_auth_error_with_subscription_pin_does_not_try_fallback(self, monkeypatch):
+        """A removed pinned subscription must fail, never select a sibling."""
+        from hermes_cli.auth import AuthError
+        import pytest
+
+        calls = []
+
+        def fake_resolve(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get("credential_id") == "removed-entry":
+                raise AuthError("Pinned credential is unavailable")
+            return {"provider": "openai-codex", "api_key": "sibling-token"}
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [{"provider": "openai-codex", "model": "gpt-5.4"}],
+        )
+
+        with pytest.raises(AuthError, match="Pinned credential is unavailable"):
+            server._resolve_runtime_with_fallback(
+                {
+                    "requested": "openai-codex",
+                    "target_model": "gpt-5.4",
+                    "credential_id": "removed-entry",
+                }
+            )
+
+        assert calls == [{
+            "requested": "openai-codex",
+            "target_model": "gpt-5.4",
+            "credential_id": "removed-entry",
+        }]
 
     def test_auth_error_skips_provider_only_fallback(self, monkeypatch):
         """Auth fallback requires one complete provider/model pair."""
