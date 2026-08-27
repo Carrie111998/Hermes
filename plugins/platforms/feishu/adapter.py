@@ -1447,6 +1447,26 @@ def _load_lark_oapi() -> bool:
         return True
 
 
+def feishu_deps_present() -> bool:
+    """PASSIVE probe: is lark-oapi installed right now?
+
+    Registry ``check_fn`` — called from status displays and config loading,
+    so it must never install anything.  Uses ``is_available`` (cheap
+    importlib.metadata lookups) instead of importing the SDK, which is
+    deferred to ``_load_lark_oapi`` at connect time.  The ACTIVE
+    lazy-installer (``check_feishu_requirements``) is registered as
+    ``ensure_deps_fn`` and runs from ``create_adapter()`` when this
+    returns False (#79812).
+    """
+    if FEISHU_AVAILABLE:
+        return True
+    try:
+        from tools.lazy_deps import is_available
+        return is_available("platform.feishu")
+    except Exception:  # pragma: no cover — defensive
+        return False
+
+
 def check_feishu_requirements() -> bool:
     """Ensure Feishu dependencies are installed without importing the SDK."""
     if FEISHU_AVAILABLE:
@@ -1796,6 +1816,8 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+            # Plugin-registered native handlers (lark_oapi client).
+            self._wire_plugin_handlers(self._client)
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -3408,6 +3430,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3716,7 +3739,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     @staticmethod
@@ -5857,7 +5880,8 @@ def register(ctx) -> None:
         name="feishu",
         label="Feishu / Lark",
         adapter_factory=_build_adapter,
-        check_fn=check_feishu_requirements,
+        check_fn=feishu_deps_present,
+        ensure_deps_fn=check_feishu_requirements,
         is_connected=_is_connected,
         validate_config=_is_connected,
         required_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
