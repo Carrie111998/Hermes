@@ -108,6 +108,40 @@ class TestSubdirectoryHintTracker:
         # Should be capped
         assert len(result) < 20_000
 
+    def test_cap_scales_with_context_length(self, tmp_path):
+        """A large-window model keeps hint content an 8K cap would drop."""
+        sub = tmp_path / "bigdir"
+        sub.mkdir()
+        # Head stays under the 8K floor; the marker only appears past it.
+        body = "HEAD-SECTION\n" + ("x" * 60_000) + "\nTAIL-SECTION"
+        (sub / "AGENTS.md").write_text(body)
+
+        tracker = SubdirectoryHintTracker(
+            working_dir=str(tmp_path), context_length=1_000_000
+        )
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(sub / "file.py")}
+        )
+        assert result is not None
+        # At a 1M window the scaled cap admits the whole file, so the
+        # operational tail survives instead of being silently dropped.
+        assert "TAIL-SECTION" in result
+        assert "truncated" not in result.lower()
+
+    def test_small_window_still_truncates_at_floor(self, tmp_path):
+        """Without a context length the historical 8K floor still applies."""
+        sub = tmp_path / "bigdir"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("y" * 60_000)
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(sub / "file.py")}
+        )
+        assert result is not None
+        assert "truncated" in result.lower()
+        assert len(result) < 20_000
+
     def test_empty_args(self, project):
         """Empty args should not crash."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
