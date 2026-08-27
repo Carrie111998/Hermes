@@ -3139,6 +3139,10 @@ def _strip_media_directives(text: str) -> str:
 
 
 _PRIVATE_OUTBOUND_METHODS = frozenset({"_post_interactive", "_send_media"})
+_INSTANCE_ASYNC_CALLBACK_SLOTS = frozenset({
+    "_fatal_error_handler", "_message_handler", "_platform_event_handler",
+    "_reaction_handler", "_topic_recovery_fn",
+})
 
 
 def _should_wrap_outbound_method(name: str) -> bool:
@@ -3233,6 +3237,22 @@ class BasePlatformAdapter(ABC, metaclass=_TerminalOutboundBoundaryMeta):
                     "thread_name", "starter_message", "seed_content", "status",
                 }
             )
+            carries_target = bool(
+                parameter_names
+                & {"chat_id", "channel_id", "parent_chat_id", "user_id", "to_account"}
+            )
+            if str(name) in _INSTANCE_ASYNC_CALLBACK_SLOTS:
+                object.__setattr__(self, name, value)
+                return
+            if str(name).startswith("_"):
+                raise TypeError(
+                    f"private async adapter assignment {name!r} is forbidden"
+                )
+            if not (carries_visible_content and carries_target):
+                raise TypeError(
+                    "instance-level async adapter patches require explicit target "
+                    "and visible-content parameters"
+                )
             if not str(name).startswith("_") or carries_visible_content:
                 if assigned_signature is None:
                     raise TypeError(

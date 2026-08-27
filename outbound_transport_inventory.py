@@ -108,6 +108,43 @@ _SEALED_PRIVATE_TRANSPORT_EXEMPTIONS = frozenset({
     "plugins/platforms/whatsapp/adapter.py:1062:_send_media_to_bridge:post",
 })
 
+_EXTERNAL_SEALED_TRANSPORT_CALLERS = {
+    fingerprint: ("tools/send_message_tool.py", "_send_to_platform")
+    for fingerprint in _REVIEWED_DIRECT_TRANSPORT_EXEMPTIONS
+    if "_standalone_send:" in fingerprint
+    or fingerprint.startswith("tools/send_message_tool.py:1972:_post:")
+    or fingerprint.startswith("tools/send_message_tool.py:2345:_send_qqbot:")
+    or fingerprint.startswith("tools/send_message_tool.py:2353:_send_qqbot:")
+    or fingerprint.startswith("tools/send_message_tool.py:2361:_send_qqbot:")
+}
+
+
+def validate_sealed_transport_exemptions(sources: dict[str, bytes]) -> None:
+    """Prove exact external exemptions still name a terminally gated caller."""
+    checked: set[tuple[str, str]] = set()
+    for caller_path, caller_name in _EXTERNAL_SEALED_TRANSPORT_CALLERS.values():
+        if (caller_path, caller_name) in checked:
+            continue
+        checked.add((caller_path, caller_name))
+        raw = sources.get(caller_path)
+        if raw is None:
+            raise RuntimeError(f"sealed transport caller source missing: {caller_path}")
+        source = raw.decode("utf-8")
+        tree = ast.parse(source)
+        caller = next(
+            (
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == caller_name
+            ),
+            None,
+        )
+        caller_source = ast.get_source_segment(source, caller) if caller is not None else ""
+        if not caller_source or "apply_terminal_outbound_text_policy" not in caller_source:
+            raise RuntimeError(
+                f"sealed transport caller is not terminally gated: {caller_path}:{caller_name}"
+            )
+
 
 def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> list[str]:
     """Return direct recipient-visible transport calls outside a closed boundary."""
@@ -182,6 +219,28 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
         call_names = argument_names | keyword_names
         has_visible_content = bool(call_names & _TRANSPORT_VISIBLE_NAMES)
         known_publish_operation = operation in _DIRECT_PUBLISH_OPERATIONS
+        function = enclosing(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        owner_hint = enclosing(function, ast.ClassDef) if function is not None else None
+        private_adapter_context = bool(
+            isinstance(function, ast.AsyncFunctionDef)
+            and function.name.startswith("_")
+            and isinstance(owner_hint, ast.ClassDef)
+            and any("BasePlatformAdapter" in ast.unparse(base) for base in owner_hint.bases)
+        )
+        opaque_payload_parameter = bool(
+            private_adapter_context
+            and (
+                {
+                    arg.arg.lower() for arg in (
+                        *function.args.posonlyargs, *function.args.args,
+                        *function.args.kwonlyargs,
+                    )
+                }
+                & {"blob", "data", "envelope", "item", "packet", "raw", "record", "value"}
+                or function.args.vararg is not None
+                or function.args.kwarg is not None
+            )
+        )
         receiver = node.func.value
         receiver_text = ast.unparse(receiver).lower()
         receiver_tokens = {
@@ -189,7 +248,7 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
         }
         structurally_transport_shaped = bool(
             isinstance(parents.get(node), ast.Await)
-            and has_visible_content
+            and (has_visible_content or opaque_payload_parameter)
             and (
                 call_names & _TRANSPORT_TARGET_NAMES
                 or receiver_tokens & {"channel", "webhook"}
@@ -200,8 +259,9 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
                 "session", "socket", "transport", "webhook",
             }
         )
-        if not has_visible_content or not (
-            known_publish_operation or structurally_transport_shaped
+        if not (
+            (known_publish_operation and has_visible_content)
+            or structurally_transport_shaped
         ):
             continue
         receiver_name = receiver.id if isinstance(receiver, ast.Name) else None
@@ -210,7 +270,6 @@ def scan_terminal_transport_inventory(source: str, *, relative_path: str) -> lis
             and operation in _DIRECT_PUBLISH_OPERATIONS
         ):
             continue
-        function = enclosing(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         if function is None:
             violations.append(f"{relative_path}:{node.lineno}:<module>:{operation}")
             continue

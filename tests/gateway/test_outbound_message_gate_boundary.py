@@ -24,6 +24,7 @@ from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CapabilityDescriptor
 from hermes_cli import plugins as plugins_mod
 from plugins.platforms.slack.adapter import SlackAdapter
+from outbound_transport_inventory import validate_sealed_transport_exemptions
 
 
 @pytest.fixture(autouse=True)
@@ -692,17 +693,29 @@ async def test_instance_callable_object_publisher_is_gated(monkeypatch):
     assert delivered == [("paul", "SAFE")]
 
 
-@pytest.mark.asyncio
-async def test_instance_non_content_helper_and_mutable_state_remain_ordinary():
-    async def _lookup_state(key):
-        return f"value:{key}"
-
+def test_instance_mutable_state_remains_ordinary():
     adapter = GateAdapter()
     adapter.retry_count = 3
-    adapter._lookup_state = _lookup_state
 
     assert adapter.retry_count == 3
-    assert await adapter._lookup_state("ready") == "value:ready"
+
+
+def test_instance_private_async_publisher_with_opaque_payload_is_forbidden():
+    async def _publish_raw(chat_id, data):
+        return chat_id, data
+
+    adapter = GateAdapter()
+    with pytest.raises(TypeError, match="private async adapter assignment"):
+        adapter._publish_raw = _publish_raw
+
+
+def test_instance_public_async_patch_without_explicit_envelope_is_forbidden():
+    async def publish_opaque(*args, **kwargs):
+        return args, kwargs
+
+    adapter = GateAdapter()
+    with pytest.raises(TypeError, match="explicit target and visible-content"):
+        adapter.publish_opaque = publish_opaque
 
 
 @pytest.mark.asyncio
@@ -815,6 +828,25 @@ async def bypass(channel, content):
     assert scan_terminal_transport_inventory(
         source, relative_path="plugins/unsafe_transport.py"
     ) == ["plugins/unsafe_transport.py:3:bypass:transmit"]
+
+
+def test_terminal_transport_inventory_rejects_opaque_payload_name_on_transport_receiver():
+    source = """
+class UnsafeAdapter(BasePlatformAdapter):
+    async def _publish(self, client, chat_id, data):
+        await client.transmit(chat_id, data)
+"""
+    assert scan_terminal_transport_inventory(
+        source, relative_path="plugins/platforms/unsafe/adapter.py"
+    ) == ["plugins/platforms/unsafe/adapter.py:4:_publish:transmit"]
+
+
+def test_sealed_external_transport_exemption_requires_terminal_policy_in_named_caller():
+    sources = {
+        "tools/send_message_tool.py": b"async def _send_to_platform():\n    return None\n",
+    }
+    with pytest.raises(RuntimeError, match="sealed transport caller is not terminally gated"):
+        validate_sealed_transport_exemptions(sources)
 
 
 def test_terminal_transport_inventory_ignores_private_non_content_helper():

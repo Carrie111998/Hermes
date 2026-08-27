@@ -294,7 +294,10 @@ def _assert_source_snapshots(
 def _validate_terminal_transport_inventory(
     snapshots: Mapping[str, _SourceSnapshot],
 ) -> None:
-    from outbound_transport_inventory import scan_terminal_transport_inventory
+    from outbound_transport_inventory import (
+        scan_terminal_transport_inventory,
+        validate_sealed_transport_exemptions,
+    )
 
     violations: list[str] = []
     for relative, snapshot in snapshots.items():
@@ -309,6 +312,9 @@ def _validate_terminal_transport_inventory(
         raise RuntimeError(
             "terminal transport inventory violation: " + ", ".join(sorted(violations))
         )
+    validate_sealed_transport_exemptions(
+        {relative: snapshot.source_bytes for relative, snapshot in snapshots.items()}
+    )
 
 
 _GATE_ROOT = _gate_repo_root()
