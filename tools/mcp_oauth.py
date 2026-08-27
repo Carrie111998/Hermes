@@ -457,29 +457,61 @@ def _write_json(path: Path, data: dict) -> None:
 class HermesTokenStorage:
     """Persist OAuth tokens and client registration to JSON files.
 
-    File layout::
+    File layout (``identity_mode: shared``, the default)::
 
         HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
         HERMES_HOME/mcp-tokens/<server_name>.cimd-off      -- CIMD refused here
+
+    File layout (``identity_mode: per_user``)::
+
+        HERMES_HOME/mcp-tokens/by-user/<u-v1-digest>/<server_name>.json
+        ...
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        oauth_scope: Any = None,
+    ):
+        from hermes_constants import get_hermes_home
+        from tools.mcp_oauth_identity import resolve_mcp_oauth_scope
+
         self._server_name = _safe_filename(server_name)
-        self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        # Pin home at construction so later file ops never re-resolve ambient
+        # HERMES_HOME (a confused-deputy risk under concurrent profiles).
+        self._hermes_home = (
+            Path(hermes_home) if hermes_home is not None else Path(get_hermes_home())
+        )
+        self._oauth_scope = (
+            oauth_scope
+            if oauth_scope is not None
+            else resolve_mcp_oauth_scope(uses_oauth=True)
+        )
+
+    def _namespace_dir(self) -> Path:
+        from tools.mcp_oauth_identity import IDENTITY_MODE_SHARED
+
+        base = _get_token_dir(self._hermes_home)
+        key = self._oauth_scope.persistence_key()
+        if key == IDENTITY_MODE_SHARED:
+            return base
+        return base / "by-user" / key
 
     def _tokens_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
+        return self._namespace_dir() / f"{self._server_name}.json"
 
     def _client_info_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.client.json"
+        return self._namespace_dir() / f"{self._server_name}.client.json"
 
     def _meta_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+        return self._namespace_dir() / f"{self._server_name}.meta.json"
 
     def _cimd_rejected_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.cimd-off"
+        return self._namespace_dir() / f"{self._server_name}.cimd-off"
 
     # -- tokens ------------------------------------------------------------
 
@@ -1274,11 +1306,44 @@ def remove_oauth_tokens(
     server_name: str,
     *,
     hermes_home: str | Path | None = None,
+    oauth_scope: Any = None,
+    all_identities: bool = False,
 ) -> None:
-    """Delete stored OAuth tokens and client info for a server."""
-    storage = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    """Delete stored OAuth tokens and client info for a server.
+
+    Default: the current OAuth scope only (shared layout, or one per-user
+    namespace). ``all_identities=True`` is the administrative path used when
+    removing a server from config — it deletes the shared artifacts *and*
+    that server's files under ``by-user/*/`` without enumerating principals.
+    """
+    if all_identities:
+        _remove_oauth_tokens_all_identities(server_name, hermes_home=hermes_home)
+        return
+    storage = HermesTokenStorage(
+        server_name, hermes_home=hermes_home, oauth_scope=oauth_scope
+    )
     storage.remove()
     logger.info("OAuth tokens removed for '%s'", server_name)
+
+
+def _remove_oauth_tokens_all_identities(
+    server_name: str,
+    *,
+    hermes_home: str | Path | None = None,
+) -> None:
+    safe = _safe_filename(server_name)
+    suffixes = (".json", ".client.json", ".meta.json", ".cimd-off")
+    base = _get_token_dir(hermes_home)
+    for suffix in suffixes:
+        (base / f"{safe}{suffix}").unlink(missing_ok=True)
+    by_user = base / "by-user"
+    if by_user.is_dir():
+        for ns in by_user.iterdir():
+            if not ns.is_dir() or not ns.name.startswith("u-v1-"):
+                continue
+            for suffix in suffixes:
+                (ns / f"{safe}{suffix}").unlink(missing_ok=True)
+    logger.info("OAuth tokens removed for '%s' (all identities)", server_name)
 
 
 # ---------------------------------------------------------------------------

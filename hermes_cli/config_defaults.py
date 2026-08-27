@@ -708,6 +708,15 @@ DEFAULT_CONFIG = {
         # When disabled, the watcher still detects the change and prints
         # guidance to apply it deliberately via /reload-mcp.
         "auto_reload_on_config_change": True,
+        # MCP OAuth identity isolation. ``shared`` (default) keeps the
+        # historical one-token-per-profile layout. ``per_user`` scopes
+        # OAuth credentials, providers, and live connections to the
+        # authenticated gateway requester — required for a shared Slack /
+        # Discord / Telegram gateway. Typos are rejected; they must never
+        # silently fall back to shared. See docs/rfc/requester-scoped-mcp-oauth.md.
+        "oauth": {
+            "identity_mode": "shared",
+        },
     },
 
     # Tool-output truncation thresholds. When terminal output or a

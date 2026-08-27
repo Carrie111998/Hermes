@@ -1297,6 +1297,15 @@ platform_toolsets:
 # Each server's tools are automatically discovered and registered.
 # See website/docs/user-guide/features/mcp.md for full documentation.
 #
+# OAuth identity isolation (shared gateway):
+#   mcp:
+#     oauth:
+#       identity_mode: shared    # default. One token per profile+server.
+#       # identity_mode: per_user  # scope OAuth to the authenticated requester
+#                                  # (Slack/Discord/Telegram/…). Typos are
+#                                  # rejected; they never fall back to shared.
+#                                  # Direct CLI cannot pick a user's token.
+#
 # Stdio servers (spawn a subprocess):
 #   command: the executable to run
 #   args: command-line arguments

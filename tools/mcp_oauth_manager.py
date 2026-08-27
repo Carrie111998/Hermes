@@ -96,6 +96,8 @@ class _ProviderEntry:
     last_mtime_ns: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
+    oauth_scope: Optional[Any] = None
+    hermes_home: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self._hermes_oauth_scope = None
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -509,6 +512,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 await get_manager().invalidate_if_disk_changed(
                     self._hermes_server_name,
                     hermes_home=self._hermes_home,
+                    oauth_scope=getattr(self, "_hermes_oauth_scope", None),
                 )
             except Exception as exc:  # pragma: no cover — defensive
                 logger.debug(
@@ -566,7 +570,7 @@ class MCPOAuthManager:
     """
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], _ProviderEntry] = {}
+        self._entries: dict[tuple[str, str, str], _ProviderEntry] = {}
         self._entries_lock = threading.Lock()
         # Holds strong references to in-flight 401 handler tasks so the
         # event loop's weak-reference bookkeeping cannot GC them mid-run
@@ -580,16 +584,29 @@ class MCPOAuthManager:
         server_name: str,
         server_url: str,
         oauth_config: Optional[dict],
+        *,
+        oauth_scope: Optional[Any] = None,
+        hermes_home: str | Path | None = None,
     ) -> Optional[Any]:
         """Return a cached OAuth provider for ``server_name`` or build one.
 
-        Idempotent: repeat calls with the same name return the same instance.
-        If ``server_url`` changes for a given name, the cached entry is
-        discarded and a fresh provider is built.
+        Idempotent: repeat calls with the same name *and OAuth scope* return
+        the same instance. If ``server_url`` changes for a given key, the
+        cached entry is discarded and a fresh provider is built.
 
         Returns None if the MCP SDK's OAuth support is unavailable.
         """
-        key = self._key(server_name)
+        from hermes_constants import get_hermes_home
+        from tools.mcp_oauth_identity import resolve_mcp_oauth_scope
+
+        scope = (
+            oauth_scope
+            if oauth_scope is not None
+            else resolve_mcp_oauth_scope(uses_oauth=True)
+        )
+        home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+        home_s = str(home.expanduser().resolve(strict=False))
+        key = self._key(server_name, home_s, oauth_scope=scope)
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
@@ -603,13 +620,16 @@ class MCPOAuthManager:
                 entry = _ProviderEntry(
                     server_url=server_url,
                     oauth_config=oauth_config,
+                    oauth_scope=scope,
+                    hermes_home=home_s,
                 )
                 self._entries[key] = entry
 
             if entry.provider is None:
                 entry.provider = self._build_provider(server_name, entry)
                 if entry.provider is not None:
-                    entry.provider._hermes_home = key[0]
+                    entry.provider._hermes_home = home_s
+                    entry.provider._hermes_oauth_scope = scope
 
             return entry.provider
 
@@ -617,11 +637,22 @@ class MCPOAuthManager:
     def _key(
         server_name: str,
         hermes_home: str | Path | None = None,
-    ) -> tuple[str, str]:
+        oauth_scope: Optional[Any] = None,
+    ) -> tuple[str, str, str]:
         from hermes_constants import get_hermes_home
+        from tools.mcp_oauth_identity import resolve_mcp_oauth_scope
 
         home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
-        return (str(home.expanduser().resolve(strict=False)), server_name)
+        scope = (
+            oauth_scope
+            if oauth_scope is not None
+            else resolve_mcp_oauth_scope(uses_oauth=True)
+        )
+        return (
+            str(home.expanduser().resolve(strict=False)),
+            server_name,
+            scope.persistence_key(),
+        )
 
     def _build_provider(
         self,
@@ -667,7 +698,11 @@ class MCPOAuthManager:
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
-        storage = HermesTokenStorage(server_name)
+        storage = HermesTokenStorage(
+            server_name,
+            hermes_home=entry.hermes_home,
+            oauth_scope=entry.oauth_scope,
+        )
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
@@ -714,22 +749,48 @@ class MCPOAuthManager:
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        oauth_scope: Optional[Any] = None,
+        all_identities: bool = False,
     ) -> _ProviderEntry | None:
         """Evict the provider from cache AND delete tokens from disk.
 
         Called by ``hermes mcp remove <name>`` and (indirectly) by
         ``hermes mcp login <name>`` during forced re-auth.
         """
-        with self._entries_lock:
-            entry = self._entries.pop(self._key(server_name, hermes_home), None)
-
-        from tools.mcp_oauth import remove_oauth_tokens
-        remove_oauth_tokens(server_name, hermes_home=hermes_home)
+        popped: _ProviderEntry | None = None
+        if all_identities:
+            prefix = None
+            if hermes_home is not None:
+                prefix = str(Path(hermes_home).expanduser().resolve(strict=False))
+            else:
+                from hermes_constants import get_hermes_home
+                prefix = str(get_hermes_home().expanduser().resolve(strict=False))
+            with self._entries_lock:
+                drop = [
+                    key for key in self._entries
+                    if key[0] == prefix and key[1] == server_name
+                ]
+                for key in drop:
+                    popped = self._entries.pop(key, popped)
+            from tools.mcp_oauth import remove_oauth_tokens
+            remove_oauth_tokens(
+                server_name, hermes_home=hermes_home, all_identities=True
+            )
+        else:
+            with self._entries_lock:
+                popped = self._entries.pop(
+                    self._key(server_name, hermes_home, oauth_scope=oauth_scope),
+                    None,
+                )
+            from tools.mcp_oauth import remove_oauth_tokens
+            remove_oauth_tokens(
+                server_name, hermes_home=hermes_home, oauth_scope=oauth_scope
+            )
         logger.info(
             "MCP OAuth '%s': evicted from cache and removed from disk",
             server_name,
         )
-        return entry
+        return popped
 
     def restore_entry(
         self,
@@ -737,22 +798,30 @@ class MCPOAuthManager:
         entry: _ProviderEntry | None,
         *,
         hermes_home: str | Path | None = None,
+        oauth_scope: Optional[Any] = None,
     ) -> None:
         """Restore a provider entry removed for a failed reauthorization."""
         if entry is None:
             return
+        scope = oauth_scope if oauth_scope is not None else getattr(entry, "oauth_scope", None)
+        home = hermes_home if hermes_home is not None else getattr(entry, "hermes_home", None)
         with self._entries_lock:
-            self._entries.setdefault(self._key(server_name, hermes_home), entry)
+            self._entries.setdefault(
+                self._key(server_name, home, oauth_scope=scope), entry
+            )
 
     def evict(
         self,
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        oauth_scope: Optional[Any] = None,
     ) -> None:
         """Drop only the in-process provider, preserving persisted OAuth state."""
         with self._entries_lock:
-            self._entries.pop(self._key(server_name, hermes_home), None)
+            self._entries.pop(
+                self._key(server_name, hermes_home, oauth_scope=oauth_scope), None
+            )
 
     # -- Disk watch ----------------------------------------------------------
 
@@ -761,6 +830,7 @@ class MCPOAuthManager:
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        oauth_scope: Optional[Any] = None,
     ) -> bool:
         """If the tokens file on disk has a newer mtime than last-seen, force
         the MCP SDK provider to reload its in-memory state.
@@ -770,14 +840,21 @@ class MCPOAuthManager:
         fresh tokens to disk, and on the next tool call the running MCP
         session picks them up without a restart.
         """
-        from tools.mcp_oauth import _get_token_dir, _safe_filename
+        from tools.mcp_oauth import HermesTokenStorage
 
-        entry = self._entries.get(self._key(server_name, hermes_home))
+        entry = self._entries.get(
+            self._key(server_name, hermes_home, oauth_scope=oauth_scope)
+        )
         if entry is None or entry.provider is None:
             return False
 
         async with entry.lock:
-            tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
+            storage = HermesTokenStorage(
+                server_name,
+                hermes_home=hermes_home if hermes_home is not None else entry.hermes_home,
+                oauth_scope=oauth_scope if oauth_scope is not None else entry.oauth_scope,
+            )
+            tokens_path = storage._tokens_path()
             try:
                 mtime_ns = tokens_path.stat().st_mtime_ns
             except (FileNotFoundError, OSError):
@@ -805,6 +882,9 @@ class MCPOAuthManager:
         self,
         server_name: str,
         failed_access_token: Optional[str] = None,
+        *,
+        oauth_scope: Optional[Any] = None,
+        hermes_home: str | Path | None = None,
     ) -> bool:
         """Handle a 401 from a tool call, deduplicated across concurrent callers.
 
@@ -817,11 +897,20 @@ class MCPOAuthManager:
 
         Thundering-herd protection: if N concurrent tool calls hit 401 with
         the same ``failed_access_token``, only one recovery attempt fires.
-        Others await the same future.
+        Others await the same future. Alice's 401 never shares Bob's pending
+        future because entries are keyed by OAuth scope.
         """
-        entry = self._entries.get(self._key(server_name))
+        captured_scope = oauth_scope
+        captured_home = hermes_home
+        entry = self._entries.get(
+            self._key(server_name, captured_home, oauth_scope=captured_scope)
+        )
         if entry is None or entry.provider is None:
             return False
+        if captured_scope is None:
+            captured_scope = entry.oauth_scope
+        if captured_home is None:
+            captured_home = entry.hermes_home
 
         key = failed_access_token or "<unknown>"
         loop = asyncio.get_running_loop()
@@ -834,9 +923,12 @@ class MCPOAuthManager:
 
                 async def _do_handle() -> None:
                     try:
-                        # Step 1: Did disk change? Picks up external refresh.
+                        # Use the captured scope/home — never re-resolve the
+                        # ambient requester (Bob must not refresh Alice).
                         disk_changed = await self.invalidate_if_disk_changed(
-                            server_name
+                            server_name,
+                            hermes_home=captured_home,
+                            oauth_scope=captured_scope,
                         )
                         if disk_changed:
                             if not pending.done():
