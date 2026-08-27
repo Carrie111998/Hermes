@@ -4,7 +4,13 @@ import logging
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    _AUTH_HEADER_RE,
+    mask_secret,
+    redact_cdp_url,
+    redact_sensitive_text,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -263,7 +269,7 @@ class TestAuthHeaders:
         assert redact_sensitive_text(text, force=True, file_read=True) == text
 
     def test_auth_header_pattern_source_preserved(self):
-        text = r'r"((?:Proxy-)?Authorization:\s*)([^\s\"\']+)"'
+        text = f'r"{_AUTH_HEADER_RE.pattern}"'
         assert redact_sensitive_text(text, force=True, code_file=True) == text
 
     @pytest.mark.parametrize(
@@ -271,6 +277,7 @@ class TestAuthHeaders:
         [
             "Authorization: Bearer opaque-provider-token-123456789",
             "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            r"Authorization: \s*opaquevalue123456789",
         ],
     )
     def test_literal_credentials_remain_redacted(self, text):
