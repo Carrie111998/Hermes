@@ -24,6 +24,7 @@ from agent.auxiliary_client import (
     _get_provider_chain,
     _is_payment_error,
     _is_rate_limit_error,
+    _is_upstream_capacity_error,
     _is_model_not_found_error,
     _is_model_incompatible_error,
     _refresh_nous_recommended_model,
@@ -1458,6 +1459,43 @@ class TestIsRateLimitError:
         exc = Exception("Rate limit exceeded, try again in 2 seconds")
         exc.status_code = 429
         assert _is_rate_limit_error(exc) is True
+
+
+    def test_429_upstream_at_capacity_is_rate_limit(self):
+        """#94978 — an upstream "temporarily at capacity" 429 must count as a
+        rate limit so the auxiliary same-provider retry applies backoff
+        instead of burning the retry budget and re-raising.
+        """
+        exc = Exception(
+            "HTTP 429: The requested model is temporarily at capacity upstream. "
+            "Please retry shortly."
+        )
+        exc.status_code = 429
+        assert _is_rate_limit_error(exc) is True
+
+
+    def test_429_upstream_at_capacity_excluded_from_fallback(self):
+        """#94978 — an upstream-capacity 429 must NOT trigger provider
+        fallback. A different model on the same gateway usually shares the
+        saturated upstream pool, and a different provider may itself be
+        saturated. Retry the same key with backoff instead.
+        """
+        exc = Exception(
+            "HTTP 429: The requested model is temporarily at capacity upstream. "
+            "Please retry shortly."
+        )
+        exc.status_code = 429
+        assert _is_upstream_capacity_error(exc) is True
+
+
+    def test_generic_rate_limit_429_is_not_upstream_capacity(self):
+        """#94978 — a per-credential rate limit (the body says nothing about
+        upstream saturation) is a true rate-limit, NOT an upstream-capacity
+        stall, so the fallback path is still correct.
+        """
+        exc = Exception("Rate limit exceeded, try again in 2 seconds")
+        exc.status_code = 429
+        assert _is_upstream_capacity_error(exc) is False
 
 
 

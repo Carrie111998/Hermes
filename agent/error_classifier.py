@@ -40,6 +40,11 @@ class FailoverReason(enum.Enum):
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
     upstream_rate_limit = "upstream_rate_limit"
+    # Upstream model at capacity (HTTP 429 with a body like "temporarily at
+    # capacity upstream"). Transient server-side saturation; the credential is
+    # healthy so back off and retry the same key, do NOT rotate the pool or
+    # switch providers. (#94978)
+    upstream_capacity = "upstream_capacity"
 
     # Server-side
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
@@ -229,6 +234,27 @@ _OVERLOADED_PATTERNS = [
     "currently overloaded",
     "at capacity",
     "over capacity",
+]
+
+# Patterns that mark an HTTP 429 as *upstream model saturation* (the server
+# itself explicitly says "retry shortly" / "try again in N seconds"). Distinct
+# from the generic overload bucket: here the right move is to back off and
+# retry the SAME key — NOT to rotate the credential pool (the key is
+# healthy) and NOT to mark the route as a transport failure (the connection
+# is fine, just saturated). The previous classifier sent these through the
+# ``overloaded`` reason, which ``conversation_loop`` grouped into
+# ``_is_transport_failure`` and gated the Retry-After / backoff branch off,
+# so a single-key user without fallback watched the turn die. (#94978)
+_UPSTREAM_CAPACITY_PATTERNS = [
+    "temporarily at capacity",
+    "at capacity upstream",
+    "currently at capacity",
+    "upstream at capacity",
+    "model is at capacity",
+    "no upstream capacity",
+    "upstream capacity",
+    "try again shortly",
+    "please retry shortly",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -1317,6 +1343,22 @@ def _classify_by_status(
         )
 
     if status_code == 429:
+        # Upstream "temporarily at capacity" 429 — server-side saturation.
+        # MUST be checked before the generic ``_OVERLOADED_PATTERNS`` bucket
+        # because the body shape (e.g. "temporarily at capacity upstream")
+        # contains the substring "at capacity" which the overload list also
+        # matches. The upstream-capacity route is more specific: it routes
+        # through the Retry-After / backoff branch (treating the credential
+        # as healthy) instead of the transport-failure branch (which
+        # escalates to eager fallback after retry_count >= 2 and killed the
+        # turn for single-key users). (#94978)
+        if any(p in error_msg for p in _UPSTREAM_CAPACITY_PATTERNS):
+            return result_fn(
+                FailoverReason.upstream_capacity,
+                retryable=True,
+                should_rotate_credential=False,
+                should_fallback=False,
+            )
         # Already checked long_context_tier above. Some providers (notably
         # Z.AI / Zhipu) reuse HTTP 429 for server-wide overload — same status
         # code as a true per-credential rate limit, but the credential is

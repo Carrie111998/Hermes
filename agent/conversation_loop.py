@@ -5422,10 +5422,27 @@ def run_conversation(
                 # the primary provider won't recover within the retry window.
                 # Transport errors: allow 1 retry first (transient hiccups
                 # recover), then fall back if the provider is truly unreachable.
+                # ── Upstream-capacity 429 (#94978) ────────────────────────
+                # HTTP 429 with a body like "temporarily at capacity upstream"
+                # is server-side saturation, NOT a per-credential rate limit.
+                # The credential is healthy, so back off and retry the same
+                # key; do NOT rotate the pool or escalate to fallback. The
+                # classifier marks ``should_rotate_credential=False`` /
+                # ``should_fallback=False`` and a dedicated
+                # ``FailoverReason.upstream_capacity`` so we can route this
+                # through the same Retry-After / backoff branch as a normal
+                # rate-limit (which the prior ``overloaded`` reason did NOT
+                # — it was in ``_is_transport_failure`` and escalated to
+                # eager fallback after retry_count >= 2, killing the turn
+                # for single-key users).
+                _is_upstream_capacity = (
+                    classified.reason == FailoverReason.upstream_capacity
+                )
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
                     FailoverReason.upstream_rate_limit,
+                    FailoverReason.upstream_capacity,
                 }
                 # Relay-wrapped output-cap errors: some gateways wrap an
                 # upstream "[400]: max_tokens (...) exceeds model's maximum
@@ -5459,7 +5476,8 @@ def run_conversation(
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
-                    (is_rate_limited and _wrapped_output_cap_budget is None)
+                    (is_rate_limited and not _is_upstream_capacity
+                     and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
@@ -6603,7 +6621,18 @@ def run_conversation(
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
-                    _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
+                    if _is_zai_coding_overload and not is_rate_limited:
+                        _wait_reason = "Provider overloaded"
+                    elif _is_upstream_capacity:
+                        # Distinct copy so the user (and our logs) can tell a
+                        # server-side "at capacity" stall apart from a
+                        # per-credential throttle — same Retry-After / backoff
+                        # contract applies, but the recovery is "wait for the
+                        # upstream pool to drain", not "switch providers".
+                        # (#94978)
+                        _wait_reason = "Upstream at capacity"
+                    else:
+                        _wait_reason = "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
                     # Z.AI Coding waits are different: they can last minutes, so surface
