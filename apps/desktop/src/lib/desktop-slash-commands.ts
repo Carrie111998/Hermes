@@ -47,7 +47,6 @@ export type DesktopActionId =
   | 'branch'
   | 'browser'
   | 'compress'
-  | 'handoff'
   | 'hatch'
   | 'help'
   | 'journey'
@@ -173,12 +172,6 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     name: '/wake',
     description: 'Control the desktop wake-word listener [on|off|status]',
     surface: action('wake'),
-    argumentMode: 'options'
-  },
-  {
-    name: '/handoff',
-    description: 'Hand off this session to a messaging platform',
-    surface: action('handoff'),
     argumentMode: 'options'
   },
   { name: '/profile', description: 'Switch the active Hermes profile', surface: action('profile') },

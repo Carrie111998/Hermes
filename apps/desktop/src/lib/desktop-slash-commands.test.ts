@@ -171,7 +171,6 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashCommandArgumentMode('/steer')).toBe('text')
     expect(desktopSlashCommandArgumentMode('/queue')).toBe('text')
     expect(desktopSlashCommandArgumentMode('/personality')).toBe('options')
-    expect(desktopSlashCommandArgumentMode('/handoff')).toBe('options')
     expect(desktopSlashCommandArgumentMode('/version')).toBeNull()
   })
 

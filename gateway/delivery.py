@@ -135,9 +135,7 @@ def looks_like_telegram_private_chat_id(chat_id: Optional[str]) -> bool:
     """True when ``chat_id`` is a positive int — Telegram's private-chat shape.
 
     Telegram private chats use positive chat IDs; groups/channels/supergroups
-    use negative IDs. This is the single source of truth for that heuristic,
-    reused by the handoff seed path in ``gateway/run.py`` so handoff-created
-    DM topics key the same way as inbound DM-topic messages.
+    use negative IDs. This is the single source of truth for that heuristic.
     """
     if chat_id is None:
         return False

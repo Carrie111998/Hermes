@@ -749,33 +749,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
-        // /handoff hands this session to a messaging platform. The platform is
-        // completed inline in the slash popover (backend _handoff_completions),
-        // so there is no overlay: `/handoff <platform>` runs the desktop's own
-        // handoff RPC. cli_only on the backend, so it must not reach slash.exec.
-        handoff: async ({ arg, command, recordInput, sessionHint }) => {
-          const platform = arg.trim()
-
-          if (!platform) {
-            notify({ kind: 'success', message: copy.handoff.pickPlatform })
-
-            return
-          }
-
-          const sid = sessionHint || activeSessionIdRef.current
-
-          if (!sid) {
-            notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
-
-            return
-          }
-
-          const result = await handoffSession(platform, { sessionId: sid })
-
-          if (!result.ok && result.error) {
-            appendSessionTextMessage(sid, 'system', recordInput ? slashStatusText(command, result.error) : result.error)
-          }
-        },
+        // /profile selects
         // /profile selects which profile new chats open in — no app relaunch.
         // A profile is per-session now, so an existing thread can't change its
         // profile mid-stream; `/profile <name>` points the next new chat (and

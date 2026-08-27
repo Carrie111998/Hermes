@@ -980,13 +980,6 @@ _cli_wake_owner = None
 # the session boundary while the agent is still attached. If a signal lands in
 # that narrow window, atexit cleanup must not emit that session finalization again.
 _single_query_finalize_attempted_session_ids: set[str | None] = set()
-# Session IDs that were handed off to the gateway via /handoff.  The CLI
-# process exits after a successful handoff, but the gateway now owns the
-# session lifecycle — _run_cleanup must NOT call finalize_session on these,
-# because doing so sets end_reason on a row the gateway just reopened and is
-# actively writing to (#88234).  The race made the handoff leg vanish from
-# session history and broke session_search recall for the handed-off session.
-_handed_off_session_ids: set[str | None] = set()
 # Weak reference to the active AIAgent for memory provider shutdown at exit
 _active_agent_ref = None
 _deferred_agent_startup_done = False
@@ -1276,12 +1269,6 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
 
 
 def _should_emit_cleanup_session_finalize(session_id: str | None) -> bool:
-    # A session that was handed off to the gateway is now owned by the
-    # gateway process.  The CLI must not finalize it on exit — that sets
-    # end_reason on a row the gateway reopened and is actively writing
-    # to, causing the handoff leg to vanish from session history (#88234).
-    if session_id is not None and session_id in _handed_off_session_ids:
-        return False
     if not _single_query_finalize_attempted_session_ids:
         return True
     if session_id is None:
@@ -1320,10 +1307,6 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
         pass
 
     session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
-    # Don't emit session-end for a session that was handed off to the
-    # gateway — the gateway owns the lifecycle now (#88234).
-    if session_id in _handed_off_session_ids:
-        return
     if session_id:
         try:
             cli.session_id = session_id
@@ -1352,10 +1335,6 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
     agent = getattr(cli, "agent", None)
     session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
     if session_id in _single_query_finalize_attempted_session_ids:
-        return
-    # Don't finalize a session that was handed off to the gateway —
-    # the gateway owns the lifecycle now (#88234).
-    if session_id in _handed_off_session_ids:
         return
 
     try:
@@ -1397,7 +1376,7 @@ def _flush_one_shot_session_store(cli) -> None:
     if agent is None:
         return
     session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
-    if not session_id or session_id in _handed_off_session_ids:
+    if not session_id:
         return
     if getattr(agent, "_persist_disabled", False):
         return
@@ -12173,9 +12152,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             else:
                 from hermes_state import format_session_db_unavailable
                 _cprint(f"  {format_session_db_unavailable()}")
-        elif canonical == "handoff":
-            if not self._handle_handoff_command(cmd_original):
-                return False
         elif canonical == "new":
             # Strip inline-skip tokens (now/--yes/-y) before deriving the title
             # so "/new now My Session" yields title="My Session" instead of

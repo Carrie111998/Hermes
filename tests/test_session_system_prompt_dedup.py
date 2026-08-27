@@ -24,38 +24,6 @@ def _prompt_count(db: SessionDB) -> int:
     )
 
 
-def test_prompt_snapshots_are_deduplicated_and_hydrated_for_readers(db):
-    prompt = "You are Hermes.\n" + ("Follow the profile policy.\n" * 5)
-    db.create_session(
-        "s1",
-        "telegram",
-        session_key="agent:main:telegram:dm:c1",
-        chat_id="c1",
-        chat_type="dm",
-        system_prompt=prompt,
-    )
-    db.create_session("s2", "cli", system_prompt=prompt)
-    db.request_handoff("s1", "telegram")
-
-    stored = db._conn.execute(
-        "SELECT hash, prompt FROM system_prompts"
-    ).fetchall()
-    assert len(stored) == 1
-    assert stored[0]["prompt"] == prompt
-    raw_sessions = db._conn.execute(
-        "SELECT system_prompt, system_prompt_hash FROM sessions ORDER BY id"
-    ).fetchall()
-    assert [row["system_prompt"] for row in raw_sessions] == [None, None]
-    assert {row["system_prompt_hash"] for row in raw_sessions} == {
-        stored[0]["hash"]
-    }
-
-    assert db.get_session("s1")["system_prompt"] == prompt
-    assert db.list_sessions_rich()[0]["system_prompt"] == prompt
-    assert db.search_sessions()[0]["system_prompt"] == prompt
-    assert db.export_session("s1")["system_prompt"] == prompt
-    assert db.list_gateway_sessions()[0]["system_prompt"] == prompt
-    assert db.list_pending_handoffs()[0]["system_prompt"] == prompt
 
 
 def test_prompt_replacement_and_route_changes_collect_only_orphans(db):

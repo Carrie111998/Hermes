@@ -410,9 +410,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_description TEXT,
     last_activity_provenance TEXT,
     api_call_count INTEGER DEFAULT 0,
-    handoff_state TEXT,
-    handoff_platform TEXT,
-    handoff_error TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
@@ -565,8 +562,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
-    ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
 """

@@ -308,15 +308,5 @@ def test_sync_db_escape_confined_to_off_loop_sites():
 # These pin that the defenses hold when driven concurrently through the facade.
 # --------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_concurrent_claim_handoff_single_winner(tmp_path):
-    db = AsyncSessionDB(hermes_state.SessionDB(db_path=tmp_path / "state.db"))
-    sid = "s-handoff"
-    await db.create_session(sid, "test")
-    await db.request_handoff(sid, "telegram")
-
-    results = await asyncio.gather(*(db.claim_handoff(sid) for _ in range(20)))
-
-    assert sum(results) == 1, f"exactly one claim must win, got {sum(results)}"
 
 

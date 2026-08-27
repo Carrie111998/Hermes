@@ -3073,13 +3073,6 @@ export const ja = defineLocale({
     noClipboardImage: 'クリップボードに画像が見つかりません',
     clipboardPasteFailed: 'クリップボードからの貼り付けに失敗しました',
     dropFiles: 'ファイルをドロップ',
-    handoff: {
-      pickPlatform: '送信先を選択',
-      success: platform => `${platform} に引き継ぎました。いつでもここで再開できます。`,
-      systemNote: platform => `↻ ${platform} に引き継ぎました — いつでもここで再開できます。`,
-      failed: error => `引き継ぎに失敗しました: ${error}`,
-      timedOut: 'ゲートウェイの待機がタイムアウトしました。`hermes gateway` は起動していますか？'
-    }
   },
 
   errors: {

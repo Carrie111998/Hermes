@@ -2821,13 +2821,6 @@ export const ar = defineLocale({
     noClipboardImage: 'لا توجد صورة في الحافظة',
     clipboardPasteFailed: 'فشل اللصق من الحافظة',
     dropFiles: 'أفلت الملفات هنا',
-    handoff: {
-      pickPlatform: 'اختر وجهة',
-      success: platform => `تم التسليم إلى ${platform}. استأنف هنا في أي وقت.`,
-      systemNote: platform => `↻ تم التسليم إلى ${platform} — استأنف هنا في أي وقت.`,
-      failed: error => `فشل التسليم: ${error}`,
-      timedOut: 'انتهت المهلة في انتظار البوابة. هل `hermes gateway` قيد التشغيل؟'
-    }
   },
   errors: {
     genericFailure: 'حدث خطأ',

@@ -333,7 +333,7 @@ def _corrupt_btree_index(db_path: Path, index_name: str) -> None:
     rebuilt EMPTY, then restore the original full definition. The stored
     b-tree now has zero entries while the schema says it must cover every
     row — exactly the on-disk state issue #63386 reported for
-    idx_sessions_handoff_state, produced without any mocking.
+    idx_sessions_gateway_peer, produced without any mocking.
     """
     raw = sqlite3.connect(str(db_path))
     orig_sql = raw.execute(

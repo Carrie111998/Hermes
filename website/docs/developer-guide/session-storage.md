@@ -39,7 +39,7 @@ Key design decisions:
 Abridged — see `SCHEMA_SQL` in `hermes_state.py` for the full current column list
 (which also includes gateway routing metadata such as `session_key`, `chat_id`,
 `chat_type`, `thread_id`, `display_name`, `origin_json`, `expiry_finalized`,
-workspace fields `cwd` / `git_branch` / `git_repo_root`, handoff and
+workspace fields `cwd` / `git_branch` / `git_repo_root`,
 compression-failure fields, `profile_name`, `rewind_count`, `archived`, and
 `pinned`):
 

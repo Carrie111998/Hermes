@@ -327,7 +327,7 @@ class SessionPortabilityMixin:
 
         Composition of existing primitives (no new import/export machinery):
         ``donor_db.export_session_lineage()`` -> ``self.import_sessions()``.
-        Import semantics apply unchanged: gateway routing, handoff, and live
+        Import semantics apply unchanged: gateway routing and live
         activity fields are reset; already-present ids are skipped
         (idempotent re-adoption after a partial run).
 
@@ -510,7 +510,7 @@ class SessionPortabilityMixin:
         Existing session IDs are skipped. Imported child sessions keep their
         parent only when that parent already exists or is included in the same
         import payload; otherwise the child is detached so partial imports don't
-        fail foreign-key validation. Gateway routing, handoff, rewind, and other
+        fail foreign-key validation. Gateway routing, rewind, and other
         live runtime state are intentionally reset: this restores conversation
         history, not ownership of a live channel or process.
 
