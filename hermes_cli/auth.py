@@ -4283,22 +4283,38 @@ def _refresh_codex_auth_tokens(
         and global_root is not None
         and _same_path(source_path, global_root)
     )
+    # Top-level mode: the active store IS the global root (a single file). A
+    # root-resolved reader here must persist directly to that same store —
+    # never through the distinct-store write-through helper, which no-ops on a
+    # same-path root and would fall into CLASS-N retries (F1).
+    top_level_root = bool(
+        global_root is not None
+        and _same_path(global_root, _auth_file_path())
+    )
 
-    def _persist_to_root(tk: Dict[str, str]) -> None:
-        # CLASS-N persistence: no durable copy of the rotated chain exists
-        # elsewhere, so retry the root write with bounded backoff; on persistent
-        # failure log CRITICAL and return (the refreshed tokens are still handed
-        # to the caller — loud, not silent).
+    def _persist_class_n(persist_fn, what: str) -> None:
+        # CLASS-N durability (shared by the C2 direct-root and C3-owned
+        # persistence steps — see A1v10): no durable copy of the rotated chain
+        # exists yet, so retry ``persist_fn`` (truthy on a durable write;
+        # raising or falsy on failure) with bounded fixed backoff; on
+        # persistent failure log CRITICAL naming a manual re-auth (the
+        # refreshed tokens are still handed to the caller — loud, not silent).
         for attempt in range(_CODEX_ROOT_PERSIST_ATTEMPTS):
-            if _write_through_codex_to_global_root(tk, None, None) is True:
-                return  # OUTCOME-SUCCESS (silent)
+            try:
+                if persist_fn():
+                    return  # OUTCOME-SUCCESS (silent)
+            except Exception as exc:
+                logger.debug(
+                    "Codex OAuth %s persistence attempt %d failed: %s",
+                    what, attempt + 1, exc,
+                )
             if attempt < _CODEX_ROOT_PERSIST_ATTEMPTS - 1:
                 time.sleep(_CODEX_ROOT_PERSIST_BACKOFF_SECONDS[attempt])
         logger.critical(
-            "Codex OAuth: could not persist the rotated token chain to the "
-            "global root after %d attempts — no durable copy exists. "
-            "Run `hermes model` to re-authenticate manually.",
-            _CODEX_ROOT_PERSIST_ATTEMPTS,
+            "Codex OAuth: could not persist the rotated token chain %s after "
+            "%d attempts — no durable copy exists. Run `hermes model` to "
+            "re-authenticate manually.",
+            what, _CODEX_ROOT_PERSIST_ATTEMPTS,
         )
 
     try:
@@ -4375,18 +4391,20 @@ def _refresh_codex_auth_tokens(
                                     adopted["access_token"] = adopted_refresh["access_token"]
                                     adopted["refresh_token"] = adopted_refresh["refresh_token"]
                                     if is_from_root:
-                                        _persist_to_root(adopted)
+                                        _persist_class_n(
+                                            lambda: _write_through_codex_to_global_root(adopted, None, None) is True,
+                                            "to the global root",
+                                        )
                                     else:
-                                        try:
-                                            _save_codex_tokens(adopted)
-                                        except Exception:
-                                            # CLASS-N: local save failed after a
-                                            # successful POST — no durable copy.
-                                            logger.critical(
-                                                "Codex OAuth: rescue refresh succeeded but the "
-                                                "token chain could not be persisted. Run "
-                                                "`hermes model` to re-authenticate manually."
-                                            )
+                                        # CLASS-N (owned): the local save after a
+                                        # successful rescue POST is the only durable
+                                        # copy — retry it through the shared backoff
+                                        # loop before CRITICAL (A1v10: 3 attempts /
+                                        # 2 backoffs).
+                                        _persist_class_n(
+                                            lambda: (_save_codex_tokens(adopted) or True),
+                                            "to the profile store",
+                                        )
                                     rescued = adopted
                 except Exception:
                     rescued = None
@@ -4403,11 +4421,18 @@ def _refresh_codex_auth_tokens(
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
 
-    if is_from_root:
-        # C2 — persist the rotation directly to root; do NOT seed a shadowing
-        # profile block (C1 write-through covers only owned-block callers).
-        _persist_to_root(updated_tokens)
+    if is_from_root and not top_level_root:
+        # C2 — persist the rotation directly to the distinct root; do NOT seed
+        # a shadowing profile block (C1 write-through covers only owned-block
+        # callers).
+        _persist_class_n(
+            lambda: _write_through_codex_to_global_root(updated_tokens, None, None) is True,
+            "to the global root",
+        )
     else:
+        # Owned-block caller, or top-level mode (the active store IS the root):
+        # ``_save_codex_tokens`` persists to the active store, and its C1
+        # write-through already skips a same-path root.
         _save_codex_tokens(updated_tokens)
     return updated_tokens
 
