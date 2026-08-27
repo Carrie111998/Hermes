@@ -2,6 +2,7 @@
 // main.ts; window handles stay injected because main.ts owns their lifecycle.
 import { type BrowserWindow, ipcMain, screen } from 'electron'
 
+import { overlayWindowBoundsToDip } from './pet-overlay-geometry'
 import { enumerateWindowsFrontToBack, enumerationFailed } from './window-below'
 
 export interface PetOverlayIpcDeps {
@@ -73,6 +74,12 @@ export function registerPetOverlayIpc({
     const bottom = workArea.y + workArea.height
 
     const windows = enumerated
+      .map(windowInfo => ({
+        ...windowInfo,
+        bounds: overlayWindowBoundsToDip(windowInfo.bounds, process.platform, bounds =>
+          screen.screenToDipRect(null, bounds)
+        )
+      }))
       .filter(({ bounds, pid }) => {
         if (pid === process.pid || bounds.width <= 0 || bounds.height <= 0) {
           return false

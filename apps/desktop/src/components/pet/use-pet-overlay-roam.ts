@@ -37,11 +37,60 @@ const MIN_TRAVEL_PX = 48
 const GRAVITY_PX_S2 = 2600
 const MAX_DT_S = 0.05
 const HOP_CHANCE = 0.35
-const BASE_HOP_DURATION_MS = 650
+const BASE_HOP_DURATION_MS = 800
 const PAUSE_POLL_MS = 250
 const MIN_LEDGE_REACH_PX = 180
+const MIN_HOP_TRAVEL_PX = 32
 
 type Phase = 'fall' | 'hop' | 'walk'
+
+/** Keep lateral hops compact, regardless of how wide the desktop ledge is. */
+export const overlayHopMaxTravel = (petW: number): number => Math.max(80, petW * 1.5)
+
+/**
+ * The portion of a destination ledge reachable by one compact sideways hop.
+ * A null range means the pet should walk closer before trying that ledge.
+ */
+export function overlayHopRange(from: Ledge, to: Ledge, fromX: number, petW: number): Ledge | null {
+  const maxTravel = overlayHopMaxTravel(petW)
+  const left = Math.max(from.left, to.left, fromX - maxTravel)
+  const right = Math.min(from.right, to.right, fromX + maxTravel)
+
+  return right > left + 2 ? { left, right, y: to.y } : null
+}
+
+/** Choose a visible hop landing point without crossing most of a wide ledge. */
+export function pickOverlayHopTarget(range: Ledge, fromX: number, rng: () => number = Math.random): number {
+  const leftRoom = Math.max(0, fromX - range.left)
+  const rightRoom = Math.max(0, range.right - fromX)
+  let direction: -1 | 1
+
+  if (leftRoom < MIN_HOP_TRAVEL_PX) {
+    direction = 1
+  } else if (rightRoom < MIN_HOP_TRAVEL_PX) {
+    direction = -1
+  } else {
+    direction = rng() < 0.5 ? -1 : 1
+  }
+
+  const available = direction < 0 ? leftRoom : rightRoom
+
+  if (available <= 0) {
+    return Math.max(range.left, Math.min(range.right, fromX))
+  }
+
+  const minimum = Math.min(MIN_HOP_TRAVEL_PX, available)
+  const distance = minimum + rng() * (available - minimum)
+
+  return fromX + direction * distance
+}
+
+/** A taller arc, with extra lift when the landing surface is below the start. */
+export function overlayHopArcHeight(petH: number, deltaY: number): number {
+  const baseLift = Math.max(88, petH * 1.5)
+
+  return Math.min(300, baseLift + Math.max(0, deltaY) * 0.55)
+}
 
 const clipTo = (bounds: OverlayBounds, area: OverlayBounds): OverlayBounds | null => {
   const x = Math.max(bounds.x, area.x)
@@ -250,9 +299,11 @@ export function usePetOverlayRoam({
       startY = current.y
       phase = 'hop'
       phaseStarted = now
-      const vertical = Math.abs(restY(ledge) - startY)
-      hopHeight = Math.max(48, petH * 0.9, vertical * 0.25)
-      hopDuration = Math.min(1100, BASE_HOP_DURATION_MS + vertical * 0.7)
+      const deltaY = restY(ledge) - startY
+      const vertical = Math.abs(deltaY)
+
+      hopHeight = overlayHopArcHeight(petH, deltaY)
+      hopDuration = Math.min(1300, BASE_HOP_DURATION_MS + vertical * 0.7)
       signal('jump')
     }
 
@@ -281,29 +332,32 @@ export function usePetOverlayRoam({
 
       current.y = restingY
       const verticalReach = Math.max(MIN_LEDGE_REACH_PX, petH * 2.75)
+      const fromLedge = currentLedge
+      const fromX = current.x
 
-      const reachable = ledges.filter(
-        ledge =>
-          ledge !== currentLedge &&
-          overlapsX(currentLedge!, ledge) &&
-          Math.abs(restY(ledge) - restingY) <= verticalReach
-      )
-
-      if (Math.random() < HOP_CHANCE) {
-        const next = reachable.length > 0 ? reachable[Math.floor(Math.random() * reachable.length)]! : currentLedge
-        let x: number
-
-        if (next === currentLedge) {
-          x = pickStrollTarget(currentLedge, current.x)
-        } else {
-          const left = Math.max(currentLedge.left, next.left)
-          const right = Math.min(currentLedge.right, next.right)
-          x = left + Math.random() * Math.max(0, right - left)
+      const reachable = ledges.flatMap(ledge => {
+        if (
+          ledge === fromLedge ||
+          !overlapsX(fromLedge, ledge) ||
+          Math.abs(restY(ledge) - restingY) > verticalReach
+        ) {
+          return []
         }
 
-        beginHop(next, x, now)
+        const range = overlayHopRange(fromLedge, ledge, fromX, petW)
 
-        return true
+        return range ? [{ ledge, range }] : []
+      })
+
+      if (Math.random() < HOP_CHANCE) {
+        const next = reachable[Math.floor(Math.random() * reachable.length)]
+        const range = next?.range ?? overlayHopRange(fromLedge, fromLedge, fromX, petW)
+
+        if (range) {
+          beginHop(next?.ledge ?? fromLedge, pickOverlayHopTarget(range, fromX), now)
+
+          return true
+        }
       }
 
       targetX = pickStrollTarget(currentLedge, current.x)

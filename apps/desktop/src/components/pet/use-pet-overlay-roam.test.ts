@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   clampOverlayRoamBounds,
   overlayGroundY,
+  overlayHopArcHeight,
+  overlayHopMaxTravel,
+  overlayHopRange,
   overlayRoamLedges,
+  pickOverlayHopTarget,
   usePetOverlayRoam
 } from './use-pet-overlay-roam'
 
@@ -73,6 +77,23 @@ describe('overlay roam geometry', () => {
     )
 
     expect(ledges).toEqual([{ left: -88, right: 1048, y: 800 }])
+  })
+
+  it('limits sideways hops and uses a taller arc', () => {
+    const ledge = { left: 0, right: 1200, y: 700 }
+    const range = overlayHopRange(ledge, ledge, 500, 64)
+
+    expect(overlayHopMaxTravel(64)).toBe(96)
+    expect(range).toEqual({ left: 404, right: 596, y: 700 })
+    expect(pickOverlayHopTarget(range!, 500, () => 1)).toBe(596)
+    expect(overlayHopArcHeight(70, 0)).toBe(105)
+    expect(overlayHopArcHeight(70, 100)).toBe(160)
+  })
+
+  it('rejects a destination ledge that is too far away for one hop', () => {
+    expect(
+      overlayHopRange({ left: 0, right: 800, y: 700 }, { left: 300, right: 700, y: 500 }, 100, 64)
+    ).toBeNull()
   })
 
   it('replans immediately when the drag completion key changes', async () => {
