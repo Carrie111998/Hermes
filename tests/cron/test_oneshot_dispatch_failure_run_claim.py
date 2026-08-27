@@ -23,7 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import cron.jobs as jobs_mod
-from cron.jobs import clear_run_claim
+from cron.jobs import clear_run_claim, heartbeat_run_claim
 
 
 @pytest.fixture
@@ -73,6 +73,45 @@ class TestClearRunClaim:
 
     def test_unknown_job_id_returns_false(self, cron_store):
         assert clear_run_claim("no-such-job") is False
+
+    def test_none_schedule_does_not_crash(self, cron_store):
+        """schedule=None (disk corruption / old-writer record) must degrade to
+        a plain False, not raise AttributeError out of a dispatch-failure path
+        that is itself supposed to be the safety net."""
+        job = _make_oneshot(claimed=True)
+        jobs = jobs_mod.load_jobs()
+        for j in jobs:
+            if j["id"] == job["id"]:
+                j["schedule"] = None
+        jobs_mod.save_jobs(jobs)
+        assert clear_run_claim(job["id"]) is False
+
+
+class TestHeartbeatRunClaim:
+    def test_refreshes_claim_timestamp_for_expected_owner(self, cron_store):
+        job = _make_oneshot(claimed=True)  # claim stamped with by="test:1"
+        assert heartbeat_run_claim(job["id"], expected_owner="test:1") is True
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded["run_claim"]["at"] != "2026-08-17T10:00:00+00:00"
+
+    def test_mismatched_owner_returns_false(self, cron_store):
+        job = _make_oneshot(claimed=True)  # claim stamped with by="test:1"
+        assert heartbeat_run_claim(job["id"], expected_owner="someone-else") is False
+
+    def test_unknown_job_id_returns_false(self, cron_store):
+        assert heartbeat_run_claim("no-such-job", expected_owner="test:1") is False
+
+    def test_none_schedule_does_not_crash(self, cron_store):
+        """schedule=None (disk corruption / old-writer record) must degrade to
+        a plain False, not raise AttributeError out of the scheduler's
+        periodic run-monitor heartbeat tick (#62002)."""
+        job = _make_oneshot(claimed=True)  # claim stamped with by="test:1"
+        jobs = jobs_mod.load_jobs()
+        for j in jobs:
+            if j["id"] == job["id"]:
+                j["schedule"] = None
+        jobs_mod.save_jobs(jobs)
+        assert heartbeat_run_claim(job["id"], expected_owner="test:1") is False
 
 
 class TestDispatchFailurePathsClearClaim:

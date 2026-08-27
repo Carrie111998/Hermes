@@ -143,6 +143,21 @@ def test_rearm_refuses_recurring_and_live_claim(tmp_cron_dir):
         rearm_oneshot(oneshot["id"], future)
 
 
+def test_rearm_none_schedule_raises_value_error_not_attribute_error(tmp_cron_dir):
+    """schedule=None (disk corruption / old-writer record) must be refused
+    with the normal "recurring jobs" ValueError, not crash with
+    AttributeError out of the re-arm-only-once-shots check."""
+    from cron.jobs import rearm_oneshot
+
+    job = create_job("corrupted", "30m")
+    record = get_job(job["id"])
+    record["schedule"] = None
+    save_jobs([record])
+    future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    with pytest.raises(ValueError, match="one-shot"):
+        rearm_oneshot(job["id"], future)
+
+
 class TestRecurringJobStuckInErrorStateIsRecoverable:
     """A recurring (cron/interval) job that could not compute its next
     occurrence is marked ``state=error`` but left ``enabled=True`` — issue
