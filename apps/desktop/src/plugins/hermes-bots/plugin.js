@@ -464,6 +464,10 @@ const $groupClarify = atom({})
 // away), and a rename re-keys the room (the feed starts clean under the new
 // name — stale events under the old key simply have no room to attach to).
 const GROUP_ACTIVITY_LIMIT = 50
+// G's human-facing identity in Bot Mode. Keep the durable room wire shape
+// (`kind: 'user'`, legacy `name: 'You'`) unchanged and translate only at
+// presentation/model-facing boundaries so old room history needs no migration.
+const GROUP_HUMAN_LABEL = 'G'
 const $groupActivity = atom({})
 
 function recordGroupActivity(group, event) {
@@ -498,7 +502,7 @@ function groupActivityLabel(event) {
     return base
   }
 
-  const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
+  const who = event?.member === 'You' ? GROUP_HUMAN_LABEL : groupSpeakerLabel(event?.member || 'A bot')
 
   return `${who} ${base}`
 }
@@ -6921,7 +6925,7 @@ function formatGroupChatLine(entry, viewerName) {
     : ''
 
   if (entry.from.kind === 'user') {
-    return `${entry.from.name || 'User'} (user): ${entry.text}${attached}`
+    return `${GROUP_HUMAN_LABEL} (user): ${entry.text}${attached}`
   }
 
   const suffix = entry.from.name === viewerName ? ' (you)' : ''
@@ -13698,13 +13702,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                           ? (b.connectionLabel || b.connectionId) === entry.from.source
                           : !b.remoteSource)
                       ) || null
-                  const display = isUser ? 'You' : displayName(member || { name: entry.from.name }, meta)
+                  const display = isUser ? GROUP_HUMAN_LABEL : displayName(member || { name: entry.from.name }, meta)
                   const entryKey = `${entry.at}:${index}`
                   const revealed = !isUser && revealedSpeaker === entryKey
                   // Clicked: append the gateway name so same-named agents on
                   // two connections are tellable apart on demand.
                   const label = isUser
-                    ? 'You'
+                    ? GROUP_HUMAN_LABEL
                     : revealed
                       ? `${display}${entry.from.source ? `-${entry.from.source}` : ''} (@${botHandle(entry.from.name, member || undefined)})`
                       : display
@@ -14654,7 +14658,7 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
   const lastFrom = last?.from?.name || ''
   const lastHandle = botHandle(lastFrom || 'bot', members.find(member => member?.name === lastFrom))
   const preview = last
-    ? `${last.from?.kind === 'user' ? 'You' : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
+    ? `${last.from?.kind === 'user' ? GROUP_HUMAN_LABEL : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
     : `${members.length} bots`
   const availableMembers = members.filter(member => botSourceStatus(member).available).length
   const availabilityLabel = `${availableMembers} of ${members.length} available`
