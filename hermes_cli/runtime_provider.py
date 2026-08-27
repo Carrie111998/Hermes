@@ -1165,6 +1165,14 @@ def _resolve_named_custom_runtime(
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
+        # The pool reports the shared billing class ("custom"), but runtime
+        # policy needs the configured endpoint identity.  Keep the same stable
+        # slug used by model selection/session persistence so a pooled named
+        # provider cannot silently acquire bare-custom request semantics.
+        pool_result["provider"] = custom_provider_slug(
+            str(custom_provider.get("name") or requested_provider),
+            str(custom_provider.get("provider_key") or ""),
+        )
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
         # An explicit ``target_model`` wins (same rule as the non-pool path).

@@ -1609,8 +1609,8 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
         },
     )
 
-    # Exercise the public resolver: it is responsible for preserving the
-    # original named identity after the pool path canonicalizes to "custom".
+    # Exercise the public resolver: pooled credentials must not collapse the
+    # configured provider identity into the shared "custom" billing class.
     resolved = rp.resolve_runtime_provider(requested="custom:lmstudio")
 
     assert resolved is not None
@@ -1620,7 +1620,7 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     }
     assert resolved["api_key"] == "pooled-key"
     assert resolved["source"] == "pool:lmstudio-pool"
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "custom:lmstudio"
     assert resolved["requested_provider"] == "custom:lmstudio"
 
 
