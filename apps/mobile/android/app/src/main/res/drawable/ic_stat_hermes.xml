@@ -1,0 +1,11 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Monochrome Hermes mark for Android's status/lock-screen notification
+         mask. Transparent outside the mark; Android applies the system tint. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,4h3v6h8V4h3v16h-3v-7H8v7H5zM10.5,6.5h3v2h-3zM10.5,15.5h3v2h-3z" />
+</vector>

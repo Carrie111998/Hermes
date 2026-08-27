@@ -32,6 +32,12 @@ const config: CapacitorConfig = {
     Keyboard: {
       resize: 'none',
     },
+    // Android needs a monochrome small icon for status/lock-screen notices;
+    // launcher bitmaps render as a blank/white square in that constrained slot.
+    LocalNotifications: {
+      iconColor: '#5E8BFF',
+      smallIcon: 'ic_stat_hermes',
+    },
   },
   server: {
     // The installed mobile client connects only to a TLS-enabled private gateway.
