@@ -173,6 +173,26 @@ class HostedRoomService:
                     payload=decision.task.payload,
                     clock=time.time,
                 )
+                # A stop can race the policy read from another process. Re-read
+                # after admission and cancel before the runtime can execute a
+                # task whose source event is now behind the room stop fence.
+                fresh_events = self._events(binding.room_id)
+                stopped_through_seq = max(
+                    (
+                        int(event["seq"])
+                        for event in fresh_events
+                        if event.get("kind") == "room.stop_requested"
+                    ),
+                    default=0,
+                )
+                if (
+                    decision.source_event_seq is not None
+                    and decision.source_event_seq < stopped_through_seq
+                ):
+                    self.runtime.cancel(
+                        decision.task.identity,
+                        cancel_id=f"stop-fence:{stopped_through_seq}",
+                    )
             elif decision.status in {"settled", "bounded"}:
                 self._append_room_status(room, decision)
 
@@ -238,6 +258,11 @@ class HostedRoomService:
         return event
 
     def stop_room(self, room_id: str, *, cancel_id: str) -> int:
+        hosted_rooms.request_room_stop(
+            self.db_path,
+            room_id=room_id,
+            cancel_id=cancel_id,
+        )
         cancelled = 0
         with self._policy_lock:
             for status in ("queued", "running", "indeterminate"):
@@ -259,8 +284,11 @@ class HostedRoomService:
         counts = Counter(str(task["status"]) for task in tasks)
         return {
             "running": runtime["running"],
-            "working": bool(counts.get("running") or counts.get("queued")),
+            "working": bool(
+                counts.get("running")
+                or counts.get("queued")
+                or counts.get("stopping")
+            ),
             "blocked": room_id in runtime["blocked_rooms"] or bool(counts.get("indeterminate")),
             "counts": dict(counts),
         }
-

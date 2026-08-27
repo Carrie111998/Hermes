@@ -12,6 +12,7 @@ can isolate state. Production handlers use the gateway's root ``state.db``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -64,6 +65,7 @@ _EVENT_KINDS_BY_ACTOR = {
     "gateway": frozenset({
         "member.unavailable",
         "room.activity",
+        "room.stop_requested",
         "turn.deferred",
         "turn.reassigned",
         "turn.cancelled",
@@ -736,6 +738,33 @@ def room_state(
     if claim_row is not None:
         state["authority_claim"] = _event_from_row(claim_row)
     return state
+
+
+def request_room_stop(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    cancel_id: Any,
+) -> dict[str, Any]:
+    """Append an idempotent fence that supersedes earlier user turns."""
+
+    cancel_id = _validate_identifier(
+        cancel_id,
+        label="cancel_id",
+        max_chars=MAX_EVENT_ID_CHARS,
+    )
+    room = room_state(db_path, room_id=room_id)
+    digest = hashlib.sha256(cancel_id.encode()).hexdigest()[:32]
+    return append_event(
+        db_path,
+        room_id=room["room_id"],
+        event_id=f"room-stop:{digest}",
+        kind="room.stop_requested",
+        actor={"kind": "gateway", "id": room["authority_gateway_id"]},
+        payload={"cancel_id": cancel_id},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
 
 
 def claim_authority(

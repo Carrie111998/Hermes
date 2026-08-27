@@ -161,3 +161,35 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     replayed = service._events("room-1")
     assert replayed == events
 
+
+def test_stop_fence_prevents_the_next_room_member_from_starting(
+    tmp_path: Path, monkeypatch
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    monkeypatch.setattr(service, "local_profiles", lambda: ("default", "ops"))
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "Inspect the release", "thread_id": "thread-1"},
+    )
+    assert len(driver.list_tasks(db, room_id="room-1")) == 1
+
+    assert service.stop_room("room-1", cancel_id="stop-1") == 1
+    service.prepare_room(service.bindings()[0])
+
+    tasks = driver.list_tasks(db, room_id="room-1")
+    assert len(tasks) == 1
+    assert tasks[0]["status"] == "cancelled"
+    assert any(
+        event["kind"] == "room.stop_requested"
+        for event in service._events("room-1")
+    )

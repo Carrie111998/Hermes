@@ -148,6 +148,30 @@ def _append_publication(
     ]
 
 
+def _append_activity(
+    db: Path,
+    *,
+    event_id: str,
+    discussion_event_id: str,
+    thread_id: str,
+) -> dict:
+    return hosted_rooms.append_event(
+        db,
+        room_id=ROOM_ID,
+        event_id=event_id,
+        kind="room.activity",
+        actor={"kind": "gateway", "id": GATEWAY_ID},
+        payload={
+            "status": "settled",
+            "reason_code": "silent_round",
+            "thread_id": thread_id,
+            "discussion_event_id": discussion_event_id,
+        },
+        authority_gateway_id=GATEWAY_ID,
+        authority_epoch=1,
+    )
+
+
 def _next_task(room: dict, db: Path) -> discussion.DiscussionTaskPlan:
     decision = discussion.plan_next_task(
         room,
@@ -176,6 +200,44 @@ def _settle_next(
     )
     _append_publication(db, publication)
     return task
+
+
+def test_distinct_threads_are_planned_fifo_without_skipping(room_db):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="First", thread_id="thread-1")
+    _append_user(db, event_id="user-2", text="Second", thread_id="thread-2")
+
+    first = _next_task(room, db)
+    assert first.discussion_event_id == "user-1"
+    _append_activity(
+        db,
+        event_id="activity-1",
+        discussion_event_id="user-1",
+        thread_id="thread-1",
+    )
+    second = _next_task(room, db)
+    assert second.discussion_event_id == "user-2"
+
+
+def test_room_stop_fences_old_work_but_allows_a_later_message(room_db):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="First", thread_id="thread-1")
+    stop = hosted_rooms.request_room_stop(
+        db,
+        room_id=ROOM_ID,
+        cancel_id="user-stop-1",
+    )
+    decision = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert decision.status == "idle"
+    assert stop["kind"] == "room.stop_requested"
+
+    _append_user(db, event_id="user-2", text="Continue", thread_id="thread-2")
+    resumed = _next_task(room, db)
+    assert resumed.discussion_event_id == "user-2"
 
 
 def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
