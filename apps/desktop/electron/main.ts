@@ -12695,7 +12695,10 @@ async function startHermes() {
 // sprite in unzoomed CSS px (overlayWindowSize -> setBounds) and has its own
 // Alt+wheel scale, so inheriting the global UI zoom would render the mascot
 // larger than its window and crop it. Chat windows keep zoom on.
-function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
+function wireCommonWindowHandlers(
+  win,
+  { zoom = true, guardLastWindowClose = false }: { zoom?: boolean; guardLastWindowClose?: boolean } = {}
+) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
   installBrowserNavGestures(win)
@@ -12738,6 +12741,12 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     event.preventDefault()
     openExternalUrl(url)
   })
+
+  if (guardLastWindowClose) {
+    win.on('close', event => {
+      heldLastWindowCloseForActiveWork(event, win)
+    })
+  }
 }
 
 // Every window we open starts with `show: false` so the renderer's first themed
@@ -12826,7 +12835,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
   win.on('leave-full-screen', () => sendWindowStateChanged(false))
 
   streamThrottle.register(win)
-  wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+  wireCommonWindowHandlers(win, { ...zoomWiringForWindowKind('chat'), guardLastWindowClose: true })
   attachRendererConsoleCapture(win, 'session-window', rememberLog)
 
   // Renderer lifecycle diagnostics + recovery (#81290): a dead session-window
@@ -13008,7 +13017,7 @@ function createInstanceWindow() {
   win.on('leave-full-screen', () => sendWindowStateChanged(false, win))
 
   streamThrottle.register(win)
-  wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+  wireCommonWindowHandlers(win, { ...zoomWiringForWindowKind('chat'), guardLastWindowClose: true })
 
   // Renderer lifecycle diagnostics + recovery (#81290), same policy as the
   // primary and session windows: a crashed instance renderer logs with its
@@ -14041,7 +14050,7 @@ function createWindow() {
   })
 
   streamThrottle.register(mainWindow)
-  wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
+  wireCommonWindowHandlers(mainWindow, { ...zoomWiringForWindowKind('chat'), guardLastWindowClose: true })
 
   // Per-window renderer lifecycle diagnostics + recovery (#81290). The reload
   // policy (crashed/oom → bounded reload via the shared rolling budget, then
@@ -17437,19 +17446,17 @@ function configureSpellChecker() {
 // Ask before a quit kills a turn in flight. True when the quit was intercepted
 // and the confirmation is on screen; "Quit Anyway" re-enters before-quit with
 // the latch set and falls straight through to the teardown below.
-function heldQuitForActiveWork(event: Electron.Event): boolean {
+function holdForActiveWork(parent, onConfirm: () => void): boolean {
   if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
     return false
   }
 
   const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
-  const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
 
   if (!prompt || !parent || parent.isDestroyed()) {
     return false
   }
 
-  event.preventDefault()
   quitPromptOpen = true
 
   void dialog
@@ -17466,16 +17473,37 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
 
       if (response === 1) {
         quitConfirmedWithActiveWork = true
-        app.quit()
+        onConfirm()
       }
     })
     .catch(() => {
-      // A dialog we can't show must not become a quit we can't perform.
       quitPromptOpen = false
       quitConfirmedWithActiveWork = true
-      app.quit()
+      onConfirm()
     })
 
+  return true
+}
+
+function heldQuitForActiveWork(event: Electron.Event): boolean {
+  const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+
+  if (!holdForActiveWork(parent, () => app.quit())) {
+    return false
+  }
+
+  event.preventDefault()
+  return true
+}
+
+function heldLastWindowCloseForActiveWork(event: Electron.Event, win): boolean {
+  const isLastWindow = BrowserWindow.getAllWindows().every(other => other === win || other.isDestroyed())
+
+  if (!isLastWindow || !holdForActiveWork(win, () => win.close())) {
+    return false
+  }
+
+  event.preventDefault()
   return true
 }
 
