@@ -82,7 +82,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -124,7 +124,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -169,7 +169,7 @@ activities:
     execution_class: P3
     quality_floor: premium
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -217,7 +217,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -262,7 +262,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -341,7 +341,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -383,7 +383,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -502,7 +502,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -544,7 +544,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -737,7 +737,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -782,7 +782,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1012,7 +1012,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1054,7 +1054,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1096,7 +1096,7 @@ activities:
     execution_class: P3
     quality_floor: premium
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1144,7 +1144,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1186,7 +1186,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1228,7 +1228,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1270,7 +1270,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1352,7 +1352,7 @@ activities:
     execution_class: P3
     quality_floor: premium
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1400,7 +1400,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1442,7 +1442,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1484,7 +1484,7 @@ activities:
     execution_class: P3
     quality_floor: premium
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1532,7 +1532,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1577,7 +1577,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1622,7 +1622,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1667,7 +1667,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1749,7 +1749,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1794,7 +1794,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1950,7 +1950,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -1995,7 +1995,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2111,7 +2111,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2156,7 +2156,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2201,7 +2201,7 @@ activities:
     execution_class: S2
     quality_floor: standard
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2467,7 +2467,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2508,7 +2508,7 @@ activities:
     execution_class: S1
     quality_floor: bounded
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2549,7 +2549,7 @@ activities:
     execution_class: P3
     quality_floor: premium
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:
@@ -2597,7 +2597,7 @@ activities:
     execution_class: P3
     quality_floor: premium
     preferred_models:
-    - deepseek/deepseek-v4-pro
+    - z-ai/glm-5.3-flash
     allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
     reasoning:

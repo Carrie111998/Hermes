@@ -45,7 +45,7 @@ class TargetConfig:
     canary_real: bool = False
     pr_budget: int = 1
     pr_budget_window_hours: int = 24
-    agent_model: str = "deepseek/deepseek-v4-pro"
+    agent_model: str = "z-ai/glm-5.3-flash"
     agent_max_iterations: int = 25
     agent_max_tokens: int = 200_000
     agent_max_files: int = 10
@@ -144,7 +144,7 @@ def load_allowlist(path: Path) -> Allowlist:
             raise AllowlistError(
                 f"allowlist target '{name}' malformed: pr_budget/pr_budget_window_hours must be int ({exc})"
             ) from exc
-        agent_model = str(raw.get("agent_model", "deepseek/deepseek-v4-pro")).strip()
+        agent_model = str(raw.get("agent_model", "z-ai/glm-5.3-flash")).strip()
         if not agent_model:
             raise AllowlistError(f"allowlist target '{name}' malformed: agent_model must be a non-empty string")
         agent_ints = {}

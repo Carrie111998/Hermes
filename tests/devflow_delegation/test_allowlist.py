@@ -193,7 +193,7 @@ def test_path_allowed_enforces_allow_and_deny(allowlist_file):
 
 def test_agent_fields_have_conservative_defaults(tmp_path):
     target = resolve_target(load_allowlist(_canary_file(tmp_path)), "sandbox")
-    assert target.agent_model == "deepseek/deepseek-v4-pro"
+    assert target.agent_model == "z-ai/glm-5.3-flash"
     assert target.agent_max_iterations == 25
     assert target.agent_max_tokens == 200_000
     assert target.agent_max_files == 10
