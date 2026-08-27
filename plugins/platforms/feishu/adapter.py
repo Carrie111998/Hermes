@@ -5864,6 +5864,8 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
     """
     if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
         os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+    if "ignore_at_all" in feishu_cfg and not os.getenv("FEISHU_IGNORE_AT_ALL"):
+        os.environ["FEISHU_IGNORE_AT_ALL"] = str(feishu_cfg["ignore_at_all"]).lower()
     return None
 
 
