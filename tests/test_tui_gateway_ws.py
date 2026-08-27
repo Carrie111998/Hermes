@@ -137,6 +137,68 @@ def test_event_only_ws_rejects_rpc_before_dispatch(monkeypatch):
     }
 
 
+def test_spectator_ws_allows_only_read_only_subscription_methods(monkeypatch):
+    sent = []
+    dispatched = []
+    inbound = iter(
+        [
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.subscribe",
+                    "params": {"session_id": "stored-1"},
+                }
+            ),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "prompt.submit",
+                    "params": {"session_id": "stored-1", "text": "blocked"},
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+
+    def fake_dispatch(req, _transport):
+        dispatched.append(req["method"])
+        return {"jsonrpc": "2.0", "id": req["id"], "result": {"subscribed": True}}
+
+    monkeypatch.setattr(server, "dispatch", fake_dispatch)
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            try:
+                return next(inbound)
+            except StopIteration:
+                raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(
+        ws_mod.handle_ws(
+            FakeWS(),
+            allowed_methods=frozenset({"session.subscribe", "session.unsubscribe"}),
+        )
+    )
+
+    assert dispatched == ["session.subscribe"]
+    rejection = next(frame for frame in sent if frame.get("id") == 2)
+    assert rejection["error"] == {
+        "code": -32601,
+        "message": "method not allowed on read-only transport",
+    }
+
+
 def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     released = []
     created = []
@@ -149,6 +211,20 @@ def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     _run_disconnect(monkeypatch, lambda transport: created.append(transport))
 
     assert released == created
+
+
+def test_ws_disconnect_unsubscribes_event_transport(monkeypatch):
+    removed = []
+    created = []
+    monkeypatch.setattr(
+        server,
+        "_unsubscribe_transport_from_all_sessions",
+        lambda transport: removed.append(transport) or 1,
+    )
+
+    _run_disconnect(monkeypatch, lambda transport: created.append(transport))
+
+    assert removed == created
 
 
 

@@ -3,10 +3,12 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+from collections import deque
 import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -14,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -2494,13 +2497,16 @@ def write_json(obj: dict) -> bool:
     ``session.events.since``.
     """
     if obj.get("method") == "event":
-        params = obj.get("params")
-        sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            from tui_gateway.event_replay import _stamp_event
-
-            _stamp_event(obj)
-            return t.write(obj)
+        sid = ((obj.get("params") or {}).get("session_id")) or ""
+        if sid and (session := _sessions.get(sid)) is not None:
+            primary = session.get("transport")
+            if primary is None:
+                # Preserve the historical fallback for sparse/test/adaptor
+                # session records that predate the stored transport field.
+                primary = current_transport() or _stdio_transport
+            return _session_event_stream(session).publish(
+                obj, primary=primary
+            )
 
     from tui_gateway.event_replay import _stamp_event
 
@@ -2517,6 +2523,274 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 def _emit(event: str, sid: str, payload: dict | None = None):
     write_json(_event_frame(event, sid, payload))
+
+
+# Per-runtime live-event replay is deliberately bounded. It is a reconnect aid,
+# not a second transcript store: durable messages remain authoritative in
+# state.db and a replay gap tells the reader to rehydrate there.
+_SESSION_EVENT_REPLAY_LIMIT = 512
+
+
+class _SessionEventStream:
+    """Ordered multicast for one authoritative in-memory session runtime.
+
+    ``session["transport"]`` remains the sole writer/interactive owner. Extra
+    transports registered here are receive-only observers and can never replace
+    it. Event ids are scoped by ``runtime_generation`` because a gateway restart
+    or cold runtime rebuild legitimately starts a fresh in-memory sequence.
+    """
+
+    def __init__(self, replay_limit: int) -> None:
+        self.runtime_generation = uuid.uuid4().hex
+        self.next_event_id = 1
+        self.replay = deque(maxlen=max(1, int(replay_limit)))
+        self.subscribers: set[Transport] = set()
+        # Delivery ordering must not keep disconnected WebSocket transports
+        # alive for the lifetime of a long-running agent session.  The stream
+        # lock serializes all WeakKeyDictionary access, while the transport's
+        # own lifetime guarantees one stable lock for every concurrent use.
+        self.delivery_locks: weakref.WeakKeyDictionary[
+            Transport, threading.Lock
+        ] = weakref.WeakKeyDictionary()
+        self.lock = threading.RLock()
+
+    def _delivery_lock(self, transport: Transport) -> threading.Lock:
+        lock = self.delivery_locks.get(transport)
+        if lock is None:
+            lock = threading.Lock()
+            self.delivery_locks[transport] = lock
+        return lock
+
+    def publish(self, frame: dict, *, primary: Transport | None) -> bool:
+        """Assign an id, retain the frame, then deliver it once to every target."""
+        acquired: list[threading.Lock] = []
+        with self.lock:
+            event_id = self.next_event_id
+            self.next_event_id += 1
+            ordered = copy.deepcopy(frame)
+            params = ordered.setdefault("params", {})
+            params["event_id"] = event_id
+            params["runtime_generation"] = self.runtime_generation
+            self.replay.append(ordered)
+
+            targets: list[Transport] = []
+            for transport in (primary, *self.subscribers):
+                if transport is None or transport is _detached_ws_transport:
+                    continue
+                if transport not in targets:
+                    targets.append(transport)
+
+            # Acquire every target's delivery lock while sequence assignment is
+            # still locked. A later publisher therefore cannot deliver event N+1
+            # before N, even when callbacks emit concurrently from several threads.
+            for transport in sorted(targets, key=id):
+                lock = self._delivery_lock(transport)
+                lock.acquire()
+                acquired.append(lock)
+
+        primary_ok = False if primary is _detached_ws_transport else primary is None
+        failed_subscribers: list[Transport] = []
+        try:
+            for transport in targets:
+                try:
+                    ok = bool(transport.write(ordered))
+                except Exception:
+                    ok = False
+                    logger.debug("session-event subscriber write failed", exc_info=True)
+                if transport is primary:
+                    primary_ok = ok
+                if not ok and transport in self.subscribers:
+                    failed_subscribers.append(transport)
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
+        if failed_subscribers:
+            with self.lock:
+                for transport in failed_subscribers:
+                    self.subscribers.discard(transport)
+        return primary_ok
+
+    def subscribe(
+        self,
+        transport: Transport,
+        *,
+        after_event_id: int | None,
+        runtime_generation: str | None,
+    ) -> dict:
+        """Attach an observer and synchronously replay its retained suffix.
+
+        The observer's delivery lock is acquired before it becomes visible to a
+        later publisher. Live event N+1 consequently waits until replay through N
+        has been written, preventing reconnect duplicates/reordering at the wire.
+        """
+        with self.lock:
+            latest = self.next_event_id - 1
+            oldest = int(self.replay[0]["params"]["event_id"]) if self.replay else latest + 1
+            cursor = latest if after_event_id is None else after_event_id
+
+            # A retry on the same connection is an idempotent status query.
+            # Replaying here would duplicate events already written to that
+            # transport after the first subscribe response was lost/delayed.
+            if transport in self.subscribers:
+                return {
+                    "runtime_generation": self.runtime_generation,
+                    "oldest_event_id": oldest,
+                    "latest_event_id": latest,
+                    "replayed": 0,
+                    "replay_gap": False,
+                    "gap_reason": None,
+                    "subscribed": True,
+                    "already_subscribed": True,
+                }
+
+            gap_reason = None
+            if after_event_id is not None and not runtime_generation:
+                gap_reason = "runtime_generation_required"
+            elif runtime_generation and runtime_generation != self.runtime_generation:
+                gap_reason = "runtime_generation_changed"
+            elif cursor > latest:
+                gap_reason = "cursor_ahead"
+            elif cursor < oldest - 1:
+                gap_reason = "replay_window_exceeded"
+
+            # Never emit a partial retained suffix before the caller learns it
+            # has a gap.  The client must rehydrate durable state and subscribe
+            # again with the returned generation/cursor.
+            if gap_reason:
+                return {
+                    "runtime_generation": self.runtime_generation,
+                    "oldest_event_id": oldest,
+                    "latest_event_id": latest,
+                    "replayed": 0,
+                    "replay_gap": True,
+                    "gap_reason": gap_reason,
+                    "subscribed": False,
+                    "already_subscribed": False,
+                }
+
+            replay = [
+                frame
+                for frame in self.replay
+                if int(frame["params"]["event_id"]) > cursor
+            ]
+
+            self.subscribers.add(transport)
+            delivery_lock = self._delivery_lock(transport)
+            delivery_lock.acquire()
+
+        ok = True
+        try:
+            for frame in replay:
+                if not transport.write(copy.deepcopy(frame)):
+                    ok = False
+                    break
+        except Exception:
+            ok = False
+            logger.debug("session-event replay write failed", exc_info=True)
+        finally:
+            delivery_lock.release()
+
+        if not ok:
+            self.unsubscribe(transport)
+            raise RuntimeError("subscriber transport closed during replay")
+
+        return {
+            "runtime_generation": self.runtime_generation,
+            "oldest_event_id": oldest,
+            "latest_event_id": latest,
+            "replayed": len(replay),
+            "replay_gap": gap_reason is not None,
+            "gap_reason": gap_reason,
+            "subscribed": True,
+            "already_subscribed": False,
+        }
+
+    def unsubscribe(self, transport: Transport) -> bool:
+        with self.lock:
+            removed = transport in self.subscribers
+            self.subscribers.discard(transport)
+            return removed
+
+
+def _session_event_stream(session: dict) -> _SessionEventStream:
+    """Return the lazily-created stream for a session record."""
+    with _sessions_lock:
+        stream = session.get("_event_stream")
+        if not isinstance(stream, _SessionEventStream):
+            stream = _SessionEventStream(_SESSION_EVENT_REPLAY_LIMIT)
+            session["_event_stream"] = stream
+        return stream
+
+
+def _subscribe_session_events(
+    sid: str,
+    session: dict,
+    transport: Transport,
+    *,
+    after_event_id: int | None = None,
+    runtime_generation: str | None = None,
+) -> dict:
+    result = _session_event_stream(session).subscribe(
+        transport,
+        after_event_id=after_event_id,
+        runtime_generation=runtime_generation,
+    )
+    return {
+        "session_id": sid,
+        "session_key": _session_lookup_key(session, fallback=sid),
+        **result,
+        "cursor": {
+            "runtime_generation": result["runtime_generation"],
+            "event_id": result["latest_event_id"],
+        },
+    }
+
+
+def _unsubscribe_session_events(session: dict, transport: Transport) -> bool:
+    stream = session.get("_event_stream")
+    return bool(
+        isinstance(stream, _SessionEventStream) and stream.unsubscribe(transport)
+    )
+
+
+def _unsubscribe_transport_from_all_sessions(transport: Transport) -> int:
+    """Remove a disconnected observer without touching runtime ownership."""
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+    return sum(_unsubscribe_session_events(session, transport) for session in sessions)
+
+
+def _subscription_cursor(rid, params: dict):
+    """Parse the reconnect cursor accepted by session.subscribe."""
+    cursor = params.get("cursor")
+    if cursor is not None and not isinstance(cursor, dict):
+        return None, None, _err(rid, 4006, "cursor must be an object")
+    cursor = cursor or {}
+    raw_event_id = cursor.get("event_id", params.get("after_event_id"))
+    generation = str(
+        cursor.get("runtime_generation", params.get("runtime_generation")) or ""
+    ).strip() or None
+    if raw_event_id is None:
+        return None, generation, None
+    if isinstance(raw_event_id, bool) or not isinstance(raw_event_id, (int, float)):
+        return None, None, _err(rid, 4006, "cursor event_id must be an integer")
+    if isinstance(raw_event_id, float) and (
+        not math.isfinite(raw_event_id) or not raw_event_id.is_integer()
+    ):
+        return None, None, _err(rid, 4006, "cursor event_id must be an integer")
+    event_id = int(raw_event_id)
+    if event_id < 0:
+        return None, None, _err(rid, 4006, "cursor event_id must be non-negative")
+    return event_id, generation, None
+
+
+def _live_subscription_target(target: str):
+    with _sessions_lock:
+        session = _sessions.get(target)
+        if session is not None and not session.get("_finalized"):
+            return target, session
+        return _find_live_session_by_key(target)
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).

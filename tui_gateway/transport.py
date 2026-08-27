@@ -105,7 +105,10 @@ class StdioTransport:
     existing test suite relies on (``monkeypatch.setattr(server, "_real_stdout", ...)``).
     """
 
-    __slots__ = ("_stream_getter", "_lock")
+    # Event-stream delivery locks use weak transport keys so disconnected
+    # peers are not retained by long-running sessions.  Keep this slotted
+    # transport weak-referenceable without otherwise changing its layout.
+    __slots__ = ("_stream_getter", "_lock", "__weakref__")
 
     def __init__(self, stream_getter: Callable[[], Any], lock: threading.Lock) -> None:
         self._stream_getter = stream_getter
@@ -192,7 +195,9 @@ class TeeTransport:
     on stdio (Ink) AND on a back-WS feeding the dashboard sidebar.
     """
 
-    __slots__ = ("_primary", "_secondaries")
+    # Session event ordering also keys locks by this wrapper when the PTY
+    # sidecar mirrors stdio into the dashboard event feed.
+    __slots__ = ("_primary", "_secondaries", "__weakref__")
 
     def __init__(self, primary: "Transport", *secondaries: "Transport") -> None:
         self._primary = primary

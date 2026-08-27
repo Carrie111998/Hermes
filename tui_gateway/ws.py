@@ -333,9 +333,9 @@ async def handle_ws(
     callers (stdio-free harnesses, the embedded TUI child) omit it and get a
     ``None`` transport identity — unchanged behaviour.
 
-    ``allowed_methods=frozenset()`` creates an event-only transport: global
-    broadcasts still reach the peer, while every inbound JSON-RPC method is
-    rejected before dispatch. The iPad spectator uses this server-side fence.
+    ``allowed_methods`` creates a server-fenced transport. The iPad spectator
+    receives only the two read-only session subscription methods; prompt,
+    approval, clarify, terminal, files and settings never reach dispatch.
     """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -388,6 +388,7 @@ async def handle_ws(
                         # clients detect a backend restart and reset their
                         # per-session seq watermarks (see event_replay).
                         "replay_epoch": replay_epoch(),
+                        "session_event_replay": True,
                     },
                 },
             }
@@ -570,6 +571,7 @@ async def handle_ws(
             except Exception:
                 _log.exception("ws browser-controller disconnect failed peer=%s", peer)
 
+            server._unsubscribe_transport_from_all_sessions(transport)
             transport.close()
 
             try:

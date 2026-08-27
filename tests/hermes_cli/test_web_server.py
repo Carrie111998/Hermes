@@ -5229,6 +5229,28 @@ class TestSpectatorServerScope:
         response = self.client.get("/api/env", headers=self.headers)
         assert response.status_code == 403
 
+    def test_scoped_credential_maps_gateway_ws_to_read_only_methods(self, monkeypatch):
+        from tui_gateway import ws as gateway_ws_module
+
+        captured = []
+
+        async def fake_handle_ws(socket, *, allowed_methods=None):
+            captured.append(allowed_methods)
+            await socket.accept()
+            await socket.close()
+
+        monkeypatch.setattr(self.ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.setattr(gateway_ws_module, "handle_ws", fake_handle_ws)
+
+        with self.client.websocket_connect(
+            f"/api/ws?spectator={self.ws._SPECTATOR_TOKEN}"
+        ):
+            pass
+
+        assert captured == [
+            frozenset({"session.subscribe", "session.unsubscribe"})
+        ]
+
 
 class TestDashboardComponentHealth:
     """Component-health rollup: error middleware, /api/status components, self-test."""

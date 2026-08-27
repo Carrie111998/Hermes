@@ -592,6 +592,18 @@ def _resolve_session_token() -> str:
 
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_SPECTATOR_TOKEN = secrets.token_urlsafe(32)
+_SPECTATOR_HEADER_NAME = "X-Hermes-Spectator-Token"
+_SPECTATOR_WS_METHODS = frozenset({"session.subscribe", "session.unsubscribe"})
+_SPECTATOR_READ_API_PREFIXES = (
+    "/api/config",
+    "/api/hermes/version",
+    "/api/model/info",
+    "/api/personalities",
+    "/api/profiles",
+    "/api/sessions",
+    "/api/status",
+)
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
 _SSH_RUNTIME_MARKER: Optional[str] = None
@@ -17641,7 +17653,7 @@ async def gateway_ws(ws: WebSocket) -> None:
         ws,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
-        allowed_methods=frozenset() if credential == "spectator" else None,
+        allowed_methods=_SPECTATOR_WS_METHODS if credential == "spectator" else None,
     )
 
 

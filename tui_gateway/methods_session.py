@@ -279,6 +279,99 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5006, str(e))
 
 
+@method("session.messages")
+def _(rid, params: dict) -> dict:
+    """Read a persisted transcript without resuming or touching the session.
+
+    Used by observer surfaces that must never create a second runtime or mutate
+    the authoritative conversation. ``offset`` is a durable message ordinal;
+    callers can publish a pre-run baseline and therefore cannot see older chat.
+    """
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    try:
+        offset = max(0, int(params.get("offset", 0) or 0))
+        limit = min(500, max(1, int(params.get("limit", 200) or 200)))
+    except (TypeError, ValueError):
+        return _err(rid, 4006, "offset and limit must be integers")
+
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5006)
+        try:
+            resolver = getattr(db, "resolve_session_id", None)
+            session_id = resolver(target) if callable(resolver) else target
+            if not session_id or not db.get_session(session_id):
+                return _err(rid, 4004, f"Session not found: {target}")
+            history = db.get_messages_as_conversation(
+                session_id,
+                repair_alternation=False,
+                include_row_ids=True,
+            )
+            page = history[offset : offset + limit]
+            return _ok(
+                rid,
+                {
+                    "session_id": session_id,
+                    "offset": offset,
+                    "next_offset": offset + len(page),
+                    "total": len(history),
+                    "messages": _history_to_messages(page),
+                },
+            )
+        except Exception as e:
+            return _err(rid, 5006, str(e))
+
+
+@method("session.subscribe")
+def _(rid, params: dict) -> dict:
+    """Attach the current transport as a receive-only live-session observer."""
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4006, "session.subscribe requires a live transport")
+    live = _live_subscription_target(target)
+    if live is None:
+        return _err(rid, 4007, "live session not found")
+    after_event_id, generation, err = _subscription_cursor(rid, params)
+    if err is not None:
+        return err
+    sid, session = live
+    try:
+        return _ok(
+            rid,
+            _subscribe_session_events(
+                sid,
+                session,
+                transport,
+                after_event_id=after_event_id,
+                runtime_generation=generation,
+            ),
+        )
+    except RuntimeError as exc:
+        return _err(rid, 5001, str(exc))
+
+
+@method("session.unsubscribe")
+def _(rid, params: dict) -> dict:
+    """Detach the current read-only observer; the runtime/writer is untouched."""
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4006, "session.unsubscribe requires a live transport")
+    live = _live_subscription_target(target)
+    removed = False if live is None else _unsubscribe_session_events(live[1], transport)
+    return _ok(
+        rid,
+        {"session_id": live[0] if live else target, "unsubscribed": removed},
+    )
+
+
 @method("session.most_recent")
 def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.
