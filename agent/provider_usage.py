@@ -33,12 +33,13 @@ from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.provider_usage_types import (
     STATE_NETWORK_ERROR,
     STATE_NO_USAGE_ENDPOINT,
     STATE_NOT_AUTHENTICATED,
+    STATE_OK,
     STATE_PARSE_ERROR,
     STATE_RATE_LIMITED,
     STATE_UNAUTHORIZED,
@@ -77,6 +78,13 @@ _CREDENTIAL_FILES = {
 _EXTRA_CANDIDATES = ("openrouter",)
 
 _CACHE_LOCK = threading.Lock()
+
+# Detection is disk-only but not free: it reads auth.json and sweeps the env
+# vars every registry provider declares. Panels reopen far faster than a
+# credential appears, so memoize it briefly rather than re-walking per call.
+_DETECT_TTL = 30.0
+_DETECT_LOCK = threading.Lock()
+_detect_memo: Optional[Tuple[float, List[str]]] = None
 
 
 def _utc_now() -> datetime:
@@ -169,7 +177,7 @@ def _has_credential_file(provider: str) -> bool:
     return False
 
 
-def detect_providers() -> List[str]:
+def detect_providers(*, use_memo: bool = True) -> List[str]:
     """Providers this machine holds a credential for. No network, no seeding.
 
     The persisted ``credential_pool`` is the strongest signal — it is what
@@ -178,6 +186,14 @@ def detect_providers() -> List[str]:
     credential files cover the case where a key is present but has never been
     seeded into the pool.
     """
+    global _detect_memo
+
+    if use_memo:
+        with _DETECT_LOCK:
+            memo = _detect_memo
+        if memo is not None and (time.time() - memo[0]) < _DETECT_TTL:
+            return list(memo[1])
+
     registry = _registry()
     persisted = _credential_pool()
     # A key whose value is an EMPTY list is a provider that was seeded once
@@ -195,7 +211,17 @@ def detect_providers() -> List[str]:
         ):
             detected.append(provider)
 
+    with _DETECT_LOCK:
+        _detect_memo = (time.time(), list(detected))
+
     return detected
+
+
+def _reset_detect_memo() -> None:
+    """Test seam — detection is memoized per process."""
+    global _detect_memo
+    with _DETECT_LOCK:
+        _detect_memo = None
 
 
 # ── Cache ──────────────────────────────────────────────────────────────────
@@ -433,7 +459,14 @@ def collect_usage(
 
     if to_fetch:
         fetched = _fetch_many(to_fetch, timeout)
-        results.update(fetched)
+        for name, usage in fetched.items():
+            floor = results.get(name)
+            # A failed refresh must not overwrite the numbers we kept as the
+            # floor — that is the whole point of holding them. `_store` already
+            # protects the cache file; this protects what the caller gets back.
+            if usage.state != STATE_OK and floor is not None and floor.windows:
+                continue
+            results[name] = usage
         _store(fetched)
 
     return [results[name] for name in names if name in results]
@@ -468,7 +501,7 @@ def _store(results: Dict[str, ProviderUsage]) -> None:
     A failure must not overwrite good numbers: the next call would then have no
     floor to fall back to, and a transient network blip would blank the panel.
     """
-    keepers = {name: usage for name, usage in results.items() if usage.state == "ok"}
+    keepers = {name: usage for name, usage in results.items() if usage.state == STATE_OK}
     if not keepers:
         return
 

@@ -2466,8 +2466,9 @@ def _(rid, params: dict) -> dict:
     Fans out over the providers this machine holds credentials for — Claude,
     Codex, Kimi, OpenRouter, Copilot, and anything a plugin adds — rather than
     the one provider this session happens to use. Cached per provider with a
-    stale-while-revalidate read, so opening the panel repeatedly costs nothing;
-    ``refresh: true`` is the manual button and skips the cache.
+    stale-while-revalidate read, and credential detection is memoized, so
+    reopening the panel costs a dict lookup; ``refresh: true`` is the manual
+    button and skips the cache.
 
     Fail-open like its billing siblings, and no scope required — same as
     ``billing.state`` / ``usage.bars`` / ``subscription.state``. Not quite

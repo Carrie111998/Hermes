@@ -23,6 +23,14 @@ from agent.provider_usage_types import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_detect_memo():
+    """Detection is memoized per process — a stale memo would leak across tests."""
+    provider_usage._reset_detect_memo()
+    yield
+    provider_usage._reset_detect_memo()
+
+
 # ── The unit model ─────────────────────────────────────────────────────────
 
 
@@ -71,7 +79,7 @@ def test_detection_reads_the_persisted_pool_without_seeding():
         patch.object(provider_usage, "_has_env_credential", return_value=False),
         patch.object(provider_usage, "_has_credential_file", return_value=False),
     ):
-        assert provider_usage.detect_providers() == ["kimi-coding"]
+        assert provider_usage.detect_providers(use_memo=False) == ["kimi-coding"]
 
 
 def test_a_pruned_pool_key_is_not_evidence_of_a_credential():
@@ -84,7 +92,7 @@ def test_a_pruned_pool_key_is_not_evidence_of_a_credential():
         patch.object(provider_usage, "_has_env_credential", return_value=False),
         patch.object(provider_usage, "_has_credential_file", return_value=False),
     ):
-        assert provider_usage.detect_providers() == []
+        assert provider_usage.detect_providers(use_memo=False) == []
 
 
 def test_openrouter_is_a_candidate_even_though_it_is_not_in_the_registry():
@@ -103,7 +111,7 @@ def test_detection_never_touches_the_credential_pool():
     import agent.credential_pool as pool_mod
 
     with patch.object(pool_mod, "load_pool", side_effect=AssertionError("load_pool called")):
-        provider_usage.detect_providers()
+        provider_usage.detect_providers(use_memo=False)
 
 
 def test_detection_covers_every_provider_the_live_pool_can_serve():
@@ -116,7 +124,7 @@ def test_detection_covers_every_provider_the_live_pool_can_serve():
     """
     from agent.credential_pool import load_pool
 
-    detected = set(provider_usage.detect_providers())
+    detected = set(provider_usage.detect_providers(use_memo=False))
     live = set()
     for provider in provider_usage.candidate_providers():
         try:
@@ -269,7 +277,9 @@ def test_the_cache_file_is_written_atomically(tmp_path):
         provider_usage._store({"demo": _usage("demo")})
 
     assert json.loads(cache_file.read_text())["demo"]["usage"]["provider"] == "demo"
-    assert not list(cache_file.parent.glob("tmp*"))
+    # atomic_write_text names its scratch file ".tmp_*", and glob skips
+    # dotfiles — match the real prefix or the assertion can never fail.
+    assert not list(cache_file.parent.glob(".tmp_*"))
 
 
 # ── Payload ────────────────────────────────────────────────────────────────
@@ -289,3 +299,60 @@ def test_the_rpc_payload_serialises_windows_for_the_wire():
     json.dumps(payload)  # must not raise
     assert payload["available"] is True
     assert payload["providers"][0]["windows"][0]["used_percent"] == 10.0
+
+
+def test_a_failed_refresh_falls_back_to_the_numbers_it_was_holding():
+    """The stale floor is the point — losing it on a blip blanks the panel.
+
+    `_store` protects the cache file; this protects what the caller gets back.
+    Without it, an expired entry plus one dropped connection returns
+    `state=network_error, windows=()` and the panel goes empty even though
+    perfectly good numbers were in hand a moment earlier.
+    """
+    cache = _cache_with("demo", 9_999)
+
+    with (
+        patch.object(provider_usage, "_profile", return_value=_Profile(_usage("demo"))),
+        patch.object(provider_usage, "_read_cache", return_value=cache),
+        patch.object(
+            provider_usage,
+            "_fetch_many",
+            return_value={"demo": ProviderUsage(provider="demo", state=STATE_NETWORK_ERROR)},
+        ),
+        patch.object(provider_usage, "_store"),
+    ):
+        (result,) = provider_usage.collect_usage(providers=["demo"])
+
+    assert result.state == STATE_OK
+    assert result.stale is True
+    assert result.windows[0].used_percent == 10.0
+
+
+def test_a_successful_refresh_clears_the_stale_mark():
+    cache = _cache_with("demo", 9_999)
+
+    with (
+        patch.object(provider_usage, "_profile", return_value=_Profile(_usage("demo"))),
+        patch.object(provider_usage, "_read_cache", return_value=cache),
+        patch.object(provider_usage, "_store"),
+    ):
+        (result,) = provider_usage.collect_usage(providers=["demo"])
+
+    assert result.stale is False
+
+
+def test_a_failure_with_no_floor_still_reports_the_failure():
+    # Nothing cached to fall back to — the typed state must survive.
+    with (
+        patch.object(provider_usage, "_profile", return_value=_Profile(_usage("demo"))),
+        patch.object(provider_usage, "_read_cache", return_value={}),
+        patch.object(
+            provider_usage,
+            "_fetch_many",
+            return_value={"demo": ProviderUsage(provider="demo", state=STATE_NETWORK_ERROR)},
+        ),
+        patch.object(provider_usage, "_store"),
+    ):
+        (result,) = provider_usage.collect_usage(providers=["demo"])
+
+    assert result.state == STATE_NETWORK_ERROR

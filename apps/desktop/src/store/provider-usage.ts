@@ -19,10 +19,10 @@ const EMPTY: ProviderUsageState = { loading: false, providers: [] }
  */
 export const $providerUsage = atom<ProviderUsageState>(EMPTY)
 
-// The backend caches per provider with its own TTL and serves
-// stale-while-revalidate, so a repeated call is nearly free. This guard is
-// only about not stacking concurrent round-trips when a panel is opened
-// twice in a row.
+// The backend caches per provider with its own TTL, memoizes credential
+// detection, and serves stale-while-revalidate — so a repeated call is cheap.
+// This guard is only about not stacking concurrent round-trips when a panel is
+// opened twice in a row.
 let inFlight: null | Promise<void> = null
 
 export async function refreshProviderUsage(options: { force?: boolean } = {}): Promise<void> {

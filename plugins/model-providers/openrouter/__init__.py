@@ -238,22 +238,78 @@ class OpenRouterProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 8.0,
     ):
-        """OpenRouter credit balance and key limits — dollars, not percent.
+        """OpenRouter balance and key limits — in dollars, not percent.
 
-        Wraps the fetcher that already backs ``/usage``, handing it the
-        aggregator's resolved key so the plugin never touches the pool.
+        Deliberately does NOT go through ``fetch_account_usage``: that path
+        returns the legacy percent-only snapshot shape, which would flatten a
+        credit balance into "96% of 100" and throw away the one figure anyone
+        actually wants. The raw dollar fields are reported as they arrive.
         """
-        from agent.account_usage import fetch_account_usage
-        from agent.provider_usage_types import from_account_snapshot
+        import httpx
 
-        return from_account_snapshot(
-            fetch_account_usage(
-                "openrouter",
-                base_url=base_url or getattr(credential, "base_url", None),
-                api_key=getattr(credential, "access_token", None),
-            ),
+        from agent.provider_usage_types import (
+            UNIT_CURRENCY,
+            ProviderUsage,
+            UsageWindow,
+            to_datetime,
+            to_decimal,
+        )
+
+        token = str(getattr(credential, "access_token", "") or "").strip()
+        if not token:
+            return None
+
+        base = str(base_url or getattr(credential, "base_url", "") or self.base_url).rstrip("/")
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        with httpx.Client(timeout=timeout) as client:
+            credits_response = client.get(f"{base}/credits", headers=headers)
+            credits_response.raise_for_status()
+            credits = ((credits_response.json() or {}).get("data")) or {}
+
+            # Key limits are optional — a key with no cap still has a balance,
+            # and losing the balance because /key 404s would be the wrong
+            # trade. Failures here degrade to one window, not to none.
+            try:
+                key_response = client.get(f"{base}/key", headers=headers)
+                key_response.raise_for_status()
+                key_data = ((key_response.json() or {}).get("data")) or {}
+            except Exception:
+                key_data = {}
+
+        purchased = to_decimal(credits.get("total_credits"))
+        spent = to_decimal(credits.get("total_usage"))
+
+        windows = [
+            UsageWindow(
+                label="credits",
+                unit=UNIT_CURRENCY,
+                currency="USD",
+                limit=purchased,
+                used=spent,
+                remaining=(purchased - spent) if purchased is not None and spent is not None else None,
+            )
+        ]
+
+        key_limit = to_decimal(key_data.get("limit"))
+        if key_limit is not None and key_limit > 0:
+            windows.append(
+                UsageWindow(
+                    label="key_limit",
+                    unit=UNIT_CURRENCY,
+                    currency="USD",
+                    limit=key_limit,
+                    used=to_decimal(key_data.get("usage")),
+                    remaining=to_decimal(key_data.get("limit_remaining")),
+                    reset_at=to_datetime(key_data.get("limit_reset")),
+                )
+            )
+
+        return ProviderUsage(
             provider="openrouter",
             display_name="OpenRouter",
+            plan="Free" if key_data.get("is_free_tier") else None,
+            windows=tuple(windows),
         )
 
 
