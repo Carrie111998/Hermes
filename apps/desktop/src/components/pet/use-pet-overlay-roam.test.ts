@@ -6,6 +6,7 @@ import {
   clampOverlayRoamBounds,
   nearestOverlayHopDestination,
   overlayDropAllowed,
+  overlayDropDestinations,
   overlayGroundY,
   overlayHasSupport,
   overlayHopApexY,
@@ -22,6 +23,7 @@ import {
   overlaySupportAt,
   overlaySupportMissOutcome,
   overlayVerticalCorrection,
+  randomOverlayDropDestination,
   revalidateOverlayPlannedHop,
   usePetOverlayRoam
 } from './use-pet-overlay-roam'
@@ -254,6 +256,30 @@ describe('overlay roam geometry', () => {
 
     expect(nearestOverlayHopDestination([farther, nearby], 600)).toBe(nearby)
     expect(nearestOverlayHopDestination([], 600)).toBeNull()
+  })
+
+  it('limits upward candidates to three pet heights but keeps every lower candidate', () => {
+    const current = { left: 100, right: 260, y: 400 }
+    const nearbyUpper = { left: 100, right: 260, y: 250 }
+    const tooHigh = { left: 100, right: 260, y: 100 }
+    const lower = { left: 100, right: 260, y: 520 }
+    const floor = { left: 0, right: 1000, y: 800 }
+    const offColumn = { left: 400, right: 600, y: 600 }
+    const ledges = [floor, current, nearbyUpper, tooHigh, lower, offColumn]
+
+    expect(overlayHopDestinations(ledges, current, 180, 70)).toEqual([{ ledge: nearbyUpper }])
+    expect(overlayDropDestinations(ledges, current, 180)).toEqual([{ ledge: floor }, { ledge: lower }])
+  })
+
+  it('selects a random pre-scanned drop destination', () => {
+    const candidates = [
+      { ledge: { left: 100, right: 260, y: 520 } },
+      { ledge: { left: 0, right: 1000, y: 800 } }
+    ]
+
+    expect(randomOverlayDropDestination(candidates, () => 0)).toBe(candidates[0])
+    expect(randomOverlayDropDestination(candidates, () => 0.999)).toBe(candidates[1])
+    expect(randomOverlayDropDestination([], () => 0.5)).toBeNull()
   })
 
   it('replans immediately when the drag completion key changes', async () => {

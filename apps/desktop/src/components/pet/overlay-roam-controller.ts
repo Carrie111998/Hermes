@@ -91,6 +91,37 @@ export function overlayHopDestinations(
   return upperSupports.length > 0 ? upperSupports : [{ ledge: fromLedge }]
 }
 
+/** Every support below the pet's current X is a valid drop destination. */
+export function overlayDropDestinations(
+  ledges: Ledge[],
+  fromLedge: Ledge,
+  fromX: number
+): OverlayHopDestination[] {
+  return ledges
+    .filter(
+      ledge =>
+        ledge !== fromLedge &&
+        ledge.y > fromLedge.y + 1 &&
+        fromX >= ledge.left - 2 &&
+        fromX <= ledge.right + 2
+    )
+    .map(ledge => ({ ledge }))
+}
+
+export function randomOverlayDropDestination(
+  candidates: OverlayHopDestination[],
+  rng: () => number = Math.random
+): OverlayHopDestination | null {
+  if (candidates.length === 0) {
+    return null
+  }
+
+  const sample = Math.max(0, Math.min(1, rng()))
+  const index = Math.min(candidates.length - 1, Math.floor(sample * candidates.length))
+
+  return candidates[index]!
+}
+
 /** Prefer the nearest valid support above the pet. */
 export function nearestOverlayHopDestination(
   candidates: OverlayHopDestination[],
@@ -353,9 +384,9 @@ export function overlayIdleAction(canDrop: boolean, rng: () => number = Math.ran
   return canDrop && sample < hopChance + DROP_CHANCE ? 'drop' : 'walk'
 }
 
-/** Never intentionally drop unless there is also somewhere valid to hop. */
-export const overlayDropAllowed = (isElevated: boolean, hasHopDestination: boolean): boolean =>
-  isElevated && hasHopDestination
+/** Never intentionally drop without a pre-scanned landing destination below. */
+export const overlayDropAllowed = (isElevated: boolean, hasDropDestination: boolean): boolean =>
+  isElevated && hasDropDestination
 
 export function overlayPlannedAction(
   canDrop: boolean,
@@ -565,7 +596,7 @@ export function startPetOverlayRoam({
     signal('jump')
   }
 
-  const beginDrop = (surface: Ledge) => {
+  const beginDrop = (surface: Ledge, destination: Ledge) => {
     if (!current) {
       return
     }
@@ -575,9 +606,9 @@ export function startPetOverlayRoam({
     nextSupportRetryAt = 0
     ignoredDropSurfaceY = surface.y
     plannedHopLanding = null
-    motionLandingLedges = ledges
+    motionLandingLedges = [destination]
     forceWalkNext = true
-    targetLedge = ledges[0]!
+    targetLedge = destination
     phase = 'fall'
     fallVelocity = 0
     signal('jump')
@@ -619,17 +650,22 @@ export function startPetOverlayRoam({
     const fromLedge = currentLedge
     const fromX = current.x
     const reachable = overlayHopDestinations(ledges, fromLedge, fromX, petH)
+    const dropDestinations = overlayDropDestinations(ledges, fromLedge, fromX)
 
     const idleAction = overlayPlannedAction(
-      overlayDropAllowed(currentLedge !== ledges[0], reachable.length > 0),
+      overlayDropAllowed(currentLedge !== ledges[0], dropDestinations.length > 0),
       supportMisses,
       settleAfterDrag || forceWalkNext
     )
 
     if (idleAction === 'drop') {
-      beginDrop(currentLedge)
+      const destination = randomOverlayDropDestination(dropDestinations)
 
-      return true
+      if (destination) {
+        beginDrop(currentLedge, destination.ledge)
+
+        return true
+      }
     }
 
     if (idleAction === 'hop') {

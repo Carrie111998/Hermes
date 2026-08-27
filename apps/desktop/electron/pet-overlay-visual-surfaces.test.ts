@@ -106,7 +106,7 @@ describe('pet overlay visual surface snapshots', () => {
     expect(landing[0]!.right - landing[0]!.left).toBe(192)
   })
 
-  it('finds the nearest vertical hop destination before tracing its full span', () => {
+  it('scans the full display height through a strip one-and-a-half pet widths wide', () => {
     const destinations = detectPetOverlayVisualLedges(frame, {
       overlayBounds: { height: 80, width: 80, x: 120, y: 0 },
       petHeight: 32,
@@ -115,24 +115,38 @@ describe('pet overlay visual surface snapshots', () => {
       workArea: electronMock.display.workArea
     })
 
-    expect(destinations).toMatchObject([{ y: 32 }])
-    expect(destinations[0]!.right - destinations[0]!.left).toBe(320)
+    expect(destinations).toMatchObject([{ y: 32 }, { y: 92 }])
+    expect(destinations.map(destination => destination.right - destination.left)).toEqual([96, 96])
   })
 
-  it('traces a selected contrast support sideways until the visible edge ends', () => {
-    const boundedFrame = grayscaleFrame(320, 180, (x, y) => (x >= 40 && x < 280 && y >= 32 ? 130 : 45))
+  it('traces the current support sideways after landing', () => {
+    const boundedFrame = grayscaleFrame(320, 180, (x, y) => (x >= 40 && x < 280 && y >= 96 ? 130 : 45))
 
     const destinations = detectPetOverlayVisualLedges(boundedFrame, {
-      // Keep the pet well off-center so a full-width trace must shift its scan
-      // window to the display edge instead of truncating the opposite side.
-      overlayBounds: { height: 80, width: 80, x: 200, y: 40 },
+      overlayBounds: { height: 80, width: 80, x: 120, y: 40 },
       petHeight: 32,
       petWidth: 64,
       scanMode: 'destination',
       workArea: electronMock.display.workArea
     })
 
-    expect(destinations).toMatchObject([{ left: 40, right: 280, y: 32 }])
+    expect(destinations).toMatchObject([{ left: 40, right: 280, y: 96 }])
+  })
+
+  it('keeps every detected surface above and below the stationary pet', () => {
+    const verticalFrame = grayscaleFrame(320, 180, (_x, y) => (y >= 150 ? 210 : y >= 92 ? 150 : y >= 24 ? 90 : 30))
+
+    const destinations = detectPetOverlayVisualLedges(verticalFrame, {
+      overlayBounds: { height: 80, width: 80, x: 120, y: 36 },
+      petHeight: 32,
+      petWidth: 64,
+      scanMode: 'destination',
+      workArea: electronMock.display.workArea
+    })
+
+    expect(destinations.map(destination => destination.y)).toEqual([92, 24, 150])
+    expect(destinations[0]).toMatchObject({ left: 0, right: 320 })
+    expect(destinations.slice(1).map(destination => destination.right - destination.left)).toEqual([96, 96])
   })
 })
 

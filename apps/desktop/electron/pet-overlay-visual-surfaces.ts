@@ -33,9 +33,6 @@ const PET_FOOT_INSET_PX = 24
 const SCAN_ABOVE_FEET_PX = 6
 const SCAN_BELOW_FEET_PX = 220
 const SUPPORT_SCAN_BELOW_FEET_PX = 16
-const DESTINATION_GAP_ABOVE_FEET_PX = 8
-const DESTINATION_SCAN_HEIGHTS = 3
-const MAX_DESTINATION_SURFACES = 12
 const CAPTURE_TIMEOUT_MS = 550
 const DEFAULT_REUSED_CAPTURE_MAX_AGE_MS = 750
 
@@ -96,7 +93,6 @@ export function detectPetOverlayVisualLedges(
   {
     motionProbe = false,
     overlayBounds,
-    petHeight: requestedPetHeight,
     petWidth: requestedPetWidth,
     scanMode = 'landing',
     workArea
@@ -107,12 +103,12 @@ export function detectPetOverlayVisualLedges(
   const localFootX = footX - frame.displayBounds.x
   const localFootY = footY - frame.displayBounds.y
   const localPetTopY = overlayBounds.y - frame.displayBounds.y
+  const workAreaTop = workArea.y - frame.displayBounds.y
   const workAreaBottom = workArea.y + workArea.height - frame.displayBounds.y
   const petWidth = Math.max(24, Math.min(256, Number(requestedPetWidth) || 64))
-  const petHeight = Math.max(24, Math.min(512, Number(requestedPetHeight) || petWidth))
   const motionMinimumSpan = Math.max(120, Math.round(petWidth * 2.25))
   const motionScanWidth = Math.max(192, Math.round(petWidth * 3))
-  const destinationScanWidth = Math.max(96, Math.round(petWidth * 1.75))
+  const destinationScanWidth = Math.max(36, Math.round(petWidth * 1.5))
   const destinationMinimumSpan = destinationScanWidth
   const scanBelow = motionProbe && scanMode === 'support' ? SUPPORT_SCAN_BELOW_FEET_PX : SCAN_BELOW_FEET_PX
   const bitmap = { data: frame.bitmap, height: frame.height, width: frame.width }
@@ -151,32 +147,33 @@ export function detectPetOverlayVisualLedges(
       toY: Math.min(localFootY + SUPPORT_SCAN_BELOW_FEET_PX, workAreaBottom - 3)
     })
 
-    const upperEndY = localFootY - DESTINATION_GAP_ABOVE_FEET_PX
-    const upperStartY = Math.max(2, localFootY - petHeight * DESTINATION_SCAN_HEIGHTS)
-    let nextY = upperStartY
-    let destination: ReturnType<typeof detectHorizontalContrastSurface> = null
+    const scanEndY = Math.min(frame.height - 3, workAreaBottom - 3)
+    let nextY = Math.max(2, workAreaTop + 2)
+    const destinations: NonNullable<ReturnType<typeof detectHorizontalContrastSurface>>[] = []
+    const maximumSurfaceCount = Math.max(1, Math.ceil((scanEndY - nextY + 1) / 4))
 
-    for (let index = 0; index < MAX_DESTINATION_SURFACES && nextY <= upperEndY; index += 1) {
+    for (let index = 0; index < maximumSurfaceCount && nextY <= scanEndY; index += 1) {
       const surface = detectHorizontalContrastSurface(bitmap, {
         ...sharedProbe,
         fromY: nextY,
-        toY: upperEndY
+        toY: scanEndY
       })
 
       if (!surface) {
         break
       }
 
-      destination = surface
+      destinations.push(surface)
       nextY = Math.max(nextY + 1, surface.y + 4)
     }
 
     const tracedSupport = support ? traceSelectedSurface(support) : null
-    const tracedDestination = destination ? traceSelectedSurface(destination) : null
     const surfaces = tracedSupport ? [tracedSupport] : []
 
-    if (tracedDestination && (!tracedSupport || Math.abs(tracedDestination.y - tracedSupport.y) > 4)) {
-      surfaces.push(tracedDestination)
+    for (const destination of destinations) {
+      if (!tracedSupport || Math.abs(destination.y - tracedSupport.y) > 4) {
+        surfaces.push(destination)
+      }
     }
 
     return surfaces.map(toScreenLedge)
