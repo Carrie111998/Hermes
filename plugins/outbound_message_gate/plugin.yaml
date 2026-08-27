@@ -1,0 +1,17 @@
+name: outbound-message-gate
+version: 1.0.0
+description: "Fail-closed outbound URL and success-claim receipt gate for protected recipients."
+author: "Paul Larche / Neo"
+hooks:
+  - post_tool_call
+  - pre_gateway_send
+config_schema:
+  protected_targets:
+    type: list
+    default: []
+  success_terms:
+    type: list
+    default: [fixed, working, resolved, live, ready, deployed, verified]
+  fetch_timeout_seconds:
+    type: float
+    default: 10

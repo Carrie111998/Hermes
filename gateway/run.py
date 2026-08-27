@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -2683,6 +2684,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    bind_outbound_receipt_context,
     merge_pending_message_event,
     utf16_len,
 )
@@ -6142,6 +6144,19 @@ class TurnRunner:
         agent.thinking_progress = ctx._thinking_enabled
         # Store agent reference for interrupt support
         ctx.agent_holder[0] = agent
+        # Pre-seed the turn id so the agent's tool hooks and every outbound
+        # metadata map use the same mechanical receipt scope. turn_context.py
+        # consumes _relay_pending_turn_id as the authoritative current turn id.
+        outbound_turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
+        if not outbound_turn_id:
+            outbound_turn_id = f"{agent.session_id or 'session'}:gateway:{uuid.uuid4().hex[:8]}"
+            agent._relay_pending_turn_id = outbound_turn_id
+        bind_outbound_receipt_context(
+            ctx._status_thread_metadata,
+            ctx._progress_metadata,
+            session_id=agent.session_id or "",
+            turn_id=outbound_turn_id,
+        )
         # Wire the platform thread-rename lane onto the agent, because the
         # session titler now fires from the turn prologue rather than after
         # the response. Titles are pushed here the moment they land.
@@ -29171,6 +29186,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # reply anchor; carry it so progress joins that thread.
             _progress_metadata = {"reply_to_message_id": event_message_id}
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_metadata = dict(_progress_metadata or {})
+        bind_outbound_receipt_context(
+            _progress_metadata,
+            session_id=session_id,
+            turn_id="",
+        )
         if _native_slack_task_cards:
             # chat.startStream in channels requires the recipient team/user
             # pair; harmless extras elsewhere, so stamp them whenever known.
@@ -29315,6 +29336,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
                 }
+        _status_thread_metadata = dict(_status_thread_metadata or {})
+        bind_outbound_receipt_context(
+            _status_thread_metadata,
+            session_id=session_id,
+            turn_id="",
+        )
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
