@@ -428,6 +428,14 @@ async def _lifespan(app: "FastAPI"):
 
     record_boot_fingerprint()
 
+    # Hosted Bot rooms belong to the backend process, not to any connected
+    # Desktop socket. Start their coordinator before accepting clients so a
+    # restart can reconcile durable work even when no viewer reconnects.
+    from tui_gateway import methods_groups as _hosted_groups
+    import tui_gateway.server  # noqa: F401
+
+    _hosted_groups.start_hosted_room_service()
+
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
@@ -470,6 +478,7 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        _hosted_groups.stop_hosted_room_service(timeout=5.0)
         if cron_stop is not None:
             cron_stop.set()
         pty_reaper_task.cancel()
