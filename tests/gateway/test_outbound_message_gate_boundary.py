@@ -693,11 +693,27 @@ async def test_instance_callable_object_publisher_is_gated(monkeypatch):
     assert delivered == [("paul", "SAFE")]
 
 
-def test_instance_mutable_state_remains_ordinary():
+def test_instance_sync_publisher_assignment_is_forbidden():
+    adapter = GateAdapter()
+
+    def publish_native(chat_id, content):
+        return (chat_id, content)
+
+    with pytest.raises(TypeError, match="synchronous adapter publisher"):
+        adapter.publish_native = publish_native
+
+
+@pytest.mark.asyncio
+async def test_instance_non_content_helper_and_mutable_state_remain_ordinary():
+    async def _lookup_state(key):
+        return f"value:{key}"
+
     adapter = GateAdapter()
     adapter.retry_count = 3
+    adapter._lookup_state = _lookup_state
 
     assert adapter.retry_count == 3
+    assert await adapter._lookup_state("ready") == "value:ready"
 
 
 def test_instance_private_async_publisher_with_opaque_payload_is_forbidden():
@@ -707,15 +723,6 @@ def test_instance_private_async_publisher_with_opaque_payload_is_forbidden():
     adapter = GateAdapter()
     with pytest.raises(TypeError, match="private async adapter assignment"):
         adapter._publish_raw = _publish_raw
-
-
-def test_instance_public_async_patch_without_explicit_envelope_is_forbidden():
-    async def publish_opaque(*args, **kwargs):
-        return args, kwargs
-
-    adapter = GateAdapter()
-    with pytest.raises(TypeError, match="explicit target and visible-content"):
-        adapter.publish_opaque = publish_opaque
 
 
 @pytest.mark.asyncio

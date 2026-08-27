@@ -3219,7 +3219,36 @@ class BasePlatformAdapter(ABC, metaclass=_TerminalOutboundBoundaryMeta):
             callable(value)
             and inspect.iscoroutinefunction(getattr(value, "__call__", None))
         )
-        if async_callable and not getattr(value, "_hermes_outbound_gate_wrapped", False):
+        already_wrapped = getattr(value, "_hermes_outbound_gate_wrapped", False)
+        if callable(value) and not async_callable and not already_wrapped:
+            publisher_tokens = {
+                token for token in str(name).lower().replace("-", "_").split("_")
+                if token
+            }
+            try:
+                sync_parameter_names = {
+                    parameter.name.lower()
+                    for parameter in inspect.signature(value).parameters.values()
+                }
+            except (TypeError, ValueError):
+                sync_parameter_names = set()
+            sync_transport_shape = bool(
+                sync_parameter_names
+                & {"chat_id", "channel_id", "parent_chat_id", "user_id", "to_account"}
+                and sync_parameter_names
+                & {
+                    "content", "text", "message", "name", "title", "caption",
+                    "payload", "body", "card", "blocks", "options",
+                    "thread_name", "starter_message", "seed_content", "status",
+                }
+            )
+            if sync_transport_shape or publisher_tokens & {
+                "deliver", "edit", "post", "publish", "send", "transmit", "update",
+            }:
+                raise TypeError(
+                    f"synchronous adapter publisher assignment {name!r} is forbidden"
+                )
+        if async_callable and not already_wrapped:
             try:
                 assigned_signature = inspect.signature(value)
                 parameter_names = {
