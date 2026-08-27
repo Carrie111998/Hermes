@@ -259,6 +259,12 @@ def build_client_bundle(
     default_query = resolved.get("default_query")
     if isinstance(default_query, Mapping) and default_query:
         client_kwargs["default_query"] = dict(default_query)
+    command = resolved.get("command")
+    if isinstance(command, str) and command:
+        client_kwargs["command"] = command
+    args = resolved.get("args")
+    if isinstance(args, (list, tuple)):
+        client_kwargs["args"] = list(args)
 
     builder = openai_builder or _default_openai_builder
     client = builder(dict(client_kwargs))
