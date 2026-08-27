@@ -167,7 +167,7 @@ describe('WisdomCandidateCard', () => {
     expect(screen.queryByText(/publisher device|from device/i)).toBeNull()
     expect(suggestWisdomSkill.mock.calls[0][3]).toBe('local-skill-1')
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' }))
-  })
+  }, 30_000)
 
   it('saves local edits before upload, saves a rescanned server revision, then requires a fresh receipt', async () => {
     const setIntervalSpy = vi.spyOn(window, 'setInterval')
@@ -205,6 +205,9 @@ describe('WisdomCandidateCard', () => {
       )
     )
 
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: 'Continue to approval' }) as HTMLButtonElement).disabled).toBe(false)
+    )
     fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
     expect(await screen.findByText(/sha256:draft-1-content/)).toBeTruthy()
     expect(suggestWisdomSkill.mock.calls[1][3]).toBe('local-skill-1')

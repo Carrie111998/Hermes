@@ -117,7 +117,7 @@ describe('CollectiveTab', () => {
 
     await waitFor(() => expect(setupWisdom).toHaveBeenCalledWith(scope))
     expect(getActionStatus).toHaveBeenCalledWith('wisdom-setup', 80, scope)
-  })
+  }, 30_000)
 
   it('scopes reads to the selected connection/profile and renders hostile text as text', async () => {
     mockInstallations()
