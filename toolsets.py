@@ -399,6 +399,7 @@ TOOLSETS = {
             "session_search", "clarify",
             "execute_code", "delegate_task",
             "coding_worker",
+            "github_issue_pr_preflight",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
@@ -433,6 +434,7 @@ TOOLSETS = {
             "session_search",
             "execute_code", "delegate_task",
             "coding_worker",
+            "github_issue_pr_preflight",
         ],
         "includes": []
     },
