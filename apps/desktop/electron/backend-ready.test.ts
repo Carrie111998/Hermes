@@ -31,14 +31,16 @@ import {
 
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter
+  stderr: EventEmitter
 }
 
 // A minimal stand-in for a spawned child process: an EventEmitter with a
 // stdout EventEmitter, matching the surface waitForDashboardPort consumes
-// (child.stdout.on('data'), child.on('exit'|'error') + the .off() teardown).
+// (child.stdout/stderr.on('data'), child.on('exit'|'error') + the .off() teardown).
 function makeFakeChild(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
   child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
 
   return child
 }
@@ -99,12 +101,57 @@ test('resolves with a HERMES_BACKEND_READY port (headless `serve`)', async () =>
   assert.equal(await p, 43210)
 })
 
+test('resolves when HERMES_BACKEND_READY arrives on stderr', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'HERMES_BACKEND_READY port=60184\n')
+  assert.equal(await p, 60184)
+})
+
 test('parses the port even when the line arrives split across chunks', async () => {
   const child = makeFakeChild()
   const p = waitForDashboardPort(child, 1000)
   child.stdout.emit('data', 'HERMES_DASHBOARD_READY po')
   child.stdout.emit('data', 'rt=8080\n')
   assert.equal(await p, 8080)
+})
+
+// The three tests below pin the per-stream line buffering (#96282 review).
+// A single shared buffer across stdout+stderr passes the happy paths above
+// but corrupts these: it splices partial lines from one pipe onto the other.
+
+test('an unterminated stderr fragment does not corrupt a later stdout READY line', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  // No trailing newline: this fragment stays in the stderr buffer forever.
+  child.stderr.emit('data', 'INFO uvicorn: partial log line with no newline')
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=51515\n')
+  // Shared buffer => the stdout line becomes
+  // '...no newlineHERMES_BACKEND_READY port=51515', which the ^-anchored
+  // _READY_RE cannot match, so this would hang until the timeout.
+  assert.equal(await p, 51515)
+})
+
+test('READY split across stdout chunks survives an interleaved stderr line', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stdout.emit('data', 'HERMES_BACKEND_READY po')
+  // A complete stderr line lands between the two stdout halves. With a
+  // shared buffer it is appended into the middle of the pending stdout
+  // fragment and the port is lost.
+  child.stderr.emit('data', 'WARNING uvicorn: reload disabled\n')
+  child.stdout.emit('data', 'rt=52525\n')
+  assert.equal(await p, 52525)
+})
+
+test('a READY token torn across stdout and stderr must NOT resolve', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 30)
+  // Neither pipe ever carries a complete sentinel line. Only a shared
+  // buffer would glue these halves into a bogus announcement.
+  child.stdout.emit('data', 'HERMES_BACKEND_READY po')
+  child.stderr.emit('data', 'rt=53535\n')
+  await assert.rejects(p, /Timed out waiting for Hermes backend port announcement/)
 })
 
 test('rejects when the child exits before announcing', async () => {
