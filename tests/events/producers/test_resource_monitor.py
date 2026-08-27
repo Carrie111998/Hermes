@@ -20,6 +20,7 @@ from events.producers.resource_monitor import (
     DEFAULT_DISK_FREE_GB_THRESHOLD,
     ResourcePressureMonitor,
     ResourceSample,
+    SpawnLatencyProbe,
     sample_resources,
 )
 
@@ -38,8 +39,13 @@ def make_sample(
     commit_limit_gb=47.0,
     phys_pct=50.0,
     phys_total_gb=64.0,
+    spawn_ms=None,
 ):
-    """Build a ResourceSample, healthy by default; override one axis to stress it."""
+    """Build a ResourceSample, healthy by default; override one axis to stress it.
+
+    ``spawn_ms=None`` maps to the -1.0 "not measured" sentinel, so tests that
+    predate the spawn axis exercise exactly the pre-2026-08-27 shape.
+    """
     limit = int(commit_limit_gb * GB)
     used = int(limit * commit_pct / 100.0)
     phys_total = int(phys_total_gb * GB)
@@ -51,6 +57,7 @@ def make_sample(
         disk_free_bytes=int(disk_free_gb * GB),
         phys_total_bytes=phys_total,
         phys_avail_bytes=phys_avail,
+        spawn_latency_ms=-1.0 if spawn_ms is None else float(spawn_ms),
     )
 
 
@@ -765,3 +772,371 @@ class TestCommitAndPhysBands:
         assert pct_band_for(96.0, COMMIT_BANDS)[0] == "severe"
         assert pct_band_for(96.1, COMMIT_BANDS)[0] == "critical"
         assert pct_band_for(85.0, COMMIT_BANDS) == (None, None)
+
+
+def drive(monitor, latencies, start=0.0, step=60.0, **sample_kw):
+    """Feed one sample per latency at ``step`` intervals; return emit results.
+
+    ``None`` entries are "probe produced no reading this poll" samples.
+    """
+    return [
+        monitor.evaluate(make_sample(spawn_ms=ms, **sample_kw), now=start + i * step)
+        for i, ms in enumerate(latencies)
+    ]
+
+
+class TestSpawnLatencyAxis:
+    """Spawn-latency (process-churn) axis — added 2026-08-27.
+
+    On 2026-08-26 a fleet of 84 concurrent agent sessions drove ~576 process
+    creations+deaths/minute and the box starved on PROCESS CHURN: `date` took
+    11.8s, CreateProcess medianed 2.3s, the session reaper NO-OPed five times
+    in a row — while commit read 74.7% (ten points below its 85% gate) and
+    phys 89% (three below its 92% trigger). Every existing axis measures
+    memory or disk, so the monitor was structurally blind to the resource
+    that actually saturated. The spawn axis measures it directly, judged on
+    SUSTAINED readings (the floor of the last 3): one slow spawn is a
+    Defender cold scan; three in a row is a storm. Forensics: loops claim
+    host-spawn-churn-20260826.
+    """
+
+    def test_2026_08_26_storm_shape_emits(self, bus):
+        # The exact blind spot, reduced: commit and phys both read "healthy"
+        # while spawns sit at the storm's measured median (2272 ms).
+        monitor = ResourcePressureMonitor(bus)
+        results = drive(
+            monitor, [2272.0, 2353.0, 2272.0], commit_pct=74.7, phys_pct=89.0)
+        assert results[-1]
+        events = _pressure_events(bus)
+        assert len(events) == 1
+        assert events[0].payload["reasons"] == ["spawn_latency"]
+
+    def test_two_slow_readings_are_not_sustained(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        assert drive(monitor, [2000.0, 2000.0]) == [None, None]
+        assert _pressure_events(bus) == []
+
+    def test_a_single_extreme_spawn_never_fires(self, bus):
+        # An 8s outlier (AV cold scan, disk hiccup) among healthy readings
+        # is exactly what "sustained" exists to ignore.
+        monitor = ResourcePressureMonitor(bus)
+        assert all(r is None for r in drive(monitor, [8000.0, 90.0, 110.0, 95.0]))
+        assert _pressure_events(bus) == []
+
+    def test_intermittent_slow_spawns_never_fire(self, bus):
+        # Alternating slow/fast means the floor of every full window is
+        # healthy — a noisy box, not a storm.
+        monitor = ResourcePressureMonitor(bus)
+        latencies = [2000.0, 100.0, 2000.0, 100.0, 2000.0, 100.0]
+        assert all(r is None for r in drive(monitor, latencies))
+        assert _pressure_events(bus) == []
+
+    def test_floor_at_threshold_does_not_breach(self, bus):
+        # Strictly greater-than, matching every other axis's trigger.
+        monitor = ResourcePressureMonitor(bus)
+        assert all(r is None for r in drive(monitor, [1500.0] * 4))
+        assert _pressure_events(bus) == []
+
+    def test_unmeasured_samples_do_not_count_toward_sustained(self, bus):
+        # Two slow readings + a probe gap + a third slow reading: the gap
+        # recorded nothing, so the third reading completes the window and
+        # only then does the axis fire.
+        monitor = ResourcePressureMonitor(bus)
+        results = drive(monitor, [2000.0, 2000.0, None, 2000.0])
+        assert results == [None, None, None, results[3]]
+        assert results[3]
+        assert len(_pressure_events(bus)) == 1
+
+    def test_sample_without_spawn_field_is_safe(self, bus):
+        # Pre-2026-08-27 constructor shape must keep working and never
+        # trigger the spawn axis (sentinel -1.0 = not measured).
+        sample = ResourceSample(
+            commit_used_bytes=int(23 * GB),
+            commit_limit_bytes=int(47 * GB),
+            pagefile_allocated_bytes=int(20 * GB),
+            disk_free_bytes=int(300 * GB),
+        )
+        assert sample.spawn_latency_ms == -1.0
+        monitor = ResourcePressureMonitor(bus)
+        for i in range(5):
+            assert monitor.evaluate(sample, now=i * 60.0) is None
+        assert _pressure_events(bus) == []
+
+    def test_spawn_breach_during_commit_episode_is_new_information(self, bus):
+        # Mirrors test_escalation_is_not_disk_specific: the per-axis rising
+        # edge must cover the new axis too, or a churn storm arriving during
+        # a memory episode waits out the cooldown.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(commit_pct=99.0), now=0.0)
+        results = drive(
+            monitor, [2000.0, 2000.0, 2000.0], start=60.0, commit_pct=99.0)
+        assert results == [None, None, results[2]]
+        assert results[2]
+        events = _pressure_events(bus)
+        assert len(events) == 2
+        assert "spawn_latency" in events[-1].payload["reasons"]
+
+    def test_spawn_latency_routes_warn_security_and_does_not_page(self, bus):
+        # DETECTION ONLY, end-to-end: the axis rides resource_pressure's
+        # default routing — WARN into security_and_system, no WhatsApp tier,
+        # no action_required. Escalation policy is routing's decision and is
+        # deliberately NOT wired here (the disk_critical hook in
+        # routing_policy.classify is the template if paging is ever wanted).
+        from events.routing_policy import Attention, classify
+
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [6000.0, 6000.0, 6000.0])
+        (event,) = _pressure_events(bus)
+        route = classify(event)
+        assert route.attention is Attention.WARN
+        assert route.topic_key == "security_and_system"
+        assert route.wa_tier is None
+
+
+class TestSpawnPayload:
+    def test_payload_carries_spawn_metrics(self, bus):
+        # The 08-26 storm's own numbers: floor 2272 is what the axis judged,
+        # 6225 is merely the last instantaneous reading.
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [2272.0, 2353.0, 6225.0])
+        p = _pressure_events(bus)[0].payload
+        assert p["spawn_latency_ms"] == pytest.approx(6225.0)
+        assert p["spawn_latency_sustained_ms"] == pytest.approx(2272.0)
+        assert p["spawn_band"] == "high"
+        assert p["spawn_band_edge_ms"] == 1500
+        assert p["thresholds"]["spawn_latency_warn_ms"] == 1500.0
+        assert p["thresholds"]["spawn_sustained_samples"] == 3
+
+    def test_a_non_spawn_episode_has_no_spawn_band(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=99.0), now=0.0)
+        p = _pressure_events(bus)[0].payload
+        assert p["reasons"] == ["commit_high"]
+        assert p["spawn_band"] is None
+        assert p["spawn_latency_ms"] is None          # sentinel -1.0 -> None
+        assert p["spawn_latency_sustained_ms"] is None
+
+
+class TestSpawnBands:
+    """The spawn band reads the sustained FLOOR, so its label certifies that
+    every recent spawn crossed the edge — the storm's shape, not one outlier.
+    "critical" (5000 sustained) marks the taskkill-amplification regime where
+    tool timeouts start firing kills that themselves need spawns."""
+
+    def _changes(self, bus):
+        return [e.payload["change"] for e in _pressure_events(bus)]
+
+    def test_first_breach_carries_the_high_band(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [2000.0, 2000.0, 2000.0])
+        p = _pressure_events(bus)[0].payload
+        assert p["spawn_band"] == "high"
+        assert p["spawn_band_edge_ms"] == 1500
+
+    def test_sustained_critical_announces_only_the_deepest_edge(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [6000.0, 6000.0, 6000.0])
+        events = _pressure_events(bus)
+        assert len(events) == 1
+        assert events[0].payload["spawn_band"] == "critical"
+        assert events[0].payload["spawn_band_edge_ms"] == 5000
+
+    def test_probe_timeout_floor_classifies_critical(self, bus):
+        # A timed-out probe reports elapsed (>= its 10s timeout) as a floor;
+        # three of those must certify the critical band.
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [10000.0, 10000.0, 10000.0])
+        assert _pressure_events(bus)[0].payload["spawn_band"] == "critical"
+
+    def test_critical_band_requires_every_reading_above_its_edge(self, bus):
+        # [6000, 6000, 2000]: floor 2000 — sustained "high", NOT "critical".
+        # Judging the max (or the last reading) would report a storm depth
+        # only one spawn ever reached.
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [6000.0, 6000.0, 2000.0])
+        assert _pressure_events(bus)[0].payload["spawn_band"] == "high"
+
+    def test_escalation_to_critical_is_delivered_not_a_sustained_repeat(self, bus):
+        # Mirrors the 2026-08-20 commit-band lesson: an episode that deepens
+        # from "slow" to "taskkill-amplifier" must reach chat, not be dropped
+        # bus-only as a sustained_repeat.
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [2000.0] * 3 + [6000.0] * 3)
+        changes = self._changes(bus)
+        assert changes == ["rising_edge", "band_change"]
+        assert _pressure_events(bus)[-1].payload["spawn_band"] == "critical"
+
+    def test_an_edge_rearms_once_the_window_recovers_past_the_factor(self, bus):
+        # critical announced, recover to 2000 sustained (2000 * 1.5 < 5000
+        # re-arms the 5000 edge), then back to 6000 sustained -> re-announce.
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [6000.0] * 3 + [2000.0] * 3 + [6000.0] * 3)
+        assert self._changes(bus) == ["rising_edge", "band_change"]
+        assert _pressure_events(bus)[-1].payload["spawn_band"] == "critical"
+
+    def test_a_dip_short_of_the_rearm_factor_does_not_re_announce(self, bus):
+        # 4000 * 1.5 = 6000 >= 5000: the critical edge stays announced, so
+        # returning to 6000 sustained is the same episode depth, not news.
+        monitor = ResourcePressureMonitor(bus)
+        drive(monitor, [6000.0] * 3 + [4000.0] * 3 + [6000.0] * 3)
+        assert "band_change" not in self._changes(bus)[1:]
+        assert len(_pressure_events(bus)) == 1
+
+    def test_spawn_band_edges_honor_the_shared_invariants(self):
+        """Every edge above the disarm (the 08-14 latch-forever lesson),
+        ascending, shallowest edge == the trigger, and the probe timeout
+        above the deepest edge so a timeout floor still classifies."""
+        from events.producers.resource_monitor import (
+            DEFAULT_SPAWN_LATENCY_DISARM_MS,
+            DEFAULT_SPAWN_LATENCY_WARN_MS,
+            DEFAULT_SPAWN_PROBE_TIMEOUT_MS,
+            SPAWN_BANDS,
+        )
+        assert all(edge > DEFAULT_SPAWN_LATENCY_DISARM_MS for edge, _ in SPAWN_BANDS)
+        assert [e for e, _ in SPAWN_BANDS] == sorted(e for e, _ in SPAWN_BANDS)
+        assert SPAWN_BANDS[0][0] == DEFAULT_SPAWN_LATENCY_WARN_MS
+        assert DEFAULT_SPAWN_PROBE_TIMEOUT_MS > SPAWN_BANDS[-1][0]
+
+
+class TestSpawnHysteresis:
+    """Sustained in BOTH directions: the breach needs the whole window above
+    the trigger, and the clear needs the whole window below the disarm — one
+    lucky spawn mid-storm must not end (or re-arm) the episode."""
+
+    def test_one_lucky_spawn_does_not_clear_the_episode(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        drive(monitor, [2000.0] * 3)               # latch + emit at t=120
+        # One healthy spawn, then the storm resumes. Were the lucky spawn a
+        # genuine clear, the resumed breach would be a fresh rising edge and
+        # emit immediately; instead the episode holds and stays cooldown-gated.
+        results = drive(monitor, [100.0] + [2000.0] * 3, start=180.0)
+        assert all(r is None for r in results)
+        assert len(_pressure_events(bus)) == 1
+
+    def test_hovering_between_disarm_and_trigger_holds_the_episode(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        drive(monitor, [2000.0] * 3)
+        # 1200 is under the 1500 trigger but over the 1000 disarm: holds.
+        results = drive(monitor, [1200.0] * 3 + [2000.0] * 3, start=180.0)
+        assert all(r is None for r in results)
+        assert len(_pressure_events(bus)) == 1
+
+    def test_sustained_recovery_ends_the_episode_and_rearms_the_edge(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        drive(monitor, [2000.0] * 3)
+        # Three healthy readings clear comfortably; the next sustained storm
+        # is a fresh emergency and fires immediately, well inside the 900s.
+        results = drive(monitor, [100.0] * 3 + [2000.0] * 3, start=180.0)
+        assert results[-1]
+        events = _pressure_events(bus)
+        assert len(events) == 2
+        assert [e.payload["change"] for e in events] == [
+            "rising_edge", "rising_edge"]
+
+    def test_a_dead_probe_does_not_wedge_the_episode_open(self, bus):
+        # The phys-axis no-disarm bug in a third disguise: if the probe dies
+        # mid-episode, its readings age out (300s) and the axis must clear —
+        # an axis that can latch but never unlatch silently degrades the
+        # whole monitor to cooldown-only re-pings forever.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        drive(monitor, [2000.0] * 3)               # latch + emit at t=120
+        # Probe produces nothing for 8 minutes; the window goes stale.
+        assert monitor.evaluate(make_sample(), now=600.0) is None
+        # A NEW sustained breach is a fresh rising edge, not cooldown-gated.
+        results = drive(monitor, [2000.0] * 3, start=660.0)
+        assert results[-1]
+        assert len(_pressure_events(bus)) == 2
+
+
+class TestSpawnLatencyProbe:
+    def test_rate_limit_returns_none_inside_the_interval(self):
+        if sys.platform != "win32":
+            pytest.skip("probe is Windows-only")
+        t = {"now": 0.0}
+        probe = SpawnLatencyProbe(
+            min_interval_seconds=55.0, clock=lambda: t["now"])
+        probe._measure = lambda: 42.0              # instance-level stub
+        assert probe() == 42.0
+        t["now"] = 10.0
+        assert probe() is None                     # rate-limited, no reading
+        t["now"] = 56.0
+        assert probe() == 42.0                     # interval elapsed
+
+    def test_a_failed_measure_still_consumes_the_interval(self):
+        # The stamp lands BEFORE the measurement, so a failing probe cannot
+        # retry hot and add its own churn to a struggling box.
+        if sys.platform != "win32":
+            pytest.skip("probe is Windows-only")
+        t = {"now": 0.0}
+        probe = SpawnLatencyProbe(
+            min_interval_seconds=55.0, clock=lambda: t["now"])
+
+        def boom():
+            raise OSError("CreateProcessW failed")
+
+        probe._measure = boom
+        assert probe() is None
+        t["now"] = 10.0
+        probe._measure = lambda: 42.0
+        assert probe() is None                     # still inside the interval
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only probe")
+    def test_real_probe_measures_a_positive_latency(self):
+        # One real CreateProcess round trip. Deliberately loose bounds: on a
+        # loaded box this can legitimately read seconds — that is the axis.
+        probe = SpawnLatencyProbe()
+        ms = probe()
+        if ms is not None:
+            assert ms > 0.0
+        assert probe() is None                     # immediately rate-limited
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="non-Windows path")
+    def test_probe_is_none_off_windows(self):
+        assert SpawnLatencyProbe()() is None
+
+
+class TestSpawnCheckIntegration:
+    def test_check_overlays_probe_reading_and_emits_when_sustained(self, bus):
+        readings = iter([2000.0, 2000.0, 2000.0])
+        monitor = ResourcePressureMonitor(
+            bus,
+            sampler=lambda: make_sample(),
+            spawn_probe=lambda: next(readings),
+        )
+        assert monitor.check() is None
+        assert monitor.check() is None
+        assert monitor.check()
+        assert _pressure_events(bus)[0].payload["reasons"] == ["spawn_latency"]
+
+    def test_check_swallows_spawn_probe_exceptions(self, bus):
+        def boom():
+            raise OSError("CreateProcessW failed")
+
+        monitor = ResourcePressureMonitor(
+            bus, sampler=lambda: make_sample(), spawn_probe=boom)
+        # A probe blow-up must never crash the gateway poll loop.
+        assert monitor.check() is None
+        assert _pressure_events(bus) == []
+
+    def test_check_tolerates_a_rate_limited_probe(self, bus):
+        monitor = ResourcePressureMonitor(
+            bus, sampler=lambda: make_sample(), spawn_probe=lambda: None)
+        assert monitor.check() is None
+        assert _pressure_events(bus) == []
+
+    def test_sampler_provided_reading_is_not_overwritten(self, bus):
+        # A sampler that already measured (tests, future samplers) wins; the
+        # probe must not even run.
+        calls = []
+
+        def probe():
+            calls.append(1)
+            return 100.0
+
+        monitor = ResourcePressureMonitor(
+            bus,
+            sampler=lambda: make_sample(spawn_ms=2000.0),
+            spawn_probe=probe,
+        )
+        monitor.check()
+        assert calls == []

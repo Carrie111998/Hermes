@@ -41,6 +41,22 @@ Docker/PG down, laptop-monitor healthy-count collapsing to 2-9/75 twice in one
 day) produced ZERO events here because commit charge sat at 50-73% throughout —
 the monitor was blind to the axis that actually killed services.
 
+The spawn-latency axis (2026-08-27) exists for the same reason one generation
+later: on 2026-08-26 a fleet of 84 concurrent agent sessions drove ~576
+process creations+deaths per MINUTE and the box starved on PROCESS CHURN — a
+trivial ``date`` took 11.8s, a CreateProcess round trip medianed 2.3s, and
+the session reaper NO-OPed five times in a row — while commit read 74.7%
+(ten points below its gate) and phys 89% (three below its trigger). Every
+axis above measures memory or disk; nothing measured the resource that
+actually saturated. This axis measures it directly: a rate-limited
+CreateProcess round-trip probe (``SpawnLatencyProbe``), classified on
+SUSTAINED readings so one slow spawn (a Defender cold scan, a disk hiccup)
+never fires. Complementary to laptop-monitor's "Claude session fleet size"
+tray row, which watches the fleet COUNT; this axis watches the churn COST.
+Loops claim ``host-spawn-churn-20260826`` holds the full forensics.
+DETECTION ONLY, like every axis here: it emits ``resource_pressure`` and
+stops — no auto-kill, no gating; escalation rides the normal event routing.
+
 ``psutil`` is a hard dependency too, but its ``virtual_memory()`` reports
 physical RAM (not commit) and its ``swap_memory()`` interpretation of the
 pagefile is version-dependent; GlobalMemoryStatusEx is the precise, stable
@@ -72,7 +88,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Set, Tuple
 
 from events.bus import EventBus
@@ -115,6 +131,27 @@ DEFAULT_RE_ALERT_COOLDOWN_SECONDS = 900.0    # re-ping a sustained episode every
 # services dying, laptop-monitor healthy-count collapsed twice) emitted zero
 # events because commit charge stayed at 50-73% the whole day.
 DEFAULT_PHYS_PCT_THRESHOLD = 92.0        # physical RAM used > this %
+# Spawn-latency axis (2026-08-27) — the churn storm's direct measurement.
+# Derived from the 2026-08-26 storm forensics (loops claim
+# host-spawn-churn-20260826): ten CreateProcess round trips of ``cmd /c
+# exit`` during the storm measured min 471 / median 2272 / mean 2353 /
+# max 6225 ms, against tens of ms on a healthy box. 1500 sits ~3x above
+# worst-case healthy jitter (a Defender cold scan can cost a few hundred ms)
+# yet below the storm's MEDIAN — and even its MIN reads only ~3x under it —
+# so the storm shape trips the axis while a merely busy box does not. The
+# axis is judged on the sustained FLOOR (the BEST of the last N readings),
+# so a breach certifies that EVERY recent spawn was at least this slow.
+DEFAULT_SPAWN_LATENCY_WARN_MS = 1500.0   # sustained floor > this many ms
+# Sustained = this many consecutive measured readings, ~3 minutes at the 60s
+# check cadence. One slow spawn is an anecdote; the 08-26 episode ran hours.
+DEFAULT_SPAWN_SUSTAINED_SAMPLES = 3
+# Readings older than this age out of the sustained window. Must sit well
+# above the probe cadence (~60s) so rate-limited polls cannot starve the
+# window, and generous enough that only a genuinely dead probe empties it —
+# an empty window reads as comfortably clear (see evaluate()), because a
+# probe that died mid-episode must not wedge the episode open forever (the
+# phys-axis no-disarm bug in a third disguise).
+DEFAULT_SPAWN_WINDOW_MAX_AGE_SECONDS = 300.0
 
 # Hysteresis disarm levels — a breached axis re-arms only once comfortably
 # clear of its trigger. Re-arming at the trigger itself let threshold hover
@@ -142,6 +179,14 @@ DEFAULT_PAGEFILE_GROWTH_GB_DISARM = 1.0      # in-window growth below this clear
 # the monitor silently degrades to cooldown-only re-pings. Gap mirrors commit's
 # 5 points (92 -> 87).
 DEFAULT_PHYS_PCT_DISARM = 87.0               # phys back below this % clears
+# Healthy spawns read tens of ms, so a recovered box clears 1000 trivially —
+# the disarm-reachability invariant from the 08-14 disk tuning holds by a
+# wide margin. The 500 ms gap below the 1500 trigger mirrors commit's
+# 85 -> 80: hovering at the trigger cannot re-arm the edge. Clearing
+# additionally requires the WHOLE sustained window below this level (the
+# mirror of the sustained breach test), so one lucky spawn mid-storm cannot
+# end the episode; see evaluate().
+DEFAULT_SPAWN_LATENCY_DISARM_MS = 1000.0     # window max back below this clears
 
 # Disk severity bands (2026-08-14). ``normalize_for_fingerprint`` collapses digit
 # runs to "N", so "C: free: 0.0 GB" and "C: free: 56.63 GB" fingerprint
@@ -211,6 +256,29 @@ PHYS_BANDS: Tuple[Tuple[float, str], ...] = (
 # while a real 96 -> 88 -> 96 round trip does re-announce.
 BAND_REARM_GAP_PCT = 5.0
 
+# Spawn-latency severity bands, in ms of sustained floor. Ascending like
+# COMMIT/PHYS_BANDS — higher is worse — and the shallowest edge is
+# deliberately the axis's own trigger, so a first breach always carries a
+# band. "critical" (5000 sustained) marks the tool-timeout amplification
+# regime: at multi-second spawns, harness tool calls start timing out, every
+# timeout fires a ``taskkill /T /F`` that itself needs spawns plus a
+# tree-walk, and the storm feeds itself (69-188 concurrent taskkills
+# observed on 08-26). Because the band reads the sustained FLOOR, "critical"
+# certifies every recent spawn exceeded 5s — the storm's shape, not one
+# outlier. A probe that hits its wait timeout reports elapsed time as a
+# FLOOR (>= the ~10s timeout), which lands here.
+SPAWN_BANDS: Tuple[Tuple[float, str], ...] = (
+    (1500.0, "high"),
+    (5000.0, "critical"),
+)
+# An announced spawn edge re-arms only once the WORST reading in the window
+# is comfortably below it (edge / 1.5): 1500 -> 1000 (== the axis disarm, so
+# the shallow edge re-arms exactly when the axis itself clears — the same
+# intended coincidence as disk's 45-edge vs its 52 disarm), 5000 -> 3333.
+# Multiplicative like DISK_BAND_REARM_FACTOR because an absolute gap cannot
+# fit both a 1500 and a 5000 edge; BAND_REARM_GAP_PCT is for 0-100 axes.
+SPAWN_BAND_REARM_FACTOR = 1.5
+
 
 def pct_band_for(
     pct: float, bands: Tuple[Tuple[float, str], ...]
@@ -258,6 +326,11 @@ class ResourceSample:
     disk_free_bytes: int
     phys_total_bytes: int = 0
     phys_avail_bytes: int = 0
+    # Spawn-latency axis (2026-08-27): one CreateProcess round trip, in ms.
+    # -1.0 means "not measured on this sample" (probe rate-limited, failed,
+    # or absent) — the axis then neither breaches nor clears. Defaulted so
+    # pre-2026-08-27 constructor shapes keep working, mirroring ``phys_*``.
+    spawn_latency_ms: float = -1.0
 
     @property
     def commit_pct(self) -> float:
@@ -336,6 +409,155 @@ def sample_resources() -> Optional[ResourceSample]:
         return None
 
 
+# Probe pacing. 55s sits just under the ~60s check cadence so every poll can
+# carry a fresh reading, while a caller polling faster than the cadence gets
+# rate-limited to ~1 spawn/min — the probe must not contribute to the storm
+# it measures (1/min against the ~576/min measured on 08-26 is ~0.2%).
+DEFAULT_SPAWN_PROBE_MIN_INTERVAL_SECONDS = 55.0
+# Hard ceiling on the wait for the child to exit. Sits ABOVE the deepest
+# SPAWN_BANDS edge (5000), so a timed-out probe still classifies correctly:
+# its elapsed reading (>= this) is a floor that lands in "critical".
+DEFAULT_SPAWN_PROBE_TIMEOUT_MS = 10000.0
+
+
+class SpawnLatencyProbe:
+    """Measures one CreateProcess round trip (spawn -> child exit), in ms.
+
+    The direct measurement of the resource the 2026-08-26 churn storm
+    actually saturated. Spawns ``cmd /c exit`` — deliberately the same
+    trivial child the storm forensics baselined (min 471 / median 2272 /
+    max 6225 ms mid-storm; tens of ms healthy) — via ctypes CreateProcessW,
+    not ``subprocess``: no pipe handles, no Python-side plumbing, just the
+    syscall path whose latency is the phenomenon. The child is real churn
+    (image load, a conhost, a Defender scan), which is the point: the probe
+    pays exactly one unit of the cost it measures.
+
+    Contract: callable returning latency in ms, or ``None`` for "no reading"
+    (non-Windows, rate-limited, or the spawn itself failed). Rate limiting
+    lives HERE, not in the monitor, so any caller — however hot its loop —
+    costs at most ~1 spawn per ``min_interval_seconds``.
+
+    Two measurement caveats, both deliberate:
+
+    * ``CreateProcessW`` itself is a blocking call and cannot be timed out
+      from within the calling thread — on a catastrophically wedged box the
+      probe can stall for as long as the create takes (2.4s was measured
+      mid-storm). The wait for the child's EXIT is what ``timeout_ms``
+      bounds; on expiry the child is terminated and the elapsed time is
+      returned as a FLOOR ("at least this slow"), which is precisely the
+      reading a storm should produce.
+    * The probe measures the round trip a real tool call pays (create +
+      child run + exit), not the bare CreateProcess return — that is the
+      quantity whose degradation times out harness tools and feeds the
+      taskkill amplifier.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_interval_seconds: float = DEFAULT_SPAWN_PROBE_MIN_INTERVAL_SECONDS,
+        timeout_ms: float = DEFAULT_SPAWN_PROBE_TIMEOUT_MS,
+        clock: Optional[Callable[[], float]] = None,
+    ):
+        self.min_interval_seconds = min_interval_seconds
+        self.timeout_ms = timeout_ms
+        self._clock = clock or time.monotonic
+        self._last_probe_at: Optional[float] = None
+
+    def __call__(self) -> Optional[float]:
+        if sys.platform != "win32":
+            return None
+        now = self._clock()
+        if (
+            self._last_probe_at is not None
+            and (now - self._last_probe_at) < self.min_interval_seconds
+        ):
+            return None
+        # Stamped BEFORE the measurement so a slow probe cannot compress the
+        # interval to its successor.
+        self._last_probe_at = now
+        try:
+            return self._measure()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("SpawnLatencyProbe failed: %s", e)
+            return None
+
+    def _measure(self) -> Optional[float]:
+        """One timed CreateProcessW of ``cmd /c exit``; ms, or None on failure."""
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wt.DWORD),
+                ("lpReserved", wt.LPWSTR),
+                ("lpDesktop", wt.LPWSTR),
+                ("lpTitle", wt.LPWSTR),
+                ("dwX", wt.DWORD),
+                ("dwY", wt.DWORD),
+                ("dwXSize", wt.DWORD),
+                ("dwYSize", wt.DWORD),
+                ("dwXCountChars", wt.DWORD),
+                ("dwYCountChars", wt.DWORD),
+                ("dwFillAttribute", wt.DWORD),
+                ("dwFlags", wt.DWORD),
+                ("wShowWindow", wt.WORD),
+                ("cbReserved2", wt.WORD),
+                ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+                ("hStdInput", wt.HANDLE),
+                ("hStdOutput", wt.HANDLE),
+                ("hStdError", wt.HANDLE),
+            ]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("hProcess", wt.HANDLE),
+                ("hThread", wt.HANDLE),
+                ("dwProcessId", wt.DWORD),
+                ("dwThreadId", wt.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        comspec = os.environ.get("ComSpec") or os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"
+        )
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(STARTUPINFOW)
+        pi = PROCESS_INFORMATION()
+        # lpCommandLine must be a WRITABLE buffer — CreateProcessW may modify
+        # it in place; passing a Python str here is undefined behaviour.
+        cmdline = ctypes.create_unicode_buffer("cmd /c exit")
+        CREATE_NO_WINDOW = 0x08000000
+        WAIT_OBJECT_0 = 0x00000000
+        WAIT_TIMEOUT = 0x00000102
+
+        start = time.perf_counter()
+        ok = kernel32.CreateProcessW(
+            comspec, cmdline, None, None, False, CREATE_NO_WINDOW,
+            None, None, ctypes.byref(si), ctypes.byref(pi),
+        )
+        if not ok:
+            logger.debug(
+                "SpawnLatencyProbe: CreateProcessW failed (winerror %s)",
+                ctypes.get_last_error(),
+            )
+            return None
+        try:
+            rc = kernel32.WaitForSingleObject(pi.hProcess, int(self.timeout_ms))
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if rc == WAIT_TIMEOUT:
+                # The child outlived the deadline: kill it (strict bound on
+                # the probe's own churn) and report elapsed as a FLOOR.
+                kernel32.TerminateProcess(pi.hProcess, 1)
+                return elapsed_ms
+            if rc != WAIT_OBJECT_0:  # pragma: no cover - WAIT_FAILED
+                return None
+            return elapsed_ms
+        finally:
+            kernel32.CloseHandle(pi.hThread)
+            kernel32.CloseHandle(pi.hProcess)
+
+
 class ResourcePressureMonitor:
     """Samples host resource pressure and emits RESOURCE_PRESSURE on the edge.
 
@@ -362,10 +584,25 @@ class ResourcePressureMonitor:
         disk_free_gb_critical_disarm: float = DEFAULT_DISK_FREE_GB_CRITICAL_DISARM,
         pagefile_growth_gb_disarm: float = DEFAULT_PAGEFILE_GROWTH_GB_DISARM,
         phys_pct_disarm: float = DEFAULT_PHYS_PCT_DISARM,
+        spawn_probe: Optional[Callable[[], Optional[float]]] = None,
+        spawn_latency_warn_ms: float = DEFAULT_SPAWN_LATENCY_WARN_MS,
+        spawn_latency_disarm_ms: float = DEFAULT_SPAWN_LATENCY_DISARM_MS,
+        spawn_sustained_samples: int = DEFAULT_SPAWN_SUSTAINED_SAMPLES,
+        spawn_window_max_age_seconds: float = DEFAULT_SPAWN_WINDOW_MAX_AGE_SECONDS,
     ):
         self.bus = bus
         self._sampler = sampler or sample_resources
         self._clock = clock or time.monotonic
+        # The probe rate-limits itself, so check() may call it every poll.
+        # Injectable like the sampler; the default no-ops off Windows.
+        self._spawn_probe = (
+            spawn_probe if spawn_probe is not None
+            else SpawnLatencyProbe(clock=self._clock)
+        )
+        self.spawn_latency_warn_ms = spawn_latency_warn_ms
+        self.spawn_latency_disarm_ms = spawn_latency_disarm_ms
+        self.spawn_sustained_samples = spawn_sustained_samples
+        self.spawn_window_max_age_seconds = spawn_window_max_age_seconds
         self.commit_pct_threshold = commit_pct_threshold
         self.disk_free_gb_threshold = disk_free_gb_threshold
         self.disk_free_gb_critical = disk_free_gb_critical
@@ -381,6 +618,12 @@ class ResourcePressureMonitor:
 
         # Rolling (monotonic_ts, pagefile_bytes) window for growth detection.
         self._pagefile_window: List[Tuple[float, int]] = []
+        # Rolling (monotonic_ts, latency_ms) window for the spawn axis. The
+        # axis is judged on this window, never on a single reading: breach =
+        # window full AND its MIN above the warn level; comfortable clear =
+        # window full AND its MAX below the disarm (or the window empty —
+        # a dead probe must not wedge the episode open forever).
+        self._spawn_window: List[Tuple[float, float]] = []
         # Edge-trigger state: per-axis hysteresis latches (reason strings). An
         # axis latches when its trigger breaches and unlatches only once
         # comfortably clear (its disarm level); episode = any axis latched.
@@ -409,6 +652,17 @@ class ResourcePressureMonitor:
             return None
         if sample is None:
             return None
+        # Overlay the spawn-latency probe, but only when the sampler did not
+        # already provide a reading (an injected test sampler may). A probe
+        # failure or rate-limit leaves the sentinel -1.0 = "not measured".
+        if sample.spawn_latency_ms < 0 and self._spawn_probe is not None:
+            try:
+                latency_ms = self._spawn_probe()
+            except Exception:
+                logger.exception("ResourcePressureMonitor: spawn probe raised")
+                latency_ms = None
+            if latency_ms is not None:
+                sample = replace(sample, spawn_latency_ms=float(latency_ms))
         return self.evaluate(sample, self._clock())
 
     def evaluate(self, sample: ResourceSample, now: float) -> Optional[str]:
@@ -428,6 +682,22 @@ class ResourcePressureMonitor:
         window_min = min(pf for _, pf in self._pagefile_window)
         growth_bytes = sample.pagefile_allocated_bytes - window_min
 
+        # Spawn-latency window: age out stale readings, record a fresh one
+        # (the -1.0 sentinel means "not measured" and records nothing), and
+        # keep only the newest ``spawn_sustained_samples``. The axis judges
+        # the WINDOW, never one reading: its floor (min) must breach for the
+        # reason to fire, so "sustained" means every recent spawn was slow.
+        self._spawn_window = [
+            (ts, ms) for ts, ms in self._spawn_window
+            if now - ts <= self.spawn_window_max_age_seconds
+        ]
+        if sample.spawn_latency_ms >= 0:
+            self._spawn_window.append((now, sample.spawn_latency_ms))
+            self._spawn_window = self._spawn_window[-self.spawn_sustained_samples:]
+        spawn_readings = [ms for _, ms in self._spawn_window]
+        spawn_window_full = len(spawn_readings) >= self.spawn_sustained_samples
+        spawn_floor = min(spawn_readings) if spawn_window_full else None
+
         reasons: List[str] = []
         if sample.commit_pct > self.commit_pct_threshold:
             reasons.append("commit_high")
@@ -439,6 +709,8 @@ class ResourcePressureMonitor:
             reasons.append("disk_critical")
         if growth_bytes > self.pagefile_growth_gb_threshold * _GB:
             reasons.append("pagefile_growth")
+        if spawn_floor is not None and spawn_floor > self.spawn_latency_warn_ms:
+            reasons.append("spawn_latency")
 
         # Hysteresis: an axis only unlatches once comfortably clear of its
         # trigger (the disarm level). A dip into the band between disarm and
@@ -455,6 +727,19 @@ class ResourcePressureMonitor:
             comfortably_clear.add("disk_critical")
         if growth_bytes < self.pagefile_growth_gb_disarm * _GB:
             comfortably_clear.add("pagefile_growth")
+        # Sustained in BOTH directions: clearing needs the whole window
+        # comfortably below the disarm, so one lucky spawn mid-storm cannot
+        # end the episode (the mirror of the min-based breach). An EMPTY
+        # window — probe dead or gone stale — also clears: an axis that can
+        # latch but not unlatch wedges the episode forever (the phys-axis
+        # no-disarm bug), and this monitor already fails toward silence on
+        # measurement loss (sample_resources -> None). A partial window
+        # holds: too little data to certify either direction.
+        if not spawn_readings or (
+            spawn_window_full
+            and max(spawn_readings) < self.spawn_latency_disarm_ms
+        ):
+            comfortably_clear.add("spawn_latency")
 
         was_latched = set(self._latched)
         self._latched = (self._latched - comfortably_clear) | set(reasons)
@@ -487,18 +772,35 @@ class ResourcePressureMonitor:
             pct_band_for(sample.phys_pct, PHYS_BANDS)
             if "phys_high" in reasons else (None, None)
         )
+        # The spawn band reads the sustained FLOOR, not the instantaneous
+        # sample, so its label certifies every recent spawn crossed the edge.
+        # ``pct_band_for`` is direction-generic (value > ascending edges)
+        # despite its name; ms fit it exactly as percent does.
+        spawn_band, spawn_band_edge = (
+            pct_band_for(spawn_floor, SPAWN_BANDS)
+            if "spawn_latency" in reasons else (None, None)
+        )
 
         # Re-arm first: an edge an axis has recovered comfortably back past may
         # announce again. Unconditional -- an episode kept alive by another axis
         # must still re-arm its edges. Each axis re-arms in its own direction:
         # disk multiplicatively upward (free space recovering), the percentage
-        # axes by an absolute gap downward.
+        # axes by an absolute gap downward, spawn multiplicatively downward
+        # judged on the window's WORST reading (one lucky spawn cannot re-arm).
+        def _edge_still_hot(axis: str, edge: float) -> bool:
+            if axis == "disk":
+                return sample.disk_free_bytes <= edge * DISK_BAND_REARM_FACTOR * _GB
+            if axis == "spawn":
+                return (
+                    not spawn_readings
+                    or max(spawn_readings) * SPAWN_BAND_REARM_FACTOR >= edge
+                )
+            pct = sample.commit_pct if axis == "commit" else sample.phys_pct
+            return pct > edge - BAND_REARM_GAP_PCT
+
         self._announced_band_edges = {
             (axis, edge) for axis, edge in self._announced_band_edges
-            if (sample.disk_free_bytes <= edge * DISK_BAND_REARM_FACTOR * _GB
-                if axis == "disk" else
-                (sample.commit_pct if axis == "commit" else sample.phys_pct)
-                > edge - BAND_REARM_GAP_PCT)
+            if _edge_still_hot(axis, edge)
         }
 
         # One ``change`` stamp covers the whole event, so ANY axis crossing a
@@ -511,6 +813,8 @@ class ResourcePressureMonitor:
              lambda e: sample.commit_pct > e),
             ("phys", phys_band_edge, PHYS_BANDS,
              lambda e: sample.phys_pct > e),
+            ("spawn", spawn_band_edge, SPAWN_BANDS,
+             lambda e: spawn_floor is not None and spawn_floor > e),
         ]
         band_changed = any(
             edge is not None and (axis, edge) not in self._announced_band_edges
@@ -575,6 +879,7 @@ class ResourcePressureMonitor:
         return self._emit(
             sample, reasons, growth_bytes, band, band_edge, change,
             commit_band, commit_band_edge, phys_band, phys_band_edge,
+            spawn_band, spawn_band_edge, spawn_floor,
         )
 
     def _emit(
@@ -585,6 +890,9 @@ class ResourcePressureMonitor:
         commit_band_edge: Optional[float] = None,
         phys_band: Optional[str] = None,
         phys_band_edge: Optional[float] = None,
+        spawn_band: Optional[str] = None,
+        spawn_band_edge: Optional[float] = None,
+        spawn_floor_ms: Optional[float] = None,
     ) -> str:
         payload = {
             "reasons": reasons,
@@ -605,6 +913,18 @@ class ResourcePressureMonitor:
             "commit_band_edge_pct": commit_band_edge,
             "phys_band": phys_band,
             "phys_band_edge_pct": phys_band_edge,
+            # Spawn-latency axis (2026-08-27). The instantaneous reading may
+            # be None ("not measured this sample"); the sustained floor is
+            # what the axis and its band were judged on.
+            "spawn_latency_ms": (
+                round(sample.spawn_latency_ms, 1)
+                if sample.spawn_latency_ms >= 0 else None
+            ),
+            "spawn_latency_sustained_ms": (
+                round(spawn_floor_ms, 1) if spawn_floor_ms is not None else None
+            ),
+            "spawn_band": spawn_band,
+            "spawn_band_edge_ms": spawn_band_edge,
             "change": change,
             "thresholds": {
                 "commit_pct": self.commit_pct_threshold,
@@ -613,17 +933,24 @@ class ResourcePressureMonitor:
                 "disk_free_gb_critical": self.disk_free_gb_critical,
                 "pagefile_growth_gb": self.pagefile_growth_gb_threshold,
                 "growth_window_min": round(self.growth_window_seconds / 60.0, 1),
+                "spawn_latency_warn_ms": self.spawn_latency_warn_ms,
+                "spawn_sustained_samples": self.spawn_sustained_samples,
             },
         }
+        spawn_txt = (
+            "%.0f ms" % sample.spawn_latency_ms
+            if sample.spawn_latency_ms >= 0 else "n/a"
+        )
         logger.warning(
             "Resource pressure: %s — commit %.1f%% (%.1f/%.1f GB) · "
             "phys %.1f%% (%.1f GB avail) · "
-            "pagefile %.1f GB (+%.1f GB/%.0fm) · C: %.1f GB free",
+            "pagefile %.1f GB (+%.1f GB/%.0fm) · C: %.1f GB free · spawn %s",
             ",".join(reasons),
             payload["commit_pct"], payload["commit_used_gb"], payload["commit_limit_gb"],
             payload["phys_used_pct"], payload["phys_available_gb"],
             payload["pagefile_allocated_gb"], payload["pagefile_growth_gb_10min"],
             payload["thresholds"]["growth_window_min"], payload["disk_c_free_gb"],
+            spawn_txt,
         )
         return self.bus.emit(
             event_type=EventType.RESOURCE_PRESSURE,
