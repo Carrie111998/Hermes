@@ -170,6 +170,50 @@ describe('parseMultipleKeypresses CSI u (Kitty keyboard protocol)', () => {
       super: false
     })
   })
+
+  // Regression: under Kitty keyboard protocol / xterm modifyOtherKeys the
+  // terminal reports the *unshifted* codepoint (Shift+a -> 97), so the parser
+  // must uppercase the letter name when shift is set. Without this, Shift+letter
+  // arrives lowercase and capitalization is lost in text input (Ghostty, #87630).
+  it('parses Shift+a (CSI 97;2u) as name "A" with shift=true', () => {
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[97;2u')
+
+    expect(keys).toHaveLength(1)
+    expect(keys[0]).toMatchObject({
+      kind: 'key',
+      name: 'A',
+      shift: true,
+      ctrl: false
+    })
+  })
+
+  it('parses Shift+Z (CSI 90;2u) as name "Z" with shift=true', () => {
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[90;2u')
+
+    expect(keys).toHaveLength(1)
+    expect(keys[0]).toMatchObject({ kind: 'key', name: 'Z', shift: true })
+  })
+
+  it('keeps plain letter lowercase (CSI 97;1u -> "a")', () => {
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[97;1u')
+
+    expect(keys).toHaveLength(1)
+    expect(keys[0]).toMatchObject({ kind: 'key', name: 'a', shift: false })
+  })
+
+  it('keeps Ctrl+letter lowercase (CSI 97;5u -> "a", ctrl=true)', () => {
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[97;5u')
+
+    expect(keys).toHaveLength(1)
+    expect(keys[0]).toMatchObject({ kind: 'key', name: 'a', ctrl: true, shift: false })
+  })
+
+  it('parses modifyOtherKeys Shift+a (CSI 27;2;97~) as name "A"', () => {
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[27;2;97~')
+
+    expect(keys).toHaveLength(1)
+    expect(keys[0]).toMatchObject({ kind: 'key', name: 'A', shift: true })
+  })
 })
 
 describe('mouse wheel modifier decoding', () => {

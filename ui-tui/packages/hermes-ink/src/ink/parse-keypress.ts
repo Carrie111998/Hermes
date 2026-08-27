@@ -533,7 +533,21 @@ function decodeModifier(modifier: number): {
  * Numpad codepoints are from Unicode Private Use Area, defined at:
  * https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions
  */
-function keycodeToName(keycode: number): string | undefined {
+// Map a keycode to its base (unshifted) name, then apply Shift casing for
+// letter keys. Under CSI-u / modifyOtherKeys the terminal reports the
+// *unshifted* codepoint (Shift+a → 97), so without this Shift+letter arrives
+// lowercase and capitalization is lost in text input. Uppercasing a-z when
+// shift is set restores the capital while leaving key.shift intact so
+// Shift keybindings still match. See GH issue (Ghostty capitalization).
+function keycodeToName(keycode: number, shift = false): string | undefined {
+  const base = _keycodeToNameBase(keycode)
+  if (base && shift && base.length === 1 && base >= 'a' && base <= 'z') {
+    return base.toUpperCase()
+  }
+  return base
+}
+
+function _keycodeToNameBase(keycode: number): string | undefined {
   switch (keycode) {
     case 9:
       return 'tab'
@@ -716,7 +730,7 @@ function parseKeypress(s: string = ''): ParsedKey {
     // Modifier defaults to 1 (no modifiers) when not present
     const modifier = match[2] ? parseInt(match[2], 10) : 1
     const mods = decodeModifier(modifier)
-    const name = keycodeToName(codepoint)
+    const name = keycodeToName(codepoint, mods.shift)
 
     return {
       kind: 'key',
@@ -738,7 +752,7 @@ function parseKeypress(s: string = ''): ParsedKey {
   // would leave the tail as garbage if it partially matched.
   if ((match = MODIFY_OTHER_KEYS_RE.exec(s))) {
     const mods = decodeModifier(parseInt(match[1]!, 10))
-    const name = keycodeToName(parseInt(match[2]!, 10))
+    const name = keycodeToName(parseInt(match[2]!, 10), mods.shift)
 
     return {
       kind: 'key',
