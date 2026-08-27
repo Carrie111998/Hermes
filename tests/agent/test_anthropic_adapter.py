@@ -275,6 +275,34 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert resolve_anthropic_token() == "cc-auto-token"
 
+    def test_suppressed_claude_code_credentials_are_not_resolved(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {"anthropic": ["claude_code"]},
+        }))
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir()
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-suppressed-token",
+                "refreshToken": "refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda: None
+        )
+
+        assert resolve_anthropic_token() is None
+
     def test_falls_back_to_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)

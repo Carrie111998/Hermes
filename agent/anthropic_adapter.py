@@ -1129,6 +1129,14 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
+    try:
+        from hermes_cli.auth import is_source_suppressed
+
+        if is_source_suppressed("anthropic", "claude_code"):
+            return None
+    except Exception:
+        logger.debug("Could not check Claude Code credential suppression", exc_info=True)
+
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
