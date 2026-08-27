@@ -5307,6 +5307,56 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _resolve_cron_image_task_id(job: dict) -> Optional[str]:
+    """Per-job Docker sandbox image isolation.
+
+    If the job pins ``docker_image``, register a per-task image override and
+    return a dedicated ``cronimg-<job_id>`` task id so this job's terminal /
+    execute_code run in their OWN container built from that image (with its
+    own home / workspace) instead of the shared ``default`` sandbox. Mounts
+    and env still come from the global terminal config (image-only isolation).
+
+    Returns the dedicated task id, or ``None`` when the job pins no image (the
+    run then collapses to the shared ``default`` sandbox — unchanged).
+    """
+    try:
+        image = (job.get("docker_image") or "").strip() or None
+    except Exception:
+        image = None
+    if not image:
+        return None
+    job_id = job.get("id")
+    try:
+        from tools.terminal_tool import register_task_env_overrides
+        task_id = f"cronimg-{job_id}"
+        register_task_env_overrides(task_id, {"docker_image": image})
+        logger.info(
+            "Job '%s': per-job docker image isolation -> %s (task_id=%s)",
+            job_id, image, task_id,
+        )
+        return task_id
+    except Exception:
+        logger.warning(
+            "Job '%s': per-job docker image override failed", job_id, exc_info=True
+        )
+        return None
+
+
+def _clear_cron_image_override(task_id):
+    """Drop a per-job image override registered by ``_resolve_cron_image_task_id``.
+
+    Called after each fire so a deleted/paused job does not leave a stale
+    entry in the task-override registry; the next fire re-registers it.
+    """
+    if not task_id:
+        return
+    try:
+        from tools.terminal_tool import clear_task_env_overrides
+        clear_task_env_overrides(task_id)
+    except Exception:
+        logger.debug("per-job image override cleanup skipped for %s", task_id, exc_info=True)
+
+
 def run_job(
     job: dict,
     *,
@@ -6404,7 +6454,31 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _cron_task_id = _resolve_cron_image_task_id(job)
+        # Thread task_id only when the job pins an image AND this agent
+        # flavor's run_conversation accepts the kwarg. Some worker agents do
+        # not; passing it unconditionally would TypeError every fire and brick
+        # the pinned job (PR #90633 review), so degrade to the shared sandbox.
+        _rc_kwargs = {}
+        if _cron_task_id:
+            try:
+                import inspect as _inspect
+                _accepts_task_id = "task_id" in _inspect.signature(
+                    agent.run_conversation
+                ).parameters
+            except (TypeError, ValueError):
+                _accepts_task_id = False
+            if _accepts_task_id:
+                _rc_kwargs["task_id"] = _cron_task_id
+            else:
+                logger.warning(
+                    "Job '%s': %s.run_conversation has no task_id param; per-job "
+                    "docker image isolation unavailable, using shared sandbox",
+                    job_id, type(agent).__name__,
+                )
+                _clear_cron_image_override(_cron_task_id)
+                _cron_task_id = None
+        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt, **_rc_kwargs)
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -6452,6 +6526,7 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+            _clear_cron_image_override(_cron_task_id)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
