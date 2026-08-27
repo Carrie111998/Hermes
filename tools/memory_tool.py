@@ -62,8 +62,143 @@ _memory_surface_flags: ContextVar[Optional[Tuple[bool, bool]]] = ContextVar(
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the profile-scoped memories directory.
+
+    When ``memory.authoritative_source: obsidian`` is configured and the
+    Obsidian vault resolves, the vault's ``Memory/`` directory becomes the
+    canonical on-disk location for ``MEMORY.md`` / ``USER.md``. This makes
+    Obsidian the literal source of truth for persistent user memory: every
+    reader (the built-in ``MemoryStore``, delegate subagents, context
+    compression, the learning graph, ``hermes backup``) transparently points
+    at the vault, so there is a single authoritative file with no divergence.
+    The ``obsidian`` memory provider keeps mirroring writes (it writes to the
+    same ``Memory/`` path), and its complementary prefetch recall block stays
+    available as an additive context source.
+
+    On the first flip, any entries already present in the classic
+    ``~/.hermes/memories`` store are merged (union + dedup) into the vault so
+    no memories are silently dropped. A ``.migrated`` sentinel guards the
+    merge so it runs exactly once. Any failure falls back to the original
+    directory so the agent never breaks on a misconfigured vault.
+    """
+    default_dir = get_hermes_home() / "memories"
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        mem = cfg.get("memory") if isinstance(cfg, dict) else None
+        if not isinstance(mem, dict):
+            return default_dir
+        if (mem.get("authoritative_source") or "").lower() != "obsidian":
+            return default_dir
+        vault = _resolve_obsidian_memory_dir(mem)
+        if vault is None:
+            return default_dir
+        _maybe_migrate_to_vault(default_dir, vault)
+        return vault
+    except Exception:
+        # Obsidian not configured / unreachable -> use the classic store.
+        return default_dir
+
+
+def _resolve_obsidian_memory_dir(mem_config: Dict[str, Any]) -> Optional["Path"]:
+    """Return the vault's ``Memory/`` dir if configured and reachable, else None."""
+    from pathlib import Path as _Path
+
+    cand = None
+    ob = mem_config.get("obsidian") if isinstance(mem_config.get("obsidian"), dict) else {}
+    cand = ob.get("vault_path") or ""
+    if not cand:
+        cand = os.environ.get("OBSIDIAN_VAULT_PATH", "")
+    if not cand:
+        fallback = Path.home() / "Documents" / "Obsidian Vault"
+        return fallback if fallback.is_dir() else None
+    p = _Path(cand).expanduser()
+    return p / "Memory" if p.is_dir() else None
+
+
+def _maybe_migrate_to_vault(src_dir: "Path", vault_dir: "Path") -> None:
+    """One-time union merge of classic memories into the vault (idempotent)."""
+    try:
+        sentinel = vault_dir / ".migrated"
+        if sentinel.exists():
+            return
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ("MEMORY.md", "USER.md"):
+            src = src_dir / fname
+            dst = vault_dir / fname
+            src_entries = [
+                e.strip()
+                for e in src.read_text(encoding="utf-8-sig").split("\n§\n")
+                if e.strip()
+            ] if src.exists() else []
+            dst_entries = [
+                e.strip()
+                for e in dst.read_text(encoding="utf-8-sig").split("\n§\n")
+                if e.strip()
+            ] if dst.exists() else []
+            if not src_entries:
+                continue
+            # Union + dedup. Existing vault entries are preserved unless the
+            # incoming classic entry is a near-duplicate (high token overlap),
+            # in which case the classic entry wins — it was the true
+            # system-prompt source of truth before this flip, so its wording
+            # is authoritative. This collapses drifted mirror copies without
+            # dropping any logical memory.
+            merged = list(dst_entries)
+            for e in src_entries:
+                if _is_near_dup(e, merged):
+                    # Replace the closest vault entry with the classic wording.
+                    idx = _closest_index(e, merged)
+                    if idx is not None:
+                        merged[idx] = e
+                else:
+                    merged.append(e)
+            if merged:
+                dst.write_text("\n§\n".join(merged) + "\n", encoding="utf-8-sig")
+        sentinel.write_text("migrated", encoding="utf-8")
+    except Exception:
+        pass  # Non-fatal: the merge is best-effort; vault stays authoritative.
+
+
+def _norm(text: str) -> str:
+    import re as _re
+
+    return _re.sub(r"\s+", " ", _re.sub(r"[^\w\s]", " ", text.lower())).strip()
+
+
+def _token_set(text: str) -> set:
+    return set(_norm(text).split())
+
+
+def _is_near_dup(entry: str, others: list) -> bool:
+    """True if *entry* is a high-overlap near-duplicate of any item in *others*."""
+    a = _token_set(entry)
+    if not a:
+        return False
+    for o in others:
+        b = _token_set(o)
+        if not b:
+            continue
+        inter = len(a & b)
+        # Overlap on the smaller set; collapse re-phrasings / drifted mirrors.
+        if inter and inter / min(len(a), len(b)) >= 0.7:
+            return True
+    return False
+
+
+def _closest_index(entry: str, others: list) -> int:
+    """Index of the highest-overlap item in *others* for *entry*, or None."""
+    a = _token_set(entry)
+    best, best_score = None, 0.0
+    for i, o in enumerate(others):
+        b = _token_set(o)
+        if not b or not a:
+            continue
+        score = len(a & b) / min(len(a), len(b))
+        if score > best_score:
+            best_score, best = score, i
+    return best if best_score >= 0.7 else None
 
 # Stable header prefixes for the system-prompt memory blocks rendered by
 # MemoryStore._render_block. Exported so compression's prompt-retention check
