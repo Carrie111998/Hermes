@@ -1,5 +1,6 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { userEvent } from '@testing-library/user-event'
 import { useEffect, useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -641,6 +642,30 @@ describe('assistant-ui streaming renderer', () => {
     expect(settled).toContain('max-h-40')
     expect(settled).toMatch(/\boverflow-auto\b/)
     expect(settled).not.toMatch(/\boverflow-hidden\b/)
+  })
+
+  it('expanded thinking body does not swallow the wheel (#96094)', async () => {
+    // Manually expanded (not preview): the body has no max-h, so it must not be
+    // a scroll container — otherwise overscroll-contain swallows the wheel
+    // instead of chaining it to the thread viewport.
+    const { container, settle } = renderSettlingReasoning()
+
+    // Collapse the live preview first, then manually expand it (userOpen=true, isPreview=false).
+    const toggle = within(container).getByRole('button', { name: /thought/i })
+    await userEvent.click(toggle)
+    await waitFor(() => {
+      expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    })
+    await userEvent.click(toggle)
+    await waitFor(() => {
+      expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    })
+
+    const expanded = container.querySelector('[data-slot="aui_thinking-body"]')?.className ?? ''
+
+    expect(expanded).not.toMatch(/\boverflow-auto\b/)
+    expect(expanded).not.toMatch(/\boverscroll-contain\b/)
+    expect(expanded).not.toMatch(/\bmax-h-40\b/)
   })
 
   it('does not collapse a live thinking preview when the turn settles', async () => {

@@ -237,10 +237,12 @@ const ThinkingDisclosure: FC<{
           className={cn(
             // Body sits flush with the "Thinking" header — no left indent —
             // and inherits the disclosure-level opacity fade defined in
-            // styles.css (~0.67 at rest, 1 on hover/focus). overflow-auto so
-            // the max-h-40 preview is a real scroller, not a clip.
-            'mt-0.5 w-full min-w-0 max-w-full overflow-auto overscroll-contain wrap-anywhere pb-1',
-            isPreview && 'max-h-40'
+            // styles.css (~0.67 at rest, 1 on hover/focus). overflow-auto +
+            // overscroll-contain are preview-only so the expanded body (no
+            // max-h) doesn't become a dead scroll container that swallows the
+            // wheel instead of chaining it to the thread viewport (#96094).
+            'mt-0.5 w-full min-w-0 max-w-full wrap-anywhere pb-1',
+            isPreview && 'max-h-40 overflow-auto overscroll-contain'
           )}
           data-slot="aui_thinking-body"
           ref={scrollRef}
