@@ -1658,7 +1658,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             result["warnings"] = warnings
         return result
     except ImportError:
-        return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
+        return {
+            "error": (
+                "python-telegram-bot not installed. "
+                "Run: uv pip install python-telegram-bot"
+            )
+        }
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
 

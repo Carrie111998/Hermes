@@ -7854,7 +7854,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             runtime_repairs = []
             update_managed_uv(repair_observer=runtime_repairs.append)
-            ensure_uv(repair_observer=runtime_repairs.append)
+            repair_uv = ensure_uv(repair_observer=runtime_repairs.append)
             runtime_repaired = next(
                 (result for result in runtime_repairs if result.repaired),
                 None,
@@ -7875,20 +7875,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # "Already up to date!" and exits without doing the one job it
             # was spawned for.
             handed_off_sync = os.environ.get(_m()._UPDATE_REEXEC_ENV) == "1"
+            needs_core_dependency_repair = handed_off_sync or not healthy
             if handed_off_sync:
                 print("→ Finishing the dependency install handed off by hermes.exe...")
             elif not healthy:
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
-            if handed_off_sync or not healthy:
+            if needs_core_dependency_repair or runtime_repaired is not None:
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
                 _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
                 _write_update_incomplete_marker()
-                from hermes_cli.managed_uv import ensure_uv
-
-                repair_uv = ensure_uv()
                 # A managed install whose venv is gone entirely (interrupted
                 # repair after the old venv was moved aside) needs the venv
                 # recreated before dependencies can be installed into it.
@@ -7911,9 +7909,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                     repair_env = managed_python_env()
                     repair_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
-                    _m()._install_python_dependencies_with_optional_fallback(
-                        [repair_uv, "pip"], env=repair_env, group="all"
-                    )
+                    if needs_core_dependency_repair:
+                        _m()._install_python_dependencies_with_optional_fallback(
+                            [repair_uv, "pip"], env=repair_env, group="all"
+                        )
                     _m()._refresh_active_lazy_features(
                         [repair_uv, "pip"],
                         env=repair_env,
@@ -7925,9 +7924,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         env=repair_env,
                     )
                 else:
-                    _m()._install_python_dependencies_with_optional_fallback(
-                        [sys.executable, "-m", "pip"], group="all"
-                    )
+                    if needs_core_dependency_repair:
+                        _m()._install_python_dependencies_with_optional_fallback(
+                            [sys.executable, "-m", "pip"], group="all"
+                        )
                     _m()._refresh_active_lazy_features(
                         [sys.executable, "-m", "pip"],
                         features=active_lazy_features,
