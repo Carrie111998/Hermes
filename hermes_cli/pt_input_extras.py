@@ -72,7 +72,12 @@ def _us_punctuation_layout() -> bool:
     primary = _configured_layout()
     if not primary:
         return False
-    if primary == "us" or primary.startswith(("us-", "us.")):
+    # Only bare "us" (optionally with a console encoding suffix such as
+    # "us.utf-8") is safe by NAME. "us-" prefixed console keymaps are NOT:
+    # us-acentos turns ' and " into dead accent keys, so Shift+' is not '"'
+    # there. Anything else falls through to the xkb table, which answers from
+    # the layout's actual definition instead of its name.
+    if primary == "us" or primary.startswith("us."):
         return True
     # The name is not "us", but the layout may still leave Shift+punctuation
     # exactly where US puts it — Greek does.  Ask its xkb table rather than
