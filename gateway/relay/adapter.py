@@ -1167,8 +1167,10 @@ class RelayAdapter(BasePlatformAdapter):
                     # lanes); a dead re-host reference does not.
                     localized.append((url, mime))
             event.media_urls = [u for u, _ in localized]
-            if types:
-                event.media_types = [m for _, m in localized]
+            # Keep the parallel-array invariant: one mime slot per surviving
+            # url, always. A short/stale media_types would shift entries onto
+            # the wrong url the moment anything indexes or merges them.
+            event.media_types = [m for _, m in localized]
         except Exception:  # noqa: BLE001 - media localization must never break inbound
             logger.debug("relay inbound media localization failed", exc_info=True)
 

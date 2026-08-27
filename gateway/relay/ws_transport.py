@@ -212,35 +212,36 @@ def _normalize_slack_parent_command(
 def _media_types_from_wire(raw: Dict[str, Any]) -> list[str]:
     """Per-attachment MIME types, aligned to ``media_urls`` BY URL.
 
-    ``media_urls`` (legacy, flat) and ``media`` (rich, Phase 2) are separate
-    wire fields, and consumers index them by the same ``i``
-    (``_event_media_type_at``). Deriving the MIME list positionally is unsafe:
-    the two fields can disagree in order, and a length check alone accepts a
-    reordered pair — attaching one attachment's MIME to another's URL, which
-    silently MIS-ROUTES it (an image classified by a PDF's mime is not treated
-    as an image at all).
+    INVARIANT: the returned list is ALWAYS the same length as ``media_urls``
+    (padded with ``""``), or empty when there are no urls. Consumers index the
+    two lists by the same ``i`` (``_event_media_type_at``) AND concatenate them
+    pairwise (``merge_pending_message_event`` extends both), so a short
+    ``media_types`` is not a harmless absence — on a merge it shifts every
+    subsequent entry onto the wrong url.
 
-    So resolve each URL's MIME by LOOKUP, never by position: build
-    ``url -> mime`` from ``media[]`` and map it over ``media_urls``. Any URL
-    with no matching entry keeps its slot as ``""`` and falls back to
-    message-level classification, which is the safe degradation.
+    Resolution is BY URL LOOKUP, never by position: ``media_urls`` (legacy,
+    flat) and ``media`` (rich, Phase 2) are independent wire fields that may
+    disagree in order, and a length check alone accepts a reordered pair —
+    attaching one attachment's MIME to another's url, which silently
+    mis-routes it. A url with no matching ``media[]`` entry keeps its slot as
+    ``""`` and falls back to message-level classification.
     """
-    media = raw.get("media")
     urls = raw.get("media_urls")
-    if not isinstance(media, list) or not media:
-        return []
     if not isinstance(urls, list) or not urls:
-        # No URL list to align to — the MIME list has no meaningful indices.
         return []
+    media = raw.get("media")
     mime_by_url: dict[str, str] = {}
-    for m in media:
-        if isinstance(m, dict):
-            url = m.get("url")
-            if isinstance(url, str) and url:
-                mime_by_url[url] = m.get("mime") or ""
+    if isinstance(media, list):
+        for m in media:
+            if isinstance(m, dict):
+                url = m.get("url")
+                if isinstance(url, str) and url:
+                    mime_by_url[url] = m.get("mime") or ""
+    # One slot per url, ALWAYS — even with no media[] at all (all ""), so the
+    # parallel-array invariant holds for every consumer.
     types = [mime_by_url.get(u, "") if isinstance(u, str) else "" for u in urls]
     missing = sum(1 for t in types if not t)
-    if missing:
+    if missing and mime_by_url:
         logger.debug(
             "relay inbound: %d/%d media_urls had no matching media[] mime",
             missing,

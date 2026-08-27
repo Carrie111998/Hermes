@@ -148,7 +148,9 @@ class TestSttGate:
         ev = _event_from_wire(
             _wire_event("voice", media_urls=["https://gw/relay/media/x"])
         )
-        assert ev.media_types == []
+        # No media[] ⇒ no per-attachment mime, but the slot still exists so the
+        # parallel-array invariant holds (see TestParallelArrayLengthInvariant).
+        assert ev.media_types == [""]
         assert _event_media_is_stt_input(ev, 0) is True
 
     def test_legacy_audio_typed_voice_note_stays_out_of_stt(self):
@@ -256,3 +258,91 @@ class TestUrlMimePairingThroughLocalization:
         )
         assert ev.media_urls == []
         assert ev.media_types == []
+
+class TestParallelArrayLengthInvariant:
+    """media_types must ALWAYS have one slot per media_url.
+
+    Not merely an indexing nicety: ``merge_pending_message_event``
+    (gateway/platforms/base.py) EXTENDS both lists when a second media message
+    is merged into a pending one. If a media_types-less event merges with a
+    typed one, extend() concatenates lists of different lengths and shifts
+    every later mime onto the wrong url. Found by self-review after two
+    rounds of external review flagged this same bug class in adjacent seams."""
+
+    def test_media_urls_without_media_still_get_one_empty_slot_each(self):
+        """An older connector sends media_urls with no media[]. Padding keeps
+        the invariant instead of emitting a length-0 media_types."""
+        ev = _event_from_wire(
+            _wire_event("image", media_urls=["https://x/a.png", "https://x/b.png"])
+        )
+        assert ev.media_types == ["", ""]
+        assert len(ev.media_types) == len(ev.media_urls)
+
+    def test_merging_an_untyped_event_with_a_typed_one_keeps_mimes_on_their_urls(self):
+        from gateway.platforms.base import merge_pending_message_event
+        from gateway.run import _event_media_type_at
+
+        untyped = _event_from_wire(
+            _wire_event("image", media_urls=["https://x/old1.png", "https://x/old2.png"])
+        )
+        typed = _event_from_wire(
+            _wire_event(
+                "document",
+                media=[{"url": "https://x/new.pdf", "mime": "application/pdf"}],
+                media_urls=["https://x/new.pdf"],
+            )
+        )
+        pending = {"k": untyped}
+        merge_pending_message_event(pending, "k", typed)
+        merged = pending["k"]
+
+        assert len(merged.media_types) == len(merged.media_urls)
+        # The PDF's mime must stay on the PDF, not slide onto old1.png.
+        assert _event_media_type_at(merged, 0) == ""
+        assert _event_media_type_at(merged, 1) == ""
+        assert _event_media_type_at(merged, 2) == "application/pdf"
+
+    def test_localization_preserves_the_invariant_when_it_drops_entries(self):
+        import asyncio
+
+        from gateway.relay.adapter import RelayAdapter
+
+        rehost = "https://conn.example/relay/media/dead"
+        kept = "https://x/kept.png"
+        ev = _event_from_wire(
+            _wire_event("image", media_urls=[rehost, kept])  # no media[] at all
+        )
+        assert ev.media_types == ["", ""]
+
+        adapter = RelayAdapter.__new__(RelayAdapter)
+        adapter._media_client = None
+        adapter._get_media_client = lambda: None  # type: ignore[method-assign]
+        asyncio.run(adapter._localize_inbound_media(ev))
+
+        assert ev.media_urls == [kept]
+        assert len(ev.media_types) == len(ev.media_urls)
+
+    def test_localization_normalizes_a_short_media_types_from_any_source(self):
+        """Defence in depth: an event that reaches the localizer with a SHORT
+        media_types (not produced by _event_from_wire — e.g. a synthetic or
+        replayed event) must come out with one slot per surviving url, not
+        with the short list passed through."""
+        import asyncio
+
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.relay.adapter import RelayAdapter
+
+        ev = MessageEvent(text="", message_type=MessageType.PHOTO)
+        ev.media_urls = ["https://x/a.png", "https://x/b.png"]
+        ev.media_types = []  # empty, while urls exist — the shape that must
+        # NOT be passed through: consumers would index/merge against a
+        # zero-length mime list and shift every later entry.
+
+        adapter = RelayAdapter.__new__(RelayAdapter)
+        adapter._media_client = None
+        adapter._get_media_client = lambda: None  # type: ignore[method-assign]
+        asyncio.run(adapter._localize_inbound_media(ev))
+
+        assert ev.media_urls == ["https://x/a.png", "https://x/b.png"]
+        assert ev.media_types == ["", ""]
+        assert len(ev.media_types) == len(ev.media_urls)
