@@ -141,3 +141,55 @@ def test_resolve_duplicate_invalid_kind_rejected(kanban_home: Path) -> None:
                 other_task_id=task_id,
                 reason="test",
             )
+
+
+def test_resolve_duplicate_requires_other_task_id_for_duplicate_of(kanban_home: Path) -> None:
+    """resolve_duplicate requires other_task_id for duplicate_of kind."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="task", assignee="dev")
+
+        # Attempt duplicate_of without other_task_id
+        with pytest.raises(ValueError, match="other_task_id is required"):
+            kb.resolve_duplicate(
+                conn,
+                task_id=task_id,
+                kind="duplicate_of",
+                reason="test",
+            )
+
+
+def test_resolve_duplicate_requires_other_task_id_for_sibling(kanban_home: Path) -> None:
+    """resolve_duplicate requires other_task_id for intentional_sibling_of kind."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="task", assignee="dev")
+
+        # Attempt intentional_sibling_of without other_task_id
+        with pytest.raises(ValueError, match="other_task_id is required"):
+            kb.resolve_duplicate(
+                conn,
+                task_id=task_id,
+                kind="intentional_sibling_of",
+                reason="test",
+            )
+
+
+def test_resolve_duplicate_distinct_allows_no_other_task_id(kanban_home: Path) -> None:
+    """resolve_duplicate allows distinct without other_task_id."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="task", assignee="dev")
+
+        # distinct should work without other_task_id
+        kb.resolve_duplicate(
+            conn,
+            task_id=task_id,
+            kind="distinct",
+            reason="explicitly distinct from similar tasks",
+        )
+
+        # Verify event was created
+        events = _events(conn, task_id, kind="duplicate_resolved")
+        assert len(events) == 1
+        kind, payload = events[0]
+        assert kind == "duplicate_resolved"
+        assert payload["resolution_kind"] == "distinct"
+        assert "other_task_id" not in payload

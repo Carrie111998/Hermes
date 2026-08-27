@@ -7885,17 +7885,23 @@ def resolve_duplicate(
         task_id: The task being classified.
         kind: One of DUPLICATE_RESOLUTION_KINDS ("duplicate_of", "intentional_sibling_of", "distinct").
         other_task_id: When kind is "duplicate_of" or "intentional_sibling_of",
-                       the ID of the other task. Optional for "distinct".
+                       the ID of the other task. Required for those kinds, optional for "distinct".
         reason: Human-readable reason for the resolution.
 
     Raises:
-        ValueError: If kind is not in DUPLICATE_RESOLUTION_KINDS.
+        ValueError: If kind is not in DUPLICATE_RESOLUTION_KINDS or if other_task_id is missing for
+                    kinds that require it ("duplicate_of", "intentional_sibling_of").
     """
     from hermes_cli.kanban_governance import DUPLICATE_RESOLUTION_KINDS
 
     if kind not in DUPLICATE_RESOLUTION_KINDS:
         raise ValueError(
             f"Invalid resolution_kind '{kind}' — must be one of: {', '.join(sorted(DUPLICATE_RESOLUTION_KINDS))}"
+        )
+
+    if kind in ("duplicate_of", "intentional_sibling_of") and not other_task_id:
+        raise ValueError(
+            f"other_task_id is required for kind='{kind}'"
         )
 
     payload = {
