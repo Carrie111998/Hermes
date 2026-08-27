@@ -913,6 +913,95 @@ class TestStuckLoopEscalation:
         assert final_runner._schedule_resume_pending_sessions() == 0
         final_adapter.handle_message.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_graceful_shutdown_does_not_double_count_startup_resume(
+        self, tmp_path, monkeypatch
+    ):
+        """One startup recovery counts once even when its process drains."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        monkeypatch.setattr(
+            "gateway.restart_loop_guard.check_and_record", lambda *_a, **_k: False
+        )
+        source = make_restart_source(chat_id="graceful-loop")
+        pending_entry = SessionEntry(
+            session_key="agent:main:telegram:dm:graceful-loop",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+        )
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+
+        for attempt in range(1, GatewayRunner._STUCK_LOOP_THRESHOLD + 1):
+            runner, adapter = make_restart_runner()
+            runner.session_store._entries = {pending_entry.session_key: pending_entry}
+            gate = asyncio.Event()
+
+            async def hold_resume(_event):
+                await gate.wait()
+
+            adapter.handle_message = AsyncMock(side_effect=hold_resume)
+
+            assert runner._suspend_stuck_loop_sessions() == 0
+            assert runner._schedule_resume_pending_sessions() == 1
+            runner._increment_restart_failure_counts({pending_entry.session_key})
+
+            counts = json.loads(counts_file.read_text(encoding="utf-8"))
+            assert counts[pending_entry.session_key] == attempt
+            gate.set()
+            await asyncio.sleep(0)
+
+        final_runner, final_adapter = make_restart_runner()
+        final_runner.session_store._entries = {
+            pending_entry.session_key: pending_entry
+        }
+        final_adapter.handle_message = AsyncMock()
+
+        assert final_runner._suspend_stuck_loop_sessions() == 1
+        assert final_runner._schedule_resume_pending_sessions() == 0
+
+    @pytest.mark.asyncio
+    async def test_successful_startup_resume_restores_shutdown_accounting(
+        self, tmp_path, monkeypatch
+    ):
+        """A later ordinary active turn is counted after recovery succeeds."""
+        import json
+
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        runner, _adapter = make_restart_runner()
+        source = make_restart_source(chat_id="recovered")
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:recovered",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+
+        runner._record_startup_resume_attempt(entry.session_key)
+        await runner._clear_restart_failure_count(entry.session_key)
+        entry.resume_pending = False
+        runner._increment_restart_failure_counts({entry.session_key})
+
+        counts_file = tmp_path / GatewayRunner._STUCK_LOOP_FILE
+        counts = json.loads(counts_file.read_text(encoding="utf-8"))
+        assert counts == {entry.session_key: 1}
+
 
 @pytest.mark.asyncio
 async def test_auto_resume_sets_sentinel_before_task_execution():

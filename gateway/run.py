@@ -7033,6 +7033,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # with the synthetic resume turns for the same session.  The queued
         # events drain only after all startup resume tasks have finished.
         self._startup_restore_in_progress = False
+        # Startup-resume attempts are counted before dispatch so SIGKILL cannot
+        # bypass the durable retry bound. Keep successfully persisted attempts
+        # process-local too, so graceful shutdown cannot count one twice.
+        self._startup_resume_attempt_keys: set[str] = set()
         # Set by start_gateway() only for an explicit ``--replace`` launch.
         # _connect_initial_adapter_with_timeout scopes it to each adapter's
         # cold-start connect and removes it before any reconnect can run.
@@ -11397,8 +11401,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and not entry.suspended
             )
         }
+        startup_attempt_keys = self.__dict__.get("_startup_resume_attempt_keys", set())
         for key in active_session_keys:
-            new_counts[key] = counts.get(key, 0) + 1
+            if key in startup_attempt_keys:
+                new_counts[key] = counts.get(key, 0)
+            else:
+                new_counts[key] = counts.get(key, 0) + 1
 
         try:
             atomic_json_write(path, new_counts, indent=None)
@@ -11427,6 +11435,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         counts[session_key] = previous + 1
         try:
             atomic_json_write(path, counts, indent=None)
+            self.__dict__.setdefault("_startup_resume_attempt_keys", set()).add(
+                session_key
+            )
         except Exception:
             logger.debug(
                 "Failed to persist startup auto-resume attempt for %s",
@@ -11497,6 +11508,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         import json
 
+        self.__dict__.setdefault("_startup_resume_attempt_keys", set()).discard(
+            session_key
+        )
         path = _hermes_home / self._STUCK_LOOP_FILE
         if not path.exists():
             return
