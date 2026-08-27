@@ -36,6 +36,7 @@ import {
   setMessages,
   touchSessionActivity
 } from '@/store/session'
+import { requestForSessionProfile, type SessionOwnerRoute } from '@/store/session-request-router'
 import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
@@ -75,12 +76,23 @@ interface SubmitPromptDeps {
   onSessionCreatedForSend?: (created: ComposerSessionCreatedForSend) => void
   requestGateway: GatewayRequest
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
-  resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  resumeStoredSession: (
+    storedSessionId: string,
+    replaceRoute?: boolean,
+    capturedOwner?: SessionOwnerRoute
+  ) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   syncAttachmentsForSubmit: (
     sessionId: string,
     attachments: ComposerAttachment[],
-    options?: { updateComposerAttachments?: boolean }
+    options?: {
+      onSessionRecovered?: (sessionId: string) => void
+      recoveryKey?: string
+      remote?: boolean
+      requestGateway?: GatewayRequest
+      storedSessionId?: null | string
+      updateComposerAttachments?: boolean
+    }
   ) => Promise<{ attachments: ComposerAttachment[]; sessionId: string }>
   updateSessionState: (
     sessionId: string,
@@ -295,6 +307,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const submittedStorageScope = submittedStorageScopeKey
         ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
         : null
+
+      const submittedOwner = submittedStorageScope?.format === 'canonical' ? submittedStorageScope.owner : undefined
+
+      const requestTargetGateway: GatewayRequest = submittedOwner
+        ? (method, params = {}, timeoutMs) =>
+            requestForSessionProfile(submittedOwner, requestGateway, method, params, timeoutMs)
+        : requestGateway
+
+      const recoveryKeyFor = (storedSessionId: null | string | undefined): string | undefined =>
+        submittedStorageScope?.format === 'canonical' && submittedStorageScopeKey
+          ? submittedStorageScopeKey
+          : storedSessionId || undefined
 
       const routedRuntimeId = routedStoredSessionId ? getRuntimeIdForStoredSession(routedStoredSessionId) : null
 
@@ -572,7 +596,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // cross-wired. Run the full profile-aware resume path. Creating here
         // would fork a contextless chat against whichever profile is active.
         try {
-          await resumeStoredSession(routedStoredSessionId)
+          if (submittedOwner) {
+            await resumeStoredSession(routedStoredSessionId, false, submittedOwner)
+          } else {
+            await resumeStoredSession(routedStoredSessionId)
+          }
         } catch {
           return abortForSessionSwitch(null)
         }
@@ -588,7 +616,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const publishedRuntimeId = getRuntimeIdForStoredSession(routedStoredSessionId)
 
           if (publishedRuntimeId) {
-            registerRecoveredRuntime(routedStoredSessionId, publishedRuntimeId)
+            registerRecoveredRuntime(recoveryKeyFor(routedStoredSessionId) ?? routedStoredSessionId, publishedRuntimeId)
           }
 
           return abortForSessionSwitch(null)
@@ -623,14 +651,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // profile is live would fork the conversation into the wrong DB (#67603).
           // A runtime a previous drift-aborted recovery already minted for this
           // exact stored session is reused instead of resuming again.
-          const cachedRuntimeId = takeRecoveredRuntime(targetStoredSessionId)
+          const recoveryKey = recoveryKeyFor(targetStoredSessionId) ?? targetStoredSessionId
+          const cachedRuntimeId = takeRecoveredRuntime(recoveryKey)
 
           const resumed = cachedRuntimeId
             ? { session_id: cachedRuntimeId }
-            : await singleFlightSessionResume(targetStoredSessionId, async () => {
-                const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
+            : await singleFlightSessionResume(recoveryKey, async () => {
+                const resumeProfile = submittedOwner?.profile ?? (await resolveSessionProfile(targetStoredSessionId))
 
-                return requestGateway<{ session_id: string }>('session.resume', {
+                return requestTargetGateway<{ session_id: string }>('session.resume', {
                   session_id: targetStoredSessionId,
                   source: 'desktop',
                   omit_messages: true,
@@ -646,7 +675,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // Keep the freshly-bound runtime findable for the next action on
             // this stored session instead of stranding it for the reaper.
             if (resumed?.session_id) {
-              registerRecoveredRuntime(targetStoredSessionId, resumed.session_id)
+              registerRecoveredRuntime(recoveryKey, resumed.session_id)
             }
 
             return abortForSessionSwitch(sessionId)
@@ -789,6 +818,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // plain text survived sleep/wake but images reported "session not
         // found". The attach path recovers and reports the live id back here.
         const attachResult = await syncAttachmentsForSubmit(sessionId, attachments, {
+          onSessionRecovered: recoveredId => {
+            if (onRuntimeRecovered) {
+              onRuntimeRecovered(recoveredId)
+            } else if (targetIsCurrentView()) {
+              activeSessionIdRef.current = recoveredId
+              setActiveSessionId(recoveredId)
+            }
+          },
+          recoveryKey: recoveryKeyFor(targetStoredSessionId),
+          remote: submittedOwner ? submittedOwner.connectionId !== 'local' : undefined,
+          requestGateway: requestTargetGateway,
+          storedSessionId: targetStoredSessionId,
           updateComposerAttachments: usingComposerAttachments
         })
 
@@ -848,10 +889,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             recoverStoredSessionId,
             liveId =>
               withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestTargetGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               ),
             {
-              requestGateway,
+              requestGateway: requestTargetGateway,
+              recoveryKey: recoveryKeyFor(recoverStoredSessionId),
               driftReason: sessionDriftReason,
               onRecovered: recoveredId => {
                 if (onRuntimeRecovered) {

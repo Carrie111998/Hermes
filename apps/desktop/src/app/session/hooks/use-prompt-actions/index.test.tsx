@@ -1980,14 +1980,96 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
+  it('routes queued resume and submit through the canonical exact owner instead of ambient', async () => {
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    $connection.set({ connectionId: 'source-a', mode: 'remote' } as never)
+    setSessions([
+      sessionInfo({ connection_id: 'source-a', id: 'stored-shared', profile: 'worker' }),
+      sessionInfo({ connection_id: ownerB.connectionId, id: 'stored-shared', profile: ownerB.profile })
+    ])
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(
+      async (_connectionId, _profile, method) =>
+        (method === 'session.resume' ? { session_id: 'rt-owner-b' } : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        storedSessionId={null}
+      />
+    )
+
+    const accepted = await handle!.submitText('owner B queued prompt', {
+      composerStorageScope: encodeComposerStorageScopeKey(ownerB, 'stored-shared'),
+      fromQueue: true,
+      sessionId: null,
+      storedSessionId: 'stored-shared'
+    })
+
+    expect(accepted).toBe(true)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(ownerB.connectionId, ownerB.profile, 'session.resume', {
+      omit_messages: true,
+      profile: ownerB.profile,
+      session_id: 'stored-shared',
+      source: 'desktop'
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerB.connectionId,
+      ownerB.profile,
+      'prompt.submit',
+      { queued: true, session_id: 'rt-owner-b', text: 'owner B queued prompt' },
+      1_800_000,
+      undefined
+    )
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('passes the canonical exact owner into the high-level routed resume', async () => {
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    const resumeStoredSession = vi.fn(async () => undefined)
+    vi.mocked(requestGatewayForAgent).mockImplementation(
+      async (_connectionId, _profile, method) =>
+        (method === 'session.resume' ? { session_id: 'rt-owner-b' } : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        getRoutedStoredSessionId={() => 'stored-shared'}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        resumeStoredSession={resumeStoredSession}
+        storedSessionId={null}
+      />
+    )
+
+    const accepted = await handle!.submitText('resume owner B route', {
+      composerStorageScope: encodeComposerStorageScopeKey(ownerB, 'stored-shared')
+    })
+
+    expect(accepted).toBe(true)
+    expect(resumeStoredSession).toHaveBeenCalledWith('stored-shared', false, ownerB)
+  })
+
   it('does not share an in-flight submit lock across exact owners with the same stored id', async () => {
     const ownerA = { connectionId: 'source-a', profile: 'worker' }
     const ownerB = { connectionId: 'source-b', profile: 'worker' }
     let settleA: (() => void) | undefined
+
     const pendingA = new Promise<void>(resolve => {
       settleA = resolve
     })
-    const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, _method, params) => {
       if (params?.session_id === 'rt-owner-a') {
         await pendingA
       }
@@ -2013,10 +2095,13 @@ describe('usePromptActions submit / queue drain semantics', () => {
     })
 
     await waitFor(() =>
-      expect(requestGateway).toHaveBeenCalledWith(
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(
+        ownerA.connectionId,
+        ownerA.profile,
         'prompt.submit',
         { session_id: 'rt-owner-a', text: 'owner A prompt' },
-        1_800_000
+        1_800_000,
+        undefined
       )
     )
 
@@ -2930,6 +3015,64 @@ describe('usePromptActions file attachment sync', () => {
       refText: '@file:`/Users/alice/Downloads/report.txt`'
     }
   }
+
+  it('routes queued attachment staging through the canonical exact owner', async () => {
+    const ownerB = { connectionId: 'source-b', profile: 'worker' }
+    $connection.set({ connectionId: 'source-a', mode: 'remote' } as never)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl: vi.fn(async () => 'data:text/plain;base64,aGVsbG8=') }
+    })
+
+    const attachmentResult = {
+      attached: true,
+      path: '/remote/work/.hermes/desktop-attachments/report.txt',
+      ref_text: '@file:.hermes/desktop-attachments/report.txt',
+      uploaded: true
+    }
+
+    const ambientRequest = vi.fn(async (method: string) => (method === 'file.attach' ? attachmentResult : {}) as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(
+      async (_connectionId, _profile, method) => (method === 'file.attach' ? attachmentResult : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        getRuntimeIdForStoredSession={() => 'rt-owner-b'}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        storedSessionId={null}
+      />
+    )
+
+    const ok = await handle!.submitText('convert owner B report', {
+      attachments: [fileAttachment()],
+      composerStorageScope: encodeComposerStorageScopeKey(ownerB, 'stored-shared'),
+      fromQueue: true,
+      sessionId: 'rt-owner-b',
+      storedSessionId: 'stored-shared'
+    })
+
+    expect(ok).toBe(true)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerB.connectionId,
+      ownerB.profile,
+      'file.attach',
+      expect.objectContaining({ session_id: 'rt-owner-b' })
+    )
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerB.connectionId,
+      ownerB.profile,
+      'prompt.submit',
+      expect.objectContaining({ session_id: 'rt-owner-b' }),
+      1_800_000,
+      undefined
+    )
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
 
   it('uploads file bytes via file.attach on a remote gateway and submits the rewritten ref', async () => {
     // Remote gateway can't read the client-disk path, so the desktop must upload
@@ -4418,6 +4561,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     ])
 
     const requestGateway = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
     let handle: HarnessHandle | null = null
 
     await actRender(
@@ -4435,7 +4579,14 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     })
 
     expect(ok).toBe(true)
-    expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      ownerB.connectionId,
+      ownerB.profile,
+      'prompt.submit',
+      expect.anything(),
+      expect.anything(),
+      undefined
+    )
   })
 
   it('aborts submit when the composer scope disagrees with the resolved target (#59305)', async () => {

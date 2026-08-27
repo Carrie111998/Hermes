@@ -39,6 +39,7 @@ import {
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { $sessionStates, isSessionRemote } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
@@ -131,6 +132,8 @@ export async function uploadComposerAttachment(
     sessionId: string
     /** Durable id used to re-register after sleep/wake or a backend restart. */
     storedSessionId?: null | string
+    /** Owner-qualified renderer key for resume/recovered-runtime bookkeeping. */
+    recoveryKey?: string
     /** Called when the attach recovered onto a fresh live id. */
     onSessionRecovered?: (sessionId: string) => void
     terminalBackend?: string
@@ -219,7 +222,7 @@ export async function uploadComposerAttachment(
     opts.sessionId,
     storedSessionId,
     stageForSession,
-    { requestGateway }
+    { recoveryKey: opts.recoveryKey, requestGateway }
   )
 
   if (usedSessionId !== opts.sessionId) {
@@ -246,7 +249,11 @@ interface PromptActionsOptions {
   onSessionCreatedForSend?: (created: ComposerSessionCreatedForSend) => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
-  resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  resumeStoredSession: (
+    storedSessionId: string,
+    replaceRoute?: boolean,
+    capturedOwner?: SessionOwnerRoute
+  ) => Promise<void> | void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
@@ -346,18 +353,31 @@ export function usePromptActions({
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: {
+        onSessionRecovered?: (sessionId: string) => void
+        recoveryKey?: string
+        remote?: boolean
+        requestGateway?: GatewayRequest
+        storedSessionId?: null | string
+        updateComposerAttachments?: boolean
+      } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
-      const storedSessionId = selectedStoredSessionIdRef.current
-      const remote = isSessionRemote(storedSessionId ?? sessionId)
+      const storedSessionId = options.storedSessionId ?? selectedStoredSessionIdRef.current
+      const remote = options.remote ?? isSessionRemote(storedSessionId ?? sessionId)
+      const targetRequestGateway = options.requestGateway ?? requestGateway
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
       const onSessionRecovered = (recoveredId: string) => {
         liveSessionId = recoveredId
-        activeSessionIdRef.current = recoveredId
-        setActiveSessionId(recoveredId)
+
+        if (options.onSessionRecovered) {
+          options.onSessionRecovered(recoveredId)
+        } else {
+          activeSessionIdRef.current = recoveredId
+          setActiveSessionId(recoveredId)
+        }
       }
 
       for (const original of attachments) {
@@ -390,7 +410,8 @@ export function usePromptActions({
           const nextAttachment = await uploadComposerAttachment(attachment, {
             backendCwd: $currentCwd.get(),
             remote,
-            requestGateway,
+            recoveryKey: options.recoveryKey,
+            requestGateway: targetRequestGateway,
             sessionId: liveSessionId,
             storedSessionId,
             onSessionRecovered,
