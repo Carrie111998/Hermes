@@ -206,10 +206,13 @@ class TestIsAvailable:
         provider = registry.get_provider("deepseek")
         assert provider is not None
         monkeypatch.setenv("DEEPSEEK_API_KEY", "real")
-        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"web": {"keyless_fallback": False}},
+        )
         monkeypatch.setattr(registry, "_providers", {"deepseek": provider})
 
-        assert registry._resolve(None, capability="search") is None
+        assert registry._resolve(None, capability="search") is not provider
         assert registry._resolve("deepseek", capability="search") is provider
 
     def test_deepseek_setup_schema_uses_picker_contract(self) -> None:
@@ -233,15 +236,23 @@ class TestIsAvailable:
         )
         monkeypatch.setattr(
             "tools.web_tools._load_web_config",
-            lambda: {"search_backend": "deepseek"},
+            lambda: {
+                "search_backend": "deepseek",
+                "keyless_fallback": False,
+            },
         )
 
+        monkeypatch.setattr(
+            "tools.web_tools._keyless_rescue_enabled",
+            lambda: False,
+        )
         from tools.web_tools import _get_search_backend, web_search_tool
 
         assert _get_search_backend() == "deepseek"
         result = json.loads(web_search_tool("query"))
         assert result["success"] is False
         assert "active DeepSeek model" in result["error"]
+        assert "deepseek-v4-flash-vision-exp" in result["error"]
 
     def test_deepseek_picker_row_can_be_selected_without_credentials(self) -> None:
         _ensure_plugins_loaded()

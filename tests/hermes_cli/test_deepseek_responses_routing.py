@@ -1,4 +1,4 @@
-"""DeepSeek V4 Flash model-aware Responses routing contracts."""
+"""DeepSeek model-aware Responses and native-search routing contracts."""
 
 from types import SimpleNamespace
 
@@ -27,6 +27,9 @@ from hermes_cli.providers import (
         "deepseek-v4-pro",
         "DEEPSEEK-V4-PRO",
         "deepseek/deepseek-v4-pro",
+        "deepseek-v4-flash-vision-exp",
+        "DEEPSEEK-V4-FLASH-VISION-EXP",
+        "deepseek/deepseek-v4-flash-vision-exp",
     ],
 )
 def test_documented_v4_models_support_responses_and_native_search(model):
@@ -53,14 +56,17 @@ def test_other_deepseek_models_stay_on_chat_completions(model):
     assert deepseek_api_mode(model) == "chat_completions"
 
 
-def test_v4_pro_has_ga_responses_and_native_search_capabilities():
+def test_documented_models_are_all_listed_for_native_search():
     assert deepseek_model_capabilities("deepseek-v4-pro") == DeepSeekModelCapabilities(
         responses_api=True,
         native_web_search=True,
     )
     enabled = deepseek_native_web_search_models()
-    assert "deepseek-v4-flash" in enabled
-    assert "deepseek-v4-pro" in enabled
+    assert enabled == (
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro",
+    )
 
 
 def test_native_search_capability_fails_closed_without_responses(monkeypatch):
@@ -303,7 +309,10 @@ def test_direct_agent_init_routes_pro_to_responses(monkeypatch, tmp_path):
     assert agent.base_url == "https://api.deepseek.com"
 
 
-@pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"],
+)
 def test_main_request_builder_uses_explicit_native_search_backend(
     monkeypatch, tmp_path, model
 ):

@@ -1393,7 +1393,10 @@ class TestDeepSeekNativeWebSearch:
             },
         ]
 
-    @pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
+    @pytest.mark.parametrize(
+        "model",
+        ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"],
+    )
     def test_explicit_deepseek_backend_swaps_client_tool_one_for_one(
         self, transport, monkeypatch, model
     ):

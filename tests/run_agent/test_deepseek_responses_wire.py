@@ -169,7 +169,10 @@ def _web_search_tool() -> dict:
     }
 
 
-@pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"],
+)
 def test_real_sdk_streams_and_replays_deepseek_web_search_call(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

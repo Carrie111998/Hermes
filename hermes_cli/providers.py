@@ -726,6 +726,10 @@ _DEEPSEEK_MODEL_CAPABILITIES: Dict[str, DeepSeekModelCapabilities] = {
         responses_api=True,
         native_web_search=True,
     ),
+    "deepseek-v4-flash-vision-exp": DeepSeekModelCapabilities(
+        responses_api=True,
+        native_web_search=True,
+    ),
 }
 _DEEPSEEK_NO_CAPABILITIES = DeepSeekModelCapabilities()
 

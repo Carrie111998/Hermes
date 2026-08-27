@@ -340,6 +340,7 @@ class TestDefaultContextLengths:
 
         expected_keys = {
             "deepseek-v4-pro": 1_000_000,
+            "deepseek-v4-flash-vision-exp": 1_000_000,
             "deepseek-v4-flash": 1_000_000,
             "deepseek-chat": 1_000_000,
             "deepseek-reasoner": 1_000_000,
@@ -359,6 +360,7 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
             cases = [
                 ("deepseek-v4-pro", 1_000_000),
+                ("deepseek-v4-flash-vision-exp", 1_000_000),
                 ("deepseek-v4-flash", 1_000_000),
                 ("deepseek/deepseek-v4-pro", 1_000_000),
                 ("deepseek/deepseek-v4-flash", 1_000_000),

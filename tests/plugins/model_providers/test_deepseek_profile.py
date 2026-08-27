@@ -193,6 +193,7 @@ class TestDeepSeekAuxModel:
         assert deepseek_profile.fallback_models == (
             "deepseek-v4-pro",
             "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
         )
 
     def test_consumer_api_returns_deepseek_v4_flash(self):

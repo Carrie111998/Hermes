@@ -103,6 +103,7 @@ deepseek = DeepSeekProfile(
     fallback_models=(
         "deepseek-v4-pro",
         "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
     ),
     base_url="https://api.deepseek.com/v1",
     default_aux_model="deepseek-v4-flash",
