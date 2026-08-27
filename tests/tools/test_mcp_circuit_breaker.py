@@ -101,6 +101,40 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_tool_level_errors_do_not_trip_server_circuit_breaker(monkeypatch, tmp_path):
+    """A valid MCP error response proves the transport is still reachable."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_not_found(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.is_error = True
+        block = MagicMock()
+        block.text = "Task not found"
+        result.content = [block]
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_not_found)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "task_detail", 10.0)
+        attempts = mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
+        for _ in range(attempts):
+            parsed = json.loads(handler({}))
+            assert parsed.get("error") == "Task not found", parsed
+
+        assert call_count["n"] == attempts
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     """After a tripped breaker's cooldown elapses, the *next* call must
     actually execute against the session (half-open probe). When the

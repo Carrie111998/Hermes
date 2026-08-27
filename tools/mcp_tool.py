@@ -5818,7 +5818,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        rpc_response_received = False
+
         async def _call():
+            nonlocal rpc_response_received
+            rpc_response_received = False
             _mark_server_call_started(server)
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
@@ -5830,6 +5834,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
+            rpc_response_received = True
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
@@ -5969,7 +5974,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    if rpc_response_received:
+                        _reset_server_error(server_name)
+                    else:
+                        _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
