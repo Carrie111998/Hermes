@@ -2028,6 +2028,12 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        # Certified ACP turns are withheld until the runtime has replaced
+        # untrusted model prose with the wrapper-owned PASS/FAIL result. This
+        # guard precedes both the JSON transcript and SQLite writes.
+        if getattr(self, "_certification_persistence_deferred", False):
+            self._session_messages = messages
+            return
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -2155,7 +2161,10 @@ class AIAgent:
         # update the skill library…") inside the user's real session history,
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
-        if getattr(self, "_persist_disabled", False):
+        if (
+            getattr(self, "_persist_disabled", False)
+            or getattr(self, "_certification_persistence_deferred", False)
+        ):
             return None
         if not self._session_db:
             return None
@@ -8406,6 +8415,9 @@ class AIAgent:
                      tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
                      skip_tool_execution_middleware: bool = False) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
+        if getattr(self, "_certification_persistence_deferred", False) is True:
+            skip_tool_request_middleware = True
+            skip_tool_execution_middleware = True
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
             self,

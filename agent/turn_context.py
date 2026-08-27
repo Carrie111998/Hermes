@@ -481,13 +481,20 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    certification_deferred = bool(
+        getattr(agent, "_certification_persistence_deferred", False)
+    )
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
     # belong to the canonical child, including observability metadata.
-    recovered_history = recover_rotated_compression_session(agent)
+    recovered_history = (
+        None
+        if certification_deferred
+        else recover_rotated_compression_session(agent)
+    )
     if recovered_history is not None:
         conversation_history = recovered_history
 
@@ -590,8 +597,9 @@ def build_turn_context(
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.
-    from agent.agent_runtime_helpers import note_turn_start
-    note_turn_start(agent, turn_id)
+    if not certification_deferred:
+        from agent.agent_runtime_helpers import note_turn_start
+        note_turn_start(agent, turn_id)
 
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0
@@ -798,7 +806,9 @@ def build_turn_context(
     # persist lock as CLI close persistence.
     persist_lock = getattr(agent, "_session_persist_lock", None)
     try:
-        if persist_lock is None:
+        if certification_deferred:
+            pass
+        elif persist_lock is None:
             agent._ensure_db_session()
         else:
             with persist_lock:
@@ -1274,20 +1284,23 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
+        if certification_deferred:
+            _pre_results = []
+        else:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _pre_results = _invoke_hook(
+                "pre_llm_call",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+            )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
@@ -1373,7 +1386,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not certification_deferred:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1385,7 +1398,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not certification_deferred:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
@@ -1472,7 +1485,9 @@ def build_turn_context(
         agent._persist_session(messages, conversation_history)
 
     try:
-        if persist_lock is None:
+        if certification_deferred:
+            pass
+        elif persist_lock is None:
             _ensure_and_persist()
         else:
             with persist_lock:

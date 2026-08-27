@@ -99,6 +99,36 @@ from agent.turn_finalizer import finalize_turn
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+
+def _run_llm_execution_with_certification_guard(
+    agent,
+    request: dict[str, Any],
+    next_call,
+    **context: Any,
+):
+    """Bypass registered response observers for uncertified model execution."""
+    if getattr(agent, "_certification_persistence_deferred", False) is True:
+        return next_call(request)
+    from hermes_cli.middleware import run_llm_execution_middleware
+
+    return run_llm_execution_middleware(request, next_call, **context)
+
+
+def _run_relay_llm_execution_with_certification_guard(
+    agent,
+    request: dict[str, Any],
+    next_call,
+    **context: Any,
+):
+    """Keep uncertified non-streaming responses out of Relay observers."""
+    if getattr(agent, "_certification_persistence_deferred", False) is True:
+        return next_call(request)
+    from agent import relay_llm
+
+    return relay_llm.execute(request, next_call, **context)
+
+
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
@@ -1045,14 +1075,18 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
+    certification_deferred = bool(
+        getattr(agent, "_certification_persistence_deferred", False)
+    )
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
+        if not certification_deferred:
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
 
@@ -1065,7 +1099,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     try:
         from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
+        if not certification_deferred:
+            seed_credits_at_session_start(agent)
     except Exception:
         logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
@@ -1073,7 +1108,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # to log at DEBUG, which silently broke prefix-cache reuse on the
     # gateway path (fresh AIAgent per turn → reads from this row every
     # subsequent turn).
-    if agent._session_db:
+    if agent._session_db and not certification_deferred:
         try:
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         except Exception as exc:
@@ -1703,6 +1738,8 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
+    if getattr(agent, "_certification_persistence_deferred", False) is True:
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
         return api_messages
@@ -2068,7 +2105,10 @@ def run_conversation(
             break
 
         # Fire step_callback for gateway hooks (agent:step event)
-        if agent.step_callback is not None:
+        if (
+            not getattr(agent, "_certification_persistence_deferred", False)
+            and agent.step_callback is not None
+        ):
             try:
                 prev_tools = []
                 for _idx, _m in enumerate(reversed(messages)):
@@ -3003,35 +3043,42 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
+                if getattr(agent, "_certification_persistence_deferred", False) is True:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+                else:
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
+
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                        )
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
 
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    if (
+                        getattr(agent, "_certification_persistence_deferred", False) is not True
+                        and has_hook("pre_api_request")
+                    ):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -3185,9 +3232,8 @@ def run_conversation(
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    from agent import relay_llm
-
-                    return relay_llm.execute(
+                    return _run_relay_llm_execution_with_certification_guard(
+                        agent,
                         next_api_kwargs,
                         agent._interruptible_api_call,
                         session_id=str(agent.session_id or ""),
@@ -3208,8 +3254,6 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -3220,7 +3264,8 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
+                    response = _run_llm_execution_with_certification_guard(
+                        agent,
                         api_kwargs,
                         _perform_api_call,
                         original_request=_original_api_kwargs,
@@ -6797,7 +6842,10 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                if (
+                    getattr(agent, "_certification_persistence_deferred", False) is not True
+                    and has_hook("post_api_request")
+                ):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
@@ -6844,7 +6892,11 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
+            if (
+                assistant_message.content
+                and not getattr(agent, "_certification_persistence_deferred", False)
+                and agent.tool_progress_callback
+            ):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(

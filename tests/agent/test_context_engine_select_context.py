@@ -134,6 +134,23 @@ def test_empty_list_keeps_original_request():
     assert logger.warning.called
 
 
+def test_certification_defer_blocks_context_engine_selection_entirely():
+    class _Engine(_MinimalEngine):
+        def select_context(self, request_messages, **kwargs):
+            raise AssertionError("uncertified transcript reached select_context")
+
+    agent = _agent_with(_Engine())
+    agent._certification_persistence_deferred = True
+    logger = MagicMock()
+
+    out = _apply_context_engine_selection(
+        agent, REQUEST, HISTORY, HISTORY[-1], logger=logger
+    )
+
+    assert out is REQUEST
+    assert not logger.warning.called
+
+
 def test_engine_mutating_inputs_cannot_corrupt_persisted_state():
     """An engine that mutates its read-only inputs in place must not affect the
     persisted conversation history / incoming message.

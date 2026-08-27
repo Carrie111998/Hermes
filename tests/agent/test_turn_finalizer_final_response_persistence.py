@@ -176,6 +176,51 @@ def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     assert agent.persisted_messages[-1]["timestamp"] != persisted_at
 
 
+def test_certification_defer_blocks_all_raw_post_turn_side_effects(monkeypatch):
+    calls: list[str] = []
+
+    def record(name):
+        def _record(*_args, **_kwargs):
+            calls.append(name)
+            return []
+        return _record
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", record("plugin"))
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        record("context_engine"),
+    )
+    agent = FakeAgent()
+    agent._certification_persistence_deferred = True
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = ["skill_manage"]
+    agent._save_trajectory = record("trajectory")
+    agent._sync_external_memory_for_turn = record("external_memory")
+    agent._spawn_background_review = record("background_review")
+
+    finalize_turn(
+        agent,
+        final_response="RAW UNCERTIFIED DRAFT",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "RAW UNCERTIFIED DRAFT", "reasoning": "SECRET"},
+        ],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=True,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert calls == []
+
+
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     """A tail assistant row that is a *pure tool-call turn* carries no answer.
 
