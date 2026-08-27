@@ -1,7 +1,7 @@
 manifest_version: 1
 
 name: coinbase
-description: Trade crypto and manage Coinbase Advanced Trade portfolios.
+description: Trade crypto, manage portfolios, and make x402 payments.
 source: https://docs.cdp.coinbase.com/coinbase-for-agents/overview
 
 transport:
@@ -14,6 +14,10 @@ auth:
 suggest:
   keywords:
     - coinbase
+    - crypto trade
+    - x402
+    - x402 payments
+    - portfolio balance
   hosts:
     - coinbase.com
 
