@@ -19581,6 +19581,15 @@ def start_server(
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
+    # Snapshot the real stdout early: importing tui_gateway.server below (for
+    # install_exit_flush_signal_handlers) runs its module-level
+    # ``sys.stdout = sys.stderr`` (JSON-RPC stdout protection for the stdio
+    # gateway). That redirect must NOT apply here — this is the HTTP/serve
+    # backend, and the HERMES_BACKEND_READY port announcement below is the
+    # desktop's only port-discovery channel, read from the spawn's stdout
+    # pipe. Restore the real stdout right before the announcement.
+    _real_process_stdout = sys.stdout
+
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
     # the `serve` path in main.py (which applies the same floor). Canonical
     # policy lives in resource_limits; #81547's motivating leak (iterdir fds)
@@ -19915,6 +19924,14 @@ def start_server(
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
+
+            # Restore the real stdout pipe before the announcement: the
+            # tui_gateway.server import above redirected sys.stdout to stderr
+            # (JSON-RPC protection), which would otherwise swallow this
+            # sentinel and make the desktop time out waiting for the port.
+            if sys.stdout is not _real_process_stdout:
+                sys.stdout = _real_process_stdout
+            
             # tui_gateway.server (imported above for the flush-on-SIGTERM
             # handlers, #94724) redirects sys.stdout→sys.stderr at import time
             # to keep stray prints off the JSON-RPC protocol stream. fd 1 is
