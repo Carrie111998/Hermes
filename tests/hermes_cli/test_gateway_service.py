@@ -2303,3 +2303,65 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
+
+
+class TestRefuseRootMacosLaunchd:
+    """Tests for the shared root-on-macOS guard used by install/start/restart (#67732).
+
+    Regression guard: without this, `sudo hermes gateway install|start|restart`
+    on macOS writes a plist to /var/root, fails launchctl bootstrap (root has
+    no GUI session), and falls back to a root-run gateway that leaves
+    root-owned state in the real user's ~/.hermes, breaking every subsequent
+    user-level launchd command.
+    """
+
+    def test_noop_when_not_macos(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        gateway_cli._refuse_root_macos_launchd("install")  # must not raise
+
+    def test_noop_when_macos_but_not_root(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 501)
+
+        gateway_cli._refuse_root_macos_launchd("install")  # must not raise
+
+    def test_exits_with_guidance_when_root_on_macos(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SystemExit) as exc_info:
+            gateway_cli._refuse_root_macos_launchd("start")
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "root" in out.lower()
+        assert "sudo" in out.lower()
+        assert "hermes gateway start" in out
+
+    @pytest.mark.parametrize("entry_point", ["launchd_install", "launchd_start", "launchd_restart"])
+    def test_root_on_macos_blocks_before_any_side_effect(self, monkeypatch, entry_point, tmp_path):
+        """Root on macOS must exit before touching the plist, launchctl, or the
+        detached-fallback / unsupported-marker path — for install, start, and
+        restart alike."""
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        def _fail(*_a, **_k):
+            raise AssertionError(f"{entry_point} touched launchd/subprocess state before the root guard")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", _fail)
+        monkeypatch.setattr(gateway_cli, "_launchctl_bootstrap", _fail)
+        monkeypatch.setattr(gateway_cli, "_write_launchd_unsupported_marker", _fail)
+        monkeypatch.setattr(gateway_cli, "_spawn_detached_gateway", _fail)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", _fail)
+
+        with pytest.raises(SystemExit) as exc_info:
+            getattr(gateway_cli, entry_point)()
+
+        assert exc_info.value.code == 1
+        assert not plist_path.exists()

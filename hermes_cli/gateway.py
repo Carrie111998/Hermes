@@ -5299,7 +5299,29 @@ def refresh_launchd_plist_if_needed() -> bool:
     return True
 
 
+def _refuse_root_macos_launchd(command: str) -> None:
+    """Exit with guidance when a launchd-managed gateway command runs as root on macOS.
+
+    launchd user agents require a GUI session, which root never has: bootstrapping
+    into ``gui/0``/``user/0`` fails outright (exit 125), and the detached fallback
+    that follows spawns the gateway as root, writing root-owned state into the real
+    user's ``HERMES_HOME`` that breaks every subsequent user-level launchd command
+    (#67732). Call this first, before any plist/state write or launchctl call, in
+    every command that can reach the launchd path on macOS.
+    """
+    if not is_macos() or os.geteuid() != 0:  # windows-footgun: ok — macOS-only guard, short-circuited by is_macos()
+        return
+    print_error(
+        f"Running `hermes gateway {command}` as root on macOS is not supported.\n"
+        "  launchd requires a GUI user session; root has none.\n"
+        "  Run the command without sudo instead:\n"
+        f"    hermes gateway {command}"
+    )
+    sys.exit(1)
+
+
 def launchd_install(force: bool = False):
+    _refuse_root_macos_launchd("install")
     plist_path = get_launchd_plist_path()
 
     if plist_path.exists() and not force:
@@ -5357,6 +5379,7 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    _refuse_root_macos_launchd("start")
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
 
@@ -5535,6 +5558,7 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    _refuse_root_macos_launchd("restart")
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
