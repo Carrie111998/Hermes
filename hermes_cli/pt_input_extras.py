@@ -11,6 +11,84 @@ can be unit-tested without importing the whole CLI runtime.
 
 from __future__ import annotations
 
+import os
+
+
+def _kitty_reports_unshifted_codepoints() -> bool:
+    """True when the CSI-u path will be driven with UNSHIFTED codepoints.
+
+    The kitty keyboard protocol always reports the base (unshifted) codepoint
+    plus a Shift modifier, while xterm modifyOtherKeys emitters report the
+    already-shifted one.  That single difference decides which half of the
+    Shift+punctuation table can ever fire, and therefore whether a US-layout
+    assumption is load-bearing — see ``_shift_punctuation_base_map_is_safe``.
+
+    Ghostty is excluded deliberately: it is pushed modifyOtherKeys only (its
+    kitty disambiguate mode strips Alt from Backspace), so it reports shifted
+    codepoints even though its TERM mentions neither protocol.
+    """
+    env = os.environ
+    if (env.get("TERM_PROGRAM") or "").strip() == "ghostty":
+        return False
+    term = (env.get("TERM") or "").strip().lower()
+    if term == "xterm-ghostty":
+        return False
+    return bool(env.get("KITTY_WINDOW_ID") or "kitty" in term)
+
+
+def _us_punctuation_layout() -> bool:
+    """True only when Shift+<punct> is POSITIVELY known to follow US layout.
+
+    Cheap and env/file based on purpose: this runs on the CLI startup path, so
+    it must not spawn a subprocess.  Unknown answers return False, because the
+    caller treats False as "do not guess".
+    """
+    layout = (os.environ.get("XKB_DEFAULT_LAYOUT") or "").strip().lower()
+    if not layout:
+        for path, key in (
+            ("/etc/default/keyboard", "XKBLAYOUT"),
+            ("/etc/vconsole.conf", "KEYMAP"),
+        ):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        name, _, value = line.partition("=")
+                        if name.strip() == key:
+                            layout = value.strip().strip('"').strip("'").lower()
+                            break
+            except OSError:
+                continue
+            if layout:
+                break
+    if not layout:
+        return False
+    # "us", "us,gr" (us primary), "us-acentos"/"us.utf-8" console keymaps.
+    primary = layout.split(",")[0].strip()
+    return primary == "us" or primary.startswith(("us-", "us."))
+
+
+def _shift_punctuation_base_map_is_safe() -> bool:
+    """Whether the base-codepoint half of the Shift+punctuation map may install.
+
+    The map has two halves and they are NOT equally safe:
+
+    * ``punct_map[ord(shifted)] = shifted`` is an IDENTITY mapping — whatever
+      shifted codepoint the terminal reports is echoed back.  Correct on every
+      keyboard layout, so it installs unconditionally.
+    * ``punct_map[base_cp] = shifted`` translates ``2`` into ``@`` from a US
+      table.  It is a guess, and on a non-US layout it types the WRONG
+      character rather than leaking an escape sequence.
+
+    Which half fires is decided entirely by the terminal, and only kitty
+    reaches the guessing half — so a kitty user on a Greek/AZERTY/German
+    keyboard is the one who would eat wrong input.  The original Shift+letter
+    patch refused symbols for exactly this reason ("they will leak, but that's
+    better than wrong input"); leaking is still the better failure, so the
+    guess installs only where it cannot be wrong.
+    """
+    return not _kitty_reports_unshifted_codepoints() or _us_punctuation_layout()
+
+
 # kitty CSI-u ORs lock-key state into the modifier parameter of every key
 # event while a lock is on: CapsLock=64, NumLock=128, both=192 (#88221,
 # #89651).  Every fixed-modifier CSI-u (and legacy CSI-tilde / CSI-letter)
@@ -43,6 +121,7 @@ def _clear_vt100_prefix_cache() -> None:
         from prompt_toolkit.input.vt100_parser import (
             _IS_PREFIX_OF_LONGER_MATCH_CACHE,
         )
+
         _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
     except Exception:
         pass
@@ -321,7 +400,7 @@ def install_modify_other_keys_aliases() -> int:
     ctrl_key_map: dict[int, object] = {}
 
     # a-z: Ctrl+A = \x01 = Keys.ControlA, ..., Ctrl+Z = \x1a = Keys.ControlZ
-    for ch in range(ord('a'), ord('z') + 1):
+    for ch in range(ord("a"), ord("z") + 1):
         raw = chr(ch & 0x1F)  # 0x01..0x1a
         existing = ANSI_SEQUENCES.get(raw)
         if existing is not None:
@@ -331,7 +410,7 @@ def install_modify_other_keys_aliases() -> int:
     # (e.g. chr(ord('0') & 0x1F) = 0x10 = ControlP, not Control0), so map
     # them directly to Keys.Control0..Keys.Control9.
     for d in range(10):
-        ctrl_key_map[ord('0') + d] = getattr(Keys, f"Control{d}")
+        ctrl_key_map[ord("0") + d] = getattr(Keys, f"Control{d}")
 
     # Symbols that produce control chars:
     # Ctrl+@   (64)  = \x00 = Keys.ControlAt
@@ -381,7 +460,7 @@ def install_modify_other_keys_aliases() -> int:
     # leaks as literal text. prompt_toolkit handles bare Alt+letter as
     # (Escape, <letter>), so we map the extended sequences to the same tuple.
     alt_map: dict[int, tuple] = {}
-    for ch in range(ord('a'), ord('z') + 1):
+    for ch in range(ord("a"), ord("z") + 1):
         letter = chr(ch)
         upper = chr(ch - 32)  # uppercase variant
         alt_map[ch] = (Keys.Escape, letter)
@@ -401,11 +480,53 @@ def install_modify_other_keys_aliases() -> int:
     # Map both the lowercase and uppercase codepoints — some terminals send
     # the already-shifted codepoint (65 for 'A') with modifier=2.
     shift_map: dict[int, str] = {}
-    for ch in range(ord('a'), ord('z') + 1):
+    for ch in range(ord("a"), ord("z") + 1):
         upper_char = chr(ch - 32)  # 'A'..'Z'
         shift_map[ch] = upper_char
         shift_map[ch - 32] = upper_char
     _install_paired(2, shift_map)
+
+    # -- Shift+punctuation → the shifted character ----
+    # Shifted punctuation (tilde, @, ^, _, {}, |, etc.) is essential for
+    # coding prompts. Terminals re-encode Shift+1 as ESC[27;2;49~ (base
+    # codepoint) and Shift+{ as ESC[27;2;123~ (already-shifted codepoint)
+    # the same way they send Shift+a as codepoint 97 or 65 — map both
+    # forms. Each base key maps to its US-layout shifted character.
+    punct_shift: dict[int, str] = {
+        ord("1"): "!",
+        ord("2"): "@",
+        ord("3"): "#",
+        ord("4"): "$",
+        ord("5"): "%",
+        ord("6"): "^",
+        ord("7"): "&",
+        ord("8"): "*",
+        ord("9"): "(",
+        ord("0"): ")",
+        ord("-"): "_",
+        ord("="): "+",
+        ord("["): "{",
+        ord("]"): "}",
+        ord("\\"): "|",
+        ord(";"): ":",
+        ord("'"): '"',
+        ord(","): "<",
+        ord("."): ">",
+        ord("/"): "?",
+        ord("`"): "~",
+    }
+    punct_map: dict[int, str] = {}
+    # Identity half — echoes back whatever shifted codepoint the terminal
+    # reported. Layout-independent by construction, so it always installs.
+    for _base_cp, shifted in punct_shift.items():
+        punct_map[ord(shifted)] = shifted
+    # Base half — translates the UNSHIFTED codepoint kitty reports through a
+    # US table. Only kitty ever reaches it, and on a non-US layout it would
+    # type the wrong character instead of leaking, so it is gated.
+    if _shift_punctuation_base_map_is_safe():
+        for base_cp, shifted in punct_shift.items():
+            punct_map[base_cp] = shifted
+    _install_paired(2, punct_map)
 
     # -- Multi-modifier letters: Shift+Alt (4), Ctrl+Shift (6),
     # Ctrl+Alt (7), Ctrl+Alt+Shift (8) ----
@@ -418,7 +539,7 @@ def install_modify_other_keys_aliases() -> int:
     shift_alt_map: dict[int, tuple] = {}
     ctrl_shift_map: dict[int, object] = {}
     ctrl_alt_map: dict[int, tuple] = {}
-    for ch in range(ord('a'), ord('z') + 1):
+    for ch in range(ord("a"), ord("z") + 1):
         upper_char = chr(ch - 32)
         ctrl_key = ctrl_key_map.get(ch)
         for cp in (ch, ch - 32):
@@ -441,9 +562,7 @@ def install_modify_other_keys_aliases() -> int:
     # how a lone Esc keypress arrives with a lock on. Lock bits (caps/num)
     # get the same variant treatment as _install_paired.
     for seq in ["\x1b[27u"] + [
-        f"\x1b[27;{mod}u"
-        for m in range(1, 17)
-        for mod in _lock_variants(m)
+        f"\x1b[27;{mod}u" for m in range(1, 17) for mod in _lock_variants(m)
     ]:
         if seq not in ANSI_SEQUENCES:
             ANSI_SEQUENCES[seq] = Keys.Escape
@@ -452,21 +571,30 @@ def install_modify_other_keys_aliases() -> int:
     # -- Modified Enter / Tab / Backspace / Space ----
     # Shift+Enter / Ctrl+Enter are installed by install_shift_enter_alias /
     # install_ctrl_enter_alias (which run first and win via setdefault).
-    _install_paired(2, {
-        9: Keys.BackTab,        # Shift+Tab — same as the legacy ESC[Z
-        127: Keys.ControlH,     # Shift+Backspace — plain backspace
-        32: " ",                # Shift+Space — still a space (#86866)
-    })
-    _install_paired(3, {
-        13: (Keys.Escape, Keys.ControlM),   # Alt+Enter — newline tuple
-        127: (Keys.Escape, Keys.ControlH),  # Alt+Backspace — backward-kill-word
-        32: (Keys.Escape, " "),             # Alt+Space
-    })
-    _install_paired(5, {
-        9: Keys.ControlI,                   # Ctrl+Tab — degrade to Tab
-        127: (Keys.Escape, Keys.ControlH),  # Ctrl+Backspace — backward-kill-word,
-                                            # matching Ink TUI + Desktop (#78285)
-    })
+    _install_paired(
+        2,
+        {
+            9: Keys.BackTab,  # Shift+Tab — same as the legacy ESC[Z
+            127: Keys.ControlH,  # Shift+Backspace — plain backspace
+            32: " ",  # Shift+Space — still a space (#86866)
+        },
+    )
+    _install_paired(
+        3,
+        {
+            13: (Keys.Escape, Keys.ControlM),  # Alt+Enter — newline tuple
+            127: (Keys.Escape, Keys.ControlH),  # Alt+Backspace — backward-kill-word
+            32: (Keys.Escape, " "),  # Alt+Space
+        },
+    )
+    _install_paired(
+        5,
+        {
+            9: Keys.ControlI,  # Ctrl+Tab — degrade to Tab
+            127: (Keys.Escape, Keys.ControlH),  # Ctrl+Backspace — backward-kill-word,
+            # matching Ink TUI + Desktop (#78285)
+        },
+    )
 
     # -- Unmodified keys with a lock bit set (kitty modifier 1 = "none") --
     # With a lock on, kitty stamps the lock bit onto keys pressed with NO
@@ -475,12 +603,15 @@ def install_modify_other_keys_aliases() -> int:
     # bare mod-1 spelling and its lock twins. Only keys kitty CSI-u-encodes
     # on their own are listed; plain text characters are still delivered
     # as UTF-8, lock bits or not.
-    _install_paired(1, {
-        9: Keys.ControlI,     # Tab
-        13: Keys.ControlM,    # Enter
-        32: " ",              # Space
-        127: Keys.ControlH,   # Backspace
-    })
+    _install_paired(
+        1,
+        {
+            9: Keys.ControlI,  # Tab
+            13: Keys.ControlM,  # Enter
+            32: " ",  # Space
+            127: Keys.ControlH,  # Backspace
+        },
+    )
 
     # -- Lock-key modifier bits (NumLock=128, CapsLock=64) on the legacy
     # CSI-letter / CSI-tilde forms kitty keeps using under the disambiguate
@@ -524,28 +655,40 @@ def install_modify_other_keys_aliases() -> int:
     # have no legacy encoding, so unmapped they leak as literal text in any
     # kitty session regardless of which modes were pushed.
     functional_map: dict[int, object] = {}
-    for d in range(10):                       # KP_0..KP_9 → digits
+    for d in range(10):  # KP_0..KP_9 → digits
         functional_map[57399 + d] = str(d)
-    functional_map.update({                   # KP operators / punctuation
-        57409: ".", 57410: "/", 57411: "*", 57412: "-",
-        57413: "+", 57414: Keys.ControlM, 57415: "=", 57416: ",",
+    functional_map.update({  # KP operators / punctuation
+        57409: ".",
+        57410: "/",
+        57411: "*",
+        57412: "-",
+        57413: "+",
+        57414: Keys.ControlM,
+        57415: "=",
+        57416: ",",
     })
-    functional_map.update({                   # KP navigation → non-keypad keys
-        57417: Keys.Left, 57418: Keys.Right, 57419: Keys.Up,
-        57420: Keys.Down, 57421: Keys.PageUp, 57422: Keys.PageDown,
-        57423: Keys.Home, 57424: Keys.End, 57425: Keys.Insert,
+    functional_map.update({  # KP navigation → non-keypad keys
+        57417: Keys.Left,
+        57418: Keys.Right,
+        57419: Keys.Up,
+        57420: Keys.Down,
+        57421: Keys.PageUp,
+        57422: Keys.PageDown,
+        57423: Keys.Home,
+        57424: Keys.End,
+        57425: Keys.Insert,
         57426: Keys.Delete,
     })
-    for n in range(13, 25):                   # F13..F24
+    for n in range(13, 25):  # F13..F24
         functional_map[57376 + (n - 13)] = getattr(Keys, f"F{n}")
     # No prompt_toolkit equivalent (lock keys, PrintScreen, Menu, F25-F35,
     # KP_BEGIN, media keys, bare modifier events): consume as Ignore
     # instead of leaking literal text.
     for code in (
-        list(range(57358, 57364))       # locks, PrintScreen, Pause, Menu
-        + list(range(57388, 57399))     # F25..F35
-        + [57427]                       # KP_BEGIN
-        + list(range(57428, 57455))     # media keys + modifier key events
+        list(range(57358, 57364))  # locks, PrintScreen, Pause, Menu
+        + list(range(57388, 57399))  # F25..F35
+        + [57427]  # KP_BEGIN
+        + list(range(57428, 57455))  # media keys + modifier key events
     ):
         functional_map.setdefault(code, Keys.Ignore)
     for code, key_val in functional_map.items():
