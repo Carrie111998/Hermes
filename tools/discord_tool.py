@@ -587,9 +587,20 @@ def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
     auto_archive_duration: int = 1440,
+    content: Optional[str] = None,
     **_kwargs: Any,
 ) -> str:
-    """Create a thread in a channel."""
+    """Create a thread in a channel, optionally seeding a first message.
+
+    ``content`` (when non-empty) is posted into the freshly created thread
+    via the normal message-create path. Neither thread-creation endpoint
+    (from-message or standalone) carries a message body, so seeding is a
+    second call — without it the thread is born as a named, anchored shell
+    and "create a thread and post the summary into it" workflows can only
+    half-complete (#96057). Seeding is fail-soft: the thread exists by the
+    time the send runs, so a failed send is reported in the payload rather
+    than failing the whole action.
+    """
     if message_id:
         # Create thread from an existing message
         path = f"/channels/{channel_id}/messages/{message_id}/threads"
@@ -606,11 +617,26 @@ def _create_thread(
             "type": 11,  # PUBLIC_THREAD
         }
     thread = _discord_request("POST", path, token, body=body)
-    return json.dumps({
+    result: Dict[str, Any] = {
         "success": True,
         "thread_id": thread["id"],
         "name": thread.get("name"),
-    })
+    }
+    seed = str(content).strip() if content else ""
+    if seed:
+        try:
+            seeded = _discord_request(
+                "POST",
+                f"/channels/{thread['id']}/messages",
+                token,
+                body={"content": seed},
+            )
+            result["seeded_message_id"] = seeded.get("id")
+        except Exception as exc:
+            # The thread itself was created successfully — surface the seed
+            # failure instead of failing the action over it.
+            result["seed_error"] = str(exc)
+    return json.dumps(result)
 
 
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
@@ -669,7 +695,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
-    ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor and optional content first message"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -871,6 +897,14 @@ def _build_schema(
             "enum": [60, 1440, 4320, 10080],
             "description": "Thread archive duration in minutes (create_thread, default 1440).",
         },
+        "content": {
+            "type": "string",
+            "description": (
+                "First message to seed the new thread with (create_thread, "
+                "optional). Without it the thread is created empty; the same "
+                "length limits as a normal message apply."
+            ),
+        },
     }
 
     return {
@@ -998,6 +1032,7 @@ def _run_discord_action(
     before: str = "",
     after: str = "",
     auto_archive_duration: int = 1440,
+    content: str = "",
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -1051,6 +1086,7 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
+            content=content,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)

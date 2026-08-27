@@ -306,6 +306,52 @@ class TestCreateThread:
             body={"name": "Discussion", "auto_archive_duration": 1440},
         )
 
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_with_content_seeds_first_message(self, mock_req, monkeypatch):
+        """#96057: content posts into the fresh thread via message-create."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "802", "name": "Decision"},   # thread created
+            {"id": "9001"},                       # seed message sent
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Decision",
+            content="Summary: we chose option B.",
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "802"
+        assert result["seeded_message_id"] == "9001"
+        assert mock_req.call_count == 2
+        seed_call = mock_req.call_args_list[1]
+        assert seed_call.args == ("POST", "/channels/802/messages", "test-token")
+        assert seed_call.kwargs["body"] == {"content": "Summary: we chose option B."}
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_seed_failure_is_fail_soft(self, mock_req, monkeypatch):
+        """The thread exists by seed time — a failed send must not fail the action."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "803", "name": "Notes"},
+            DiscordAPIError(403, '{"message": "Missing Access"}'),
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Notes", content="hello",
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "803"
+        assert "seed_error" in result
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_without_content_makes_one_call(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "804", "name": "Plain"}
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Plain",
+        ))
+        assert result["success"] is True
+        assert mock_req.call_count == 1
+        assert "seed_error" not in result and "seeded_message_id" not in result
+
 
 # ---------------------------------------------------------------------------
 # Error handling
