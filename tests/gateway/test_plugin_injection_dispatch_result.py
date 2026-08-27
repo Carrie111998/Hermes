@@ -325,14 +325,23 @@ async def test_await_dispatch_reports_internal_dispatch_failure():
 
 
 @pytest.mark.asyncio
-async def test_await_dispatch_reports_a_cancelled_dispatch():
-    started = asyncio.Event()
+async def test_cancel_after_adapter_entry_cannot_claim_refusal_or_safe_retry():
+    """Once the adapter holds the event, non-delivery is no longer provable.
 
-    async def _slow(_event):
-        started.set()
-        await asyncio.sleep(30)
+    The adapter records its side effect before its next cancellation point, so a
+    cancel landing here may have interrupted a wake that already happened.
+    Reporting that as a retry-safe refusal is how the same wake gets delivered
+    twice.
+    """
+    delivered: list = []
+    entered = asyncio.Event()
 
-    adapter = SimpleNamespace(handle_message=_slow)
+    async def _blocking(event):
+        delivered.append(event)
+        entered.set()
+        await asyncio.Event().wait()
+
+    adapter = SimpleNamespace(handle_message=_blocking)
     loop = asyncio.get_running_loop()
     runner = _runner(_entry(), adapter, loop=loop)
 
@@ -342,12 +351,80 @@ async def test_await_dispatch_reports_a_cancelled_dispatch():
         plugin_id="wake-plugin",
         await_dispatch=True,
     )
-    await started.wait()
+    await entered.wait()
     handle.cancel()
     result = await handle
 
+    assert delivered, "the adapter side effect ran before cancellation"
     assert result.accepted is False
     assert result.reason == "cancelled"
+    assert result.settled is False
+    assert result.indeterminate is True
+    assert result.refused is False
+    assert result.safe_to_retry is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_adapter_entry_is_a_settled_retry_safe_refusal():
+    """Cancellation that provably wins the race is still a terminal refusal."""
+    looked_up = asyncio.Event()
+    hold = asyncio.Event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    loop = asyncio.get_running_loop()
+    runner = _runner(_entry(), adapter, loop=loop)
+
+    async def _blocked_lookup(_session_key):
+        looked_up.set()
+        await hold.wait()
+        return _entry()
+
+    runner._async_session_store.lookup_by_session_key = _blocked_lookup
+
+    handle = runner._schedule_plugin_message_injection(
+        session_key=SESSION_KEY,
+        content="wake up",
+        plugin_id="wake-plugin",
+        await_dispatch=True,
+    )
+    await looked_up.wait()
+    assert handle.cancel() is True
+    result = await handle
+
+    adapter.handle_message.assert_not_awaited()
+    assert result.accepted is False
+    assert result.reason == "cancelled"
+    assert result.settled is True
+    assert result.refused is True
+    assert result.safe_to_retry is True
+
+
+@pytest.mark.asyncio
+async def test_adapter_raising_after_a_side_effect_preserves_unknown_delivery():
+    """An adapter can deliver and then blow up; that is not a proven refusal."""
+    delivered: list = []
+
+    async def _explode(event):
+        delivered.append(event)
+        raise RuntimeError("adapter exploded after its side effect")
+
+    adapter = SimpleNamespace(handle_message=_explode)
+    loop = asyncio.get_running_loop()
+    runner = _runner(_entry(), adapter, loop=loop)
+
+    result = await runner._schedule_plugin_message_injection(
+        session_key=SESSION_KEY,
+        content="wake up",
+        plugin_id="wake-plugin",
+        await_dispatch=True,
+    )
+
+    assert delivered, "the adapter side effect ran before the exception"
+    assert result.accepted is False
+    assert result.reason == "internal_error"
+    assert result.settled is False
+    assert result.indeterminate is True
+    assert result.refused is False
+    assert result.safe_to_retry is False
 
 
 def test_await_dispatch_result_is_blocking_readable_from_another_thread():
@@ -697,13 +774,19 @@ async def test_correlation_id_is_metadata_not_idempotent_admission():
 def test_every_declared_reason_is_classified():
     """No reason may be silently unclassified as settled or indeterminate."""
     from hermes_cli.plugin_injection import (
+        DELIVERY_SENSITIVE_REASONS,
         GATEWAY_INJECTION_REASONS,
         INDETERMINATE_REASONS,
     )
 
     assert INDETERMINATE_REASONS <= set(GATEWAY_INJECTION_REASONS)
-    # Only an unfinished observation is indeterminate; everything else decided.
+    # Only an unfinished observation is unconditionally indeterminate.
     assert INDETERMINATE_REASONS == {"timeout"}
+    # These two settle only when the host can prove the adapter never got the
+    # event; after that boundary they become delivery-unknown.
+    assert DELIVERY_SENSITIVE_REASONS <= set(GATEWAY_INJECTION_REASONS)
+    assert DELIVERY_SENSITIVE_REASONS == {"cancelled", "internal_error"}
+    assert not (DELIVERY_SENSITIVE_REASONS & INDETERMINATE_REASONS)
     for reason in GATEWAY_INJECTION_REASONS:
         result = GatewayInjectionResult(
             reason in ("adopted", "cli_queued"),

@@ -18,7 +18,12 @@ from gateway.platforms.base import (
 )
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
-from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_cli.plugins import (
+    InjectionDelivery,
+    PluginContext,
+    PluginManager,
+    PluginManifest,
+)
 
 
 def _entry(*, origin=True) -> SessionEntry:
@@ -350,12 +355,14 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
     )
 
     await asyncio.sleep(0)
-    runner._dispatch_plugin_message_injection.assert_awaited_once_with(
-        session_key="agent:main:telegram:dm:42",
-        content="wake up",
-        plugin_id="notify-plugin",
-        correlation_id=None,
-    )
+    runner._dispatch_plugin_message_injection.assert_awaited_once()
+    kwargs = runner._dispatch_plugin_message_injection.await_args.kwargs
+    assert kwargs["session_key"] == "agent:main:telegram:dm:42"
+    assert kwargs["content"] == "wake up"
+    assert kwargs["plugin_id"] == "notify-plugin"
+    assert kwargs["correlation_id"] is None
+    # The delivery arbiter travels with every dispatch, awaited or not.
+    assert isinstance(kwargs["delivery"], InjectionDelivery)
 
 
 @pytest.mark.asyncio

@@ -19365,6 +19365,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         content: str,
         plugin_id: str,
         correlation_id: str | None = None,
+        delivery=None,
     ):
         """Delegate to :mod:`gateway.plugin_injection`."""
         from gateway.plugin_injection import dispatch_injection
@@ -19375,6 +19376,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content=content,
             plugin_id=plugin_id,
             correlation_id=correlation_id,
+            delivery=delivery,
         )
 
     def _get_cached_session_source(self, session_key: str):

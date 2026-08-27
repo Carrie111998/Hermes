@@ -1459,16 +1459,17 @@ class PluginState:
 # nor gateway/run.py grows another authority subsystem. Re-exported here because
 # plugins import it from the same place they import PluginContext.
 from hermes_cli.plugin_injection import (  # noqa: E402
+    DELIVERY_SENSITIVE_REASONS,
     GATEWAY_INJECTION_REASONS,
     INDETERMINATE_REASONS,
     MAX_INJECTION_CORRELATION_ID,
     GatewayInjectionHandle,
     GatewayInjectionResult,
+    InjectionDelivery,
     build_call_context,
     submit_to_gateway,
     validate_correlation_id,
 )
-
 
 
 class PluginContext:

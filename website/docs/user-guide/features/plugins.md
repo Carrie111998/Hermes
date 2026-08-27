@@ -792,9 +792,9 @@ else:
 |-------|---------|
 | `accepted` | `True` only when the event reached the stored session's adapter. The result object is falsy otherwise. |
 | `reason` | `adopted`, `unknown_session`, `unauthorized`, `no_adapter`, `gateway_draining`, `internal_error`, `not_scheduled`, `injection_denied`, `no_gateway`, `invalid_request`, `unsupported`, `cancelled`, `timeout`, or `cli_queued`. |
-| `settled` | `False` only for `timeout` — the dispatch is still in flight and may yet be adopted. |
+| `settled` | `False` whenever delivery is unknown: always for `timeout`, and for `cancelled` / `internal_error` once dispatch already entered the adapter. |
 | `indeterminate` | `not settled`. The outcome is unknown, not negative. |
-| `refused` | `True` for a *settled* denial: the event will never reach the session. |
+| `refused` | `True` for a *settled* denial: the host proved the event never crossed into the adapter, so it will never reach the session. |
 | `safe_to_retry` | `True` only when re-issuing the injection cannot duplicate a delivered wake. |
 | `session_id` | The host's id for the session that received the message. Set on `adopted`. |
 | `session_key` | The key that was resolved. |
@@ -804,8 +804,10 @@ else:
 - `handle.result(...)` blocks and is only valid off the gateway loop; awaiting is the correct call on it. `handle.cancel()` cancels a pending dispatch, after which the result reads `cancelled`.
 - Both paths return a result object rather than raising, including on timeout and internal failure.
 
-:::danger A timeout is *unknown*, not *denied*
+:::danger A falsy result is not always a *denial*
 `handle.result(timeout=...)` running out of patience does **not** cancel the dispatch. It returns `accepted=False, reason="timeout", settled=False` and the wake may still land a moment later.
+
+The same holds once dispatch has entered the session's adapter: cancelling there, or an adapter that raises after doing its work, cannot prove the wake did not happen, so both report `settled=False, refused=False, safe_to_retry=False`. A cancel that provably wins the race *before* adapter entry stays a terminal, retry-safe refusal.
 
 Check `refused` — not just falsiness — before reporting failure, and check `safe_to_retry` before re-sending. **`correlation_id` is metadata, not a durable idempotency key: nothing on this path deduplicates on it, so two injections carrying the same id both reach the session.** The reconciliation path is the *same handle*: poll `handle.settled` or call `handle.result(...)` again to learn the eventual outcome.
 

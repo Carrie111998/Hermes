@@ -31,6 +31,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from hermes_cli.plugin_injection import (
     GatewayInjectionHandle,
     GatewayInjectionResult,
+    InjectionDelivery,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ def schedule_injection(
     if not getattr(runner, "_running", False) or loop is None or loop.is_closed():
         return _refused("gateway_draining")
 
+    # Shared with the handle so a cancellation or crash can be told apart from a
+    # provable refusal once the adapter holds the event.
+    delivery = InjectionDelivery()
+
     # Through the runner's seam, not straight at ``dispatch_injection``: the
     # runner stays the single entry point that owns this coroutine.
     coro = runner._dispatch_plugin_message_injection(
@@ -76,6 +81,7 @@ def schedule_injection(
         content=content,
         plugin_id=plugin_id,
         correlation_id=correlation_id,
+        delivery=delivery,
     )
     try:
         current_loop = asyncio.get_running_loop()
@@ -130,6 +136,7 @@ def schedule_injection(
             future,
             correlation_id=correlation_id,
             session_key=session_key,
+            delivery=delivery,
         )
     return True
 
@@ -141,11 +148,16 @@ async def dispatch_injection(
     content: str,
     plugin_id: str,
     correlation_id: Optional[str] = None,
+    delivery: Optional[InjectionDelivery] = None,
 ) -> GatewayInjectionResult:
     """Route a plugin-triggered turn through the session's live adapter.
 
     Returns a :class:`GatewayInjectionResult`. It is falsy for every refusal, so
     callers that only cared about the boolean still read correctly.
+
+    ``delivery`` is the arbiter between this coroutine and a caller holding the
+    handle: everything up to the adapter call is disprovable delivery, the
+    adapter call itself is not.
     """
     from gateway.platforms.base import MessageEvent, MessageType
 
@@ -207,6 +219,9 @@ async def dispatch_injection(
         allow_gateway_control=False,
         metadata=metadata,
     )
+    if delivery is not None and not delivery.enter_adapter():
+        # A cancel reserved the outcome first, so non-delivery is still provable.
+        return _refused("cancelled")
     await adapter.handle_message(event)
     logger.info(
         "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",

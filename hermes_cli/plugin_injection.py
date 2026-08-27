@@ -10,11 +10,20 @@ authority subsystem.
 Settlement law
 --------------
 Every outcome here is either **settled** (a terminal fact: the event was adopted,
-or it was refused before reaching the session) or **indeterminate** (the dispatch
-is still in flight and may yet be adopted). An observation timeout is
-indeterminate, never a refusal: the caller stopped waiting, the host did not stop
-working. Collapsing that into ``accepted=False`` would let a webhook answer
-"failed" and retry a wake that is about to land, delivering it twice.
+or it was refused before reaching the session) or **indeterminate** (delivery is
+unknown and may yet be, or already have been, adopted). Refusal is the strong
+claim, and it is only made when the host can prove the event never crossed into
+``adapter.handle_message``:
+
+* an observation timeout is indeterminate -- the caller stopped waiting, the host
+  did not stop working;
+* cancellation or an adapter exception *after* that boundary is likewise
+  indeterminate, because the adapter may already have run its side effect;
+* cancellation that provably won the race against adapter entry stays a
+  terminal, retry-safe refusal.
+
+Collapsing any of these into a retry-safe ``accepted=False`` would let a webhook
+answer "failed" and re-send a wake that already landed, delivering it twice.
 
 ``correlation_id`` is a bounded opaque tag echoed into the dispatched event's
 metadata so a caller can *recognize* its event. It is deliberately **not** a
@@ -28,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -36,7 +46,9 @@ logger = logging.getLogger(__name__)
 # Reasons a gateway message injection can resolve to. ``adopted`` is the only
 # outcome that means the event reached the stored session. Everything else is a
 # refusal a caller can act on -- except ``timeout``, which is not an outcome at
-# all but the absence of one (see ``INDETERMINATE_REASONS``).
+# all but the absence of one, and ``cancelled``/``internal_error``, which are
+# refusals only while delivery is still disprovable (see ``INDETERMINATE_REASONS``
+# and ``DELIVERY_SENSITIVE_REASONS``).
 GATEWAY_INJECTION_REASONS = (
     "adopted",
     "unknown_session",
@@ -58,9 +70,57 @@ GATEWAY_INJECTION_REASONS = (
 # result carrying one of these is falsy but MUST NOT be read as a denial.
 INDETERMINATE_REASONS = frozenset({"timeout"})
 
+# Reasons whose settlement depends on how far dispatch got. Losing a dispatch to
+# cancellation or an exception is a proven refusal only while the event is still
+# on the host's side of ``adapter.handle_message``; past that boundary the
+# adapter may already have run its side effect, so the outcome is
+# delivery-unknown. See :class:`InjectionDelivery`.
+DELIVERY_SENSITIVE_REASONS = frozenset({"cancelled", "internal_error"})
+
 # Terminal refusals that still cannot be blindly retried, because the event may
 # already have reached the adapter before the failure surfaced.
 _UNSAFE_RETRY_REASONS = frozenset({"internal_error"})
+
+
+class InjectionDelivery:
+    """Tracks the one boundary that makes a refusal provable.
+
+    ``refused`` claims the event will never reach the session. That is only
+    true while dispatch has not entered ``adapter.handle_message``. Both sides
+    of the race arbitrate through this object: dispatch claims the boundary with
+    :meth:`enter_adapter`, a caller reserves cancellation with
+    :meth:`request_cancel`, and whoever gets there second is told it lost.
+    """
+
+    __slots__ = ("_lock", "_adapter_entered", "_cancel_requested")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._adapter_entered = False
+        self._cancel_requested = False
+
+    def enter_adapter(self) -> bool:
+        """Claim the adoption boundary; False when a cancel already won it."""
+        with self._lock:
+            if self._cancel_requested:
+                return False
+            self._adapter_entered = True
+            return True
+
+    def request_cancel(self) -> bool:
+        """Reserve cancellation; False when the adapter already has the event."""
+        with self._lock:
+            if self._adapter_entered:
+                return False
+            self._cancel_requested = True
+            return True
+
+    @property
+    def delivery_unknown(self) -> bool:
+        """Whether the host can no longer prove the event was not delivered."""
+        with self._lock:
+            return self._adapter_entered
+
 
 MAX_INJECTION_CORRELATION_ID = 128
 
@@ -95,7 +155,8 @@ class GatewayInjectionResult:
 
     @property
     def refused(self) -> bool:
-        """A terminal denial: the event will never reach the session."""
+        """A terminal denial: the host proved the event never crossed into the
+        adapter, so it will never reach the session."""
         return self.settled and not self.accepted
 
     @property
@@ -126,7 +187,7 @@ class GatewayInjectionHandle:
     would deliver the wake twice.
     """
 
-    __slots__ = ("_future", "_correlation_id", "_session_key")
+    __slots__ = ("_future", "_correlation_id", "_session_key", "_delivery")
 
     def __init__(
         self,
@@ -134,10 +195,12 @@ class GatewayInjectionHandle:
         *,
         correlation_id: Optional[str] = None,
         session_key: Optional[str] = None,
+        delivery: Optional[InjectionDelivery] = None,
     ) -> None:
         self._future = future
         self._correlation_id = correlation_id
         self._session_key = session_key
+        self._delivery = delivery
 
     @classmethod
     def resolved(cls, result: GatewayInjectionResult) -> "GatewayInjectionHandle":
@@ -160,16 +223,31 @@ class GatewayInjectionHandle:
         return bool(self._future.done())
 
     def cancel(self) -> bool:
-        """Cancel the pending dispatch; a later read reports ``cancelled``."""
+        """Cancel the pending dispatch; a later read reports ``cancelled``.
+
+        Cancelling once the adapter already holds the event does not undo the
+        wake, so the reported outcome becomes delivery-unknown rather than a
+        retry-safe refusal.
+        """
+        if self._delivery is not None:
+            self._delivery.request_cancel()
         return bool(self._future.cancel())
 
     def _failure(self, reason: str) -> GatewayInjectionResult:
+        settled = reason not in INDETERMINATE_REASONS
+        if (
+            settled
+            and reason in DELIVERY_SENSITIVE_REASONS
+            and self._delivery is not None
+            and self._delivery.delivery_unknown
+        ):
+            settled = False
         return GatewayInjectionResult(
             False,
             reason,
             session_key=self._session_key,
             correlation_id=self._correlation_id,
-            settled=reason not in INDETERMINATE_REASONS,
+            settled=settled,
         )
 
     def _coerce(self, value: Any) -> GatewayInjectionResult:
