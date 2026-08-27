@@ -19,6 +19,51 @@ def test_cprint_falls_back_to_plain_print_when_prompt_toolkit_has_no_console(cap
     assert capsys.readouterr().out == "fallback text\n"
 
 
+def test_deferred_update_notice_goes_through_prompt_toolkit_channel(monkeypatch):
+    """#95968: the deferred notice must not write Rich SGR bytes straight to
+    stdout from its background thread — while prompt_toolkit owns the terminal
+    those ESC bytes mangle into literal '?' on screen. The notice must render
+    to an ANSI string and emit through cprint (print_formatted_text), never
+    through console.print."""
+    import threading
+    from types import SimpleNamespace
+
+    done = threading.Event()
+    done.set()
+    monkeypatch.setattr(banner, "_update_check_done", done)
+    monkeypatch.setattr(banner, "_update_result", 449)
+    monkeypatch.setattr(banner, "_deferred_update_notice_started", False)
+
+    captured: list[str] = []
+    monkeypatch.setattr(banner, "cprint", lambda text: captured.append(text))
+
+    printed: list[str] = []
+    mock_console = SimpleNamespace(
+        width=80, print=lambda *a, **k: printed.append(str(a)),
+    )
+
+    banner._defer_update_notice(mock_console, max_wait=1.0)
+
+    # The notice thread runs synchronously enough here: the event is already
+    # set, so wait for the worker to finish via the capture.
+    import time
+    deadline = time.monotonic() + 5.0
+    while not captured and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert len(captured) == 1
+    text = captured[0]
+    # Rich styles each token span separately, so strip the SGR sequences
+    # before asserting on the human-readable content.
+    import re
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    assert "449 commits behind" in plain
+    assert "\x1b[" in text  # real ANSI escapes, not Rich markup brackets
+    assert "[bold" not in text
+    # The unsafe channel (background Rich console.print) must stay unused.
+    assert printed == []
+
+
 
 
 
