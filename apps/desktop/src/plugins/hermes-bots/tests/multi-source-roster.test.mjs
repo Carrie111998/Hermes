@@ -32,7 +32,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;\nglobalThis.__botConnectionRoute = botConnectionRoute;\nglobalThis.__resolveBotConnectionRoute = resolveBotConnectionRoute;\nglobalThis.__preferReachableSameNameRows = preferReachableSameNameRows;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;\nglobalThis.__botConnectionRoute = botConnectionRoute;\nglobalThis.__resolveBotConnectionRoute = resolveBotConnectionRoute;\nglobalThis.__preferReachableSameNameRows = preferReachableSameNameRows;\nglobalThis.__resolveGroupEntrySpeaker = resolveGroupEntrySpeaker;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -298,6 +298,46 @@ test('botRosterMeta: an unrelated failure while resolving meta for a live route 
   })
 
   assert.throws(() => metaFor(owned, explodingMetaByName), /unrelated invariant failure/)
+})
+
+test('group transcript resolves same-name speaker metadata through its owning connection', () => {
+  const { __resolveGroupEntrySpeaker: resolve } = runtime()
+  const local = { name: 'default' }
+  const remote = {
+    name: 'default',
+    connectionId: 'homelab',
+    connectionLabel: 'Homelab',
+    remoteSource: true,
+    sourceScoped: true
+  }
+  const metadata = {
+    default: { image: 'local-avatar' },
+    'homelab::default': { image: 'remote-avatar' }
+  }
+
+  const remoteSpeaker = resolve(
+    { from: { kind: 'bot', name: 'default', source: 'Homelab' } },
+    [local, remote],
+    metadata
+  )
+  assert.equal(remoteSpeaker.member.connectionId, 'homelab')
+  assert.equal(remoteSpeaker.meta.image, 'remote-avatar')
+
+  const missingRemote = resolve(
+    { from: { kind: 'bot', name: 'default', source: 'Deleted device' } },
+    [local],
+    metadata
+  )
+  assert.equal(missingRemote.member, null)
+  assert.equal(missingRemote.meta, null)
+
+  const localSpeaker = resolve({ from: { kind: 'bot', name: 'default' } }, [local, remote], metadata)
+  assert.equal(localSpeaker.member, local)
+  assert.equal(localSpeaker.meta.image, 'local-avatar')
+
+  const userSpeaker = resolve({ from: { kind: 'user', name: 'user' } }, [local, remote], metadata)
+  assert.equal(userSpeaker.member, null)
+  assert.equal(userSpeaker.meta, null)
 })
 
 test('botHandle: precomputed multi-source handle wins; default stays hermes', () => {

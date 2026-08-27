@@ -13229,6 +13229,33 @@ function migrateGroupComposerDraft(oldKey, newKey) {
   groupComposerDrafts.delete(oldKey)
 }
 
+function resolveGroupEntrySpeaker(entry, members, metaByName) {
+  const isUser = entry.from.kind === 'user'
+
+  if (isUser) {
+    return { isUser, member: null, meta: null }
+  }
+
+  // A profile name is only unique within its owning connection. Resolve the
+  // roster row first, then use the same owner-scoped metadata lookup as every
+  // other bot surface so a remote `default` never borrows the local avatar.
+  const member = members.find(bot =>
+    bot.name === entry.from.name &&
+    (entry.from.source
+      ? (bot.connectionLabel || bot.connectionId) === entry.from.source
+      : !bot.remoteSource)
+  ) || null
+  const fallback = entry.from.source
+    ? { name: entry.from.name, remoteSource: true }
+    : { name: entry.from.name }
+
+  return {
+    isUser,
+    member,
+    meta: botRosterMeta(member || fallback, metaByName)
+  }
+}
+
 function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
@@ -13684,20 +13711,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
 
   // One log entry, rendered exactly as before conversation folding existed.
   const renderEntry = (entry, index) => {
-                  const isUser = entry.from.kind === 'user'
-                  const meta = isUser || entry.from.source ? null : allMeta[entry.from.name]
-                  // Match this speaker back to its member descriptor so display
-                  // names and disambiguating handles come from the roster (the
-                  // primary "default" profile renders as Hermes, remote dupes
-                  // carry their @name-device handle) instead of raw profile ids.
-                  const member = isUser
-                    ? null
-                    : members.find(b =>
-                        b.name === entry.from.name &&
-                        (entry.from.source
-                          ? (b.connectionLabel || b.connectionId) === entry.from.source
-                          : !b.remoteSource)
-                      ) || null
+                  const { isUser, member, meta } = resolveGroupEntrySpeaker(entry, members, allMeta)
                   const display = isUser ? 'You' : displayName(member || { name: entry.from.name }, meta)
                   const entryKey = `${entry.at}:${index}`
                   const revealed = !isUser && revealedSpeaker === entryKey
@@ -13710,8 +13724,6 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                       : display
                   // Speaker avatar: same appearance pipeline as the roster
                   // (custom image/pet, else deterministic shape+color face).
-                  // Remote speakers have no local meta and get the
-                  // deterministic face for their name — stable per bot.
                   const { shape, color, image } = isUser
                     ? { shape: null, color: null, image: null }
                     : botAppearance(entry.from.name, meta)
