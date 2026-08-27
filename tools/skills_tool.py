@@ -84,6 +84,7 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    skill_is_manual_only,
 )
 
 logger = logging.getLogger(__name__)
@@ -713,6 +714,7 @@ def _find_all_skills(
         get_project_skills_dirs,
         iter_project_skill_files,
         iter_skill_index_files,
+        skill_is_manual_only,
     )
 
     if skip_disabled:
@@ -788,7 +790,7 @@ def _find_all_skills(
                     continue
                 # Manual-only skills stay out of MODEL-facing listings only
                 # (see _parse_skill_file for the system-prompt half).
-                if hide_manual_only and frontmatter.get("disable-model-invocation") is True:
+                if hide_manual_only and skill_is_manual_only(frontmatter):
                     continue
 
                 description = frontmatter.get("description", "")
@@ -992,6 +994,7 @@ def _serve_plugin_skill(
                 {
                     "success": False,
                     "error": f"File '{file_path}' not found in skill '{namespace}:{bare}'.",
+                    "skill_dir": str(skill_root),
                 },
                 ensure_ascii=False,
             )
@@ -1005,6 +1008,7 @@ def _serve_plugin_skill(
                     "file": file_path,
                     "content": f"[Binary file: {target.name}, size: {target.stat().st_size} bytes]",
                     "is_binary": True,
+                    "skill_dir": str(skill_root),
                 },
                 ensure_ascii=False,
             )
@@ -1021,6 +1025,7 @@ def _serve_plugin_skill(
                 "content": content,
                 "file_type": target.suffix,
                 "_source_path": str(target),
+                "skill_dir": str(skill_root),
             },
             ensure_ascii=False,
         )
@@ -1605,6 +1610,7 @@ def skill_view(
                         "error": f"File '{file_path}' not found in skill '{name}'.",
                         "available_files": available_files,
                         "hint": "Use one of the available file paths listed above",
+                        "skill_dir": str(skill_dir),
                     },
                     ensure_ascii=False,
                 )
@@ -1621,6 +1627,7 @@ def skill_view(
                         "file": file_path,
                         "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
                         "is_binary": True,
+                        "skill_dir": str(skill_dir),
                     },
                     ensure_ascii=False,
                 )
@@ -1646,6 +1653,10 @@ def skill_view(
                     # Internal: absolute source path for the repeat-view dedup
                     # fingerprint (mtime+size change detection).
                     "_source_path": str(target_file),
+                    # Internal: which skill served this, for the manual-invocation
+                    # gate. Carried explicitly rather than derived from
+                    # _source_path — see _manual_only_refusal.
+                    "skill_dir": str(skill_dir),
                 },
                 ensure_ascii=False,
             )
@@ -2154,6 +2165,13 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
             _skill_view_tracker.pop(str(task_id), None)
 
 
+# Payload keys that mean the call actually served the skill's material — file
+# contents, the rendered body, or an enumeration of what the skill directory holds.
+# A payload carrying any of these has something to withhold; one carrying none is a
+# bare error that reveals nothing beyond the name the caller already typed.
+_SERVING_KEYS = ("content", "body", "available_files")
+
+
 def _manual_only_refusal(name: str, payload: dict, file_path: str | None = None) -> str | None:
     """Return a refusal when the skill *payload* is manual-invocation-only.
 
@@ -2161,41 +2179,58 @@ def _manual_only_refusal(name: str, payload: dict, file_path: str | None = None)
     user can invoke it with /name, but the model may not load it on its own.
     Takes the payload skill_view already produced — re-loading here would double
     every model skill_view call and double-count the view telemetry the curator
-    reads (tools/skill_usage.py). Returns None for anything it cannot positively
-    identify as flagged; skill_view owns the real error messages.
+    reads (tools/skill_usage.py). skill_view owns the real error messages.
+
+    The skill is identified by the payload's ``skill_dir``, which every serving
+    branch now sets. It is NOT reconstructed from ``_source_path``: that pointed at
+    the requested supporting file rather than SKILL.md, and walking back up it took
+    one parent per component of *file_path*, which held only while the two were an
+    unresolved join. More to the point, several branches — a binary file, and a
+    miss that answers with the skill's file listing — returned no ``_source_path``
+    at all, so the reconstruction had nothing to work from and this function waved
+    the call through.
+
+    When the skill cannot be identified, the answer depends on what the payload
+    carries. A payload serving content or a directory listing is refused: an
+    unidentifiable skill is the one case where the gate has no evidence, and a gate
+    with no evidence must not be the one that opens. A payload with nothing to serve
+    is left alone, so skill_view's own error reaches the caller intact.
     """
-    src = payload.get("_source_path")
-    if not src:
-        return None
-    # The flag lives in SKILL.md, but with file_path= set, _source_path is the
-    # requested supporting file — reading it would find no flag and wave the
-    # call through, which is how a manual-only skill's references/ leaks. The
-    # payload carries skill_dir only on the plain view, so derive it: with
-    # file_path set, _source_path is exactly skill_dir / file_path.
     skill_dir = payload.get("skill_dir")
     if skill_dir:
         skill_md = Path(skill_dir) / "SKILL.md"
-    elif file_path:
-        root = Path(src)
-        for _ in Path(file_path).parts:
-            root = root.parent
-        skill_md = root / "SKILL.md"
     else:
-        skill_md = Path(src)
+        # With no file_path, _source_path is the SKILL.md itself.
+        src = payload.get("_source_path")
+        skill_md = Path(src) if src and not file_path else None
+
+    if skill_md is None:
+        if any(payload.get(k) for k in _SERVING_KEYS):
+            return _manual_only_error(name, payload)
+        return None
+
     try:
         frontmatter, _ = _parse_frontmatter(
             skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
         )
     except OSError:
+        # The skill's own SKILL.md is unreadable: same no-evidence case as above.
+        if any(payload.get(k) for k in _SERVING_KEYS):
+            return _manual_only_error(name, payload)
         return None
-    if frontmatter.get("disable-model-invocation") is not True:
+
+    if not skill_is_manual_only(frontmatter):
         return None
+    return _manual_only_error(name, payload)
+
+
+def _manual_only_error(name: str, payload: dict) -> str:
+    resolved = payload.get("name") or name
     return json.dumps(
         {
             "success": False,
-            "error": f"'{payload.get('name') or name}' is a manual-invocation-only skill.",
-            "hint": f"Ask the user to run /{payload.get('name') or name}; "
-                    "do not load it yourself.",
+            "error": f"'{resolved}' is a manual-invocation-only skill.",
+            "hint": f"Ask the user to run /{resolved}; do not load it yourself.",
         },
         ensure_ascii=False,
     )
@@ -2224,7 +2259,7 @@ def _skill_view_with_bump(args, **kw):
     )
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
+        if isinstance(parsed, dict):
             # ── Manual-invocation gate ───────────────────────────────
             # This is the MODEL's entry point to skill_view; the slash-command
             # and --skills paths reach _load_skill_payload directly and are
@@ -2232,9 +2267,17 @@ def _skill_view_with_bump(args, **kw):
             # name can still reach the context by other means (an instruction
             # file naming the command, for one), so refuse the load rather than
             # rely on the model not guessing it.
-            refusal = _manual_only_refusal(name, parsed, args.get("file_path"))
-            if refusal is not None:
-                return refusal
+            #
+            # Deliberately NOT limited to success=True. A miss on file_path answers
+            # `success: false` and attaches `available_files` — the flagged skill's
+            # whole directory tree — so gating on success alone let the enumeration
+            # through. What decides is whether the payload SERVES something, which
+            # is also what keeps this from reading SKILL.md on every bare error.
+            if parsed.get("success") or any(parsed.get(k) for k in _SERVING_KEYS):
+                refusal = _manual_only_refusal(name, parsed, args.get("file_path"))
+                if refusal is not None:
+                    return refusal
+        if isinstance(parsed, dict) and parsed.get("success"):
             _record_skill_view(task_id, name, args.get("file_path"), parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.

@@ -39,6 +39,7 @@ from agent.skill_utils import (
     read_active_org_id,
     skill_matches_environment,
     skill_matches_environment_list,
+    skill_is_manual_only,
     skill_matches_platform,
     skill_matches_platform_list,
 )
@@ -1699,7 +1700,7 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         # auto-match it. Command wrappers mirrored from the hub carry this flag
         # precisely because they must cost zero context. Explicit loads bypass
         # it, exactly like skill_matches_environment above.
-        if frontmatter.get("disable-model-invocation") is True:
+        if skill_is_manual_only(frontmatter):
             return False, frontmatter, ""
 
         return True, frontmatter, extract_skill_description(frontmatter)
