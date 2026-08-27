@@ -508,6 +508,23 @@ function carriedConnectionId(prev: SessionInfo | undefined, incoming: SessionInf
     : undefined
 }
 
+function uniqueUntaggedPrevious(previous: SessionInfo[], incoming: SessionInfo): SessionInfo | undefined {
+  if (incoming.connection_id?.trim()) {
+    return undefined
+  }
+
+  const profile = profileKeyOf(incoming.profile)
+  const lineageIds = [incoming.id, incoming._lineage_root_id].filter((id): id is string => Boolean(id))
+
+  const candidates = previous.filter(
+    session =>
+      profileKeyOf(session.profile) === profile &&
+      lineageIds.some(storedSessionId => sessionMatchesStoredId(session, storedSessionId))
+  )
+
+  return candidates.length === 1 ? candidates[0] : undefined
+}
+
 export function mergeSessionPage(
   previous: SessionInfo[],
   incoming: SessionInfo[],
@@ -534,7 +551,11 @@ export function mergeSessionPage(
   const prevByLineage = new Map(previous.map(session => [lineageIdentity(session), session]))
 
   const merged = incoming.map(session => {
-    const prev = prevById.get(identity(session)) ?? prevByLineage.get(lineageIdentity(session))
+    const prev =
+      prevById.get(identity(session)) ??
+      prevByLineage.get(lineageIdentity(session)) ??
+      uniqueUntaggedPrevious(previous, session)
+
     // User-send stamps last_active before the DB flushes the user row
     // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
     const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)

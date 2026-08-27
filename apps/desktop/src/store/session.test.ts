@@ -373,6 +373,32 @@ describe('mergeSessionPage', () => {
     expect(mergeSessionPage(previous, incoming, [])[0]).toMatchObject({ connection_id: 'local', profile: 'omar' })
   })
 
+  it('carries a unique remote owner onto an untagged refresh row', () => {
+    const previous = [
+      session({ connection_id: 'homelab', id: 'omar-remote', last_active: 5, profile: 'omar', title: 'Remote work' })
+    ]
+
+    const incoming = [session({ id: 'omar-remote', last_active: 6, profile: 'omar', title: null })]
+
+    expect(mergeSessionPage(previous, incoming, [])[0]).toMatchObject({
+      connection_id: 'homelab',
+      profile: 'omar',
+      title: 'Remote work'
+    })
+  })
+
+  it('does not guess an owner or title for an ambiguous untagged refresh row', () => {
+    const previous = [
+      session({ connection_id: 'source-a', id: 'shared-remote', profile: 'worker', title: 'Owner A' }),
+      session({ connection_id: 'source-b', id: 'shared-remote', profile: 'worker', title: 'Owner B' })
+    ]
+
+    const incoming = [session({ id: 'shared-remote', profile: 'worker', title: null })]
+
+    expect(mergeSessionPage(previous, incoming, [])[0]).toMatchObject({ profile: 'worker', title: null })
+    expect(mergeSessionPage(previous, incoming, [])[0]?.connection_id).toBeUndefined()
+  })
+
   it('drops the carried tag when the refreshed row names a different profile, and never overrides an incoming tag', () => {
     const previous = [
       session({ connection_id: 'local', id: 'moved', profile: 'omar' }),
@@ -419,9 +445,7 @@ describe('mergeSessionPage', () => {
   })
 
   it('never carries title metadata across same-profile ids owned by different connections', () => {
-    const previous = [
-      session({ connection_id: 'source-a', id: 'shared', profile: 'worker', title: 'Owner A title' })
-    ]
+    const previous = [session({ connection_id: 'source-a', id: 'shared', profile: 'worker', title: 'Owner A title' })]
 
     const incoming = [session({ connection_id: 'source-b', id: 'shared', profile: 'worker', title: null })]
 
