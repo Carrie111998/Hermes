@@ -327,7 +327,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const resumeById = useCallback(
-    (id: string) => {
+    (id: string, opts?: { fallbackToNew?: boolean }) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
 
@@ -377,12 +377,29 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             }
           })
           .catch((e: Error) => {
+            // A definitive "session not found" cannot heal on retry: the id is
+            // gone from the gateway's in-memory registry AND every store (a ui
+            // session reaped after a WS drop or gateway restart, or a row
+            // deleted out from under the dashboard's breadcrumb file). The
+            // automatic resume paths (startup breadcrumb, gateway-respawn
+            // recovery, auto-resume-recent) opt in to forging a fresh session
+            // instead — without this the TUI sits at "ready" with no sid and
+            // every prompt queues forever against a dead id. Explicit /resume
+            // and the session picker keep the plain error.
+            if (opts?.fallbackToNew && /session not found/i.test(e.message)) {
+              sys('previous session no longer exists — forging a fresh one')
+              patchUiState({ status: 'forging session…' })
+              void newSession()
+
+              return
+            }
+
             sys(`error: ${e.message}`)
             patchUiState({ status: 'ready' })
           })
       })
     },
-    [closeSession, colsRef, gw, panel, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]
+    [closeSession, colsRef, gw, newSession, panel, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]
   )
 
   const guardBusySessionSwitch = useCallback(

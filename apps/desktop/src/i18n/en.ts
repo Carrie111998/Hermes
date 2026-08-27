@@ -3385,6 +3385,7 @@ export const en: Translations = {
     audioReadFailed: 'Could not read recorded audio',
     sessionUnavailable: 'Session unavailable',
     createSessionFailed: 'Could not create a new session',
+    staleSessionRestarted: 'The previous conversation no longer exists — your message was sent in a fresh chat.',
     promptFailed: 'Prompt failed',
     providerCredentialRequired: 'Add a provider credential before sending your first message.',
     emptySlashCommand: 'empty slash command',
