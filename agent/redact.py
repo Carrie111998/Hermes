@@ -326,11 +326,11 @@ def _is_known_benign_assignment(key: str, value: str) -> bool:
     normalized_value = value.casefold()
     if (normalized_key, normalized_value) in {
         ("identity_token", "bailu"),
+        ("per_layer_token_embd.weight", "cpu"),
         ("runtime.token", "local"),
+        ("token", "cpu"),
     }:
         return True
-    if normalized_value == "cpu":
-        return normalized_key == "token" or "token_embd" in normalized_key
     return False
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.

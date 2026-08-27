@@ -123,6 +123,8 @@ class TestEnvAssignments:
             ('{"token": "opaqueValue123456789"}', "opaqueValue123456789"),
             ('{"key_material": "CPU"}', "CPU"),
             ('{"bearer": "local"}', "local"),
+            ("token_embd_api_key=CPU", "CPU"),
+            ("secret.token_embd.password: CPU", "CPU"),
             ("TOKEN=" + "sk-" + "a" * 30, "a" * 20),
             ("TOKEN=abc", "abc"),
             ('{"token": "aaaa"}', "aaaa"),
