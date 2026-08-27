@@ -701,9 +701,27 @@ def _chat_messages_to_responses_input(
                     # reasoning item (otherwise: missing_following_item error).
                     # When the assistant produced only reasoning with no visible
                     # content, emit an empty assistant message as the required
-                    # following item.
-                    items.append({"role": "assistant", "content": ""})
-                    item_sources.append(msg)
+                    # following item — UNLESS valid tool calls follow, which
+                    # already satisfy the following-item requirement (and some
+                    # Responses backends, e.g. Volcengine Ark plan endpoints,
+                    # reject empty-content messages with HTTP 400
+                    # missing `input.content`).
+                    _has_valid_tool_calls = False
+                    _tcs = msg.get("tool_calls")
+                    if isinstance(_tcs, list):
+                        for _tc in _tcs:
+                            if not isinstance(_tc, dict):
+                                continue
+                            _fn = _tc.get("function", {})
+                            if (
+                                isinstance(_fn.get("name"), str)
+                                and _fn.get("name").strip()
+                            ):
+                                _has_valid_tool_calls = True
+                                break
+                    if not _has_valid_tool_calls:
+                        items.append({"role": "assistant", "content": ""})
+                        item_sources.append(msg)
 
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
