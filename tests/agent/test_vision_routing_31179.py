@@ -180,6 +180,12 @@ model:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
 
+        from agent.models_dev import ModelCapabilities
+
+        monkeypatch.setattr(
+            "agent.models_dev.get_model_capabilities",
+            lambda *_args, **_kwargs: ModelCapabilities(supports_vision=False),
+        )
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is None, (
