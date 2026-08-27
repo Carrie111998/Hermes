@@ -8,9 +8,11 @@ import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentBranch,
   $currentCwd,
+  $sessions,
   setCurrentBranch,
   setCurrentCwd,
   setSelectedStoredSessionId,
+  setSessions,
   workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
 import type { SessionInfo, SessionResumeResponse } from '@/types/hermes'
@@ -23,13 +25,17 @@ import {
   chatMessagesEquivalent,
   chatPartsEquivalent,
   dedupeInflightUserAgainstTranscript,
+  dropListedSession,
+  findListedSession,
   goneSessionVerdict,
   isSessionGoneError,
+  legacySessionAliasesForOwner,
   overlayConcurrentMessageChanges,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
   removeRepresentedLocalLiveProjection,
   resolveResumedBusy,
+  restoreListedSession,
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -263,6 +269,60 @@ describe('sessionMatchesStoredId', () => {
     expect(sessionMatchesStoredId(session({ id: 'a' }), 'a')).toBe(true)
     expect(sessionMatchesStoredId(session({ id: 'live', _lineage_root_id: 'root' }), 'root')).toBe(true)
     expect(sessionMatchesStoredId(session({ id: 'a' }), 'b')).toBe(false)
+  })
+})
+
+describe('owner-qualified listed sessions', () => {
+  afterEach(() => {
+    setSessions([])
+  })
+
+  it('finds the exact owner when two rows share a stored id', () => {
+    const sourceA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const sourceB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+    setSessions([sourceA, sourceB])
+
+    expect(findListedSession('shared', { connectionId: 'source-b', profile: 'worker' })?.session).toBe(sourceB)
+    expect($sessions.get()).toEqual([sourceA, sourceB])
+  })
+
+  it('evicts only the exact owner when two rows share a stored id', () => {
+    const sourceA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const sourceB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+    setSessions([sourceA, sourceB])
+
+    dropListedSession('shared', { connectionId: 'source-b', profile: 'worker' })
+
+    expect($sessions.get()).toEqual([sourceA])
+  })
+
+  it('restores a failed exact-owner eviction without replacing its same-id twin', () => {
+    const sourceA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const sourceB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+    setSessions([sourceA])
+
+    restoreListedSession(sourceB, 'sessions')
+
+    expect($sessions.get()).toEqual([sourceB, sourceA])
+  })
+
+  it('proves only aliases not claimed by another owner for legacy cleanup', () => {
+    const sourceA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker', _lineage_root_id: 'root-a' })
+    const sourceB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker', _lineage_root_id: 'root-b' })
+
+    expect(
+      legacySessionAliasesForOwner('shared', sourceB, [sourceA, sourceB], {
+        connectionId: 'source-b',
+        profile: 'worker'
+      })
+    ).toEqual(['root-b'])
+  })
+
+  it('infers a listed row owner before allowing legacy raw cleanup aliases', () => {
+    const sourceA = session({ connection_id: 'source-a', id: 'shared', profile: 'worker', _lineage_root_id: 'root-a' })
+    const sourceB = session({ connection_id: 'source-b', id: 'shared', profile: 'worker', _lineage_root_id: 'root-b' })
+
+    expect(legacySessionAliasesForOwner('shared', sourceB, [sourceA, sourceB])).toEqual(['root-b'])
   })
 })
 

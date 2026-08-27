@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -63,7 +63,11 @@ vi.mock('./chrome', () => ({
   )
 }))
 
-vi.mock('./session-row', () => ({ SidebarSessionRow: () => null }))
+vi.mock('./session-row', () => ({
+  SidebarSessionRow: ({ onDelete }: { onDelete: () => void }) => (
+    <button data-testid="virtual-delete" onClick={onDelete} type="button" />
+  )
+}))
 
 afterEach(cleanup)
 
@@ -104,6 +108,41 @@ describe('VirtualSessionList', () => {
     expect(new Set(virtualIds).size).toBe(2)
     expect(new Set(sortableIds).size).toBe(2)
     expect(sortableIds).toEqual(virtualIds)
+  })
+
+  it('passes a virtualized row exact owner to deletion', () => {
+    const onDeleteSession = vi.fn()
+    const session = {
+      connection_id: 'source-b',
+      id: 'shared',
+      profile: 'worker-b'
+    } as SessionInfo
+    const sessionRows: SidebarListRow[] = [
+      { key: 'today', kind: 'divider', label: 'Today' },
+      { entry: { session }, kind: 'session' }
+    ]
+
+    const { getByTestId } = render(
+      <VirtualSessionList
+        activeSessionId={null}
+        onArchiveSession={noop}
+        onDeleteSession={onDeleteSession}
+        onResumeSession={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        pinned={false}
+        rows={sessionRows}
+        sortable={false}
+      />
+    )
+
+    fireEvent.click(getByTestId('virtual-delete'))
+
+    expect(onDeleteSession).toHaveBeenCalledWith('shared', {
+      connectionId: 'source-b',
+      profile: 'worker-b',
+      targetProfile: 'worker-b'
+    })
   })
 
   it('positions measured rows independently within a total-size spacer', () => {

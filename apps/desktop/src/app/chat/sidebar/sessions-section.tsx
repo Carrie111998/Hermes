@@ -21,6 +21,9 @@ import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
+
+import { sessionRowOwnerRoute } from '../session-row-owner'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
@@ -102,7 +105,7 @@ interface SidebarSessionsSectionProps {
   activeSessionId: null | string
   activeSessionIdentity?: null | string
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
-  onDeleteSession: (sessionId: string) => void
+  onDeleteSession: (sessionId: string, ownerRoute?: SessionOwnerRoute) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
@@ -261,7 +264,7 @@ export function SidebarSessionsSection({
           : session.id === activeSessionId,
         onArchive: () => onArchiveSession(session.id),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-        onDelete: () => onDeleteSession(session.id),
+        onDelete: () => onDeleteSession(session.id, sessionRowOwnerRoute(session)),
         onPin: () => onTogglePin(sessionPinId(session)),
         onToggleUnread: () => onToggleUnread(session.id),
         onResume: () => onResumeSession(session.id, session),

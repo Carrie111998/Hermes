@@ -878,6 +878,34 @@ export function setSessionOwnerHint(sessionId: string, route: SessionOwnerRoute)
   }
 }
 
+/** Drop one exact owner's persisted hints for the deleted session aliases.
+ * Same raw ids on other connections remain routable. */
+export function forgetSessionOwnerHints(
+  candidateIds: readonly (null | string | undefined)[],
+  ownerRoute: Pick<SessionOwnerRoute, 'connectionId' | 'profile'>
+): void {
+  const ids = new Set(candidateIds.flatMap(id => (id?.trim() ? [id.trim()] : [])))
+  const connectionId = ownerRoute.connectionId.trim()
+  const profile = ownerRoute.profile.trim() || 'default'
+
+  if (!ids.size || !connectionId) {
+    return
+  }
+
+  let changed = false
+
+  for (const [key, entry] of [...sessionOwnerHints]) {
+    if (ids.has(entry.id) && entry.route.connectionId === connectionId && entry.route.profile === profile) {
+      sessionOwnerHints.delete(key)
+      changed = true
+    }
+  }
+
+  if (changed) {
+    persistSessionOwnerHints()
+  }
+}
+
 /** Drop every hint naming `connectionId` — the registry no longer has it, so
  *  nothing can dial that route again (fail-closed would otherwise pin those
  *  sessions to a dead source forever). */

@@ -30,6 +30,7 @@ import {
   applyConfiguredDefaultProjectDir,
   commitWorkspaceCwdForSelectedSession,
   ensureDefaultWorkspaceCwd,
+  forgetSessionOwnerHints,
   forgetSessionOwnerHintsForConnection,
   forgetSessionOwnerHintsForSession,
   getConfiguredDefaultProjectDir,
@@ -202,6 +203,23 @@ describe('session owner hints', () => {
     ).toEqual({ connectionId: 'source-a', profile: 'worker', targetProfile: 'worker' })
     expect(sessionOwnerRouteFromRow(session({ profile: 'default' }))).toBeUndefined()
     expect(sessionOwnerRouteFromRow(session({ connection_id: '  ', profile: 'default' }))).toBeUndefined()
+  })
+
+  it('forgets only the deleted owner hints for duplicate ids, in memory and on disk', () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
+    const sourceB = { connectionId: 'source-b', profile: 'worker' }
+    setSessionOwnerHint('same-session', sourceA)
+    setSessionOwnerHint('same-session', sourceB)
+
+    forgetSessionOwnerHints(['same-session'], sourceB)
+
+    expect(getSessionOwnerHint('same-session', sourceA)).toEqual(sourceA)
+    expect(getSessionOwnerHint('same-session', sourceB)).toBeUndefined()
+
+    _resetSessionOwnerHintsForTests()
+    hydrateSessionOwnerHints()
+    expect(getSessionOwnerHint('same-session', sourceA)).toEqual(sourceA)
+    expect(getSessionOwnerHint('same-session', sourceB)).toBeUndefined()
   })
 })
 

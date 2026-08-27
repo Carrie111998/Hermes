@@ -287,13 +287,70 @@ export function dropTranscriptTail(storedSessionId: string, scope?: TranscriptTa
   }
 }
 
-/** Drop EVERY scope's entry for a stored id. Delete-path only: the save-path
- *  scope (ownerRoute) and the delete-path scope (the removed row's
- *  connection_id) are derived from different sources, so a shape drift
- *  between them would orphan the entry until LRU eviction (#94914 review,
- *  defect 1). A DELETED stored id cannot be legitimately reused, so sweeping
- *  all scopes is safe there — but never on the failed-resume path, where a
- *  same-id twin in another profile must keep its own tail. */
+/** Drop the durable tails attributable to one exact session owner. A stored id
+ * can exist on several registry connections, so delete must never sweep by raw
+ * id. `targetProfile` is an allowed alias because REST cache writes use the
+ * backend profile while the clicked row carries the Desktop route profile. */
+export function dropTranscriptTailsForOwner(
+  storedSessionId: string,
+  ownerRoute: { connectionId: string; profile: string; targetProfile?: string }
+): void {
+  const id = (storedSessionId ?? '').trim()
+  const connectionId = ownerRoute.connectionId.trim()
+  const connectionIds = new Set(connectionId === 'local' ? ['', 'local'] : [connectionId])
+
+  const profiles = new Set(
+    [ownerRoute.profile, ownerRoute.targetProfile]
+      .map(profile => profile?.trim() || '')
+      .filter(Boolean)
+  )
+
+  const store = storage()
+
+  if (!store || !id || !connectionId || profiles.size === 0) {
+    return
+  }
+
+  try {
+    const belongsToOwner = (entry: string): boolean => {
+      if (!entry.startsWith('[')) {
+        return false
+      }
+
+      try {
+        const parsed = JSON.parse(entry)
+
+        return (
+          Array.isArray(parsed) &&
+          parsed.length === 3 &&
+          connectionIds.has(parsed[0]) &&
+          profiles.has(parsed[1]) &&
+          parsed[2] === id
+        )
+      } catch {
+        return false
+      }
+    }
+
+    const index = readIndex(store)
+
+    for (const entry of index.filter(belongsToOwner)) {
+      store.removeItem(PREFIX + entry)
+    }
+
+    writeIndex(
+      store,
+      index.filter(entry => !belongsToOwner(entry))
+    )
+  } catch {
+    // best effort
+  }
+}
+
+/** Drop EVERY scope's entry for a stored id. Legacy raw-id cleanup only: the
+ * caller must first prove that no surviving owner claims this alias. Exact-owner
+ * deletion uses `dropTranscriptTailsForOwner` instead; sweeping a colliding raw
+ * id would erase another connection's cached transcript. */
 export function dropTranscriptTailEverywhere(storedSessionId: string): void {
   const id = (storedSessionId ?? '').trim()
   const store = storage()

@@ -48,6 +48,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $turnStartedAt,
+  _resetSessionOwnerHintsForTests,
   getSessionOwnerHint,
   knownSessionOwner,
   sessionMatchesStoredId,
@@ -65,14 +66,22 @@ import {
   setMessages,
   setMessagingSessions,
   setNewChatWorkspaceTarget,
+  setPrimarySessionOwnerIntent,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
+  setSessionOwnerHint,
   setSessions,
   setTurnStartedAt
 } from '@/store/session'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
+import {
+  $transcriptTailBySessionId,
+  recordTranscriptTail,
+  transcriptTailState
+} from '@/store/transcript-tail'
+import { loadTranscriptTail, saveTranscriptTail } from '@/store/transcript-tail-cache'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
@@ -148,13 +157,17 @@ function Harness({
   navigate = vi.fn(),
   onReady,
   requestGateway,
-  selectedStoredSessionId = null
+  runtimeIdByStoredSessionIdRef,
+  selectedStoredSessionId = null,
+  sessionStateByRuntimeIdRef
 }: {
   activeSessionId?: null | string
   navigate?: ReturnType<typeof vi.fn>
   onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: null | string
+  sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
 
@@ -169,10 +182,10 @@ function Harness({
     navigate: navigate as never,
     requestGateway,
     resetViewSync: vi.fn(),
-    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
+    runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>()),
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref(selectedStoredSessionId),
-    sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
+    sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>()),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
   })
@@ -3745,6 +3758,11 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     $sessionMutationsInFlight.set(new Set())
     $sessionSeenCounts.set({})
     $unreadFinishedMarkers.set({})
+    $sessionTiles.set([])
+    $transcriptTailBySessionId.set({})
+    setPrimarySessionOwnerIntent(null)
+    _resetSessionOwnerHintsForTests({ storage: true })
+    window.localStorage.clear()
     mockDeleteSession.mockReset()
     mockGetSession.mockReset()
     mockSetSessionArchived.mockReset()
@@ -3762,6 +3780,11 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     $sessionMutationsInFlight.set(new Set())
     $sessionSeenCounts.set({})
     $unreadFinishedMarkers.set({})
+    $sessionTiles.set([])
+    $transcriptTailBySessionId.set({})
+    setPrimarySessionOwnerIntent(null)
+    _resetSessionOwnerHintsForTests({ storage: true })
+    window.localStorage.clear()
   })
 
   async function readyActions() {
@@ -3771,6 +3794,232 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
 
     return handle!
   }
+
+  it('deletes and evicts only the clicked exact owner when raw ids collide', async () => {
+    const sourceA = storedSession({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const sourceB = storedSession({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+    setSessions([sourceA, sourceB])
+    mockDeleteSession.mockResolvedValue({ ok: true })
+
+    const handle = await readyActions()
+    await act(async () => {
+      await handle.removeSession('shared', { connectionId: 'source-b', profile: 'worker' })
+    })
+
+    expect(mockDeleteSession).toHaveBeenCalledWith('shared', {
+      connectionId: 'source-b',
+      profile: 'worker'
+    })
+    expect($sessions.get()).toEqual([sourceA])
+  })
+
+  it('restores only the clicked exact owner after a duplicate-id delete fails', async () => {
+    const sourceA = storedSession({ connection_id: 'source-a', id: 'shared', profile: 'worker' })
+    const sourceB = storedSession({ connection_id: 'source-b', id: 'shared', profile: 'worker' })
+    setSessions([sourceA, sourceB])
+    mockDeleteSession.mockRejectedValue(new Error('backend down'))
+
+    const handle = await readyActions()
+    await act(async () => {
+      await handle.removeSession('shared', { connectionId: 'source-b', profile: 'worker' })
+    })
+
+    expect(mockDeleteSession).toHaveBeenCalledWith('shared', {
+      connectionId: 'source-b',
+      profile: 'worker'
+    })
+    expect($sessions.get()).toEqual([sourceB, sourceA])
+  })
+
+  it('uses only owner-proven aliases for raw legacy cleanup', async () => {
+    const sourceA = storedSession({
+      _lineage_root_id: 'root-a',
+      connection_id: 'source-a',
+      id: 'shared',
+      profile: 'worker'
+    })
+
+    const sourceB = storedSession({
+      _lineage_root_id: 'root-b',
+      connection_id: 'source-b',
+      id: 'shared',
+      profile: 'worker'
+    })
+
+    setSessions([sourceA, sourceB])
+    $pinnedSessionIds.set(['shared', 'root-a', 'root-b'])
+    mockDeleteSession.mockResolvedValue({ ok: true })
+
+    const handle = await readyActions()
+    await act(async () => {
+      await handle.removeSession('shared', { connectionId: 'source-b', profile: 'worker' })
+    })
+
+    expect($removedSessionIds.get().has('shared')).toBe(false)
+    expect($removedSessionIds.get().has('root-b')).toBe(true)
+    expect($pinnedSessionIds.get()).toEqual(['shared', 'root-a'])
+  })
+
+  it('cleans only the exact owner persisted tail and route hint', async () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
+    const sourceB = { connectionId: 'source-b', profile: 'worker' }
+    const tail = (id: string) => [{ id, parts: [{ text: id, type: 'text' }], role: 'assistant' }] as never
+    setSessions([
+      storedSession({ connection_id: sourceA.connectionId, id: 'shared-cleanup', profile: sourceA.profile }),
+      storedSession({ connection_id: sourceB.connectionId, id: 'shared-cleanup', profile: sourceB.profile })
+    ])
+    saveTranscriptTail('shared-cleanup', tail('source-a-tail'), sourceA)
+    saveTranscriptTail('shared-cleanup', tail('source-b-tail'), sourceB)
+    setSessionOwnerHint('shared-cleanup', sourceA)
+    setSessionOwnerHint('shared-cleanup', sourceB)
+    mockDeleteSession.mockResolvedValue({ ok: true })
+
+    const handle = await readyActions()
+    await act(async () => {
+      await handle.removeSession('shared-cleanup', sourceB)
+    })
+
+    expect(loadTranscriptTail('shared-cleanup', sourceA)?.[0]?.id).toBe('source-a-tail')
+    expect(loadTranscriptTail('shared-cleanup', sourceB)).toBeNull()
+    expect(getSessionOwnerHint('shared-cleanup', sourceA)).toEqual(sourceA)
+    expect(getSessionOwnerHint('shared-cleanup', sourceB)).toBeUndefined()
+  })
+
+  it('clears only the deleted local owner in-memory transcript tail aliases', async () => {
+    const sourceA = { connectionId: 'local', mode: 'local' as const, profile: 'worker-a' }
+    const sourceB = { connectionId: 'local', mode: 'local' as const, profile: 'worker-b' }
+
+    const page = {
+      messages: [],
+      pagination: { limit: 1, offset: 0, order: 'latest', returned: 0 }
+    } as never
+
+    setSessions([
+      storedSession({ id: 'shared-local-tail', profile: sourceA.profile }),
+      storedSession({ id: 'shared-local-tail', profile: sourceB.profile })
+    ])
+    recordTranscriptTail('shared-local-tail', page, sourceA.profile)
+    recordTranscriptTail('shared-local-tail', page, sourceB.profile)
+    mockDeleteSession.mockResolvedValue({ ok: true })
+
+    const handle = await readyActions()
+    await act(async () => {
+      await handle.removeSession('shared-local-tail', sourceB)
+    })
+
+    expect(transcriptTailState('shared-local-tail', sourceA.profile)).toBeDefined()
+    expect(transcriptTailState('shared-local-tail', sourceB.profile)).toBeUndefined()
+  })
+
+  it('does not close a selected same-id runtime owned by another connection', async () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
+    const sourceB = { connectionId: 'source-b', profile: 'worker' }
+    const navigate = vi.fn()
+    setSessions([
+      storedSession({ connection_id: sourceA.connectionId, id: 'shared-selected', profile: sourceA.profile }),
+      storedSession({ connection_id: sourceB.connectionId, id: 'shared-selected', profile: sourceB.profile })
+    ])
+    setPrimarySessionOwnerIntent({ ownerRoute: sourceA, storedSessionId: 'shared-selected' })
+    mockDeleteSession.mockResolvedValue({ ok: true })
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-a"
+        navigate={navigate}
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        selectedStoredSessionId="shared-selected"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('shared-selected', sourceB)
+    })
+
+    expect(vi.mocked(requestGatewayForAgent).mock.calls.filter(call => call[2] === 'session.close')).toEqual([])
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('keeps a same-id tile owned by another connection', async () => {
+    const sourceA = { connectionId: 'source-a', profile: 'worker' }
+    const sourceB = { connectionId: 'source-b', profile: 'worker' }
+    setSessions([
+      storedSession({ connection_id: sourceA.connectionId, id: 'shared-tile', profile: sourceA.profile }),
+      storedSession({ connection_id: sourceB.connectionId, id: 'shared-tile', profile: sourceB.profile })
+    ])
+
+    const runtimeBindings: MutableRefObject<Map<string, string>> = {
+      current: new Map([['shared-tile', 'runtime-a']])
+    }
+
+    const runtimeStates: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['runtime-a', createClientSessionState('shared-tile')]])
+    }
+
+    $sessionTiles.set([{ ownerRoute: sourceA, runtimeId: 'runtime-a', storedSessionId: 'shared-tile' }])
+    mockDeleteSession.mockResolvedValue({ ok: true })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        runtimeIdByStoredSessionIdRef={runtimeBindings}
+        sessionStateByRuntimeIdRef={runtimeStates}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('shared-tile', sourceB)
+    })
+
+    expect($sessionTiles.get()).toEqual([
+      { ownerRoute: sourceA, runtimeId: 'runtime-a', storedSessionId: 'shared-tile' }
+    ])
+    expect(runtimeBindings.current.get('shared-tile')).toBe('runtime-a')
+    expect(runtimeStates.current.has('runtime-a')).toBe(true)
+  })
+
+  it('closes and evicts only a tile runtime with the deleted exact owner', async () => {
+    const sourceB = { connectionId: 'source-b', profile: 'worker' }
+    setSessions([
+      storedSession({ connection_id: sourceB.connectionId, id: 'owned-tile', profile: sourceB.profile })
+    ])
+
+    const runtimeBindings: MutableRefObject<Map<string, string>> = {
+      current: new Map([['owned-tile', 'runtime-b']])
+    }
+
+    const runtimeStates: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['runtime-b', createClientSessionState('owned-tile')]])
+    }
+
+    $sessionTiles.set([{ ownerRoute: sourceB, runtimeId: 'runtime-b', storedSessionId: 'owned-tile' }])
+    mockDeleteSession.mockResolvedValue({ ok: true })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        runtimeIdByStoredSessionIdRef={runtimeBindings}
+        sessionStateByRuntimeIdRef={runtimeStates}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('owned-tile', sourceB)
+    })
+
+    expect($sessionTiles.get()).toEqual([])
+    expect(runtimeBindings.current.has('owned-tile')).toBe(false)
+    expect(runtimeStates.current.has('runtime-b')).toBe(false)
+  })
 
   it('DELETEs a stamped messaging session against its owning profile', async () => {
     mockDeleteSession.mockResolvedValue({ ok: true })

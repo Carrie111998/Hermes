@@ -1310,10 +1310,54 @@ export function sessionShouldHaveTranscript(session: SessionInfo | undefined): b
 
 export type ListedSessionSlice = 'cron' | 'messaging' | 'sessions'
 
+export function sessionMatchesOwner(session: SessionInfo, ownerRoute?: SessionProfileRoute): boolean {
+  if (!ownerRoute) {
+    return true
+  }
+
+  return (
+    (session.connection_id?.trim() || 'local') === ownerRoute.connectionId.trim() &&
+    normalizeProfileKey(session.profile) === normalizeProfileKey(ownerRoute.profile)
+  )
+}
+
+/** Raw-id stores predate owner-qualified identity. Return only aliases that no
+ * surviving row on another owner can claim, so legacy cleanup cannot erase a
+ * same-id twin's pin/tombstone/queue state. */
+export function legacySessionAliasesForOwner(
+  storedSessionId: string,
+  removed: SessionInfo | undefined,
+  rows: readonly SessionInfo[],
+  ownerRoute?: SessionProfileRoute
+): string[] {
+  const aliases = [...new Set([storedSessionId, removed?.id, removed?._lineage_root_id].filter(Boolean))] as string[]
+
+  const provenOwner =
+    ownerRoute ??
+    (removed?.profile?.trim()
+      ? {
+          connectionId: removed.connection_id?.trim() || 'local',
+          profile: removed.profile.trim()
+        }
+      : undefined)
+
+  if (!provenOwner) {
+    return aliases
+  }
+
+  return aliases.filter(
+    alias =>
+      !rows.some(session => sessionMatchesStoredId(session, alias) && !sessionMatchesOwner(session, provenOwner))
+  )
+}
+
 export function findListedSession(
-  storedSessionId: string
+  storedSessionId: string,
+  ownerRoute?: SessionProfileRoute
 ): { session: SessionInfo; slice: ListedSessionSlice } | undefined {
-  const match = (session: SessionInfo) => sessionMatchesStoredId(session, storedSessionId)
+  const match = (session: SessionInfo) =>
+    sessionMatchesStoredId(session, storedSessionId) && sessionMatchesOwner(session, ownerRoute)
+
   const fromMessaging = $messagingSessions.get().find(match)
 
   if (fromMessaging) {
@@ -1335,8 +1379,9 @@ export function findListedSession(
   return undefined
 }
 
-export function dropListedSession(storedSessionId: string): void {
-  const keep = (session: SessionInfo) => !sessionMatchesStoredId(session, storedSessionId)
+export function dropListedSession(storedSessionId: string, ownerRoute?: SessionProfileRoute): void {
+  const keep = (session: SessionInfo) =>
+    !sessionMatchesStoredId(session, storedSessionId) || !sessionMatchesOwner(session, ownerRoute)
 
   setSessions(prev => prev.filter(keep))
   setMessagingSessions(prev => prev.filter(keep))
@@ -1352,9 +1397,18 @@ export function restoreListedSession(session: SessionInfo, slice?: ListedSession
         ? 'cron'
         : 'sessions')
 
+  const restoredOwner: SessionProfileRoute | undefined = session.profile?.trim()
+    ? {
+        connectionId: session.connection_id?.trim() || 'local',
+        profile: session.profile.trim()
+      }
+    : undefined
+
   const prepend = (prev: SessionInfo[]) => [
     session,
-    ...prev.filter(existing => !sessionMatchesStoredId(existing, session.id))
+    ...prev.filter(
+      existing => !sessionMatchesStoredId(existing, session.id) || !sessionMatchesOwner(existing, restoredOwner)
+    )
   ]
 
   if (target === 'messaging') {

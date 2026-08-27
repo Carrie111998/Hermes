@@ -5,7 +5,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import {
   clearTranscriptTails,
   dropTranscriptTail,
-  dropTranscriptTailEverywhere,
+  dropTranscriptTailsForOwner,
   loadTranscriptTail,
   saveTranscriptTail
 } from './transcript-tail-cache'
@@ -169,19 +169,48 @@ describe('transcript tail cache', () => {
       expect(loadTranscriptTail('sess-d', { profile: 'p2' })).not.toBeNull()
     })
 
-    it('delete-path everywhere-drop clears every scope of the id even when scopes drifted', () => {
-      // Save under a routed scope (connectionId present); the delete path
-      // derives its scope from the removed row, which may lack the tag —
-      // the everywhere-drop must still clear the entry (#94914 defect 1).
-      saveTranscriptTail('sess-gone', [msg('routed-row')], { connectionId: 'homelab', profile: 'ops' })
-      saveTranscriptTail('sess-gone', [msg('local-row')], { profile: 'ops' })
-      saveTranscriptTail('sess-kept', [msg('other-row')], { profile: 'ops' })
+    it('delete cleanup drops only the exact owner scope of a duplicate id', () => {
+      saveTranscriptTail('sess-gone', [msg('owner-row')], { connectionId: 'homelab', profile: 'ops' })
+      saveTranscriptTail('sess-gone', [msg('other-source-row')], { connectionId: 'studio', profile: 'ops' })
+      saveTranscriptTail('sess-gone', [msg('legacy-local-row')], { profile: 'ops' })
 
-      dropTranscriptTailEverywhere('sess-gone')
+      dropTranscriptTailsForOwner('sess-gone', { connectionId: 'homelab', profile: 'ops' })
 
       expect(loadTranscriptTail('sess-gone', { connectionId: 'homelab', profile: 'ops' })).toBeNull()
-      expect(loadTranscriptTail('sess-gone', { profile: 'ops' })).toBeNull()
-      expect(loadTranscriptTail('sess-kept', { profile: 'ops' })).not.toBeNull()
+      expect(loadTranscriptTail('sess-gone', { connectionId: 'studio', profile: 'ops' })).not.toBeNull()
+      expect(loadTranscriptTail('sess-gone', { profile: 'ops' })).not.toBeNull()
+    })
+
+    it('delete cleanup recognizes the exact route target profile as an owner alias', () => {
+      saveTranscriptTail('sess-alias', [msg('backend-row')], {
+        connectionId: 'homelab',
+        profile: 'backend-worker'
+      })
+      saveTranscriptTail('sess-alias', [msg('other-row')], {
+        connectionId: 'homelab',
+        profile: 'other-worker'
+      })
+
+      dropTranscriptTailsForOwner('sess-alias', {
+        connectionId: 'homelab',
+        profile: 'desktop-alias',
+        targetProfile: 'backend-worker'
+      })
+
+      expect(loadTranscriptTail('sess-alias', { connectionId: 'homelab', profile: 'backend-worker' })).toBeNull()
+      expect(loadTranscriptTail('sess-alias', { connectionId: 'homelab', profile: 'other-worker' })).not.toBeNull()
+    })
+
+    it('delete cleanup treats empty and local connection ids as proven local-owner aliases', () => {
+      saveTranscriptTail('sess-local', [msg('explicit-local')], { connectionId: 'local', profile: 'worker' })
+      saveTranscriptTail('sess-local', [msg('legacy-local')], { profile: 'worker' })
+      saveTranscriptTail('sess-local', [msg('remote-twin')], { connectionId: 'homelab', profile: 'worker' })
+
+      dropTranscriptTailsForOwner('sess-local', { connectionId: 'local', profile: 'worker' })
+
+      expect(loadTranscriptTail('sess-local', { connectionId: 'local', profile: 'worker' })).toBeNull()
+      expect(loadTranscriptTail('sess-local', { profile: 'worker' })).toBeNull()
+      expect(loadTranscriptTail('sess-local', { connectionId: 'homelab', profile: 'worker' })).not.toBeNull()
     })
 
     it('purges pre-scoping v1 entries so a stale tail can never paint again', async () => {

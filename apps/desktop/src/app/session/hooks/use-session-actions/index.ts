@@ -62,15 +62,19 @@ import { clearStoredTranscriptReadOnly, markStoredTranscriptReadOnly } from '@/s
 import {
   $activeSessionStoredIdRotation,
   $connection,
+  $cronSessions,
   $currentCwd,
   $currentFastMode,
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
   $messages,
+  $messagingSessions,
   $newChatWorkspaceTarget,
+  $primarySessionOwnerIntent,
   $sessions,
   $yoloActive,
+  forgetSessionOwnerHints,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -101,6 +105,7 @@ import {
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
   requestForSessionProfile,
+  type SessionOwnerRoute,
   type SessionOwnerScope,
   type SessionProfileRoute
 } from '@/store/session-request-router'
@@ -120,9 +125,11 @@ import { broadcastSessionsChanged } from '@/store/session-sync'
 import { forgetSessionUnread } from '@/store/session-unread'
 import { $archivedSessions } from '@/store/sidebar-archive'
 import { restoreSessionTodosFromSnapshot } from '@/store/todos'
+import { clearTranscriptTail } from '@/store/transcript-tail'
 import {
   dropTranscriptTail,
   dropTranscriptTailEverywhere,
+  dropTranscriptTailsForOwner,
   loadTranscriptTail,
   saveTranscriptTail
 } from '@/store/transcript-tail-cache'
@@ -153,6 +160,7 @@ import {
   findListedSession,
   goneSessionVerdict,
   isSessionGoneError,
+  legacySessionAliasesForOwner,
   overlayConcurrentMessageChanges,
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
@@ -163,6 +171,7 @@ import {
   resolveStoredSession,
   restoreListedSession,
   selectBranchMessages,
+  sessionMatchesOwner,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
   toBranchMessages,
@@ -2197,7 +2206,7 @@ export function useSessionActions({
   )
 
   const removeSession = useCallback(
-    async (storedSessionId: string) => {
+    async (storedSessionId: string, capturedOwner?: SessionOwnerRoute) => {
       clearNotifications()
 
       // The row may live in the main list, the messaging/cron sidebar slices,
@@ -2205,16 +2214,22 @@ export function useSessionActions({
       // $sessions by design). Resolve from all of them so deleting a
       // messaging/cron row (or from the Archived filter) evicts the row
       // instead of leaving a ghost that resumes into a dead id.
-      const listed = findListedSession(storedSessionId)
+      const listed = findListedSession(storedSessionId, capturedOwner)
 
       const removed =
-        listed?.session ?? $archivedSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+        listed?.session ??
+        $archivedSessions
+          .get()
+          .find(
+            session =>
+              sessionMatchesStoredId(session, storedSessionId) && sessionMatchesOwner(session, capturedOwner)
+          )
 
       // Messaging/cron rows frequently arrive without an inline profile; fall
       // back to the stored-session ownership lookup so their DELETE routes to
       // the owning profile instead of the ambient one.
       const stampedProfile = removed?.profile?.trim()
-      const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+      const profile = capturedOwner?.profile || stampedProfile || (await resolveSessionProfile(storedSessionId))
 
       // Listed profile-less row + multiple profiles + unresolved owner:
       // never fall through to the primary backend (fake already_absent).
@@ -2229,33 +2244,69 @@ export function useSessionActions({
         return
       }
 
-      const wasSelected = selectedStoredSessionId === storedSessionId
+      const selectedOwnerIntent = $primarySessionOwnerIntent.get()
+
+      const selectedOwnerCandidates = [
+        ...$sessions.get(),
+        ...$messagingSessions.get(),
+        ...$cronSessions.get(),
+        ...$archivedSessions.get()
+      ].filter(session => sessionMatchesStoredId(session, storedSessionId))
+
+      const selectedOwnerIsUnambiguous =
+        Boolean(capturedOwner) &&
+        selectedOwnerCandidates.length > 0 &&
+        selectedOwnerCandidates.every(session => sessionMatchesOwner(session, capturedOwner))
+
+      const selectedOwnerMatches =
+        !capturedOwner ||
+        selectedOwnerIsUnambiguous ||
+        (selectedOwnerIntent?.storedSessionId === storedSessionId &&
+          selectedOwnerIntent.ownerRoute.connectionId.trim() === capturedOwner.connectionId.trim() &&
+          normalizeProfileKey(selectedOwnerIntent.ownerRoute.profile) === normalizeProfileKey(capturedOwner.profile))
+
+      const wasSelected = selectedStoredSessionId === storedSessionId && selectedOwnerMatches
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
       const previousPinned = $pinnedSessionIds.get()
 
-      const removedOwner: SessionOwnerScope = removed?.connection_id
-        ? {
-            connectionId: removed.connection_id,
-            profile: removed.profile || 'default'
-          }
-        : profile
+      const removedOwner: SessionOwnerScope =
+        capturedOwner ??
+        (removed?.connection_id
+          ? {
+              connectionId: removed.connection_id,
+              profile: removed.profile || 'default'
+            }
+          : profile)
 
       const previousArchived = $archivedSessions.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
-      const removedPinId = removed ? sessionPinId(removed) : storedSessionId
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
-      dropListedSession(storedSessionId)
-      $archivedSessions.set(previousArchived.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      const legacyAliases = legacySessionAliasesForOwner(
+        storedSessionId,
+        removed,
+        [...$sessions.get(), ...$messagingSessions.get(), ...$cronSessions.get(), ...previousArchived],
+        capturedOwner
+      )
+
+      const legacyAliasSet = new Set(legacyAliases)
+
+      dropListedSession(storedSessionId, capturedOwner)
+      $archivedSessions.set(
+        previousArchived.filter(
+          session =>
+            !sessionMatchesStoredId(session, storedSessionId) || !sessionMatchesOwner(session, capturedOwner)
+        )
+      )
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
       // the delete RPC is in flight, so a racing refresh can't flash it back.
-      tombstoneSessions(removedIds)
-      beginSessionMutation(removedIds)
-      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
+      tombstoneSessions(legacyAliases)
+      beginSessionMutation(legacyAliases)
+      $pinnedSessionIds.set(previousPinned.filter(id => !legacyAliasSet.has(id)))
 
       // Tear down before awaiting so the route effect can't resume the
       // doomed session via the stale /<sid> URL.
@@ -2272,30 +2323,89 @@ export function useSessionActions({
 
         await deleteSession(storedSessionId, removedOwner)
 
-        dropTranscriptTailEverywhere(storedSessionId)
+        const cleanupIds = [...new Set(removedIds.filter((id): id is string => Boolean(id)))]
+
+        if (removedOwner && typeof removedOwner === 'object') {
+          const restConnections = new Set(
+            removedOwner.connectionId.trim() === 'local' ? ['', 'local'] : [removedOwner.connectionId]
+          )
+
+          const restProfiles = new Set(
+            [removedOwner.profile, removedOwner.targetProfile]
+              .map(candidate => candidate?.trim() || '')
+              .filter(Boolean)
+          )
+
+          for (const id of cleanupIds) {
+            dropTranscriptTailsForOwner(id, removedOwner)
+
+            for (const restConnection of restConnections) {
+              for (const restProfile of restProfiles) {
+                clearTranscriptTail(id, {
+                  connectionId: restConnection,
+                  profile: restProfile
+                })
+              }
+            }
+          }
+
+          forgetSessionOwnerHints(cleanupIds, removedOwner)
+        } else {
+          for (const alias of legacyAliases) {
+            dropTranscriptTailEverywhere(alias)
+            clearTranscriptTail(alias)
+          }
+        }
+
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
-        forgetSessionUnread(removedIds, profile)
+        forgetSessionUnread(legacyAliases, profile)
         clearQueuedPromptsForOwnerLineage(
           typeof removedOwner === 'object' && removedOwner
             ? removedOwner
             : { connectionId: 'local', profile: typeof removedOwner === 'string' ? removedOwner : 'default' },
           removedIds
         )
-        clearQueuedPrompts(storedSessionId)
+
+        for (const alias of legacyAliases) {
+          clearQueuedPrompts(alias)
+        }
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)
         }
 
-        // A tiled copy of this session must not outlive it: collapse the pane
-        // and evict its mirrored runtime state so nothing submits to (or renders)
-        // a deleted session.
-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
+        // A tiled copy of this session must not outlive it, but a raw stored id
+        // can name a tile owned by another connection. Exact-owner deletion only
+        // closes a tile whose persisted owner route matches the clicked row.
+        const tiledSession = $sessionTiles.get().find(tile => {
+          if (tile.storedSessionId !== storedSessionId) {
+            return false
+          }
+
+          if (!capturedOwner) {
+            return true
+          }
+
+          return (
+            tile.ownerRoute?.connectionId.trim() === capturedOwner.connectionId.trim() &&
+            normalizeProfileKey(tile.ownerRoute.profile) === normalizeProfileKey(capturedOwner.profile)
+          )
+        })
+
+        const tiledRuntimeId = capturedOwner
+          ? tiledSession?.runtimeId
+          : runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+
+        if (tiledSession) {
+          closeSessionTile(storedSessionId)
+        }
 
         if (tiledRuntimeId) {
-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          if (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) === tiledRuntimeId) {
+            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          }
+
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
@@ -2307,7 +2417,7 @@ export function useSessionActions({
         // Restore the archived-view row too (no-op when it wasn't archived).
         $archivedSessions.set(previousArchived)
 
-        untombstoneSessions(removedIds)
+        untombstoneSessions(legacyAliases)
         $pinnedSessionIds.set(previousPinned)
 
         if (wasSelected) {
@@ -2334,7 +2444,7 @@ export function useSessionActions({
         // Release the tombstone to the normal projects.tree prune now the RPC has
         // settled (kept on success — the backend has deleted it; cleared on the
         // rollback above on failure).
-        endSessionMutation(removedIds)
+        endSessionMutation(legacyAliases)
       }
     },
     [
