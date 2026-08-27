@@ -1365,3 +1365,64 @@ class TestOpencodeVisionFallback:
         assert caps is not None
         assert caps.supports_vision is False
         assert caps.context_window == 1000000
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_catalog_entry_without_attachment_stays_authoritative(self, _mock):
+        """Gap-pin: a models.dev entry that exists but declares no vision —
+        no ``attachment`` field and no image input modality — must keep its
+        authoritative judgment (vision OFF). The fallback must not fire for
+        a catalog-known model, even when the slug carries the vision marker:
+        capability profiles are never fabricated for known models."""
+        registry = {
+            "opencode-go": {
+                "id": "opencode-go",
+                "models": {
+                    "deepseek-v4-flash-vision-exp": {
+                        "id": "deepseek-v4-flash-vision-exp",
+                        "tool_call": True,
+                        "modalities": {"input": ["text"]},
+                        "limit": {"context": 500000, "output": 4096},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("opencode-go", "deepseek-v4-flash-vision-exp")
+        assert caps is not None
+        assert caps.supports_vision is False
+        # Catalog metadata still wins over the fallback stub's defaults.
+        assert caps.supports_tools is True
+        assert caps.context_window == 500000
+        assert caps.max_output_tokens == 4096
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_vision_marker_in_provider_name_does_not_count(self, _mock):
+        """A provider name that merely extends a family slug with ``vision``
+        must not vouch for a text-only model — the marker has to live in the
+        model id itself (anchored slug pattern, #96066)."""
+        caps = get_model_capabilities(
+            "opencode-go-vision-proxy", "deepseek-v4-flash"
+        )
+        assert caps is None
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_qualified_model_id_still_matches(self, _mock):
+        """An already-qualified model id (family prefix in the slug itself)
+        matches the anchored pattern exactly like a bare id does."""
+        caps = get_model_capabilities(
+            "opencode-go", "opencode-go/deepseek-v4-flash-vision-exp"
+        )
+        assert caps is not None
+        assert caps.supports_vision is True
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_opencode_free_family_gets_the_same_fallback(self, _mock):
+        caps = get_model_capabilities("opencode-free", "deepseek-v4-flash-vision-exp")
+        assert caps is not None
+        assert caps.supports_vision is True
+
+    @patch("agent.models_dev.fetch_models_dev", return_value={})
+    def test_empty_model_stays_unknown(self, _mock):
+        """No model id → no capability claim, even under a family provider."""
+        assert get_model_capabilities("opencode-go", "") is None
+        assert get_model_capabilities("opencode-go", None) is None

@@ -8041,6 +8041,16 @@ def _make_agent(
                 str(requested_provider or ""),
                 str(_fresh_base_url or ""),
             )
+            # A custom family proxy may surface its opencode.ai endpoint only
+            # in the persisted override (config base_url empty or pointing
+            # elsewhere) — probe the override URL too, so the family routing
+            # invariants still apply instead of honoring a stale persisted
+            # api_mode verbatim (#96066).
+            if _oc_family is None and override_base_url:
+                _oc_family = _opencode_family_for_runtime(
+                    str(requested_provider or ""),
+                    str(override_base_url or ""),
+                )
             if _oc_family is not None:
                 from hermes_cli.models import (
                     normalize_opencode_base_url,

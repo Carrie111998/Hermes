@@ -41,6 +41,7 @@ rather than parsing the raw JSON themselves.
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -1266,6 +1267,15 @@ def get_model_capabilities(
     )
 
 
+# Anchored slug pattern for the OpenCode vision fill-gap (#96066): the
+# qualified identifier (family prefix + model id, e.g.
+# ``opencode-go/deepseek-v4-flash-vision-exp``) must start with an
+# opencode family slug and carry a ``vision`` marker. Deliberately narrow —
+# the fallback must never fabricate a capability profile, so anything that
+# does not match stays "unknown" for the rest of the pipeline.
+_OPENCODE_VISION_SLUG_RE = re.compile(r"^opencode-(?:go|zen|free).*vision", re.IGNORECASE)
+
+
 def _opencode_vision_fallback(provider: str, model: str) -> Optional[ModelCapabilities]:
     """Vision-capable stub for OpenCode-family models absent from models.dev.
 
@@ -1274,22 +1284,42 @@ def _opencode_vision_fallback(provider: str, model: str) -> Optional[ModelCapabi
     relay before models.dev picks them up. With an empty or stale registry
     those models resolve to ``None`` here, so ``image_input_mode: auto``
     treats them as text-only and routes user-attached images through the
-    lossy ``vision_analyze`` describe path instead of native pixels. A
-    ``-vision`` slug token is an unambiguous vision marker for this family,
-    so fill the catalog gap deterministically rather than depending on
-    registry freshness.
+    lossy ``vision_analyze`` describe path instead of native pixels.
 
-    Only fires on a complete catalog miss (no entry, no override), matching
-    the ``model_overrides._default`` fill-gap semantics. Returns None for
-    non-OpenCode providers and for models without the marker, so unknown
-    models keep their current "unknown" behavior elsewhere.
+    Contract — vision is claimed ONLY when ALL of these hold:
+
+    1. **Complete catalog miss.** The caller invokes this only when the
+       catalog has no entry for the model AND no ``model_overrides`` entry
+       exists (mirroring ``model_overrides._default`` fill-gap semantics).
+       A catalog entry — even one declaring no vision — stays authoritative
+       and the fallback must not fire.
+    2. **OpenCode family membership.** ``opencode_provider_family`` must
+       resolve the provider (built-in slug or name-extended custom family
+       proxy).
+    3. **Anchored slug pattern.** The qualified identifier
+       ``<provider>/<model>`` matches ``^opencode-(go|zen|free).*vision``,
+       with the ``vision`` marker itself living in the model id — never in
+       a provider name that merely extends a family slug (e.g.
+       ``opencode-go-vision-proxy`` must not vouch for a non-vision model).
+
+    Anything else returns None, so unknown models keep their current
+    "unknown" behavior everywhere downstream.
     """
     from hermes_cli.models import opencode_provider_family
 
     if opencode_provider_family(provider) is None:
         return None
-    bare = str(model or "").strip().rsplit("/", 1)[-1]
-    if "-vision" not in bare.lower():
+    bare = str(model or "").strip().lstrip("/")
+    if not bare:
+        return None
+    # The marker must be in the model id itself; a provider name that
+    # happens to contain "vision" must not vouch for a text-only model.
+    if "vision" not in bare.lower():
+        return None
+    # Anchor the family prefix on the qualified identifier so bare ids
+    # under a family provider (deepseek-v4-flash-vision-exp on
+    # opencode-go) and already-qualified ids both match.
+    if _OPENCODE_VISION_SLUG_RE.match(f"{provider}/{bare}") is None:
         return None
     return ModelCapabilities(
         supports_tools=True,

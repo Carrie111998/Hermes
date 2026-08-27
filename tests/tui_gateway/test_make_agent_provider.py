@@ -262,3 +262,87 @@ def test_make_agent_still_honors_persisted_override_for_non_opencode_provider():
     assert call_kwargs["provider"] == "anthropic"
     assert call_kwargs["api_mode"] == "anthropic_messages"
     assert call_kwargs["base_url"].rstrip("/") == "https://api.anthropic.com"
+
+
+def test_custom_family_name_proxy_gets_model_derived_api_mode_keeps_custom_base_url():
+    """Boundary: a CUSTOM provider whose name extends a family slug (e.g.
+    ``opencode-go-bridge`` at a private relay, #85589) gets the same
+    model-derived api_mode as the built-ins — a stale persisted
+    anthropic_messages must not win — while its own non-opencode.ai
+    endpoint is preserved, not replaced by the opencode.ai default."""
+    fresh_runtime = {
+        "provider": "opencode-go-bridge",
+        "base_url": "https://my-relay.example/v1",
+        "api_key": "sk-bridge-test",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    stale_override = {
+        "model": "deepseek-v4-flash-vision-exp",
+        "provider": "opencode-go-bridge",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+    }
+    call_kwargs = _make_agent_with_override(stale_override, fresh_runtime)
+
+    # api_mode re-derived from the target model (deepseek on Go = chat).
+    assert call_kwargs["api_mode"] == "chat_completions"
+    # The custom relay endpoint survives untouched (no opencode.ai rewrite).
+    assert call_kwargs["base_url"].rstrip("/") == "https://my-relay.example/v1"
+    assert call_kwargs["api_key"] == "sk-bridge-test"
+
+
+def test_custom_provider_hosted_on_opencode_ai_gets_family_treatment():
+    """Boundary: a custom provider whose NAME is not family-extended but
+    whose resolved endpoint is hosted on opencode.ai gets family treatment
+    through the hostname leg of the dual detection (#85589) — stale
+    persisted anthropic overrides are rejected."""
+    fresh_runtime = {
+        "provider": "my-oc-proxy",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "api_key": "sk-oc-test",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    stale_override = {
+        "model": "deepseek-v4-flash-vision-exp",
+        "provider": "my-oc-proxy",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+    }
+    call_kwargs = _make_agent_with_override(stale_override, fresh_runtime)
+
+    assert call_kwargs["api_mode"] == "chat_completions"
+    assert call_kwargs["base_url"].rstrip("/") == "https://opencode.ai/zen/go/v1"
+
+
+def test_custom_provider_with_opencode_hosted_persisted_url_gets_family_treatment():
+    """Boundary: when a custom proxy's opencode.ai endpoint only exists in
+    the PERSISTED override (config base_url empty), the family guard must
+    still fire — otherwise a stale persisted anthropic_messages would be
+    honored verbatim and the anthropic transport would target the
+    opencode.ai endpoint (#96066)."""
+    fresh_runtime = {
+        "provider": "my-oc-proxy",
+        "base_url": "",
+        "api_key": "sk-oc-test",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    override = {
+        "model": "deepseek-v4-flash-vision-exp",
+        "provider": "my-oc-proxy",
+        "base_url": "https://opencode.ai/zen/go",  # anthropic-stripped
+        "api_mode": "anthropic_messages",          # stale wire
+    }
+    call_kwargs = _make_agent_with_override(override, fresh_runtime)
+
+    assert call_kwargs["api_mode"] == "chat_completions"
+    # opencode.ai endpoint honored, re-normalized to the chat /v1 suffix.
+    assert call_kwargs["base_url"].rstrip("/") == "https://opencode.ai/zen/go/v1"
