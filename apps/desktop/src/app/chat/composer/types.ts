@@ -43,6 +43,8 @@ export interface ChatBarProps {
   state: ChatBarState
   gateway?: HermesGateway | null
   queueSessionKey?: string | null
+  /** Profile-qualified local draft/attachment/queue key. Never sent to the backend. */
+  storageScopeKey?: string | null
   sessionId?: string | null
   cwd?: string | null
   onCancel: () => Promise<void> | void

@@ -14,6 +14,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import {
   type ComposerAttachment,
   type ComposerDraftSyncMode,
+  migrateSessionDraft,
   onComposerDraftSyncRequest,
   reloadPersistedDrafts,
   stashSessionDraft,
@@ -53,6 +54,7 @@ interface UseComposerDraftArgs {
   activeQueueSessionKey: string | null
   focusKey: ChatBarProps['focusKey']
   inputDisabled: boolean
+  legacyScopeKey?: string | null
   queueEditRef: RefObject<QueueEditState | null>
   sessionId: string | null | undefined
 }
@@ -72,6 +74,7 @@ export function useComposerDraft({
   activeQueueSessionKey,
   focusKey,
   inputDisabled,
+  legacyScopeKey,
   queueEditRef,
   sessionId
 }: UseComposerDraftArgs) {
@@ -421,6 +424,10 @@ export function useComposerDraft({
     pendingDraftPersistRef.current = null
     draftScopeRef.current = activeQueueSessionKey
 
+    if (legacyScopeKey !== undefined && legacyScopeKey !== activeQueueSessionKey) {
+      migrateSessionDraft(legacyScopeKey, activeQueueSessionKey)
+    }
+
     const { attachments, text } = takeSessionDraft(activeQueueSessionKey)
     loadIntoComposer(text, attachments)
 
@@ -441,7 +448,7 @@ export function useComposerDraft({
       // lingers in the map and re-appears stale on the way back.
       clearDraftSuggestions(historySessionId)
     }
-  }, [activeQueueSessionKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeQueueSessionKey, legacyScopeKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // The HUD handoff's two verbs. Entering HUD mode flushes this editor's text
   // into the shared stash so the HUD's composer boots with it; leaving repaints

@@ -98,6 +98,7 @@ export function ChatBar({
   queueSessionKey,
   sessionId,
   state,
+  storageScopeKey,
   onCancel,
   onAddUrl,
   onAttachDroppedItems,
@@ -127,7 +128,8 @@ export function ChatBar({
   // is created first); render-time assignment keeps the ref current.
   const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
   const submitScopeKey = queueSessionKey === undefined ? (sessionId ?? null) : queueSessionKey
-  const actionScopeKey = identityScopeKey ?? submitScopeKey
+  const activeQueueSessionKey = storageScopeKey === undefined ? submitScopeKey : storageScopeKey
+  const actionScopeKey = identityScopeKey ?? activeQueueSessionKey
   const submitScopeEpochRef = useRef({ key: actionScopeKey, value: 0 })
 
   if (submitScopeEpochRef.current.key !== actionScopeKey) {
@@ -201,7 +203,6 @@ export function ChatBar({
   // busy submit routes text to the queue instead of a steer (which would sit
   // undelivered behind the blocked tool batch). Drives the button affordance.
   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
-  const activeQueueSessionKey = submitScopeKey
 
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
@@ -272,7 +273,15 @@ export function ChatBar({
     setComposerText,
     stashAt,
     syncDraftFromEditor
-  } = useComposerDraft({ actionsDisabled, activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
+  } = useComposerDraft({
+    actionsDisabled,
+    activeQueueSessionKey,
+    focusKey,
+    inputDisabled,
+    legacyScopeKey: storageScopeKey === undefined ? undefined : submitScopeKey,
+    queueEditRef,
+    sessionId
+  })
 
   // Undo/redo. The rich editor bypasses Chromium's editing pipeline for speed,
   // which also bypasses its undo stack — so we own the stack and every edit
@@ -346,7 +355,8 @@ export function ChatBar({
     onSubmit,
     queueEditRef,
     queueSessionKey,
-    sessionId
+    sessionId,
+    submitScopeKey
   })
 
   const statusStackVisible = !actionsDisabled && (queuedPrompts.length > 0 || statusPresent)

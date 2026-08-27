@@ -44,6 +44,8 @@ describe('ChatBar transition focus', () => {
 
     clearSessionDraft('runtime-a')
     clearSessionDraft(null)
+    clearSessionDraft('profile-a\0stored-1')
+    clearSessionDraft('profile-b\0stored-1')
   })
 
   it('keeps the real contenteditable, draft, focus, and caret while actions become fenced', () => {
@@ -270,6 +272,61 @@ describe('ChatBar transition focus', () => {
     await act(async () => resolveMiddleware?.({ text: '/compress' }))
 
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('loads a legacy unqualified draft into its first profile-qualified scope', () => {
+    stashSessionDraft('stored-1', 'legacy draft', [])
+
+    const view = render(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar {...props({ queueSessionKey: 'stored-1', storageScopeKey: 'profile-a\0stored-1' })} />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    expect(view.container.querySelector('[data-slot="composer-rich-input"]')?.textContent).toBe('legacy draft')
+  })
+
+  it('swaps profile-qualified drafts when both profiles share the same stored id', () => {
+    stashSessionDraft('profile-a\0stored-1', 'profile A draft', [])
+    stashSessionDraft('profile-b\0stored-1', 'profile B draft', [])
+
+    const view = render(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar
+            {...props({
+              identityScopeKey: 'profile-a\0stored-1',
+              queueSessionKey: 'stored-1',
+              storageScopeKey: 'profile-a\0stored-1'
+            })}
+          />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    const editor = view.container.querySelector<HTMLElement>('[data-slot="composer-rich-input"]')!
+
+    expect(editor.textContent).toBe('profile A draft')
+
+    view.rerender(
+      <MemoryRouter>
+        <ThreadRuntime messages={[]}>
+          <ChatBar
+            {...props({
+              actionsDisabled: true,
+              identityScopeKey: 'profile-b\0stored-1',
+              queueSessionKey: 'stored-1',
+              storageScopeKey: 'profile-b\0stored-1'
+            })}
+          />
+        </ThreadRuntime>
+      </MemoryRouter>
+    )
+
+    expect(view.container.querySelector('[data-slot="composer-rich-input"]')).toBe(editor)
+    expect(editor.textContent).toBe('profile B draft')
   })
 
   it('blocks image, clipboard, and PR attachment paste while actions are fenced', () => {

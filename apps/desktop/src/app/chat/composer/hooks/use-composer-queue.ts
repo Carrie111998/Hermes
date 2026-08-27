@@ -42,6 +42,7 @@ interface UseComposerQueueArgs {
   queueEditRef: RefObject<QueueEditState | null>
   queueSessionKey: ChatBarProps['queueSessionKey']
   sessionId: string | null | undefined
+  submitScopeKey: string | null
 }
 
 /**
@@ -67,7 +68,8 @@ export function useComposerQueue({
   onSubmit,
   queueEditRef,
   queueSessionKey,
-  sessionId
+  sessionId,
+  submitScopeKey
 }: UseComposerQueueArgs) {
   const { t } = useI18n()
   const scope = useComposerScope()
@@ -232,7 +234,7 @@ export function useComposerQueue({
             ...(entry.displayText ? { displayText: entry.displayText } : {}),
             fromQueue: true,
             sessionId: drainRuntimeSessionId,
-            storedSessionId: drainQueueSessionKey
+            storedSessionId: submitScopeKey
           })
         )
 
@@ -256,7 +258,7 @@ export function useComposerQueue({
         drainingQueueEntriesRef.current.delete(entry.id)
       }
     },
-    [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId]
+    [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId, submitScopeKey]
   )
 
   const pickDrainHead = useCallback(
@@ -396,7 +398,7 @@ export function useComposerQueue({
     const prev = prevQueueKeyRef.current
     prevQueueKeyRef.current = activeQueueSessionKey
 
-    if (queueSessionKey || !prev || !activeQueueSessionKey || prev === activeQueueSessionKey) {
+    if (queueSessionKey !== undefined || !prev || !activeQueueSessionKey || prev === activeQueueSessionKey) {
       return
     }
 

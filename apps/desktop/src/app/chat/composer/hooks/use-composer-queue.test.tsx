@@ -31,7 +31,9 @@ function renderQueueHook(
     onSteer?: ChatBarProps['onSteer']
     onSubmit?: ChatBarProps['onSubmit']
     queueSessionKey?: string | null
+    runtimeDerived?: boolean
     sessionKey?: string
+    submitScopeKey?: string | null
   } = {}
 ) {
   const onSubmit = vi.fn<ChatBarProps['onSubmit']>(overrides.onSubmit ?? (async () => true))
@@ -81,8 +83,9 @@ function renderQueueHook(
         onSteer,
         onSubmit,
         queueEditRef,
-        queueSessionKey: durableQueueSessionKey,
-        sessionId: `rt-${activeSessionKey}`
+        queueSessionKey: overrides.runtimeDerived ? undefined : durableQueueSessionKey,
+        sessionId: `rt-${activeSessionKey}`,
+        submitScopeKey: overrides.submitScopeKey ?? durableQueueSessionKey
       })
     },
     { initialProps }
@@ -112,6 +115,21 @@ describe('useComposerQueue park integration', () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('keeps a profile-qualified queue local while submitting the raw stored id', async () => {
+    const storageKey = 'profile-a\0stored-1'
+    enqueueQueuedPrompt(storageKey, { attachments: [], text: 'profile A queue' })
+
+    const { onSubmit } = renderQueueHook({
+      queueSessionKey: 'stored-1',
+      sessionKey: storageKey,
+      submitScopeKey: 'stored-1'
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
+    expect(onSubmit.mock.calls[0]?.[1]?.storedSessionId).toBe('stored-1')
+    expect(getQueuedPrompts(storageKey)).toHaveLength(0)
   })
 
   it('holds every queued action while route and active session disagree', async () => {
@@ -199,10 +217,10 @@ describe('useComposerQueue park integration', () => {
     const onSubmit = vi.fn<ChatBarProps['onSubmit']>(() => pending)
 
     enqueueQueuedPrompt(sessionA, { attachments: [], text: 'migrating entry' })
-    const { hook } = renderQueueHook({ onSubmit, queueSessionKey: null, sessionKey: sessionA })
+    const { hook } = renderQueueHook({ onSubmit, runtimeDerived: true, sessionKey: sessionA })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
-    hook.rerender({ busy: false, queueSessionKey: null, sessionKey: sessionB })
+    hook.rerender({ busy: false, sessionKey: sessionB })
 
     await waitFor(() => expect(getQueuedPrompts(sessionB)).toHaveLength(1))
     expect(onSubmit).toHaveBeenCalledTimes(1)

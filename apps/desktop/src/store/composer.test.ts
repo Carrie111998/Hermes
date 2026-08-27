@@ -296,6 +296,16 @@ describe('session drafts', () => {
     clearSessionDraft(tipAfter)
   })
 
+  it('migrates the legacy New Chat draft into a profile-qualified scope', () => {
+    stashSessionDraft(null, 'new chat before profile scoping', [])
+
+    expect(migrateSessionDraft(null, 'profile-a\0__new__')).toBe(true)
+    expect(takeSessionDraft('profile-a\0__new__').text).toBe('new chat before profile scoping')
+    expect(takeSessionDraft(null).text).toBe('')
+
+    clearSessionDraft('profile-a\0__new__')
+  })
+
   it('does not overwrite a non-empty destination draft during migration', () => {
     stashSessionDraft('from', 'old tip draft', [])
     stashSessionDraft('to', 'already typed on new tip', [])

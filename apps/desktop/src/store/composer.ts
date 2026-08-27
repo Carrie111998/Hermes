@@ -484,7 +484,7 @@ export function migrateSessionDraft(fromKey: string | null | undefined, toKey: s
   const from = draftKey(fromKey)
   const to = draftKey(toKey)
 
-  if (!fromKey || !toKey || from === to) {
+  if (fromKey === undefined || !toKey || from === to) {
     return false
   }
 

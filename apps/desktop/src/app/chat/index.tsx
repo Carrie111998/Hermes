@@ -485,7 +485,8 @@ const ChatViewContent = memo(function ChatViewContent({
     ? profileScopeKey({ connectionId: tileOwner.connectionId, profile: tileOwner.profile })
     : activeOwnerScopeKey
 
-  const composerIdentityScopeKey = `${composerOwnerScopeKey}\0${queueSessionKey ?? '__new__'}`
+  const composerStorageScopeKey = `${composerOwnerScopeKey}\0${queueSessionKey ?? '__new__'}`
+  const composerIdentityScopeKey = composerStorageScopeKey
   const runtimeOwnerScopeByIdRef = useRef(new Map<string, string>())
 
   if (isPrimary && activeSessionId && !runtimeOwnerScopeByIdRef.current.has(activeSessionId)) {
@@ -500,13 +501,26 @@ const ChatViewContent = memo(function ChatViewContent({
   // migrating on bare inequality would re-home A's queued prompts onto B and
   // auto-drain them into the wrong chat.
   useEffect(() => {
+    const selectedStorageScopeKey = `${composerOwnerScopeKey}\0${selectedSessionId ?? '__new__'}`
+
+    // One-time compatibility bridge from the legacy unqualified stores. The
+    // ambient owner claims the old entry; after this point every profile has a
+    // distinct local draft/queue namespace even when backend IDs collide.
+    migrateSessionDraft(selectedSessionId, selectedStorageScopeKey)
+    migrateQueuedPrompts(selectedSessionId, selectedStorageScopeKey)
+
+    if (queueSessionKey !== selectedSessionId) {
+      migrateSessionDraft(queueSessionKey, composerStorageScopeKey)
+      migrateQueuedPrompts(queueSessionKey, composerStorageScopeKey)
+    }
+
     if (!shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)) {
       return
     }
 
-    migrateSessionDraft(selectedSessionId, queueSessionKey)
-    migrateQueuedPrompts(selectedSessionId, queueSessionKey)
-  }, [queueSessionKey, selectedSessionId, sessions])
+    migrateSessionDraft(selectedStorageScopeKey, composerStorageScopeKey)
+    migrateQueuedPrompts(selectedStorageScopeKey, composerStorageScopeKey)
+  }, [composerOwnerScopeKey, composerStorageScopeKey, queueSessionKey, selectedSessionId, sessions])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any
@@ -514,10 +528,10 @@ const ChatViewContent = memo(function ChatViewContent({
   // ChatBar wraps its own onCancel internally — its send-now-while-busy path
   // needs the raw interrupt — so it still receives the unwrapped prop.
   const haltRun = useCallback(() => {
-    parkQueuedPrompts(queueSessionKey || activeSessionId)
+    parkQueuedPrompts(composerStorageScopeKey)
 
     return onCancel()
-  }, [activeSessionId, onCancel, queueSessionKey])
+  }, [composerStorageScopeKey, onCancel])
 
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
@@ -811,6 +825,7 @@ const ChatViewContent = memo(function ChatViewContent({
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}
               state={chatBarState}
+              storageScopeKey={composerStorageScopeKey}
             />
           </Suspense>
         )}
