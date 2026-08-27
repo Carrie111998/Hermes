@@ -506,6 +506,21 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    # DELEGATE-WAVE ROUTING, APPLIED BEFORE THE MODEL EVER SEES THE TOOL LIST.
+    #
+    # When the switch is on, repository changes are delegate-wave's to make, so the tools that
+    # could edit files or run commands are not offered. Withholding beats instructing: guidance is
+    # something a model can reason its way past, and the failure is invisible until somebody reads
+    # a transcript. This is the one place the schema list is assembled, so it is the one place the
+    # rule has to hold.
+    try:
+        from tools.delegate_routing import filter_tools as _route_filter
+
+        tools_to_include = _route_filter(tools_to_include)
+    except Exception:
+        # A broken routing module must never cost the user their tools.
+        pass
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
 

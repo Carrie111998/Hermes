@@ -936,6 +936,26 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     the change stays in the reused prefix.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
+
+    # DELEGATE-WAVE ROUTING, STATED WHERE THE MODEL CANNOT MISS IT.
+    #
+    # The switch withholds the tools that could change a repository, which is what makes the
+    # rule real -- but a model that simply finds itself unable to edit will flounder, retry,
+    # and blame its environment. Being told WHY, and what route remains, is the difference
+    # between a constraint and a broken tool.
+    #
+    # In the stable layer because it holds for the whole session. Putting it in the volatile
+    # one would cost a prefix-cache hit on every turn for something that never changes.
+    try:
+        from tools.delegate_routing import GUIDANCE, routing_enabled
+
+        if routing_enabled():
+            parts["stable"] = (
+                f"{parts['stable']}\n\n{GUIDANCE}" if parts["stable"] else GUIDANCE
+            )
+    except Exception:
+        pass
+
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
 
