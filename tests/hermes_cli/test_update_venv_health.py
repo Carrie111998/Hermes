@@ -286,18 +286,14 @@ def test_detect_venv_python_revalidates_null_native_image(_winp, tmp_path):
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_detect_venv_python_skips_definitive_inaccessible_native_image(
+def test_detect_venv_python_revalidates_access_denied_native_image(
     _winp, tmp_path
 ):
+    live_exe = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    holder = _proc(536, live_exe, "python.exe", ["python.exe", "worker.py"])
     me = MagicMock()
     me.parents.return_value = []
-
-    def process(pid=None):
-        if pid is None:
-            return me
-        raise AssertionError("definitive inaccessible row must not reach psutil")
-
-    process_factory = MagicMock(side_effect=process)
+    process_factory = MagicMock(side_effect=lambda pid=None: me if pid is None else holder)
     fake_psutil = types.SimpleNamespace(
         process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
         Process=process_factory,
@@ -306,11 +302,14 @@ def test_detect_venv_python_skips_definitive_inaccessible_native_image(
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
         update_module,
         "_windows_process_image_rows",
-        return_value=[(536, "System", "")],
+        return_value=[(536, "python.exe", "")],
     ), patch.dict(sys.modules, {"psutil": fake_psutil}):
-        assert cli_main._detect_venv_python_processes() == []
+        assert cli_main._detect_venv_python_processes() == [
+            (536, "python.exe", "python.exe worker.py")
+        ]
 
-    assert process_factory.call_args_list == [call()]
+    assert process_factory.call_args_list == [call(), call(536)]
+    holder.exe.assert_called_once_with()
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -413,17 +412,16 @@ def test_windows_process_image_rows_closes_snapshot_and_process_handles(_winp):
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_windows_process_image_rows_marks_access_denied_as_definitive(_winp):
+def test_windows_process_image_rows_marks_access_denied_for_revalidation(_winp):
     kernel, _last_error = _fake_kernel32()
     kernel.OpenProcess.return_value = 0
-    errors = iter([5, 18])
     with (
         patch.object(ctypes, "WinDLL", create=True, return_value=kernel),
-        patch.object(ctypes, "get_last_error", side_effect=lambda: next(errors)),
+        patch.object(ctypes, "get_last_error", return_value=18),
     ):
         rows = update_module._windows_process_image_rows()
 
-    assert rows == [(707, "custom-runner.exe", "")]
+    assert rows == [(707, "custom-runner.exe", None)]
     assert kernel.QueryFullProcessImageNameW.call_count == 0
     assert kernel.CloseHandle.call_args_list == [call(100)]
 

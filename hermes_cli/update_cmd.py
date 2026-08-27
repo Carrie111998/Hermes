@@ -4659,8 +4659,8 @@ def _windows_process_image_rows() -> list[tuple[int, str, str | None]] | None:
 
     ``QueryFullProcessImageNameW`` avoids psutil's pathological bulk metadata
     path while preserving the old contract: *any* executable beneath the venv
-    is a candidate holder, regardless of its filename. Inaccessible process
-    images remain ``None`` just as the previous psutil scan skipped them.
+    is a candidate holder, regardless of its filename. Per-process image-query
+    failures remain ``None`` so the exact PID is revalidated through psutil;
     ``None`` for the whole result requests the full psutil fallback.
     """
     if not _m()._is_windows():
@@ -4711,11 +4711,10 @@ def _windows_process_image_rows() -> list[tuple[int, str, str | None]] | None:
         def _query_image(pid: int) -> str | None:
             process = kernel32.OpenProcess(0x1000, False, pid)
             if not process:
-                # Access denied and invalid/system PIDs cannot be strengthened by
-                # psutil's executable query, which crosses the same Win32 access
-                # boundary. Use "" as a definitive inaccessible sentinel; reserve
-                # None for a transient identity failure that must be revalidated.
-                return "" if ctypes.get_last_error() in {5, 87} else None
+                # Toolhelp/OpenProcess access and psutil's per-PID lookup do not
+                # have identical success boundaries. Preserve the unresolved row
+                # for exact live-PID revalidation instead of false-clearing it.
+                return None
             try:
                 size = wintypes.DWORD(32768)
                 buffer = ctypes.create_unicode_buffer(size.value)
@@ -4725,7 +4724,7 @@ def _windows_process_image_rows() -> list[tuple[int, str, str | None]] | None:
                     buffer,
                     ctypes.byref(size),
                 ):
-                    return "" if ctypes.get_last_error() in {5, 87} else None
+                    return None
                 return buffer.value
             finally:
                 kernel32.CloseHandle(process)
@@ -4841,7 +4840,7 @@ def _detect_venv_python_processes(
 
         def _native_proc_rows():
             for candidate_pid, candidate_name, candidate_exe in native_rows:
-                if candidate_pid in skip or candidate_exe == "":
+                if candidate_pid in skip:
                     continue
                 # Preserve the base scanner's broad command-line contract:
                 # a renamed or alternate external launcher can still reference
