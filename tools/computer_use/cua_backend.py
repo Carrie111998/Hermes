@@ -3037,7 +3037,12 @@ class CuaDriverBackend(ComputerUseBackend):
                 partial_pids.add(pid)
 
         metadata_exact = [w for w in windows if w.get("pid") in exact_pids]
-        if metadata_exact:
+        if exact_pids:
+            # Exact app metadata is authoritative even when its PID has no
+            # corresponding visible window. Falling through here would let a
+            # nameless browser/title substring impersonate the requested app
+            # and cause the wrong window to be captured before any response
+            # guard can intervene.
             return metadata_exact
 
         direct_partial = [

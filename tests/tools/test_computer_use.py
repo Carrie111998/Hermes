@@ -1493,6 +1493,74 @@ class TestCaptureAppFilterNoMatch:
     (e.g. a menu-bar utility), giving the agent wrong UI elements.
     """
 
+    def test_exact_metadata_pid_absence_blocks_nameless_title_fallback(self):
+        windows = [
+            {
+                "app_name": "",
+                "pid": 222,
+                "window_id": 22,
+                "is_on_screen": True,
+                "title": "Hermes Agent - Dashboard — Mozilla Firefox",
+                "z_index": 1,
+            },
+        ]
+        apps = [
+            {
+                "name": "Hermes",
+                "bundle_id": "com.nous.hermes",
+                "pid": 111,
+                "running": True,
+            },
+        ]
+        backend = _make_cua_backend_with_windows_and_apps(windows, apps)
+
+        matched = backend._match_windows_for_app(windows, "Hermes")
+
+        assert matched == []
+
+        capture = backend.capture(mode="som", app="Hermes")
+        call_tool = cast(Any, backend._session.call_tool)
+        called_tools = [call.args[0] for call in call_tool.call_args_list]
+        assert "get_window_state" not in called_tools
+        assert "screenshot" not in called_tools
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+        assert capture.elements == []
+        assert capture.png_b64 is None
+
+    def test_exact_metadata_pid_returns_only_its_windows(self):
+        expected = {
+            "app_name": "",
+            "pid": 111,
+            "window_id": 11,
+            "is_on_screen": True,
+            "title": "Hermes",
+            "z_index": 0,
+        }
+        wrong_title = {
+            "app_name": "",
+            "pid": 222,
+            "window_id": 22,
+            "is_on_screen": True,
+            "title": "Hermes Agent - Dashboard — Mozilla Firefox",
+            "z_index": 1,
+        }
+        apps = [
+            {
+                "name": "Hermes",
+                "bundle_id": "com.nous.hermes",
+                "pid": 111,
+                "running": True,
+            },
+        ]
+        backend = _make_cua_backend_with_windows_and_apps(
+            [wrong_title, expected], apps
+        )
+
+        assert backend._match_windows_for_app(
+            [wrong_title, expected], "Hermes"
+        ) == [expected]
+
     def test_app_filter_no_match_returns_empty_capture_with_diagnostic(self):
         # Simulates a localized macOS where Calculator's app_name is "計算機".
         windows = [

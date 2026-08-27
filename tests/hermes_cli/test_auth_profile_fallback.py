@@ -19,12 +19,18 @@ from pathlib import Path
 import pytest
 
 
-def _make_auth_store(pool: dict | None = None, providers: dict | None = None) -> dict:
+def _make_auth_store(
+    pool: dict | None = None,
+    providers: dict | None = None,
+    suppressed_sources: dict | None = None,
+) -> dict:
     store: dict = {"version": 1}
     if pool is not None:
         store["credential_pool"] = pool
     if providers is not None:
         store["providers"] = providers
+    if suppressed_sources is not None:
+        store["suppressed_sources"] = suppressed_sources
     return store
 
 
@@ -55,6 +61,53 @@ def _write(path: Path, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
+
+
+def _fallback_entry(entry_id: str, source: str) -> dict:
+    return {
+        "id": entry_id,
+        "label": entry_id,
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": source,
+        "access_token": "opaque-" + entry_id + "-value",
+    }
+
+
+def test_provider_slice_filters_suppressed_global_sources(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    suppressed_source = "device_code"
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "xai-oauth": [
+            _fallback_entry("global-device", suppressed_source),
+            _fallback_entry("global-manual", "manual"),
+        ],
+    }))
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+
+    assert [entry["id"] for entry in read_credential_pool("xai-oauth")] == [
+        "global-manual"
+    ]
+
+    # A non-empty local slice remains authoritative even when global fallback
+    # has unsuppressed entries available.
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={"xai-oauth": [_fallback_entry("profile-local", "manual")]},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+    assert [entry["id"] for entry in read_credential_pool("xai-oauth")] == [
+        "profile-local"
+    ]
 
 
 
@@ -109,9 +162,65 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
 # ---------------------------------------------------------------------------
 
 
+def test_whole_pool_merge_filters_suppressed_global_sources(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    suppressed_source = "device_code"
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "xai-oauth": [
+            _fallback_entry("global-device", suppressed_source),
+            _fallback_entry("global-manual", "manual"),
+        ],
+        "openrouter": [_fallback_entry("global-router", "manual")],
+    }))
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+
+    merged = read_credential_pool()
+    assert isinstance(merged, dict)
+    assert [entry["id"] for entry in merged["xai-oauth"]] == ["global-manual"]
+    assert [entry["id"] for entry in merged["openrouter"]] == ["global-router"]
+
+
+
 # ---------------------------------------------------------------------------
 # get_provider_auth_state — singleton fallback
 # ---------------------------------------------------------------------------
+
+
+def test_provider_state_fallback_respects_profile_source_suppression(profile_env):
+    from hermes_cli.auth import get_provider_auth_state
+
+    suppressed_source = "device_code"
+    access_value = "xai-access-" + "opaque-value"
+    refresh_value = "xai-refresh-" + "opaque-value"
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(providers={
+            "xai-oauth": {
+                "tokens": {
+                    "access_token": access_value,
+                    "refresh_token": refresh_value,
+                },
+                "auth_mode": "oauth_device_code",
+            },
+        }),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            providers={},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+
+    assert get_provider_auth_state("xai-oauth") is None
+
 
 
 def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_env):

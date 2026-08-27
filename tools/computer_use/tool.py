@@ -130,6 +130,85 @@ _INPUT_ACTIONS = frozenset({
 })
 
 
+_CAPTURE_SCREEN_SENTINELS = frozenset({
+    "screen", "desktop", "fullscreen", "full-screen", "all",
+})
+
+_CAPTURE_BROWSER_IDENTITY_TOKENS = frozenset({
+    "brave", "chrome", "chromium", "edge", "firefox", "msedge",
+    "opera", "safari", "vivaldi",
+})
+
+
+_CAPTURE_APP_ALIASES = {
+    "chrome": "chrome",
+    "google-chrome": "chrome",
+    "google-chrome-stable": "chrome",
+    "chrome-browser": "chrome",
+    "com-google-chrome": "chrome",
+    "firefox": "firefox",
+    "mozilla-firefox": "firefox",
+    "org-mozilla-firefox": "firefox",
+    "edge": "edge",
+    "msedge": "edge",
+    "microsoft-edge": "edge",
+    "com-microsoft-edgemac": "edge",
+    "chromium": "chromium",
+    "chromium-browser": "chromium",
+}
+
+
+def _canonical_capture_app_name(value: Any) -> str:
+    """Canonicalize exact app identities without accepting title substrings."""
+    if not isinstance(value, str):
+        return ""
+    normalized = re.sub(r"[\s_]+", "-", value.strip().casefold()).strip("-")
+    if normalized.endswith(".app"):
+        normalized = normalized[:-4]
+    return _CAPTURE_APP_ALIASES.get(normalized, normalized)
+
+
+def _capture_app_name_tokens(value: str) -> Tuple[str, ...]:
+    return tuple(re.findall(r"[a-z0-9]+", value))
+
+
+def _capture_app_matches(requested_app: Any, returned_app: Any) -> bool:
+    """Accept backend app-name variants without trusting browser window titles."""
+    requested = _canonical_capture_app_name(requested_app)
+    if requested in _CAPTURE_SCREEN_SENTINELS:
+        # The backend resolves these aliases to an OS desktop/shell window, so
+        # CaptureResult.app is intentionally the shell identity, not the alias.
+        return True
+
+    returned = _canonical_capture_app_name(returned_app)
+    if not requested or not returned:
+        return False
+    if requested == returned:
+        return True
+
+    requested_tokens = _capture_app_name_tokens(requested)
+    returned_tokens = _capture_app_name_tokens(returned)
+    requested_browsers = set(requested_tokens) & _CAPTURE_BROWSER_IDENTITY_TOKENS
+    returned_browsers = set(returned_tokens) & _CAPTURE_BROWSER_IDENTITY_TOKENS
+    if returned_browsers - requested_browsers:
+        # A non-browser request such as "Hermes" must not accept a browser
+        # window title merely because that title contains the requested word.
+        return False
+
+    if not requested_tokens or len(requested_tokens) > len(returned_tokens):
+        return False
+    width = len(requested_tokens)
+    return any(
+        all(
+            returned_token.startswith(requested_token)
+            for requested_token, returned_token in zip(
+                requested_tokens, returned_tokens[start:start + width]
+            )
+        )
+        for start in range(len(returned_tokens) - width + 1)
+    )
+
+
 def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
     """Current sticky-target app when it clearly differs from *requested_app*.
 
@@ -678,6 +757,29 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
                 "window_id": args.get("window_id"),
             })
         cap = backend.capture(**capture_kwargs)
+        requested_app = args.get("app")
+        exact_binding = (
+            args.get("pid") is not None and args.get("window_id") is not None
+        )
+        if (
+            isinstance(requested_app, str)
+            and requested_app.strip()
+            and not exact_binding
+            and not _capture_app_matches(requested_app, cap.app)
+        ):
+            returned_app = cap.app.strip() if isinstance(cap.app, str) else ""
+            return json.dumps({
+                "ok": False,
+                "action": "capture",
+                "code": "capture_target_mismatch",
+                "error": (
+                    f"capture requested app {requested_app.strip()!r}, but the "
+                    f"backend returned {returned_app or '<unverifiable>'!r}. "
+                    "Screenshot and element data were withheld before response "
+                    "materialization. Use list_apps/list_windows or an exact "
+                    "pid+window_id binding."
+                ),
+            })
         return _capture_response(cap)
 
     if action == "wait":

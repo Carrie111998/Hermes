@@ -78,7 +78,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from hermes_cli.config import (
@@ -1469,6 +1469,23 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     return auth_file
 
 
+_GLOBAL_PROVIDER_STATE_SOURCES = {
+    "nous": "device_code",
+    "openai-codex": "device_code",
+    "xai-oauth": "device_code",
+}
+
+
+def _global_provider_state_source(
+    provider_id: str, state: Dict[str, Any]
+) -> Optional[str]:
+    """Resolve the source whose suppression governs a global singleton state."""
+    explicit_source = state.get("source")
+    if isinstance(explicit_source, str) and explicit_source.strip():
+        return explicit_source.strip()
+    return _GLOBAL_PROVIDER_STATE_SOURCES.get(provider_id)
+
+
 def _load_provider_state_with_source(
     auth_store: Dict[str, Any],
     provider_id: str,
@@ -1495,6 +1512,15 @@ def _load_provider_state_with_source(
         if isinstance(global_providers, dict):
             global_state = global_providers.get(provider_id)
             if isinstance(global_state, dict):
+                fallback_source = _global_provider_state_source(
+                    provider_id, global_state
+                )
+                if (
+                    fallback_source
+                    and fallback_source
+                    in _suppressed_sources_for_provider(auth_store, provider_id)
+                ):
+                    return None, None
                 return dict(global_state), global_path
     return None, None
 
@@ -1667,7 +1693,40 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def _suppressed_sources_for_provider(
+    auth_store: Dict[str, Any], provider_id: str
+) -> set[str]:
+    """Return profile-local credential source suppressions without mutating them."""
+    suppressed = auth_store.get("suppressed_sources")
+    if not isinstance(suppressed, dict):
+        return set()
+    raw_sources = suppressed.get(provider_id)
+    if isinstance(raw_sources, list):
+        return {str(source) for source in raw_sources if source}
+    if isinstance(raw_sources, dict):
+        return {str(source) for source in raw_sources if source}
+    return set()
+
+
+def _filter_suppressed_global_entries(
+    entries: List[Any], suppressed_sources: set[str]
+) -> List[Any]:
+    """Remove only global fallback entries explicitly suppressed by source."""
+    if not suppressed_sources:
+        return list(entries)
+    return [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, dict)
+            and entry.get("source") in suppressed_sources
+        )
+    ]
+
+
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+) -> Union[Dict[str, Any], List[Any]]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1703,7 +1762,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             existing = merged.get(gp_key)
             if isinstance(existing, list) and existing:
                 continue
-            merged[gp_key] = list(gp_entries)
+            filtered_entries = _filter_suppressed_global_entries(
+                gp_entries,
+                _suppressed_sources_for_provider(auth_store, gp_key),
+            )
+            if filtered_entries:
+                merged[gp_key] = filtered_entries
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1711,7 +1775,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return list(provider_entries)
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    if not isinstance(global_entries, list):
+        return []
+    return _filter_suppressed_global_entries(
+        global_entries,
+        _suppressed_sources_for_provider(auth_store, provider_id),
+    )
 
 
 _POOL_STATUS_FIELDS = (

@@ -40,6 +40,7 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
+    _redact_tool_result_for_egress,
     make_tool_result_message,
 )
 from tools.terminal_tool import (
@@ -311,6 +312,9 @@ def _emit_terminal_post_tool_call(
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    result = _redact_tool_result_for_egress(result)
+    if isinstance(error_message, str):
+        error_message = _redact_tool_result_for_egress(error_message)
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(
@@ -692,6 +696,7 @@ def _run_agent_tool_execution_middleware(
                     getattr(guardrail_decision, "message", None)
                     or "Tool blocked by guardrail policy"
                 )
+            result = _redact_tool_result_for_egress(result)
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
@@ -729,7 +734,7 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            return _redact_tool_result_for_egress(execute(final_args))
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
@@ -779,7 +784,7 @@ def _run_agent_tool_execution_middleware(
         },
     )
     return _ManagedToolResult(
-        result=result,
+        result=_redact_tool_result_for_egress(result),
         args=state["args"],
         middleware_trace=state["middleware_trace"],
         blocked=bool(state["blocked"]),
@@ -1441,8 +1446,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 return
             except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _redact_tool_result_for_egress(str(tool_error))
+                result = f"Error executing tool '{function_name}': {safe_error}"
+                logger.error("_invoke_tool raised for %s: %s", function_name, safe_error)
             duration = time.time() - start
             if not blocked and not dispatched:
                 _emit_terminal_post_tool_call(
@@ -1789,6 +1795,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     failed=is_error,
                     tool_call_id=tool_call_id,
                 )
+                function_result = _redact_tool_result_for_egress(function_result)
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -2451,8 +2458,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
                 _ce_result = function_result
             except Exception as tool_error:
-                function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
-                logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _redact_tool_result_for_egress(str(tool_error))
+                function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {safe_error}"})
+                logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, safe_error)
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
@@ -2487,8 +2495,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
                 _mem_result = function_result
             except Exception as tool_error:
-                function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
-                logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _redact_tool_result_for_egress(str(tool_error))
+                function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {safe_error}"})
+                logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, safe_error)
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
@@ -2578,8 +2587,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _redact_tool_result_for_egress(str(tool_error))
+                function_result = f"Error executing tool '{function_name}': {safe_error}"
+                logger.error("handle_function_call raised for %s: %s", function_name, safe_error)
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
@@ -2657,13 +2667,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _redact_tool_result_for_egress(str(tool_error))
+                function_result = f"Error executing tool '{function_name}': {safe_error}"
+                logger.error("handle_function_call raised for %s: %s", function_name, safe_error)
             tool_duration = time.time() - tool_start_time
 
         _execution_timed_out = isinstance(
             function_result, (_ToolTimeoutResult, _ToolCancelledResult)
         )
+        function_result = _redact_tool_result_for_egress(function_result)
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2707,6 +2719,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 failed=_is_error_result,
                 tool_call_id=tool_call_id,
             )
+            function_result = _redact_tool_result_for_egress(function_result)
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )

@@ -8,6 +8,8 @@ NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
 """
 
+import json
+
 import pytest
 
 from agent.tool_dispatch_helpers import (
@@ -134,6 +136,78 @@ class TestUntrustedWrapping:
 
 
 class TestMakeToolResultMessage:
+
+    def test_plain_tool_result_redacts_exact_carriers_and_strict_urls(self):
+        refresh_value = "refresh-" + "opaque-egress-value"
+        session_value = "dashboard-" + "opaque-egress-value"
+        query_value = "query-" + "opaque-egress-value"
+        password_value = "password-" + "opaque-egress-value"
+        raw = (
+            json.dumps({"refresh_token": refresh_value})
+            + '\n<script>window.__HERMES_SESSION_TOKEN__ = "'
+            + session_value
+            + '";</script>\nhttps://user:'
+            + password_value
+            + "@example.test/path?token="
+            + query_value
+            + "&view=public"
+        )
+
+        msg = make_tool_result_message("terminal", raw, "call_egress_plain")
+
+        assert refresh_value not in msg["content"]
+        assert session_value not in msg["content"]
+        assert query_value not in msg["content"]
+        assert password_value not in msg["content"]
+        assert "view=public" in msg["content"]
+        assert "</script>" in msg["content"]
+
+    def test_multimodal_tool_result_redacts_text_only(self):
+        refresh_value = "refresh-" + "opaque-multimodal-value"
+        query_value = "query-" + "opaque-multimodal-value"
+        raw_text = (
+            json.dumps({"refresh_token": refresh_value})
+            + " https://example.test/cb?token="
+            + query_value
+        )
+        image_part = {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+            },
+        }
+        envelope = {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": raw_text},
+                {"type": "text", "content": raw_text},
+                image_part,
+            ],
+            "text_summary": raw_text,
+        }
+
+        msg = make_tool_result_message("terminal", envelope, "call_egress_multi")
+        result = msg["content"]
+
+        assert refresh_value not in result["content"][0]["text"]
+        assert query_value not in result["content"][0]["text"]
+        assert refresh_value not in result["content"][1]["content"]
+        assert query_value not in result["content"][1]["content"]
+        assert refresh_value not in result["text_summary"]
+        assert query_value not in result["text_summary"]
+        assert result["content"][2] is image_part
+        assert result["content"][2]["image_url"]["url"] == (
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+        )
+
+    def test_tool_result_egress_preserves_global_redaction_opt_out(self, monkeypatch):
+        query_value = "query-" + "opaque-opt-out-value"
+        raw = "https://example.test/cb?token=" + query_value
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+        msg = make_tool_result_message("terminal", raw, "call_egress_opt_out")
+
+        assert query_value in msg["content"]
 
     def test_message_is_timestamped_when_result_is_created(self, monkeypatch):
         monkeypatch.setattr("agent.message_metadata.wall_time", lambda: 123.5)
