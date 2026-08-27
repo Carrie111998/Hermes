@@ -1866,6 +1866,8 @@ def init_agent(
     _memory_toolset_requested = (
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
+    mem_config = {}
+    agent._memory_provider_only_tools = False
     if not skip_memory or _memory_toolset_requested:
         try:
             from tools.memory_tool import (
@@ -1874,6 +1876,9 @@ def init_agent(
             )
 
             mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._memory_provider_only_tools = bool(
+                mem_config.get("provider_only_tools", False)
+            )
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
             )

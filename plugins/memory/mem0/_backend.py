@@ -10,7 +10,15 @@ class Mem0Backend(ABC):
     """Unified interface over Platform (MemoryClient) and OSS (Memory) backends."""
 
     @abstractmethod
-    def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        *,
+        filters: dict,
+        top_k: int = 10,
+        threshold: float | None = None,
+        rerank: bool = False,
+    ) -> list[dict]:
         ...
 
     @abstractmethod
@@ -53,8 +61,19 @@ class PlatformBackend(Mem0Backend):
         from mem0 import MemoryClient
         self._client = MemoryClient(api_key=api_key)
 
-    def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
-        response = self._client.search(query, filters=filters, top_k=top_k, rerank=rerank)
+    def search(
+        self,
+        query: str,
+        *,
+        filters: dict,
+        top_k: int = 10,
+        threshold: float | None = None,
+        rerank: bool = False,
+    ) -> list[dict]:
+        kwargs: dict[str, Any] = {"filters": filters, "top_k": top_k, "rerank": rerank}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        response = self._client.search(query, **kwargs)
         return _unwrap_results(response)
 
     def add(
@@ -112,11 +131,21 @@ class SelfHostedBackend(Mem0Backend):
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
-    def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        *,
+        filters: dict,
+        top_k: int = 10,
+        threshold: float | None = None,
+        rerank: bool = False,
+    ) -> list[dict]:
         # rerank is a platform-only feature; the self-hosted /search ignores it.
         body: dict[str, Any] = {"query": query, "top_k": top_k}
         if filters:
             body["filters"] = filters  # user_id belongs in filters (top-level is deprecated)
+        if threshold is not None:
+            body["threshold"] = threshold
         return _unwrap_results(self._json("POST", "/search", json=body))
 
     def add(
@@ -177,13 +206,30 @@ class OSSBackend(Mem0Backend):
             block["config"] = provider_config
             return block
 
+        def _resolve_api_key_env(section: dict) -> dict:
+            """Resolve a named API-key env var without persisting secrets in mem0.json."""
+            resolved = dict(section)
+            provider_config = dict(resolved.get("config", {}))
+            env_name = provider_config.pop("api_key_env", None)
+            if env_name:
+                api_key = os.environ.get(env_name)
+                if not api_key:
+                    raise ValueError(
+                        f"Configured API key environment variable is not set: {env_name}"
+                    )
+                provider_config["api_key"] = api_key
+            resolved["config"] = provider_config
+            return resolved
+
         vector_store = dict(oss_config["vector_store"])
         vs_config = dict(vector_store.get("config", {}))
 
         if "path" in vs_config:
             vs_config["path"] = os.path.expanduser(vs_config["path"])
 
-        embedder_config = oss_config.get("embedder", {}).get("config", {})
+        embedder = _resolve_api_key_env(_provider_block("embedder"))
+        llm = _resolve_api_key_env(_provider_block("llm"))
+        embedder_config = embedder.get("config", {})
         dims = embedder_config.get("embedding_dims")
         if not dims:
             from ._oss_providers import KNOWN_DIMS
@@ -199,10 +245,27 @@ class OSSBackend(Mem0Backend):
 
         config = {
             "vector_store": vector_store,
-            "llm": _provider_block("llm"),
-            "embedder": _provider_block("embedder"),
-            "version": "v1.1",
+            "llm": llm,
+            "embedder": embedder,
+            "version": oss_config.get("version", "v1.1"),
         }
+        custom_instructions = oss_config.get("custom_instructions")
+        custom_instructions_path = oss_config.get("custom_instructions_path")
+        if custom_instructions_path:
+            instructions_path = os.path.expanduser(custom_instructions_path)
+            with open(instructions_path, encoding="utf-8") as handle:
+                custom_instructions = handle.read().strip()
+        if custom_instructions:
+            config["custom_instructions"] = custom_instructions
+        if oss_config.get("reranker"):
+            config["reranker"] = _resolve_api_key_env(oss_config["reranker"])
+        if "history_db_path" in oss_config:
+            history_path = oss_config["history_db_path"]
+            config["history_db_path"] = (
+                history_path
+                if history_path == ":memory:"
+                else os.path.expanduser(history_path)
+            )
         self._memory = Memory.from_config(config)
 
     @staticmethod
@@ -269,8 +332,19 @@ class OSSBackend(Mem0Backend):
             except Exception:
                 pass
 
-    def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
-        response = self._memory.search(query, filters=filters, top_k=top_k)
+    def search(
+        self,
+        query: str,
+        *,
+        filters: dict,
+        top_k: int = 10,
+        threshold: float | None = None,
+        rerank: bool = False,
+    ) -> list[dict]:
+        kwargs: dict[str, Any] = {"filters": filters, "top_k": top_k, "rerank": rerank}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        response = self._memory.search(query, **kwargs)
         return _unwrap_results(response)
 
     def add(

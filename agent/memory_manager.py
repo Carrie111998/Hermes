@@ -169,13 +169,27 @@ def inject_memory_provider_tools(agent: Any) -> int:
     if not callable(get_schemas):
         return 0
 
+    raw_schemas: list[Any] = list(get_schemas())  # type: ignore[arg-type]
+
     valid_tool_names = getattr(agent, "valid_tool_names", None)
     if valid_tool_names is None:
         valid_tool_names = set()
         agent.valid_tool_names = valid_tool_names
 
+    # Optional provider-only mode: when a healthy external provider exposes
+    # tools, hide the built-in file-backed write tool while retaining the L1
+    # MEMORY/USER prompt injection. If the provider has no schemas or failed to
+    # initialize, the built-in tool remains as a safe fallback.
+    if getattr(agent, "_memory_provider_only_tools", False) and raw_schemas:
+        tools[:] = [
+            tool for tool in tools
+            if tool.get("function", {}).get("name") != "memory"
+        ]
+        existing_tool_names.discard("memory")
+        valid_tool_names.discard("memory")
+
     added = 0
-    for raw_schema in get_schemas():
+    for raw_schema in raw_schemas:
         schema = normalize_tool_schema(raw_schema)
         if schema is None:
             logger.warning(
@@ -410,6 +424,7 @@ class MemoryManager:
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
+        self._failed_initializations: set[int] = set()
         self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
@@ -530,7 +545,11 @@ class MemoryManager:
         """
         blocks = []
         for provider in self._providers:
+            if id(provider) in self._failed_initializations:
+                continue
             try:
+                if not provider.tooling_ready():
+                    continue
                 block = provider.system_prompt_block()
                 if block and block.strip():
                     blocks.append(block)
@@ -884,7 +903,16 @@ class MemoryManager:
         schemas = []
         seen = set()
         for provider in self._providers:
+            if id(provider) in self._failed_initializations:
+                continue
             try:
+                if not provider.tooling_ready():
+                    logger.warning(
+                        "Memory provider '%s' backend is not ready; retaining "
+                        "the built-in memory fallback and hiding provider tools",
+                        provider.name,
+                    )
+                    continue
                 for raw_schema in provider.get_tool_schemas():
                     schema = normalize_tool_schema(raw_schema)
                     if schema is None:
@@ -1384,9 +1412,11 @@ class MemoryManager:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
         for provider in self._providers:
+            self._failed_initializations.discard(id(provider))
             try:
                 provider.initialize(session_id=session_id, **kwargs)
             except Exception as e:
+                self._failed_initializations.add(id(provider))
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,

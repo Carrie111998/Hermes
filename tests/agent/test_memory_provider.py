@@ -1191,6 +1191,98 @@ class TestMemoryToolToolsetGate:
         tools, names = self._run_memory_injection(None, mgr)
         assert names == {"fact_store", "memory_search", "memory_add"}
 
+    def test_provider_only_mode_replaces_builtin_memory_tool(self):
+        """A healthy external provider can be the sole model-facing writer."""
+        mgr = self._mgr_with_tools("mem0_search", "mem0_add")
+        builtin = {
+            "type": "function",
+            "function": {"name": "memory", "description": "builtin", "parameters": {}},
+        }
+        agent = SimpleNamespace(
+            _memory_manager=mgr,
+            _memory_provider_only_tools=True,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+            tools=[builtin],
+            valid_tool_names={"memory"},
+        )
+
+        inject_memory_provider_tools(agent)
+
+        names = {t["function"]["name"] for t in agent.tools}
+        assert names == {"mem0_search", "mem0_add"}
+        assert agent.valid_tool_names == names
+
+    def test_provider_only_mode_keeps_builtin_when_provider_has_no_tools(self):
+        """No external schema means the built-in tool remains a fallback."""
+        mgr = self._mgr_with_tools()
+        builtin = {
+            "type": "function",
+            "function": {"name": "memory", "description": "builtin", "parameters": {}},
+        }
+        agent = SimpleNamespace(
+            _memory_manager=mgr,
+            _memory_provider_only_tools=True,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+            tools=[builtin],
+            valid_tool_names={"memory"},
+        )
+
+        inject_memory_provider_tools(agent)
+
+        assert [t["function"]["name"] for t in agent.tools] == ["memory"]
+        assert agent.valid_tool_names == {"memory"}
+
+    def test_provider_only_mode_keeps_builtin_when_initialize_raises(self):
+        """A registered but failed provider must not remove the safe fallback."""
+        mgr = self._mgr_with_tools("ext_add")
+        provider = mgr.get_provider("ext")
+        assert provider is not None
+        provider.initialize = MagicMock(side_effect=RuntimeError("backend down"))
+        setattr(provider, "_prompt_block", "Use unavailable ext_add")
+        mgr.initialize_all("session")
+        builtin = {
+            "type": "function",
+            "function": {"name": "memory", "description": "builtin", "parameters": {}},
+        }
+        agent = SimpleNamespace(
+            _memory_manager=mgr,
+            _memory_provider_only_tools=True,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+            tools=[builtin],
+            valid_tool_names={"memory"},
+        )
+
+        assert inject_memory_provider_tools(agent) == 0
+        assert [t["function"]["name"] for t in agent.tools] == ["memory"]
+        assert mgr.build_system_prompt() == ""
+
+    def test_provider_only_mode_keeps_builtin_when_backend_not_ready(self):
+        """A provider that degrades without raising must also retain fallback."""
+        mgr = self._mgr_with_tools("ext_add")
+        provider = mgr.get_provider("ext")
+        assert provider is not None
+        provider.tooling_ready = MagicMock(return_value=False)
+        setattr(provider, "_prompt_block", "Use unavailable ext_add")
+        builtin = {
+            "type": "function",
+            "function": {"name": "memory", "description": "builtin", "parameters": {}},
+        }
+        agent = SimpleNamespace(
+            _memory_manager=mgr,
+            _memory_provider_only_tools=True,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+            tools=[builtin],
+            valid_tool_names={"memory"},
+        )
+
+        assert inject_memory_provider_tools(agent) == 0
+        assert [t["function"]["name"] for t in agent.tools] == ["memory"]
+        assert mgr.build_system_prompt() == ""
+
 
 class TestContextEngineToolsetGate:
     """Issue #5544 (sibling): context engine tools follow the same gate.

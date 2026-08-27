@@ -17,8 +17,12 @@ class FakeBackend:
         self._all_results = all_results or {"results": [], "count": 0}
         self.captured = []
 
-    def search(self, query, *, filters, top_k=10, rerank=True):
-        self.captured.append(("search", query, {"filters": filters, "top_k": top_k, "rerank": rerank}))
+    def search(self, query, *, filters, top_k=10, threshold=None, rerank=True):
+        self.captured.append((
+            "search",
+            query,
+            {"filters": filters, "top_k": top_k, "threshold": threshold, "rerank": rerank},
+        ))
         return self._search_results
 
     def get_all(self, *, filters, page=1, page_size=100):
@@ -40,6 +44,7 @@ class FakeBackend:
     def delete(self, memory_id):
         self.captured.append(("delete", memory_id))
         return {"result": "Memory deleted.", "memory_id": memory_id}
+
 
 
 class TestMem0V3Tools:
@@ -144,6 +149,7 @@ class TestMem0V3Internal:
         assert call[2]["user_id"] == "u123"
         assert call[2]["agent_id"] == "hermes"
         assert call[2]["infer"] is True
+        assert call[1] == [{"role": "user", "content": "user said"}]
 
 
 class TestMem0Prefetch:
@@ -171,7 +177,8 @@ class TestMem0Prefetch:
         assert kind == "search"
         assert query == "what theme do I like?"
         assert opts["filters"] == {"user_id": "u123"}
-        assert opts["top_k"] == 10
+        assert opts["top_k"] == 4
+        assert opts["threshold"] == 0.3
         assert opts["rerank"] is False
         assert "## Mem0 Memory" in result
         assert "user prefers dark mode" in result
@@ -192,12 +199,16 @@ class TestMem0Prefetch:
         search_returned = threading.Event()
 
         class SlowBackend(FakeBackend):
-            def search(self, query, *, filters, top_k=10, rerank=True):
+            def search(self, query, *, filters, top_k=10, threshold=None, rerank=True):
                 entered.set()
                 try:
                     release.wait(30)
                     return super().search(
-                        query, filters=filters, top_k=top_k, rerank=rerank
+                        query,
+                        filters=filters,
+                        top_k=top_k,
+                        threshold=threshold,
+                        rerank=rerank,
                     )
                 finally:
                     search_returned.set()
@@ -257,6 +268,8 @@ class TestMem0V3Config:
         assert "mem0_update" in block
         assert "mem0_delete" in block
         assert "mem0_list" not in block
+        assert block.startswith("Memory Router:")
+        assert block.count(".") == 1
         assert "mem0_profile" not in block
         assert "mem0_conclude" not in block
 
@@ -347,6 +360,30 @@ class TestMem0WriteMetadata:
         provider._channel = channel
         provider._backend = FakeBackend()
         return provider
+
+    def test_add_tool_passes_channel_metadata(self):
+        provider = self._make_provider("telegram")
+        provider.handle_tool_call("mem0_add", {"content": "user likes dark mode"})
+        call = provider._backend.captured[-1]
+        assert call[2]["metadata"] == {
+            "channel": "telegram",
+            "source": "hermes_explicit",
+            "schema_version": "1",
+        }
+
+    def test_sync_turn_passes_channel_metadata(self):
+        provider = self._make_provider("discord")
+        provider.sync_turn("hi", "hello", session_id="s")
+        # sync_turn fires a daemon thread; wait for it.
+        if provider._sync_thread:
+            provider._sync_thread.join(timeout=5.0)
+        adds = [c for c in provider._backend.captured if c[0] == "add"]
+        assert adds, "expected an add call from sync_turn"
+        assert adds[-1][2]["metadata"] == {
+            "channel": "discord",
+            "source": "hermes_auto",
+            "schema_version": "1",
+        }
 
 
 class _SentinelBackend:

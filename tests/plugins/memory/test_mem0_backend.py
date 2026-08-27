@@ -53,6 +53,26 @@ class TestPlatformBackend:
         assert client.calls[0][2]["filters"] == {"user_id": "u1"}
         assert client.calls[0][2]["top_k"] == 5
 
+    def test_search_forwards_rerank(self):
+        backend, client = self._make()
+        backend.search("q", filters={}, rerank=False)
+        assert client.calls[0][2]["rerank"] is False
+
+    def test_search_rerank_default_false(self):
+        backend, client = self._make()
+        backend.search("q", filters={})
+        assert client.calls[0][2]["rerank"] is False
+
+    def test_search_forwards_threshold(self):
+        backend, client = self._make()
+        backend.search("q", filters={}, threshold=0.3)
+        assert client.calls[0][2]["threshold"] == 0.3
+
+    def test_search_returns_list(self):
+        backend, _ = self._make()
+        result = backend.search("q", filters={})
+        assert isinstance(result, list)
+        assert result[0]["id"] == "m1"
 
     def test_add_forwards_kwargs(self):
         backend, client = self._make()
@@ -112,6 +132,90 @@ class TestOSSBackend:
         backend._memory = memory
         return backend, memory
 
+    def test_init_forwards_official_config_and_resolves_secret_env(self, monkeypatch, tmp_path):
+        import mem0
+
+        captured = {}
+        monkeypatch.setenv("TEST_EMBEDDING_KEY", "secret-value")
+
+        def _fake_from_config(config):
+            captured["config"] = config
+            return FakeOSSMemory()
+
+        monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config)
+        prompt_path = tmp_path / "instructions.md"
+        prompt_path.write_text("Only durable user facts.", encoding="utf-8")
+
+        OSSBackend({
+            "vector_store": {"provider": "qdrant", "config": {"url": "http://127.0.0.1:6333"}},
+            "llm": {"provider": "deepseek", "config": {"model": "deepseek-chat"}},
+            "embedder": {
+                "provider": "openai",
+                "config": {"model": "custom-embedder", "api_key_env": "TEST_EMBEDDING_KEY"},
+            },
+            "custom_instructions_path": str(prompt_path),
+            "history_db_path": ":memory:",
+            "version": "v1.1",
+        })
+
+        config = captured["config"]
+        assert config["custom_instructions"] == "Only durable user facts."
+        assert config["history_db_path"] == ":memory:"
+        assert config["embedder"]["config"]["api_key"] == "secret-value"
+        assert "api_key_env" not in config["embedder"]["config"]
+
+    def test_search_returns_list(self):
+        backend, _ = self._make()
+        result = backend.search("test", filters={"user_id": "u1"})
+        assert isinstance(result, list)
+        assert result[0]["id"] == "m1"
+
+    def test_search_passes_filters(self):
+        backend, memory = self._make()
+        backend.search("q", filters={"user_id": "u1"}, top_k=3)
+        assert memory.calls[0][2]["filters"] == {"user_id": "u1"}
+        assert memory.calls[0][2]["top_k"] == 3
+
+    def test_search_forwards_rerank(self):
+        """OSS Memory supports reranking when a reranker is configured."""
+        backend, memory = self._make()
+        backend.search("q", filters={}, rerank=True)
+        assert memory.calls[0][2]["rerank"] is True
+
+    def test_search_forwards_threshold(self):
+        backend, memory = self._make()
+        backend.search("q", filters={}, threshold=0.3)
+        assert memory.calls[0][2]["threshold"] == 0.3
+
+    def test_add_forwards_kwargs(self):
+        backend, memory = self._make()
+        msgs = [{"role": "user", "content": "hi"}]
+        backend.add(msgs, user_id="u1", agent_id="hermes", infer=False)
+        assert memory.calls[0][2]["user_id"] == "u1"
+        assert memory.calls[0][2]["infer"] is False
+
+    def test_update_maps_text_to_data(self):
+        """OSS Memory.update uses `data=` param, not `text=`."""
+        backend, memory = self._make()
+        backend.update("m1", "new text")
+        assert memory.calls[0][0] == "update"
+        assert memory.calls[0][1] == "m1"
+        assert memory.calls[0][2] == {"data": "new text"}
+
+    def test_delete_positional_arg(self):
+        backend, memory = self._make()
+        backend.delete("m1")
+        assert memory.calls[0] == ("delete", "m1")
+
+    def test_update_normalizes_response(self):
+        backend, _ = self._make()
+        result = backend.update("m1", "text")
+        assert result == {"result": "Memory updated.", "memory_id": "m1"}
+
+    def test_delete_normalizes_response(self):
+        backend, _ = self._make()
+        result = backend.delete("m1")
+        assert result == {"result": "Memory deleted.", "memory_id": "m1"}
 
     def test_legacy_api_base_aliases_are_normalized_before_mem0_init(self, monkeypatch):
         import sys

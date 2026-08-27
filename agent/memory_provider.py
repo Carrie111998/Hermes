@@ -175,6 +175,16 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def tooling_ready(self) -> bool:
+        """Return whether this provider can safely expose model-facing tools.
+
+        Providers whose ``initialize()`` can degrade without raising should
+        override this hook and report the health of the initialized backend.
+        The default preserves compatibility for providers that initialize
+        atomically or do not require a live backend.
+        """
+        return True
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 

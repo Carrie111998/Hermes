@@ -129,7 +129,8 @@ SEARCH_SCHEMA = {
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
             "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
-            "rerank": {"type": "boolean", "description": "Rerank results for relevance (default: false, platform mode only)."},
+            "threshold": {"type": "number", "description": "Minimum relevance score from 0 to 1; defaults to the configured search threshold."},
+            "rerank": {"type": "boolean", "description": "Rerank when the selected backend has a reranker configured (default: false)."},
         },
         "required": ["query"],
     },
@@ -206,6 +207,10 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = _DEFAULT_USER_ID
         self._agent_id = "hermes"
         self._rerank_default = False
+        self._search_threshold = 0.30
+        self._prefetch_top_k = 4
+        self._sync_user_only = True
+        self._sync_max_chars = 8000
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
         self._sync_thread = None
         self._prefetch_thread = None
@@ -232,6 +237,10 @@ class Mem0MemoryProvider(MemoryProvider):
         # Platform needs an api_key; self-hosted needs a host (api_key optional
         # when the server runs with AUTH_DISABLED).
         return bool(cfg.get("api_key") or cfg.get("host"))
+
+    def tooling_ready(self) -> bool:
+        """Expose mem0_* tools only after a backend initialized successfully."""
+        return self._backend is not None
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
@@ -343,13 +352,10 @@ class Mem0MemoryProvider(MemoryProvider):
         #   1. Operator-configured MEM0_USER_ID (env or $HERMES_HOME/mem0.json) —
         #      the canonical principal, applied across every gateway so the same
         #      human gets one merged memory store.
-        #   2. Gateway-native id from kwargs (Telegram numeric id, Discord
-        #      snowflake, etc.) — preserves per-platform isolation when no
-        #      override is configured.
-        #   3. Hardcoded fallback _DEFAULT_USER_ID (CLI with no auth).
+        #   2. Gateway-native id from kwargs when no canonical override exists.
+        #   3. Hardcoded fallback _DEFAULT_USER_ID for CLI with no auth.
         # The literal _DEFAULT_USER_ID string is treated as unset so users who
-        # ran the setup wizard with the suggested default still get gateway-
-        # native ids instead of being silently bucketed together.
+        # keep the setup-wizard placeholder still get gateway-native ids.
         configured = self._config.get("user_id")
         if configured == _DEFAULT_USER_ID:
             configured = None
@@ -363,6 +369,27 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = (
             _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         )
+        try:
+            self._search_threshold = max(
+                0.0, min(float(self._config.get("search_threshold", 0.30)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._search_threshold = 0.30
+        try:
+            self._prefetch_top_k = max(
+                1, min(int(self._config.get("prefetch_top_k", 4)), 20)
+            )
+        except (TypeError, ValueError):
+            self._prefetch_top_k = 4
+        _user_only = self._config.get("sync_user_only", True)
+        self._sync_user_only = (
+            _user_only.lower() not in ("false", "0", "no")
+            if isinstance(_user_only, str) else bool(_user_only)
+        )
+        try:
+            self._sync_max_chars = max(0, int(self._config.get("sync_max_chars", 8000)))
+        except (TypeError, ValueError):
+            self._sync_max_chars = 8000
         self._channel = kwargs.get("platform") or "cli"
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
@@ -377,10 +404,13 @@ class Mem0MemoryProvider(MemoryProvider):
         # cross-agent recall.
         return {"user_id": self._user_id}
 
-    def _write_metadata(self) -> Dict[str, Any]:
-        # Tag every write with the gateway channel so the dashboard can offer
-        # per-channel filtered views without coupling identity to the channel.
-        return {"channel": self._channel} if self._channel else {}
+    def _write_metadata(self, source: str) -> Dict[str, Any]:
+        # Tag every write with origin and gateway channel so automatic candidate
+        # extraction can be audited separately from explicit agent writes.
+        metadata: Dict[str, Any] = {"source": source, "schema_version": "1"}
+        if self._channel:
+            metadata["channel"] = self._channel
+        return metadata
 
     def system_prompt_block(self) -> str:
         # Mirror the precedence in _create_backend (oss > host > platform) so
@@ -393,22 +423,20 @@ class Mem0MemoryProvider(MemoryProvider):
             mode_label = "self-hosted (HTTP API)"
         else:
             mode_label = "platform (cloud API)"
-        # Rerank is a Mem0 Platform feature only.
-        rerank_note = " Rerank is available on search." if (self._mode == "platform" and not self._host) else ""
+        # Rerank is available on Platform, and on OSS when a reranker is configured.
+        config = self._config if isinstance(self._config, dict) else {}
+        oss_config = config.get("oss") or {}
+        oss_reranker = bool(oss_config.get("reranker")) if isinstance(oss_config, dict) else False
+        rerank_note = (
+            ", with Rerank available on search"
+            if (self._mode == "platform" and not self._host) or oss_reranker
+            else ""
+        )
         return (
-            "# Mem0 Memory\n"
-            f"Active. Mode: {mode_label}. User: {self._user_id}.\n"
-            "You have persistent memory of this user from past conversations. "
-            "You should call mem0_search before answering anything that could depend "
-            "on prior context (the user's preferences, facts, history, people, "
-            "projects, or earlier decisions) — do not rely on the chat window "
-            "alone, and do not assume you have no memory.\n"
-            "For multi-part or multi-hop questions, run several searches with "
-            "different wording/angles and follow-up searches on what the first "
-            "results surface; one search is rarely enough. Keep searching until "
-            "you have every fact the question needs before you answer.\n"
-            "Tools: mem0_search to find memories, mem0_add to store facts, "
-            f"mem0_update and mem0_delete to manage by ID.{rerank_note}"
+            f"Memory Router: Mem0 ({mode_label}, user {self._user_id}) is the active "
+            "durable-memory provider; use mem0_search, mem0_add, mem0_update, and "
+            f"mem0_delete for provider operations{rerank_note}, do not dual-write, "
+            "and load `solajaws-memory-governance` only for complex governance."
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -441,7 +469,11 @@ class Mem0MemoryProvider(MemoryProvider):
             body = ""
             try:
                 results = backend.search(
-                    query, filters=self._read_filters(), top_k=10, rerank=False,
+                    query,
+                    filters=self._read_filters(),
+                    top_k=self._prefetch_top_k,
+                    threshold=self._search_threshold,
+                    rerank=False,
                 )
                 lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
                 if lines:
@@ -478,7 +510,13 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
-        if self._backend is None or self._is_breaker_open():
+        if not user_content or self._backend is None or self._is_breaker_open():
+            return
+        if self._sync_max_chars and len(user_content) > self._sync_max_chars:
+            logger.info(
+                "Skipping Mem0 auto-sync for oversized user message (%d > %d chars)",
+                len(user_content), self._sync_max_chars,
+            )
             return
 
         def _sync():
@@ -486,16 +524,15 @@ class Mem0MemoryProvider(MemoryProvider):
             if backend is None:
                 return
             try:
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]
+                messages = [{"role": "user", "content": user_content}]
+                if not self._sync_user_only and assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
                 backend.add(
                     messages,
                     user_id=self._user_id,
                     agent_id=self._agent_id,
                     infer=True,
-                    metadata=self._write_metadata(),
+                    metadata=self._write_metadata("hermes_auto"),
                 )
                 self._record_success()
             except Exception as e:
@@ -537,12 +574,25 @@ class Mem0MemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: query")
             try:
                 top_k = max(1, min(int(args.get("top_k", 10)), 50))
+                try:
+                    threshold = max(
+                        0.0,
+                        min(float(args.get("threshold", self._search_threshold)), 1.0),
+                    )
+                except (TypeError, ValueError):
+                    threshold = self._search_threshold
                 rerank_raw = args.get("rerank", getattr(self, "_rerank_default", False))
                 if isinstance(rerank_raw, str):
                     rerank = rerank_raw.lower() not in ("false", "0", "no")
                 else:
                     rerank = bool(rerank_raw)
-                results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
+                results = self._backend.search(
+                    query,
+                    filters=self._read_filters(),
+                    top_k=top_k,
+                    threshold=threshold,
+                    rerank=rerank,
+                )
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
@@ -564,7 +614,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     user_id=self._user_id,
                     agent_id=self._agent_id,
                     infer=False,
-                    metadata=self._write_metadata(),
+                    metadata=self._write_metadata("hermes_explicit"),
                 )
                 self._record_success()
                 event_id = result.get("event_id") if isinstance(result, dict) else None
