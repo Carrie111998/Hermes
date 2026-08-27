@@ -346,14 +346,19 @@ FTS_STORAGE_VERSION = 1
 MAX_FTS5_QUERY_CHARS = 2_048
 
 
-_FTS_TRIGGERS = (
+_FTS_BASE_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+
+_FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+_FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
 
 
 SCHEMA_SQL = """
@@ -753,6 +758,10 @@ FTS_STALE_KEY = "fts_stale"
 
 # Durable diagnostic for stale FTS recovery blocked across process restarts.
 FTS_REBUILD_DEFERRAL_KEY = "fts_rebuild_deferral"
+
+FTS_TRIGRAM_POLICY_KEY = "trigram_fts_policy"
+FTS_TRIGRAM_POLICY_ENABLED = "enabled"
+FTS_TRIGRAM_POLICY_DISABLED = "disabled"
 
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────

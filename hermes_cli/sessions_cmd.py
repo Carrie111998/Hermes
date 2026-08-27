@@ -1291,6 +1291,40 @@ def cmd_sessions(args, sessions_parser=None):
 
     elif action == "optimize-storage":
         db_path = db.db_path
+        do_vacuum = not getattr(args, "no_vacuum", False)
+        if getattr(args, "reclaim_disabled_trigram", False):
+            before_bytes = os.path.getsize(db_path) if db_path.exists() else 0
+            before_mb = before_bytes / (1024 * 1024)
+            print(f"Reclaiming disabled trigram search index for {db_path}")
+            try:
+                result = db.reclaim_disabled_trigram_fts(vacuum=do_vacuum)
+            except Exception as e:
+                print(f"Error: disabled-trigram reclaim failed: {e}")
+                db.close()
+                return
+            if not result.get("ok"):
+                print(f"Could not reclaim: {result.get('reason', 'unknown')}")
+                db.close()
+                return
+            after_mb = (
+                os.path.getsize(db_path) / (1024 * 1024)
+                if db_path.exists()
+                else 0.0
+            )
+            logical_after = db.logical_size_bytes()
+            if logical_after is not None:
+                after_mb = logical_after / (1024 * 1024)
+            saved = before_mb - after_mb
+            print("✓ Disabled trigram index reclaimed.")
+            print(
+                f"  Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                f"({_size_delta_label(saved)})"
+            )
+            if result.get("vacuumed") is False:
+                print("  (VACUUM failed — run `hermes sessions optimize` later.)")
+            db.close()
+            return
+
         if not db.fts_optimize_available():
             print("Search index is already on the compact layout — nothing to do.")
             db.close()
@@ -1302,7 +1336,6 @@ def cmd_sessions(args, sessions_parser=None):
         # Disk preflight: the rebuild adds the new index before the old is
         # torn down, and the final VACUUM needs a full second copy of the
         # file. Require headroom ≈ current file size to finish cleanly.
-        do_vacuum = not getattr(args, "no_vacuum", False)
         try:
             import shutil as _shutil
             free_bytes = _shutil.disk_usage(db_path.parent).free

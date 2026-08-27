@@ -3420,6 +3420,85 @@ class TestFTSExternalContentMigration:
 
 
 
+    def test_mixed_trigram_policy_openers_converge_without_teardown(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session("s1", source="cli")
+            db.append_message("s1", role="user", content="needle 大别山")
+            assert db.get_meta("trigram_fts_policy") == "enabled"
+            assert db._fts_table_exists("messages_fts_trigram") is True
+            assert len(db.search_messages("大别山")) == 1
+        finally:
+            db.close()
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("DELETE FROM state_meta WHERE key = 'trigram_fts_policy'")
+
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": False}},
+        )
+        monkeypatch.setenv("HERMES_DISABLE_FTS_TRIGRAM", "1")
+        disabled = SessionDB(db_path=db_path)
+        try:
+            assert disabled.get_meta("trigram_fts_policy") == "disabled"
+            assert disabled._fts_table_exists("messages_fts_trigram") is True
+            assert disabled._trigram_available is False
+            assert disabled._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'messages_fts_trigram_insert'"
+            ).fetchone() is None
+            disabled.append_message("s1", role="user", content="disabled 大别山")
+        finally:
+            disabled.close()
+
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": True}},
+        )
+        monkeypatch.delenv("HERMES_DISABLE_FTS_TRIGRAM", raising=False)
+        enabled = SessionDB(db_path=db_path)
+        try:
+            assert enabled.get_meta("trigram_fts_policy") == "disabled"
+            assert enabled._fts_table_exists("messages_fts_trigram") is True
+            assert enabled._trigram_available is False
+            assert len(enabled.search_messages("needle")) >= 1
+            assert len(enabled.search_messages("disabled")) >= 1
+            result = enabled.reclaim_disabled_trigram_fts(vacuum=False)
+            assert result["ok"] is True
+            assert enabled._fts_table_exists("messages_fts_trigram") is False
+            assert len(enabled.search_messages("disabled")) >= 1
+        finally:
+            enabled.close()
+
+    def test_invalid_trigram_policy_config_fails_before_trigram_ddl(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": "sometimes"}},
+        )
+
+        with pytest.raises(ValueError, match="sessions.trigram_fts"):
+            SessionDB(db_path=db_path)
+
+        with sqlite3.connect(str(db_path)) as conn:
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name = 'messages_fts_trigram'"
+            ).fetchone() is None
+
     def _simulate_pre_fix_demote_crash_window(self, db):
         """Replay the pre-fix demote crash window: trash + empty v23 schema,
         no rebuild markers (executescript committed mid-demote before markers).

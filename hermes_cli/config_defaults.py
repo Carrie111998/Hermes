@@ -3414,6 +3414,13 @@ DEFAULT_CONFIG = {
         #     enforcement is a copy/gating change, not new migration code.
         #   "off": suppress the notice entirely.
         "fts_optimize_notice": "advise",
+        # Database-global trigram FTS policy for state.db. True keeps the
+        # CJK/substring trigram index online; false stops trigram sync on the
+        # next open without dropping the large FTS table. For legacy env-flag
+        # installs, stop all Hermes owners, run
+        # `hermes config set sessions.trigram_fts false`, remove
+        # HERMES_DISABLE_FTS_TRIGRAM, then restart.
+        "trigram_fts": True,
         # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
         # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
         # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)
