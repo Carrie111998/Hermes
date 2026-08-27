@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -86,6 +87,62 @@ async def _kv_put_int(js, bucket: str, key: str, val: int) -> None:
         kv = await js.key_value(bucket)
     await kv.put(key, str(val).encode())
 
+
+
+
+
+# ── Publisher (gateway enforcement — v4 end-tag) ──────────────────────
+
+# End-of-turn pattern: "Round X is done" (case-insensitive, X=any number)
+_END_TAG_RE = re.compile(r"Round\s+\d+\s+is\s+done", re.IGNORECASE)
+
+
+def _has_end_tag(text: str) -> bool:
+    """Check if message body contains a round-done marker."""
+    return bool(_END_TAG_RE.search(text))
+
+
+async def publish_collab_msg(thread_ts: str, text: str,
+                             channel: str = "C0BLTNRDT2L") -> int:
+    """Publish collab.msg to NATS. Returns seq (0 if skipped). Auto-detects end-tag.
+
+    CRITICAL: only publishes messages containing "Round X is done" end tag.
+    Non-end-tag messages (status, thinking, confirmation) go to Slack only.
+    This prevents multi-message noise from armming unnecessary watcher timers.
+    """
+    done = _has_end_tag(text)
+    if not done:
+        logger.info(
+            "nats-collab-publish: SKIP (no end tag) thread=%s — Slack only",
+            thread_ts,
+        )
+        return 0
+    payload = json.dumps({
+        "from": MY_BOT_NAME,
+        "text": text,
+        "channel": channel,
+        "done": done,
+    })
+    subject = f"collab.msg.{thread_ts}.{MY_BOT_NAME}"
+
+    nc = await nats.connect(
+        NATS_URL,
+        reconnect_time_wait=2.0,
+        max_reconnect_attempts=2,
+        name="hermes-collab-publisher",
+    )
+    try:
+        js = nc.jetstream()
+        ack = await js.publish(subject, payload.encode())
+        seq = ack.seq
+        tag_info = "END-TAG" if done else "no-end-tag"
+        logger.info(
+            "nats-collab-publish: seq=%d subject=%s done=%s tag=%s",
+            seq, subject, done, tag_info,
+        )
+        return seq
+    finally:
+        await nc.close()
 
 # ── Listener ────────────────────────────────────────────────────────────
 
@@ -189,6 +246,7 @@ async def run_nats_collab_listener(runner) -> None:
                     chat_type="group",
                     user_id="system:nats-collab",
                     user_name=f"nats-done-{sender}",
+                    thread_id=thread_ts,
                 )
 
                 pause_note = ""

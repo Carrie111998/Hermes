@@ -281,16 +281,24 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         elif adapter._slack_strict_mention() and not is_mentioned:
             return False
         elif not is_mentioned:
-            if thread_reply and active_session:
+            # Thread-scoped gate (hermes-local/threadgate-v1): skip ONLY
+            # thread-replies in threads with no participation/mention/session,
+            # plus unmentioned top-level MPIM/group-DM messages (shared
+            # surfaces stay gated). Top-level channel messages stay free.
+            is_dm = channel_type in {"im", "mpim"}
+            if not thread_reply and not is_dm:
                 return True
-            else:
-                return False
+            if active_session:
+                return True
+            return False
     return True
 
 
-def test_default_require_mention_channel_without_mention_ignored():
+def test_require_mention_top_level_without_mention_processed():
+    # Thread-scoped gate (threadgate-v1): require_mention=true gates only
+    # thread-replies; top-level channel messages stay free.
     adapter = _make_adapter()  # default: require_mention=True
-    assert _would_process(adapter, text="hello everyone") is False
+    assert _would_process(adapter, text="hello everyone") is True
 
 
 def test_require_mention_false_channel_without_mention_processed():
@@ -306,12 +314,14 @@ def test_channel_in_free_response_processed_without_mention():
     assert _would_process(adapter, channel_id=CHANNEL_ID, text="hello") is True
 
 
-def test_other_channel_not_in_free_response_still_gated():
+def test_other_channel_not_in_free_response_top_level_processed():
+    # Thread-scoped gate (threadgate-v1): top-level messages are not gated
+    # even outside free-response channels; only thread-replies are.
     adapter = _make_adapter(
         require_mention=True,
         free_response_channels=[CHANNEL_ID],
     )
-    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, text="hello") is False
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, text="hello") is True
 
 
 def test_dm_always_processed_regardless_of_setting():
@@ -901,5 +911,6 @@ def test_mention_patterns_trigger_in_channel_without_literal_mention():
     """A wake word triggers the bot in a channel even with require_mention on."""
     adapter = _make_adapter(require_mention=True, mention_patterns=["hey hermes"])
     assert _would_process(adapter, text="hey hermes what's the status") is True
-    # Unrelated channel chatter is still ignored.
-    assert _would_process(adapter, text="lunch anyone?") is False
+    # Top-level channel chatter is now processed (thread-scoped gate: only
+    # non-participated thread-replies are skipped).
+    assert _would_process(adapter, text="lunch anyone?") is True

@@ -37,6 +37,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.nats_collab_listener import publish_collab_msg, TARGET_SLACK_CHANNEL as NATS_COLLAB_CHANNEL
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1381,6 +1382,14 @@ class SlackAdapter(BasePlatformAdapter):
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
+
+            # ── NATS collab enforcement: publish to NATS before Slack ──
+            if chat_id == NATS_COLLAB_CHANNEL and thread_ts:
+                try:
+                    seq = await publish_collab_msg(thread_ts, content, channel=chat_id)
+                    logger.debug("nats-collab-publish: seq=%d thread=%s — confirmed before Slack", seq, thread_ts)
+                except Exception as e:
+                    logger.warning("nats-collab-publish failed: %s — falling through to Slack anyway", e)
 
             # reply_broadcast: also post thread replies to the main channel.
             # Controlled via platform config: gateway.slack.reply_broadcast
@@ -2832,6 +2841,33 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
+        # ── Other-bot filter: skip if message addresses another bot (not us) ──
+        # e.g. "@Claude ping" — Hermes should NOT respond
+        other_bot_ids = self._slack_other_bot_ids()
+        other_bot_names = self._slack_other_bot_names()
+        if (other_bot_ids or other_bot_names) and not is_one_to_one_dm and not is_mentioned:
+            is_other_addressed = any(
+                f"<@{bid}>" in routing_text for bid in other_bot_ids
+            ) or any(
+                f"@{name}" in routing_text for name in other_bot_names
+            )
+            if is_other_addressed:
+                logger.info(
+                    "[Slack] Message addresses other bot, not us — skipping (channel=%s user=%s)",
+                    channel_id, user_id,
+                )
+                # Debug ack: send tiny reply so operator can visually confirm filter fired
+                try:
+                    client = self._get_client(channel_id)
+                    await client.chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=ts,
+                        text="NO_REPLY",
+                    )
+                except Exception:
+                    pass
+                return
+
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
@@ -2860,8 +2896,14 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=event_thread_ts,
                     user_id=user_id,
                 )
+                # Thread-scoped gate: skip ONLY thread-replies in threads the bot
+                # never participated in / was never @mentioned in / has no
+                # session. Top-level channel messages stay ungated so general
+                # discussion still reaches the agent (blanket require_mention
+                # would silence those too). hermes-local/threadgate-v1.
                 if (
-                    not reply_to_bot_thread
+                    (is_thread_reply or is_dm)
+                    and not reply_to_bot_thread
                     and not in_mentioned_thread
                     and not has_session
                 ):
@@ -4222,6 +4264,61 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(raw, str) and raw.strip():
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
+
+    def _slack_other_bot_names(self) -> List[str]:
+        """Bot display names to detect in plain-text mentions (e.g. ``@Claude``).
+
+        Reads ``slack.other_bot_names`` (list) or ``SLACK_OTHER_BOT_NAMES``
+        (comma-separated env var).  Complements ``_slack_other_bot_ids``
+        which only matches Slack-formatted ``<@BOT_ID>`` mentions.
+        """
+        cached = getattr(self, "_cached_other_bot_names", None)
+        if cached is not None:
+            return cached
+
+        names: List[str] = []
+        configured = self.config.extra.get("other_bot_names") if self.config.extra else None
+        if isinstance(configured, list):
+            names = [str(x).strip() for x in configured if x]
+        elif isinstance(configured, str):
+            names = [x.strip() for x in configured.split(",") if x.strip()]
+
+        if not names:
+            raw = os.getenv("SLACK_OTHER_BOT_NAMES", "").strip()
+            if raw:
+                names = [x.strip() for x in raw.split(",") if x.strip()]
+
+        self._cached_other_bot_names = names
+        return names
+
+    def _slack_other_bot_ids(self) -> List[str]:
+        """Bot user IDs whose messages we should ignore when not also @mentioned.
+
+        Reads ``slack.other_bot_ids`` (list) or ``SLACK_OTHER_BOT_IDS``
+        (comma-separated env var).  When a channel message explicitly addresses
+        a bot in this list (e.g. ``<@U0BKX9KH7U6>``) but does NOT also mention
+        our own bot, the adapter quietly drops the message.
+        """
+        cached = getattr(self, "_cached_other_bot_ids", None)
+        if cached is not None:
+            return cached
+
+        ids: List[str] = []
+        configured = self.config.extra.get("other_bot_ids") if self.config.extra else None
+        if isinstance(configured, list):
+            ids = [str(x).strip() for x in configured if x]
+        elif isinstance(configured, str):
+            ids = [x.strip() for x in configured.split(",") if x.strip()]
+
+        if not ids:
+            raw = os.getenv("SLACK_OTHER_BOT_IDS", "").strip()
+            if raw:
+                ids = [x.strip() for x in raw.split(",") if x.strip()]
+
+        self._cached_other_bot_ids = ids
+        if ids:
+            logger.info("[Slack] Other-bot filter active: %s", ids)
+        return ids
 
     def _slack_mention_patterns(self) -> List["re.Pattern"]:
         """Compile optional regex wake-word patterns for channel triggers.
