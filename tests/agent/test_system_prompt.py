@@ -118,6 +118,34 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestSkillsMemoryOrdering:
+    def test_skills_index_precedes_memory_snapshot(self):
+        class MemoryStore:
+            def format_for_system_prompt(self, target):
+                if target == "memory":
+                    return "MEMORY_BLOCK"
+                if target == "user":
+                    return "USER_PROFILE_BLOCK"
+                return ""
+
+        agent = _make_agent(
+            valid_tool_names=["skill_view", "memory"],
+            _memory_store=MemoryStore(),
+            _memory_enabled=True,
+            _user_profile_enabled=True,
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_INDEX"),
+        ):
+            volatile = build_system_prompt_parts(agent)["volatile"]
+
+        assert volatile.index("SKILLS_INDEX") < volatile.index("MEMORY_BLOCK")
+        assert volatile.index("SKILLS_INDEX") < volatile.index("USER_PROFILE_BLOCK")
+
+
 class TestExecutionGuidanceInjection:
     """Injection gate for OPENAI_MODEL_EXECUTION_GUIDANCE via
     ``agent.execution_guidance`` (auto/true/false/list).
