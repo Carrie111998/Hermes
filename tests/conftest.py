@@ -204,6 +204,103 @@ _sqlite_opened_since_collect = 0
 _collect_armed = False
 
 
+# ── live-state-db guard (rides the same wrapper) ────────────────────────────
+# ``~/.hermes/state.db`` is the LIVE gateway/session database for this machine.
+# A test that opens it can corrupt real sessions, and — because sqlite takes
+# locks — can wedge the running gateway. Nothing in the suite is supposed to
+# reach it: ``_hermetic_environment`` redirects HERMES_HOME to a per-test
+# tempdir, and every production path resolves through
+# ``hermes_state.py:229`` (``get_hermes_home() / "state.db"``). So an open of
+# the live file means the isolation FAILED — a leaked env var, a module that
+# cached the path at import time before the fixture ran, or a hardcoded path.
+#
+# That failure is silent today: the test passes, having read or written real
+# data. This turns it into a loud, immediate RuntimeError.
+#
+# It rides the existing ``sqlite3.connect`` wrapper rather than adding a second
+# one, for the reason stated above: one wrapper covers every call site in the
+# suite without editing any of them, including connections opened at module
+# import / collection time, which no fixture can see.
+#
+# The canonical root is ``~/.hermes`` and is NEVER profile-scoped (CLAUDE.md,
+# "Notification Layer"), so it is derived from the home directory rather than
+# from HERMES_HOME — which the fixtures deliberately move.
+_LIVE_STATE_DB_BYPASS_MARK = "live_state_db_bypass"
+_allow_live_state_db = [False]
+
+
+def _normalize_db_target(value) -> str | None:
+    """Collapse a ``sqlite3.connect`` first argument onto a comparison key.
+
+    Returns None for anything that cannot name the live file (``:memory:``,
+    bytes that will not decode, a path that cannot be resolved). Comparison is
+    ``normcase(realpath(...))`` so a drive-case difference, a forward/backslash
+    mix, a relative path, or a symlink/junction cannot walk around the guard.
+    """
+    try:
+        raw = os.fspath(value)
+    except TypeError:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode()
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(raw, str) or not raw or raw == ":memory:":
+        return None
+    if raw.startswith("file:"):
+        # URI form (``uri=True``): file:/C:/x/state.db?mode=ro&cache=shared
+        raw = raw[len("file:") :].split("?", 1)[0]
+        if "%" in raw:
+            from urllib.parse import unquote
+
+            raw = unquote(raw)
+        # file:///C:/... -> /C:/... ; strip the slash before a drive letter.
+        if len(raw) > 2 and raw[0] == "/" and raw[2] == ":":
+            raw = raw[1:]
+        if not raw:
+            return None
+    try:
+        return os.path.normcase(os.path.realpath(raw))
+    except (OSError, ValueError):
+        return None
+
+
+def _live_state_db_targets() -> frozenset:
+    """The live state.db and its sidecars, as normalized comparison keys."""
+    root = os.path.join(os.path.expanduser("~"), ".hermes")
+    names = ("state.db", "state.db-wal", "state.db-shm")
+    keys = (_normalize_db_target(os.path.join(root, n)) for n in names)
+    return frozenset(k for k in keys if k)
+
+
+_LIVE_STATE_DB_TARGETS = _live_state_db_targets()
+
+
+def _reject_live_state_db(target) -> None:
+    if _allow_live_state_db[0]:
+        return
+    key = _normalize_db_target(target)
+    if key is None or key not in _LIVE_STATE_DB_TARGETS:
+        return
+    raise RuntimeError(
+        "live-state-db guard: a test tried to open the LIVE machine database "
+        f"{target!r}.\n"
+        "That file is the running gateway's session store -- opening it can "
+        "corrupt real sessions and can wedge the live gateway on a sqlite "
+        "lock.\n"
+        "This means HERMES_HOME isolation did not reach this code path. Usual "
+        "causes: the module cached the db path at import time (before the "
+        "autouse _hermetic_environment fixture ran), a hardcoded "
+        "os.path.expanduser('~')/.hermes path, or an env var the test set "
+        "itself.\n"
+        "Fix the path resolution so it goes through get_hermes_home() at CALL "
+        "time, or point the test at tmp_path. Only if a real live-DB read is "
+        "genuinely the thing under test, mark it with "
+        f"@pytest.mark.{_LIVE_STATE_DB_BYPASS_MARK}."
+    )
+
+
 def _install_sqlite_open_tripwire() -> None:
     import sqlite3
 
@@ -213,6 +310,9 @@ def _install_sqlite_open_tripwire() -> None:
 
     def _counting_connect(*args, **kwargs):
         global _sqlite_opened_since_collect
+        # Refuse BEFORE counting: a rejected open never happened, so it must
+        # not arm the teardown gc pass.
+        _reject_live_state_db(args[0] if args else kwargs.get("database"))
         _sqlite_opened_since_collect += 1
         return _real_connect(*args, **kwargs)
 
@@ -1465,6 +1565,28 @@ _PROVIDER_AUTH_PROBE_GUARD = _NetworkProbeGuard(
 _NETWORK_PROBE_GUARDS = (_LOCAL_SERVER_PROBE_GUARD, _PROVIDER_AUTH_PROBE_GUARD)
 
 
+@pytest.fixture(autouse=True)
+def _live_state_db_guard(request):
+    """Arm/disarm the live-``state.db`` refusal in the sqlite3.connect wrapper.
+
+    The refusal itself lives in ``_reject_live_state_db`` (module level, so it
+    also covers opens during collection/import, which no fixture can reach).
+    This fixture only lifts it for a test explicitly marked
+    ``@pytest.mark.live_state_db_bypass``.
+
+    Restoration is unconditional in the ``finally`` so a raising test cannot
+    leave the guard disarmed for the rest of the file -- the failure mode that
+    would silently un-protect every later test in the same process.
+    """
+    bypass = request.node.get_closest_marker(_LIVE_STATE_DB_BYPASS_MARK) is not None
+    previous = _allow_live_state_db[0]
+    _allow_live_state_db[0] = bypass
+    try:
+        yield
+    finally:
+        _allow_live_state_db[0] = previous
+
+
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
     config.addinivalue_line(
@@ -1497,6 +1619,13 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_REAL_DASHBOARD_PID_SCAN_MARK}: opt out of the autouse stub that "
         "defaults hermes_cli.main._find_stale_dashboard_pids to [] (for tests "
         "of the scanner itself, which stub psutil.process_iter beneath it).",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{_LIVE_STATE_DB_BYPASS_MARK}: allow this test to open the LIVE "
+        "~/.hermes/state.db. Almost never correct -- an open of the live file "
+        "normally means HERMES_HOME isolation failed for that code path. Use "
+        "only when reading the real machine database IS the thing under test.",
     )
 
     # Arm the PID-scan guards. Patch now if a module is somehow already
