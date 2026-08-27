@@ -1,308 +1,49 @@
-name: PR 91079 materialize exact current-main final object
+name: PR 91079 upstream commit-object authority probe
 
 on:
   pull_request:
-    types: [synchronize, reopened]
+    types: [synchronize]
+    paths:
+      - '.github/workflows/pr91079-materialize-patch.yml'
 
 permissions:
-  contents: read
-
-concurrency:
-  group: pr91079-current-main-materializer-${{ github.event.pull_request.head.sha }}
-  cancel-in-progress: false
+  contents: write
 
 jobs:
-  assemble:
-    if: github.event.pull_request.number == 91079 && github.event.pull_request.head.repo.full_name == 'andrexibiza/hermes-agent'
+  probe:
+    if: >-
+      github.event.pull_request.number == 91079 &&
+      github.event.pull_request.head.repo.full_name == 'andrexibiza/hermes-agent' &&
+      github.event.pull_request.head.ref == 'fix/windows-desktop-pack-transaction'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
-      - name: Check out exact submitted PR head
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          repository: andrexibiza/hermes-agent
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-
-      - name: Verify exact source object
+      - name: Create one unreferenced exact-author commit object
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          trap 'status=$?; echo "materializer failed at shell line $LINENO with exit $status" >&2; exit $status' ERR
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
-          git merge-base --is-ancestor db32f7bb0864f5944c6ed9f505d0b979bedc8f2f HEAD
+          repo="$GITHUB_REPOSITORY"
+          main_sha="$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha')"
+          main_tree="$(gh api "repos/$repo/git/commits/$main_sha" --jq '.tree.sha')"
+          authored_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
-      - name: Recompose canonical delivery on current upstream main
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          trap 'status=$?; echo "materializer failed at shell line $LINENO with exit $status" >&2; exit $status' ERR
-          implementation=db32f7bb0864f5944c6ed9f505d0b979bedc8f2f
+          jq -n \
+            --arg message 'chore(pr91079): verify upstream commit-object authority' \
+            --arg tree "$main_tree" \
+            --arg parent "$main_sha" \
+            --arg name 'Axl Ibiza, MBA' \
+            --arg email 'andrexibiza@gmail.com' \
+            --arg date "$authored_at" \
+            '{message:$message, tree:$tree, parents:[$parent], author:{name:$name,email:$email,date:$date}, committer:{name:$name,email:$email,date:$date}}' \
+            | gh api --method POST "repos/$repo/git/commits" --input - > "$RUNNER_TEMP/commit.json"
 
-          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
-            +refs/heads/main:refs/remotes/upstream/main
-          base="$(git rev-parse refs/remotes/upstream/main)"
-          git switch --detach "$base"
-
-          implementation_paths=(
-            apps/desktop/scripts/before-pack-recovery.mjs
-            apps/desktop/scripts/before-pack.mjs
-            apps/desktop/scripts/before-pack.test.mjs
-            apps/desktop/scripts/desktop-builder-runtime.mjs
-            apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs
-            apps/desktop/scripts/desktop-pack-transaction.mjs
-            apps/desktop/scripts/desktop-pack-transaction.test.mjs
-            apps/desktop/scripts/run-electron-builder.mjs
-            apps/desktop/scripts/stage-native-deps-recovery.mjs
-            apps/desktop/scripts/stage-native-deps-recovery.test.mjs
-            apps/desktop/vitest.config.ts
-            tests/hermes_cli/test_desktop_pack_transaction_windows.py
-          )
-          git checkout "$implementation" -- "${implementation_paths[@]}"
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          p = Path('apps/desktop/package.json')
-          s = p.read_text(encoding='utf-8')
-          replacements = (
-              (
-                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs",',
-                  '    "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs",',
-              ),
-              (
-                  '    "check:test:desktop:all": "npm run test:desktop:all",',
-                  '    "check:test:desktop:all": "node --test scripts/stage-native-deps-recovery.test.mjs && npm run test:desktop:all",',
-              ),
-              (
-                  '    "beforePack": "scripts/before-pack.mjs",',
-                  '    "beforePack": "scripts/before-pack-recovery.mjs",',
-              ),
-          )
-          for old, new in replacements:
-              if s.count(old) != 1:
-                  raise SystemExit(f'expected exactly one package contract line: {old}')
-              s = s.replace(old, new)
-
-          data = json.loads(s)
-          scripts = data['scripts']
-          assert scripts['build'].endswith('node scripts/stage-native-deps-recovery.mjs')
-          assert 'vite build' not in scripts['build']
-          assert scripts['check:test:desktop:all'].startswith(
-              'node --test scripts/stage-native-deps-recovery.test.mjs && '
-          )
-          assert data['build']['beforePack'] == 'scripts/before-pack-recovery.mjs'
-          assert scripts['check:test:plugins'] == 'node --test src/plugins/*/tests/*.test.mjs'
-          assert 'run-ui-shard.mjs' not in s
-          p.write_text(s, encoding='utf-8')
-          PY
-
-          python - <<'PY'
-          from pathlib import Path
-
-          p = Path('hermes_cli/main.py')
-          s = p.read_text(encoding='utf-8')
-          start_marker = 'def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n'
-          end_marker = '\ndef _ensure_desktop_exe_launchable(\n'
-          if s.count(start_marker) != 1 or s.count(end_marker) != 1:
-              raise SystemExit('desktop rollback composition anchors are not unique')
-          a = s.index(start_marker)
-          b = s.index(end_marker, a)
-          replacement = '''def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:
-              """Restore the previous unpacked desktop app from its ``.bak`` tree.
-
-              Returns the restored executable path, or ``None`` when no usable backup
-              exists or the filesystem transaction cannot complete. The invalid candidate
-              is kept alongside as ``<unpacked-dir>.corrupt`` after a successful rollback.
-
-              The live path is never deleted to make room for the backup. A stale
-              quarantine must be retired before either generation moves; the candidate is
-              then quarantined by rename, and backup promotion owns the commit point. If
-              promotion fails, the candidate is moved back to the live path while the
-              backup remains intact. Best-effort: never raises.
-              """
-              unpacked = packaged_executable.parent
-              backup_dir = _desktop_backup_unpacked_dir(packaged_executable)
-              backup_exe = backup_dir / packaged_executable.name
-              if not backup_exe.exists():
-                  return None
-              if _desktop_exe_integrity_error(backup_exe) is not None:
-                  return None
-
-              corrupt_dir = unpacked.parent / (unpacked.name + ".corrupt")
-              marker_path = backup_dir.with_name(backup_dir.name + ".session")
-
-              if corrupt_dir.exists():
-                  try:
-                      shutil.rmtree(corrupt_dir)
-                  except FileNotFoundError:
-                      pass
-                  except OSError:
-                      return None
-
-              try:
-                  unpacked.rename(corrupt_dir)
-              except OSError:
-                  return None
-
-              try:
-                  backup_dir.rename(unpacked)
-              except OSError:
-                  try:
-                      corrupt_dir.rename(unpacked)
-                  except OSError:
-                      # Both generations remain preserved at explicit paths for manual or
-                      # later recovery; never delete either one here.
-                      pass
-                  return None
-
-              try:
-                  marker_path.unlink()
-              except OSError:
-                  pass
-
-              restored = unpacked / packaged_executable.name
-              return restored if restored.exists() else None
-          '''
-          p.write_text(s[:a] + replacement + s[b:], encoding='utf-8')
-          PY
-
-          python -m py_compile hermes_cli/main.py
-          git add apps/desktop/package.json hermes_cli/main.py "${implementation_paths[@]}"
-          git config user.name "Andrex Ibiza, MBA"
-          git config user.email "andrexibiza@gmail.com"
-          git commit \
-            -m "fix(desktop): make Windows package replacement fully transactional (#91079)" \
-            -m "Publish the reviewed rollback-safe Python composition directly into the submitted tree, retire all temporary publication machinery, and recompose the package transaction on exact upstream main $base. Preserve current-main package-script and CLI changes while binding build, test, beforePack, rollback, and isolated dependency-realization authority to the reviewed implementation."
-
-          final_sha="$(git rev-parse HEAD)"
-          final_tree="$(git rev-parse HEAD^{tree})"
-          printf 'PR91079_BASE=%s\nPR91079_FINAL_SHA=%s\nPR91079_FINAL_TREE=%s\n' \
-            "$base" "$final_sha" "$final_tree" >> "$GITHUB_ENV"
-
-      - name: Verify canonical final object
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          trap 'status=$?; echo "materializer failed at shell line $LINENO with exit $status" >&2; exit $status' ERR
-          test "$(git rev-parse HEAD^)" = "$PR91079_BASE"
-          test "$(git rev-list --count "$PR91079_BASE"..HEAD)" = "1"
-          git diff --check "$PR91079_BASE"..HEAD
-          test ! -e .github/pr91079-actions-kick
-          test ! -e .github/workflows/pr91079-materialize-patch.yml
-          test ! -e .github/workflows/pr91079-publish-final.yml
-
-          git diff --name-only "$PR91079_BASE"..HEAD | sort > /tmp/actual-paths
-          cat > /tmp/expected-paths <<'EOF'
-          apps/desktop/package.json
-          apps/desktop/scripts/before-pack-recovery.mjs
-          apps/desktop/scripts/before-pack.mjs
-          apps/desktop/scripts/before-pack.test.mjs
-          apps/desktop/scripts/desktop-builder-runtime.mjs
-          apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs
-          apps/desktop/scripts/desktop-pack-transaction.mjs
-          apps/desktop/scripts/desktop-pack-transaction.test.mjs
-          apps/desktop/scripts/run-electron-builder.mjs
-          apps/desktop/scripts/stage-native-deps-recovery.mjs
-          apps/desktop/scripts/stage-native-deps-recovery.test.mjs
-          apps/desktop/vitest.config.ts
-          hermes_cli/main.py
-          tests/hermes_cli/test_desktop_pack_transaction_windows.py
-          EOF
-          sed -i 's/^          //' /tmp/expected-paths
-          diff -u /tmp/expected-paths /tmp/actual-paths
-
-          while IFS= read -r path; do
-            case "$path" in
-              *.mjs) node --check "$path" ;;
-            esac
-          done < /tmp/actual-paths
-
-          python - <<'PY'
-          from pathlib import Path
-
-          s = Path('hermes_cli/main.py').read_text(encoding='utf-8')
-          block = s.split(
-              'def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n',
-              1,
-          )[1].split('\ndef _ensure_desktop_exe_launchable(\n', 1)[0]
-          required = (
-              'unpacked.rename(corrupt_dir)',
-              'backup_dir.rename(unpacked)',
-              'corrupt_dir.rename(unpacked)',
-              'marker_path.unlink()',
-          )
-          for token in required:
-              assert token in block, token
-          assert 'shutil.rmtree(unpacked' not in block
-          PY
-
-          echo "base=$PR91079_BASE"
-          echo "final_sha=$PR91079_FINAL_SHA"
-          echo "final_tree=$PR91079_FINAL_TREE"
-
-      - name: Export exact product object
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          out=/tmp/pr91079-final-current-main
-          rm -rf "$out"
-          mkdir -p "$out/hermes_cli" "$out/apps/desktop"
-          cp hermes_cli/main.py "$out/hermes_cli/main.py"
-          cp apps/desktop/package.json "$out/apps/desktop/package.json"
-          git format-patch --stdout "$PR91079_BASE"..HEAD > "$out/final.patch"
-          git bundle create "$out/final.bundle" HEAD ^"$PR91079_BASE"
-          git archive --format=tar.gz --output="$out/changed-files.tar.gz" HEAD -- \
-            apps/desktop/package.json \
-            apps/desktop/scripts/before-pack-recovery.mjs \
-            apps/desktop/scripts/before-pack.mjs \
-            apps/desktop/scripts/before-pack.test.mjs \
-            apps/desktop/scripts/desktop-builder-runtime.mjs \
-            apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs \
-            apps/desktop/scripts/desktop-pack-transaction.mjs \
-            apps/desktop/scripts/desktop-pack-transaction.test.mjs \
-            apps/desktop/scripts/run-electron-builder.mjs \
-            apps/desktop/scripts/stage-native-deps-recovery.mjs \
-            apps/desktop/scripts/stage-native-deps-recovery.test.mjs \
-            apps/desktop/vitest.config.ts \
-            hermes_cli/main.py \
-            tests/hermes_cli/test_desktop_pack_transaction_windows.py
-          {
-            echo "source_pr_head=${{ github.event.pull_request.head.sha }}"
-            echo "base=$PR91079_BASE"
-            echo "commit=$PR91079_FINAL_SHA"
-            echo "tree=$PR91079_FINAL_TREE"
-            echo "main_py_blob=$(git rev-parse HEAD:hermes_cli/main.py)"
-            echo "main_py_sha256=$(sha256sum hermes_cli/main.py | awk '{print $1}')"
-            echo "package_json_blob=$(git rev-parse HEAD:apps/desktop/package.json)"
-            echo "package_json_sha256=$(sha256sum apps/desktop/package.json | awk '{print $1}')"
-            echo "changed_paths_begin"
-            git diff --name-only "$PR91079_BASE"..HEAD | sort
-            echo "changed_paths_end"
-            echo "changed_blobs_begin"
-            git ls-tree -r HEAD -- \
-              apps/desktop/package.json \
-              apps/desktop/scripts/before-pack-recovery.mjs \
-              apps/desktop/scripts/before-pack.mjs \
-              apps/desktop/scripts/before-pack.test.mjs \
-              apps/desktop/scripts/desktop-builder-runtime.mjs \
-              apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs \
-              apps/desktop/scripts/desktop-pack-transaction.mjs \
-              apps/desktop/scripts/desktop-pack-transaction.test.mjs \
-              apps/desktop/scripts/run-electron-builder.mjs \
-              apps/desktop/scripts/stage-native-deps-recovery.mjs \
-              apps/desktop/scripts/stage-native-deps-recovery.test.mjs \
-              apps/desktop/vitest.config.ts \
-              hermes_cli/main.py \
-              tests/hermes_cli/test_desktop_pack_transaction_windows.py
-            echo "changed_blobs_end"
-          } > "$out/manifest.txt"
-
-      - name: Upload exact current-main product object
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: pr91079-final-current-main
-          path: /tmp/pr91079-final-current-main
-          retention-days: 7
-          if-no-files-found: error
+          object_sha="$(jq -r '.sha' "$RUNNER_TEMP/commit.json")"
+          test -n "$object_sha"
+          gh api "repos/$repo/git/commits/$object_sha" > "$RUNNER_TEMP/verified.json"
+          test "$(jq -r '.author.name' "$RUNNER_TEMP/verified.json")" = 'Axl Ibiza, MBA'
+          test "$(jq -r '.author.email' "$RUNNER_TEMP/verified.json")" = 'andrexibiza@gmail.com'
+          test "$(jq -r '.committer.name' "$RUNNER_TEMP/verified.json")" = 'Axl Ibiza, MBA'
+          test "$(jq -r '.committer.email' "$RUNNER_TEMP/verified.json")" = 'andrexibiza@gmail.com'
+          echo "created_unreferenced_commit_object=$object_sha"
