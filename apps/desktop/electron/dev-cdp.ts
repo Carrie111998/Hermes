@@ -27,6 +27,10 @@
  * debugger off-host, and offering the knob invites someone to try.
  */
 
+import path from 'node:path'
+import os from 'node:os'
+import crypto from 'node:crypto'
+
 /** Why the port is closed, for a one-line log the developer can act on. */
 type ClosedReason = 'packaged' | 'no-dev-server' | 'opted-out' | 'invalid-port'
 
@@ -104,5 +108,35 @@ function describeDevCdpDecision(decision: DevCdpDecision): string | null {
   }
 }
 
-export { DEFAULT_PORT, describeDevCdpDecision, resolveDevCdpPort }
-export type { DevCdpDecision }
+/**
+ * The per-instance debug descriptor the renderer exposes to an attached MCP
+ * server, so the server can prove which Hermes home the connected target is
+ * actually running against — instead of trusting a caller-supplied coordinate.
+ *
+ * Emitted by the same main process that opens the CDP port (never the renderer,
+ * never a caller), so it is target-derived authority. The MCP server reads
+ * `dataRoot` over CDP and refuses unless it matches the declared sandbox home.
+ *
+ * Returns null when the port is closed (packaged / no-dev-server / opted-out),
+ * so nothing is exposed outside dev mode.
+ */
+type DevCdpInstance = { nonce: string; dataRoot: string }
+
+function resolveDevCdpInstance({ env, isPackaged, devServer }: DevCdpInput): DevCdpInstance | null {
+  const decision = resolveDevCdpPort({ env, isPackaged, devServer })
+  if (decision.port === null) return null
+
+  const declared = env.HERMES_HOME
+  const dataRoot = path.resolve(declared && declared.length > 0
+    ? declared
+    : path.join(os.homedir(), '.hermes'))
+
+  // Per-run opaque nonce. The server checks it is present (a descriptor exists)
+  // and compares the canonical dataRoot against its declared sandbox home.
+  const nonce = crypto.randomBytes(16).toString('hex')
+
+  return { nonce, dataRoot }
+}
+
+export { DEFAULT_PORT, describeDevCdpDecision, resolveDevCdpPort, resolveDevCdpInstance }
+export type { DevCdpDecision, DevCdpInstance }

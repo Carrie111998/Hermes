@@ -24,6 +24,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { actTools, handleAct } from './tools/act.mjs'
 import { flowTools, handleFlow } from './tools/flows.mjs'
+import { assertTargetAttested, canon } from './guard.mjs'
 
 // ---------------------------------------------------------------------------
 // Output bounds — never dump the whole DOM into an agent's context.
@@ -44,46 +45,14 @@ const CFG = {
   allowAct: process.env.DESKTOP_DEBUG_MCP_ALLOW_ACT === '1'
 }
 
-let cdp = null // lazily connected CDP instance
-const consoleRing = [] // renderer console capture (bounded)
-
-// The HERMES_HOME the operator declares this desktop instance is running
-// against. Mutating tools refuse to run unless this is set AND differs from
-// the operator's real default home — see assertSandboxed(). This is the rail
-// that prevents a debug MCP run from reading/writing the operator's real API
-// keys and chat history (the 2026-08-26 incident: a manual electron launch
-// with only HERMES_DESKTOP_USER_DATA_DIR set silently used ~/.hermes).
+// The Hermes home the operator DECLARES this desktop instance runs against.
+// The guard (guard.mjs) does NOT trust this alone — it reads the *realized*
+// data root from the connected target and refuses unless they match.
 const EXPECTED_HOME = process.env.DESKTOP_DEBUG_MCP_EXPECTED_HOME || ''
 const DEFAULT_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes')
 
-/**
- * Fail-closed safety rail for mutating tools.
- *
- * A debug MCP run must target an isolated sandbox (its own HERMES_HOME), never
- * the operator's real data. We cannot reliably read the target's HERMES_HOME
- * from the renderer (it is not exposed), so we require the operator to DECLARE
- * it: set DESKTOP_DEBUG_MCP_EXPECTED_HOME to the sandbox path when launching
- * the server. If unset, or if it equals the default home, mutating tools are
- * refused with a clear instruction.
- */
-function assertSandboxed() {
-  if (!EXPECTED_HOME) {
-    throw new Error(
-      'REFUSED: DESKTOP_DEBUG_MCP_EXPECTED_HOME is not set. The debug MCP ' +
-        'server will not mutate a desktop instance unless you declare which ' +
-        'isolated HERMES_HOME it is running against. Launch with ' +
-        'DESKTOP_DEBUG_MCP_EXPECTED_HOME=/tmp/your-sandbox-home and ensure the ' +
-        'desktop instance was started with the same HERMES_HOME. Never point ' +
-        'this at your real ~/.hermes.'
-    )
-  }
-  if (EXPECTED_HOME === DEFAULT_HOME) {
-    throw new Error(
-      `REFUSED: declared HERMES_HOME (${EXPECTED_HOME}) is the default home. ` +
-        'The debug MCP server must target an isolated sandbox, not your real data.'
-    )
-  }
-}
+let cdp = null // lazily connected CDP instance
+const consoleRing = [] // renderer console capture (bounded)
 
 async function connect() {
   if (cdp) return cdp
@@ -193,14 +162,19 @@ async function consoleLog({ level, sinceMs }) {
   return rows.slice(-MAX_CONSOLE)
 }
 
-async function screenshot({ path }) {
+async function screenshot() {
   const c = await connect()
   const shot = await c.send('Page.captureScreenshot', { format: 'png' })
-  const file = path || `/tmp/desktop-debug-mcp/screen-${Date.now()}.png`
-  const fs = await import('node:fs')
-  fs.mkdirSync(file.substring(0, file.lastIndexOf('/')), { recursive: true })
-  fs.writeFileSync(file, Buffer.from(shot.data, 'base64'))
-  return { savedTo: file, bytes: shot.data.length }
+  // Return the capture as MCP image content — never write to disk. This keeps
+  // the tool genuinely read-only: an MCP caller cannot clobber an arbitrary
+  // file (e.g. ui_screenshot({path:'/home/me/.bashrc'}) was a mutation, not a
+  // read). If a saved copy is needed, the caller persists the returned bytes.
+  return {
+    content: [
+      { type: 'image', data: shot.data, mimeType: 'image/png' },
+      { type: 'text', text: JSON.stringify({ bytes: shot.data.length }) }
+    ]
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +222,8 @@ const readTools = [
   },
   {
     name: 'ui_screenshot',
-    description: 'Capture the current window as PNG to a path (default under /tmp/desktop-debug-mcp). Returns the path.',
-    inputSchema: { type: 'object', properties: { path: { type: 'string' } } }
+    description: 'Capture the current window as a PNG and return it as image content. Does NOT write to disk (the tool is read-only; persist the returned bytes yourself if you need a file).',
+    inputSchema: { type: 'object', properties: {} }
   }
 ]
 
@@ -292,7 +266,11 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     let out
     if (readTools.some(t => t.name === name)) {
       out = name === 'status' ? undefined : undefined
-      // dispatch read tools
+      // dispatch read tools — these disclose live UI/chat state, so they are
+      // also gated by target attestation (the connected target must prove it
+      // is the isolated sandbox, not the operator's real dev Desktop).
+      const live = await connect()
+      await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })
       if (name === 'desktop_ui_status') out = await status()
       else if (name === 'ui_inspect') out = await inspect(a)
       else if (name === 'ui_query') out = await query(a)
@@ -313,7 +291,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
       const live = await connect()
-      assertSandboxed()
+      await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })
       out = await handleAct(name, a, { ...toolCtx, cdp: live })
     } else if (flowTools.some(t => t.name === name)) {
       if (!CFG.allowAct) {
@@ -322,7 +300,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
       const live = await connect()
-      assertSandboxed()
+      await assertTargetAttested(live, { expectedHome: EXPECTED_HOME, defaultHome: DEFAULT_HOME })
       out = await handleFlow(name, a, { ...toolCtx, cdp: live })
     } else {
       throw new Error(`unknown tool: ${name}`)

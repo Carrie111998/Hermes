@@ -166,7 +166,7 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
-import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
+import { describeDevCdpDecision, resolveDevCdpPort, resolveDevCdpInstance } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import {
@@ -503,6 +503,12 @@ if (REMOTE_DISPLAY_REASON) {
 // electron/dev-cdp.ts. Must run before app `ready` like the switches above;
 // Chromium binds it at launch.
 const DEV_CDP = resolveDevCdpPort({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
+
+// Per-instance debug descriptor the renderer exposes to an attached MCP server,
+// so the server can attest which Hermes home this target actually runs against
+// (target-derived authority, not a caller-supplied coordinate). Null when the
+// CDP port is closed, so nothing is exposed outside dev mode.
+const DEV_CDP_INSTANCE = resolveDevCdpInstance({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
 
 if (DEV_CDP.port) {
   app.commandLine.appendSwitch('remote-debugging-port', String(DEV_CDP.port))
@@ -14158,6 +14164,20 @@ function createWindow() {
   })
 
   const createdMainWindow = mainWindow
+
+  // Expose the per-instance debug descriptor to an attached MCP server so it can
+  // attest which Hermes home this target runs against. Written by the main
+  // process (the CDP authority), never the renderer or a caller — so it is
+  // target-derived, not a second declaration. Only when the CDP port is open.
+  if (DEV_CDP_INSTANCE) {
+    mainWindow.webContents.on('did-finish-load', () => {
+      mainWindow.webContents
+        .executeJavaScript(
+          `globalThis.__DEBUG_MCP_INSTANCE__ = ${JSON.stringify(DEV_CDP_INSTANCE)}`
+        )
+        .catch(() => {})
+    })
+  }
 
   // Chat-surface registration: see applyWindowTranslucency.
   translucencyBackedWindows.add(mainWindow)
