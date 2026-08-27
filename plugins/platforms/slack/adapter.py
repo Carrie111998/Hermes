@@ -913,6 +913,18 @@ class SlackAdapter(BasePlatformAdapter):
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    # Slack native streaming (chat.startStream/appendStream/stopStream) is
+    # stream-is-the-message: the streamed message IS the final message —
+    # send() intercepts the turn-final via _try_finalize_stream and seals
+    # the stream instead of posting a duplicate. The stream consumer keys
+    # its protections on this attribute (keep ONE cumulative stream across
+    # tool boundaries, no segment reset around commentary, seal only at
+    # turn-final). Without it the consumer applies Telegram-shaped draft
+    # semantics — real sends at segment breaks and state resets that break
+    # the append-only prefix invariant — which sealed streams mid-turn and
+    # posted the final twice (sealed stream + plain send). The relay Slack
+    # adapter already declares this; the native adapter was the gap.
+    draft_stream_is_message = True
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
@@ -2640,8 +2652,12 @@ class SlackAdapter(BasePlatformAdapter):
                     "ts": stream.stream_ts,
                     "chunks": chunks,
                 }
-                if fallback_text:
-                    append_payload["markdown_text"] = fallback_text
+                # Slack rejects appendStream calls that carry BOTH chunks and
+                # markdown_text ("cannot_provide_both_markdown_text_and_chunks"),
+                # so the task-card content must travel in chunks alone. The
+                # fallback_text parameter stays in the signature for the
+                # gateway's editable-text fallback path, which is what renders
+                # it when the native rail fails.
                 await client.api_call("chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
