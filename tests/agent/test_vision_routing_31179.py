@@ -182,9 +182,14 @@ model:
 
         from agent.models_dev import ModelCapabilities
 
+        def get_model_capabilities(provider, model, *, allow_network=False):
+            assert (provider, model) == ("deepseek", "deepseek-v4-pro")
+            assert allow_network is True
+            return ModelCapabilities(supports_vision=False)
+
         monkeypatch.setattr(
             "agent.models_dev.get_model_capabilities",
-            lambda *_args, **_kwargs: ModelCapabilities(supports_vision=False),
+            get_model_capabilities,
         )
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
@@ -203,6 +208,11 @@ model:
 """)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         _fresh_modules()
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.resolve_anthropic_token",
+            lambda: "sk-ant-test",
+        )
 
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
