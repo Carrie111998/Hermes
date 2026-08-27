@@ -2645,8 +2645,14 @@ def list_authenticated_providers(
 
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
-    _current_provider_norm = str(current_provider or "").strip().lower()
-    _current_base_url_norm = str(current_base_url or "").strip().rstrip("/").lower()
+    # PyYAML parses unquoted numeric names (`provider: 2070`) as int. Later
+    # `.strip()` on that raw value 500s GET /api/model/options and the Desktop
+    # Model tab cannot assign custom endpoints.
+    current_provider = str(current_provider or "").strip()
+    current_base_url = str(current_base_url or "").strip()
+    current_model = str(current_model or "").strip()
+    _current_provider_norm = current_provider.lower()
+    _current_base_url_norm = current_base_url.rstrip("/").lower()
 
     def _can_probe_custom_provider(*, row_is_current: bool) -> bool:
         return bool(probe_custom_providers or (probe_current_custom_provider and row_is_current))
