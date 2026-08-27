@@ -36,12 +36,11 @@ def _kitty_reports_unshifted_codepoints() -> bool:
     return bool(env.get("KITTY_WINDOW_ID") or "kitty" in term)
 
 
-def _us_punctuation_layout() -> bool:
-    """True only when Shift+<punct> is POSITIVELY known to follow US layout.
+def _configured_layout() -> str:
+    """The primary configured keyboard layout, or "" when nothing says.
 
     Cheap and env/file based on purpose: this runs on the CLI startup path, so
-    it must not spawn a subprocess.  Unknown answers return False, because the
-    caller treats False as "do not guess".
+    it must not spawn a subprocess.
     """
     layout = (os.environ.get("XKB_DEFAULT_LAYOUT") or "").strip().lower()
     if not layout:
@@ -60,11 +59,163 @@ def _us_punctuation_layout() -> bool:
                 continue
             if layout:
                 break
-    if not layout:
+    # "us,gr" means us is primary; "us-acentos"/"us.utf-8" are console keymaps.
+    return layout.split(",")[0].strip()
+
+
+def _us_punctuation_layout() -> bool:
+    """True only when Shift+<punct> is POSITIVELY known to follow US layout.
+
+    Unknown answers return False, because the caller treats False as "do not
+    guess".
+    """
+    primary = _configured_layout()
+    if not primary:
         return False
-    # "us", "us,gr" (us primary), "us-acentos"/"us.utf-8" console keymaps.
-    primary = layout.split(",")[0].strip()
-    return primary == "us" or primary.startswith(("us-", "us."))
+    if primary == "us" or primary.startswith(("us-", "us.")):
+        return True
+    # The name is not "us", but the layout may still leave Shift+punctuation
+    # exactly where US puts it — Greek does.  Ask its xkb table rather than
+    # rejecting a layout that is in fact compatible.
+    return _layout_keeps_us_shift_punctuation(primary)
+
+
+# Shift+<punct> on a US layout, keyed by the base character.  Single source of
+# truth: the alias table below builds both of its halves from this, and
+# ``_layout_keeps_us_shift_punctuation`` checks a foreign layout against it, so
+# the two can never drift apart.
+_SHIFT_PUNCTUATION_BY_CHAR = {
+    "1": "!",
+    "2": "@",
+    "3": "#",
+    "4": "$",
+    "5": "%",
+    "6": "^",
+    "7": "&",
+    "8": "*",
+    "9": "(",
+    "0": ")",
+    "-": "_",
+    "=": "+",
+    "[": "{",
+    "]": "}",
+    "\\": "|",
+    ";": ":",
+    "'": '"',
+    ",": "<",
+    ".": ">",
+    "/": "?",
+    "`": "~",
+}
+_SHIFT_PUNCTUATION = {ord(b): s for b, s in _SHIFT_PUNCTUATION_BY_CHAR.items()}
+
+# xkb key names for the keys the Shift+punctuation map covers, plus the keysym
+# names those keys carry at shift level 2 on US.  These answer the question the
+# layout NAME cannot: does this layout leave Shift+punctuation where US puts it?
+# Greek DOES — it declares the number row ``any, any`` or with the identical US
+# symbols and only overrides the AltGr levels — while AZERTY does not (``AE01``
+# is ``ampersand, 1``).  Judging by name alone would reject Greek needlessly,
+# and that is exactly the difference between a kitty user getting the fix or not.
+_XKB_KEY_BY_BASE = {
+    "1": "AE01",
+    "2": "AE02",
+    "3": "AE03",
+    "4": "AE04",
+    "5": "AE05",
+    "6": "AE06",
+    "7": "AE07",
+    "8": "AE08",
+    "9": "AE09",
+    "0": "AE10",
+    "-": "AE11",
+    "=": "AE12",
+    "[": "AD11",
+    "]": "AD12",
+    "\\": "BKSL",
+    ";": "AC10",
+    "'": "AC11",
+    ",": "AB08",
+    ".": "AB09",
+    "/": "AB10",
+    "`": "TLDE",
+}
+_XKB_KEYSYM_CHAR = {
+    "exclam": "!",
+    "at": "@",
+    "numbersign": "#",
+    "dollar": "$",
+    "percent": "%",
+    "asciicircum": "^",
+    "ampersand": "&",
+    "asterisk": "*",
+    "parenleft": "(",
+    "parenright": ")",
+    "underscore": "_",
+    "plus": "+",
+    "braceleft": "{",
+    "braceright": "}",
+    "bar": "|",
+    "colon": ":",
+    "quotedbl": '"',
+    "less": "<",
+    "greater": ">",
+    "question": "?",
+    "asciitilde": "~",
+}
+_XKB_SYMBOLS_DIRS = ("/usr/share/X11/xkb/symbols", "/usr/local/share/X11/xkb/symbols")
+_XKB_KEY_RE = None
+
+
+def _layout_keeps_us_shift_punctuation(layout: str) -> bool:
+    """True when *layout*'s xkb definition leaves Shift+punctuation at US values.
+
+    Answers by reading the layout's own symbol table rather than trusting its
+    name.  A key that is absent, or declared ``any, any``, inherits the base
+    layout and therefore matches US; a key that names a level-2 keysym must
+    name the US one.  Anything unreadable or unresolvable is treated as a
+    mismatch, because the caller's contract is "do not guess".
+
+    Deliberately conservative across variants: if ANY block in the file gives a
+    target key a level-2 symbol that disagrees with US, the layout is rejected.
+    A needless rejection costs a leaked escape sequence; a wrong acceptance
+    costs wrongly typed characters.
+    """
+    global _XKB_KEY_RE
+    if not layout or "/" in layout or "." in layout:
+        return False
+    if _XKB_KEY_RE is None:
+        import re
+
+        _XKB_KEY_RE = re.compile(
+            r"key\s*<(?P<key>[A-Z0-9]+)>\s*\{\s*\[(?P<syms>[^\]]*)\]"
+        )
+    wanted = {_XKB_KEY_BY_BASE[b]: v for b, v in _SHIFT_PUNCTUATION_BY_CHAR.items()}
+    seen: set[str] = set()
+    for directory in _XKB_SYMBOLS_DIRS:
+        try:
+            with open(
+                f"{directory}/{layout}", encoding="utf-8", errors="replace"
+            ) as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for match in _XKB_KEY_RE.finditer(text):
+            key = match.group("key")
+            expected = wanted.get(key)
+            if expected is None:
+                continue
+            syms = [s.strip() for s in match.group("syms").split(",")]
+            if len(syms) < 2:
+                return False
+            level2 = syms[1]
+            if level2 == "any":
+                seen.add(key)  # inherits the base layout => US
+                continue
+            if _XKB_KEYSYM_CHAR.get(level2) != expected:
+                return False  # redefined away from US
+            seen.add(key)
+        return bool(seen)  # file found; verdict stands
+    return False  # no xkb data available
 
 
 def _shift_punctuation_base_map_is_safe() -> bool:
@@ -492,29 +643,7 @@ def install_modify_other_keys_aliases() -> int:
     # codepoint) and Shift+{ as ESC[27;2;123~ (already-shifted codepoint)
     # the same way they send Shift+a as codepoint 97 or 65 — map both
     # forms. Each base key maps to its US-layout shifted character.
-    punct_shift: dict[int, str] = {
-        ord("1"): "!",
-        ord("2"): "@",
-        ord("3"): "#",
-        ord("4"): "$",
-        ord("5"): "%",
-        ord("6"): "^",
-        ord("7"): "&",
-        ord("8"): "*",
-        ord("9"): "(",
-        ord("0"): ")",
-        ord("-"): "_",
-        ord("="): "+",
-        ord("["): "{",
-        ord("]"): "}",
-        ord("\\"): "|",
-        ord(";"): ":",
-        ord("'"): '"',
-        ord(","): "<",
-        ord("."): ">",
-        ord("/"): "?",
-        ord("`"): "~",
-    }
+    punct_shift = _SHIFT_PUNCTUATION
     punct_map: dict[int, str] = {}
     # Identity half — echoes back whatever shifted codepoint the terminal
     # reported. Layout-independent by construction, so it always installs.
