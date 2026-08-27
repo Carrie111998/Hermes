@@ -7702,13 +7702,10 @@ def _client_cache_key(
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # The model MUST participate in the key. Two concurrent auxiliary calls to
     # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
-    # fan-out running opus + gpt-5.5 in parallel threads) would otherwise share
-    # one cache entry. On a cache MISS both build a client for the same key; the
-    # second's _store_cached_client sees the first as the "old" entry and CLOSES
-    # it — while the first call is still mid-request on it — yielding a spurious
-    # APIConnectionError that fails the sibling advisor (root cause of the run2
-    # double-advisor "Connection error" collapse). Keying on model gives each
-    # model its own client, so concurrent fan-out calls never cross-close.
+    # fan-out running opus + gpt-5.5 in parallel threads) need distinct cache
+    # entries. Otherwise one call can reuse the client/default-model pairing
+    # created for its sibling. Keying on model keeps each call bound to the
+    # client configuration selected for that model.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
     return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
