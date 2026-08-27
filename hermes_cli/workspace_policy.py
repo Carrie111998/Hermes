@@ -47,6 +47,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -108,6 +109,26 @@ _RUNTIME_DB_ENDINGS = (
     ".sqlite3", ".sqlite3-journal", ".sqlite3-shm", ".sqlite3-wal",
 )
 _SPACE = " "
+_KEY_SCAN_BLOCK_BYTES = 1_048_576
+_KEY_SCAN_CARRY_CHARS = 4_096
+
+# These built-in redaction patterns intentionally trade precision for broad
+# log masking. That is appropriate for redaction, where a false positive is
+# cheap, but not for a dispatch gate. Ordinary identifiers such as
+# ``am_i_right_about_this`` match them. A plugin that registers a more specific
+# pattern remains authoritative even when it shares one of these prefixes.
+_LOW_CONFIDENCE_BUILTIN_PATTERNS = frozenset({
+    r"sk_[A-Za-z0-9_]{10,}",
+    r"am_[A-Za-z0-9_-]{10,}",
+    r"fal_[A-Za-z0-9_-]{10,}",
+    r"fc-[A-Za-z0-9]{10,}",
+})
+_LOW_CONFIDENCE_PREFIXES = ("sk_", "am_", "fal_", "fc-")
+_LOW_CONFIDENCE_CONTEXT_RE = re.compile(
+    r"(?:api[_-]?key|key|token|secret|credential|auth|authorization|password)"
+    r"[A-Za-z0-9_.-]*[\"']?\s*(?:=|:)\s*(?:Bearer\s+)?[\"']?\s*$",
+    re.IGNORECASE,
+)
 
 # Assertions 18-20 are executed against these, through Hermes' own guards.
 GUARD_PROBE_PUSH = "git push origin main"
@@ -132,6 +153,39 @@ def _runtime_database_has_live_connection(path: Path) -> bool:
             path_text = path_text[:-len(sidecar)]
             break
     return has_live_connection(path_text)
+
+
+@lru_cache(maxsize=16)
+def _compile_dispatch_override(patterns: tuple):
+    """Compile one matcher per canonical/plugin registry generation."""
+    return re.compile(r"(?:" + "|".join(patterns) + r")\Z")
+
+
+def _low_confidence_match_is_overridden(token: str) -> bool:
+    """Whether a precise built-in or plugin pattern also owns *token*."""
+    patterns = tuple(
+        pattern for pattern in (
+            *secret_redaction._PREFIX_PATTERNS,
+            *secret_redaction._plugin_patterns(),
+        )
+        if pattern not in _LOW_CONFIDENCE_BUILTIN_PATTERNS
+    )
+    return bool(_compile_dispatch_override(patterns).fullmatch(token))
+
+
+def _contains_dispatch_gating_key(text: str) -> bool:
+    """Apply Hermes' canonical matcher with dispatch-safe precision."""
+    for match in secret_redaction._PREFIX_RE.finditer(text):
+        token = match.group(1)
+        if token.startswith(_LOW_CONFIDENCE_PREFIXES):
+            context = text[max(0, match.start(1) - 256):match.start(1)]
+            if (
+                not _low_confidence_match_is_overridden(token)
+                and not _LOW_CONFIDENCE_CONTEXT_RE.search(context)
+            ):
+                continue
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -607,8 +661,11 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
 
     Every non-runtime, non-binary local file is eligible regardless of suffix,
     including logs, rotations, backups, source files, and extensionless config.
-    Provider shapes come from Hermes' canonical, plugin-extensible redaction
-    matcher so this boundary cannot drift onto its own shorter provider list.
+    Files are streamed in bounded blocks; a large normal log is scanned rather
+    than refused. Provider shapes come from Hermes' canonical,
+    plugin-extensible redaction matcher, with four deliberately loose built-in
+    redaction families filtered from dispatch gating unless a more specific
+    canonical or plugin pattern also matches.
     SQLite runtime files are excluded from text matching, but an explicitly
     configured forbidden digest is checked before that exclusion whenever the
     database family is not already open in this process; lock safety takes
@@ -635,51 +692,51 @@ def scan_for_key_material(home: str, *, forbidden_sha256: tuple = (),
                 continue
             runtime_database = lower_name.endswith(_RUNTIME_DB_ENDINGS)
             credential_named = bool(_CREDENTIAL_FILENAME_RE.search(lower_name))
-
-            if forbidden_sha256 and not (
+            live_database = (
                 runtime_database and _runtime_database_has_live_connection(fpath)
-            ):
-                try:
-                    digest = hashlib.sha256()
-                    with fpath.open("rb") as stream:
-                        for block in iter(lambda: stream.read(1_048_576), b""):
-                            digest.update(block)
-                except OSError as exc:
-                    if strict:
-                        findings.append(f"{fpath} (unreadable: {exc.strerror})")
-                    continue
-                if digest.hexdigest() in forbidden_sha256:
-                    findings.append(f"{fpath} (matches a forbidden key digest)")
-                    continue
+            )
+            should_digest = bool(forbidden_sha256) and not live_database
+            should_match_provider = not runtime_database
 
             # Hermes' own SQLite databases contain arbitrary task text and
             # binary pages. They are runtime state, not credential stores; raw
             # text matching produced universal false positives in task and WAL
-            # content. A configured forbidden digest was already checked.
-            if runtime_database:
+            # content. Dormant files remain eligible for exact digest matching.
+            if not should_digest and not should_match_provider:
                 continue
+
+            digest = hashlib.sha256() if should_digest else None
+            provider_match = False
+            binary = False
+            non_whitespace = False
+            carry = ""
             try:
-                if fpath.stat().st_size > 1_000_000:
-                    if strict:
-                        findings.append(
-                            f"{fpath} (eligible file exceeds credential scan limit)"
-                        )
-                    continue
-                blob = fpath.read_bytes()
+                with fpath.open("rb") as stream:
+                    first_block = True
+                    for block in iter(
+                        lambda: stream.read(_KEY_SCAN_BLOCK_BYTES), b""
+                    ):
+                        if digest is not None:
+                            digest.update(block)
+                        if not non_whitespace and block.strip():
+                            non_whitespace = True
+                        if first_block:
+                            binary = b"\x00" in block[:8192]
+                            first_block = False
+                        if should_match_provider and not binary and not provider_match:
+                            window = carry + block.decode("latin-1")
+                            provider_match = _contains_dispatch_gating_key(window)
+                            carry = window[-_KEY_SCAN_CARRY_CHARS:]
             except OSError as exc:
                 if strict:
                     findings.append(f"{fpath} (unreadable: {exc.strerror})")
                 continue
-            # NUL content is the exclusion-shaped binary test. Unknown suffixes
-            # remain eligible; only content that is plainly binary is skipped.
-            if b"\x00" in blob[:8192]:
-                if credential_named and blob.strip(b"\x00"):
-                    findings.append(f"{fpath} (credential-shaped filename)")
-                continue
-            text = blob.decode("utf-8", errors="ignore")
-            if secret_redaction._PREFIX_RE.search(text):
+
+            if digest is not None and digest.hexdigest() in forbidden_sha256:
+                findings.append(f"{fpath} (matches a forbidden key digest)")
+            elif provider_match:
                 findings.append(f"{fpath} (contains provider key material)")
-            elif credential_named and blob.strip():
+            elif credential_named and non_whitespace:
                 findings.append(f"{fpath} (credential-shaped filename)")
     return findings
 

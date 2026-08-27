@@ -929,11 +929,11 @@ def test_release_failure_terminates_the_acknowledged_worker(
 
 
 @pytest.mark.live_system_guard_bypass
-@pytest.mark.parametrize("log_contains_key", [False, True])
-def test_real_board_assertion_eight_handles_runtime_db_and_unredacted_log(
-    tmp_path, monkeypatch, log_contains_key
+@pytest.mark.parametrize("log_case", ["none", "large-ordinary", "large-key"])
+def test_real_board_assertion_eight_streams_logs_and_refuses_keys(
+    tmp_path, monkeypatch, log_case
 ):
-    """A runtime DB passes, but provider material in a real log refuses."""
+    """Large normal logs pass, but provider material still refuses."""
     from hermes_cli import workspace_policy as wp
 
     home = tmp_path / "hermes-home"
@@ -974,10 +974,17 @@ def test_real_board_assertion_eight_handles_runtime_db_and_unredacted_log(
         "hermes_cli.config.load_config_readonly", lambda *a, **k: config
     )
     secret = "glpat-EXAMPLENOTREAL1234567890"
-    if log_contains_key:
+    if log_case != "none":
         logs = home / "logs"
         logs.mkdir()
-        (logs / "agent.log").write_text(f"provider response key={secret}\n")
+        ordinary = (
+            "am_i_right_about_this sk_learn_model_name "
+            "fal_back_provider_list\n"
+        )
+        content = ordinary + ("x" * 2_000_000)
+        if log_case == "large-key":
+            content += f"\nprovider response key={secret}\n"
+        (logs / "agent.log").write_text(content)
 
     processes = []
 
@@ -1008,7 +1015,7 @@ def test_real_board_assertion_eight_handles_runtime_db_and_unredacted_log(
         conn.commit()
 
         result = kb.dispatch_once(conn, spawn_fn=None)
-        if log_contains_key:
+        if log_case == "large-key":
             assert result.spawned == []
             events = conn.execute(
                 "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -1016,6 +1023,7 @@ def test_real_board_assertion_eight_handles_runtime_db_and_unredacted_log(
             ).fetchall()
             assert "confinement_violation" in [row["kind"] for row in events]
             assert "spawn_failed" in [row["kind"] for row in events]
+            assert "confinement_verified" not in [row["kind"] for row in events]
             assert all(secret not in row["payload"] for row in events)
             assert processes
             processes[0].wait(timeout=10)

@@ -456,6 +456,10 @@ def test_ordinary_runtime_text_is_not_credential_material(tmp_path):
         "setup_hooks: true\n"
         "backup_dir: /tmp\n"
         "up_stream_configuration_value: 1\n"
+        "sk_learn_model_name\n"
+        "am_i_right_about_this\n"
+        "fal_back_provider_list\n"
+        "fc-back-provider-list\n"
     )
     (home / "settings.yaml").write_text(ordinary)
     (home / "keyboard.md").write_text("ordinary keyboard instructions")
@@ -509,6 +513,61 @@ def test_provider_keys_are_detected_without_a_suffix_allowlist(
     assert findings
     assert str(target) in findings[0]
     assert all(secret not in finding for finding in findings)
+
+
+def test_provider_key_spanning_stream_blocks_is_detected(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    secret = b"glpat-EXAMPLENOTREAL1234567890"
+    first = b"x" * (wp._KEY_SCAN_BLOCK_BYTES - 3) + b"\ngl"
+    (home / "agent.log").write_bytes(first + secret[2:] + b"\n")
+    findings = wp.scan_for_key_material(str(home))
+    assert findings
+    assert secret.decode() not in findings[0]
+
+
+@pytest.mark.parametrize("assignment", [
+    "ELEVENLABS_API_KEY=sk_EXAMPLENOTREAL1234567890",
+    "AGENTMAIL_API_KEY=am_EXAMPLENOTREAL1234567890",
+    "FAL_API_KEY=fal_EXAMPLENOTREAL1234567890",
+    "FIRECRAWL_API_KEY=fc-EXAMPLENOTREAL1234567890",
+])
+def test_loose_provider_families_still_gate_in_credential_context(
+    tmp_path, assignment
+):
+    home = tmp_path / "h"
+    home.mkdir()
+    (home / "config").write_text(assignment)
+    findings = wp.scan_for_key_material(str(home))
+    assert findings
+    assert assignment not in findings[0]
+
+
+def test_specific_plugin_pattern_can_override_a_loose_builtin_prefix(tmp_path):
+    from agent import redact
+
+    home = tmp_path / "h"
+    home.mkdir()
+    token = "am_i_right_about_this"
+    (home / "agent.log").write_text(token)
+    assert wp.scan_for_key_material(str(home)) == []
+
+    original = {
+        source: list(patterns)
+        for source, patterns in redact._PLUGIN_PREFIX_PATTERNS.items()
+    }
+    try:
+        assert redact.register_redaction_patterns(
+            [r"am_i_[A-Za-z0-9_]{10,}"], source="workspace-policy-test"
+        ) == 1
+        findings = wp.scan_for_key_material(str(home))
+        assert findings
+        assert token not in findings[0]
+    finally:
+        with redact._registry_lock:
+            redact._PLUGIN_PREFIX_PATTERNS.clear()
+            redact._PLUGIN_PREFIX_PATTERNS.update(original)
+            redact._rebuild_prefix_matcher()
 
 
 def test_key_material_refuses_without_exposing_the_value(tmp_path):
@@ -588,6 +647,26 @@ def test_forbidden_digest_scan_does_not_byte_open_a_live_database(
         ) == []
     finally:
         conn.close()
+
+
+def test_digest_and_provider_scan_share_one_stream(tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    home.mkdir()
+    target = home / "agent.log"
+    target.write_text("ordinary log line\n" + ("x" * 2_000_000))
+    original_open = type(target).open
+    opens = []
+
+    def _counted_open(path, *args, **kwargs):
+        if path == target:
+            opens.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(target), "open", _counted_open)
+    assert wp.scan_for_key_material(
+        str(home), forbidden_sha256=("0" * 64,)
+    ) == []
+    assert opens == [target]
 
 
 def test_a_hermes_home_outside_the_sandbox_is_refused(tmp_path):
