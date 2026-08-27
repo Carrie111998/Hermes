@@ -1455,6 +1455,155 @@ class PluginState:
             atomic_json_write(self.path, data, mode=0o600)
 
 
+# Reasons a gateway message injection can resolve to. ``adopted`` is the only
+# outcome that means the event reached the stored session; every other value is
+# a refusal a caller can act on instead of a silent drop.
+GATEWAY_INJECTION_REASONS = (
+    "adopted",
+    "unknown_session",
+    "unauthorized",
+    "no_adapter",
+    "gateway_draining",
+    "internal_error",
+    "not_scheduled",
+    "injection_denied",
+    "no_gateway",
+    "invalid_request",
+    "unsupported",
+    "cancelled",
+    "timeout",
+    "cli_queued",
+)
+
+_MAX_INJECTION_CORRELATION_ID = 128
+
+
+@dataclass(frozen=True)
+class GatewayInjectionResult:
+    """What gateway dispatch decided about one injected message.
+
+    ``accepted`` is truthy only for ``reason == "adopted"``, i.e. the event was
+    handed to the adapter that owns the stored session. ``session_id`` is the
+    host's identity for that session -- never anything the caller supplied.
+    """
+
+    accepted: bool
+    reason: str
+    session_id: Optional[str] = None
+    session_key: Optional[str] = None
+    correlation_id: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
+class GatewayInjectionHandle:
+    """Deferred :class:`GatewayInjectionResult` for an awaited injection.
+
+    Await it on the gateway loop; call :meth:`result` from another thread (the
+    shape a plugin's own HTTP listener needs when it must answer a request only
+    after dispatch resolved). Both paths return a result object rather than
+    raising, so a caller never has to guess whether a failure means "refused"
+    or "crashed".
+    """
+
+    __slots__ = ("_future", "_correlation_id", "_session_key")
+
+    def __init__(
+        self,
+        future: Any,
+        *,
+        correlation_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> None:
+        self._future = future
+        self._correlation_id = correlation_id
+        self._session_key = session_key
+
+    @classmethod
+    def resolved(cls, result: GatewayInjectionResult) -> "GatewayInjectionHandle":
+        """Wrap an outcome that was decided before anything was scheduled."""
+        import concurrent.futures
+
+        future: Any = concurrent.futures.Future()
+        future.set_result(result)
+        return cls(
+            future,
+            correlation_id=result.correlation_id,
+            session_key=result.session_key,
+        )
+
+    @property
+    def correlation_id(self) -> Optional[str]:
+        return self._correlation_id
+
+    def cancel(self) -> bool:
+        """Cancel the pending dispatch; a later read reports ``cancelled``."""
+        return bool(self._future.cancel())
+
+    def _failure(self, reason: str) -> GatewayInjectionResult:
+        return GatewayInjectionResult(
+            False,
+            reason,
+            session_key=self._session_key,
+            correlation_id=self._correlation_id,
+        )
+
+    def _coerce(self, value: Any) -> GatewayInjectionResult:
+        if isinstance(value, GatewayInjectionResult):
+            return value
+        return self._failure("internal_error")
+
+    async def _resolve(self) -> GatewayInjectionResult:
+        import concurrent.futures
+
+        future = self._future
+        if isinstance(future, concurrent.futures.Future):
+            future = asyncio.wrap_future(future)
+        try:
+            return self._coerce(await future)
+        except asyncio.CancelledError:
+            # A cancelled *dispatch* is an outcome; a cancelled *caller* is not.
+            if self._future.cancelled():
+                return self._failure("cancelled")
+            raise
+        except Exception:
+            logger.warning("Gateway injection dispatch failed", exc_info=True)
+            return self._failure("internal_error")
+
+    def __await__(self):
+        return self._resolve().__await__()
+
+    def result(self, timeout: Optional[float] = None) -> GatewayInjectionResult:
+        """Block until dispatch resolves. Never call this on the gateway loop."""
+        import concurrent.futures
+
+        future = self._future
+        if not isinstance(future, concurrent.futures.Future):
+            raise RuntimeError(
+                "GatewayInjectionHandle.result() would deadlock on the gateway "
+                "loop; await the handle instead"
+            )
+        try:
+            return self._coerce(future.result(timeout))
+        except concurrent.futures.TimeoutError:
+            return self._failure("timeout")
+        except concurrent.futures.CancelledError:
+            return self._failure("cancelled")
+        except Exception:
+            logger.warning("Gateway injection dispatch failed", exc_info=True)
+            return self._failure("internal_error")
+
+
+def _validate_injection_correlation_id(value: Any) -> bool:
+    """Correlation ids are opaque bounded tags, never routing information."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _MAX_INJECTION_CORRELATION_ID
+        and value.isprintable()
+    )
+
+
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
@@ -2049,7 +2198,9 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
-    ) -> bool:
+        await_dispatch: bool = False,
+        correlation_id: str | None = None,
+    ) -> Any:
         """Inject a message into a CLI or gateway conversation.
 
         If the agent is idle (waiting for user input), this starts a new turn.
@@ -2060,13 +2211,44 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
-        A ``True`` return means the live gateway accepted the request for
-        asynchronous dispatch, not that platform delivery has completed.
 
-        Returns True if the message was queued successfully.
+        By default this returns ``True`` once the live gateway *accepted the
+        request for asynchronous dispatch* -- which cannot be distinguished
+        from an unknown session, a rotated session, revoked authorization, or a
+        missing adapter, all of which are only discovered later and logged.
+
+        Pass ``await_dispatch=True`` to get a :class:`GatewayInjectionHandle`
+        instead: await it (or call ``.result(timeout=...)`` off the gateway
+        loop) for a :class:`GatewayInjectionResult` naming what dispatch
+        actually decided, plus the host's ``session_id`` for the session that
+        received it. The default remains non-awaiting and unchanged.
+
+        ``correlation_id`` is an optional bounded opaque tag stamped onto the
+        dispatched event's metadata and echoed back in the result, so a caller
+        can prove *this* event reached *that* session. It is never routing
+        information: the route always comes from the stored session.
         """
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
+
+        def _refuse(reason: str) -> Any:
+            result = GatewayInjectionResult(
+                False,
+                reason,
+                session_key=session_key,
+                correlation_id=correlation_id,
+            )
+            return GatewayInjectionHandle.resolved(result) if await_dispatch else False
+
+        if correlation_id is not None and not _validate_injection_correlation_id(
+            correlation_id
+        ):
+            logger.warning(
+                "inject_message: correlation_id must be printable text of at "
+                "most %d characters",
+                _MAX_INJECTION_CORRELATION_ID,
+            )
+            return _refuse("invalid_request")
 
         if cli is not None:
             if getattr(cli, "_agent_running", False):
@@ -2075,13 +2257,20 @@ class PluginContext:
             else:
                 # Agent is idle - queue as next input
                 cli._pending_input.put(msg)
+            if await_dispatch:
+                # CLI injection has no gateway dispatch stage to report on.
+                return GatewayInjectionHandle.resolved(
+                    GatewayInjectionResult(
+                        True, "cli_queued", correlation_id=correlation_id
+                    )
+                )
             return True
 
         if not session_key:
             logger.warning(
                 "inject_message: gateway mode requires an existing session_key"
             )
-            return False
+            return _refuse("invalid_request")
         if not self._gateway_injection_allowed():
             plugin_id = self.manifest.key or self.manifest.name
             logger.warning(
@@ -2090,28 +2279,95 @@ class PluginContext:
                 plugin_id,
                 plugin_id,
             )
-            return False
+            return _refuse("injection_denied")
 
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
-            return False
+            return _refuse("no_gateway")
 
         plugin_id = self.manifest.key or self.manifest.name
-        try:
-            return bool(
-                self._manager.inject_gateway_message(
-                    session_key=session_key,
-                    content=msg,
-                    plugin_id=plugin_id,
-                )
+        kwargs: Dict[str, Any] = {
+            "session_key": session_key,
+            "content": msg,
+            "plugin_id": plugin_id,
+        }
+        # Only widen the injector call when the caller asked for the new
+        # behavior, so a host that published the original three-kwarg injector
+        # keeps working unchanged.
+        extra = []
+        if await_dispatch:
+            extra.append("await_dispatch")
+        if correlation_id is not None:
+            extra.append("correlation_id")
+        if extra and not self._manager.gateway_injector_accepts(*extra):
+            logger.warning(
+                "inject_message: the live gateway injector does not support "
+                "dispatch-outcome reporting for plugin %s",
+                plugin_id,
             )
+            return _refuse("unsupported")
+        if await_dispatch:
+            kwargs["await_dispatch"] = True
+        if correlation_id is not None:
+            kwargs["correlation_id"] = correlation_id
+        try:
+            outcome = self._manager.inject_gateway_message(**kwargs)
         except Exception:
             logger.warning(
                 "inject_message: gateway scheduling failed for plugin %s",
                 plugin_id,
                 exc_info=True,
             )
-            return False
+            return _refuse("internal_error")
+
+        if not await_dispatch:
+            return bool(outcome)
+        if isinstance(outcome, GatewayInjectionHandle):
+            return outcome
+        if isinstance(outcome, GatewayInjectionResult):
+            return GatewayInjectionHandle.resolved(outcome)
+        return _refuse("unsupported")
+
+    # -- host-authenticated call context -------------------------------------
+
+    @property
+    def call_context(self) -> Dict[str, str]:
+        """Identity of the turn that invoked this plugin, as the host knows it.
+
+        Tool handlers receive only what the model wrote into the arguments, so
+        anything a plugin must *trust* has to come from here instead. Values
+        are bound per asyncio task by the gateway, so concurrent sessions in
+        one process never read each other's identity. Every field is ``""``
+        when no session is bound (plain CLI, cron, tests).
+
+        The mapping is a fresh copy on each read; mutating it changes nothing.
+
+        Note what is deliberately absent: there is no host-authenticated
+        operator-approval receipt. An action that requires "a human approved
+        this" cannot be authorized from this context and must fail closed.
+        """
+        fields = {
+            "session_key": "HERMES_SESSION_KEY",
+            "session_id": "HERMES_SESSION_ID",
+            "platform": "HERMES_SESSION_PLATFORM",
+            "source": "HERMES_SESSION_SOURCE",
+            "chat_id": "HERMES_SESSION_CHAT_ID",
+            "chat_type": "HERMES_SESSION_CHAT_TYPE",
+            "chat_name": "HERMES_SESSION_CHAT_NAME",
+            "thread_id": "HERMES_SESSION_THREAD_ID",
+            "user_id": "HERMES_SESSION_USER_ID",
+            "user_name": "HERMES_SESSION_USER_NAME",
+            "scope_id": "HERMES_SESSION_SCOPE_ID",
+            "message_id": "HERMES_SESSION_MESSAGE_ID",
+        }
+        try:
+            from gateway.session_context import get_session_env
+        except Exception:
+            return {"profile": self.profile_name, **{k: "" for k in fields}}
+
+        context = {key: get_session_env(name, "") for key, name in fields.items()}
+        context["profile"] = self.profile_name
+        return context
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
@@ -4206,12 +4462,38 @@ class PluginManager:
         if registered is not None and registered[0] is owner:
             self._gateway_message_injector = None
 
-    def inject_gateway_message(self, **kwargs: Any) -> bool:
-        """Submit a plugin-triggered turn to the live gateway."""
+    def gateway_injector_accepts(self, *names: str) -> bool:
+        """Whether the live injector accepts these keyword arguments.
+
+        Lets a caller fall back cleanly instead of relying on a ``TypeError``,
+        which would also swallow a genuine ``TypeError`` from inside a
+        correctly-shaped injector.
+        """
         registered = self._gateway_message_injector
         if registered is None:
             return False
-        return bool(registered[1](**kwargs))
+        try:
+            parameters = inspect.signature(registered[1]).parameters
+        except (TypeError, ValueError):
+            return False
+        if any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return True
+        return all(name in parameters for name in names)
+
+    def inject_gateway_message(self, **kwargs: Any) -> Any:
+        """Submit a plugin-triggered turn to the live gateway.
+
+        Returns whatever the registered injector returned: a bool for the
+        default fire-and-forget call, or a ``GatewayInjectionHandle`` when the
+        caller passed ``await_dispatch=True``.
+        """
+        registered = self._gateway_message_injector
+        if registered is None:
+            return False
+        return registered[1](**kwargs)
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.

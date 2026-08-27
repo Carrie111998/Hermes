@@ -104,6 +104,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=...)` - see [Injecting Messages](#injecting-messages) |
+| Read the host's identity for this turn | `ctx.call_context` — see [Trusted Call Context](#trusted-call-context) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -722,7 +723,7 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, await_dispatch: bool = False, correlation_id: str | None = None) -> bool | GatewayInjectionHandle`
 
 In CLI mode:
 
@@ -741,7 +742,7 @@ In gateway mode:
 - The route and conversation are pinned while dispatch is pending. Hermes drops the request if topic recovery changes the route or the session rotates before handling starts.
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
-- Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
+- Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log — use [`await_dispatch=True`](#confirming-dispatch-with-await_dispatch) to receive that outcome instead of only logging it.
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 
@@ -760,6 +761,65 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 
 :::note
 This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
+:::
+
+### Confirming dispatch with `await_dispatch`
+
+The default `True` return only means the gateway accepted the request for asynchronous dispatch. An unknown session key, a rotated session, revoked authorisation, and a missing adapter all return `True` too and are then dropped with a log line — so a caller that has to *report* whether the message landed (a webhook receiver answering an HTTP request, for example) cannot do it from the return value.
+
+Pass `await_dispatch=True` to get a `GatewayInjectionHandle` instead:
+
+```python
+handle = ctx.inject_message(
+    "New data arrived from the webhook",
+    session_key="agent:main:telegram:dm:123456789",
+    await_dispatch=True,
+    correlation_id=event_id,          # optional, bounded, opaque
+)
+
+result = await handle                 # on the gateway loop
+# result = handle.result(timeout=5)   # from another thread
+
+if result.accepted:
+    respond(200, {"status": "adopted", "session_id": result.session_id})
+else:
+    respond(409, {"status": result.reason})
+```
+
+`GatewayInjectionResult` fields:
+
+| Field | Meaning |
+|-------|---------|
+| `accepted` | `True` only when the event reached the stored session's adapter. The result object is falsy otherwise. |
+| `reason` | `adopted`, `unknown_session`, `unauthorized`, `no_adapter`, `gateway_draining`, `internal_error`, `not_scheduled`, `injection_denied`, `no_gateway`, `invalid_request`, `unsupported`, `cancelled`, `timeout`, or `cli_queued`. |
+| `session_id` | The host's id for the session that received the message. Set on `adopted`. |
+| `session_key` | The key that was resolved. |
+| `correlation_id` | Echo of the tag you supplied, if any. |
+
+- `correlation_id` is an opaque bounded tag (printable, ≤128 characters). It is stamped onto the dispatched event's metadata as `hermes_plugin_injection_id` and echoed in the result so you can prove *this* event reached *that* session. It is never routing information — the platform, chat, thread, and user always come from the stored session.
+- `handle.result(...)` blocks and is only valid off the gateway loop; awaiting is the correct call on it. `handle.cancel()` cancels a pending dispatch, after which the result reads `cancelled`.
+- Both paths return a result object rather than raising, including on timeout and internal failure.
+- In CLI mode there is no gateway dispatch stage, so an awaited handle resolves immediately to `cli_queued`.
+- The default (`await_dispatch=False`) call is unchanged and still returns a plain `bool`.
+
+## Trusted Call Context
+
+A tool handler receives only what the model wrote into the tool arguments. Anything the plugin has to *trust* — which profile, which gateway session, which thread, which user — must come from the host instead:
+
+```python
+identity = ctx.call_context
+if identity["session_key"] != expected_session_key:
+    return "refused: this action belongs to a different session"
+```
+
+`ctx.call_context` returns a fresh `dict[str, str]` with `profile`, `session_key`, `session_id`, `platform`, `source`, `chat_id`, `chat_type`, `chat_name`, `thread_id`, `user_id`, `user_name`, `scope_id`, and `message_id`.
+
+- Values are bound per asyncio task by the gateway, so two concurrent sessions in one process never read each other's identity.
+- Every field is `""` when no session is bound — a plain CLI run, a cron job, or a test.
+- The returned mapping is a copy; mutating it changes nothing.
+
+:::warning
+There is no host-authenticated *operator approval* field. `ctx.call_context` tells you which human session a turn came from, not that a human approved a specific action. A plugin action that requires explicit approval must fail closed rather than trust a model-supplied claim that approval was granted.
 :::
 
 ## Calling MCP servers from plugins

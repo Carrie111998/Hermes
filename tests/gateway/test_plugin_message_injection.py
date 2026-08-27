@@ -160,7 +160,8 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
         plugin_id="notify-plugin",
     )
 
-    assert accepted is True
+    assert accepted.accepted is True
+    assert accepted.reason == "adopted"
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "check the deployment"
@@ -201,7 +202,7 @@ async def test_dispatch_rejects_unroutable_session(entry, with_adapter):
         plugin_id="notify-plugin",
     )
 
-    assert accepted is False
+    assert accepted.accepted is False
     adapter.handle_message.assert_not_awaited()
 
 
@@ -221,7 +222,7 @@ async def test_dispatch_rechecks_current_authorization(raises):
         plugin_id="notify-plugin",
     )
 
-    assert accepted is False
+    assert accepted.accepted is False
     adapter.handle_message.assert_not_awaited()
 
 
@@ -259,7 +260,7 @@ async def test_dispatch_rejects_stored_role_only_authorization(monkeypatch):
         plugin_id="notify-plugin",
     )
 
-    assert accepted is False
+    assert accepted.accepted is False
     adapter.handle_message.assert_not_awaited()
 
 
@@ -288,7 +289,7 @@ async def test_dispatch_stops_when_gateway_drains_during_lookup():
     runner._draining = True
     release_lookup.set()
 
-    assert await dispatch is False
+    assert (await dispatch).accepted is False
     adapter.handle_message.assert_not_awaited()
 
 
@@ -353,6 +354,7 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
         session_key="agent:main:telegram:dm:42",
         content="wake up",
         plugin_id="notify-plugin",
+        correlation_id=None,
     )
 
 

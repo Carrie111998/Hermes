@@ -19343,16 +19343,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
-    ) -> bool:
-        """Schedule a plugin-triggered turn on the live gateway loop."""
+        await_dispatch: bool = False,
+        correlation_id: str | None = None,
+    ):
+        """Schedule a plugin-triggered turn on the live gateway loop.
+
+        Returns ``True``/``False`` for the scheduling outcome by default. With
+        ``await_dispatch=True`` it returns a ``GatewayInjectionHandle`` that
+        resolves to what dispatch itself decided, so a caller can tell adoption
+        apart from a silent drop.
+        """
+        from hermes_cli.plugins import GatewayInjectionHandle, GatewayInjectionResult
+
+        def _refused(reason: str):
+            if not await_dispatch:
+                return False
+            return GatewayInjectionHandle.resolved(
+                GatewayInjectionResult(
+                    False,
+                    reason,
+                    session_key=session_key,
+                    correlation_id=correlation_id,
+                )
+            )
+
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
-            return False
+            return _refused("gateway_draining")
 
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key,
             content=content,
             plugin_id=plugin_id,
+            correlation_id=correlation_id,
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -19368,7 +19391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Plugin message injection scheduling failed",
                     exc_info=True,
                 )
-                return False
+                return _refused("not_scheduled")
             self._background_tasks.add(future)
             future.add_done_callback(self._background_tasks.discard)
         else:
@@ -19380,11 +19403,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_level=logging.WARNING,
             )
             if future is None:
-                return False
+                return _refused("not_scheduled")
 
         def _log_result(completed) -> None:
             try:
-                accepted = completed.result()
+                result = completed.result()
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
                 return
             except Exception:
@@ -19395,14 +19418,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
                 return
-            if not accepted:
+            if not result:
                 logger.warning(
-                    "Plugin message injection was not routed: plugin=%s session=%s",
+                    "Plugin message injection was not routed: plugin=%s session=%s "
+                    "reason=%s",
                     plugin_id,
                     session_key,
+                    getattr(result, "reason", "unknown"),
                 )
 
         future.add_done_callback(_log_result)
+        if await_dispatch:
+            return GatewayInjectionHandle(
+                future,
+                correlation_id=correlation_id,
+                session_key=session_key,
+            )
         return True
 
     async def _dispatch_plugin_message_injection(
@@ -19411,16 +19442,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
-    ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        correlation_id: str | None = None,
+    ):
+        """Route a plugin-triggered turn through the session's live adapter.
+
+        Returns a ``GatewayInjectionResult``. It is falsy for every refusal, so
+        callers that only cared about the boolean still read correctly.
+        """
+        from hermes_cli.plugins import GatewayInjectionResult
+
+        def _refused(reason: str) -> "GatewayInjectionResult":
+            return GatewayInjectionResult(
+                False,
+                reason,
+                session_key=session_key,
+                correlation_id=correlation_id,
+            )
+
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
-            return False
+            return _refused("gateway_draining")
 
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None:
-            return False
+            return _refused("unknown_session")
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
-            return False
+            return _refused("gateway_draining")
 
         source = dataclasses.replace(entry.origin)
         try:
@@ -19434,7 +19480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     plugin_id,
                     session_key,
                 )
-                return False
+                return _refused("unauthorized")
         except Exception:
             logger.warning(
                 "Plugin message injection authorization check failed: "
@@ -19443,11 +19489,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 exc_info=True,
             )
-            return False
+            return _refused("unauthorized")
 
         adapter = self._adapter_for_source(source)
         if adapter is None:
-            return False
+            return _refused("no_adapter")
+
+        metadata = {
+            "hermes_plugin_id": plugin_id,
+            "hermes_plugin_injection": True,
+            "gateway_session_key": session_key,
+            "gateway_session_id": entry.session_id,
+            "gateway_session_strict": True,
+        }
+        if correlation_id is not None:
+            metadata["hermes_plugin_injection_id"] = correlation_id
 
         event = MessageEvent(
             text=content,
@@ -19455,13 +19511,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             internal=True,
             allow_gateway_control=False,
-            metadata={
-                "hermes_plugin_id": plugin_id,
-                "hermes_plugin_injection": True,
-                "gateway_session_key": session_key,
-                "gateway_session_id": entry.session_id,
-                "gateway_session_strict": True,
-            },
+            metadata=metadata,
         )
         await adapter.handle_message(event)
         logger.info(
@@ -19470,7 +19520,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key,
             entry.session_id,
         )
-        return True
+        return GatewayInjectionResult(
+            True,
+            "adopted",
+            session_id=entry.session_id,
+            session_key=session_key,
+            correlation_id=correlation_id,
+        )
 
     def _get_cached_session_source(self, session_key: str):
         if not session_key:
