@@ -3687,9 +3687,11 @@ DEFAULT_CONFIG = {
         "capability_manifest": "",
         # macOS only: allow launching an UNSIGNED (ad-hoc / TeamIdentifier
         # not set) CuaDriver.app for the private-session daemon. The default
-        # (false) fails closed unless the bundle is signed with the official
-        # cua-driver identity (com.trycua.driver / team 4YEC26S9KF). Enable
-        # only when developing the driver locally from source.
+        # (false) fails closed unless the bundle is signed with an official
+        # cua-driver identity (com.trycua.driver with TeamIdentifier in the
+        # trusted allowlist: legacy ``4YEC26S9KF`` or current Cua AI, Inc.
+        # ``YCK386LBJ7`` for cua-driver 0.22.x). Enable only when developing
+        # the driver locally from source.
         "allow_unsigned_driver": False,
         # Pre-authorize existing-profile browser attachment in standard mode
         # (cua-driver's trusted-launcher `--grant existing-profile`). When
