@@ -145,6 +145,20 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         "which skills will load for that profile.",
     )
 
+    skills_active = skills_subparsers.add_parser(
+        "active",
+        help="List currently active (enabled and platform-compatible) skills",
+        description="Show skills that are currently active and loaded for the active profile and platform.",
+    )
+    skills_active.add_argument(
+        "--source", default="all", choices=["all", "hub", "builtin", "local"]
+    )
+    skills_active.add_argument(
+        "--json",
+        action="store_true",
+        help="Output active skills as JSON",
+    )
+
     skills_check = skills_subparsers.add_parser(
         "check", help="Check installed hub skills for updates"
     )

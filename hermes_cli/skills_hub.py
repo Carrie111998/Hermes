@@ -1081,6 +1081,88 @@ def do_list(source_filter: str = "all",
     c.print(summary)
 
 
+def do_active(source_filter: str = "all",
+              console: Optional[Console] = None,
+              as_json: bool = False) -> None:
+    """List skills that are currently active and loaded for the active profile and platform."""
+    import platform
+    from tools.skills_hub import HubLockFile, ensure_hub_dirs
+    from tools.skills_sync import _read_manifest
+    from tools.skills_tool import _find_all_skills
+    from agent.skill_utils import get_disabled_skill_names, skill_matches_platform_list
+
+    c = console or _console
+    ensure_hub_dirs()
+    lock = HubLockFile()
+    hub_installed = {e["name"]: e for e in lock.list_installed()}
+    builtin_names = set(_read_manifest())
+
+    all_skills = _find_all_skills(skip_disabled=True)
+    disabled_names = get_disabled_skill_names()
+
+    active_skills = []
+    current_os = platform.system().lower()
+    if current_os == "darwin":
+        current_os = "macos"
+
+    for skill in sorted(all_skills, key=lambda s: (s.get("category") or "", s["name"])):
+        name = skill["name"]
+        if name in disabled_names:
+            continue
+
+        platforms = skill.get("platforms")
+        if platforms and not skill_matches_platform_list(platforms):
+            continue
+
+        hub_entry = hub_installed.get(name)
+        if hub_entry:
+            source_type = "hub"
+            source_display = hub_entry.get("source", "hub")
+        elif name in builtin_names:
+            source_type = "builtin"
+            source_display = "builtin"
+        else:
+            source_type = "local"
+            source_display = "local"
+
+        if source_filter != "all" and source_filter != source_type:
+            continue
+
+        desc = skill.get("description", "").strip()
+        active_skills.append({
+            "name": name,
+            "category": skill.get("category", ""),
+            "source": source_display,
+            "source_type": source_type,
+            "description": desc,
+        })
+
+    if as_json:
+        import json
+        c.print(json.dumps(active_skills, indent=2))
+        return
+
+    if not active_skills:
+        c.print(f"[dim]No active skills found for current profile and platform ({current_os}).[/]\n")
+        return
+
+    title = f"Active Skills ({current_os})"
+    table = Table(title=title)
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Category", style="dim")
+    table.add_column("Source", style="dim")
+    table.add_column("Description", style="white")
+
+    for s in active_skills:
+        desc_preview = s["description"]
+        if len(desc_preview) > 60:
+            desc_preview = desc_preview[:57] + "..."
+        table.add_row(s["name"], s["category"], s["source"], desc_preview)
+
+    c.print(table)
+    c.print(f"[dim]{len(active_skills)} active skill(s) loaded for {current_os}.[/]\n")
+
+
 def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> None:
     """Check hub-installed skills for upstream updates."""
     from tools.skills_hub import check_for_skill_updates
@@ -1830,6 +1912,11 @@ def skills_command(args) -> None:
             source_filter=args.source,
             enabled_only=getattr(args, "enabled_only", False),
         )
+    elif action == "active":
+        do_active(
+            source_filter=getattr(args, "source", "all"),
+            as_json=getattr(args, "json", False),
+        )
     elif action == "check":
         do_check(name=getattr(args, "name", None))
     elif action == "update":
@@ -2013,6 +2100,15 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
                 source_filter = args[idx + 1]
         do_list(source_filter=source_filter, enabled_only=enabled_only, console=c)
 
+    elif action == "active":
+        source_filter = "all"
+        as_json = "--json" in args
+        if "--source" in args:
+            idx = args.index("--source")
+            if idx + 1 < len(args):
+                source_filter = args[idx + 1]
+        do_active(source_filter=source_filter, console=c, as_json=as_json)
+
     elif action == "check":
         name = args[0] if args else None
         do_check(name=name, console=c)
@@ -2113,6 +2209,8 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]inspect[/] <identifier>        Preview a skill without installing\n"
         "  [cyan]list[/] [--source hub|builtin|local] [--enabled-only]\n"
         "       List installed skills; --enabled-only filters to the active profile's live set\n"
+        "  [cyan]active[/] [--source hub|builtin|local] [--json]\n"
+        "       List currently active/loaded skills for the active profile and platform\n"
         "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
         "  [cyan]update[/] [name]               Update hub skills with upstream changes\n"
         "  [cyan]audit[/] [name]                Re-scan hub skills for security\n"
