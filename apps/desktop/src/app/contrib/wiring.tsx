@@ -110,7 +110,6 @@ import {
   CRON_ROUTE,
   navigateToWorkspacePage,
   routeSessionId,
-  sessionRoute,
   SETTINGS_ROUTE,
   syncWorkspaceRoute
 } from '../routes'
@@ -967,7 +966,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // close GESTURE (⌘-click / middle-click) — the strip reads the closer, not
   // the `uncloseable` flag, so the pane stays undismissable either way.
   useEffect(() => {
-    registerPaneCloser('workspace', () => void closeWorkspaceTab(id => navigate(sessionRoute(id))))
+    registerPaneCloser('workspace', () =>
+      void closeWorkspaceTab((id, ownerRoute) =>
+        openSession(id, navigate, 'main', { ownerRoute, workspaceMode: 'sessions' })
+      )
+    )
 
     return () => registerPaneCloser('workspace')
   }, [navigate])

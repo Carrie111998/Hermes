@@ -276,7 +276,10 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // macOS the menu accelerator owns ⌘W and routes through the same
     // closeActiveTab via IPC (see use-desktop-integrations); this binding is
     // the Win/Linux path where ⌘W reaches the renderer directly.
-    'view.closeTab': () => void closeActiveTab(id => navigate(sessionRoute(id))),
+    'view.closeTab': () =>
+      void closeActiveTab((id, ownerRoute) =>
+        openSession(id, navigate, 'main', { ownerRoute, workspaceMode: 'sessions' })
+      ),
     'view.reopenTab': reopenLastClosedTile,
     'view.findInPage': () => {
       // Suppress on overlay routes so it doesn't collide with overlay-specific

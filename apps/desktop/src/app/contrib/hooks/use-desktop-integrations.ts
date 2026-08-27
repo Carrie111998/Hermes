@@ -303,7 +303,10 @@ export function useDesktopIntegrations({
   // path is the `view.closeTab` keybind (use-keybinds), sharing closeActiveTab.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onClosePreviewRequested?.(
-      () => void closeActiveTab(id => navigate(sessionRoute(id)))
+      () =>
+        void closeActiveTab((id, ownerRoute) =>
+          openSession(id, navigate, 'main', { ownerRoute, workspaceMode: 'sessions' })
+        )
     )
 
     return () => unsubscribe?.()

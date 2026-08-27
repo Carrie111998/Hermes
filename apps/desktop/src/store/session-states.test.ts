@@ -40,6 +40,7 @@ import {
   openSessionTile,
   orderTilesByTree,
   patchSessionTile,
+  patchSessionTileForOwnerGeneration,
   recordSessionEventScope,
   releaseSessionTranscript,
   requestForOwnedSession,
@@ -129,8 +130,39 @@ describe('resetTileRuntimeBindings', () => {
 
     expect(invalidateRuntimeBindings).toHaveBeenCalledTimes(1)
     expect($sessionTiles.get()).toEqual([
-      { anchor: undefined, before: undefined, dir: undefined, storedSessionId: 'stored-a' }
+      { anchor: undefined, before: undefined, dir: undefined, ownerGeneration: 1, storedSessionId: 'stored-a' }
     ])
+  })
+
+  it('rejects stale resumes while reconnect generations advance monotonically', () => {
+    const ownerRoute = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+
+    $sessionTiles.set([
+      {
+        ownerGeneration: 0,
+        ownerRoute,
+        runtimeId: 'runtime-dead',
+        storedSessionId: 'stored-a'
+      }
+    ])
+
+    resetTileRuntimeBindings()
+
+    expect($sessionTiles.get()[0]).toMatchObject({ ownerGeneration: 1, ownerRoute, storedSessionId: 'stored-a' })
+    expect($sessionTiles.get()[0]).not.toHaveProperty('runtimeId')
+    expect(
+      patchSessionTileForOwnerGeneration('stored-a', 0, { runtimeId: 'runtime-stale-zero' }, ownerRoute)
+    ).toBe(false)
+
+    // A reconnect while the replacement resume is still in flight has no
+    // runtime binding to clear, but must invalidate that generation too.
+    resetTileRuntimeBindings()
+
+    expect($sessionTiles.get()[0]).toMatchObject({ ownerGeneration: 2, ownerRoute, storedSessionId: 'stored-a' })
+    expect(
+      patchSessionTileForOwnerGeneration('stored-a', 1, { runtimeId: 'runtime-stale-one' }, ownerRoute)
+    ).toBe(false)
+    expect($sessionTiles.get()[0]).not.toHaveProperty('runtimeId')
   })
 
   it('tolerates a delegate without invalidateRuntimeBindings (older wiring)', () => {
@@ -473,6 +505,7 @@ describe('SessionTile workspace scope', () => {
       anchor: undefined,
       before: undefined,
       dir: undefined,
+      ownerGeneration: 1,
       storedSessionId: 'bot-chat',
       workspaceMode: 'bots',
       workspaceOwnerKey: 'connection-a::default'
@@ -957,7 +990,24 @@ describe('nextSessionTileForWorkspace (⌘W promotion source)', () => {
     $layoutTree.set(group(['workspace', tilePane('a'), tilePane('b')], { active: 'workspace', id: 'main' }))
     $sessionTiles.set([tile('a'), tile('b')])
 
-    expect(nextSessionTileForWorkspace()).toBe('a')
+    expect(nextSessionTileForWorkspace()).toEqual(tile('a'))
+  })
+
+  it('returns the exact owner tile when duplicate stored ids share the workspace strip', () => {
+    const ownerA = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+    const ownerB = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+    const tileA = { ownerRoute: ownerA, storedSessionId: 'shared-promotion' }
+    const tileB = { ownerRoute: ownerB, storedSessionId: 'shared-promotion' }
+
+    $layoutTree.set(
+      group(
+        ['workspace', sessionTilePaneId('shared-promotion', ownerB), sessionTilePaneId('shared-promotion', ownerA)],
+        { active: 'workspace', id: 'main' }
+      )
+    )
+    $sessionTiles.set([tileA, tileB])
+
+    expect(nextSessionTileForWorkspace()).toEqual(tileB)
   })
 
   it('side-by-side layout: a tile in ANOTHER zone still promotes instead of dropping main to a fresh draft (#88924)', () => {
@@ -971,7 +1021,7 @@ describe('nextSessionTileForWorkspace (⌘W promotion source)', () => {
     )
     $sessionTiles.set([tile('side')])
 
-    expect(nextSessionTileForWorkspace()).toBe('side')
+    expect(nextSessionTileForWorkspace()).toEqual(tile('side'))
   })
 
   it('returns null when no live tile exists anywhere in the tree', () => {

@@ -1383,8 +1383,17 @@ export function resetTileRuntimeBindings(
 
   sessionTileDelegate()?.invalidateRuntimeBindings?.(preservedTileIdentities)
 
-  if (tiles.some(tile => tile.runtimeId && !preservedTileIdentities.has(tileIdentity(tile)))) {
-    $sessionTiles.set(tiles.map(tile => (preservedTileIdentities.has(tileIdentity(tile)) ? tile : toStored(tile))))
+  const invalidatedTiles = tiles.map((tile: SessionTile) =>
+    preservedTileIdentities.has(tileIdentity(tile))
+      ? tile
+      : {
+          ...toStored(tile),
+          ownerGeneration: (tile.ownerGeneration ?? 0) + 1
+        }
+  )
+
+  if (invalidatedTiles.some((tile: SessionTile, index: number) => tile !== tiles[index])) {
+    $sessionTiles.set(invalidatedTiles)
   }
 }
 
@@ -1612,9 +1621,10 @@ export function openSessionTile(
 /** ⌘W on the MAIN tab: the next session tab stacked WITH the workspace, to
  *  shift into main. Walks the workspace group's strip from the workspace tab
  *  outward (the tab after it first, then wrapping to the ones before), and
- *  returns the first session tile's stored id. Null when the workspace has no
- *  session tab stacked beside it (⌘W then stays the no-op it was). */
-export function nextSessionTileForWorkspace(): null | string {
+ *  returns the exact tile so duplicate stored ids retain their owner route.
+ *  Null when the workspace has no session tab stacked beside it (⌘W then stays
+ *  the no-op it was). */
+export function nextSessionTileForWorkspace(): null | SessionTile {
   const tree = $layoutTree.get()
   const group = tree ? findGroupOfPane(tree, 'workspace') : null
 
@@ -1632,7 +1642,7 @@ export function nextSessionTileForWorkspace(): null | string {
       const tile = tileForIdentity(tiles, paneId.slice(TILE_PANE_PREFIX.length))
 
       if (tile) {
-        return tile.storedSessionId
+        return tile
       }
     }
   }
@@ -1644,7 +1654,7 @@ export function nextSessionTileForWorkspace(): null | string {
   // also collapses its zone, so Close is how a multi-pane layout shrinks.
   for (const tile of tiles) {
     if (tree && findGroupOfPane(tree, sessionTilePaneId(tile.storedSessionId, tile.ownerRoute))) {
-      return tile.storedSessionId
+      return tile
     }
   }
 

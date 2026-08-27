@@ -1,9 +1,11 @@
 import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { SessionTile } from '@/store/session-states'
+
 const closeFocusedSessionTab = vi.fn(() => false)
 const closeFocusedToolTab = vi.fn(() => false)
-const nextSessionTileForWorkspace = vi.fn<() => null | string>(() => null)
+const nextSessionTileForWorkspace = vi.fn<() => null | SessionTile>(() => null)
 const closeSessionTile = vi.fn()
 const requestFreshSession = vi.fn()
 
@@ -92,13 +94,26 @@ describe('closeActiveTab', () => {
 describe('closeWorkspaceTab', () => {
   it('shifts the next stacked session into main', () => {
     loadedMainOnly()
-    nextSessionTileForWorkspace.mockReturnValue('stored-b')
+    nextSessionTileForWorkspace.mockReturnValue({ storedSessionId: 'stored-b' })
     const load = vi.fn()
 
     expect(closeWorkspaceTab(load)).toBe(true)
-    expect(closeSessionTile).toHaveBeenCalledWith('stored-b')
-    expect(load).toHaveBeenCalledWith('stored-b')
+    expect(closeSessionTile).toHaveBeenCalledWith('stored-b', undefined)
+    expect(load).toHaveBeenCalledWith('stored-b', undefined)
     // Promotion refills main — it must not ALSO blank it.
+    expect(requestFreshSession).not.toHaveBeenCalled()
+  })
+
+  it('closes and loads the same exact-owner twin when stored ids collide', () => {
+    loadedMainOnly()
+    const ownerRoute = { connectionId: 'source-b', mode: 'remote' as const, profile: 'worker' }
+
+    nextSessionTileForWorkspace.mockReturnValue({ ownerRoute, storedSessionId: 'shared-promotion' })
+    const load = vi.fn()
+
+    expect(closeWorkspaceTab(load)).toBe(true)
+    expect(closeSessionTile).toHaveBeenCalledWith('shared-promotion', ownerRoute)
+    expect(load).toHaveBeenCalledWith('shared-promotion', ownerRoute)
     expect(requestFreshSession).not.toHaveBeenCalled()
   })
 
