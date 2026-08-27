@@ -220,7 +220,8 @@ class TestAnnotationCaptureAtDiscovery:
             "trust": "untrusted",
             "tools": {"resources": False, "prompts": False},
         }
-        with patch("tools.registry.registry", ToolRegistry()), \
+        reg = ToolRegistry()
+        with patch("tools.registry.registry", reg), \
              patch("tools.mcp_tool._track_mcp_tool_server"):
             mcp_tool._register_server_tools("srv", server, config)
 
@@ -230,6 +231,12 @@ class TestAnnotationCaptureAtDiscovery:
         # Anything not exactly True is write-capable.
         assert not hints.get("delete_repo")
         assert not hints.get("no_annotations")
+        list_entry = reg.get_entry("mcp__srv__list_repos")
+        delete_entry = reg.get_entry("mcp__srv__delete_repo")
+        unknown_entry = reg.get_entry("mcp__srv__no_annotations")
+        assert list_entry is not None and list_entry.read_only is True
+        assert delete_entry is not None and delete_entry.read_only is False
+        assert unknown_entry is not None and unknown_entry.read_only is False
 
     def test_dict_annotations_supported(self):
         """Cached/JSON annotations arrive as plain dicts."""
