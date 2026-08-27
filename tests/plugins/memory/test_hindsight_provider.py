@@ -396,7 +396,27 @@ class TestEmbeddedDaemonConfigChangeRestart:
     def _run_start_daemon_and_wait(self, provider, tmp_path, monkeypatch, fake_client):
         """Drive provider.initialize() in local_embedded mode, then block
         until the background daemon-start thread it spawns has finished."""
+        import sys
         import threading
+        import types
+
+        # hindsight_embed is an optional runtime dependency: the daemon-start
+        # thread imports hindsight_embed.daemon_embed_manager to redirect its
+        # Rich console. It is absent on CI, where the resulting ImportError is
+        # swallowed by the thread's blanket ``except Exception`` and the body
+        # silently never reaches the behavior under test. Stub the module so
+        # this test exercises the product path on any machine instead of
+        # passing only where the optional package happens to be installed.
+        if "hindsight_embed.daemon_embed_manager" not in sys.modules:
+            parent = sys.modules.get("hindsight_embed")
+            if parent is None:
+                parent = types.ModuleType("hindsight_embed")
+                monkeypatch.setitem(sys.modules, "hindsight_embed", parent)
+            dem = types.ModuleType("hindsight_embed.daemon_embed_manager")
+            monkeypatch.setitem(
+                sys.modules, "hindsight_embed.daemon_embed_manager", dem
+            )
+            monkeypatch.setattr(parent, "daemon_embed_manager", dem, raising=False)
 
         monkeypatch.setattr(
             "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
