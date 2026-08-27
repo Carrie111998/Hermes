@@ -73,6 +73,8 @@ import {
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
+import { dropTranscriptTail, saveTranscriptTail } from '@/store/transcript-tail-cache'
+import { isWatchWindow } from '@/store/windows'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
@@ -111,6 +113,11 @@ vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   noteActiveTreeGroup: vi.fn(),
   revealTreePane: vi.fn()
+}))
+
+vi.mock('@/store/windows', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  isWatchWindow: vi.fn(() => false)
 }))
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
@@ -2013,6 +2020,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     // not-called assertions below only see this describe's traffic.
     vi.mocked(requestGatewayForProfile).mockReset()
     vi.mocked(requestGatewayForAgent).mockReset()
+    vi.mocked(isWatchWindow).mockReset().mockReturnValue(false)
   })
 
   afterEach(() => {
@@ -2334,6 +2342,233 @@ describe('resumeSession warm-cache mapping integrity', () => {
     })
     await resumePromise
     expect($messages.get()).toHaveLength(500)
+  })
+
+  it('mints transcript provenance after an identity-validated cold REST hydrate', async () => {
+    setSessions([
+      storedSession({
+        _lineage_root_id: 'root-A',
+        id: 'stored-A',
+        message_count: 2
+      })
+    ])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'cold prompt', role: 'user', timestamp: 1 },
+        { content: 'cold answer', role: 'assistant', timestamp: 2 }
+      ],
+      session_id: 'stored-A'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map()
+    }
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    const resumedState = sessionStateByRuntimeIdRef.current.get('rt-A')
+    expect(JSON.stringify(resumedState?.messages)).toContain('cold prompt')
+    expect(resumedState?.transcriptProvenance).toEqual(
+      createPersistedDisplayTranscriptProvenance({
+        lineageRootId: 'root-A',
+        scope: undefined,
+        storedSessionId: 'stored-A'
+      })
+    )
+  })
+
+  it.each(['missing REST identity', 'wrong REST identity', 'wrong resume identity'] as const)(
+    'keeps a cold transcript unproven for %s',
+    async identityMode => {
+      setSessions([
+        storedSession({
+          _lineage_root_id: 'root-A',
+          id: 'stored-A',
+          message_count: 2
+        })
+      ])
+      vi.mocked(getLatestSessionMessages).mockResolvedValue({
+        messages: [
+          { content: 'cold prompt', role: 'user', timestamp: 1 },
+          { content: 'cold answer', role: 'assistant', timestamp: 2 }
+        ],
+        ...(identityMode === 'missing REST identity'
+          ? {}
+          : { session_id: identityMode === 'wrong REST identity' ? 'stored-B' : 'stored-A' })
+      } as never)
+
+      const requestGateway = vi.fn(async (method: string) => {
+        if (method === 'session.resume') {
+          return {
+            info: {},
+            message_count: 2,
+            messages: [
+              { content: 'runtime prompt', role: 'user', timestamp: 1 },
+              { content: 'runtime answer', role: 'assistant', timestamp: 2 }
+            ],
+            resumed: identityMode === 'wrong resume identity' ? 'stored-B' : 'stored-A',
+            running: false,
+            session_id: 'rt-A',
+            session_key: identityMode === 'wrong resume identity' ? 'stored-B' : 'stored-A'
+          } as never
+        }
+
+        return {} as never
+      })
+      const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+        current: new Map()
+      }
+      let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+      render(
+        <ResumeHarness
+          onReady={ready => (resume = ready)}
+          requestGateway={requestGateway}
+          sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+        />
+      )
+      await waitFor(() => expect(resume).not.toBeNull())
+      await resume!('stored-A', true)
+
+      const resumedState = sessionStateByRuntimeIdRef.current.get('rt-A')
+      expect(resumedState).toBeDefined()
+      expect(resumedState?.transcriptProvenance).toBeUndefined()
+    }
+  )
+
+  it('keeps a cold watch-window transcript unproven without REST authority', async () => {
+    vi.mocked(isWatchWindow).mockReturnValue(true)
+    setSessions([storedSession({ _lineage_root_id: 'root-A', id: 'stored-A', message_count: 2 })])
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [
+            { content: 'watch prompt', role: 'user', timestamp: 1 },
+            { content: 'watch answer', role: 'assistant', timestamp: 2 }
+          ],
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map()
+    }
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+    expect(sessionStateByRuntimeIdRef.current.get('rt-A')?.transcriptProvenance).toBeUndefined()
+  })
+
+  it('does not infer proof from a cold durable-tail paint before REST authority', async () => {
+    setSessions([storedSession({ _lineage_root_id: 'root-A', id: 'stored-A', message_count: 2 })])
+    saveTranscriptTail(
+      'stored-A',
+      [
+        { id: 'tail-user', parts: [{ text: 'tail prompt', type: 'text' }], role: 'user' },
+        { id: 'tail-assistant', parts: [{ text: 'tail answer', type: 'text' }], role: 'assistant' }
+      ],
+      undefined
+    )
+
+    const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    const resumed = deferred<SessionResumeResponse>()
+    vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise)
+
+    const requestGateway = vi.fn((method: string) => {
+      if (method === 'session.resume') {
+        return resumed.promise as never
+      }
+
+      return Promise.resolve({}) as never
+    })
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map()
+    }
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    const resumePromise = resume!('stored-A', true)
+
+    await waitFor(() => expect(JSON.stringify($messages.get())).toContain('tail prompt'))
+    expect(sessionStateByRuntimeIdRef.current.size).toBe(0)
+
+    persisted.resolve({
+      messages: [
+        { content: 'persisted prompt', role: 'user', timestamp: 1 },
+        { content: 'persisted answer', role: 'assistant', timestamp: 2 }
+      ],
+      session_id: 'stored-A'
+    })
+    resumed.resolve({
+      info: {},
+      message_count: 2,
+      messages: [],
+      messages_omitted: true,
+      resumed: 'stored-A',
+      running: false,
+      session_id: 'rt-A',
+      session_key: 'stored-A'
+    })
+    await resumePromise
+
+    expect(sessionStateByRuntimeIdRef.current.get('rt-A')?.transcriptProvenance).toEqual(
+      createPersistedDisplayTranscriptProvenance({
+        lineageRootId: 'root-A',
+        scope: undefined,
+        storedSessionId: 'stored-A'
+      })
+    )
+    dropTranscriptTail('stored-A', undefined)
   })
 
   it('does not publish an unproven warm transcript before persisted authority settles', async () => {

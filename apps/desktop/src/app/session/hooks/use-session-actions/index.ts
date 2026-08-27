@@ -1427,6 +1427,14 @@ export function useSessionActions({
       const stored =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
 
+      const expectedProvenance = stored
+        ? createPersistedDisplayTranscriptProvenance({
+            lineageRootId: stored._lineage_root_id ?? null,
+            scope: sessionRestScope,
+            storedSessionId
+          })
+        : null
+
       applyStoredSessionPreviewRuntimeInfo(stored, storedSessionId)
 
       if (stored) {
@@ -1534,6 +1542,28 @@ export function useSessionActions({
 
         const prefetchMatchesResumedSession =
           !prefetchedStoredSessionId || !resumedStoredSessionId || prefetchedStoredSessionId === resumedStoredSessionId
+
+        const currentStored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+
+        const currentExpectedProvenance = currentStored
+          ? createPersistedDisplayTranscriptProvenance({
+              lineageRootId: currentStored._lineage_root_id ?? null,
+              scope: sessionRestScope,
+              storedSessionId
+            })
+          : null
+
+        const acceptedPersistedDisplayTranscript = Boolean(
+          prefetchApplied &&
+          expectedProvenance &&
+          currentExpectedProvenance &&
+          hasPersistedDisplayTranscriptProvenance(
+            { transcriptProvenance: expectedProvenance },
+            currentExpectedProvenance
+          ) &&
+          prefetchedResult?.session_id === storedSessionId &&
+          resumedStoredSessionId === storedSessionId
+        )
 
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
 
@@ -1687,6 +1717,7 @@ export function useSessionActions({
             ...state,
             ...(runtimeInfo ?? {}),
             messages: visibleMessagesForView,
+            transcriptProvenance: acceptedPersistedDisplayTranscript ? expectedProvenance ?? undefined : undefined,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.
