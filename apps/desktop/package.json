@@ -220,6 +220,10 @@
       {
         "from": "assets/icon.ico",
         "to": "icon.ico"
+      },
+      {
+        "from": "node_modules/@nous-research/ui/dist/fonts",
+        "to": "node_modules/@nous-research/ui/dist/fonts"
       }
     ],
     "asar": true,
