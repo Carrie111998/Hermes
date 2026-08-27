@@ -10,10 +10,11 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 
 # --- from web_server.py (originally lines 1273-1372) ---
+
 
 class ConfigUpdate(BaseModel):
     config: dict
@@ -119,6 +120,7 @@ class ManagedFileDelete(BaseModel):
 
 # --- from web_server.py (originally lines 1398-1491) ---
 
+
 class ModelAssignment(BaseModel):
     """Payload for POST /api/model/set — assign a provider/model to a slot.
 
@@ -127,6 +129,7 @@ class ModelAssignment(BaseModel):
     scope="auxiliary" with task=""  → applied to every auxiliary.* slot
     scope="auxiliary" with task="__reset__"  → resets every slot to provider="auto"
     """
+
     scope: str
     provider: str
     model: str
@@ -217,12 +220,14 @@ class MoaConfigPayload(_MoaReferenceControls):
 
 # --- from web_server.py (originally lines 2718-2720) ---
 
+
 class FsWriteText(BaseModel):
     path: str
     content: str
 
 
 # --- from web_server.py (originally lines 2826-2856) ---
+
 
 class GitPathBody(BaseModel):
     path: str
@@ -272,11 +277,13 @@ class GitBranchSwitchBody(BaseModel):
 
 # --- from web_server.py (originally lines 3610-3611) ---
 
+
 class CuratorPause(BaseModel):
     paused: bool
 
 
 # --- from web_server.py (originally lines 3649-3657) ---
+
 
 class LearningNodeRef(BaseModel):
     id: str
@@ -291,6 +298,7 @@ class LearningNodeEdit(BaseModel):
 
 class WisdomSuggestRequest(BaseModel):
     skill: Optional[str] = None
+    local_skill_id: Optional[str] = None
     description: Optional[str] = None
     system_specification: Optional[Dict[str, Any]] = None
     send_for_owner_only_server_review: bool = False
@@ -313,6 +321,35 @@ class WisdomReviewRequest(BaseModel):
     profile: Optional[str] = None
 
 
+class WisdomEditedFile(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    content_utf8: str = Field(max_length=256 * 1024)
+
+
+class WisdomPreparedSaveRequest(BaseModel):
+    draft_id: str
+    author_description: str = Field(min_length=1, max_length=4096)
+    files: List[WisdomEditedFile] = Field(min_length=2, max_length=32)
+    profile: Optional[str] = None
+
+
+class WisdomCandidateDismissRequest(BaseModel):
+    local_skill_id: str
+    content_hash: str
+    profile: Optional[str] = None
+
+
+class WisdomReviseRequest(BaseModel):
+    draft_id: str
+    author_description: str = Field(min_length=1, max_length=4096)
+    files: List[WisdomEditedFile] = Field(min_length=2, max_length=32)
+    expected_content_hash: str
+    expected_author_description_hash: str
+    expected_package_manifest_hash: str
+    send_for_owner_only_server_review: bool = False
+    profile: Optional[str] = None
+
+
 class WisdomDecisionRequest(BaseModel):
     draft_id: str
     profile: Optional[str] = None
@@ -320,7 +357,7 @@ class WisdomDecisionRequest(BaseModel):
 
 class WisdomInstallPlanRequest(BaseModel):
     reference: str
-    update_mode: Optional[str] = None
+    update_mode: Optional[Literal["MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"]] = None
     profile: Optional[str] = None
 
 
@@ -360,6 +397,7 @@ class WisdomNotificationRequest(BaseModel):
 
 # --- from web_server.py (originally lines 3786-3792) ---
 
+
 class DebugShareRequest(BaseModel):
     # Redaction is ON by default — force-mode scrubs credential-shaped tokens
     # out of log content before it leaves the machine. The toggle exists so an
@@ -371,11 +409,13 @@ class DebugShareRequest(BaseModel):
 
 # --- from web_server.py (originally lines 4492-4493) ---
 
+
 class TTSSpeakRequest(BaseModel):
     text: str
 
 
 # --- from web_server.py (originally lines 11549-11551) ---
+
 
 class OAuthSubmitBody(BaseModel):
     session_id: str
@@ -383,6 +423,7 @@ class OAuthSubmitBody(BaseModel):
 
 
 # --- from web_server.py (originally lines 11708-11715) ---
+
 
 class BulkDeleteSessions(BaseModel):
     ids: List[str]
@@ -395,6 +436,7 @@ class SessionImport(BaseModel):
 
 
 # --- from web_server.py (originally lines 12082-12090) ---
+
 
 class SessionRename(BaseModel):
     title: Optional[str] = None
@@ -412,6 +454,7 @@ class SessionRename(BaseModel):
 
 
 # --- from web_server.py (originally lines 12149-12174) ---
+
 
 class SessionPrune(BaseModel):
     older_than_days: Optional[float] = 90
@@ -443,6 +486,7 @@ class SessionPrune(BaseModel):
 
 # --- from web_server.py (originally lines 12335-12352) ---
 
+
 class CronJobCreate(BaseModel):
     prompt: str = ""
     schedule: str
@@ -465,12 +509,14 @@ class CronJobUpdate(BaseModel):
 
 # --- from web_server.py (originally lines 12924-12926) ---
 
+
 class AutomationBlueprintInstantiate(BaseModel):
-    blueprint: str                      # blueprint key, e.g. "morning-brief"
-    values: Dict[str, Any] = {}      # filled slot values from the form
+    blueprint: str  # blueprint key, e.g. "morning-brief"
+    values: Dict[str, Any] = {}  # filled slot values from the form
 
 
 # --- from web_server.py (originally lines 13002-13019) ---
+
 
 class MCPServerCreate(BaseModel):
     name: str
@@ -494,12 +540,14 @@ class MCPServersReplace(BaseModel):
 
 # --- from web_server.py (originally lines 13518-13520) ---
 
+
 class MCPEnabledToggle(BaseModel):
     enabled: bool
     profile: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 13622-13627) ---
+
 
 class MCPCatalogInstall(BaseModel):
     name: str
@@ -510,6 +558,7 @@ class MCPCatalogInstall(BaseModel):
 
 
 # --- from web_server.py (originally lines 13716-13723) ---
+
 
 class PairingApprove(BaseModel):
     platform: str
@@ -525,6 +574,7 @@ class PairingRevoke(BaseModel):
 
 
 # --- from web_server.py (originally lines 13793-13804) ---
+
 
 class WebhookCreate(BaseModel):
     name: str
@@ -542,11 +592,13 @@ class WebhookCreate(BaseModel):
 
 # --- from web_server.py (originally lines 13930-13931) ---
 
+
 class WebhookEnabledToggle(BaseModel):
     enabled: bool
 
 
 # --- from web_server.py (originally lines 13997-14002) ---
+
 
 class CredentialPoolAdd(BaseModel):
     provider: str
@@ -557,6 +609,7 @@ class CredentialPoolAdd(BaseModel):
 
 
 # --- from web_server.py (originally lines 14171-14178) ---
+
 
 class MemoryProviderSelect(BaseModel):
     # "" or "built-in" disables the external provider (built-in only).
@@ -570,12 +623,14 @@ class MemoryReset(BaseModel):
 
 # --- from web_server.py (originally lines 14274-14276) ---
 
+
 class BackupRequest(BaseModel):
     # Optional output path; defaults to a timestamped zip in the home dir.
     output: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 14339-14348) ---
+
 
 class ImportRequest(BaseModel):
     archive: str
@@ -591,6 +646,7 @@ class ImportRequest(BaseModel):
 
 # --- from web_server.py (originally lines 14505-14513) ---
 
+
 class HookCreate(BaseModel):
     event: str
     command: str
@@ -604,12 +660,14 @@ class HookCreate(BaseModel):
 
 # --- from web_server.py (originally lines 14573-14575) ---
 
+
 class HookDelete(BaseModel):
     event: str
     command: str
 
 
 # --- from web_server.py (originally lines 14667-14669) ---
+
 
 class SkillInstallRequest(BaseModel):
     identifier: str
@@ -618,6 +676,7 @@ class SkillInstallRequest(BaseModel):
 
 # --- from web_server.py (originally lines 14724-14726) ---
 
+
 class SkillUninstallRequest(BaseModel):
     name: str
     profile: Optional[str] = None
@@ -625,11 +684,13 @@ class SkillUninstallRequest(BaseModel):
 
 # --- from web_server.py (originally lines 14748-14749) ---
 
+
 class SkillsUpdateRequest(BaseModel):
     profile: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 15116-15166) ---
+
 
 class ProfileCreate(BaseModel):
     name: str
@@ -702,6 +763,7 @@ class ProfileDescribeAuto(BaseModel):
 
 # --- from web_server.py (originally lines 15831-15834) ---
 
+
 class SkillToggle(BaseModel):
     name: str
     enabled: bool
@@ -709,6 +771,7 @@ class SkillToggle(BaseModel):
 
 
 # --- from web_server.py (originally lines 15883-15893) ---
+
 
 class SkillCreate(BaseModel):
     name: str
@@ -725,12 +788,14 @@ class SkillContentUpdate(BaseModel):
 
 # --- from web_server.py (originally lines 16022-16024) ---
 
+
 class ToolsetToggle(BaseModel):
     enabled: bool
     profile: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 16199-16204) ---
+
 
 class ToolsetProviderSelect(BaseModel):
     provider: str
@@ -742,6 +807,7 @@ class ToolsetProviderSelect(BaseModel):
 
 # --- from web_server.py (originally lines 16324-16327) ---
 
+
 class ToolsetModelSelect(BaseModel):
     model: str
     provider: Optional[str] = None
@@ -750,12 +816,14 @@ class ToolsetModelSelect(BaseModel):
 
 # --- from web_server.py (originally lines 16510-16512) ---
 
+
 class ToolsetEnvUpdate(BaseModel):
     env: Dict[str, str]
     profile: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 16570-16572) ---
+
 
 class ToolsetPostSetup(BaseModel):
     key: str
@@ -764,12 +832,14 @@ class ToolsetPostSetup(BaseModel):
 
 # --- from web_server.py (originally lines 16823-16825) ---
 
+
 class TerminalBackendSelect(BaseModel):
     backend: str
     profile: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 16919-16921) ---
+
 
 class RawConfigUpdate(BaseModel):
     yaml_text: str
@@ -778,17 +848,20 @@ class RawConfigUpdate(BaseModel):
 
 # --- from web_server.py (originally lines 19410-19411) ---
 
+
 class ThemeSetBody(BaseModel):
     name: str
 
 
 # --- from web_server.py (originally lines 19449-19450) ---
 
+
 class FontSetBody(BaseModel):
     font: str
 
 
 # --- from web_server.py (originally lines 19681-19684) ---
+
 
 class _AgentPluginInstallBody(BaseModel):
     identifier: str
@@ -798,12 +871,14 @@ class _AgentPluginInstallBody(BaseModel):
 
 # --- from web_server.py (originally lines 19896-19898) ---
 
+
 class _PluginProvidersPutBody(BaseModel):
     memory_provider: Optional[str] = None
     context_engine: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 19919-19920) ---
+
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool

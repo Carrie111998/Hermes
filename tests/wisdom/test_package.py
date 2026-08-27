@@ -7,6 +7,7 @@ import pytest
 import hermes_wisdom.package as package_module
 from hermes_wisdom.package import (
     PackagePolicyError,
+    infer_authoring_system_specification,
     prepare_package,
     verify_content_files,
 )
@@ -43,7 +44,135 @@ def test_preparation_creates_only_instruction_overlay_and_hashes(tmp_path: Path)
         (package.overlay / "skill.manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["requirements"]["tools"] == []
+    from hermes_cli import __version__ as hermes_version
+
+    assert manifest["requirements"]["hermes"]["minimum_version"] == hermes_version
+    assert len(manifest["requirements"]["platforms"]) == 1
+    assert len(manifest["requirements"]["architectures"]) == 1
     assert package.content_hash.startswith("sha256:")
+
+
+def test_authoring_defaults_normalize_device_and_explicit_skill_requirements(
+    tmp_path: Path,
+):
+    skill = make_skill(tmp_path)
+    (skill / "SKILL.md").write_text(
+        """---
+name: my-skill
+description: Test.
+metadata:
+  hermes:
+    requires_toolsets: [terminal, browser]
+    requires_tools: [execute_code, terminal]
+    requires_plugins:
+      - local/example-plugin
+      - id: local/optional-plugin
+        minimum_version: 2.4.0
+        required: false
+---
+
+# Test
+""",
+        encoding="utf-8",
+    )
+
+    specification = infer_authoring_system_specification(
+        skill,
+        hermes_version="9.8.7",
+        system_name="Darwin",
+        machine="aarch64",
+    )
+
+    assert specification.hermes.minimum_version == "9.8.7"
+    assert specification.platforms == ["macOS"]
+    assert specification.architectures == ["arm64"]
+    assert [requirement.name for requirement in specification.tools] == [
+        "terminal",
+        "browser",
+        "execute_code",
+    ]
+    assert all(requirement.auto_install is False for requirement in specification.tools)
+    assert specification.runtime.shell is True
+    assert specification.runtime.browser is True
+    assert specification.runtime.code is True
+    assert [requirement.model_dump() for requirement in specification.plugins] == [
+        {
+            "id": "local/example-plugin",
+            "minimum_version": None,
+            "required": True,
+        },
+        {
+            "id": "local/optional-plugin",
+            "minimum_version": "2.4.0",
+            "required": False,
+        },
+    ]
+
+
+def test_explicit_portability_declarations_override_device_defaults(tmp_path: Path):
+    skill = make_skill(tmp_path)
+    (skill / "SKILL.md").write_text(
+        """---
+name: my-skill
+description: Test.
+platforms: [linux, windows]
+architectures: []
+---
+
+# Test
+""",
+        encoding="utf-8",
+    )
+
+    specification = infer_authoring_system_specification(
+        skill,
+        hermes_version="1.2.3",
+        system_name="Darwin",
+        machine="arm64",
+    )
+
+    assert specification.platforms == ["Linux", "Windows"]
+    assert specification.architectures == []
+
+
+def test_existing_manifest_is_preserved_instead_of_reinferred(tmp_path: Path):
+    skill = make_skill(tmp_path)
+    manifest = {
+        "schema_version": 1,
+        "name": "my-skill",
+        "requirements": {
+            "hermes": {"minimum_version": "0.3.0"},
+            "platforms": [],
+            "architectures": [],
+            "model": {"capabilities": [], "minimum_context_window": None},
+            "tools": [],
+            "plugins": [],
+            "credentials": [],
+            "connections": [],
+            "filesystem": {"read": [], "write": []},
+            "network": {"destinations": []},
+            "runtime": {
+                "shell": False,
+                "browser": False,
+                "code": False,
+                "sandbox": True,
+            },
+            "hardware": [],
+            "known_limitations": [],
+        },
+    }
+    original = json.dumps(manifest, separators=(",", ":")).encode()
+    (skill / "skill.manifest.json").write_bytes(original)
+
+    package = prepare_package(
+        skill,
+        overlay_root=tmp_path / "overlays",
+        author_description="A valid description.",
+        owner="owner",
+        installation_id="installation-123456",
+    )
+
+    assert (package.overlay / "skill.manifest.json").read_bytes() == original
 
 
 @pytest.mark.parametrize("extension", [".txt", ".md", ".rst", ".adoc", ".asciidoc"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import re
 import shutil
 import stat
@@ -19,8 +20,10 @@ from .contract import (
     ModelRequirement,
     NetworkRequirement,
     PackageManifest,
+    PluginRequirement,
     RuntimeRequirement,
     SystemSpecification,
+    ToolRequirement,
     author_description_hash,
     derive_content_hash,
     load_manifest,
@@ -97,6 +100,173 @@ class PreparedPackage:
     files: list[ContentFile]
     objects: ObjectSet
     commit: str
+
+
+def _declared_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = [item for item in value if isinstance(item, str)]
+    else:
+        return []
+    return list(dict.fromkeys(item.strip() for item in values if item.strip()))[:64]
+
+
+def _normalized_authoring_platform(value: str) -> str:
+    normalized = value.strip().casefold()
+    if normalized in {"darwin", "mac", "macos", "osx"}:
+        return "macOS"
+    if normalized.startswith("linux"):
+        return "Linux"
+    if normalized.startswith("win"):
+        return "Windows"
+    return value.strip()
+
+
+def _normalized_authoring_architecture(value: str) -> str:
+    normalized = value.strip().casefold().replace("-", "_")
+    if normalized in {"aarch64", "arm64"}:
+        return "arm64"
+    if normalized in {"amd64", "x64", "x86_64"}:
+        return "x86_64"
+    return value.strip()
+
+
+def _frontmatter(source: Path) -> dict[str, object]:
+    try:
+        from agent.skill_utils import parse_frontmatter
+
+        parsed, _body = parse_frontmatter(
+            (source / "SKILL.md").read_text(encoding="utf-8")
+        )
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _hermes_metadata(frontmatter: dict[str, object]) -> dict[str, object]:
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    typed_metadata: dict[str, object] = {
+        str(key): value for key, value in metadata.items()
+    }
+    hermes = typed_metadata.get("hermes")
+    if not isinstance(hermes, dict):
+        return {}
+    return {str(key): value for key, value in hermes.items()}
+
+
+def _tool_requirements(metadata: dict[str, object]) -> list[ToolRequirement]:
+    # A toolset is a valid compatibility target too: local capability detection
+    # includes both enabled toolset names and their concrete tools.
+    names = [
+        *_declared_strings(metadata.get("requires_toolsets")),
+        *_declared_strings(metadata.get("requires_tools")),
+    ]
+    return [
+        ToolRequirement(name=name, auto_install=False) for name in dict.fromkeys(names)
+    ][:64]
+
+
+def _plugin_requirements(metadata: dict[str, object]) -> list[PluginRequirement]:
+    raw = metadata.get("requires_plugins")
+    values = raw if isinstance(raw, list) else [raw] if raw is not None else []
+    requirements: list[PluginRequirement] = []
+    seen: set[str] = set()
+    for item in values:
+        if isinstance(item, str):
+            plugin_id = item.strip()
+            minimum_version = None
+            required = True
+        elif isinstance(item, dict):
+            plugin: dict[str, object] = {str(key): value for key, value in item.items()}
+            plugin_id = str(plugin.get("id") or "").strip()
+            raw_version = plugin.get("minimum_version")
+            minimum_version = (
+                str(raw_version).strip() if raw_version is not None else None
+            )
+            required = plugin.get("required", True) is not False
+        else:
+            continue
+        if not plugin_id or plugin_id in seen:
+            continue
+        seen.add(plugin_id)
+        requirements.append(
+            PluginRequirement(
+                id=plugin_id,
+                minimum_version=minimum_version or None,
+                required=required,
+            )
+        )
+        if len(requirements) == 64:
+            break
+    return requirements
+
+
+def infer_authoring_system_specification(
+    source: Path,
+    *,
+    hermes_version: str,
+    system_name: str | None = None,
+    machine: str | None = None,
+) -> SystemSpecification:
+    """Build conservative owner-review defaults without exporting inventory.
+
+    The authoring device establishes one known-good OS/architecture target.
+    Skill-specific tool and plugin requirements come only from explicit
+    frontmatter; the profile's complete enabled inventory is never consulted.
+    """
+    frontmatter = _frontmatter(source)
+    metadata = _hermes_metadata(frontmatter)
+
+    if "platforms" in frontmatter:
+        platforms = [
+            _normalized_authoring_platform(item)
+            for item in _declared_strings(frontmatter.get("platforms"))
+        ]
+    else:
+        current_platform = _normalized_authoring_platform(
+            system_name if system_name is not None else platform.system()
+        )
+        platforms = [current_platform] if current_platform else []
+
+    architecture_source: object | None = None
+    architecture_declared = False
+    if "architectures" in frontmatter:
+        architecture_source = frontmatter.get("architectures")
+        architecture_declared = True
+    elif "architectures" in metadata:
+        architecture_source = metadata.get("architectures")
+        architecture_declared = True
+    if architecture_declared:
+        architectures = [
+            _normalized_authoring_architecture(item)
+            for item in _declared_strings(architecture_source)
+        ]
+    else:
+        current_architecture = _normalized_authoring_architecture(
+            machine if machine is not None else platform.machine()
+        )
+        architectures = [current_architecture] if current_architecture else []
+
+    tools = _tool_requirements(metadata)
+    tool_names = {requirement.name for requirement in tools}
+    return SystemSpecification(
+        hermes=HermesRequirement(minimum_version=hermes_version),
+        platforms=platforms,
+        architectures=architectures,
+        model=ModelRequirement(),
+        tools=tools,
+        plugins=_plugin_requirements(metadata),
+        filesystem=FilesystemRequirement(),
+        network=NetworkRequirement(),
+        runtime=RuntimeRequirement(
+            shell=bool(tool_names & {"shell", "terminal"}),
+            browser=bool(tool_names & {"browser", "computer", "computer_use"}),
+            code=bool(tool_names & {"code", "code_execution", "execute_code"}),
+        ),
+    )
 
 
 def _segment_key(segment: str, *, path: str) -> str:
@@ -294,12 +464,9 @@ def prepare_package(
 
         generated = PackageManifest(
             name=source.name,
-            requirements=SystemSpecification(
-                hermes=HermesRequirement(minimum_version=hermes_version),
-                model=ModelRequirement(),
-                filesystem=FilesystemRequirement(),
-                network=NetworkRequirement(),
-                runtime=RuntimeRequirement(),
+            requirements=infer_authoring_system_specification(
+                source,
+                hermes_version=hermes_version,
             ),
         )
         (target / "skill.manifest.json").write_bytes(

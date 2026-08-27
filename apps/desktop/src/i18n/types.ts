@@ -22,6 +22,9 @@ export interface WisdomTranslations {
   contributionWorkflow: string
   potential: string
   potentialHelp: string
+  noSuggestions: string
+  browseLocal: (count: number) => string
+  browseLocalHelp: string
   ownerReview: string
   ownerReviewHelp: string
   noDrafts: string
@@ -60,22 +63,59 @@ export interface WisdomTranslations {
   publishing: string
   proposalTitle: string
   localSuggestion: string
+  preparingLocal: string
+  whySuggested: string
   proposalNotice: string
   openCollective: string
   prepareExact: string
+  skillName: string
+  editDefaultsNotice: string
+  detailedRequirements: string
+  hideDetailedRequirements: string
   specificationNotice: string
   openFullReview: string
   sendPrivateReview: string
+  saveLocal: string
+  savingLocal: string
+  source: string
+  preview: string
+  localDraft: string
+  serverReviewed: string
   serverEnforced: string
   localAdvisory: string
+  qualificationLabel: string
+  scanPassed: string
+  reviewFindings: string
+  scanAvailable: string
+  scanUnavailable: string
+  reviewed: string
+  contentHash: string
+  authorDescriptionHash: string
+  packageManifestHash: string
   serverReviewNotice: string
   decline: string
   approvePublish: string
   checkUpdates: (count: number) => string
   checking: string
+  refreshShared: string
+  refreshingShared: string
+  installReferenceLabel: string
+  installReferencePlaceholder: string
+  installReferenceHelp: string
+  reviewInstall: string
+  planningInstall: string
+  updateModeLabel: string
+  updateModeDefault: string
+  updateModeManual: string
+  updateModeAutomatic: string
+  updateModeRequired: string
+  updateModeHelp: string
+  updateModePlan: (mode: string) => string
   install: string
   uninstall: string
   checkSkill: string
+  updateAvailable: (version?: number) => string
+  reviewUpdate: string
   installed: (version: number, mode: string) => string
   confirmAction: (action: string) => string
   acceptCompatibility: string

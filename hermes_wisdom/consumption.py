@@ -24,6 +24,7 @@ from .compatibility import detect_local_capabilities, evaluate
 from .contract import (
     PackageManifest,
     SystemSpecification,
+    org_directory_name,
     parse_manifest_bytes,
     sha256_address,
 )
@@ -93,7 +94,9 @@ def _safe_target(store: WisdomStore, installation: dict[str, Any]) -> Path:
     org_id = store.active_org_id()
     if not org_id or installation["org_id"] != org_id:
         raise PackagePolicyError("managed installation belongs to another organization")
-    managed_root = (get_skills_dir() / "_wisdom" / org_id).resolve()
+    managed_root = (
+        get_skills_dir() / "_wisdom" / org_directory_name(org_id)
+    ).resolve()
     target = Path(str(installation["target_path"])).resolve()
     try:
         target.relative_to(managed_root)

@@ -9,7 +9,12 @@ from fastapi import HTTPException
 
 from hermes_cli import web_server
 from hermes_cli.web_models import (
+    WisdomEditedFile,
+    WisdomCandidateDismissRequest,
     WisdomInstallApplyRequest,
+    WisdomInstallPlanRequest,
+    WisdomPreparedSaveRequest,
+    WisdomReviseRequest,
     WisdomSetupRequest,
     WisdomSuggestRequest,
     WisdomUpdateApplyRequest,
@@ -72,6 +77,7 @@ def test_suggest_bff_preserves_profile_and_owner_approved_fields(monkeypatch) ->
     monkeypatch.setattr(web_server, "_run_wisdom", run)
     body = WisdomSuggestRequest(
         skill="work",
+        local_skill_id="local-1",
         description="Outcome-oriented owner copy",
         system_specification={"auto_install": False},
         send_for_owner_only_server_review=True,
@@ -90,8 +96,125 @@ def test_suggest_bff_preserves_profile_and_owner_approved_fields(monkeypatch) ->
                 "description": "Outcome-oriented owner copy",
                 "system_specification": {"auto_install": False},
                 "allow_private_secret_review": True,
+                "local_skill_id": "local-1",
             },
         ),
+    ]
+
+
+def test_revise_bff_forwards_complete_content_and_hash_preconditions(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class Service:
+        def revise(self, draft_id, **kwargs):
+            calls.append((draft_id, kwargs))
+            return {"draft": {"id": "draft-2"}}
+
+    async def run(profile, fn):
+        calls.append(profile)
+        return fn(Service())
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+    body = WisdomReviseRequest(
+        draft_id="draft-1",
+        author_description="Updated owner copy",
+        files=[
+            WisdomEditedFile(path="SKILL.md", content_utf8="# Updated\n"),
+            WisdomEditedFile(
+                path="skill.manifest.json",
+                content_utf8='{"schema_version":1}',
+            ),
+        ],
+        expected_content_hash="sha256:content",
+        expected_author_description_hash="sha256:description",
+        expected_package_manifest_hash="sha256:manifest",
+        profile="research",
+    )
+
+    result = asyncio.run(web_server.post_wisdom_revise(body))
+
+    assert result == {"draft": {"id": "draft-2"}}
+    assert calls == [
+        "research",
+        (
+            "draft-1",
+            {
+                "author_description": "Updated owner copy",
+                "files": [
+                    {"path": "SKILL.md", "content_utf8": "# Updated\n"},
+                    {
+                        "path": "skill.manifest.json",
+                        "content_utf8": '{"schema_version":1}',
+                    },
+                ],
+                "expected_content_hash": "sha256:content",
+                "expected_description_hash": "sha256:description",
+                "expected_manifest_hash": "sha256:manifest",
+                "allow_private_secret_review": False,
+            },
+        ),
+    ]
+
+
+def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) -> None:
+    calls = []
+
+    class Service:
+        def save_prepared(self, draft_id, **kwargs):
+            calls.append(("save", draft_id, kwargs))
+            return {"local_draft_id": draft_id}
+
+        def dismiss_local_candidate(self, local_skill_id, content_hash):
+            calls.append(("dismiss", local_skill_id, content_hash))
+            return {"dismissed": True}
+
+    async def run(profile, fn):
+        calls.append(("profile", profile))
+        return fn(Service())
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+    files = [
+        WisdomEditedFile(path="SKILL.md", content_utf8="# Edited\n"),
+        WisdomEditedFile(
+            path="skill.manifest.json", content_utf8='{"schema_version":1}'
+        ),
+    ]
+    saved = asyncio.run(
+        web_server.post_wisdom_prepared_save(
+            WisdomPreparedSaveRequest(
+                draft_id="local:1",
+                author_description="Owner copy",
+                files=files,
+                profile="research",
+            )
+        )
+    )
+    dismissed = asyncio.run(
+        web_server.post_wisdom_candidate_dismiss(
+            WisdomCandidateDismissRequest(
+                local_skill_id="skill-1",
+                content_hash="sha256:content",
+                profile="research",
+            )
+        )
+    )
+
+    assert saved == {"local_draft_id": "local:1"}
+    assert dismissed == {"dismissed": True}
+    assert calls == [
+        ("profile", "research"),
+        (
+            "save",
+            "local:1",
+            {
+                "author_description": "Owner copy",
+                "files": [item.model_dump() for item in files],
+            },
+        ),
+        ("profile", "research"),
+        ("dismiss", "skill-1", "sha256:content"),
     ]
 
 
@@ -117,6 +240,35 @@ def test_install_apply_bff_requires_a_plan_receipt(monkeypatch) -> None:
 
     assert result == {"state": "installed"}
     assert calls == [("customer-b", "receipt-123", True)]
+
+
+def test_install_plan_bff_forwards_validated_update_mode(monkeypatch) -> None:
+    calls: list[tuple[str | None, str, str | None]] = []
+
+    class Service:
+        def install_plan(self, reference: str, *, update_mode: str | None):
+            calls.append((None, reference, update_mode))
+            return {"state": "planned", "update_mode": update_mode}
+
+    async def run(profile, fn):
+        result = fn(Service())
+        calls[0] = (profile, calls[0][1], calls[0][2])
+        return result
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+    body = WisdomInstallPlanRequest(
+        reference="skill-1", update_mode="AUTO_WITH_NOTICE", profile="customer-b"
+    )
+
+    result = asyncio.run(web_server.post_wisdom_install_plan(body))
+
+    assert result == {"state": "planned", "update_mode": "AUTO_WITH_NOTICE"}
+    assert calls == [("customer-b", "skill-1", "AUTO_WITH_NOTICE")]
+
+
+def test_install_plan_request_rejects_unknown_update_mode() -> None:
+    with pytest.raises(ValueError):
+        WisdomInstallPlanRequest(reference="skill-1", update_mode="SILENT")
 
 
 def test_wisdom_error_mapping_is_opaque_and_bounded() -> None:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_wisdom.client import Draft, WisdomValidationError
+from hermes_wisdom.client import Draft, WisdomConflict, WisdomValidationError
 from hermes_wisdom.contract import (
     PackageManifest,
     SystemSpecification,
@@ -13,7 +13,11 @@ from hermes_wisdom.contract import (
     canonical_json_bytes,
     sha256_address,
 )
-from hermes_wisdom.package import PackagePolicyError, verify_content_files
+from hermes_wisdom.package import (
+    PackagePolicyError,
+    prepare_package,
+    verify_content_files,
+)
 from hermes_wisdom.service import WisdomService
 from hermes_wisdom.store import WisdomStore
 
@@ -110,7 +114,7 @@ class SetupClient:
         self.display_org_id = org_id
 
     def capability(self):
-        return {"capabilities": ["wisdom"]}
+        return {"features": ["wisdom"]}
 
     def register_identity(self, installation_id):
         return {"installation_id": installation_id, "state": "active"}
@@ -123,9 +127,9 @@ class ReviewClient:
         manifest = canonical_json_bytes(
             PackageManifest(
                 name="reviewed-skill",
-                requirements=SystemSpecification.model_validate(
-                    {"hermes": {"minimum_version": "0.1.0"}}
-                ),
+                requirements=SystemSpecification.model_validate({
+                    "hermes": {"minimum_version": "0.1.0"}
+                }),
             ).model_dump(mode="json")
         )
         self.files = [
@@ -136,10 +140,14 @@ class ReviewClient:
         self.revision = "revision-1"
         self.approvals: list[dict] = []
         self.publications = 0
+        self.uploaded = 0
+        self.revisions: list[dict] = []
 
     def _draft(self):
         _records, content_hash = verify_content_files(self.files)
-        manifest = next(body for path, _, body in self.files if path == "skill.manifest.json")
+        manifest = next(
+            body for path, _, body in self.files if path == "skill.manifest.json"
+        )
         return Draft(
             id="draft-review",
             orgId="org-1",
@@ -172,6 +180,25 @@ class ReviewClient:
             content_hash=content_hash,
         )
 
+    def upload_private_objects(self, objects):
+        self.uploaded += len(objects)
+
+    def revise_draft(self, _draft_id, **payload):
+        self.revisions.append(payload)
+        return self._draft().model_copy(
+            update={
+                "id": "draft-revised",
+                "draftCommit": payload["commit"],
+                "contentHash": payload["content_hash"],
+                "authorDescription": payload["description"],
+                "authorDescriptionHash": author_description_hash(
+                    payload["description"]
+                ),
+                "packageManifestHash": None,
+                "updatedAt": "revision-2",
+            }
+        )
+
     def approve(self, _draft_id, **hashes):
         self.approvals.append(hashes)
         return self._draft().model_copy(update={"state": "owner_approved"})
@@ -191,21 +218,19 @@ def _review_service(tmp_path: Path, *, client: ReviewClient):
         source_kind="local",
     )
     draft = client._draft()
-    store.record_draft(
-        {
-            "id": draft.id,
-            "skill_id": skill_id,
-            "source_hash": draft.contentHash,
-            "overlay_path": str(skill_path),
-            "draft_commit": draft.draftCommit,
-            "server_revision": draft.updatedAt,
-            "state": draft.state,
-            "description": draft.authorDescription or "",
-            "content_hash": draft.contentHash,
-            "description_hash": draft.authorDescriptionHash or "",
-            "manifest_hash": draft.packageManifestHash or "",
-        }
-    )
+    store.record_draft({
+        "id": draft.id,
+        "skill_id": skill_id,
+        "source_hash": draft.contentHash,
+        "overlay_path": str(skill_path),
+        "draft_commit": draft.draftCommit,
+        "server_revision": draft.updatedAt,
+        "state": draft.state,
+        "description": draft.authorDescription or "",
+        "content_hash": draft.contentHash,
+        "description_hash": draft.authorDescriptionHash or "",
+        "manifest_hash": draft.packageManifestHash or "",
+    })
     return WisdomService(store=store, client=client)
 
 
@@ -235,21 +260,50 @@ def test_prepare_requires_local_owner_edit_before_any_network(
     )
     fake = FakeClient()
     service = WisdomService(store=WisdomStore(tmp_path / "state"), client=fake)
-    monkeypatch.setattr("hermes_wisdom.service._find_skill_dir", lambda _name: skill)
     monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
     monkeypatch.setattr(
-        "hermes_wisdom.service.draft_description", lambda _body: "Drafted locally."
+        "hermes_wisdom.service.draft_description",
+        lambda _body: pytest.fail("existing author copy should avoid a model call"),
     )
 
     prepared = service.suggest("my-skill")
     assert prepared["network_submission"] is False
+    assert prepared["drafted_description"] == "Test."
     assert fake.uploaded == 0
-    overlay = Path(prepared["overlay_path"])
-    manifest = json.loads((overlay / "skill.manifest.json").read_text(encoding="utf-8"))
-    manifest["requirements"]["known_limitations"] = ["Owner reviewed limitation"]
-    (overlay / "skill.manifest.json").write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    assert {item["path"] for item in prepared["files"]} == {
+        "SKILL.md",
+        "skill.manifest.json",
+    }
+    manifest = json.loads(
+        next(
+            item["content_utf8"]
+            for item in prepared["files"]
+            if item["path"] == "skill.manifest.json"
+        )
     )
+    manifest["requirements"]["known_limitations"] = ["Owner reviewed limitation"]
+    edited_files = [
+        {
+            "path": item["path"],
+            "content_utf8": (
+                item["content_utf8"].replace("# Test", "# Owner edited test")
+                if item["path"] == "SKILL.md"
+                else json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+            ),
+        }
+        for item in prepared["files"]
+    ]
+    saved = service.save_prepared(
+        prepared["local_draft_id"],
+        author_description="Owner-approved copy.",
+        files=edited_files,
+    )
+    assert fake.uploaded == 0
+    assert saved["drafted_description"] == "Owner-approved copy."
+    assert "# Owner edited test" in next(
+        item["content_utf8"] for item in saved["files"] if item["path"] == "SKILL.md"
+    )
+    assert "# Owner edited test" not in (skill / "SKILL.md").read_text()
 
     submitted = service.suggest(
         "my-skill",
@@ -267,6 +321,99 @@ def test_prepare_requires_local_owner_edit_before_any_network(
     serialized = json.dumps(fake.submissions[0])
     for forbidden in ("usage", "refinement", "candidate", "ranking", "stability"):
         assert forbidden not in serialized
+
+
+def test_local_candidate_decline_suppresses_exact_content_without_network(
+    monkeypatch, tmp_path: Path
+):
+    skill = tmp_path / "skills" / "declined-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Declined\n", encoding="utf-8")
+    fake = FakeClient()
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=fake)
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    monkeypatch.setattr(
+        "hermes_wisdom.service.draft_description", lambda _body: "Local draft."
+    )
+
+    candidate = service.scan_candidates()[0]
+    prepared = service.suggest(
+        "declined-skill", local_skill_id=candidate["local_skill_id"]
+    )
+    result = service.dismiss_local_candidate(
+        candidate["local_skill_id"], candidate["content_hash"]
+    )
+
+    assert result == {"dismissed": True}
+    local = service.store.draft(prepared["local_draft_id"])
+    assert local is not None
+    assert local["state"] == "declined"
+    assert fake.uploaded == 0
+    assert service.scan_candidates() == []
+
+
+def test_candidate_scan_hides_an_exact_contributed_version_until_content_changes(
+    monkeypatch, tmp_path: Path
+):
+    skills = tmp_path / "skills"
+    skill = skills / "incident-handoff"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Incident handoff\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=FakeClient())
+
+    candidate = service.scan_candidates()[0]
+    service.store.record_draft({
+        "id": "draft-1",
+        "skill_id": candidate["local_skill_id"],
+        "source_hash": candidate["content_hash"],
+        "overlay_path": str(skill),
+        "state": "published",
+        "description": "Share incident context.",
+        "content_hash": "sha256:" + "1" * 64,
+        "description_hash": "sha256:" + "2" * 64,
+        "manifest_hash": "sha256:" + "3" * 64,
+    })
+
+    assert service.scan_candidates() == []
+
+    (skill / "SKILL.md").write_text(
+        "# Incident handoff\n\nNew material guidance.\n", encoding="utf-8"
+    )
+    changed = service.scan_candidates()
+    assert [item["name"] for item in changed] == ["incident-handoff"]
+    assert changed[0]["contribution_state"] == "new"
+
+
+def test_suggest_uses_candidate_identity_and_rejects_a_stale_duplicate_action(
+    monkeypatch, tmp_path: Path
+):
+    skills = tmp_path / "skills"
+    local = skills / "deployment-checklist"
+    managed = skills / "_wisdom" / "org-1" / "deployment-checklist"
+    local.mkdir(parents=True)
+    managed.mkdir(parents=True)
+    (local / "SKILL.md").write_text("# Local deployment checklist\n", encoding="utf-8")
+    (managed / "SKILL.md").write_text("# Managed copy\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    monkeypatch.setattr(
+        "hermes_wisdom.service.draft_description", lambda _body: "Deploy safely."
+    )
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=FakeClient())
+    candidate = service.scan_candidates()[0]
+
+    prepared = service.suggest(
+        "deployment-checklist", local_skill_id=candidate["local_skill_id"]
+    )
+    assert Path(prepared["overlay_path"], "SKILL.md").read_text() == (
+        "# Local deployment checklist\n"
+    )
+    service.store.set_draft_state(prepared["local_draft_id"], "submitted")
+
+    with pytest.raises(WisdomConflict, match="already in the contribution flow"):
+        service.suggest(
+            "deployment-checklist", local_skill_id=candidate["local_skill_id"]
+        )
 
 
 def test_setup_persists_explicit_disclosure_and_enables_the_profile(
@@ -302,6 +449,30 @@ def test_setup_persists_explicit_disclosure_and_enables_the_profile(
     third = service.setup(disclosure_accepted=True)
     assert third["installation_id"] != first["installation_id"]
     assert service.store.active_org_id() == "org-2"
+
+
+def test_setup_accepts_opaque_nas_org_id_with_portable_managed_path(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_wisdom.contract import org_directory_name
+
+    org_id = "nas_organisation:wisdom-local"
+    skills = tmp_path / "skills"
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    config = {"wisdom": {"enabled": False}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(config))
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda value: None)
+    service = WisdomService(
+        store=WisdomStore(tmp_path / "state"), client=SetupClient(org_id)
+    )
+
+    result = service.setup(disclosure_accepted=True)
+
+    segment = org_directory_name(org_id)
+    assert result["organization_id"] == org_id
+    assert result["managed_directory"] == str(skills / "_wisdom" / segment)
+    assert (skills / "_wisdom" / ".active_org").read_text() == segment + "\n"
+    assert service.store.active_org_id() == org_id
 
 
 def test_status_does_not_enroll_an_unconfigured_profile(monkeypatch, tmp_path: Path):
@@ -390,6 +561,117 @@ def test_approval_requires_a_complete_review_receipt(tmp_path: Path):
         service.approve("draft-review")
 
 
+def test_edit_creates_a_rescanned_successor_and_invalidates_old_receipt(
+    monkeypatch, tmp_path: Path
+):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    reviewed = service.review("draft-review", acknowledge=True)
+    edited_files = [
+        {
+            "path": path,
+            "content_utf8": (
+                "# Updated reviewed skill\n" if path == "SKILL.md" else body.decode()
+            ),
+        }
+        for path, _mode, body in client.files
+    ]
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+
+    result = service.revise(
+        "draft-review",
+        author_description="Updated owner copy.",
+        files=edited_files,
+        expected_content_hash=reviewed["hashes"]["content"],
+        expected_description_hash=reviewed["hashes"]["author_description"],
+        expected_manifest_hash=reviewed["hashes"]["package_manifest"],
+    )
+
+    assert result["draft"]["id"] == "draft-revised"
+    assert client.uploaded > 0
+    assert client.revisions[0]["description"] == "Updated owner copy."
+    assert client.revisions[0]["expected_content_hash"] == reviewed["hashes"]["content"]
+    assert service.store.draft("draft-review")["state"] == "invalidated"
+    assert service.store.draft("draft-revised")["state"] == "ready"
+    assert service.store.receipt("draft-review") is None
+
+
+def test_edit_rejects_stale_hashes_and_incomplete_package(tmp_path: Path):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    reviewed = service.review("draft-review", acknowledge=False)
+    complete_files = [
+        {"path": path, "content_utf8": body.decode()}
+        for path, _mode, body in client.files
+    ]
+
+    with pytest.raises(WisdomConflict, match="changed after it was opened"):
+        service.revise(
+            "draft-review",
+            author_description=client.description,
+            files=complete_files,
+            expected_content_hash="sha256:" + "0" * 64,
+            expected_description_hash=reviewed["hashes"]["author_description"],
+            expected_manifest_hash=reviewed["hashes"]["package_manifest"],
+        )
+    with pytest.raises(PackagePolicyError, match="complete existing package"):
+        service.revise(
+            "draft-review",
+            author_description=client.description,
+            files=complete_files[:1],
+            expected_content_hash=reviewed["hashes"]["content"],
+            expected_description_hash=reviewed["hashes"]["author_description"],
+            expected_manifest_hash=reviewed["hashes"]["package_manifest"],
+        )
+    assert client.uploaded == 0
+
+
+def test_edit_never_uses_the_browser_draft_id_as_a_filesystem_segment(
+    monkeypatch, tmp_path: Path
+):
+    client = ReviewClient()
+    store = WisdomStore(tmp_path / "state")
+    service = WisdomService(store=store, client=client)
+    reviewed = service.review("../outside", acknowledge=False)
+    edited_files = [
+        {"path": path, "content_utf8": body.decode()}
+        for path, _mode, body in client.files
+    ]
+    overlay_roots: list[Path] = []
+    real_prepare = prepare_package
+
+    def capture_overlay(*args, **kwargs):
+        overlay_roots.append(Path(kwargs["overlay_root"]))
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr("hermes_wisdom.service.prepare_package", capture_overlay)
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+
+    service.revise(
+        "../outside",
+        author_description=client.description,
+        files=edited_files,
+        expected_content_hash=reviewed["hashes"]["content"],
+        expected_description_hash=reviewed["hashes"]["author_description"],
+        expected_manifest_hash=reviewed["hashes"]["package_manifest"],
+    )
+
+    assert overlay_roots[0].parent == store.root / "revisions"
+    assert len(overlay_roots[0].name) == 64
+
+
 @pytest.mark.parametrize("mutation", ["content", "description", "manifest", "revision"])
 def test_approval_rejects_each_stale_receipt_binding(tmp_path: Path, mutation: str):
     client = ReviewClient()
@@ -421,6 +703,18 @@ def test_successful_approval_consumes_receipt_and_replay_is_denied(tmp_path: Pat
     client = ReviewClient()
     service = _review_service(tmp_path, client=client)
     store = service.store
+    local = store.draft("draft-review")
+    assert local is not None
+    event_id = store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=str(local["skill_id"]),
+        content_hash=str(local["source_hash"]),
+        payload={"skill_name": "reviewed-skill", "local_reasons": {}},
+        session_id="session-1",
+        task_id="task-1",
+        qualification="manual_selection",
+    )
+    assert event_id is not None
     reviewed = service.review("draft-review", acknowledge=True)
 
     result = service.approve("draft-review")
@@ -435,6 +729,14 @@ def test_successful_approval_consumes_receipt_and_replay_is_denied(tmp_path: Pat
     ]
     assert client.publications == 1
     assert store.receipt("draft-review") is None
+    assert store.draft("draft-review")["state"] == "published"
+    assert store.local_events(kind="wisdom.candidate", session_id="session-1") == []
+    with store.transaction() as db:
+        candidate_state = db.execute(
+            "SELECT state FROM candidate WHERE skill_id=? AND content_hash=?",
+            (str(local["skill_id"]), str(local["source_hash"])),
+        ).fetchone()[0]
+    assert candidate_state == "contributed"
     with pytest.raises(PackagePolicyError, match="fresh complete-package review"):
         service.approve("draft-review")
     assert client.publications == 1

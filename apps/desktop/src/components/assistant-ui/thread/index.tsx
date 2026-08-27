@@ -164,14 +164,22 @@ export const Thread = memo(function Thread({
   // always correct.
   const loadingIndicator = useMemo(() => <BackgroundResumeNotice />, [])
 
+  // Candidate events are written by the Agent against the durable stored
+  // session key. Desktop's runtime session id is a short-lived websocket
+  // owner and changes whenever a stored conversation is resumed, so polling
+  // with it can never hydrate a durable event after reconnect. Fresh sessions
+  // temporarily have no stored key, where the runtime id is the correct
+  // fallback until persistence binds the pair.
+  const wisdomSessionId = sessionKey || sessionId
+
   const wisdomContent = useMemo(
-    () => (sessionId ? (
+    () => (wisdomSessionId ? (
       <>
         <WisdomNoticeCard profile={wisdomProfile} />
-        <WisdomCandidateCard profile={wisdomProfile} sessionId={sessionId} />
+        <WisdomCandidateCard profile={wisdomProfile} sessionId={wisdomSessionId} />
       </>
     ) : undefined),
-    [sessionId, wisdomProfile]
+    [wisdomProfile, wisdomSessionId]
   )
 
   return (

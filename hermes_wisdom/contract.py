@@ -30,8 +30,8 @@ class ContractPin:
 
 
 CONTRACT_PIN = ContractPin(
-    gateway_commit="fda8bd80fb8ca461966d14a79dda4ed0e07fb4d4",
-    openapi_sha256="1c38e43df6fdb83705cd9d14d58655bf3eab08b84f41198272821866c8d2f603",
+    gateway_commit="1be8197b832fa50da67f633ed56ec82be5c99bfe",
+    openapi_sha256="aae9ac9d56dd6aea60c3855b485f26a6cc2f87257a8183ee12a95b12497e3940",
     manifest_schema_sha256="64d0010eada1d79fa16309e9fd715faf77b6186360ea0b095182b2bdaeec5714",
     canonical_vectors_sha256="e2b28c708f69e99b342de1df48498d96efde68867857391590bc964a609a730b",
     requirements_pr="NousResearch/gateway-gateway#215",
@@ -41,6 +41,14 @@ CONTRACT_PIN = ContractPin(
 PACKAGE_MANIFEST_SCHEMA_VERSION = 1
 AUTHOR_DESCRIPTION_SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+FILESYSTEM_SAFE_ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def org_directory_name(org_id: str) -> str:
+    """Map an opaque organization id to a portable managed-tree segment."""
+    if FILESYSTEM_SAFE_ORG_ID_RE.fullmatch(org_id):
+        return org_id
+    return "org-" + hashlib.sha256(org_id.encode("utf-8")).hexdigest()
 
 
 class StrictModel(BaseModel):

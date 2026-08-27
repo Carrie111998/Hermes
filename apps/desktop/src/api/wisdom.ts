@@ -21,6 +21,7 @@ export interface WisdomCandidate {
   eligibility: 'eligible' | 'instruction_only_fork_required'
   reason: null | string
   qualification: string
+  contribution_state: 'new' | 'prepared'
 }
 
 export interface WisdomCandidateEvent {
@@ -71,6 +72,8 @@ export interface WisdomPreparedDraft {
   local_draft_id: string
   overlay_path: string
   drafted_description: string
+  files: WisdomDraftReview['files']
+  local_scan: WisdomLocalScan
   system_specification: Record<string, unknown>
   next_step: string
 }
@@ -94,6 +97,17 @@ export interface WisdomDraftReview {
   receipt: null | string
 }
 
+export interface WisdomEditedFile {
+  path: string
+  content_utf8: string
+}
+
+export interface WisdomRevisedDraft {
+  draft: WisdomDraft & Record<string, unknown>
+  local_scan: WisdomLocalScan
+  notice: string
+}
+
 export interface WisdomSkillDetail {
   latest_version_detail?: Record<string, unknown>
   local_compatibility?: Record<string, unknown>
@@ -107,11 +121,13 @@ export interface WisdomVersionContent {
   files: Array<{ content_utf8: string; hash: string; mode: 'exec' | 'file'; path: string }>
 }
 
+export type WisdomUpdateMode = 'AUTO_WITH_NOTICE' | 'MANUAL' | 'REQUIRED'
+
 export interface WisdomManagedInstall {
   skill_id: string
   slug: string
   version: number
-  update_mode: 'AUTO_WITH_NOTICE' | 'MANUAL' | 'REQUIRED'
+  update_mode: WisdomUpdateMode
   state: string
   target_path: string
 }
@@ -119,6 +135,24 @@ export interface WisdomManagedInstall {
 export interface WisdomInstallations {
   installations: WisdomManagedInstall[]
   notifications: Array<Record<string, unknown>>
+}
+
+export type WisdomInstallationCheckState =
+  'archived' | 'current' | 'not_recorded' | 'taken_down' | 'update_available' | 'updated'
+
+export interface WisdomInstallationCheck {
+  skill_id: string
+  state: WisdomInstallationCheckState
+  plan?: WisdomActionPlan
+  result?: Record<string, unknown>
+}
+
+export interface WisdomCheckResult {
+  installations: WisdomInstallationCheck[]
+  qualification_events?: unknown[]
+  feed?: Record<string, unknown>
+  owner_decisions?: Record<string, unknown>
+  telegram?: Record<string, unknown>
 }
 
 export interface WisdomActionPlan {
@@ -177,11 +211,18 @@ export const getWisdomVersionContent = (
 export const getWisdomInstallations = (profile?: ProfileScope): Promise<WisdomInstallations> =>
   request('/api/wisdom/installations', profile)
 
-export const checkWisdom = (profile?: ProfileScope): Promise<Record<string, unknown>> =>
-  request('/api/wisdom/check', profile, { method: 'POST', body: { apply_automatic: true } })
+export const checkWisdom = (profile?: ProfileScope, applyAutomatic = true): Promise<WisdomCheckResult> =>
+  request('/api/wisdom/check', profile, { method: 'POST', body: { apply_automatic: applyAutomatic } })
 
-export const planWisdomInstall = (reference: string, profile?: ProfileScope): Promise<WisdomActionPlan> =>
-  request('/api/wisdom/install/plan', profile, { method: 'POST', body: { reference } })
+export const planWisdomInstall = (
+  reference: string,
+  profile?: ProfileScope,
+  updateMode?: WisdomUpdateMode
+): Promise<WisdomActionPlan> =>
+  request('/api/wisdom/install/plan', profile, {
+    method: 'POST',
+    body: { reference, update_mode: updateMode }
+  })
 
 export const applyWisdomInstall = (
   receipt: string,
@@ -222,12 +263,14 @@ export const acknowledgeWisdomNotifications = (
 export const suggestWisdomSkill = (
   skill: string,
   profile?: ProfileScope,
-  approval?: { description: string; systemSpecification: Record<string, unknown> }
+  approval?: { description: string; systemSpecification: Record<string, unknown> },
+  localSkillId?: string
 ): Promise<WisdomPreparedDraft | WisdomSubmittedDraft> =>
   request('/api/wisdom/suggest', profile, {
     method: 'POST',
     body: {
       skill,
+      local_skill_id: localSkillId,
       description: approval?.description,
       system_specification: approval?.systemSpecification
     }
@@ -241,6 +284,46 @@ export const reviewWisdomDraft = (
   request('/api/wisdom/review', profile, {
     method: 'POST',
     body: { acknowledge, draft_id: draftId }
+  })
+
+export const saveWisdomPreparedDraft = (
+  draftId: string,
+  authorDescription: string,
+  files: WisdomEditedFile[],
+  profile?: ProfileScope
+): Promise<WisdomPreparedDraft> =>
+  request('/api/wisdom/prepared/save', profile, {
+    method: 'POST',
+    body: { author_description: authorDescription, draft_id: draftId, files }
+  })
+
+export const dismissWisdomCandidate = (
+  localSkillId: string,
+  contentHash: string,
+  profile?: ProfileScope
+): Promise<{ dismissed: true }> =>
+  request('/api/wisdom/candidates/dismiss', profile, {
+    method: 'POST',
+    body: { content_hash: contentHash, local_skill_id: localSkillId }
+  })
+
+export const reviseWisdomDraft = (
+  draftId: string,
+  authorDescription: string,
+  files: WisdomEditedFile[],
+  hashes: WisdomDraftReview['hashes'],
+  profile?: ProfileScope
+): Promise<WisdomRevisedDraft> =>
+  request('/api/wisdom/revise', profile, {
+    method: 'POST',
+    body: {
+      draft_id: draftId,
+      author_description: authorDescription,
+      files,
+      expected_content_hash: hashes.content,
+      expected_author_description_hash: hashes.author_description,
+      expected_package_manifest_hash: hashes.package_manifest
+    }
   })
 
 export const decideWisdomDraft = (

@@ -10,6 +10,7 @@ import {
   getWisdomStatus,
   installSkillFromHub,
   profileScopeKey,
+  reviseWisdomDraft,
   saveMcpServers,
   setApiRequestConnection,
   setApiRequestProfile,
@@ -91,7 +92,19 @@ describe('capability helpers are connection-scoped', () => {
       {
         description: 'Owner copy',
         systemSpecification: { hermes: { minimum_version: '0.17.0' } }
-      }
+      },
+      'local-skill-id'
+    )
+    void reviseWisdomDraft(
+      'draft-1',
+      'Owner copy',
+      [{ path: 'SKILL.md', content_utf8: '# Skill' }],
+      {
+        content: 'sha256:content',
+        author_description: 'sha256:description',
+        package_manifest: 'sha256:manifest'
+      },
+      { connectionId: 'homelab', profile: 'inbox-bot' }
     )
 
     for (const call of api.mock.calls) {
@@ -101,14 +114,20 @@ describe('capability helpers are connection-scoped', () => {
   })
 
   it('keeps local candidate evidence out of Wisdom mutation bodies', () => {
-    void suggestWisdomSkill('local-skill', 'research', {
-      description: 'Owner copy',
-      systemSpecification: { hermes: { minimum_version: '0.17.0' } }
-    })
+    void suggestWisdomSkill(
+      'local-skill',
+      'research',
+      {
+        description: 'Owner copy',
+        systemSpecification: { hermes: { minimum_version: '0.17.0' } }
+      },
+      'local-skill-id'
+    )
 
     expect(api.mock.calls.at(-1)?.[0]).toMatchObject({
       body: {
         description: 'Owner copy',
+        local_skill_id: 'local-skill-id',
         skill: 'local-skill',
         system_specification: { hermes: { minimum_version: '0.17.0' } }
       },

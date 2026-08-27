@@ -17,13 +17,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home, get_skills_dir
-from tools.skill_usage import _find_skill_dir, is_bundled, is_hub_installed
+from tools.skill_usage import is_bundled, is_hub_installed
 from tools.skills_guard import scan_skill, should_allow_install
 from tools.skillevaluator_scan import run_tier1_scan, tier1_advisory_enabled
 
 from .client import (
     WisdomClient,
     WisdomConflict,
+    WisdomError,
     WisdomNotFound,
     WisdomValidationError,
 )
@@ -35,10 +36,14 @@ from .contract import (
     SystemSpecification,
     author_description_hash,
     canonical_json_bytes,
+    org_directory_name,
     parse_manifest_bytes,
     sha256_address,
 )
 from .package import (
+    MAX_FILES,
+    MAX_FILE_BYTES,
+    MAX_TREE_BYTES,
     PackagePolicyError,
     PreparedPackage,
     prepare_package,
@@ -48,7 +53,7 @@ from .store import WisdomStore, utc_now
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
-ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$")
 WISDOM_DISCLOSURE = (
     "Candidate signals stay on this profile. Only owner-approved private draft bytes, "
     "author copy, manifest metadata, and managed-install state reach the Gateway."
@@ -100,18 +105,20 @@ def _source_fingerprint(source: Path) -> str:
     return sha256_address("".join(rows).encode("utf-8"))
 
 
-def _write_active_org_marker(managed: Path, org_id: str) -> None:
+def _write_active_org_marker(managed: Path, org_id: str) -> str:
     if not ORG_ID_RE.fullmatch(org_id):
         raise WisdomValidationError("team organization identity is malformed")
+    directory_name = org_directory_name(org_id)
     managed.mkdir(parents=True, exist_ok=True, mode=0o700)
     marker = managed / ".active_org"
     pending = managed / f".active_org.{uuid.uuid4().hex}.pending"
     try:
-        pending.write_text(org_id + "\n", encoding="utf-8")
+        pending.write_text(directory_name + "\n", encoding="utf-8")
         pending.chmod(0o600)
         os.replace(pending, marker)
     finally:
         pending.unlink(missing_ok=True)
+    return directory_name
 
 
 def _verified_tree(root: Path) -> tuple[dict[str, str], str]:
@@ -125,6 +132,29 @@ def _verified_tree(root: Path) -> tuple[dict[str, str], str]:
             files.append((path.relative_to(root).as_posix(), "file", path.read_bytes()))
     records, content_hash = verify_content_files(files)
     return {record.path: record.hash for record in records}, content_hash
+
+
+def _editable_package_files(root: Path) -> list[dict[str, str]]:
+    """Return a complete, policy-validated UTF-8 package for local editing."""
+    if not root.is_dir() or root.is_symlink():
+        raise PackagePolicyError("prepared package is missing or unsafe")
+    files: list[tuple[str, str, bytes]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise PackagePolicyError("prepared package contains a symbolic link")
+        if path.is_file():
+            files.append((path.relative_to(root).as_posix(), "file", path.read_bytes()))
+    records, _ = verify_content_files(files)
+    bodies = {path: body for path, _mode, body in files}
+    return [
+        {
+            "path": record.path,
+            "mode": record.mode,
+            "hash": record.hash,
+            "content_utf8": bodies[record.path].decode("utf-8"),
+        }
+        for record in records
+    ]
 
 
 def _scan_summary(path: Path) -> dict[str, Any]:
@@ -189,30 +219,57 @@ def _extract_model_text(response: Any) -> str:
 
 def draft_description(skill_md: str) -> str:
     """Draft author copy with the configured model under normal routing rules."""
-    from agent.auxiliary_client import call_llm
+    try:
+        from agent.auxiliary_client import call_llm
 
-    response = call_llm(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Write one concise, outcome-oriented plain-text description of this Hermes skill. "
-                    "Do not claim quality, safety, usage, popularity, or platform verification. "
-                    "Return only the description, at most 600 characters."
-                ),
-            },
-            {"role": "user", "content": skill_md[:24000]},
-        ],
-        temperature=0.2,
-        max_tokens=220,
-        timeout=60,
-    )
-    text = _extract_model_text(response)
+        response = call_llm(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Write one concise, outcome-oriented plain-text description of this Hermes skill. "
+                        "Do not claim quality, safety, usage, popularity, or platform verification. "
+                        "Return only the description, at most 600 characters."
+                    ),
+                },
+                {"role": "user", "content": skill_md[:24000]},
+            ],
+            temperature=0.2,
+            max_tokens=220,
+            timeout=60,
+        )
+        text = _extract_model_text(response)
+    except Exception as exc:
+        raise WisdomError(
+            "Hermes could not draft a description with the configured model. "
+            "Check the model setup and try again."
+        ) from exc
     if not text:
         raise PackagePolicyError(
             "the configured model did not return an author description"
         )
     return text
+
+
+def _existing_author_description(skill_md: str) -> str | None:
+    """Reuse explicit skill copy before asking a model to rewrite it.
+
+    Most agent-created skills already carry a concise frontmatter description.
+    Treating that as the editable initial owner copy keeps local review available
+    when inference is offline and avoids an unnecessary model round trip. Skills
+    without usable copy still use the configured model path below.
+    """
+    try:
+        from agent.skill_utils import parse_frontmatter
+
+        frontmatter, _body = parse_frontmatter(skill_md)
+    except Exception:
+        return None
+    value = frontmatter.get("description")
+    if not isinstance(value, str):
+        return None
+    description = value.strip()
+    return description or None
 
 
 class WisdomService:
@@ -285,7 +342,7 @@ class WisdomService:
         # ledger. A crash may temporarily select the new verified org while
         # setup asks to resume, but can never keep loading the stale org after
         # Gateway accepted the change.
-        _write_active_org_marker(managed, org_id)
+        managed_org = _write_active_org_marker(managed, org_id)
         self.store.activate_installation_identity(installation_id, org_id)
         recovered = self.reconcile_pending_install_records()
         recovered.extend(self.consumption.recover())
@@ -305,10 +362,10 @@ class WisdomService:
             "installation_id": installation_id,
             "organization_id": org_id,
             "registered": registered,
-            "capabilities": capability.get("capabilities", []),
+            "capabilities": capability.get("features", []),
             "display_scopes": list(self.client.display_scopes),
             "database": str(self.store.path),
-            "managed_directory": str(managed / org_id),
+            "managed_directory": str(managed / managed_org),
             "candidate_count": len(candidates),
             "recovered_gateway_records": recovered,
             "disclosure": WISDOM_DISCLOSURE,
@@ -444,7 +501,7 @@ class WisdomService:
             ),
             "gateway_available": live,
             "error": None if live else error,
-            "capability_advertised": "wisdom" in (capability.get("capabilities") or []),
+            "capability_advertised": "wisdom" in (capability.get("features") or []),
             "display_scopes": scopes,
             "dogfood_admin_claim": admin_gate,
             "installation_id": installation_id,
@@ -475,6 +532,28 @@ class WisdomService:
             paths.append(path)
         return paths
 
+    def _candidate_source(
+        self, skill_name: str, local_skill_id: str | None = None
+    ) -> Path:
+        eligible = {path.resolve() for path in self._eligible_paths()}
+        if local_skill_id:
+            local = self.store.local_skill(local_skill_id)
+            if local:
+                source = Path(str(local["canonical_path"])).resolve()
+                if source in eligible and source.name == skill_name:
+                    return source
+            raise PackagePolicyError(
+                "this local skill changed or moved; scan local skills and try again"
+            )
+        matches = [path for path in eligible if path.name == skill_name]
+        if not matches:
+            raise PackagePolicyError("skill is not eligible for Collective Wisdom")
+        if len(matches) > 1:
+            raise PackagePolicyError(
+                "more than one eligible local skill has this name; select it from the dashboard"
+            )
+        return matches[0]
+
     def scan_candidates(self) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         qualified = {
@@ -488,6 +567,11 @@ class WisdomService:
             skill_id = self.store.register_skill(
                 path, content_hash=source_hash, source_kind="local"
             )
+            contribution = self.store.latest_draft_for_source(skill_id, source_hash)
+            if contribution and str(contribution["state"]) != "prepared":
+                # The exact bytes have already entered the contribution flow.
+                # A material source change gets a new hash and becomes eligible again.
+                continue
             try:
                 # Preparation remains manual; this dry structural pass rejects
                 # scripts/templates/unsupported bytes without uploading anything.
@@ -520,6 +604,7 @@ class WisdomService:
                 "qualification": (
                     str(event["qualification"]) if event else "manual_selection"
                 ),
+                "contribution_state": "prepared" if contribution else "new",
             })
         return candidates
 
@@ -536,6 +621,25 @@ class WisdomService:
             ]
         }
 
+    def _prepared_result(self, draft: dict[str, Any]) -> dict[str, Any]:
+        overlay = Path(str(draft["overlay_path"]))
+        manifest = _parse_package_manifest(
+            (overlay / "skill.manifest.json").read_bytes()
+        )
+        return {
+            "network_submission": False,
+            "local_draft_id": str(draft["id"]),
+            "overlay_path": str(overlay),
+            "drafted_description": str(draft["description"]),
+            "system_specification": manifest.requirements.model_dump(mode="json"),
+            "files": _editable_package_files(overlay),
+            "local_scan": _scan_summary(overlay),
+            "next_step": (
+                "Review and save the complete local package, then send its exact bytes "
+                "for owner-only server review."
+            ),
+        }
+
     def suggest(
         self,
         skill_name: str | None = None,
@@ -543,22 +647,36 @@ class WisdomService:
         description: str | None = None,
         system_specification: dict[str, Any] | None = None,
         allow_private_secret_review: bool = False,
+        local_skill_id: str | None = None,
     ) -> dict[str, Any]:
         if not skill_name:
             return {"candidates": self.scan_candidates(), "network_submission": False}
-        source = _find_skill_dir(skill_name)
-        if source is None or source.resolve() not in {
-            path.resolve() for path in self._eligible_paths()
-        }:
-            raise PackagePolicyError("skill is not eligible for Collective Wisdom")
+        source = self._candidate_source(skill_name, local_skill_id)
         source_hash = _source_fingerprint(source)
         skill_id = self.store.register_skill(
             source, content_hash=source_hash, source_kind="local"
         )
         prepared = self.store.prepared_draft(skill_id, source_hash)
+        existing = self.store.latest_draft_for_source(skill_id, source_hash)
+        if prepared is None and existing is not None:
+            state = str(existing["state"])
+            if state == "published":
+                message = (
+                    "this exact skill version is already shared; change the local content "
+                    "before contributing a new version"
+                )
+            else:
+                message = (
+                    f"this exact skill version is already in the contribution flow ({state}); "
+                    "open its existing draft instead"
+                )
+            raise WisdomConflict(message, code="wisdom_source_already_contributed")
         if prepared is None:
-            author_copy = description or draft_description(
-                (source / "SKILL.md").read_text(encoding="utf-8")
+            skill_md = (source / "SKILL.md").read_text(encoding="utf-8")
+            author_copy = (
+                description
+                or _existing_author_description(skill_md)
+                or draft_description(skill_md)
             )
             local_package = prepare_package(
                 source,
@@ -579,31 +697,12 @@ class WisdomService:
                 "description_hash": local_package.description_hash,
                 "manifest_hash": local_package.manifest_hash,
             })
-            return {
-                "network_submission": False,
-                "local_draft_id": local_id,
-                "overlay_path": str(local_package.overlay),
-                "drafted_description": local_package.description,
-                "system_specification": local_package.manifest.requirements.model_dump(
-                    mode="json"
-                ),
-                "next_step": (
-                    "Edit the author description and skill.manifest.json in the overlay, review every "
-                    "file, then rerun `hermes wisdom suggest <skill> --description <approved-copy>`."
-                ),
-            }
+            local = self.store.draft(local_id)
+            if local is None:  # pragma: no cover - SQLite write/read invariant
+                raise WisdomValidationError("prepared local draft was not persisted")
+            return self._prepared_result(local)
         if description is None:
-            manifest = _parse_package_manifest(
-                (Path(prepared["overlay_path"]) / "skill.manifest.json").read_bytes()
-            )
-            return {
-                "network_submission": False,
-                "local_draft_id": prepared["id"],
-                "overlay_path": prepared["overlay_path"],
-                "drafted_description": prepared["description"],
-                "system_specification": manifest.requirements.model_dump(mode="json"),
-                "next_step": "Provide the owner-approved description to submit the edited overlay.",
-            }
+            return self._prepared_result(prepared)
         if system_specification is None:
             raise PackagePolicyError(
                 "submission requires explicit owner approval of the System Specification"
@@ -673,6 +772,92 @@ class WisdomService:
             "notice": "Draft bytes are owner-private; nothing is published until hash-bound approval.",
         }
 
+    def save_prepared(
+        self,
+        draft_id: str,
+        *,
+        author_description: str,
+        files: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Save owner edits locally without performing any network operation."""
+        local = self.store.draft(draft_id)
+        if local is None or not draft_id.startswith("local:"):
+            raise WisdomNotFound("prepared draft not found")
+        if str(local["state"]) != "prepared":
+            raise WisdomConflict(
+                f"this local draft cannot be edited while it is {str(local['state']).replace('_', ' ')}",
+                code=f"state_is_{local['state']}",
+            )
+
+        overlay = Path(str(local["overlay_path"]))
+        authoritative = {
+            item["path"]: item for item in _editable_package_files(overlay)
+        }
+        if len(files) > MAX_FILES:
+            raise PackagePolicyError(f"package exceeds {MAX_FILES} files")
+
+        requested: dict[str, bytes] = {}
+        for item in files:
+            path = item.get("path")
+            content = item.get("content_utf8")
+            if not isinstance(path, str) or not isinstance(content, str):
+                raise PackagePolicyError(
+                    "every edited file requires a path and UTF-8 content"
+                )
+            if path in requested:
+                raise PackagePolicyError(f"duplicate edited file: {path}")
+            requested[path] = content.encode("utf-8")
+
+        verify_content_files([(path, "file", body) for path, body in requested.items()])
+        if set(requested) != set(authoritative):
+            raise PackagePolicyError(
+                "a saved local draft must include the complete existing package without adding, removing, or renaming files"
+            )
+
+        namespace = sha256_address(draft_id.encode("utf-8")).removeprefix("sha256:")
+        local_inputs = self.store.root / "local-edit-inputs"
+        local_inputs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="edit-", dir=local_inputs) as raw_stage:
+            stage = Path(raw_stage)
+            for path, body in requested.items():
+                destination = stage.joinpath(*PurePosixPath(path).parts)
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                destination.write_bytes(body)
+                destination.chmod(0o600)
+            package = prepare_package(
+                stage,
+                overlay_root=self.store.root / "local-edits" / namespace,
+                author_description=author_description,
+                owner=str(self.client.identity.get("owner")),
+                installation_id=self.store.installation_identity(),
+            )
+
+        self.store.record_draft({
+            **local,
+            "overlay_path": str(package.overlay),
+            "state": "prepared",
+            "description": package.description,
+            "content_hash": package.content_hash,
+            "description_hash": package.description_hash,
+            "manifest_hash": package.manifest_hash,
+        })
+        saved = self.store.draft(draft_id)
+        if saved is None:  # pragma: no cover - SQLite write/read invariant
+            raise WisdomValidationError("saved local draft was not persisted")
+        return self._prepared_result(saved)
+
+    def dismiss_local_candidate(
+        self, local_skill_id: str, content_hash: str
+    ) -> dict[str, Any]:
+        local = self.store.local_skill(local_skill_id)
+        if local is None or str(local.get("current_hash")) != content_hash:
+            raise WisdomNotFound("local candidate not found")
+        self.store.dismiss_candidate(local_skill_id, content_hash)
+        prepared = self.store.prepared_draft(local_skill_id, content_hash)
+        if prepared is not None:
+            self.store.set_draft_state(str(prepared["id"]), "declined")
+        return {"dismissed": True}
+
     def review(
         self, draft_id: str, *, acknowledge: bool, portal: bool = False
     ) -> dict[str, Any]:
@@ -726,6 +911,143 @@ class WisdomService:
             )
         return result
 
+    def revise(
+        self,
+        draft_id: str,
+        *,
+        author_description: str,
+        files: list[dict[str, str]],
+        expected_content_hash: str,
+        expected_description_hash: str,
+        expected_manifest_hash: str,
+        allow_private_secret_review: bool = False,
+    ) -> dict[str, Any]:
+        """Create and upload an edited successor without mutating reviewed bytes."""
+        current = self.client.reconstruct_draft(draft_id)
+        draft = current.detail.draft
+        manifest_body = next(
+            body for path, _, body in current.files if path == "skill.manifest.json"
+        )
+        authoritative = (
+            current.content_hash,
+            author_description_hash(draft.authorDescription or ""),
+            sha256_address(manifest_body),
+        )
+        expected = (
+            expected_content_hash,
+            expected_description_hash,
+            expected_manifest_hash,
+        )
+        if authoritative != expected:
+            raise WisdomConflict(
+                "this draft changed after it was opened; reload it before saving",
+                code="stale_revision",
+            )
+        if draft.state not in {"ready", "changes_requested", "invalidated"}:
+            raise WisdomConflict(
+                f"this draft cannot be edited while it is {draft.state.replace('_', ' ')}",
+                code=f"state_is_{draft.state}",
+            )
+        if len(files) > MAX_FILES:
+            raise PackagePolicyError(f"package exceeds {MAX_FILES} files")
+
+        requested: dict[str, bytes] = {}
+        total = 0
+        for item in files:
+            path = item.get("path")
+            content = item.get("content_utf8")
+            if not isinstance(path, str) or not isinstance(content, str):
+                raise PackagePolicyError(
+                    "every edited file requires a path and UTF-8 content"
+                )
+            if path in requested:
+                raise PackagePolicyError(f"duplicate edited file: {path}")
+            body = content.encode("utf-8")
+            if len(body) > MAX_FILE_BYTES:
+                raise PackagePolicyError(f"file exceeds {MAX_FILE_BYTES} bytes: {path}")
+            total += len(body)
+            if total > MAX_TREE_BYTES:
+                raise PackagePolicyError(
+                    f"package exceeds {MAX_TREE_BYTES} total bytes"
+                )
+            requested[path] = body
+
+        authoritative_files = {path: (mode, body) for path, mode, body in current.files}
+        if set(requested) != set(authoritative_files):
+            raise PackagePolicyError(
+                "an edited revision must include the complete existing package without adding, removing, or renaming files"
+            )
+        if any(mode != "file" for mode, _ in authoritative_files.values()):
+            raise PackagePolicyError(
+                "executable Wisdom content cannot be edited or published"
+            )
+
+        revision_inputs = self.store.root / "revision-inputs"
+        revision_inputs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        revision_namespace = sha256_address(draft_id.encode("utf-8")).removeprefix(
+            "sha256:"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="edit-", dir=revision_inputs
+        ) as raw_stage:
+            stage = Path(raw_stage)
+            for path, body in requested.items():
+                destination = stage.joinpath(*PurePosixPath(path).parts)
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                destination.write_bytes(body)
+                destination.chmod(0o600)
+            package = prepare_package(
+                stage,
+                overlay_root=self.store.root / "revisions" / revision_namespace,
+                author_description=author_description,
+                owner=str(self.client.identity.get("owner")),
+                installation_id=self.store.installation_identity(),
+            )
+
+        local_scan = _scan_summary(package.overlay)
+        if local_scan["guard"]["allowed"] is False:
+            raise PackagePolicyError(
+                f"built-in guard blocked the exact edited package: {local_scan['guard']['reason']}"
+            )
+        if _has_high_confidence_secret(local_scan) and not allow_private_secret_review:
+            raise PackagePolicyError(
+                "high-confidence local secret finding paused upload; explicitly confirm owner-only server review to continue"
+            )
+
+        self.client.upload_private_objects(package.objects)
+        revised = self.client.revise_draft(
+            draft_id,
+            commit=package.commit,
+            content_hash=package.content_hash,
+            description=package.description,
+            expected_content_hash=expected_content_hash,
+            expected_description_hash=expected_description_hash,
+            expected_manifest_hash=expected_manifest_hash,
+        )
+        local = self.store.draft(draft_id)
+        if local:
+            self.store.set_draft_state(draft_id, "invalidated")
+            self.store.record_draft({
+                "id": revised.id,
+                "skill_id": str(local["skill_id"]),
+                "source_hash": str(local["source_hash"]),
+                "overlay_path": str(package.overlay),
+                "draft_commit": revised.draftCommit,
+                "server_revision": revised.updatedAt,
+                "state": revised.state,
+                "description": revised.authorDescription or "",
+                "content_hash": revised.contentHash,
+                "description_hash": revised.authorDescriptionHash
+                or package.description_hash,
+                "manifest_hash": revised.packageManifestHash or package.manifest_hash,
+            })
+        self.store.consume_receipt(draft_id)
+        return {
+            "draft": revised.model_dump(mode="json"),
+            "local_scan": local_scan,
+            "notice": "Changes were saved as a new owner-private revision and rescanned.",
+        }
+
     def approve(self, draft_id: str) -> dict[str, Any]:
         receipt = self.store.receipt(draft_id)
         if not receipt:
@@ -760,6 +1082,12 @@ class WisdomService:
             manifest_hash=receipt["manifest_hash"],
         )
         published = self.client.publish(draft_id, content_hash=receipt["content_hash"])
+        publication_state = published.get("state")
+        if publication_state not in {"pending_moderation", "published"}:
+            raise WisdomValidationError(
+                "Gateway returned an invalid publication state"
+            )
+        self.store.complete_contribution(draft_id, str(publication_state))
         self.store.consume_receipt(draft_id)
         return {"approved": approved.model_dump(mode="json"), "publication": published}
 
@@ -1019,7 +1347,9 @@ class WisdomService:
         org_id = self.store.active_org_id()
         if not org_id:
             raise PackagePolicyError("run `hermes wisdom setup` before installing")
-        managed_root = (get_skills_dir() / "_wisdom" / org_id).resolve()
+        managed_root = (
+            get_skills_dir() / "_wisdom" / org_directory_name(org_id)
+        ).resolve()
         managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = (managed_root / plan["slug"]).resolve()
         try:

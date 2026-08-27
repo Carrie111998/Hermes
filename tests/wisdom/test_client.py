@@ -60,6 +60,10 @@ class Response:
     def json(self):
         return self._body
 
+    def raise_for_status(self):
+        if self.status_code < 200 or self.status_code >= 300:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 class Session:
     def __init__(self, response):
@@ -70,6 +74,10 @@ class Session:
         self.calls.append((method, url, kwargs))
         return self.response
 
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.response
+
 
 def client(response):
     value = WisdomClient.__new__(WisdomClient)
@@ -77,6 +85,12 @@ def client(response):
     value.timeout = 7
     value.session = Session(response)
     return value
+
+
+def test_capability_uses_gateway_features_field():
+    value = client(Response(200, {"features": ["personal", "org", "wisdom"]}))
+
+    assert value.capability()["features"][-1] == "wisdom"
 
 
 def test_submit_body_has_no_local_candidate_or_activity_signals():
@@ -135,6 +149,35 @@ def test_approve_exact_three_hash_body():
         "content_hash": "c",
         "author_description_hash": "d",
         "package_manifest_hash": "m",
+    }
+
+
+def test_revise_binds_predecessor_hashes_and_new_private_commit():
+    value = client(Response(201, {"draft": _draft(id="d2")}))
+
+    revised = value.revise_draft(
+        "d1",
+        commit="sha256:" + "e" * 64,
+        content_hash="sha256:" + "f" * 64,
+        description="Updated owner copy.",
+        expected_content_hash="sha256:" + "b" * 64,
+        expected_description_hash="sha256:" + "c" * 64,
+        expected_manifest_hash="sha256:" + "d" * 64,
+    )
+
+    assert revised.id == "d2"
+    method, url, request = value.session.calls[0]
+    assert (method, url) == (
+        "POST",
+        "https://gateway.example/v1/sync/wisdom/drafts/d1/revise",
+    )
+    assert request["json"] == {
+        "draft_commit": "sha256:" + "e" * 64,
+        "content_hash": "sha256:" + "f" * 64,
+        "author_description": "Updated owner copy.",
+        "expected_content_hash": "sha256:" + "b" * 64,
+        "expected_author_description_hash": "sha256:" + "c" * 64,
+        "expected_package_manifest_hash": "sha256:" + "d" * 64,
     }
 
 

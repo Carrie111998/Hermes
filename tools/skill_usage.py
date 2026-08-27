@@ -912,7 +912,11 @@ def bump_use(
             record_successful_use(
                 skill_name,
                 task_id=task_id,
-                session_id=session_id,
+                # Skill invocation call sites carry the live transcript key as
+                # task_id.  Persist it as the candidate event's session owner
+                # as well so Dashboard/Desktop/TUI polling can attach the
+                # consent card to the turn that qualified the skill.
+                session_id=session_id or task_id,
             )
         except Exception:
             logger.debug(

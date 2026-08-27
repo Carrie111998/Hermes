@@ -1529,6 +1529,463 @@
           "auth"
         ]
       },
+      "WisdomSystemSpec": {
+        "type": "object",
+        "properties": {
+          "hermes": {
+            "type": "object",
+            "properties": {
+              "minimum_version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": [
+              "minimum_version"
+            ]
+          },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "architectures": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "model": {
+            "type": "object",
+            "properties": {
+              "capabilities": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "minimum_context_window": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "exclusiveMinimum": 0
+              }
+            },
+            "required": [
+              "capabilities",
+              "minimum_context_window"
+            ]
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "minimum_version": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "auto_install": {
+                  "type": "boolean",
+                  "enum": [
+                    false
+                  ],
+                  "description": "Must be false in dogfood; requirements are inert compatibility metadata and never authorize dependency installation."
+                },
+                "requires_admin": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "name",
+                "minimum_version",
+                "auto_install",
+                "requires_admin"
+              ]
+            }
+          },
+          "plugins": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256,
+                  "description": "Stable canonical plugin identifier."
+                },
+                "minimum_version": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "required": {
+                  "type": "boolean",
+                  "description": "Requirement strength only; never authorizes automatic installation."
+                }
+              },
+              "required": [
+                "id",
+                "minimum_version",
+                "required"
+              ]
+            }
+          },
+          "credentials": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "connections": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "filesystem": {
+            "type": "object",
+            "properties": {
+              "read": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "write": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              }
+            },
+            "required": [
+              "read",
+              "write"
+            ]
+          },
+          "network": {
+            "type": "object",
+            "properties": {
+              "destinations": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              }
+            },
+            "required": [
+              "destinations"
+            ]
+          },
+          "runtime": {
+            "type": "object",
+            "properties": {
+              "shell": {
+                "type": "boolean"
+              },
+              "browser": {
+                "type": "boolean"
+              },
+              "code": {
+                "type": "boolean"
+              },
+              "sandbox": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "shell",
+              "browser",
+              "code",
+              "sandbox"
+            ]
+          },
+          "hardware": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "known_limitations": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        },
+        "required": [
+          "hermes",
+          "platforms",
+          "architectures",
+          "model",
+          "tools",
+          "plugins",
+          "credentials",
+          "connections",
+          "filesystem",
+          "network",
+          "runtime",
+          "hardware",
+          "known_limitations"
+        ]
+      },
+      "WisdomDraftRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "orgId": {
+            "type": "string"
+          },
+          "ownerUserId": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "draftCommit": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "contentHash": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "authorDescription": {
+            "type": "string"
+          },
+          "authorDescriptionHash": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "authorDescriptionSchemaVersion": {
+            "type": "integer"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "vetting",
+              "ready",
+              "owner_approved",
+              "publishing",
+              "pending_moderation",
+              "changes_requested",
+              "published",
+              "declined",
+              "invalidated"
+            ]
+          },
+          "proposalN": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ownerApprovedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "moderationNote": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "moderationDeciderUserId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "moderationDecidedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "packageManifestHash": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "packageManifestSchemaVersion": {
+            "type": "integer"
+          },
+          "systemSpec": {
+            "$ref": "#/components/schemas/WisdomSystemSpec"
+          },
+          "scan": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {}
+          },
+          "scanVerdict": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "pass",
+              "advisory",
+              "blocked"
+            ]
+          },
+          "explanation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "explanationModel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supersedesDraftId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "orgId",
+          "ownerUserId",
+          "slug",
+          "draftCommit",
+          "contentHash",
+          "authorDescription",
+          "authorDescriptionHash",
+          "authorDescriptionSchemaVersion",
+          "state",
+          "proposalN",
+          "ownerApprovedAt",
+          "moderationNote",
+          "moderationDeciderUserId",
+          "moderationDecidedAt",
+          "packageManifestHash",
+          "packageManifestSchemaVersion",
+          "systemSpec",
+          "scan",
+          "scanVerdict",
+          "explanation",
+          "explanationModel",
+          "supersedesDraftId",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "WisdomDraftResponse": {
+        "type": "object",
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/WisdomDraftRecord"
+          }
+        },
+        "required": [
+          "draft"
+        ]
+      },
+      "WisdomDraftReviseRequest": {
+        "type": "object",
+        "properties": {
+          "draft_commit": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "content_hash": {
+            "type": "string",
+            "description": "Optional client cross-check; the server derives the successor hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "author_description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "expected_content_hash": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "expected_author_description_hash": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "expected_package_manifest_hash": {
+            "type": "string",
+            "description": "Canonical sha256 content address or consent hash.",
+            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "required": [
+          "draft_commit",
+          "author_description",
+          "expected_content_hash",
+          "expected_author_description_hash",
+          "expected_package_manifest_hash"
+        ],
+        "additionalProperties": false
+      },
       "SyncRefsResponse": {
         "type": "object",
         "properties": {
@@ -1896,432 +2353,6 @@
         ],
         "additionalProperties": false
       },
-      "WisdomSystemSpec": {
-        "type": [
-          "object",
-          "null"
-        ],
-        "properties": {
-          "hermes": {
-            "type": "object",
-            "properties": {
-              "minimum_version": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
-              }
-            },
-            "required": [
-              "minimum_version"
-            ]
-          },
-          "platforms": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
-          },
-          "architectures": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
-          },
-          "model": {
-            "type": "object",
-            "properties": {
-              "capabilities": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256
-                }
-              },
-              "minimum_context_window": {
-                "type": [
-                  "integer",
-                  "null"
-                ],
-                "exclusiveMinimum": 0
-              }
-            },
-            "required": [
-              "capabilities",
-              "minimum_context_window"
-            ]
-          },
-          "tools": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "name": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256
-                },
-                "minimum_version": {
-                  "type": [
-                    "string",
-                    "null"
-                  ],
-                  "minLength": 1,
-                  "maxLength": 256
-                },
-                "auto_install": {
-                  "type": "boolean",
-                  "enum": [
-                    false
-                  ],
-                  "description": "Must be false in dogfood; requirements are inert compatibility metadata and never authorize dependency installation."
-                },
-                "requires_admin": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "name",
-                "minimum_version",
-                "auto_install",
-                "requires_admin"
-              ]
-            }
-          },
-          "plugins": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256,
-                  "description": "Stable canonical plugin identifier."
-                },
-                "minimum_version": {
-                  "type": [
-                    "string",
-                    "null"
-                  ],
-                  "minLength": 1,
-                  "maxLength": 256
-                },
-                "required": {
-                  "type": "boolean",
-                  "description": "Requirement strength only; never authorizes automatic installation."
-                }
-              },
-              "required": [
-                "id",
-                "minimum_version",
-                "required"
-              ]
-            }
-          },
-          "credentials": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
-          },
-          "connections": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
-          },
-          "filesystem": {
-            "type": "object",
-            "properties": {
-              "read": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256
-                }
-              },
-              "write": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256
-                }
-              }
-            },
-            "required": [
-              "read",
-              "write"
-            ]
-          },
-          "network": {
-            "type": "object",
-            "properties": {
-              "destinations": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256
-                }
-              }
-            },
-            "required": [
-              "destinations"
-            ]
-          },
-          "runtime": {
-            "type": "object",
-            "properties": {
-              "shell": {
-                "type": "boolean"
-              },
-              "browser": {
-                "type": "boolean"
-              },
-              "code": {
-                "type": "boolean"
-              },
-              "sandbox": {
-                "type": "boolean"
-              }
-            },
-            "required": [
-              "shell",
-              "browser",
-              "code",
-              "sandbox"
-            ]
-          },
-          "hardware": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
-          },
-          "known_limitations": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
-          }
-        },
-        "required": [
-          "hermes",
-          "platforms",
-          "architectures",
-          "model",
-          "tools",
-          "plugins",
-          "credentials",
-          "connections",
-          "filesystem",
-          "network",
-          "runtime",
-          "hardware",
-          "known_limitations"
-        ],
-        "description": "Validated V1 System Specification, or null only for a legacy pre-manifest row."
-      },
-      "WisdomDraftRecord": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "orgId": {
-            "type": "string"
-          },
-          "ownerUserId": {
-            "type": "string"
-          },
-          "slug": {
-            "type": "string"
-          },
-          "draftCommit": {
-            "type": "string",
-            "description": "Canonical sha256 content address or consent hash.",
-            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          },
-          "contentHash": {
-            "type": "string",
-            "description": "Canonical sha256 content address or consent hash.",
-            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          },
-          "authorDescription": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "authorDescriptionHash": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Canonical sha256 content address or consent hash.",
-            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          },
-          "authorDescriptionSchemaVersion": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "vetting",
-              "ready",
-              "owner_approved",
-              "publishing",
-              "pending_moderation",
-              "changes_requested",
-              "published",
-              "declined",
-              "invalidated"
-            ]
-          },
-          "proposalN": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "ownerApprovedAt": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "moderationNote": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "moderationDeciderUserId": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "moderationDecidedAt": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "packageManifestHash": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Canonical sha256 content address or consent hash.",
-            "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          },
-          "packageManifestSchemaVersion": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "systemSpec": {
-            "$ref": "#/components/schemas/WisdomSystemSpec"
-          },
-          "scan": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "additionalProperties": {}
-          },
-          "scanVerdict": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "enum": [
-              "pass",
-              "advisory",
-              "blocked"
-            ]
-          },
-          "explanation": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "explanationModel": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "createdAt": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "updatedAt": {
-            "type": "string",
-            "format": "date-time"
-          }
-        },
-        "required": [
-          "id",
-          "orgId",
-          "ownerUserId",
-          "slug",
-          "draftCommit",
-          "contentHash",
-          "authorDescription",
-          "authorDescriptionHash",
-          "authorDescriptionSchemaVersion",
-          "state",
-          "proposalN",
-          "ownerApprovedAt",
-          "moderationNote",
-          "moderationDeciderUserId",
-          "moderationDecidedAt",
-          "packageManifestHash",
-          "packageManifestSchemaVersion",
-          "systemSpec",
-          "scan",
-          "scanVerdict",
-          "explanation",
-          "explanationModel",
-          "createdAt",
-          "updatedAt"
-        ]
-      },
-      "WisdomDraftResponse": {
-        "type": "object",
-        "properties": {
-          "draft": {
-            "$ref": "#/components/schemas/WisdomDraftRecord"
-          }
-        },
-        "required": [
-          "draft"
-        ]
-      },
       "WisdomDraftSubmitRequest": {
         "type": "object",
         "properties": {
@@ -2531,7 +2562,17 @@
                   "description": "Current lifecycle fence to echo when fetching or recording a managed install."
                 },
                 "system_spec": {
-                  "$ref": "#/components/schemas/WisdomSystemSpec"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/WisdomSystemSpec"
+                    },
+                    {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  ]
                 },
                 "first_published_at": {
                   "type": [
@@ -2780,7 +2821,56 @@
           "drafts": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/WisdomDraftRecord"
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/WisdomDraftRecord"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "publicationContext": {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "new_skill",
+                            "revised_submission",
+                            "update"
+                          ]
+                        },
+                        "currentVersion": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ],
+                          "exclusiveMinimum": 0
+                        },
+                        "proposedVersion": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0
+                        },
+                        "supersedesProposalN": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ],
+                          "exclusiveMinimum": 0
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "currentVersion",
+                        "proposedVersion",
+                        "supersedesProposalN"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "publicationContext"
+                  ]
+                }
+              ]
             }
           }
         },
@@ -3041,7 +3131,17 @@
                   ]
                 },
                 "system_spec": {
-                  "$ref": "#/components/schemas/WisdomSystemSpec"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/WisdomSystemSpec"
+                    },
+                    {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  ]
                 },
                 "scan": {
                   "type": [
@@ -3074,6 +3174,32 @@
                   ]
                 },
                 "capabilities": {},
+                "publication_kind": {
+                  "type": "string",
+                  "enum": [
+                    "new_skill",
+                    "revised_submission",
+                    "update"
+                  ]
+                },
+                "current_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "exclusiveMinimum": 0
+                },
+                "proposed_version": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0
+                },
+                "supersedes_proposal_id": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "exclusiveMinimum": 0
+                },
                 "hashes": {
                   "type": "object",
                   "properties": {
@@ -3123,6 +3249,10 @@
                 "scan_verdict",
                 "explanation",
                 "explanation_model",
+                "publication_kind",
+                "current_version",
+                "proposed_version",
+                "supersedes_proposal_id",
                 "hashes"
               ]
             }
@@ -3200,7 +3330,17 @@
                 ]
               },
               "system_spec": {
-                "$ref": "#/components/schemas/WisdomSystemSpec"
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WisdomSystemSpec"
+                  },
+                  {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  }
+                ]
               },
               "scan": {
                 "type": [
@@ -3233,6 +3373,32 @@
                 ]
               },
               "capabilities": {},
+              "publication_kind": {
+                "type": "string",
+                "enum": [
+                  "new_skill",
+                  "revised_submission",
+                  "update"
+                ]
+              },
+              "current_version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "exclusiveMinimum": 0
+              },
+              "proposed_version": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              "supersedes_proposal_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "exclusiveMinimum": 0
+              },
               "hashes": {
                 "type": "object",
                 "properties": {
@@ -3282,6 +3448,10 @@
               "scan_verdict",
               "explanation",
               "explanation_model",
+              "publication_kind",
+              "current_version",
+              "proposed_version",
+              "supersedes_proposal_id",
               "hashes"
             ]
           },
@@ -3546,24 +3716,15 @@
                 "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
               },
               "author_description": {
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "author_description_hash": {
-                "type": [
-                  "string",
-                  "null"
-                ],
+                "type": "string",
                 "description": "Canonical sha256 content address or consent hash.",
                 "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
               },
               "author_description_schema_version": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "verified_facts": {
                 "type": [
@@ -3573,31 +3734,18 @@
                 "additionalProperties": {}
               },
               "package_manifest_hash": {
-                "type": [
-                  "string",
-                  "null"
-                ],
+                "type": "string",
                 "description": "Canonical sha256 content address or consent hash.",
                 "example": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
               },
               "package_manifest_schema_version": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "explanation": {
                 "type": "string"
               },
               "system_spec": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/WisdomSystemSpec"
-                  },
-                  {
-                    "description": "Validated V1 System Specification; null only for a legacy version."
-                  }
-                ]
+                "$ref": "#/components/schemas/WisdomSystemSpec"
               },
               "scan": {
                 "type": [
@@ -5369,6 +5517,113 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SyncCapabilitiesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sync/wisdom/drafts/{id}/revise": {
+      "post": {
+        "summary": "Create a newly vetted successor to an owner-private draft.",
+        "description": "Uploads are already present in the owner's personal HSP namespace. The server reconstructs, validates, scans, and re-hashes the complete successor package before atomically invalidating the predecessor. The predecessor remains immutable for proposal and audit integrity; retrying the same revision returns the one authoritative successor.",
+        "tags": [
+          "wisdom"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "description": "Draft or skill id (uuid).",
+              "example": "6a1f6f3e-7f7d-4e57-9b6e-2f6f0d3c9a11"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WisdomDraftReviseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successor created and vetted ({ draft } in ready).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WisdomDraftResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body or incomplete owner-scoped object closure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing wisdom:publish scope, NAS-admin claim, or org_role.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Predecessor not found — or not yours.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale predecessor, wrong state, or a different revision won.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid description, instruction-only package violation, author mismatch, or scan blocked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -7347,7 +7602,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The explicitly configured policy ({ publicationPolicy: open|moderated, hardBlockPatterns, version }).",
+            "description": "The effective policy ({ publicationPolicy: open|moderated, hardBlockPatterns, version }). Untouched organizations receive the epoch-1 open default.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7377,7 +7632,7 @@
             }
           },
           "404": {
-            "description": "policy_not_configured — the wisdom plane fails closed.",
+            "description": "Stored policy is invalid and the wisdom plane failed closed.",
             "content": {
               "application/json": {
                 "schema": {

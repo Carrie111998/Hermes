@@ -7,11 +7,12 @@ import logging
 import re
 import threading
 from difflib import unified_diff
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_skills_dir
+from hermes_time import get_timezone
 from tools.skill_usage import _find_skill_dir, is_bundled, is_hub_installed
 
 from .contract import sha256_address
@@ -23,12 +24,29 @@ RETENTION_DAYS = 35
 RECENT_USE_DAYS = 30
 STABILITY_DAYS = 7
 REQUIRED_REFINEMENTS = 3
-HIGH_USAGE_CONSECUTIVE_DAYS = 7
+HIGH_USAGE_CONSECUTIVE_BUSINESS_DAYS = 7
 
 
 def _now(value: datetime | None = None) -> datetime:
     current = value or datetime.now(timezone.utc)
     return current.astimezone(timezone.utc)
+
+
+def _profile_timezone() -> tuple[tzinfo, str]:
+    """Return the configured profile timezone and a stable local-ledger key."""
+
+    configured = get_timezone()
+    if configured is not None:
+        return configured, str(getattr(configured, "key", configured))
+    local = datetime.now().astimezone().tzinfo or timezone.utc
+    return local, f"local:{local}"
+
+
+def _next_business_day(day: date) -> date:
+    candidate = day + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def _eligible_path(skill_name: str) -> Path | None:
@@ -144,13 +162,14 @@ def _classify_ambiguous(
     return "meaningful" if label == "meaningful" else "non_meaningful"
 
 
-def _consecutive(days: list[str], *, required: int) -> bool:
-    parsed = sorted({datetime.fromisoformat(day).date() for day in days})
+def _consecutive_business_days(days: list[str], *, required: int) -> bool:
+    dates = {datetime.fromisoformat(day).date() for day in days}
+    parsed = sorted(day for day in dates if day.weekday() < 5)
     if len(parsed) < required:
         return False
     run = 1
     for previous, current in zip(parsed, parsed[1:]):
-        run = run + 1 if current == previous + timedelta(days=1) else 1
+        run = run + 1 if current == _next_business_day(previous) else 1
         if run >= required:
             return True
     return required <= 1
@@ -195,7 +214,9 @@ def process_due_stability_jobs(
     if state.active_org_id() is None:
         return []
     current = _now(at)
-    recent_day = (current.date() - timedelta(days=RECENT_USE_DAYS - 1)).isoformat()
+    profile_timezone, timezone_name = _profile_timezone()
+    profile_day = current.astimezone(profile_timezone).date()
+    recent_day = (profile_day - timedelta(days=RECENT_USE_DAYS - 1)).isoformat()
     recent_time = (current - timedelta(days=RECENT_USE_DAYS)).isoformat()
     emitted: list[str] = []
     for job in state.due_stability_jobs(current.isoformat()):
@@ -231,7 +252,9 @@ def process_due_stability_jobs(
         # qualification window. Keep the one-shot job pending until that use
         # arrives; a subsequent mutation or expired refinement evidence makes
         # the job terminal above.
-        if not state.usage_days(skill_id, since=recent_day):
+        if not state.usage_days(
+            skill_id, since=recent_day, timezone_name=timezone_name
+        ):
             continue
         event_id = _emit_candidate(
             state,
@@ -268,6 +291,8 @@ def record_successful_use(
     if state.active_org_id() is None:
         return None
     current = _now(at)
+    profile_timezone, timezone_name = _profile_timezone()
+    profile_day = current.astimezone(profile_timezone).date()
     content_hash, tree = snapshot_tree(path)
     snapshot_text = _frontmatter_free_text(path)
     skill_id = state.register_skill(
@@ -277,20 +302,33 @@ def record_successful_use(
         tree=tree,
         snapshot_text=snapshot_text,
     )
-    day = current.date().isoformat()
-    retain_after = (current.date() - timedelta(days=RETENTION_DAYS - 1)).isoformat()
-    state.record_usage_day(skill_id, day, retain_after=retain_after)
-    recent_after = (current.date() - timedelta(days=RECENT_USE_DAYS - 1)).isoformat()
-    days = state.usage_days(skill_id, since=recent_after)
+    day = profile_day.isoformat()
+    retain_after = (profile_day - timedelta(days=RETENTION_DAYS - 1)).isoformat()
+    state.record_usage_day(
+        skill_id,
+        day,
+        timezone_name=timezone_name,
+        retain_after=retain_after,
+    )
+    recent_after = (profile_day - timedelta(days=RECENT_USE_DAYS - 1)).isoformat()
+    days = state.usage_days(
+        skill_id, since=recent_after, timezone_name=timezone_name
+    )
     stability_events = process_due_stability_jobs(store=state, at=current)
-    if _consecutive(days, required=HIGH_USAGE_CONSECUTIVE_DAYS):
+    if _consecutive_business_days(
+        days, required=HIGH_USAGE_CONSECUTIVE_BUSINESS_DAYS
+    ):
         high_usage = _emit_candidate(
             state,
             skill_id=skill_id,
             skill_name=skill_name,
             content_hash=content_hash,
             qualification="high_usage",
-            local_reasons={"consecutive_utc_days": HIGH_USAGE_CONSECUTIVE_DAYS},
+            local_reasons={
+                "consecutive_business_days": HIGH_USAGE_CONSECUTIVE_BUSINESS_DAYS,
+                "business_day_timezone": timezone_name,
+                "business_week": "monday_friday",
+            },
             session_id=session_id,
             task_id=task_id,
         )

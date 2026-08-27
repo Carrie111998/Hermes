@@ -2133,6 +2133,25 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
             _skill_view_tracker.pop(str(task_id), None)
 
 
+def _record_active_skill_view(skill_name: str, **kw) -> None:
+    """Track every successful skill_view, including unchanged dedup stubs."""
+
+    try:
+        from tools.skill_usage import bump_use, bump_view
+
+        bump_view(skill_name)
+        # A skill_view tool call is the agent actively loading the skill to
+        # act on it. The unchanged-content stub saves prompt tokens, but it is
+        # still a real use for lifecycle and local Wisdom qualification.
+        bump_use(
+            skill_name,
+            task_id=kw.get("task_id"),
+            session_id=kw.get("session_id"),
+        )
+    except Exception:
+        pass
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
@@ -2150,6 +2169,13 @@ def _skill_view_with_bump(args, **kw):
     # so a post-compression re-view returns full content again.
     stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
     if stub is not None:
+        try:
+            parsed_stub = json.loads(stub)
+            resolved = parsed_stub.get("name") or name
+            if resolved:
+                _record_active_skill_view(str(resolved), **kw)
+        except Exception:
+            pass
         return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id
@@ -2162,16 +2188,7 @@ def _skill_view_with_bump(args, **kw):
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
             if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(
-                    str(resolved),
-                    task_id=kw.get("task_id"),
-                    session_id=kw.get("session_id"),
-                )
+                _record_active_skill_view(str(resolved), **kw)
     except Exception:
         pass
     return result

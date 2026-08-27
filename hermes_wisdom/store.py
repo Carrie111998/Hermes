@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -140,9 +140,10 @@ class WisdomStore:
                 );
                 CREATE TABLE IF NOT EXISTS usage_day (
                   skill_id TEXT NOT NULL,
-                  day_utc TEXT NOT NULL,
+                  day_local TEXT NOT NULL,
+                  timezone_name TEXT NOT NULL,
                   use_count INTEGER NOT NULL CHECK(use_count >= 0),
-                  PRIMARY KEY(skill_id, day_utc),
+                  PRIMARY KEY(skill_id, timezone_name, day_local),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS refinement (
@@ -224,6 +225,30 @@ class WisdomStore:
                 db.execute("ALTER TABLE stability_job ADD COLUMN session_id TEXT")
             if "task_id" not in stability_columns:
                 db.execute("ALTER TABLE stability_job ADD COLUMN task_id TEXT")
+            usage_columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(usage_day)").fetchall()
+            }
+            if "day_local" not in usage_columns:
+                # V4 recorded UTC calendar dates. Preserve those private
+                # counters in a distinct UTC bucket so a configured local
+                # timezone never combines them with business-day evidence.
+                db.executescript(
+                    """
+                    ALTER TABLE usage_day RENAME TO usage_day_v4;
+                    CREATE TABLE usage_day (
+                      skill_id TEXT NOT NULL,
+                      day_local TEXT NOT NULL,
+                      timezone_name TEXT NOT NULL,
+                      use_count INTEGER NOT NULL CHECK(use_count >= 0),
+                      PRIMARY KEY(skill_id, timezone_name, day_local),
+                      FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO usage_day(skill_id,day_local,timezone_name,use_count)
+                      SELECT skill_id,day_utc,'UTC',use_count FROM usage_day_v4;
+                    DROP TABLE usage_day_v4;
+                    """
+                )
             candidate_sql = str(
                 db.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='candidate'"
@@ -430,26 +455,35 @@ class WisdomStore:
             return value
 
     def record_usage_day(
-        self, skill_id: str, day_utc: str, *, retain_after: str
+        self,
+        skill_id: str,
+        day_local: str,
+        *,
+        timezone_name: str,
+        retain_after: str,
     ) -> None:
         with self.transaction() as db:
             db.execute(
-                "INSERT INTO usage_day VALUES(?,?,1) ON CONFLICT(skill_id,day_utc) "
+                "INSERT INTO usage_day VALUES(?,?,?,1) "
+                "ON CONFLICT(skill_id,timezone_name,day_local) "
                 "DO UPDATE SET use_count=MIN(use_count+1,2147483647)",
-                (skill_id, day_utc),
+                (skill_id, day_local, timezone_name),
             )
             db.execute(
-                "DELETE FROM usage_day WHERE skill_id=? AND day_utc<?",
+                "DELETE FROM usage_day WHERE skill_id=? AND day_local<?",
                 (skill_id, retain_after),
             )
 
-    def usage_days(self, skill_id: str, *, since: str) -> list[str]:
+    def usage_days(
+        self, skill_id: str, *, since: str, timezone_name: str
+    ) -> list[str]:
         with self.transaction() as db:
             return [
                 str(row[0])
                 for row in db.execute(
-                    "SELECT day_utc FROM usage_day WHERE skill_id=? AND day_utc>=? ORDER BY day_utc",
-                    (skill_id, since),
+                    "SELECT day_local FROM usage_day WHERE skill_id=? "
+                    "AND timezone_name=? AND day_local>=? ORDER BY day_local",
+                    (skill_id, timezone_name, since),
                 ).fetchall()
             ]
 
@@ -562,15 +596,22 @@ class WisdomStore:
     def local_events(
         self, *, kind: str | None = None, session_id: str | None = None
     ) -> list[dict[str, Any]]:
-        query = "SELECT * FROM local_event WHERE state!='dismissed'"
+        query = (
+            "SELECT e.* FROM local_event e WHERE e.state='unread' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM local_draft d "
+            "WHERE d.skill_id=e.skill_id AND d.source_hash=e.content_hash "
+            "AND d.state IN ('pending_moderation','published')"
+            ")"
+        )
         params: list[str] = []
         if kind:
-            query += " AND kind=?"
+            query += " AND e.kind=?"
             params.append(kind)
         if session_id:
-            query += " AND session_id=?"
+            query += " AND e.session_id=?"
             params.append(session_id)
-        query += " ORDER BY created_at DESC"
+        query += " ORDER BY e.created_at DESC"
         with self.transaction() as db:
             rows = [dict(row) for row in db.execute(query, params).fetchall()]
         for row in rows:
@@ -586,6 +627,34 @@ class WisdomStore:
             )
             db.execute(
                 "UPDATE local_event SET state='dismissed' WHERE skill_id=? AND content_hash=?",
+                (skill_id, content_hash),
+            )
+
+    def complete_contribution(self, draft_id: str, state: str) -> None:
+        """Retire a candidate event after its owner-approved contribution succeeds."""
+
+        now = utc_now()
+        with self.transaction() as db:
+            draft = db.execute(
+                "SELECT skill_id,source_hash FROM local_draft WHERE id=?",
+                (draft_id,),
+            ).fetchone()
+            if draft is None:
+                return
+            skill_id = str(draft["skill_id"])
+            content_hash = str(draft["source_hash"])
+            db.execute(
+                "UPDATE local_draft SET state=?,updated_at=? WHERE id=?",
+                (state, now, draft_id),
+            )
+            db.execute(
+                "UPDATE candidate SET state='contributed',dismissed_at=NULL "
+                "WHERE skill_id=? AND content_hash=?",
+                (skill_id, content_hash),
+            )
+            db.execute(
+                "UPDATE local_event SET state='handled' "
+                "WHERE skill_id=? AND content_hash=?",
                 (skill_id, content_hash),
             )
 
@@ -671,6 +740,7 @@ class WisdomStore:
                    description,content_hash,description_hash,manifest_hash,created_at,updated_at
                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(id) DO UPDATE SET draft_commit=excluded.draft_commit,
+                   overlay_path=excluded.overlay_path,
                    server_revision=excluded.server_revision,state=excluded.state,
                    description=excluded.description,content_hash=excluded.content_hash,
                    description_hash=excluded.description_hash,manifest_hash=excluded.manifest_hash,
@@ -704,6 +774,19 @@ class WisdomStore:
             row = db.execute(
                 "SELECT * FROM local_draft WHERE skill_id=? AND source_hash=? "
                 "AND state='prepared' ORDER BY updated_at DESC LIMIT 1",
+                (skill_id, source_hash),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def latest_draft_for_source(
+        self, skill_id: str, source_hash: str
+    ) -> dict[str, Any] | None:
+        """Return the newest contribution state for one exact local source version."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM local_draft WHERE skill_id=? AND source_hash=? "
+                "ORDER BY updated_at DESC, CASE WHEN id LIKE 'local:%' THEN 1 ELSE 0 END, id DESC "
+                "LIMIT 1",
                 (skill_id, source_hash),
             ).fetchone()
             return dict(row) if row else None

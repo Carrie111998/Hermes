@@ -397,7 +397,7 @@ class WisdomClient:
             body = response.json()
         except (requests.RequestException, ValueError) as exc:
             raise WisdomError("Gateway capabilities are unavailable") from exc
-        if "wisdom" not in (body.get("capabilities") or []):
+        if "wisdom" not in (body.get("features") or []):
             raise WisdomAuthError("Gateway does not advertise Collective Wisdom")
         return body
 
@@ -446,6 +446,32 @@ class WisdomClient:
         return ReconstructedDraft(
             detail=detail, files=files, content_files=records, content_hash=content_hash
         )
+
+    def revise_draft(
+        self,
+        draft_id: str,
+        *,
+        commit: str,
+        content_hash: str,
+        description: str,
+        expected_content_hash: str,
+        expected_description_hash: str,
+        expected_manifest_hash: str,
+    ) -> Draft:
+        """Create a newly vetted successor for an immutable owner draft."""
+        body = self._request(
+            "POST",
+            f"drafts/{quote(draft_id, safe='')}/revise",
+            json_body={
+                "draft_commit": commit,
+                "content_hash": content_hash,
+                "author_description": description,
+                "expected_content_hash": expected_content_hash,
+                "expected_author_description_hash": expected_description_hash,
+                "expected_package_manifest_hash": expected_manifest_hash,
+            },
+        )
+        return Draft.model_validate(body.get("draft", body))
 
     def approve(
         self,

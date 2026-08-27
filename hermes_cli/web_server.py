@@ -1685,6 +1685,9 @@ from hermes_cli.web_models import (  # noqa: F401
     LearningNodeEdit,
     WisdomSuggestRequest,
     WisdomReviewRequest,
+    WisdomPreparedSaveRequest,
+    WisdomCandidateDismissRequest,
+    WisdomReviseRequest,
     WisdomDecisionRequest,
     WisdomSetupRequest,
     WisdomScanRequest,
@@ -15468,6 +15471,7 @@ async def post_wisdom_suggest(body: WisdomSuggestRequest):
             description=body.description,
             system_specification=body.system_specification,
             allow_private_secret_review=body.send_for_owner_only_server_review,
+            local_skill_id=body.local_skill_id,
         ),
     )
 
@@ -15478,6 +15482,44 @@ async def post_wisdom_review(body: WisdomReviewRequest):
         body.profile,
         lambda service: service.review(
             body.draft_id, acknowledge=body.acknowledge, portal=False
+        ),
+    )
+
+
+@app.post("/api/wisdom/prepared/save")
+async def post_wisdom_prepared_save(body: WisdomPreparedSaveRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.save_prepared(
+            body.draft_id,
+            author_description=body.author_description,
+            files=[item.model_dump() for item in body.files],
+        ),
+    )
+
+
+@app.post("/api/wisdom/candidates/dismiss")
+async def post_wisdom_candidate_dismiss(body: WisdomCandidateDismissRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.dismiss_local_candidate(
+            body.local_skill_id, body.content_hash
+        ),
+    )
+
+
+@app.post("/api/wisdom/revise")
+async def post_wisdom_revise(body: WisdomReviseRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.revise(
+            body.draft_id,
+            author_description=body.author_description,
+            files=[item.model_dump() for item in body.files],
+            expected_content_hash=body.expected_content_hash,
+            expected_description_hash=body.expected_author_description_hash,
+            expected_manifest_hash=body.expected_package_manifest_hash,
+            allow_private_secret_review=body.send_for_owner_only_server_review,
         ),
     )
 

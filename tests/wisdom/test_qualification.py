@@ -3,9 +3,10 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from hermes_wisdom.qualification import (
-    HIGH_USAGE_CONSECUTIVE_DAYS,
+    HIGH_USAGE_CONSECUTIVE_BUSINESS_DAYS,
     RETENTION_DAYS,
     _emit_candidate,
     _classify_ambiguous,
@@ -45,15 +46,20 @@ def _eligible(monkeypatch, skill: Path) -> None:
     )
 
 
-def test_high_usage_threshold_uses_consecutive_utc_days_and_deduplicates(
+def test_high_usage_threshold_uses_consecutive_business_days_and_deduplicates(
     monkeypatch, tmp_path: Path
 ):
     skill = _skill(tmp_path)
     _eligible(monkeypatch, skill)
     store = _configured_store(tmp_path)
-    start = datetime(2026, 8, 1, 23, 55, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "hermes_wisdom.qualification.get_timezone",
+        lambda: ZoneInfo("Australia/Brisbane"),
+    )
+    start = datetime(2026, 8, 3, 9, tzinfo=ZoneInfo("Australia/Brisbane"))
+    business_offsets = (0, 1, 2, 3, 4, 7, 8)
 
-    for offset in range(HIGH_USAGE_CONSECUTIVE_DAYS - 1):
+    for offset in business_offsets[:-1]:
         assert (
             record_successful_use(
                 "learned-skill", at=start + timedelta(days=offset), store=store
@@ -62,7 +68,7 @@ def test_high_usage_threshold_uses_consecutive_utc_days_and_deduplicates(
         )
     event_id = record_successful_use(
         "learned-skill",
-        at=start + timedelta(days=HIGH_USAGE_CONSECUTIVE_DAYS - 1),
+        at=start + timedelta(days=business_offsets[-1]),
         session_id="session-1",
         task_id="task-1",
         store=store,
@@ -71,7 +77,7 @@ def test_high_usage_threshold_uses_consecutive_utc_days_and_deduplicates(
     assert (
         record_successful_use(
             "learned-skill",
-            at=start + timedelta(days=HIGH_USAGE_CONSECUTIVE_DAYS),
+            at=start + timedelta(days=business_offsets[-1] + 1),
             store=store,
         )
         is None
@@ -80,19 +86,100 @@ def test_high_usage_threshold_uses_consecutive_utc_days_and_deduplicates(
     assert len(events) == 1
     assert events[0]["session_id"] == "session-1"
     assert events[0]["payload"]["networked"] is False
+    assert events[0]["payload"]["consent_required"] is True
+    assert events[0]["payload"]["local_reasons"] == {
+        "consecutive_business_days": HIGH_USAGE_CONSECUTIVE_BUSINESS_DAYS,
+        "business_day_timezone": "Australia/Brisbane",
+        "business_week": "monday_friday",
+    }
+
+
+def test_weekend_usage_neither_advances_nor_breaks_business_day_streak(
+    monkeypatch, tmp_path: Path
+):
+    skill = _skill(tmp_path)
+    _eligible(monkeypatch, skill)
+    store = _configured_store(tmp_path)
+    monkeypatch.setattr(
+        "hermes_wisdom.qualification.get_timezone",
+        lambda: ZoneInfo("Australia/Brisbane"),
+    )
+    start = datetime(2026, 8, 3, 9, tzinfo=ZoneInfo("Australia/Brisbane"))
+
+    for offset in (0, 1, 2, 3, 4, 5, 6, 7):
+        assert (
+            record_successful_use(
+                "learned-skill", at=start + timedelta(days=offset), store=store
+            )
+            is None
+        )
+    assert record_successful_use(
+        "learned-skill", at=start + timedelta(days=8), store=store
+    )
+
+
+def test_midweek_gap_resets_then_rebuilds_business_day_streak(
+    monkeypatch, tmp_path: Path
+):
+    skill = _skill(tmp_path)
+    _eligible(monkeypatch, skill)
+    store = _configured_store(tmp_path)
+    monkeypatch.setattr(
+        "hermes_wisdom.qualification.get_timezone",
+        lambda: ZoneInfo("Australia/Brisbane"),
+    )
+    start = datetime(2026, 8, 3, 9, tzinfo=ZoneInfo("Australia/Brisbane"))
+
+    for offset in (0, 1, 3, 4, 7, 8, 9, 10):
+        assert (
+            record_successful_use(
+                "learned-skill", at=start + timedelta(days=offset), store=store
+            )
+            is None
+        )
+    assert record_successful_use(
+        "learned-skill", at=start + timedelta(days=11), store=store
+    )
+
+
+def test_profile_timezone_controls_the_qualification_day(monkeypatch, tmp_path: Path):
+    skill = _skill(tmp_path)
+    _eligible(monkeypatch, skill)
+    store = _configured_store(tmp_path)
+    monkeypatch.setattr(
+        "hermes_wisdom.qualification.get_timezone",
+        lambda: ZoneInfo("Australia/Brisbane"),
+    )
+
+    # Sunday in UTC is already Monday in the configured profile timezone.
+    record_successful_use(
+        "learned-skill",
+        at=datetime(2026, 8, 2, 16, tzinfo=timezone.utc),
+        store=store,
+    )
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT day_local,timezone_name FROM usage_day"
+        ).fetchone()
+    assert tuple(row) == ("2026-08-03", "Australia/Brisbane")
 
 
 def test_usage_retention_is_bounded(monkeypatch, tmp_path: Path):
     skill = _skill(tmp_path)
     _eligible(monkeypatch, skill)
     store = _configured_store(tmp_path)
+    monkeypatch.setattr(
+        "hermes_wisdom.qualification.get_timezone", lambda: ZoneInfo("UTC")
+    )
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for offset in range(RETENTION_DAYS + 8):
         record_successful_use(
             "learned-skill", at=start + timedelta(days=offset * 2), store=store
         )
     with store.transaction() as db:
-        rows = db.execute("SELECT day_utc FROM usage_day ORDER BY day_utc").fetchall()
+        rows = db.execute(
+            "SELECT day_local FROM usage_day ORDER BY day_local"
+        ).fetchall()
     assert len(rows) <= (RETENTION_DAYS + 1) // 2
     assert rows[0][0] >= (start.date() + timedelta(days=50)).isoformat()
 

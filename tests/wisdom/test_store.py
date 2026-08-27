@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 from hermes_wisdom.store import WisdomStore
@@ -86,6 +87,40 @@ def test_operation_journal_survives_restart(tmp_path: Path):
     assert resumed[0]["phase"] == "files_committed"
 
 
+def test_local_events_hide_a_contribution_that_already_reached_publication(
+    tmp_path: Path,
+):
+    store = WisdomStore(tmp_path / "wisdom")
+    skill_path = tmp_path / "skill"
+    skill_path.mkdir()
+    (skill_path / "SKILL.md").write_text("hello", encoding="utf-8")
+    skill_id = store.register_skill(
+        skill_path, content_hash="sha256:source", source_kind="local"
+    )
+    store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=skill_id,
+        content_hash="sha256:source",
+        payload={"skill_name": "skill"},
+        session_id="session-1",
+        task_id="task-1",
+        qualification="manual_selection",
+    )
+    store.record_draft({
+        "id": "draft-1",
+        "skill_id": skill_id,
+        "source_hash": "sha256:source",
+        "overlay_path": str(tmp_path / "overlay"),
+        "state": "published",
+        "description": "Owner copy",
+        "content_hash": "sha256:content",
+        "description_hash": "sha256:description",
+        "manifest_hash": "sha256:manifest",
+    })
+
+    assert store.local_events(kind="wisdom.candidate", session_id="session-1") == []
+
+
 def test_verified_org_change_deactivates_stale_managed_installs(tmp_path: Path):
     store = WisdomStore(tmp_path / "wisdom")
     store.installation_identity()
@@ -119,7 +154,7 @@ def test_identity_rotation_is_atomic_with_org_activation(tmp_path: Path):
     assert store.active_org_id() == "org-2"
 
 
-def test_schema_v4_migrates_snapshot_text_and_stability_provenance(tmp_path: Path):
+def test_schema_v5_tracks_profile_local_usage_days(tmp_path: Path):
     store = WisdomStore(tmp_path / "wisdom")
     with store.transaction() as db:
         snapshot_columns = {
@@ -128,9 +163,53 @@ def test_schema_v4_migrates_snapshot_text_and_stability_provenance(tmp_path: Pat
         stability_columns = {
             row[1] for row in db.execute("PRAGMA table_info(stability_job)").fetchall()
         }
+        usage_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(usage_day)").fetchall()
+        }
         version = db.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
     assert "skill_text" in snapshot_columns
     assert {"session_id", "task_id"} <= stability_columns
-    assert version == "4"
+    assert {"day_local", "timezone_name"} <= usage_columns
+    assert "day_utc" not in usage_columns
+    assert version == "5"
+
+
+def test_schema_v5_preserves_v4_usage_in_an_explicit_utc_bucket(tmp_path: Path):
+    root = tmp_path / "wisdom"
+    root.mkdir()
+    with sqlite3.connect(root / "wisdom.db") as db:
+        db.executescript(
+            """
+            CREATE TABLE local_skill (
+              id TEXT PRIMARY KEY,
+              canonical_path TEXT NOT NULL,
+              fs_identity TEXT,
+              current_hash TEXT,
+              source_kind TEXT NOT NULL,
+              deleted_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE usage_day (
+              skill_id TEXT NOT NULL,
+              day_utc TEXT NOT NULL,
+              use_count INTEGER NOT NULL,
+              PRIMARY KEY(skill_id, day_utc),
+              FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
+            );
+            INSERT INTO local_skill VALUES(
+              'skill-1','/tmp/skill',NULL,NULL,'local',NULL,'now','now'
+            );
+            INSERT INTO usage_day VALUES('skill-1','2026-08-03',2);
+            """
+        )
+
+    store = WisdomStore(root)
+
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT day_local,timezone_name,use_count FROM usage_day"
+        ).fetchone()
+    assert tuple(row) == ("2026-08-03", "UTC", 2)
