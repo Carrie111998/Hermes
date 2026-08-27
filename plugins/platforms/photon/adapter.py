@@ -1429,6 +1429,14 @@ class PhotonAdapter(BasePlatformAdapter):
             _reply_to_id = content.get("reply_to_message_id")
             _reply_to_text = content.get("reply_to_text")
             _reply_to_direction = content.get("reply_to_direction")
+            # When the sidecar could not recover the target text — e.g. replies
+            # to cron / background sends whose original content was never in
+            # any transcript — hydrate it from the outbound sent-text index
+            # recorded at send time (ports #96149's residual-case fix).
+            if _reply_to_id and not _reply_to_text:
+                _reply_to_text = self._hydrated_reply_text(
+                    space_id, _reply_to_id, _reply_to_text
+                )
         elif ctype == "group":
             text_parts: List[str] = []
             mtype = MessageType.TEXT
@@ -2232,6 +2240,55 @@ class PhotonAdapter(BasePlatformAdapter):
             for old in list(sent.keys())[: len(sent) - self._SENT_IDS_MAX]:
                 del sent[old]
 
+    @staticmethod
+    def _hydrated_reply_text(
+        chat_id: Optional[str],
+        reply_to_message_id: Optional[str],
+        reply_to_text: Optional[str],
+    ) -> Optional[str]:
+        """Fill in missing quoted text for a reply to one of OUR messages.
+
+        Sidecar-side Spectrum hydration fails exactly when the target was
+        sent from a background context (cron delivery, ``/background``
+        notification) that never touched the conversation transcript — the
+        reply then arrives with an ID but no quotable text, the gateway's
+        ``[Replying to: "..."]`` prefix never fires, and the agent has to
+        guess what the user is referring to (#1594 residual gap; cron-reply
+        amnesia #75131).
+
+        Best-effort: consults the outbound sent-text index recorded at send
+        time (same pattern as Telegram's rich_sent_store). Only an explicit
+        reply-target ID is ever resolved; nothing is injected on lookup
+        failure so ambiguous replies degrade to today's behaviour instead of
+        guessing. Same-chat scoping is enforced by the store's composite key.
+
+        This is ported from @DanBennettUK's PR #96149 into #95687 so the
+        threaded-reply PR closes its own residual case.
+        """
+        if not chat_id or not reply_to_message_id or reply_to_text:
+            return reply_to_text or None
+        try:
+            from gateway.sent_text_store import lookup as _sent_lookup
+
+            return _sent_lookup(chat_id, reply_to_message_id)
+        except Exception:
+            # The index must never break inbound dispatch.
+            return None
+
+    def _remember_sent_message(
+        self,
+        chat_id: Optional[str],
+        message_id: Optional[str],
+        sent_text: str,
+    ) -> None:
+        """Record outbound ``(chat_id, message_id) -> text`` best-effort."""
+        try:
+            from gateway.sent_text_store import record as _sent_record
+
+            _sent_record(chat_id, message_id, sent_text)
+        except Exception:
+            pass
+
     # A DM space is addressable two ways — the chat GUID (`any;-;+1555...`)
     # that inbound events carry, and the bare E.164 phone that home-channel
     # config typically uses. The sidecar's resolveSpace treats them as the
@@ -2573,8 +2630,13 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        self._record_sent_message(message_id)
+        # Persist the sent text so a later reply to this message (whose
+        # sidecar-side target hydration fails for background/cron sends) can
+        # still be anchored to what we said (#1594/#75131; ports #96149).
+        self._remember_sent_message(space_id, message_id, text)
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_send_poll(
         self, space_id: str, title: str, options: list,
@@ -2658,8 +2720,13 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        self._record_sent_message(message_id)
+        # The caption (if any) is the replyable text; record it so a later
+        # thread-tap reply anchors to what we said (#1594/#75131, #96149).
+        if caption:
+            self._remember_sent_message(space_id, message_id, caption)
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         # Guard: adapter not yet connected (no sidecar address known).
@@ -2887,6 +2954,12 @@ async def _standalone_send(
                     if not data.get("ok"):
                         return _standalone_error(resp)
                     last_message_id = data.get("messageId")
+                    # Persist the delivered text (cron/background sends are
+                    # exactly the ones later replies can't get quoted text for
+                    # — #75131/#1594; ports #96149's residual-case fix).
+                    from gateway.sent_text_store import record as _sent_record
+
+                    _sent_record(chat_id, last_message_id, message)
 
             # 2. Each attachment as a separate /send-attachment call.
             #    media_files is List[Tuple[path, is_voice]] (see
