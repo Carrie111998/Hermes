@@ -1,0 +1,406 @@
+name: PR 91079 current-main finalizer
+
+on:
+  push:
+    branches:
+      - fix/windows-desktop-pack-transaction
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr91079-current-main-finalizer
+  cancel-in-progress: false
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      base_sha: ${{ steps.object.outputs.base_sha }}
+      final_sha: ${{ steps.object.outputs.final_sha }}
+    steps:
+      - name: Checkout carrier history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python test runner
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Compose exact current-main product object
+        id: object
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'Axl Ibiza, MBA'
+          git config user.email 'andrexibiza@gmail.com'
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git 2>/dev/null || true
+          git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
+          git fetch --no-tags origin db32f7bb0864f5944c6ed9f505d0b979bedc8f2f
+          BASE=$(git rev-parse refs/remotes/upstream/main)
+          git checkout --detach "$BASE"
+          git switch -c pr91079-final-candidate
+
+          paths=(
+            'apps/desktop/scripts/before-pack-recovery.mjs'
+            'apps/desktop/scripts/before-pack.mjs'
+            'apps/desktop/scripts/before-pack.test.mjs'
+            'apps/desktop/scripts/desktop-builder-runtime.mjs'
+            'apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs'
+            'apps/desktop/scripts/desktop-pack-transaction.mjs'
+            'apps/desktop/scripts/desktop-pack-transaction.test.mjs'
+            'apps/desktop/scripts/run-electron-builder.mjs'
+            'apps/desktop/scripts/stage-native-deps-recovery.mjs'
+            'apps/desktop/scripts/stage-native-deps-recovery.test.mjs'
+            'apps/desktop/vitest.config.ts'
+            'tests/hermes_cli/test_desktop_pack_transaction_windows.py'
+          )
+          git checkout db32f7bb0864f5944c6ed9f505d0b979bedc8f2f -- "${paths[@]}"
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('apps/desktop/package.json')
+          s = p.read_text()
+          replacements = (
+              ('"build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs"',
+               '"build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps-recovery.mjs"', 'build'),
+              ('"check:test:desktop:all": "npm run test:desktop:all"',
+               '"check:test:desktop:all": "node --test scripts/stage-native-deps-recovery.test.mjs && npm run test:desktop:all"', 'check:test:desktop:all'),
+              ('"beforePack": "scripts/before-pack.mjs"',
+               '"beforePack": "scripts/before-pack-recovery.mjs"', 'beforePack'),
+          )
+          for old, new, label in replacements:
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} anchor count {count}, expected 1')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('hermes_cli/main.py')
+          s = p.read_text()
+          start = 'def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:\n'
+          end = '\ndef _ensure_desktop_exe_launchable(\n'
+          if s.count(start) != 1 or s.count(end) != 1:
+              raise SystemExit(f'rollback anchors start={s.count(start)} end={s.count(end)}')
+          a = s.index(start)
+          b = s.index(end, a)
+          replacement = '''def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:
+              """Restore the previous unpacked desktop app from its ``.bak`` tree.
+
+              Returns the restored executable path, or ``None`` when no usable backup
+              exists or the filesystem transaction cannot complete. The invalid candidate
+              is kept alongside as ``<unpacked-dir>.corrupt`` after a successful rollback.
+
+              The live path is never deleted to make room for the backup. A stale
+              quarantine must be retired before either generation moves; the candidate is
+              then quarantined by rename, and backup promotion owns the commit point. If
+              promotion fails, the candidate is moved back to the live path while the
+              backup remains intact. Best-effort: never raises.
+              """
+              unpacked = packaged_executable.parent
+              backup_dir = _desktop_backup_unpacked_dir(packaged_executable)
+              backup_exe = backup_dir / packaged_executable.name
+              if not backup_exe.exists():
+                  return None
+              if _desktop_exe_integrity_error(backup_exe) is not None:
+                  return None
+
+              corrupt_dir = unpacked.parent / (unpacked.name + ".corrupt")
+              marker_path = backup_dir.with_name(backup_dir.name + ".session")
+
+              if corrupt_dir.exists():
+                  try:
+                      shutil.rmtree(corrupt_dir)
+                  except FileNotFoundError:
+                      pass
+                  except OSError:
+                      return None
+
+              try:
+                  unpacked.rename(corrupt_dir)
+              except OSError:
+                  return None
+
+              try:
+                  backup_dir.rename(unpacked)
+              except OSError:
+                  try:
+                      corrupt_dir.rename(unpacked)
+                  except OSError:
+                      # Both generations remain preserved at explicit paths for manual or
+                      # later recovery; never delete either one here.
+                      pass
+                  return None
+
+              try:
+                  marker_path.unlink()
+              except OSError:
+                  pass
+
+              restored = unpacked / packaged_executable.name
+              return restored if restored.exists() else None
+          '''
+          # The triple-quoted workflow literal is indented by YAML/Python source.
+          import textwrap
+          replacement = textwrap.dedent(replacement)
+          p.write_text(s[:a] + replacement + s[b:])
+          PY
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/hermes_cli/test_desktop_pack_transaction_windows.py')
+          s = p.read_text()
+          marker = 'def test_real_packaged_windows_recovery_transaction('
+          if marker not in s:
+              s += r'''
+
+
+def test_real_packaged_windows_recovery_transaction(tmp_path):
+    """Recover and launch the exact electron-builder Windows package witness."""
+    import hashlib
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import pytest
+    import hermes_cli.main as main
+
+    if sys.platform != "win32":
+        pytest.skip("requires Windows PE launch")
+    source_value = os.environ.get("HERMES_REAL_PACKAGED_WINDOWS_EXE")
+    if not source_value:
+        pytest.skip("HERMES_REAL_PACKAGED_WINDOWS_EXE is not set")
+
+    source_exe = Path(source_value).resolve()
+    assert source_exe.is_file(), source_exe
+    assert main._desktop_exe_integrity_error(source_exe) is None
+
+    candidate_dir = tmp_path / source_exe.parent.name
+    shutil.copytree(source_exe.parent, candidate_dir)
+    candidate_exe = candidate_dir / source_exe.name
+    backup_dir = main._desktop_backup_unpacked_dir(candidate_exe)
+    shutil.copytree(candidate_dir, backup_dir)
+    backup_exe = backup_dir / source_exe.name
+    backup_digest = hashlib.sha256(backup_exe.read_bytes()).hexdigest()
+
+    candidate_exe.write_bytes(b"MZ" + (b"\\0" * 62))
+    assert main._desktop_exe_integrity_error(candidate_exe) is not None
+
+    restored = main._rollback_desktop_from_backup(candidate_exe)
+    assert restored == candidate_exe
+    assert restored.is_file()
+    assert hashlib.sha256(restored.read_bytes()).hexdigest() == backup_digest
+    assert main._desktop_exe_integrity_error(restored) is None
+
+    quarantined_exe = candidate_dir.with_name(candidate_dir.name + ".corrupt") / source_exe.name
+    assert quarantined_exe.is_file()
+    assert main._desktop_exe_integrity_error(quarantined_exe) is not None
+
+    completed = subprocess.run(
+        [str(restored), "--version"],
+        cwd=restored.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+'''
+          p.write_text(s)
+          PY
+
+          cat > /tmp/expected-pr91079-paths <<'EOF'
+          apps/desktop/package.json
+          apps/desktop/scripts/before-pack-recovery.mjs
+          apps/desktop/scripts/before-pack.mjs
+          apps/desktop/scripts/before-pack.test.mjs
+          apps/desktop/scripts/desktop-builder-runtime.mjs
+          apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs
+          apps/desktop/scripts/desktop-pack-transaction.mjs
+          apps/desktop/scripts/desktop-pack-transaction.test.mjs
+          apps/desktop/scripts/run-electron-builder.mjs
+          apps/desktop/scripts/stage-native-deps-recovery.mjs
+          apps/desktop/scripts/stage-native-deps-recovery.test.mjs
+          apps/desktop/vitest.config.ts
+          hermes_cli/main.py
+          tests/hermes_cli/test_desktop_pack_transaction_windows.py
+          EOF
+          git diff --name-only "$BASE" -- | LC_ALL=C sort > /tmp/actual-pr91079-paths
+          diff -u /tmp/expected-pr91079-paths /tmp/actual-pr91079-paths
+          test "$(wc -l < /tmp/actual-pr91079-paths)" -eq 14
+          git diff --check "$BASE" --
+          python -m py_compile hermes_cli/main.py tests/hermes_cli/test_desktop_pack_transaction_windows.py
+          node --check apps/desktop/scripts/before-pack-recovery.mjs
+          node --check apps/desktop/scripts/before-pack.mjs
+          node --check apps/desktop/scripts/desktop-builder-runtime.mjs
+          node --check apps/desktop/scripts/desktop-pack-transaction.mjs
+          node --check apps/desktop/scripts/run-electron-builder.mjs
+          node --check apps/desktop/scripts/stage-native-deps-recovery.mjs
+          node --test \
+            apps/desktop/scripts/before-pack.test.mjs \
+            apps/desktop/scripts/desktop-pack-transaction.test.mjs \
+            apps/desktop/scripts/stage-native-deps-recovery.test.mjs \
+            apps/desktop/scripts/desktop-pack-recovery-composition.test.mjs
+          python -m pytest -q tests/hermes_cli/test_desktop_pack_transaction_windows.py
+
+          git add -- $(cat /tmp/actual-pr91079-paths)
+          git commit -m 'fix(desktop): make Windows packaging recovery transactional'
+          FINAL=$(git rev-parse HEAD)
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git rev-list --count "$BASE..$FINAL")" -eq 1
+          test "$(git show -s --format='%an <%ae>' "$FINAL")" = 'Axl Ibiza, MBA <andrexibiza@gmail.com>'
+          test "$(git show -s --format='%cn <%ce>' "$FINAL")" = 'Axl Ibiza, MBA <andrexibiza@gmail.com>'
+          git push --force origin "$FINAL:refs/heads/pr91079-final-candidate"
+          echo "base_sha=$BASE" >> "$GITHUB_OUTPUT"
+          echo "final_sha=$FINAL" >> "$GITHUB_OUTPUT"
+          printf '{"base":"%s","final":"%s","paths":14}\n' "$BASE" "$FINAL" | tee /tmp/pr91079-candidate.json
+
+      - name: Upload candidate receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr91079-current-main-candidate
+          path: /tmp/pr91079-candidate.json
+          if-no-files-found: error
+
+  packaged-windows-witness:
+    needs: compose
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      TARGET_SHA: ${{ needs.compose.outputs.final_sha }}
+    steps:
+      - name: Checkout exact candidate object
+        uses: actions/checkout@v4
+        with:
+          repository: andrexibiza/hermes-agent
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+
+      - name: Prove exact checkout
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:TARGET_SHA) { throw "checkout $actual != target $env:TARGET_SHA" }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Build real unpacked Windows package through transaction wrapper
+        shell: pwsh
+        working-directory: apps/desktop
+        run: |
+          npm run build
+          node scripts/run-electron-builder.mjs --win --x64 --dir
+
+      - name: Locate packaged executable
+        id: package
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path apps/desktop -Recurse -File -Filter '*.exe' |
+            Where-Object { $_.FullName -match 'win[^\\]*unpacked' -and $_.Name -notmatch 'uninstall' } |
+            Select-Object -First 1
+          if (-not $exe) { throw 'No unpacked Windows executable found' }
+          "exe=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Packaged executable: $($exe.FullName)"
+
+      - name: Execute real packaged recovery and loader gate
+        shell: pwsh
+        env:
+          HERMES_REAL_PACKAGED_WINDOWS_EXE: ${{ steps.package.outputs.exe }}
+        run: |
+          python -m pytest -q tests/hermes_cli/test_desktop_pack_transaction_windows.py -k real_packaged_windows_recovery_transaction
+
+      - name: Emit independent witness receipt
+        shell: pwsh
+        env:
+          PACKAGED_EXE: ${{ steps.package.outputs.exe }}
+        run: |
+          New-Item -ItemType Directory -Force -Path witness | Out-Null
+          $actual = git rev-parse HEAD
+          $digest = (Get-FileHash -Algorithm SHA256 -Path $env:PACKAGED_EXE).Hash.ToLowerInvariant()
+          $version = & $env:PACKAGED_EXE --version 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "packaged executable --version failed: $version" }
+          [ordered]@{
+            target_sha = $env:TARGET_SHA
+            checked_out_sha = $actual
+            packaged_executable = $env:PACKAGED_EXE
+            packaged_executable_sha256 = $digest
+            loader_exit_code = $LASTEXITCODE
+            loader_output = $version.Trim()
+            recovery_test = 'passed'
+          } | ConvertTo-Json | Set-Content witness/receipt.json
+          Get-Content witness/receipt.json
+
+      - name: Upload witness receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr91079-packaged-windows-recovery
+          path: witness/receipt.json
+          if-no-files-found: error
+
+  publish:
+    needs: [compose, packaged-windows-witness]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout carrier ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish exact verified object and remove candidate ref
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.compose.outputs.base_sha }}
+          FINAL_SHA: ${{ needs.compose.outputs.final_sha }}
+          CARRIER_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'Axl Ibiza, MBA'
+          git config user.email 'andrexibiza@gmail.com'
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git 2>/dev/null || true
+          git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
+          test "$(git rev-parse refs/remotes/upstream/main)" = "$BASE_SHA"
+          git fetch --no-tags origin refs/heads/pr91079-final-candidate:refs/remotes/origin/pr91079-final-candidate
+          test "$(git rev-parse refs/remotes/origin/pr91079-final-candidate)" = "$FINAL_SHA"
+          test "$(git rev-parse "$FINAL_SHA^")" = "$BASE_SHA"
+          test "$(git rev-list --count "$BASE_SHA..$FINAL_SHA")" -eq 1
+          git push --force-with-lease=refs/heads/fix/windows-desktop-pack-transaction:$CARRIER_SHA origin "$FINAL_SHA:refs/heads/fix/windows-desktop-pack-transaction"
+          git push origin :refs/heads/pr91079-final-candidate
+          printf '{"base":"%s","final":"%s","carrier":"%s","windows_witness":"passed"}\n' "$BASE_SHA" "$FINAL_SHA" "$CARRIER_SHA" | tee /tmp/pr91079-published.json
+
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr91079-published-current-main
+          path: /tmp/pr91079-published.json
+          if-no-files-found: error
