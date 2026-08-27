@@ -26,6 +26,7 @@ Design:
 import copy
 import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -76,6 +77,12 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Heading of a section in a pre-§ MEMORY.md. Stores written before the
+# delimited format (and files people still write by hand) separate their
+# facts with markdown headings and nothing else, so that is the one legacy
+# shape the parser adopts - see MemoryStore._legacy_sections.
+_LEGACY_SECTION_RE = re.compile(r"^#{2,6} \S", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -803,10 +810,48 @@ class MemoryStore:
             return "", False
 
     @staticmethod
+    def _legacy_sections(raw: str) -> Optional[List[str]]:
+        """Split a pre-§ ``##``-sectioned memory file into entries.
+
+        A MEMORY.md in the legacy markdown format carries no § at all, so
+        the delimiter parse yields ONE entry holding the whole file. That
+        blob is larger than the store's char limit by construction on any
+        store with history, which trips the entry-size drift signal, and
+        every replace/remove is then refused with a .bak snapshot: the
+        store is permanently read-only with no way back through the tool
+        (#94121). Adopting the sections as entries instead makes the file
+        round-trippable, so the content survives the next flush (the
+        concern behind the guard in #26045) and the store becomes editable
+        again. The first successful write persists it in § form.
+
+        Returns ``None`` when *raw* is not in that shape: a file that
+        already holds a delimiter is a tool-written store, and one lone
+        heading is just an entry that happens to start with markdown, not
+        a sectioned document.
+        """
+        if ENTRY_DELIMITER in raw:
+            return None
+        starts = [m.start() for m in _LEGACY_SECTION_RE.finditer(raw)]
+        if len(starts) < 2:
+            return None
+        # Anything before the first heading is content too (a title line, or
+        # entries a tool wrote before the file was hand-edited); keep it as
+        # its own entry rather than dropping it.
+        bounds = starts if starts[0] == 0 else [0] + starts
+        sections = [
+            raw[start:end].strip()
+            for start, end in zip(bounds, bounds[1:] + [len(raw)])
+        ]
+        return [s for s in sections if s]
+
+    @staticmethod
     def _parse_entries(raw: str) -> List[str]:
         """Split raw memory-file text into stripped, non-empty entries."""
         if not raw.strip():
             return []
+        legacy = MemoryStore._legacy_sections(raw)
+        if legacy is not None:
+            return legacy
         # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
         # alone would incorrectly split entries that contain "§" in their content.
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
@@ -851,7 +896,11 @@ class MemoryStore:
 
         1. Round-trip mismatch — re-parsing and re-serializing the file
            doesn't produce identical bytes (rare; would catch oddly-encoded
-           delimiters).
+           delimiters). A legacy ``##``-sectioned file is exempt: the parser
+           adopts its sections as entries (see ``_legacy_sections``), so the
+           content DOES survive a flush and refusing the write would only
+           freeze the store (#94121). Signal 2 still applies to it, which is
+           what keeps a free-form external append out.
         2. Entry-size overflow — any single parsed entry exceeds the
            store's whole-file char limit. The tool budgets the ENTIRE store
            against that limit; no single tool-written entry can exceed it.
@@ -871,13 +920,18 @@ class MemoryStore:
         if not raw.strip():
             return None
 
-        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
-        roundtrip = ENTRY_DELIMITER.join(parsed)
+        legacy = self._legacy_sections(raw)
+        if legacy is not None:
+            parsed = legacy
+            roundtrip_ok = True
+        else:
+            parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+            roundtrip_ok = raw.strip() == ENTRY_DELIMITER.join(parsed)
 
         char_limit = self._char_limit(target)
         max_entry_len = max((len(e) for e in parsed), default=0)
 
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        drift_detected = (not roundtrip_ok) or (max_entry_len > char_limit)
         if not drift_detected:
             return None
 
