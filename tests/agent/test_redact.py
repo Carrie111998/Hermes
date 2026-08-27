@@ -124,11 +124,13 @@ class TestEnvAssignments:
             ('{"key_material": "CPU"}', "CPU"),
             ('{"bearer": "local"}', "local"),
             ("TOKEN=" + "sk-" + "a" * 30, "a" * 20),
+            ("TOKEN=abc", "abc"),
+            ('{"token": "aaaa"}', "aaaa"),
+            ("token: letmein", "letmein"),
+            ("token: 1111", "1111"),
         ],
     )
-    def test_strong_key_or_credential_shaped_value_still_redacts(
-        self, text, cleartext
-    ):
+    def test_unknown_credential_assignment_values_still_redact(self, text, cleartext):
         assert cleartext not in redact_sensitive_text(text, force=True)
 
 
