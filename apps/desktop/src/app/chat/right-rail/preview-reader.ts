@@ -56,8 +56,9 @@ const readerSessions = new Map<RightRailTabId, string>()
 
 /** True when at least one preview tab has a registered live page reader
  *  AND that tab is still open in `$previewTabs` (guards against stale
- *  registrations outliving their tab). Used by the desktop bridge to
- *  allow preview actions from non-active sessions (#95459). */
+ *  registrations outliving their tab, e.g. after a tab closes before its
+ *  unregister callback runs). Used by the desktop bridge to allow preview
+ *  actions from non-active sessions (#95459). */
 export function hasLivePreviewReaders(): boolean {
   const openIds = new Set($previewTabs.get().map(t => t.id))
 
