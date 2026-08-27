@@ -99,11 +99,12 @@ export function ModelPill({
   // fetcher (model-menu-panel / ComposerControls) owns that.
   const profile = useStore($activeGatewayProfile)
 
-  const defaultProvider = useQuery<ModelOptionsResponse | undefined>({
-    enabled: false,
-    queryFn: () => undefined,
-    queryKey: modelOptionsQueryKey(profile)
-  }).data?.provider?.trim() ?? ''
+  const defaultProvider =
+    useQuery<ModelOptionsResponse | undefined>({
+      enabled: false,
+      queryFn: () => undefined,
+      queryKey: modelOptionsQueryKey(profile)
+    }).data?.provider?.trim() ?? ''
 
   // Two same-named models on two providers (e.g. `qwen3.7-plus` on both
   // `custom:aliyun-coding-plan` and `custom:token-plan-a`) would otherwise look
@@ -123,11 +124,7 @@ export function ModelPill({
         <span className="truncate">
           {formatModelStatusLabel(currentModel, { defaultEffort, fastMode, reasoningEffort })}
           {showProviderTag && (
-            <span
-              aria-hidden="true"
-              className="ml-0.5 opacity-70"
-              data-testid="model-provider-tag"
-            >
+            <span aria-hidden="true" className="ml-0.5 opacity-70" data-testid="model-provider-tag">
               {copy.providerTag(liveProvider)}
             </span>
           )}
