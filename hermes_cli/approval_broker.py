@@ -269,8 +269,9 @@ def deny_agent_provenance() -> None:
     reason = _agent_provenance_reason()
     if reason is not None:
         raise ApprovalProvenanceError(
-            f"Approval refused: running inside {reason}. Human approval gates "
-            f"cannot be crossed by an agent."
+            f"Approval refused: running inside {reason}. This is an advisory "
+            f"check, not a boundary — it recognises the ordinary case rather "
+            f"than preventing a determined one."
         )
 
 

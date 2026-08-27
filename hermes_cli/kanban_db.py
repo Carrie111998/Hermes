@@ -8115,12 +8115,35 @@ def schedule_task(
 #     gated PARENT therefore does not satisfy its children's dependencies.
 #   * nothing auto-releases on ``scheduled_at``.
 #
-# AUTHORITY NOTE: ``release_plan_gate`` currently accepts a caller-supplied
-# ``actor`` string. That is NOT yet proof of human intent — the attestation
-# broker that makes it one is a later commit in this series. Until then this
-# function must not be exposed through any model tool, and this slice must not
-# be described as delivering the approval boundary. The DB-layer guard below
-# still refuses delegated-child callers, matching every other mutator here.
+# AUTHORITY NOTE — READ BEFORE DESCRIBING THIS AS A CONTROL.
+#
+# ``release_plan_gate`` requires an ``Attestation`` produced by
+# ``hermes_cli.approval_broker``. That object binds a decision to one plan
+# revision's exact bytes, is single-use, and expires — and every one of those
+# properties is enforced here, inside this transaction.
+#
+# It is NOT an authentication boundary, and this gate must not be described as
+# one. No authenticated approval adapter ships, so the sanctioned surface
+# refuses every request. Beyond that:
+#
+#   * same-user Python can call ``issue_attestation_for_adapter`` directly, or
+#     monkeypatch the adapter seam, and mint an attestation this function will
+#     accept;
+#   * same-user processes can modify this database directly and clear
+#     ``gate_state`` without calling anything here at all.
+#
+# What this gate provides is COOPERATIVE WORKFLOW INTEGRITY: an agent following
+# the sanctioned path cannot advance a gated task, cannot replay or re-target an
+# approval, and cannot approve a plan whose text has since changed — and every
+# refusal is audited. It is not enforcement against arbitrary same-user code.
+#
+# A secure boundary requires the authoritative state and the authentication to
+# live outside the agent-writable trust domain — a separately authenticated
+# remote service, or a separate operating-system identity. See
+# ``planning/APPROVAL-SURFACE-DESIGN-NOTE.md``.
+#
+# The DB-layer guard below still refuses delegated-child callers, matching every
+# other mutator here.
 
 
 def _audit_gate_refusal(
@@ -8209,10 +8232,13 @@ def plan_gate_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
     """Resolve the plan a gated task is waiting on, straight from the database.
 
     Read-only. Exists so a human-facing surface can DISPLAY the authoritative
-    plan text before asking for confirmation, without the caller supplying — or
-    being able to influence — which artifact is shown. ``release_plan_gate``
-    re-reads all of this independently, so a stale display cannot approve
-    different words than the ones on screen.
+    plan text, without the caller supplying — or being able to influence — which
+    artifact is shown. ``release_plan_gate`` re-reads all of this independently,
+    so an attestation minted against a stale display is refused rather than
+    applied to different words.
+
+    Display only: no surface currently consumes this to ask for a confirmation,
+    because none can. See the AUTHORITY NOTE above ``release_plan_gate``.
     """
     ev = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? "

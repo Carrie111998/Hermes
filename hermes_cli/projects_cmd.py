@@ -103,13 +103,13 @@ def build_parser(
 
     p_ap = sub.add_parser(
         "approve-plan",
-        help="Approve a plan at the human gate (interactive terminal only)",
+        help="Show a gated plan (approval unavailable: no authenticated surface)",
     )
     p_ap.add_argument("task_id", help="The gated task id (t_…)")
 
     p_rp = sub.add_parser(
         "reject-plan",
-        help="Reject a plan at the human gate (interactive terminal only)",
+        help="Show a gated plan (rejection unavailable: no authenticated surface)",
     )
     p_rp.add_argument("task_id", help="The gated task id (t_…)")
     p_rp.add_argument(
@@ -162,15 +162,20 @@ def projects_command(args: argparse.Namespace) -> int:
 # Human approval gate
 # ---------------------------------------------------------------------------
 #
-# These two commands are the ONLY surface that can cross a plan gate. They are
-# deliberately not reachable from a tool, the gateway, the dashboard, cron, or
-# `bot_relay`: the broker refuses every one of those contexts, and confirmation
-# is read from /dev/tty rather than stdin, so a piped or redirected answer
-# cannot satisfy them either.
+# These two commands CANNOT cross a plan gate. They display the authoritative
+# plan and then fail closed, because no separately authenticated approval
+# surface is configured and none ships.
 #
-# Nothing about WHAT is being approved comes from the command line. The task id
-# is a lookup key; the project, revision, root task and plan body are all read
-# from the database, and the release path re-reads them independently.
+# The earlier design read a confirmation phrase from /dev/tty and tried to
+# establish that the caller was not an agent. It was withdrawn: a process
+# running as the same user can allocate its own PTY, erase any local marker, and
+# orphan itself to shed its ancestry, so no local check distinguishes a human
+# from an agent. The refusal below therefore does not depend on recognising the
+# caller at all.
+#
+# Nothing about WHAT is displayed comes from the command line. The task id is a
+# lookup key; the project, revision, root task and plan body are all read from
+# the database, which is what a future authenticated adapter would bind to.
 
 
 def _print_plan(task_id: str, task, ctx: dict) -> None:
