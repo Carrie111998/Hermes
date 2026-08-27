@@ -21,12 +21,17 @@ def build_backup_parser(subparsers, *, cmd_backup: Callable) -> None:
         "skills, sessions, and data (excludes the hermes-agent codebase). "
         "Use --quick for a fast snapshot of just critical state files.",
     )
-    backup_parser.add_argument(
+    # --output only applies to full ZIP backups; --quick writes a managed
+    # snapshot directory under state-snapshots/ and has no selectable output
+    # path. Accepting both silently ignored the requested path.
+    mode_group = backup_parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "-o",
         "--output",
-        help="Output path for the zip file (default: ~/hermes-backup-<timestamp>.zip)",
+        help="Output path for the zip file (default: ~/hermes-backup-<timestamp>.zip). "
+        "Full ZIP backups only; cannot be combined with --quick.",
     )
-    backup_parser.add_argument(
+    mode_group.add_argument(
         "-q",
         "--quick",
         action="store_true",
