@@ -45,6 +45,19 @@ BOLD='\033[1m'
 # Configuration
 REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+# Source the mirror resolver library. Defines hermes_pypi_mirror,
+# hermes_github_clone_url, hermes_mirror_reachable, and
+# hermes_mirror_status. Resolved URL is a *candidate* — install.sh probes
+# it with hermes_mirror_reachable before depending on it, so a wrong
+# resolver choice never produces a confusing 30-second connect timeout.
+#
+# Why source (not a subshell): the resolver exports shell functions; sourcing
+# keeps everything in the install.sh session and avoids re-resolving on
+# every subshell invocation. The library file is a flat script with public
+# functions at the top level.
+HERMES_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./install_mirror.sh
+. "$HERMES_SCRIPTS_DIR/install_mirror.sh"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -1467,11 +1480,30 @@ EOF
             log_success "Cloned via SSH"
         else
             rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
+            # Resolve the HTTPS clone URL through a proxy when the install is
+            # running from a network where github.com is unreachable (#95167).
+            # The resolver returns the input unchanged when no proxy is
+            # reachable, so this is a no-op on healthy networks.
+            RESOLVED_HTTPS="$(hermes_github_clone_url "$REPO_URL_HTTPS")"
+            if [ "$RESOLVED_HTTPS" != "$REPO_URL_HTTPS" ]; then
+                log_info "Using GitHub proxy for clone: $RESOLVED_HTTPS"
+            fi
             log_info "SSH failed, trying HTTPS..."
-            if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+            if git clone --depth 1 --branch "$BRANCH" "$RESOLVED_HTTPS" "$INSTALL_DIR"; then
                 log_success "Cloned via HTTPS"
             else
-                log_error "Failed to clone repository"
+                # Actionable next-step instead of the bare "we tried two
+                # things" error (#95167): if the resolver couldn't reach
+                # any PyPI/GitHub mirror, the user is on a network where
+                # setting HERMES_PYPI_MIRROR / HERMES_GITHUB_PROXY is
+                # the actual fix.
+                log_error "Failed to clone repository (tried SSH, HTTPS)."
+                log_info ""
+                log_info "If github.com / pypi.org are blocked from your network, configure a mirror:"
+                log_info "  export HERMES_GITHUB_PROXY='https://ghfast.top/'"
+                log_info "  export HERMES_PYPI_MIRROR='https://mirrors.aliyun.com/pypi/simple/'"
+                log_info ""
+                log_info "Re-run with the env vars exported; the installer resolves PyPI mirrors via the regional fallback list in install_mirror.sh."
                 exit 1
             fi
         fi
@@ -1709,6 +1741,19 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
+        #
+        # Resolve the PyPI index URL through the mirror resolver. Honors
+        # HERMES_PYPI_MIRROR if set, otherwise returns the canonical PyPI
+        # URL or a reachable regional mirror (#95167). --locked does NOT
+        # bypass the index when a hash mismatches -- it fails closed with
+        # "no compatible index" -- which is why we still set UV_INDEX_URL
+        # here. Mirrors that lag PyPI by minutes can produce false
+        # negatives; the resolver only picks one that's actually reachable.
+        UV_INDEX_URL="$(hermes_pypi_mirror)"
+        export UV_INDEX_URL
+        if [ "$UV_INDEX_URL" != "https://pypi.org/simple/" ]; then
+            log_info "Using PyPI mirror: $UV_INDEX_URL"
+        fi
         if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
@@ -1808,9 +1853,20 @@ PY
     rm -f "$ALL_INSTALL_LOG"
 
     if [ "$_installed" = false ]; then
+        # Actionable error for the dependency-install failure (#95167):
+        # when the tiered cascade exhausts itself the user is usually
+        # staring at a wall of pip output with no hint that a mirror
+        # would fix it.
         log_error "Package installation failed even with no extras."
+        log_info ""
         log_info "Check that build tools are installed: sudo apt install build-essential python3-dev"
         log_info "Then re-run: cd $INSTALL_DIR && uv pip install -e '.[all]'"
+        log_info ""
+        log_info "If you're on a network that blocks pypi.org, configure a PyPI mirror:"
+        log_info "  export HERMES_PYPI_MIRROR='https://mirrors.aliyun.com/pypi/simple/'"
+        log_info "  (other mirrors: pypi.tuna.tsinghua.edu.cn, pypi.mirrors.ustc.edu.cn, mirrors.cloud.tencent.com)"
+        log_info ""
+        log_info "Re-run with the env vars exported; the installer resolves PyPI mirrors via the regional fallback list in install_mirror.sh."
         exit 1
     fi
 
