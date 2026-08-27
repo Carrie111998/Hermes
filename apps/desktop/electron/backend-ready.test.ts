@@ -30,6 +30,7 @@ import {
 } from './backend-ready'
 
 type FakeChildProcess = EventEmitter & {
+  stderr: EventEmitter
   stdout: EventEmitter
 }
 
@@ -38,6 +39,7 @@ type FakeChildProcess = EventEmitter & {
 // (child.stdout.on('data'), child.on('exit'|'error') + the .off() teardown).
 function makeFakeChild(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
+  child.stderr = new EventEmitter()
   child.stdout = new EventEmitter()
 
   return child
@@ -96,6 +98,24 @@ test('resolves with a HERMES_BACKEND_READY port (headless `serve`)', async () =>
   const child = makeFakeChild()
   const p = waitForDashboardPort(child, 1000)
   child.stdout.emit('data', 'HERMES_BACKEND_READY port=43210\n')
+  assert.equal(await p, 43210)
+})
+
+test('resolves when the runtime announces readiness on stderr', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'HERMES_BACKEND_READY port=43210\n')
+  assert.equal(await p, 43210)
+})
+
+test('resolves from output buffered before the watcher attached', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(
+    child,
+    1000,
+    () => '',
+    () => 'HERMES_BACKEND_READY port=43210\n'
+  )
   assert.equal(await p, 43210)
 })
 

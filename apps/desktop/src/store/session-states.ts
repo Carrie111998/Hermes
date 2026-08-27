@@ -191,7 +191,7 @@ export function _resetSessionOwnerHoldsForTests(): void {
  * is cleared, so the primary runtime must survive that handoff. Open panes have
  * the same ownership contract: a non-focused idle tile is still user-visible
  * state and must not be evicted just because another pane has focus. Prefer the
- * live event scope, with the tile's persisted route as the pre-bind fallback.
+ * live event scope, with the tile's known owner as the pre-bind fallback.
  *
  * A just-created session's owner is named by its create → foreground hold
  * (holdSessionOwnerUntilForeground) until the selected/tiled publication or
@@ -209,9 +209,15 @@ export function foregroundSessionScopes(): Set<string> {
     }
   }
 
-  const addRouteScope = (route: SessionOwnerRoute | undefined) => {
-    const connectionId = route?.connectionId?.trim()
-    const profile = route?.profile?.trim()
+  const addOwnerScope = (owner: SessionOwnerScope) => {
+    if (typeof owner === 'string') {
+      scopes.add(normalizeProfileKey(owner))
+
+      return
+    }
+
+    const connectionId = owner?.connectionId?.trim()
+    const profile = owner?.profile?.trim()
 
     if (connectionId && profile) {
       scopes.add(registryBackendScopeKey(connectionId, profile))
@@ -219,10 +225,11 @@ export function foregroundSessionScopes(): Set<string> {
   }
 
   addRuntimeScope($activeSessionId.get() ?? undefined)
+  addOwnerScope(knownOwnerForSession($selectedStoredSessionId.get()))
 
   for (const tile of $sessionTiles.get()) {
     addRuntimeScope(tile.runtimeId)
-    addRouteScope(tile.ownerRoute)
+    addOwnerScope(knownOwnerForSession(tile.storedSessionId))
   }
 
   // Create → foreground holds. A hold whose scope the rungs above already

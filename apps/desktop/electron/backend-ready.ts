@@ -35,7 +35,7 @@ function resolvePortAnnounceTimeoutMs(env = process.env) {
 }
 
 /**
- * Watch a child process's stdout for the `HERMES_(BACKEND|DASHBOARD)_READY
+ * Watch a child process's output for the `HERMES_(BACKEND|DASHBOARD)_READY
  * port=<N>` line that web_server.py prints after uvicorn binds its socket.
  *
  * Returns the parsed port. Rejects if:
@@ -51,7 +51,12 @@ function resolvePortAnnounceTimeoutMs(env = process.env) {
  * on every terminal path — resolve, reject, or timeout — so repeated
  * backend spawns don't leak listener slots on the child.
  */
-function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(), describeOutputTail = () => '') {
+function waitForDashboardPort(
+  child,
+  timeoutMs = resolvePortAnnounceTimeoutMs(),
+  describeOutputTail = () => '',
+  bufferedOutput = () => ''
+) {
   return new Promise((resolve, reject) => {
     let buf = ''
     let done = false
@@ -64,6 +69,7 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
       done = true
       clearTimeout(timer)
       child.stdout.off('data', onData)
+      child.stderr?.off('data', onData)
       child.off('exit', onExit)
       child.off('error', onError)
     }
@@ -102,8 +108,10 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
     }, timeoutMs)
 
     child.stdout.on('data', onData)
+    child.stderr?.on('data', onData)
     child.on('exit', onExit)
     child.on('error', onError)
+    onData(bufferedOutput())
   })
 }
 
@@ -189,6 +197,8 @@ function waitForDashboardPortAnnouncement(
   options: {
     /** Returns a formatted stdout/stderr tail suffix for exit errors (#93608). */
     describeOutputTail?: () => string
+    /** Returns output captured before this watcher attached. */
+    bufferedOutput?: () => string
     readyFile?: fs.PathOrFileDescriptor | null
     timeoutMs?: number
   } = {}
@@ -200,7 +210,7 @@ function waitForDashboardPortAnnouncement(
     return waitForDashboardReadyFile(options.readyFile, child, timeoutMs, describeOutputTail)
   }
 
-  return waitForDashboardPort(child, timeoutMs, describeOutputTail)
+  return waitForDashboardPort(child, timeoutMs, describeOutputTail, options.bufferedOutput)
 }
 
 export {
