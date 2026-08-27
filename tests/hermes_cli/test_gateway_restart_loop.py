@@ -753,9 +753,8 @@ class TestTerminalToolGatewayLifecycleGuard:
                 return {"output": "", "returncode": 0}
 
         # Simulate a CLI agent session: _HERMES_GATEWAY=1 is in the
-        # environment (inherited from the gateway), but
-        # _is_supervised_gateway_process() returns False because the
-        # process does not own the gateway PID file.
+        # environment (inherited from the gateway), but _is_gateway_process()
+        # returns False because this process does not own the gateway PID file.
         self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=False)
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
         monkeypatch.setattr(
