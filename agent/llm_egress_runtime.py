@@ -39,6 +39,7 @@ from agent.source_provenance import DEFAULT_POLICY_DIGEST, SourceProvenanceRegis
 # authorized JSON body so credentials or other caller-controlled text cannot
 # be appended after the firewall receipt is written.
 _SDK_CONTROL_KEYS = frozenset({"timeout"})
+_INTERNAL_EGRESS_KEYS = frozenset({"_hermes_source_provenance"})
 _PROTOCOL_LITERAL_FIELDS = frozenset({"role", "type"})
 _PROTOCOL_LITERAL_VALUES = frozenset({
     "assistant",
@@ -310,6 +311,12 @@ def _segment_read_file_presentation(
     metadata: Any,
     grant_texts: Sequence[tuple[str, SourceGrant]],
     used_grants: dict[str, SourceGrant],
+    *,
+    registry: SourceProvenanceRegistry | None = None,
+    session_id: str = "",
+    turn_id: str = "",
+    request_id: str = "",
+    policy_digest: str = "",
 ) -> SourcePresentationSegment | UntrustedProvenanceSegment:
     """Bind the real JSON/line-number presentation to one exact read grant."""
 
@@ -343,6 +350,31 @@ def _segment_read_file_presentation(
         )
         if parsed["content"] == expected:
             candidates.append((digest, grant))
+    if not candidates and registry is not None:
+        original_request_id = metadata.get("request_id")
+        if isinstance(original_request_id, str):
+            for original_digest in allowed_digests:
+                rebound = registry.rebind_validated_presentation(
+                    original_digest,
+                    original_request_id=original_request_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    policy_digest=policy_digest,
+                )
+                if rebound is None:
+                    continue
+                raw_text = _read_grant_text(rebound)
+                if raw_text is None:
+                    continue
+                expected = "\n".join(
+                    f"{line_number}|{line}"
+                    for line_number, line in enumerate(
+                        raw_text.split("\n"), start=rebound.line_start
+                    )
+                )
+                if parsed["content"] == expected:
+                    candidates.append((source_grant_digest(rebound), rebound))
     if len(candidates) != 1:
         return denied
     digest, grant = candidates[0]
@@ -359,6 +391,8 @@ def _typed_payload(
     field_name: str | None = None,
     syntax_tool_call_ids: frozenset[str] = frozenset(),
     protected_tool_content: bool = False,
+    registry: SourceProvenanceRegistry | None = None,
+    request_identity: tuple[str, str, str, str] = ("", "", "", ""),
 ) -> Any:
     if isinstance(value, str):
         if field_name in _PROTOCOL_LITERAL_FIELDS and value in _PROTOCOL_LITERAL_VALUES:
@@ -400,7 +434,15 @@ def _typed_payload(
                 continue
             if is_read_file_result and key == "content" and isinstance(item, str):
                 typed[key] = _segment_read_file_presentation(
-                    item, source_metadata, grant_texts, used_grants
+                    item,
+                    source_metadata,
+                    grant_texts,
+                    used_grants,
+                    registry=registry,
+                    session_id=request_identity[0],
+                    turn_id=request_identity[1],
+                    request_id=request_identity[2],
+                    policy_digest=request_identity[3],
                 )
                 continue
             typed[key] = _typed_payload(
@@ -413,6 +455,8 @@ def _typed_payload(
                 protected_tool_content=(
                     is_recognized_tool_result and key in {"content", "output"}
                 ),
+                registry=registry,
+                request_identity=request_identity,
             )
         return typed
     if isinstance(value, (list, tuple)):
@@ -425,6 +469,8 @@ def _typed_payload(
                 field_name=field_name,
                 syntax_tool_call_ids=syntax_tool_call_ids,
                 protected_tool_content=protected_tool_content,
+                registry=registry,
+                request_identity=request_identity,
             )
             for item in value
         ]
@@ -479,6 +525,55 @@ def _route_for_agent(agent: Any, route: Any | None) -> Any:
     )
 
 
+def _restore_source_provenance_sidecar(
+    body: Mapping[str, Any], sidecar: Any
+) -> dict[str, Any]:
+    """Reattach only exact content-bound metadata to internal message copies."""
+
+    restored = dict(body)
+    messages = restored.get("messages")
+    if not isinstance(messages, list) or not isinstance(sidecar, list):
+        return restored
+    copied_messages = list(messages)
+    changed = False
+    for entry in sidecar:
+        if not isinstance(entry, Mapping):
+            continue
+        index = entry.get("message_index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            continue
+        if index < 0 or index >= len(copied_messages):
+            continue
+        message = copied_messages[index]
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        if (
+            message.get("role") != "tool"
+            or not isinstance(content, str)
+            or message.get("tool_call_id") != entry.get("tool_call_id")
+            or entry.get("content_sha256")
+            != sha256(content.encode("utf-8")).hexdigest()
+        ):
+            continue
+        copied = dict(message)
+        copied["_source_provenance"] = {
+            key: entry[key]
+            for key in (
+                "request_id",
+                "source_grant_digests",
+                "content_sha256",
+                "presentation_kind",
+            )
+            if key in entry
+        }
+        copied_messages[index] = copied
+        changed = True
+    if changed:
+        restored["messages"] = copied_messages
+    return restored
+
+
 def authorize_agent_sdk_kwargs(
     agent: Any,
     kwargs: Mapping[str, Any],
@@ -487,9 +582,15 @@ def authorize_agent_sdk_kwargs(
     sdk_control_keys: Sequence[str] = _SDK_CONTROL_KEYS,
 ) -> tuple[dict[str, Any], AuthorizedEgress]:
     controls = {key: kwargs[key] for key in sdk_control_keys if key in kwargs}
-    body = {key: value for key, value in kwargs.items() if key not in controls}
+    sidecar = kwargs.get("_hermes_source_provenance")
+    body = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in controls and key not in _INTERNAL_EGRESS_KEYS
+    }
     if os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1":
         body = _sanitize_protected_kanban_body(body)
+    body = _restore_source_provenance_sidecar(body, sidecar)
     session_id = str(getattr(agent, "session_id", "") or "")
     turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     request_id = str(getattr(agent, "_current_api_request_id", "") or "")
@@ -521,6 +622,8 @@ def authorize_agent_sdk_kwargs(
             if os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1"
             else frozenset()
         ),
+        registry=registry if isinstance(registry, SourceProvenanceRegistry) else None,
+        request_identity=(session_id, turn_id, request_id, policy_digest),
     )
     request = TypedOutboundRequest(
         payload=typed_body,
@@ -576,6 +679,8 @@ def authorize_agent_sdk_kwargs(
         if locations:
             logger.warning("LLM egress blocked structural locations: %s", locations)
         raise
+    if isinstance(registry, SourceProvenanceRegistry):
+        registry.remember_validated_presentations(tuple(used_grants.values()))
     rebuilt = json.loads(authorization.payload_bytes)
     if not isinstance(rebuilt, dict):
         raise TypeError("authorized provider payload must be a JSON object")

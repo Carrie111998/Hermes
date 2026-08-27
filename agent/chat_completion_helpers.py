@@ -928,6 +928,20 @@ _EGRESS_PROTECTED_PROVIDERS = frozenset(
 )
 
 
+def _attach_source_provenance_sidecar(agent, kwargs: dict, messages: list) -> dict:
+    """Carry internal read proofs around strict wire-message conversion."""
+
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider not in _EGRESS_PROTECTED_PROVIDERS:
+        return kwargs
+    from agent.source_provenance_tools import build_source_provenance_sidecar
+
+    sidecar = build_source_provenance_sidecar(messages)
+    if not sidecar:
+        return kwargs
+    return {**kwargs, "_hermes_source_provenance": sidecar}
+
+
 def _dispatch_provider_request(agent, request, callback):
     """Apply the exact provider-bound egress policy at a physical call site."""
 
@@ -1985,6 +1999,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
+    _source_sidecar_messages = api_messages
 
     # Provider detection flags
     _is_qwen = agent._is_qwen_portal()
@@ -2065,7 +2080,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        _chat_kwargs = _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -2087,6 +2102,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
         )
+        return _attach_source_provenance_sidecar(
+            agent, _chat_kwargs, _source_sidecar_messages
+        )
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -2098,7 +2116,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    _chat_kwargs = _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -2134,6 +2152,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+    )
+    return _attach_source_provenance_sidecar(
+        agent, _chat_kwargs, _source_sidecar_messages
     )
 
 

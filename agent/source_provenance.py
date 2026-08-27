@@ -20,7 +20,7 @@ from typing import Iterator
 import uuid
 
 from agent.file_safety import get_read_block_error
-from agent.llm_egress_firewall import SourceGrant
+from agent.llm_egress_firewall import SourceGrant, source_grant_digest
 from agent.redact import redact_sensitive_text
 
 
@@ -86,6 +86,7 @@ class SourceProvenanceRegistry:
 
     def __init__(self) -> None:
         self._grants: dict[str, list[SourceGrant]] = {}
+        self._validated_presentations: dict[str, SourceGrant] = {}
         self._lock = RLock()
 
     def issue_file_slice(
@@ -242,6 +243,66 @@ class SourceProvenanceRegistry:
             ]
             for request_id in stale:
                 self._grants.pop(request_id, None)
+            stale_presentations = [
+                digest
+                for digest, grant in self._validated_presentations.items()
+                if grant.turn_id == turn_id
+            ]
+            for digest in stale_presentations:
+                self._validated_presentations.pop(digest, None)
+
+    def remember_validated_presentations(
+        self, grants: tuple[SourceGrant, ...]
+    ) -> None:
+        """Retain grants only after their presentation passed final egress."""
+
+        with self._lock:
+            for grant in grants:
+                if isinstance(grant, SourceGrant):
+                    self._validated_presentations[source_grant_digest(grant)] = grant
+
+    def rebind_validated_presentation(
+        self,
+        digest: str,
+        *,
+        original_request_id: str,
+        session_id: str,
+        turn_id: str,
+        request_id: str,
+        policy_digest: str,
+    ) -> SourceGrant | None:
+        """Re-verify and bind an earlier validated presentation to a later call."""
+
+        with self._lock:
+            original = self._validated_presentations.get(digest)
+        if original is None:
+            return None
+        if (
+            original.session_id != session_id
+            or original.turn_id != turn_id
+            or original.policy_digest != policy_digest
+            or original.request_id != original_request_id
+            or not _is_later_request(original.request_id, request_id, turn_id)
+        ):
+            return None
+        try:
+            content = _read_bounded_slice(
+                original.canonical_path,
+                original.line_start,
+                original.line_end,
+            )
+            return self.issue_file_slice(
+                path=original.canonical_path,
+                line_start=original.line_start,
+                line_end=original.line_end,
+                content=content,
+                session_id=session_id,
+                turn_id=turn_id,
+                request_id=request_id,
+                policy_digest=policy_digest,
+            )
+        except (OSError, SourceProvenanceError):
+            return None
 
 
 def provenance_kwargs_for_agent(
@@ -326,6 +387,18 @@ def following_api_request_id(request_id: str, turn_id: str) -> str:
     # An unparseable current request cannot be projected to an exact future
     # request. Keep the read available but issue no usable grant.
     return ""
+
+
+def _is_later_request(original: str, candidate: str, turn_id: str) -> bool:
+    """Require a strictly later numeric API request in the same turn."""
+
+    prefix = f"{turn_id}:api:"
+    if not original.startswith(prefix) or not candidate.startswith(prefix):
+        return False
+    try:
+        return int(candidate[len(prefix) :]) > int(original[len(prefix) :])
+    except ValueError:
+        return False
 
 
 def _read_bounded_slice(path: Path, line_start: int, line_end: int) -> bytes:
