@@ -401,7 +401,7 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   const readIdentity = ownerRoute
     ? (sessionRowIdentityForOwner(ownerLookupSessionRows(), storedId, ownerRoute) ??
       ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedId))
-    : storedId
+    : (sessionRowIdentityForOwner(ownerLookupSessionRows(), storedId) ?? storedId)
 
   const wasWorking = previous?.busy ?? false
 
