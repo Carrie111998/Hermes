@@ -5177,6 +5177,45 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # clobber an explicit override with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
+        # Resolve a config.yaml `model_aliases:` direct alias on the explicit
+        # -m/--model value, mirroring the oneshot path (hermes_cli/oneshot.py)
+        # and interactive /model (model_switch.switch_model).  Without this,
+        # `hermes chat -q -m <alias>` sends the raw alias string to the
+        # default provider (e.g. "local8b" → zai → HTTP 400 → silent fallback
+        # chain), because cmd_chat → cli.main() never runs alias resolution.
+        # Only applies to an explicit -m: the config-default model was already
+        # resolved when it was written by `hermes config set` / the picker.
+        _alias_provider_override: Optional[str] = None
+        _alias_base_url_override: Optional[str] = None
+        if model:
+            try:
+                from hermes_cli import model_switch as _ms
+
+                _ms._ensure_direct_aliases()
+                _da = _ms.DIRECT_ALIASES.get(model.strip().lower())
+            except Exception:
+                _da = None
+            if _da is not None:
+                self.model = _da.model
+                self._model_is_default = False
+                if _da.provider and _da.provider != "custom":
+                    # Named provider alias: route provider explicitly —
+                    # unless the user passed --provider themselves
+                    # (explicit CLI args win over alias resolution).
+                    if not provider:
+                        _alias_provider_override = _da.provider
+                elif _da.base_url:
+                    # Bare custom endpoint alias: pin the endpoint via
+                    # _explicit_base_url — _ensure_runtime_credentials routes
+                    # `custom` + explicit_base_url through
+                    # _resolve_named_custom_runtime ("direct-alias" source),
+                    # which builds the runtime from the alias's base_url.
+                    # Only when the user didn't pass --provider/--base-url
+                    # themselves (explicit args win over alias resolution).
+                    if not provider and not base_url:
+                        _alias_base_url_override = _da.base_url
+                # A bare `custom` provider with no base_url is unresolvable;
+                # leave routing untouched and let the resolver surface it.
         # A ``moa:<preset>`` model string selects the MoA virtual provider in
         # one shot (parity with interactive ``/moa`` and the model picker). Do
         # this before provider resolution so ``-Q -m moa:<preset>`` routes
@@ -5248,6 +5287,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._model_is_default = False
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
+
+        # Direct-alias overrides resolved from an explicit -m/--model in
+        # __init__.  Applied after the ambient assignments so an alias pins
+        # its provider/endpoint over the config default, while explicit
+        # --provider / --base-url CLI args already won inside the resolution
+        # block (those skip the alias overrides entirely).
+        if _alias_provider_override:
+            self.requested_provider = _alias_provider_override
+            self.provider = _alias_provider_override
+        if _alias_base_url_override:
+            self._explicit_base_url = _alias_base_url_override
+            # Bare custom endpoint: route resolution through the direct-alias
+            # path (_resolve_named_custom_runtime "direct-alias" source) so
+            # the alias's base_url is used verbatim.
+            self.requested_provider = "custom"
+            self.provider = "custom"
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
