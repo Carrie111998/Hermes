@@ -6203,9 +6203,26 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         tool_name, arguments=args, meta=_meta
                     )
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # THE PROBE IS THE ONE WE RACE. DO NOT BUILD A SECOND ONE.
+                    #
+                    # This used to call _watch_children() purely to ask
+                    # isawaitable() about the result, throw that coroutine away,
+                    # and then call it AGAIN for the real ensure_future(). The
+                    # discarded one was never awaited and never closed, so every
+                    # single stdio tool call emitted
+                    #   RuntimeWarning: coroutine '_watch_stdio_children' was
+                    #   never awaited
+                    # on a live MCP path. Warning noise on a hot path is not
+                    # cosmetic: it trains the reader to ignore the channel that
+                    # real un-awaited coroutines would announce themselves on.
+                    #
+                    # Built once here and either raced below or explicitly
+                    # closed. isawaitable() on the object (rather than
+                    # iscoroutinefunction() on the callable) is kept deliberately
+                    # so a stub returning any awaitable still behaves as before.
+                    _watch_probe = _watch_children() if callable(_watch_children) else None
                     _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        inspect.isawaitable(_watch_probe)
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
@@ -6213,6 +6230,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # non-awaitable, or there is no child-watcher to race
                         # against: plain await is exactly the pre-#81995
                         # semantics.
+                        #
+                        # A coroutine we built and are not going to run must be
+                        # closed, or it becomes the very warning this change
+                        # removes.
+                        if asyncio.iscoroutine(_watch_probe):
+                            _watch_probe.close()
                         result = (
                             await _call_coro
                             if asyncio.iscoroutine(_call_coro)
@@ -6224,7 +6247,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_probe)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
