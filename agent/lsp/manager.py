@@ -25,12 +25,9 @@ Design choices:
   ``beforeFileEdited`` / ``getNewDiagnostics`` pattern, except wired
   to the local LSP layer instead of MCP IDE RPC.
 
-The service is **off by default** — call :meth:`is_active` to check
-whether it's actually doing anything.  When LSP is disabled in
-config, when no git workspace can be detected, when all configured
-servers are missing binaries and auto-install is off, ``is_active``
-returns False and the file_operations layer falls through to the
-in-process syntax check.
+The service is enabled by default — call :meth:`is_active` to check
+whether it is accepting work.  Per-file workspace/server gates still
+fall through to the in-process syntax check when LSP cannot run.
 """
 from __future__ import annotations
 
@@ -39,6 +36,8 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
@@ -59,7 +58,8 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
-MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+MIN_IDLE_TIMEOUT = 30  # floor for positive config values; 0 disables reaping
+SHUTDOWN_WAIT_TIMEOUT = 10.0
 
 
 class _BackgroundLoop:
@@ -98,12 +98,10 @@ class _BackgroundLoop:
             except Exception:  # noqa: BLE001
                 pass
 
-    def run(self, coro, *, timeout: Optional[float] = None) -> Any:
-        """Submit a coroutine to the loop and block until done.
-
-        Returns the coroutine's result, or raises its exception.
-        """
+    def submit(self, coro) -> Future:
+        """Submit *coro* and return its thread-safe owner future."""
         from agent.async_utils import safe_schedule_threadsafe
+
         if self._loop is None:
             if asyncio.iscoroutine(coro):
                 coro.close()
@@ -111,24 +109,98 @@ class _BackgroundLoop:
         fut = safe_schedule_threadsafe(coro, self._loop)
         if fut is None:
             raise RuntimeError("background loop not running")
+        return fut
+
+    def run(self, coro, *, timeout: Optional[float] = None) -> Any:
+        """Submit a coroutine to the loop and block until done.
+
+        Returns the coroutine's result, or raises its exception.
+        """
+        fut = self.submit(coro)
         try:
             return fut.result(timeout=timeout)
         except Exception:
             fut.cancel()
             raise
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         loop = self._loop
         if loop is None:
-            return
+            return True
         try:
             loop.call_soon_threadsafe(loop.stop)
         except RuntimeError:
             pass
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                return False
         self._loop = None
         self._thread = None
+        return True
+
+
+@dataclass
+class _ClientEntry:
+    """One published client generation for a server/workspace key."""
+
+    client: LSPClient
+    generation: int
+    leases: int = 0
+    retiring: bool = False
+    retire_reason: Optional[str] = None
+    retirement_task: Optional[asyncio.Task] = None
+    retirement_error: Optional[str] = None
+    leases_drained: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.leases_drained.set()
+
+
+def _task_returned_true(task: asyncio.Task) -> bool:
+    """Return whether a completed lifecycle task confirmed cleanup."""
+    if not task.done() or task.cancelled():
+        return False
+    try:
+        return task.result() is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _ClientLease:
+    """Generation-bound ownership held across every awaited client use."""
+
+    def __init__(
+        self,
+        service: "LSPService",
+        key: Tuple[str, str],
+        entry: _ClientEntry,
+    ) -> None:
+        self._service = service
+        self._key = key
+        self._entry = entry
+        self._released = False
+
+    @property
+    def client(self) -> LSPClient:
+        return self._entry.client
+
+    @property
+    def generation(self) -> int:
+        return self._entry.generation
+
+    async def __aenter__(self) -> LSPClient:
+        return self.client
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._service._release_lease(self._key, self._entry)
 
 
 class LSPService:
@@ -172,12 +244,20 @@ class LSPService:
             self._loop.start()
 
         # Per-(server_id, workspace_root) state
-        self._clients: Dict[Tuple[str, str], LSPClient] = {}
+        self._clients: Dict[Tuple[str, str], _ClientEntry] = {}
         self._broken: set = set()
-        self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
+        self._spawning: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._generations: Dict[Tuple[str, str], int] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
+        self._shutdown_task: Optional[asyncio.Task] = None
+        self._shutdown_future: Optional[Future] = None
+        self._shutdown_state = "running" if self._enabled else "closed"
+        self._shutdown_error: Optional[str] = None
+        self._admitting = self._enabled
+        self._clients_drained = not self._enabled
+        self._loop_stopped = not self._enabled
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
@@ -215,10 +295,9 @@ class LSPService:
         except (TypeError, ValueError):
             idle_timeout = DEFAULT_IDLE_TIMEOUT
         if 0 < idle_timeout < MIN_IDLE_TIMEOUT:
-            # A timeout below the per-operation wait budget could reap a
-            # client mid-flight; the resulting outer timeout would then
-            # mark the (server, workspace) pair broken for the process
-            # lifetime.  Clamp to a safe floor (0 still disables).
+            # Keep very small values from thrashing server indexes.  Active
+            # operations are protected independently by generation leases.
+            # Zero remains the explicit "disable reaping" value.
             idle_timeout = MIN_IDLE_TIMEOUT
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
@@ -259,7 +338,8 @@ class LSPService:
 
     def is_active(self) -> bool:
         """Return True iff this service should be consulted at all."""
-        return self._enabled
+        with self._state_lock:
+            return self._enabled and self._admitting
 
     def enabled_for(self, file_path: str) -> bool:
         """Return True iff LSP should run for this specific file.
@@ -274,7 +354,7 @@ class LSPService:
         timeout cost — until the service is restarted (``hermes lsp
         restart``) or the process exits.
         """
-        if not self._enabled:
+        if not self.is_active():
             return False
         srv = find_server_for_file(file_path)
         if srv is None or srv.server_id in self._disabled_servers:
@@ -284,14 +364,15 @@ class LSPService:
             return False
         # Broken-set short-circuit.  Use the per-server root if we can
         # compute one cheaply; otherwise fall back to the workspace
-        # root as the broken key (which is what _get_or_spawn would
+        # root as the broken key (which is what _acquire_client would
         # have used anyway when it failed).
         try:
             per_server_root = srv.resolve_root(file_path, ws_root) or ws_root
         except Exception:  # noqa: BLE001
             per_server_root = ws_root
-        if (srv.server_id, per_server_root) in self._broken:
-            return False
+        with self._state_lock:
+            if (srv.server_id, per_server_root) in self._broken:
+                return False
         return True
 
     def snapshot_baseline(self, file_path: str) -> None:
@@ -418,7 +499,7 @@ class LSPService:
         edits skip it instantly instead of re-paying timeout cost.
 
         Called when the outer ``_loop.run`` timeout cancels an in-flight
-        spawn/initialize that the inner ``_get_or_spawn`` task was still
+        spawn/initialize that the inner ``_acquire_client`` task was still
         holding open.  Without this, every subsequent write would re-enter
         the spawn path and re-pay the full ``snapshot_baseline``
         timeout (8s) until the binary is fixed.
@@ -441,59 +522,129 @@ class LSPService:
         except Exception:  # noqa: BLE001
             per_server_root = ws_root
         key = (srv.server_id, per_server_root)
-        already_broken = key in self._broken
-        self._broken.add(key)
-
-        # Kill any client we managed to spawn before the timeout.  The
-        # cancelled future never reached the broken-set add inside
-        # ``_get_or_spawn`` so the client may still be hanging in
-        # ``_clients`` with a half-initialized state.
         with self._state_lock:
-            client = self._clients.pop(key, None)
-            self._last_used.pop(key, None)
-        if client is not None:
+            already_broken = key in self._broken
+            self._broken.add(key)
+
+        # Cancel an in-flight spawn and retire any published generation.
+        # The retirement task itself is retained, so this bounded outer
+        # wait cannot abandon cleanup when it times out.
+        if not self._loop_stopped:
             try:
-                # Fire-and-forget shutdown — give it a second to cleanup,
-                # but don't block.  We're already on a slow path.
-                self._loop.run(client.shutdown(), timeout=1.0)
+                self._loop.run(self._break_key_async(key), timeout=1.0)
             except Exception:  # noqa: BLE001
                 pass
 
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
 
-    def shutdown(self) -> None:
-        """Tear down all clients and stop the background loop."""
+    def shutdown(self) -> bool:
+        """Tear down all clients and stop the background loop.
+
+        Returns ``True`` only after spawn tasks, request leases, client
+        cleanup, and the background loop have all finished.  A timeout or
+        cleanup failure leaves the loop alive so a later caller can observe
+        the retained teardown task instead of publishing a replacement.
+        """
         if not self._enabled:
-            return
+            return True
+        shutdown_future: Optional[Future] = None
         try:
-            self._loop.run(self._shutdown_async(), timeout=10.0)
+            with self._state_lock:
+                already_closed = self._shutdown_state == "closed"
+                clients_drained = self._clients_drained
+                if not already_closed:
+                    # Close admission synchronously.  Even if the event loop is
+                    # blocked inside a server installer/spawn and cannot start
+                    # the teardown coroutine before our join timeout, no new
+                    # request can acquire or publish a generation meanwhile.
+                    self._admitting = False
+                    if self._shutdown_state == "running":
+                        self._shutdown_state = "closing"
+                if not (already_closed or clients_drained):
+                    shutdown_future = self._shutdown_future
+                    if shutdown_future is None or shutdown_future.done():
+                        # Store the cross-thread owner before waiting.  A caller
+                        # timeout must not cancel the only queued teardown while
+                        # build_spawn()/an installer is blocking the loop.
+                        shutdown_future = self._loop.submit(self._shutdown_async())
+                        self._shutdown_future = shutdown_future
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP shutdown scheduling error: %s", e)
+            with self._state_lock:
+                self._shutdown_state = "failed"
+                self._shutdown_error = f"{type(e).__name__}: {e}"
+            return False
+
+        if already_closed or clients_drained:
+            return self._finish_shutdown()
+        assert shutdown_future is not None
+        try:
+            succeeded = bool(shutdown_future.result(timeout=SHUTDOWN_WAIT_TIMEOUT))
+        except FutureTimeoutError:
+            with self._state_lock:
+                self._shutdown_error = "timed out waiting for retained teardown"
+            return False
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
-        self._loop.stop()
+            with self._state_lock:
+                self._shutdown_state = "failed"
+                self._shutdown_error = f"{type(e).__name__}: {e}"
+            return False
+        if not succeeded:
+            return False
+        return self._finish_shutdown()
+
+    def _finish_shutdown(self) -> bool:
+        with self._state_lock:
+            if self._loop_stopped:
+                return True
+        if not self._loop.stop():
+            with self._state_lock:
+                self._shutdown_state = "failed"
+                self._shutdown_error = "background event loop did not stop"
+            return False
+        with self._state_lock:
+            self._loop_stopped = True
+            self._shutdown_state = "closed"
+            self._shutdown_error = None
+            self._shutdown_future = None
         clear_cache()
+        return True
+
+    def _get_shutdown_error(self) -> Optional[str]:
+        """Return the in-process teardown error for singleton ownership."""
+        with self._state_lock:
+            return self._shutdown_error
 
     # ------------------------------------------------------------------
     # async internals
     # ------------------------------------------------------------------
 
     async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
-        client = await self._get_or_spawn(file_path)
-        if client is None:
+        lease = await self._acquire_client(file_path)
+        if lease is None:
             return []
+        client = lease.client
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("snapshot open/wait failed: %s", e)
-            return []
-        self._touch(client)
-        if not fresh:
-            # No fresh data for the pre-edit content — an empty baseline
-            # is safe: worst case the delta filter removes less, never
-            # more.  Never seed the baseline from stale stores.
-            return []
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+            try:
+                version = await client.open_file(
+                    file_path, language_id=language_id_for(file_path)
+                )
+                fresh = await client.wait_for_diagnostics(
+                    file_path, version, mode=self._wait_mode
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("snapshot open/wait failed: %s", e)
+                return []
+            if not fresh:
+                # No fresh data for the pre-edit content — an empty baseline
+                # is safe: worst case the delta filter removes less, never
+                # more.  Never seed the baseline from stale stores.
+                return []
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            lease.release()
 
     async def _open_and_wait_async(self, file_path: str) -> Optional[List[Dict[str, Any]]]:
         """Open + wait for FRESH diagnostics.
@@ -504,22 +655,30 @@ class LSPService:
         content, it's clean", ``None`` means "no verdict" — the caller
         must not substitute stale data for either.
         """
-        client = await self._get_or_spawn(file_path)
-        if client is None:
+        lease = await self._acquire_client(file_path)
+        if lease is None:
             return None
+        client = lease.client
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("open/wait failed for %s: %s", file_path, e)
-            return None
-        self._touch(client)
-        if not fresh:
-            return None
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+            try:
+                version = await client.open_file(
+                    file_path, language_id=language_id_for(file_path)
+                )
+                await client.save_file(file_path)
+                fresh = await client.wait_for_diagnostics(
+                    file_path,
+                    version,
+                    mode=self._wait_mode,
+                    timeout=self._wait_timeout,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("open/wait failed for %s: %s", file_path, e)
+                return None
+            if not fresh:
+                return None
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            lease.release()
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
         ws, gated = resolve_workspace_for_file(file_path)
@@ -527,12 +686,18 @@ class LSPService:
         if not (ws and gated and srv):
             return []
         with self._state_lock:
-            client = self._clients.get((srv.server_id, ws))
-        if client is None:
+            entry = self._clients.get((srv.server_id, ws))
+        if entry is None or entry.retiring:
             return []
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+        return list(entry.client.diagnostics_for(file_path, fresh_only=True))
 
-    async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+    async def _acquire_client(self, file_path: str) -> Optional[_ClientLease]:
+        """Return a lease on the current generation, spawning if needed.
+
+        A retiring generation stays published until its cleanup completes.
+        Callers wait on that retained retirement task before a replacement
+        generation can be spawned for the same key.
+        """
         srv = find_server_for_file(file_path)
         if srv is None:
             return None
@@ -551,27 +716,80 @@ class LSPService:
             return None  # exclude marker hit, server gated off
 
         key = (srv.server_id, per_server_root)
-        if key in self._broken:
-            return None
-        with self._state_lock:
-            client = self._clients.get(key)
-            if client is not None and client.is_running:
-                self._last_used[key] = time.time()
-                eventlog.log_active(srv.server_id, per_server_root)
-                return client
-            spawning = self._spawning.get(key)
-        if spawning is not None:
+        while True:
+            retirement: Optional[asyncio.Task] = None
+            spawning: Optional[asyncio.Task] = None
+            lease: Optional[_ClientLease] = None
+            with self._state_lock:
+                if not self._admitting or key in self._broken:
+                    return None
+                entry = self._clients.get(key)
+                if (
+                    entry is not None
+                    and not entry.retiring
+                    and entry.client.is_running
+                ):
+                    entry.leases += 1
+                    entry.leases_drained.clear()
+                    self._last_used[key] = time.time()
+                    lease = _ClientLease(self, key, entry)
+                elif entry is not None:
+                    retirement = self._begin_retirement_locked(
+                        key, entry, "client no longer running"
+                    )
+                else:
+                    spawning = self._spawning.get(key)
+                    if spawning is None:
+                        generation = self._generations.get(key, 0) + 1
+                        self._generations[key] = generation
+                        spawning = asyncio.create_task(
+                            self._spawn_client(
+                                srv,
+                                key,
+                                per_server_root,
+                                generation,
+                            )
+                        )
+                        self._spawning[key] = spawning
+
+            if lease is not None:
+                try:
+                    eventlog.log_active(srv.server_id, per_server_root)
+                except BaseException:
+                    lease.release()
+                    raise
+                return lease
+            if retirement is not None:
+                try:
+                    retired = await asyncio.shield(retirement)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    return None
+                if not retired:
+                    return None
+                continue
+            assert spawning is not None
             try:
-                return await spawning
+                await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                raise
             except Exception:  # noqa: BLE001
                 return None
 
-        # Begin spawn
-        loop = asyncio.get_running_loop()
-        spawn_future: asyncio.Future = loop.create_future()
-        with self._state_lock:
-            self._spawning[key] = spawn_future
+    async def _spawn_client(
+        self,
+        srv,
+        key: Tuple[str, str],
+        per_server_root: str,
+        generation: int,
+    ) -> Optional[_ClientEntry]:
+        """Build one generation and publish it only while admission is open."""
+        client: Optional[LSPClient] = None
         try:
+            with self._state_lock:
+                if not self._admitting or key in self._broken:
+                    return None
             ctx = ServerContext(
                 workspace_root=per_server_root,
                 install_strategy=self._install_strategy,
@@ -580,14 +798,17 @@ class LSPService:
                 init_overrides=self._init_overrides,
             )
             spec = srv.build_spawn(per_server_root, ctx)
+            with self._state_lock:
+                if not self._admitting or key in self._broken:
+                    return None
             if spec is None:
                 # ``build_spawn`` returns None when the binary can't be
                 # located (auto-install disabled, manual-only server,
                 # or install attempt failed).  Surface this once via
                 # the structured logger so the user can act on it.
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
-                self._broken.add(key)
-                spawn_future.set_result(None)
+                with self._state_lock:
+                    self._broken.add(key)
                 return None
             client = LSPClient(
                 server_id=srv.server_id,
@@ -598,38 +819,178 @@ class LSPService:
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             )
-            try:
-                await client.start()
-            except Exception as e:  # noqa: BLE001
-                eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
-                self._broken.add(key)
-                spawn_future.set_result(None)
-                return None
+            await client.start()
+            entry = _ClientEntry(client=client, generation=generation)
             with self._state_lock:
-                self._clients[key] = client
-                self._last_used[key] = time.time()
-            eventlog.log_active(srv.server_id, per_server_root)
-            spawn_future.set_result(client)
-            return client
+                publish = self._admitting and key not in self._broken
+                if publish:
+                    self._clients[key] = entry
+                    self._last_used[key] = time.time()
+            if not publish:
+                await self._cleanup_unpublished_client(
+                    key,
+                    client,
+                    generation,
+                    "spawn completed after admission closed",
+                )
+                return None
+            return entry
+        except asyncio.CancelledError:
+            if client is not None:
+                await self._cleanup_unpublished_client(
+                    key,
+                    client,
+                    generation,
+                    "spawn cancelled",
+                )
+            raise
+        except Exception as e:  # noqa: BLE001
+            eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
+            with self._state_lock:
+                self._broken.add(key)
+            if client is not None:
+                await self._cleanup_unpublished_client(
+                    key,
+                    client,
+                    generation,
+                    "spawn/initialize failed",
+                )
+            return None
         finally:
             with self._state_lock:
-                self._spawning.pop(key, None)
+                if self._spawning.get(key) is asyncio.current_task():
+                    self._spawning.pop(key, None)
+
+    async def _cleanup_unpublished_client(
+        self,
+        key: Tuple[str, str],
+        client: LSPClient,
+        generation: int,
+        reason: str,
+    ) -> bool:
+        """Clean a generation that never reached the active registry.
+
+        A cleanup failure is still published as a retiring tombstone.  This
+        makes service shutdown fail closed instead of forgetting a process
+        that may still be alive merely because admission closed first.
+        """
+        entry = _ClientEntry(client=client, generation=generation)
+        entry.retiring = True
+        entry.retire_reason = reason
+        with self._state_lock:
+            published = key not in self._clients
+            if published:
+                self._clients[key] = entry
+        try:
+            await client.shutdown()
+        except Exception as e:  # noqa: BLE001
+            message = f"{type(e).__name__}: {e}"
+            with self._state_lock:
+                if self._clients.get(key) is entry:
+                    entry.retirement_error = message
+                self._broken.add(key)
+            logger.warning(
+                "LSP unpublished generation %s cleanup failed for %s/%s: %s",
+                generation,
+                key[0],
+                key[1],
+                message,
+            )
+            return False
+        with self._state_lock:
+            if published and self._clients.get(key) is entry:
+                self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+        return True
+
+    def _release_lease(
+        self,
+        key: Tuple[str, str],
+        entry: _ClientEntry,
+    ) -> None:
+        with self._state_lock:
+            if entry.leases <= 0:
+                return
+            entry.leases -= 1
+            if entry.leases == 0:
+                entry.leases_drained.set()
+            if self._clients.get(key) is entry and not entry.retiring:
+                self._last_used[key] = time.time()
+
+    def _begin_retirement_locked(
+        self,
+        key: Tuple[str, str],
+        entry: _ClientEntry,
+        reason: str,
+    ) -> asyncio.Task:
+        task = entry.retirement_task
+        if task is not None and not task.done():
+            return task
+        if task is not None and _task_returned_true(task):
+            return task
+        if not entry.retiring:
+            entry.retiring = True
+            entry.retire_reason = reason
+        elif entry.retire_reason is None:
+            entry.retire_reason = reason
+        task = asyncio.create_task(self._retire_entry(key, entry))
+        entry.retirement_task = task
+        return task
+
+    async def _retire_entry(
+        self,
+        key: Tuple[str, str],
+        entry: _ClientEntry,
+    ) -> bool:
+        await entry.leases_drained.wait()
+        try:
+            await entry.client.shutdown()
+        except Exception as e:  # noqa: BLE001
+            message = f"{type(e).__name__}: {e}"
+            with self._state_lock:
+                entry.retirement_error = message
+                self._broken.add(key)
+            logger.warning(
+                "LSP generation %s cleanup failed for %s/%s: %s",
+                entry.generation,
+                key[0],
+                key[1],
+                message,
+            )
+            return False
+        if entry.retire_reason == "idle timeout":
+            # Clear the active-announcement key and emit the reap INFO while
+            # this retiring entry is still published.  A replacement cannot
+            # become visible until this task returns, so multi-key sweeps
+            # cannot downgrade an early replacement to DEBUG reuse.
+            eventlog.log_reaped([key], self._idle_timeout)
+        with self._state_lock:
+            entry.retirement_error = None
+            if self._clients.get(key) is entry:
+                self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+        return True
+
+    async def _break_key_async(self, key: Tuple[str, str]) -> None:
+        with self._state_lock:
+            spawning = self._spawning.get(key)
+            entry = self._clients.get(key)
+            retirement = (
+                self._begin_retirement_locked(key, entry, "pair marked broken")
+                if entry is not None
+                else None
+            )
+        if spawning is not None:
+            spawning.cancel()
+        retained = [task for task in (spawning, retirement) if task is not None]
+        if retained:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in retained),
+                return_exceptions=True,
+            )
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
-
-    def _touch(self, client: LSPClient) -> None:
-        """Refresh the last-used timestamp for a client we just used.
-
-        Guarded on membership so a reaped-mid-operation client can't
-        resurrect an orphan ``_last_used`` entry after the reaper popped
-        the key.  All writers and the reaper run on the background loop
-        thread; the lock keeps this consistent with the reader anyway.
-        """
-        key = (client.server_id, client.workspace_root)
-        with self._state_lock:
-            if key in self._clients:
-                self._last_used[key] = time.time()
 
     async def _idle_reaper_loop(self) -> None:
         interval = min(60.0, self._idle_timeout)
@@ -648,39 +1009,81 @@ class LSPService:
     async def _reap_idle_once(self) -> None:
         cutoff = time.time() - self._idle_timeout
         with self._state_lock:
-            idle_keys = [
-                key
-                for key in self._clients
-                if self._last_used.get(key, 0) < cutoff
+            idle_entries = [
+                (key, entry)
+                for key, entry in self._clients.items()
+                if not entry.retiring and self._last_used.get(key, 0) < cutoff
             ]
-            clients = [self._clients.pop(key) for key in idle_keys]
-            for key in idle_keys:
-                self._last_used.pop(key, None)
-        if clients:
-            eventlog.log_reaped(
-                [(c.server_id, c.workspace_root) for c in clients],
-                self._idle_timeout,
-            )
+            retirements = [
+                self._begin_retirement_locked(key, entry, "idle timeout")
+                for key, entry in idle_entries
+            ]
+        if retirements:
             await asyncio.gather(
-                *(client.shutdown() for client in clients),
+                *(asyncio.shield(task) for task in retirements),
                 return_exceptions=True,
             )
 
-    async def _shutdown_async(self) -> None:
+    async def _shutdown_async(self) -> bool:
+        task = self._shutdown_task
+        if task is None or (task.done() and not _task_returned_true(task)):
+            task = asyncio.create_task(self._shutdown_impl())
+            self._shutdown_task = task
+        return bool(await asyncio.shield(task))
+
+    async def _shutdown_impl(self) -> bool:
+        with self._state_lock:
+            self._admitting = False
+            self._shutdown_state = "closing"
+            self._shutdown_error = None
+
         reaper = self._idle_reaper_task
         self._idle_reaper_task = None
         if reaper is not None:
             reaper.cancel()
             await asyncio.gather(reaper, return_exceptions=True)
+
         with self._state_lock:
-            clients = list(self._clients.values())
-            self._clients.clear()
-            self._broken.clear()
-            self._last_used.clear()
-        await asyncio.gather(
-            *(c.shutdown() for c in clients),
-            return_exceptions=True,
-        )
+            spawning = list(self._spawning.values())
+        for task in spawning:
+            task.cancel()
+        if spawning:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in spawning),
+                return_exceptions=True,
+            )
+
+        with self._state_lock:
+            retirements = [
+                self._begin_retirement_locked(key, entry, "service shutdown")
+                for key, entry in list(self._clients.items())
+            ]
+        results = []
+        if retirements:
+            results = await asyncio.gather(
+                *(asyncio.shield(task) for task in retirements),
+                return_exceptions=True,
+            )
+
+        with self._state_lock:
+            failures = [result for result in results if result is not True]
+            succeeded = not failures and not self._clients and not self._spawning
+            self._clients_drained = succeeded
+            if succeeded:
+                self._shutdown_state = "closed"
+                self._shutdown_error = None
+            else:
+                self._shutdown_state = "failed"
+                if failures:
+                    self._shutdown_error = "one or more client generations failed to retire"
+                elif self._spawning:
+                    self._shutdown_error = "one or more client generations are still spawning"
+                else:
+                    self._shutdown_error = "one or more client generations are still retiring"
+            if succeeded:
+                self._broken.clear()
+                self._last_used.clear()
+        return succeeded
 
     # ------------------------------------------------------------------
     # status / introspection (used by ``hermes lsp status``)
@@ -693,10 +1096,10 @@ class LSPService:
                 {
                     "server_id": k[0],
                     "workspace_root": k[1],
-                    "state": c.state,
-                    "running": c.is_running,
+                    "state": entry.client.state,
+                    "running": entry.client.is_running,
                 }
-                for k, c in self._clients.items()
+                for k, entry in self._clients.items()
             ]
             broken = list(self._broken)
         return {

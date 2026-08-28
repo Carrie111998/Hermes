@@ -31,13 +31,23 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Union
 
 from agent.lsp.manager import LSPService
 
 logger = logging.getLogger("agent.lsp")
 
-_service: Optional[LSPService] = None
+
+@dataclass(frozen=True)
+class _ServiceTombstone:
+    """A service whose teardown was not confirmed successful."""
+
+    service: LSPService
+    error: str
+
+
+_service: Optional[Union[LSPService, _ServiceTombstone]] = None
 _atexit_registered = False
 _service_lock = threading.Lock()
 
@@ -55,12 +65,14 @@ def get_service() -> Optional[LSPService]:
     when it terminates.
     """
     global _service, _atexit_registered
-    if _service is not None:
-        return _service if _service.is_active() else None
     with _service_lock:
-        if _service is not None:
-            return _service if _service.is_active() else None
-        _service = LSPService.create_from_config()
+        current = _service
+        if isinstance(current, _ServiceTombstone):
+            return None
+        if current is not None:
+            return current if current.is_active() else None
+        current = LSPService.create_from_config()
+        _service = current
         if not _atexit_registered:
             # ``atexit`` handlers run in LIFO order on normal Python
             # exit and on SystemExit, but NOT on os._exit() or
@@ -74,23 +86,44 @@ def get_service() -> Optional[LSPService]:
             # stdout buffers drain.
             atexit.register(_atexit_shutdown)
             _atexit_registered = True
-    return _service if (_service is not None and _service.is_active()) else None
+        return current if (current is not None and current.is_active()) else None
 
 
-def shutdown_service() -> None:
+def shutdown_service() -> bool:
     """Tear down the LSP service if one was started.
 
-    Safe to call multiple times; safe to call when no service was created.
+    Returns ``True`` only when teardown completed.  The singleton lock is
+    held through teardown so ``get_service()`` cannot publish a replacement
+    concurrently.  Failed or incomplete teardown leaves a tombstone that
+    continues refusing replacement until a later shutdown call succeeds.
     """
     global _service
     with _service_lock:
-        svc = _service
-        _service = None
-    if svc is not None:
+        current = _service
+        if current is None:
+            return True
+        svc = current.service if isinstance(current, _ServiceTombstone) else current
         try:
-            svc.shutdown()
+            succeeded = bool(svc.shutdown())
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
+            _service = _ServiceTombstone(
+                service=svc,
+                error=f"{type(e).__name__}: {e}",
+            )
+            return False
+        if succeeded:
+            _service = None
+            return True
+        try:
+            error = svc._get_shutdown_error() or "teardown incomplete"
+        except Exception as e:  # noqa: BLE001
+            error = f"teardown incomplete; error unavailable: {type(e).__name__}: {e}"
+        _service = _ServiceTombstone(
+            service=svc,
+            error=error,
+        )
+        return False
 
 
 def _atexit_shutdown() -> None:
