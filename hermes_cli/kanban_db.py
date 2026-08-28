@@ -1486,7 +1486,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- spawn so confinement is auditable after the fact, not only asserted at
     -- launch. NULL for runs that predate the column and for synthetic runs
     -- (no process was started).
-    observed_cwd        TEXT
+    observed_cwd        TEXT,
+    -- The agent session that produced this run. With ``profile`` this is the
+    -- JOIN KEY into that profile's ``state.db.session_model_usage``, where
+    -- token counts and cost already live. Nothing here recomputes them.
+    session_id          TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2700,6 +2704,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # existing status guard changes. ``gate_state`` is what distinguishes
         # "waiting on a human" from "waiting on a clock".
         _add_column_if_missing(conn, "tasks", "gate_state", "gate_state TEXT")
+
+    # Routing lane (M3A-ROUTING-POLICY §4.1): an explicit human or PM-agent
+    # choice recorded on the card, never inferred from prompt text. Additive
+    # and NULL by default, so a board that records no lane behaves exactly as
+    # it did before — the profile's own config decides, unchanged.
+    if "routing_lane" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "routing_lane", "routing_lane TEXT"
+        )
+
     # Indexed here rather than in SCHEMA_SQL: on a legacy DB the column does not
     # exist when SCHEMA_SQL runs, and CREATE INDEX over a missing column aborts
     # initialization. Same reason idx_tasks_tenant / idx_tasks_session_id live
@@ -2813,6 +2827,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "observed_cwd" not in run_cols:
             _add_column_if_missing(
                 conn, "task_runs", "observed_cwd", "observed_cwd TEXT"
+            )
+        # Same shape, same reason: the session that produced a run is the join
+        # key for its cost. Historical runs get NULL — the value was never
+        # captured and guessing it would fabricate an accounting join.
+        if "session_id" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "session_id", "session_id TEXT"
             )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
@@ -8381,6 +8402,87 @@ def list_gated_tasks(conn: sqlite3.Connection) -> list:
         item["revision"] = (ctx or {}).get("revision")
         out.append(item)
     return out
+
+
+def set_routing_lane(
+    conn: sqlite3.Connection, task_id: str, lane: Optional[str], *,
+    selected_by: Optional[str] = None,
+) -> bool:
+    """Record an explicit routing lane on a card. False when the task is unknown.
+
+    A lane is a **declared choice**, never an inference: M3b ships no
+    classifier (M3A-ROUTING-POLICY §4.2), so ``selection`` is always
+    ``manual``. Recording one changes nothing else — not status, not assignee,
+    not scheduling. Absent a lane the profile's own configuration decides
+    exactly as it does today, which is why a blank lane clears the column
+    rather than storing an empty string.
+
+    Emits a ``routing_decided`` task event so the decision reaches the board
+    timeline, and appends the same decision to ``logs/routing.jsonl``. The log
+    append is best-effort by design: losing an audit line must never fail the
+    board write it describes.
+    """
+    _assert_not_delegated_child_mutation()
+    normalized = str(lane).strip() if isinstance(lane, str) else None
+    if not normalized:
+        normalized = None
+    row = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, project_id, assignee, current_run_id FROM tasks "
+            "WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET routing_lane = ? WHERE id = ?",
+            (normalized, task_id),
+        )
+        _append_event(
+            conn, task_id, "routing_decided",
+            {"lane": normalized, "selection": "manual",
+             "selected_by": selected_by, "project_id": row["project_id"]},
+            run_id=row["current_run_id"],
+        )
+
+    try:
+        from hermes_cli import routing_audit
+
+        routing_audit.record_routing_decision(
+            task_id=task_id,
+            project_id=row["project_id"],
+            lane=normalized,
+            selected_by=selected_by,
+            profile=row["assignee"],
+            run_ref=(f"task_run:{row['current_run_id']}"
+                     if row["current_run_id"] else None),
+        )
+    except Exception:
+        # Never raise out of the audit path — see routing_audit's docstring.
+        pass
+    return True
+
+
+def record_run_session_id(
+    conn: sqlite3.Connection, run_id: Optional[int], session_id: Optional[str],
+) -> bool:
+    """Stamp the agent session that produced a run. False when not stored.
+
+    This is the join key, and only the key: with ``task_runs.profile`` it
+    resolves to that profile's ``state.db.session_model_usage``, where the
+    token and cost figures already are. Nothing here recomputes them, and no
+    part of the run's own lifecycle state changes.
+    """
+    if run_id is None:
+        return False
+    text = str(session_id).strip() if isinstance(session_id, str) else ""
+    if not text:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET session_id = ? WHERE id = ?", (text, run_id),
+        )
+    return cur.rowcount == 1
 
 
 def plan_gate_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
