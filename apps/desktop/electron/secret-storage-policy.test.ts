@@ -2,8 +2,9 @@
  * Tests for electron/secret-storage-policy.ts — the "is OS-keychain
  * encryption enabled at all?" decision seam.
  *
- * The behavior this file pins: keychain-backed encryption is OPT-IN
- * (default OFF), and once the one-shot legacy migration has run, a
+ * The behavior this file pins: keychain-backed encryption is the safe default,
+ * and plaintext is an explicit user choice. Once the one-shot legacy
+ * migration has run, a
  * safeStorage blob under an opted-out policy reads as 'drop' — i.e. the
  * caller must treat it as absent WITHOUT touching safeStorage, so a broken
  * macOS login keychain can never raise its password dialog on launch.
@@ -42,15 +43,15 @@ function fakeIo(initial: string | null = null): SecretStoragePolicyIo & { fileTe
 
 // ── defaults ────────────────────────────────────────────────────────────────
 
-test('missing policy file defaults to encryption OFF, not migrated', () => {
+test('missing policy file defaults to encryption ON, not migrated', () => {
   const policy = readSecretStoragePolicy(fakeIo())
 
-  assert.deepEqual(policy, { on: false, migrated: false })
+  assert.deepEqual(policy, { on: true, migrated: false })
 })
 
-test('corrupt or non-object policy file reads as the default', () => {
+test('corrupt or non-object policy file defaults to encryption ON', () => {
   for (const bad of ['not-json', '[]', '"on"', 'null', '123']) {
-    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: false, migrated: false })
+    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: true, migrated: false })
   }
 })
 
