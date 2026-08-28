@@ -83,7 +83,14 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
+    # Local patch (2026-08-26, CHG-23): historical entries carry ttl_ms=0
+    # (mcp 2.x SDK default, not a real server hint), which made every lookup
+    # a MISS forever. Treat non-positive TTLs as "no hint / never expires",
+    # matching the documented pre-2026 behavior.
+    if (
+        isinstance(ttl_ms, (int, float)) and ttl_ms > 0
+        and isinstance(written_at, (int, float))
+    ):
         if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
             return None
     return entry
