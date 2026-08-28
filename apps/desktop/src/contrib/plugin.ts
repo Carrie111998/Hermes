@@ -12,6 +12,7 @@
  * through the plugin host loader (next phase); this is that seam.
  */
 
+import type { HermesSelectPathsOptions } from '@/global'
 import { pluginRest, type PluginRestOptions, pluginSocket } from '@/hermes'
 import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
@@ -55,6 +56,10 @@ export interface PluginOs {
   /** Reveal a path in the OS file manager (Finder / Explorer). Resolves
    *  false when unavailable. */
   revealPath: (path: string) => Promise<boolean>
+  /** Open a native file or directory picker. Cancellation, an unavailable
+   *  older shell, or malformed bridge output resolves to an empty list.
+   *  A real bridge failure is surfaced to the plugin. */
+  selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
   /** Write text to the system clipboard. Resolves false when unavailable. */
   writeClipboard: (text: string) => Promise<boolean>
 }
@@ -81,8 +86,8 @@ export interface PluginContext {
    *  accelerator over your polling, never a replacement. */
   socket: (path: string, onMessage: (data: unknown) => void) => () => void
   /** The curated OS door: native notification, open-external, reveal-in-file-
-   *  manager, clipboard — attributed to this plugin, result-shaped (never
-   *  throws for a missing capability). */
+   *  manager, clipboard, and native file or directory selection — attributed
+   *  to this plugin, result-shaped for a missing capability. */
   os: PluginOs
   /** Plugin-scoped persistence. */
   storage: PluginStorage
@@ -155,6 +160,17 @@ function createPluginOs(pluginId: string): PluginOs {
         return true
       }),
     revealPath: path => attempt(async bridge => (bridge.revealPath ? bridge.revealPath(path) : false)),
+    selectPaths: async options => {
+      const bridge = typeof window === 'undefined' ? undefined : window.hermesDesktop
+
+      if (!bridge?.selectPaths) {
+        return []
+      }
+
+      const paths = await bridge.selectPaths(options)
+
+      return Array.isArray(paths) ? paths.filter(path => typeof path === 'string' && path.length > 0) : []
+    },
     writeClipboard: text => attempt(bridge => bridge.writeClipboard(text))
   }
 }

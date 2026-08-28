@@ -38,12 +38,16 @@ describe('createPluginContext.os', () => {
     await expect(ctx.os.openExternal('https://example.com')).resolves.toBe(false)
     await expect(ctx.os.revealPath('/tmp')).resolves.toBe(false)
     await expect(ctx.os.writeClipboard('hi')).resolves.toBe(false)
+    await expect(ctx.os.selectPaths({ directories: true, multiple: false })).resolves.toEqual([])
   })
 
-  it('routes through the bridge and turns a bridge throw into false', async () => {
+  it('routes path selection through the bridge and surfaces a bridge failure', async () => {
     const bridge = {
       openExternal: vi.fn().mockResolvedValue(undefined),
       revealPath: vi.fn().mockResolvedValue(true),
+      selectPaths: vi.fn()
+        .mockResolvedValueOnce(['C:\\Projects\\demo\\source.docx'])
+        .mockRejectedValueOnce(new Error('native dialog failed')),
       writeClipboard: vi.fn().mockRejectedValue(new Error('nope'))
     }
 
@@ -54,6 +58,10 @@ describe('createPluginContext.os', () => {
       await expect(ctx.os.openExternal('https://example.com')).resolves.toBe(true)
       expect(bridge.openExternal).toHaveBeenCalledWith('https://example.com')
       await expect(ctx.os.revealPath('/tmp')).resolves.toBe(true)
+      const pickerOptions = { defaultPath: 'C:\\Projects\\demo', directories: false, multiple: true }
+      await expect(ctx.os.selectPaths(pickerOptions)).resolves.toEqual(['C:\\Projects\\demo\\source.docx'])
+      expect(bridge.selectPaths).toHaveBeenCalledWith(pickerOptions)
+      await expect(ctx.os.selectPaths(pickerOptions)).rejects.toThrow('native dialog failed')
       await expect(ctx.os.writeClipboard('hi')).resolves.toBe(false)
     } finally {
       delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
