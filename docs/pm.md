@@ -1,8 +1,13 @@
 # Project management: plans, gates, and what approval actually guarantees
 
-Hermes' PM workflow puts two human gates in the middle of an otherwise
-autonomous board. This page is about what those gates are for, and — more
-importantly — what they are not.
+Hermes' PM workflow puts a human plan gate in the middle of an otherwise
+autonomous board. This page is about what that gate is — and, more importantly,
+what it is not.
+
+Every factual claim below is checked against the code by
+`tests/hermes_cli/test_assurance_statement.py` and
+`tests/agent/test_pm_plan_gate_guidance.py`. Where a thing is not built, this
+page says so rather than describing the plan for it.
 
 ## The assurance statement
 
@@ -30,41 +35,93 @@ importantly — what they are not.
 > separate OS identities, an external approval service the agent cannot reach,
 > or hardware-backed confirmation. None of these is in Phase 1.
 
-This text is canonical. It is reproduced in
-`hermes_cli/approval_broker.py`, the `pm_approvals` schema comment, this page,
-and `tests/hermes_cli/test_approval_broker.py`, and
-`tests/hermes_cli/test_assurance_statement.py` fails if any copy drifts.
+This text is canonical. `approval_broker.ASSURANCE_STATEMENT` is the source,
+and `approval_broker.ASSURANCE_LOCATIONS` lists where it is reproduced and
+which acceptance locations are still deferred.
 
-## The two gates
+## How a plan gate is represented
 
-| Gate | Status | Who crosses it |
-|---|---|---|
-| 1 | `awaiting_approval` | a human, through an authenticated surface |
-| 2 | `ready_to_deploy` | a human, at strength `strong` or above |
+A gated task is parked in the **existing** `scheduled` status — already
+non-dispatchable — with `tasks.gate_state` set:
 
-Both are **dispatcher-inert**: no `task_runs` row is ever created for a task in
-a gate status, because `SPAWNABLE_STATUSES` is derived
-(`VALID_STATUSES − GATE − TERMINAL`) rather than listed, so a status added later
-cannot be forgotten into spawnability.
+```text
+status     = 'scheduled'
+gate_state = 'plan'
+```
 
-Gate events are **passive notifications**. They are excluded from `_WAKE_KINDS`
-by derivation, so a gate can never wake an agent toward the gate it is
-forbidden to cross.
+No new task status was added. `VALID_STATUSES` is unchanged
+(`triage, todo, scheduled, ready, running, blocked, review, done, archived`),
+so every literal status guard in the dispatcher behaves exactly as it did
+before. A `scheduled` task with `gate_state IS NULL` is an ordinary time-parked
+task and is untouched by any of this.
+
+`VALID_GATE_STATES` declares `{"plan", "deploy"}`, but **only `plan` has a
+writer**. There is no deploy gate: nothing parks a task at one, and nothing
+releases one. The constant reserves the name.
+
+## What being gated does
+
+For any actor following the sanctioned path:
+
+- the task is not dispatched and not auto-promoted;
+- it does not satisfy its children's dependencies;
+- an approval cannot be replayed, re-targeted to another project or revision,
+  or applied to a plan whose text changed after it was read — the binding is
+  CAS on `(project_id, revision)` plus `UNIQUE(subject, binding_hash)`;
+- every release and every refusal is audited in the same transaction as the
+  state change, so the ledger and the state cannot disagree;
+- gate notifications are passive. `WAKE_KINDS` is *derived* as
+  `TERMINAL_KINDS − NEVER_WAKE_KINDS`, and the plan-gate kinds are in
+  `NEVER_WAKE_KINDS`, so a gate can never wake an agent toward the gate it is
+  forbidden to cross.
+
+## What being gated does not do
+
+**No approval surface ships.** `resolve_plan_approval_adapter()` returns
+`None`, there is deliberately no configuration key that names an adapter, and
+`for_plan_decision()` raises `NoApprovalSurfaceError` on every call before
+doing anything else. The CLI displays the authoritative plan and refuses to
+decide. `release_plan_gate` is the only way out of `gate_state='plan'`, and it
+requires an `Attestation` that nothing shipped can mint.
+
+`issue_attestation_for_adapter()` is a constructor, not an authentication
+boundary. It authenticates nothing; calling it asserts that the caller has
+already established human presence somewhere else.
+
+**Same-user processes remain outside the boundary.** Same-user Python can call
+the issuer directly or monkeypatch the adapter seam, and both produce an
+attestation `release_plan_gate` accepts. More fundamentally,
+`UPDATE tasks SET gate_state = NULL` needs no Hermes code at all. No
+application-level change closes that, and none is attempted.
+
+So: **cooperative workflow integrity, not a security boundary.** A real
+boundary needs authoritative state and authentication outside the
+agent-writable trust domain — a separately authenticated remote service, or a
+separate OS identity owning the database. Neither is started. See
+`planning/M3B-ARCHITECTURE-RECONCILIATION.md`, which supersedes the
+architecture section of the master specification on exactly this point.
+
+## Authoring a plan
+
+`project_ensure` and `plan_submit` are orchestrator-scoped tools: available to
+a profile with the `kanban` toolset that is **not** scoped to a single task.
+A dispatcher-spawned worker does not get them, and a delegated child is refused
+twice — by the `check_fn` and again at the handler.
+
+Drafting is not approving. Neither tool changes a task status, clears
+`gate_state`, or writes `pm_approvals`. Submitting again supersedes the
+previous revision, which is why re-submitting to force a decision only creates
+more for a human to read.
+
+Orchestrator profiles also receive `PM_PLAN_GATE_GUIDANCE` in their system
+prompt, saying the same things this page says. Ordinary kanban workers do not:
+they are never spawned on a parked task, so they never meet a gate, and their
+prompt is unchanged.
 
 ## Phases
 
-A card under the `pm-v1` workflow template carries a phase in
-`current_step_key`: `planning`, `research`, `building`, `qa`, `deploy`. A worker
-finishes its own phase and hands off; it does not carry a card across a phase
-boundary it was not assigned.
-
-## There is no local approval authority
-
-`approval_broker.for_plan_decision` fails closed. Nothing in this slice can
-mint an approval locally — not the CLI, not a tool, not a worker, not cron.
-An earlier revision confirmed human presence by reading a fixed phrase from
-`/dev/tty`; that design was defeated twice and withdrawn, and the reasoning is
-recorded in the module docstring. A future authenticated adapter mints an
-`Attestation` through `issue_attestation_for_adapter`, and the consuming
-machinery — subject, binding hash over the exact plan bytes, single-use nonce,
-TTL, and the one-transaction release — accepts it unchanged.
+`tasks.workflow_template_id` and `tasks.current_step_key` exist as columns and
+can be filtered on, but **nothing writes them**. There is no workflow engine,
+no phase transitions, and no `pm-v1` template in the codebase. Cards do not
+carry phases today. Any description of a five-phase lifecycle is a plan, not a
+feature.

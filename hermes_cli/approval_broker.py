@@ -51,8 +51,8 @@ binding, the single-use nonce, the TTL, and the atomic transaction in
 machinery accepts it unchanged. None of it had to be rebuilt, because none of it
 was what failed — the *surface* was.
 
-ASSURANCE STATEMENT (canonical — reproduced verbatim in six locations)
-----------------------------------------------------------------------
+ASSURANCE STATEMENT (canonical — see ASSURANCE_LOCATIONS for where it lives)
+---------------------------------------------------------------------------
 Hermes approval gates are an integrity control, not a security boundary
 against arbitrary code execution as your own user account.
 
@@ -96,12 +96,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-# The canonical assurance statement. Every other location reproduces these
+# The canonical assurance statement. Each implemented location reproduces these
 # words; the medium sets the wrapping and the comment or quote prefix, and
 # `test_assurance_statement.py` compares them word-for-word after normalising
-# both away. Editing the words here without editing the other five locations
-# fails that test — which is the point: one claim about what Hermes guarantees,
-# not six that drift apart.
+# both away. Editing the words here without editing the others fails that test
+# — which is the point: one claim about what Hermes guarantees, not several
+# that drift apart.
 ASSURANCE_STATEMENT = """\
 Hermes approval gates are an integrity control, not a security boundary
 against arbitrary code execution as your own user account.
@@ -128,6 +128,26 @@ separate OS identities, an external approval service the agent cannot reach,
 or hardware-backed confirmation. None of these is in Phase 1.
 """
 
+
+# Where the statement lives. The specification names six acceptance locations;
+# four exist. The other two are surfaces that have not been built, and they are
+# listed here as deferred rather than quietly dropped — the count is part of
+# the claim, so an inflated one is its own small untruth.
+ASSURANCE_LOCATIONS = {
+    "implemented": (
+        "hermes_cli/approval_broker.py — this module's docstring",
+        "hermes_cli/kanban_db.py — the pm_approvals schema comment",
+        "docs/pm.md",
+        "tests/hermes_cli/test_approval_broker.py — its docstring",
+    ),
+    # Not delivered by commit 12. `test_assurance_statement.py` fails if either
+    # surface appears without the statement; an absence test is a reminder, not
+    # a delivered location.
+    "deferred": (
+        "the desktop approval dialog — no approval UI exists (milestone 4/7)",
+        "the `hermes project doctor` header — `doctor` was deferred from commit 9",
+    ),
+}
 
 # Attestations expire quickly: the window between a human reading a plan and
 # confirming it is seconds, and a long-lived object is a replay target.

@@ -252,6 +252,47 @@ SKILLS_GUIDANCE = (
     "4. **DEDUP** — After reloading a pruned skill, **ignore any remaining `[SKILL_PRUNED]` markers for that same skill** — they are historical artifacts from previous compactions and do not need further action."
 )
 
+# Plan-gate guidance for the ORCHESTRATOR surface only.
+#
+# Kept out of KANBAN_GUIDANCE deliberately. That block reaches every profile
+# with `kanban_show`, which is every dispatcher-spawned worker on every board,
+# and most boards have no plans at all. A worker is also never spawned on a
+# parked task, so it never meets a gate. The party that can author a plan — and
+# therefore the only one that meets the gate through the sanctioned path — is
+# the orchestrator, and `plan_submit` is exactly the tool it has and a worker
+# does not.
+#
+# The predicate is static per process (`_check_kanban_orchestrator_mode`:
+# profile toolset + environment, never board or card state), so the prompt stays
+# byte-identical no matter what happens to the board underneath it.
+#
+# Every claim here is checked against the code in
+# `tests/agent/test_pm_plan_gate_guidance.py`. It describes the plan gate as it
+# is actually built — cooperative workflow integrity with no approval surface —
+# not as MASTER-SPECIFICATION.md §4.2 imagined it. See
+# planning/M3B-ARCHITECTURE-RECONCILIATION.md, which supersedes that section.
+PM_PLAN_GATE_GUIDANCE = (
+    "# Plan gates\n"
+    "If this board uses plans, a task can be parked at a human plan gate: its "
+    "status stays `scheduled` and its `gate_state` becomes `plan`. A parked "
+    "task is inert — it is not dispatched, not auto-promoted, and does not "
+    "satisfy its children's dependencies — and gate notifications are passive, "
+    "so they never wake you.\n"
+    "\n"
+    "**No approval surface ships.** There is no tool, CLI command, or profile "
+    "that can release a plan gate today; the local path fails closed on every "
+    "call. Drafting is not approving: `project_ensure` and `plan_submit` write "
+    "the plan a human will read, and touch no task, status, or gate. Submit "
+    "the plan and move on to work that is not blocked — do not poll, do not "
+    "resubmit to force a decision (each submission is a new revision to read), "
+    "and do not ask another agent to approve. The absence of an approval tool "
+    "is the design, not a gap to route around.\n"
+    "\n"
+    "This is workflow integrity between cooperating processes, not a security "
+    "boundary: it holds for anyone following the sanctioned path.\n"
+)
+
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
@@ -326,22 +367,6 @@ KANBAN_GUIDANCE = (
     "question: if two tasks would each pick one, decide it yourself and write "
     "the decision into BOTH card bodies. Every child card body must carry the "
     "decisions it depends on, because workers cannot see sibling context.\n"
-    "\n"
-    "## Plan gates and phases\n"
-    "\n"
-    "A board running the `pm-v1` workflow has two human gates: "
-    "`awaiting_approval` (the plan) and `ready_to_deploy` (the deploy). "
-    "**You will never be spawned on a gated card** — no run is created for "
-    "one — and **you cannot approve**: no tool, CLI, or peer profile can "
-    "cross a gate, by design. Do not try to, do not ask another agent to, "
-    "and do not treat the absence of an approval tool as a bug to route "
-    "around. Gate notices are passive: they never wake you.\n"
-    "\n"
-    "Your card carries a phase (`planning`, `research`, `building`, `qa`, "
-    "`deploy`). Finish your own phase and hand off; do not carry a card "
-    "across a phase you were not assigned. If you are a planner, submit "
-    "the plan and stop — a human decides next, so polling or resubmitting "
-    "only creates a new revision to review.\n"
     "\n"
     "## Reference details that change outcomes\n"
     "\n"

@@ -1632,9 +1632,16 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.prompt_builder import KANBAN_GUIDANCE, PM_PLAN_GATE_GUIDANCE
     agent._kanban_worker_guidance = (
         KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    )
+    # Plan-gate guidance is orchestrator-scoped. `plan_submit` is present iff
+    # `_check_kanban_orchestrator_mode` passed — profile toolset plus
+    # environment, resolved once here and never from board state — so this is
+    # session-static for the same reason the block above is.
+    agent._pm_plan_gate_guidance = (
+        PM_PLAN_GATE_GUIDANCE if "plan_submit" in agent.valid_tool_names else ""
     )
 
     # Check tool requirements

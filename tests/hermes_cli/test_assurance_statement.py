@@ -7,15 +7,20 @@ wrapping and prefix. It means word-for-word, and that is what these tests
 enforce: normalise the prefixes and the whitespace away, then require an exact
 match against ``approval_broker.ASSURANCE_STATEMENT``.
 
-Two of the six locations do not exist yet — there is no desktop approval dialog
-and no ``hermes project doctor``. Rather than quietly dropping them, the tests
-below pin their absence, so the day either surface is built this file fails and
-whoever builds it has to carry the statement along.
+Four of the specification's six acceptance locations exist. The other two are
+surfaces that have not been built — there is no desktop approval dialog and no
+``hermes project doctor``. ``approval_broker.ASSURANCE_LOCATIONS`` is the
+manifest of both sets, and the tests below drive off it rather than a list
+repeated here. An absence test is a reminder, not a delivered location, and is
+labelled as such.
+
+The deferred surfaces are pinned by what is actually true — no approval adapter
+resolves, and the ``project`` parser has no ``doctor`` verb — rather than by
+grepping the desktop tree, where passive gate wording would look the same as an
+approval dialog.
 """
 
 import re
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -113,23 +118,47 @@ def test_the_schema_comment_does_not_change_what_sqlite_stores(tmp_path, monkeyp
     assert "subject" in cols and "binding_hash" in cols
 
 
-# --- the two locations that do not exist yet -------------------------------
+# --- the manifest is the truth about coverage ------------------------------
 
-def test_there_is_still_no_desktop_approval_dialog():
-    """When one is built, it must carry the statement — see this file."""
-    desktop = REPO / "apps" / "desktop"
-    if not desktop.is_dir():
-        pytest.skip("no desktop app in this checkout")
-    hits = subprocess.run(
-        ["grep", "-rl", "awaiting_approval", str(desktop)],
-        capture_output=True, text=True).stdout.split()
-    assert not hits, (
-        "a desktop approval surface now exists — add the assurance statement "
-        f"to it and to this test: {hits}")
+def test_the_manifest_matches_what_is_actually_carried():
+    from hermes_cli.approval_broker import ASSURANCE_LOCATIONS
+
+    assert len(ASSURANCE_LOCATIONS["implemented"]) == 4
+    assert len(ASSURANCE_LOCATIONS["deferred"]) == 2
+    for entry in ASSURANCE_LOCATIONS["implemented"]:
+        path = entry.split(" — ")[0].strip()
+        assert (REPO / path).exists(), f"manifest names a missing file: {path}"
+
+
+def test_the_module_does_not_claim_more_locations_than_it_has():
+    import hermes_cli.approval_broker as broker
+
+    for inflated in ("six locations", "the other five", "all six"):
+        assert inflated not in broker.__doc__, inflated
+    src = (REPO / "hermes_cli" / "approval_broker.py").read_text()
+    assert "the other five locations" not in src
+
+
+# --- the two deferred locations, pinned by what is true --------------------
+
+def test_no_approval_surface_ships_so_there_is_no_desktop_dialog():
+    """The desktop dialog's absence is a fact about adapters, not about text.
+
+    A grep for gate wording under `apps/desktop` would also match the passive
+    gate display, which is not an approval surface. This is the real check.
+    """
+    from hermes_cli import approval_broker as ab
+
+    assert ab.resolve_plan_approval_adapter() is None, (
+        "an approval adapter now resolves — if a desktop dialog was built, it "
+        "owes the assurance statement; add it and update ASSURANCE_LOCATIONS")
+    with pytest.raises(ab.NoApprovalSurfaceError):
+        ab.for_plan_decision(
+            project_id="p", revision=1, plan_body="b", decision="approved")
 
 
 def test_there_is_still_no_project_doctor_verb():
-    """`doctor` was deferred from commit 9; its header is location six."""
+    """`doctor` was deferred from commit 9; its header is a deferred location."""
     import argparse
 
     from hermes_cli import projects_cmd
@@ -145,5 +174,6 @@ def test_there_is_still_no_project_doctor_verb():
                 verbs |= set(sub.choices)
     assert verbs, "the project verb list must be discoverable"
     assert "doctor" not in verbs, (
-        "`hermes project doctor` now exists — its header is the sixth "
-        f"assurance location, and this test is the reminder: {sorted(verbs)}")
+        "`hermes project doctor` now exists — its header is a deferred "
+        f"assurance location; carry the statement and move it in the "
+        f"manifest: {sorted(verbs)}")
