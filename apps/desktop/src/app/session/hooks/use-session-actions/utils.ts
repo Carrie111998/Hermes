@@ -1390,7 +1390,7 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
 
 export async function resolveStoredSession(
   storedSessionId: string,
-  ownerRoute?: SessionProfileRoute
+  ownerScope?: SessionOwnerScope
 ): Promise<SessionInfo | undefined> {
   const projectSessions = $projectTree
     .get()
@@ -1411,16 +1411,40 @@ export async function resolveStoredSession(
 
   const cached = cachedCandidates.find(session => session.profile?.trim()) ?? cachedCandidates[0]
 
-  if (ownerRoute) {
+  if (typeof ownerScope === 'string') {
+    const profile = normalizeProfileKey(ownerScope)
+
+    const ownedCached = cachedCandidates.find(
+      session => session.profile && normalizeProfileKey(session.profile) === profile
+    )
+
+    if (ownedCached) {
+      return ownedCached
+    }
+
+    try {
+      const session = await getSession(storedSessionId, profile)
+      session.profile = profile
+      upsertResolvedSession(session, storedSessionId)
+
+      return session
+    } catch {
+      // An explicit profile is fail-closed. Returning metadata from another
+      // profile would preserve routing but leak that session's cwd/parent id.
+      return undefined
+    }
+  }
+
+  if (ownerScope) {
     const scope = {
-      connectionId: ownerRoute.connectionId,
-      profile: ownerRoute.targetProfile || ownerRoute.profile
+      connectionId: ownerScope.connectionId,
+      profile: ownerScope.targetProfile || ownerScope.profile
     }
 
     const cachedOwnerMatches =
       cached &&
-      cached.connection_id === ownerRoute.connectionId &&
-      (!cached.profile || normalizeProfileKey(cached.profile) === normalizeProfileKey(ownerRoute.profile))
+      cached.connection_id === ownerScope.connectionId &&
+      (!cached.profile || normalizeProfileKey(cached.profile) === normalizeProfileKey(ownerScope.profile))
 
     if (cached && cachedOwnerMatches) {
       return cached
@@ -1428,8 +1452,8 @@ export async function resolveStoredSession(
 
     try {
       const session = await getSession(storedSessionId, scope)
-      session.profile = normalizeProfileKey(ownerRoute.profile)
-      session.connection_id = ownerRoute.connectionId
+      session.profile = normalizeProfileKey(ownerScope.profile)
+      session.connection_id = ownerScope.connectionId
       upsertResolvedSession(session, storedSessionId)
 
       return session

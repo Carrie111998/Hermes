@@ -2148,11 +2148,16 @@ export function useSessionActions({
       // miss: resolve it (cache → active backend → cross-profile) so the branch
       // is created on the parent's OWNING profile, not whichever is live (#67603).
       const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      const explicitProfile = sessionProfile?.trim() || undefined
 
       const stored =
-        cached?.profile?.trim() ? cached : ((await resolveStoredSession(storedSessionId)) ?? cached)
+        explicitProfile !== undefined
+          ? await resolveStoredSession(storedSessionId, explicitProfile)
+          : cached?.profile?.trim()
+            ? cached
+            : ((await resolveStoredSession(storedSessionId)) ?? cached)
 
-      const profile = sessionProfile ?? stored?.profile
+      const profile = explicitProfile ?? stored?.profile
 
       try {
         await ensureGatewayProfile(profile)

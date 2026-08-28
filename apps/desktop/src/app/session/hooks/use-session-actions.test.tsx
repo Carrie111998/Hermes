@@ -2039,6 +2039,64 @@ describe('branchStoredSession desktop source tagging', () => {
     expect(createParams).toMatchObject({ parent_session_id: 'stored-parent', profile: 'work' })
   })
 
+  it('uses metadata from the explicitly forwarded owner when two profiles share a session id', async () => {
+    setSessions([
+      storedSession({
+        cwd: '/repo/default-worktree',
+        id: 'stored-parent',
+        message_count: 1,
+        profile: 'default'
+      })
+    ])
+    $projectTree.set([
+      {
+        id: 'p_work',
+        label: 'Work',
+        path: '/repo/work-worktree',
+        previewSessions: [
+          storedSession({
+            cwd: '/repo/work-worktree',
+            id: 'stored-parent',
+            message_count: 1,
+            profile: 'work'
+          })
+        ],
+        repos: [],
+        sessionCount: 1
+      } as never
+    ])
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession: ((storedSessionId: string, profile?: string) => Promise<boolean>) | null = null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent', 'work')).resolves.toBe(true)
+
+    expect(getAllSessionMessages).toHaveBeenCalledWith('stored-parent', 'work')
+    expect(createParams).toMatchObject({
+      cwd: '/repo/work-worktree',
+      parent_session_id: 'stored-parent',
+      profile: 'work'
+    })
+  })
+
   it('omits profile for a profile-less parent so single-profile users are unchanged', async () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
     vi.mocked(getAllSessionMessages).mockResolvedValue({
