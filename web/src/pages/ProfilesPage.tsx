@@ -27,6 +27,7 @@ import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { api } from "@/lib/api";
 import type { ActiveProfileInfo, ProfileInfo } from "@/lib/api";
 import { copyTextToClipboard } from "@/lib/clipboard";
+import { describeProfileModelSave } from "@/lib/profileModelScope";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
@@ -301,8 +302,15 @@ export default function ProfilesPage() {
       modelLoading: p.modelLoading ?? "Loading models…",
       modelNone:
         p.modelNone ?? "No authenticated providers — set a key first",
-      editModel: p.editModel ?? "Change model",
-      modelSaved: p.modelSaved ?? "Model updated",
+      editModel: p.editModel ?? "Change default model",
+      modelSaved: p.modelSaved ?? "Default model updated for new sessions",
+      modelExistingSessions:
+        p.modelExistingSessions ??
+        "Existing sessions keep their current model and any /model override.",
+      modelScopeUnconfirmed:
+        p.modelScopeUnconfirmed ??
+        "Default model saved; affected session scope unconfirmed",
+      modelDefaultLabel: p.modelDefaultLabel ?? "Default model",
       modelSelect: p.modelSelect ?? "Select a model",
       actions: p.actions ?? "Actions",
       manageSkills: p.manageSkills ?? "Manage skills & tools",
@@ -669,8 +677,19 @@ export default function ProfilesPage() {
     if (!picked) return;
     setModelSaving(true);
     try {
-      await api.setProfileModel(name, picked.provider, picked.model);
-      showToast(`${L.modelSaved}: ${picked.model}`, "success");
+      const result = await api.setProfileModel(
+        name,
+        picked.provider,
+        picked.model,
+      );
+      showToast(
+        describeProfileModelSave(picked.model, result, {
+          savedForNewSessions: L.modelSaved,
+          existingSessionsUnchanged: L.modelExistingSessions,
+          scopeUnconfirmed: L.modelScopeUnconfirmed,
+        }),
+        "success",
+      );
       setProfiles((prev) =>
         prev.map((p) =>
           p.name === name
@@ -1207,7 +1226,7 @@ export default function ProfilesPage() {
                       <div className="mt-auto flex flex-col gap-0.5 pt-1 text-xs text-muted-foreground">
                         {p.model && (
                           <span className="truncate">
-                            {t.profiles.model}: {p.model}
+                            {L.modelDefaultLabel}: {p.model}
                             {p.provider ? ` (${p.provider})` : ""}
                           </span>
                         )}
@@ -1295,6 +1314,10 @@ export default function ProfilesPage() {
                         </SelectOption>
                       ))}
                     </Select>
+
+                    <p className="text-xs text-muted-foreground">
+                      {L.modelExistingSessions}
+                    </p>
 
                     <div className="flex justify-end">
                       <Button

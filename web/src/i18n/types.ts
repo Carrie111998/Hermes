@@ -429,6 +429,9 @@ export interface Translations {
     modelNone?: string;
     editModel?: string;
     modelSaved?: string;
+    modelExistingSessions?: string;
+    modelScopeUnconfirmed?: string;
+    modelDefaultLabel?: string;
     modelSelect?: string;
     actions?: string;
     manageSkills?: string;
