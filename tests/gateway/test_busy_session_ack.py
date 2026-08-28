@@ -190,7 +190,7 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
-    async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch):
+    async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch, caplog):
         """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
         import gateway.run as _gr
 
@@ -206,9 +206,13 @@ class TestBusySessionAck:
 
         agent = MagicMock()
         agent.steer = MagicMock(return_value=True)
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 7}
         runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 30
 
-        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+        with caplog.at_level("INFO", logger="gateway.run"), patch(
+            "gateway.run.merge_pending_message_event"
+        ) as mock_merge:
             await runner._handle_active_session_busy_message(event, sk)
 
         # VERIFY: Agent was steered, NOT interrupted
@@ -224,6 +228,11 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Steered" in content or "steer" in content.lower()
         assert "Interrupting" not in content
+        assert any(
+            "Busy-path absorbed inbound message" in record.getMessage()
+            and "agent_idle=7s" in record.getMessage()
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):

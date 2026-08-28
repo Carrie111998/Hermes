@@ -10499,6 +10499,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
 
+        # This path otherwise has no inbound-message log. Record enough agent
+        # activity state to distinguish a genuinely busy turn from a leaked
+        # session slot silently absorbing every follow-up.
+        busy_started = self._running_agents_ts.get(session_key, 0)
+        busy_age = (time.time() - busy_started) if busy_started else -1.0
+        busy_idle = -1.0
+        if running_agent is not None and hasattr(running_agent, "get_activity_summary"):
+            try:
+                busy_idle = float(
+                    running_agent.get_activity_summary().get("seconds_since_activity", -1)
+                )
+            except Exception:
+                pass
+        logger.info(
+            "Busy-path absorbed inbound message for session %s "
+            "(mode=%s steered=%s redirected=%s agent_age=%.0fs agent_idle=%.0fs)",
+            session_key,
+            effective_mode,
+            steered,
+            redirected,
+            busy_age,
+            busy_idle,
+        )
+
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
