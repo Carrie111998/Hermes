@@ -88,6 +88,61 @@ def _normalize_multiplex_profile_allowlist(value: Any) -> Optional[List[str]]:
     return normalized
 
 
+def _normalize_profile_turn_allowlist(value: Any) -> List[str]:
+    """Normalize the opt-in set of profiles eligible for one routed turn.
+
+    Unlike ``multiplex_profile_allowlist``, this mode has no serve-all form:
+    an absent or malformed value is an empty list, so no inbound source can
+    enter a named profile runtime accidentally.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        logger.warning(
+            "Invalid gateway.profile_turn_allowlist (expected a list, got %s); "
+            "disabling profile-turn routing",
+            type(value).__name__,
+        )
+        return []
+
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    normalized: List[str] = []
+    seen = set()
+    for entry in value:
+        if not isinstance(entry, str):
+            logger.warning(
+                "Skipping invalid gateway.profile_turn_allowlist entry %r "
+                "(expected a profile name)",
+                entry,
+            )
+            continue
+        try:
+            name = normalize_profile_name(entry)
+            validate_profile_name(name)
+        except ValueError:
+            logger.warning(
+                "Skipping invalid gateway.profile_turn_allowlist entry %r",
+                entry,
+            )
+            continue
+        # ``default`` maps to the legacy ``agent:main`` namespace. Allowing it
+        # here would instead manufacture ``agent:default`` for a route that
+        # does not need a named runtime at all.
+        if name == "default":
+            logger.warning(
+                "Skipping gateway.profile_turn_allowlist entry %r: "
+                "the default profile is not a named profile turn",
+                entry,
+            )
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently
@@ -982,6 +1037,12 @@ class GatewayConfig:
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
 
+    # Explicit profile targets permitted for a single inbound profile turn.
+    # Empty by default: unlike multiplexing, this does not create adapters,
+    # listeners, API prefixes, or schedulers; it only authorizes a stamped
+    # source to enter that profile's runtime scope for one message turn.
+    profile_turn_allowlist: List[str] = field(default_factory=list)
+
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
@@ -1032,6 +1093,9 @@ class GatewayConfig:
     def __post_init__(self) -> None:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
+        )
+        self.profile_turn_allowlist = _normalize_profile_turn_allowlist(
+            self.profile_turn_allowlist
         )
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1148,6 +1212,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
+            "profile_turn_allowlist": self.profile_turn_allowlist,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
@@ -1222,6 +1287,10 @@ class GatewayConfig:
             multiplex_profile_allowlist = nested_gateway.get(
                 "multiplex_profile_allowlist"
             )
+        if "profile_turn_allowlist" in data:
+            profile_turn_allowlist = data.get("profile_turn_allowlist")
+        else:
+            profile_turn_allowlist = nested_gateway.get("profile_turn_allowlist")
         if "systemd_watchdog_seconds" in data:
             systemd_watchdog_raw = data.get("systemd_watchdog_seconds")
             systemd_watchdog_key = "systemd_watchdog_seconds"
@@ -1328,6 +1397,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             multiplex_profile_allowlist=multiplex_profile_allowlist,
+            profile_turn_allowlist=profile_turn_allowlist,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             loop_watchdog_probe_interval_s=loop_watchdog_probe_interval_s,
@@ -1484,6 +1554,18 @@ def load_gateway_config() -> GatewayConfig:
             ):
                 gw_data["multiplex_profile_allowlist"] = gateway_section[
                     "multiplex_profile_allowlist"
+                ]
+
+            if "profile_turn_allowlist" in yaml_cfg:
+                gw_data["profile_turn_allowlist"] = yaml_cfg[
+                    "profile_turn_allowlist"
+                ]
+            elif (
+                isinstance(gateway_section, dict)
+                and "profile_turn_allowlist" in gateway_section
+            ):
+                gw_data["profile_turn_allowlist"] = gateway_section[
+                    "profile_turn_allowlist"
                 ]
 
             # Profile-based routing rules: accept either top-level

@@ -56,6 +56,13 @@ def is_multiplex_active() -> bool:
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
+# A profile turn on an otherwise single-profile gateway needs the same
+# credential isolation as a multiplexed turn, without changing the process
+# deployment mode. This remains task-local so ordinary gateway work keeps its
+# legacy environment fallback.
+_SECRET_SCOPE_STRICT: ContextVar[bool] = ContextVar(
+    "_SECRET_SCOPE_STRICT", default=False
+)
 
 
 class UnscopedSecretError(RuntimeError):
@@ -80,6 +87,16 @@ def set_secret_scope(secrets: Optional[Mapping[str, str]]) -> Token:
 def reset_secret_scope(token: Token) -> None:
     """Restore the previous secret scope."""
     _SECRET_SCOPE.reset(token)
+
+
+def set_secret_scope_strict(strict: bool) -> Token:
+    """Require scoped credential misses to fail closed for this context only."""
+    return _SECRET_SCOPE_STRICT.set(bool(strict))
+
+
+def reset_secret_scope_strict(token: Token) -> None:
+    """Restore the previous context-local strict-scope setting."""
+    _SECRET_SCOPE_STRICT.reset(token)
 
 
 def current_secret_scope() -> Optional[Mapping[str, str]]:
@@ -178,7 +195,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
+        if _MULTIPLEX_ACTIVE or _SECRET_SCOPE_STRICT.get():
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.

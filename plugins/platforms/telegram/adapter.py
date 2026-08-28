@@ -23,6 +23,126 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+
+_PROFILE_MENTION_HANDLE_RE = re.compile(
+    r"^\s*@([A-Za-z][A-Za-z0-9_]{0,31})(?![A-Za-z0-9_])"
+)
+_PROFILE_MENTION_HANDLE_ANY_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])@([A-Za-z][A-Za-z0-9_]{0,31})(?![A-Za-z0-9_])"
+)
+_PROFILE_MENTION_HANDLE_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}\Z")
+_PROFILE_MENTION_LEADING_GUIDANCE = (
+    "Use a leading profile handle, for example: @glm your request."
+)
+_PROFILE_MENTION_TEXT_ONLY_GUIDANCE = (
+    "Profile routing is text-only. Send @glm followed by your request as text."
+)
+_PROFILE_MENTION_UNAVAILABLE_GUIDANCE = "That profile route is unavailable right now."
+
+
+def _normalize_profile_mention_handle(value: object) -> Optional[str]:
+    """Return a canonical configured Telegram handle, or ``None`` if invalid."""
+    if not isinstance(value, str):
+        return None
+    handle = value.strip()
+    if handle.startswith("@"):
+        handle = handle[1:]
+    if not _PROFILE_MENTION_HANDLE_NAME_RE.fullmatch(handle):
+        return None
+    return handle.casefold()
+
+
+def find_profile_mention_alias(
+    text: object,
+    routes: object,
+) -> tuple[Optional[str], bool]:
+    """Return a configured ``@handle`` and whether it is leading.
+
+    This recognizes only valid configured handles, normalizing the optional
+    ``@`` in config keys and casing.  A non-leading match is deliberately
+    surfaced to the adapter so it can fail closed instead of letting a broad
+    legacy wake regex dispatch the text to the default profile.
+    """
+    if not isinstance(text, str) or not isinstance(routes, dict) or not routes:
+        return None, False
+
+    configured = {
+        normalized
+        for raw_handle in routes
+        if (normalized := _normalize_profile_mention_handle(raw_handle)) is not None
+    }
+    if not configured:
+        return None, False
+
+    leading = _PROFILE_MENTION_HANDLE_RE.match(text)
+    if leading is not None:
+        alias = leading.group(1).casefold()
+        if alias in configured:
+            return alias, True
+
+    for match in _PROFILE_MENTION_HANDLE_ANY_RE.finditer(text):
+        alias = match.group(1).casefold()
+        if alias in configured:
+            return alias, False
+    return None, False
+
+
+def resolve_profile_mention_route(
+    text: object,
+    routes: object,
+    eligible_profiles: object,
+) -> tuple[Optional[str], bool]:
+    """Resolve a leading Telegram handle to an eligible profile-turn target.
+
+    Returns ``(target, matched)``. ``matched`` with a ``None`` target is an
+    explicit invalid, unserved, or ambiguous route and must be rejected by the
+    caller rather than falling through to the default profile.
+    """
+    if not isinstance(text, str) or not isinstance(routes, dict) or not routes:
+        return None, False
+
+    match = _PROFILE_MENTION_HANDLE_RE.match(text)
+    if match is None:
+        return None, False
+    requested_handle = match.group(1).casefold()
+    matching_targets = [
+        target
+        for raw_handle, target in routes.items()
+        if _normalize_profile_mention_handle(raw_handle) == requested_handle
+    ]
+    if not matching_targets:
+        return None, False
+    if len(matching_targets) != 1:
+        return None, True
+
+    try:
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        target = matching_targets[0]
+        if not isinstance(target, str):
+            return None, True
+        target = normalize_profile_name(target)
+        validate_profile_name(target)
+        if target == "default":
+            return None, True
+
+        served = set()
+        for candidate in eligible_profiles:
+            if not isinstance(candidate, str):
+                continue
+            candidate = normalize_profile_name(candidate)
+            validate_profile_name(candidate)
+            if candidate == "default":
+                continue
+            served.add(candidate)
+    except (TypeError, ValueError):
+        return None, True
+
+    if target not in served:
+        return None, True
+    return target, True
+
+
 from agent.deadline import run_bounded_async
 
 
@@ -8689,6 +8809,217 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
 
+    def _profile_mention_routes_for_primary_group(
+        self, message: Message
+    ) -> Optional[dict]:
+        """Return configured aliases only on the default primary group adapter."""
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        routes = extra.get("profile_mention_routes") if isinstance(extra, dict) else None
+        if not isinstance(routes, dict) or not routes or not self._is_group_chat(message):
+            return None
+
+        owner_profile = getattr(self, "_owner_profile", None)
+        if (
+            isinstance(owner_profile, str)
+            and owner_profile.strip()
+            and owner_profile.strip().casefold() != "default"
+        ):
+            return None
+
+        # A named profile's own gateway is a separate primary process, not the
+        # default transport that owns this opt-in turn router. Leave its group
+        # messages on its historical path (the live fleet may run both).
+        try:
+            from hermes_constants import get_default_hermes_root, get_process_hermes_home
+
+            if get_process_hermes_home().resolve() != get_default_hermes_root().resolve():
+                return None
+        except Exception:
+            # Failure to establish default-profile ownership must not create a
+            # new route on an otherwise independent gateway.
+            return None
+        return routes
+
+    def _profile_mention_alias_reference(
+        self, message: Message, text: object
+    ) -> tuple[Optional[str], bool]:
+        """Return a configured primary-adapter alias and whether it is leading."""
+        routes = self._profile_mention_routes_for_primary_group(message)
+        if routes is None:
+            return None, False
+        return find_profile_mention_alias(text, routes)
+
+    def _profile_mention_refusal_is_permitted(self, message: Message) -> bool:
+        """Apply the pre-dispatch gates before emitting an alias refusal.
+
+        Alias misuse must never acquire a chat/topic/guest bypass merely because
+        it receives a short adapter-level reply instead of an agent turn.
+        """
+        if (
+            self._profile_mention_routes_for_primary_group(message) is None
+            or self._is_own_message(message)
+        ):
+            return False
+
+        thread_id = self._effective_message_thread_id(message)
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = (
+                str(thread_id)
+                if thread_id is not None
+                else self._GENERAL_TOPIC_THREAD_ID
+            )
+            if topic_id not in allowed_topics:
+                return False
+
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        if (
+            self._telegram_exclusive_bot_mentions()
+            and self._explicit_bot_mentions_exclude_self(message)
+        ):
+            return False
+
+        allowed_chats = self._telegram_allowed_chats()
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        return (
+            not allowed_chats
+            or chat_id in allowed_chats
+            or self._is_guest_mention(message)
+        )
+
+    def _profile_mention_correlation(self, message: Message) -> tuple[object, object, object]:
+        chat = getattr(message, "chat", None)
+        return (
+            getattr(chat, "id", "unknown"),
+            getattr(message, "message_id", "unknown"),
+            self._effective_message_thread_id(message),
+        )
+
+    async def _send_profile_mention_refusal(
+        self,
+        message: Message,
+        *,
+        alias: str,
+        reason: str,
+        text: str,
+    ) -> None:
+        """Reply in the same chat/topic without ever exposing the raw prompt."""
+        chat_id, message_id, thread_id = self._profile_mention_correlation(message)
+        logger.warning(
+            "[%s] Rejected Telegram profile mention route: alias=@%s reason=%s "
+            "chat=%s message=%s thread=%s",
+            getattr(self, "name", "telegram"),
+            alias,
+            reason,
+            chat_id,
+            message_id,
+            thread_id,
+        )
+        reply_kwargs = {}
+        effective_thread_id = self._effective_message_thread_id(message)
+        if effective_thread_id is not None:
+            try:
+                reply_kwargs["message_thread_id"] = int(effective_thread_id)
+            except (TypeError, ValueError):
+                pass
+        try:
+            await message.reply_text(text, **reply_kwargs)
+        except Exception:
+            logger.warning(
+                "[%s] Failed to send Telegram profile mention refusal: "
+                "alias=@%s reason=%s chat=%s message=%s thread=%s",
+                getattr(self, "name", "telegram"),
+                alias,
+                reason,
+                chat_id,
+                message_id,
+                thread_id,
+                exc_info=True,
+            )
+
+    def _apply_profile_mention_route(
+        self,
+        message: Message,
+        event: MessageEvent,
+    ) -> bool:
+        """Stamp a valid leading handle route on a primary Telegram text event.
+
+        Static profile routing has already run while ``event`` was built, so a
+        pre-stamped source (or its fail-closed rejection marker) always wins.
+        This adapter-only route is intentionally after normal Telegram auth and
+        trigger gating, but before batching derives its session key.
+        """
+        source = getattr(event, "source", None)
+        if source is None:
+            return True
+        if getattr(source, "profile_route_rejected", False) is True:
+            return False
+        if getattr(source, "profile", None):
+            return True
+
+        routes = self._profile_mention_routes_for_primary_group(message)
+        if routes is None:
+            return True
+
+        alias, _ = find_profile_mention_alias(event.text, routes)
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        allowlist = getattr(config, "profile_turn_allowlist", None)
+        eligible_profiles = ()
+        resolution_failed = False
+        resolve_targets = getattr(runner, "_profile_turn_target_homes", None)
+        if (
+            isinstance(allowlist, list)
+            and allowlist
+            and not getattr(config, "multiplex_profiles", False)
+            and callable(resolve_targets)
+        ):
+            try:
+                eligible_profiles = resolve_targets()
+            except Exception:
+                resolution_failed = True
+
+        target, matched = resolve_profile_mention_route(
+            event.text,
+            routes,
+            eligible_profiles,
+        )
+        if not matched:
+            return True
+        chat_id, message_id, thread_id = self._profile_mention_correlation(message)
+        if target is None:
+            source.profile_route_rejected = True
+            logger.warning(
+                "[%s] Rejected Telegram profile mention route: alias=@%s reason=%s "
+                "chat=%s message=%s thread=%s",
+                getattr(self, "name", "telegram"),
+                alias or "unknown",
+                "target-resolution-error" if resolution_failed else "unavailable",
+                chat_id,
+                message_id,
+                thread_id,
+            )
+            return False
+        source.profile = target
+        source.profile_turn_routed = True
+        logger.info(
+            "[%s] Accepted Telegram profile mention route: alias=@%s target=%s "
+            "chat=%s message=%s thread=%s",
+            getattr(self, "name", "telegram"),
+            alias or "unknown",
+            target,
+            chat_id,
+            message_id,
+            thread_id,
+        )
+        return True
+
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
@@ -9549,6 +9880,7 @@ class TelegramAdapter(BasePlatformAdapter):
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
+        - a leading configured profile-mention alias is present in group text
 
         When ``allowed_chats`` is non-empty, it remains a hard gate except for
         the narrow ``guest_mode`` bypass: group/supergroup messages that
@@ -9630,7 +9962,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # _message_mentions_bot above — skip the redundant second call.
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
             return True
-        return self._message_matches_mention_patterns(message)
+        if self._message_matches_mention_patterns(message):
+            return True
+        if not is_command:
+            _alias, is_leading = self._profile_mention_alias_reference(
+                message, getattr(message, "text", None)
+            )
+            if is_leading:
+                return True
+        return False
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
@@ -9688,7 +10028,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(msg):
+        should_process = self._should_process_message(msg)
+        alias, is_leading_alias = self._profile_mention_alias_reference(msg, msg.text)
+        if alias is not None:
+            if not is_leading_alias:
+                if self._profile_mention_refusal_is_permitted(msg):
+                    await self._send_profile_mention_refusal(
+                        msg,
+                        alias=alias,
+                        reason="embedded-text",
+                        text=_PROFILE_MENTION_LEADING_GUIDANCE,
+                    )
+                return
+            if not should_process:
+                # Do not turn a blocked alias into observed/default-profile
+                # context.  All normal authorization/chat/topic gates already
+                # ran in ``_should_process_message``.
+                return
+        if not should_process:
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
@@ -9696,6 +10053,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        if not self._apply_profile_mention_route(msg, event):
+            if alias is not None and is_leading_alias:
+                await self._send_profile_mention_refusal(
+                    msg,
+                    alias=alias,
+                    reason="unavailable",
+                    text=_PROFILE_MENTION_UNAVAILABLE_GUIDANCE,
+                )
+            return
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -9705,7 +10071,25 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg, is_command=True):
+        should_process = self._should_process_message(msg, is_command=True)
+        alias, _ = self._profile_mention_alias_reference(msg, msg.text)
+        if alias is not None:
+            if not self._is_user_authorized_from_message(msg):
+                logger.warning(
+                    "[Telegram] Blocked unauthorized user %s in chat %s",
+                    getattr(getattr(msg, "from_user", None), "id", None),
+                    getattr(getattr(msg, "chat", None), "id", None),
+                )
+                return
+            if self._profile_mention_refusal_is_permitted(msg):
+                await self._send_profile_mention_refusal(
+                    msg,
+                    alias=alias,
+                    reason="command",
+                    text=_PROFILE_MENTION_TEXT_ONLY_GUIDANCE,
+                )
+            return
+        if not should_process:
             return
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
@@ -9966,7 +10350,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(update.message, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(update.message):
+        should_process = self._should_process_message(update.message)
+        alias, _ = self._profile_mention_alias_reference(
+            update.message, getattr(update.message, "caption", None)
+        )
+        if alias is not None:
+            if self._profile_mention_refusal_is_permitted(update.message):
+                await self._send_profile_mention_refusal(
+                    update.message,
+                    alias=alias,
+                    reason="media-caption",
+                    text=_PROFILE_MENTION_TEXT_ONLY_GUIDANCE,
+                )
+            # A configured alias in media/caption content is never an agent
+            # input: do not observe it, enqueue it, or download its payload.
+            return
+        if not should_process:
             if self._should_observe_unmentioned_group_message(update.message):
                 _m = update.message
                 _observe_type = self._media_message_type(_m)

@@ -2283,7 +2283,7 @@ async def _reclaim_stale(runner: object) -> None:
 
 
 @_contextmanager
-def _profile_runtime_scope(profile_home: "Path"):
+def _profile_runtime_scope(profile_home: "Path", *, strict_secrets: bool = False):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
     Combines the two seams the multiplexer needs:
@@ -2295,9 +2295,11 @@ def _profile_runtime_scope(profile_home: "Path"):
          keys and never the process-global ``os.environ`` (which in a
          multiplexer may hold another profile's values).
 
-    Only used on the multiplexed inbound path. Single-profile gateways never
-    enter this scope, so their behavior is unchanged. Loading the profile's
-    ``.env`` here does NOT mutate ``os.environ`` — ``build_profile_secret_scope``
+    Multiplexed inbound paths always use this scope. The bounded
+    profile-turn path may also request ``strict_secrets``: that is a
+    task-local fail-closed credential scope and deliberately does not change
+    the process-wide multiplex deployment mode. Loading the profile's ``.env``
+    here does NOT mutate ``os.environ`` — ``build_profile_secret_scope``
     returns an isolated dict — which is what keeps subprocesses (MCP, kanban)
     from inheriting cross-profile secrets.
     """
@@ -2306,15 +2308,19 @@ def _profile_runtime_scope(profile_home: "Path"):
         build_profile_secret_scope,
         set_secret_scope,
         reset_secret_scope,
+        set_secret_scope_strict,
+        reset_secret_scope_strict,
     )
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    strict_secret_token = set_secret_scope_strict(strict_secrets)
     try:
         yield
     finally:
+        reset_secret_scope_strict(strict_secret_token)
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
@@ -8008,7 +8014,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         config = getattr(self, "config", None)
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
         # produces the same namespace as the primary path: None (legacy
-        # agent:main) unless multiplexing is on, then the active profile.
+        # agent:main) unless multiplexing or a trusted profile turn selects a
+        # named profile.
         _profile = None
         if getattr(config, "multiplex_profiles", False):
             if source.profile:
@@ -8019,6 +8026,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _profile = get_active_profile_name() or "default"
                 except Exception:
                     _profile = None
+        elif getattr(source, "profile_turn_routed", False) is True:
+            _profile = self._profile_turn_profile_for_source(source)
         return build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
@@ -16560,10 +16569,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return _handler
 
+    def _make_profile_turn_message_handler(self):
+        """Scope only adapter-stamped profile turns on the primary transport.
+
+        Unlike the multiplex handler, this neither creates secondary adapters
+        nor routes ordinary inbound messages. It preserves the primary
+        transport's authorization home while a valid, allowlisted Telegram
+        group text turn reads the target profile's state.
+        """
+        default_home = Path(get_hermes_home())
+
+        async def _handler(event):
+            source = getattr(event, "source", None)
+            if source is not None:
+                source._authorization_profile_home = default_home
+            profile_home = self._profile_turn_home_for_event(event)
+            if profile_home is None:
+                return await self._handle_message(event)
+            with _profile_runtime_scope(profile_home, strict_secrets=True):
+                return await self._handle_message(event)
+
+        return _handler
+
     def _primary_message_handler(self):
         """Return the correctly scoped handler for a primary adapter."""
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
+        if getattr(self.config, "profile_turn_allowlist", None):
+            return self._make_profile_turn_message_handler()
         return self._handle_message
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
@@ -17451,6 +17484,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.profile = self._profile_name_for_source(source)
             except ProfileRouteRejected:
                 source.profile_route_rejected = True
+        elif (
+            not getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and getattr(source, "profile", None)
+            and getattr(source, "profile_route_rejected", False) is not True
+        ):
+            # A non-multiplex gateway must never treat an arbitrary
+            # ``source.profile`` as a scope selector. Only the primary
+            # Telegram adapter's internal profile-turn stamp can authorize it.
+            self._profile_turn_home_for_event(event)
 
         # SessionSource owns a strict boolean marker. Require the literal value
         # so duck-typed test/internal sources with dynamic attributes are not
@@ -28904,6 +28946,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
+
+    def _profile_turn_target_homes(self) -> Dict[str, Path]:
+        """Return on-disk profiles explicitly eligible for a routed turn.
+
+        This is intentionally independent of ``_multiplex_profile_homes``:
+        profile-turn routing neither serves secondary adapters nor changes any
+        gateway process topology.
+        """
+        config = getattr(self, "config", None)
+        allowlist = getattr(config, "profile_turn_allowlist", None)
+        if not isinstance(allowlist, list) or not allowlist:
+            return {}
+
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
+
+        targets: Dict[str, Path] = {}
+        for raw_name in allowlist:
+            if not isinstance(raw_name, str):
+                continue
+            try:
+                name = normalize_profile_name(raw_name)
+                validate_profile_name(name)
+                if name != "default" and profile_exists(name):
+                    targets[name] = get_profile_dir(name)
+            except (OSError, TypeError, ValueError):
+                continue
+        return targets
+
+    def _profile_turn_profile_for_source(
+        self, source: SessionSource
+    ) -> Optional[str]:
+        """Return a trusted profile-turn namespace for an already-checked source."""
+        config = getattr(self, "config", None)
+        if getattr(config, "multiplex_profiles", False):
+            return None
+        if getattr(source, "profile_turn_routed", False) is not True:
+            return None
+        if getattr(source, "profile_route_rejected", False) is True:
+            return None
+        profile = getattr(source, "profile", None)
+        if not isinstance(profile, str):
+            return None
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            profile = normalize_profile_name(profile)
+            validate_profile_name(profile)
+        except (TypeError, ValueError):
+            return None
+        if profile == "default":
+            return None
+        return profile if profile in self._profile_turn_target_homes() else None
+
+    @staticmethod
+    def _reject_profile_turn_source(source: SessionSource) -> None:
+        """Mark an untrusted profile-turn source for the shared ingress drop."""
+        try:
+            source.profile_route_rejected = True
+        except Exception:
+            pass
+
+    def _profile_turn_home_for_event(self, event: MessageEvent) -> Optional[Path]:
+        """Return the scoped home for one trusted primary Telegram text event.
+
+        The adapter's ``profile_turn_routed`` stamp is internal-only and is
+        required in addition to the allowlist/existence check. This prevents a
+        connector, plugin, or test-created ``source.profile`` from turning a
+        non-multiplex gateway into an arbitrary profile runtime.
+        """
+        config = getattr(self, "config", None)
+        if getattr(config, "multiplex_profiles", False):
+            return None
+        source = getattr(event, "source", None)
+        profile = getattr(source, "profile", None)
+        if not profile:
+            return None
+        try:
+            from hermes_constants import get_default_hermes_root, get_process_hermes_home
+
+            is_default_process = (
+                get_process_hermes_home().resolve()
+                == get_default_hermes_root().resolve()
+            )
+        except Exception:
+            is_default_process = False
+        if not is_default_process:
+            self._reject_profile_turn_source(source)
+            return None
+        if (
+            getattr(source, "profile_turn_routed", False) is not True
+            or getattr(source, "platform", None) is not Platform.TELEGRAM
+            or getattr(source, "chat_type", None) not in {"group", "forum", "supergroup"}
+            or getattr(event, "message_type", None) != MessageType.TEXT
+        ):
+            self._reject_profile_turn_source(source)
+            return None
+
+        target = self._profile_turn_profile_for_source(source)
+        if target is None:
+            self._reject_profile_turn_source(source)
+            return None
+        try:
+            source.profile = target
+        except Exception:
+            self._reject_profile_turn_source(source)
+            return None
+        return self._profile_turn_target_homes().get(target)
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.

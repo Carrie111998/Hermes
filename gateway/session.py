@@ -185,6 +185,10 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # Internal, wire-invisible proof that a primary Telegram adapter performed
+    # the bounded profile-turn route after its own auth and trigger gates. A
+    # plain ``source.profile`` must not activate this non-multiplex path.
+    profile_turn_routed: bool = field(default=False, repr=False, compare=False)
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -1958,15 +1962,36 @@ class SessionStore:
         to (``source.profile`` — set by the /p/<profile>/ URL prefix or
         per-credential adapter), falling back to the active profile name.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
+        if getattr(self.config, "multiplex_profiles", False):
+            if source is not None and source.profile:
+                return source.profile
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                return get_active_profile_name() or "default"
+            except Exception:
+                return None
+
+        # Profile-turn routing is deliberately narrower than multiplexing:
+        # only the adapter's non-serializable stamp may use the configured
+        # allowlist to select a named session namespace. Ordinary sources stay
+        # byte-identical in agent:main, even while the feature is configured.
+        if source is None or getattr(source, "profile_turn_routed", False) is not True:
             return None
-        if source is not None and source.profile:
-            return source.profile
+        profile = getattr(source, "profile", None)
+        allowed = getattr(self.config, "profile_turn_allowlist", None)
+        if not isinstance(profile, str) or not isinstance(allowed, list):
+            return None
         try:
-            from hermes_cli.profiles import get_active_profile_name
-            return get_active_profile_name() or "default"
-        except Exception:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            profile = normalize_profile_name(profile)
+            validate_profile_name(profile)
+        except (TypeError, ValueError):
             return None
+        if profile == "default":
+            return None
+        return profile if profile in allowed else None
 
     @staticmethod
     def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
