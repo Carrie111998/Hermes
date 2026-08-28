@@ -2360,7 +2360,6 @@ registry.register(
     handler=_handle_show,
     check_fn=_check_kanban_mode,
     emoji="📋",
-    repo_access="none",
 )
 
 registry.register(
@@ -2370,7 +2369,6 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
-    repo_access="none",
 )
 
 registry.register(
@@ -2380,7 +2378,6 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
-    repo_access="none",
 )
 
 registry.register(
@@ -2390,7 +2387,6 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
-    repo_access="none",
 )
 
 registry.register(
@@ -2400,7 +2396,6 @@ registry.register(
     handler=_handle_request_review,
     check_fn=_check_kanban_mode,
     emoji="👀",
-    repo_access="none",
 )
 
 registry.register(
@@ -2410,7 +2405,6 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
-    repo_access="none",
 )
 
 registry.register(
@@ -2420,7 +2414,6 @@ registry.register(
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
     emoji="💓",
-    repo_access="none",
 )
 
 registry.register(
@@ -2430,7 +2423,6 @@ registry.register(
     handler=_handle_comment,
     check_fn=_check_kanban_mode,
     emoji="💬",
-    repo_access="none",
 )
 
 registry.register(
@@ -2440,7 +2432,6 @@ registry.register(
     handler=_handle_attach,
     check_fn=_check_kanban_mode,
     emoji="📎",
-    repo_access="none",
 )
 
 registry.register(
@@ -2450,7 +2441,6 @@ registry.register(
     handler=_handle_attach_url,
     check_fn=_check_kanban_mode,
     emoji="📎",
-    repo_access="none",
 )
 
 registry.register(
@@ -2460,7 +2450,6 @@ registry.register(
     handler=_handle_attachments,
     check_fn=_check_kanban_mode,
     emoji="📎",
-    repo_access="none",
 )
 
 registry.register(
@@ -2470,7 +2459,6 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
-    repo_access="none",
 )
 
 registry.register(
@@ -2480,7 +2468,6 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
-    repo_access="none",
 )
 
 registry.register(
@@ -2490,5 +2477,4 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
-    repo_access="none",
 )

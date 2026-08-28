@@ -21,9 +21,9 @@ tools that can mutate a repository are not offered at all -- the model cannot
 call what it cannot see -- and the accompanying note explains the one route that
 remains. That is what "mechanically disallowed" has to mean to be worth saying.
 
-WHAT IS WITHHELD is whatever declares repo_access="write" at registration, plus
-anything that declares nothing at all. There is no list of names here to fall out
-of date; see the reasoning below _ALLOWED_WHEN_ROUTING.
+WHAT IS WITHHELD is whatever resolves to repo_access="write", plus anything
+that declares nothing at all. Built-ins are classified in one core manifest;
+plugins and MCP tools must classify themselves and never inherit by name.
 
 One choice is worth stating up here because it has a visible cost. `terminal`
 declares "write" even though it is mostly used for reading, because `echo > file`
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_KEY = "delegate_wave_route_repo_changes"
 
-# HOW A TOOL IS JUDGED: BY WHAT IT DECLARES, NOT BY ITS NAME.
+# HOW A TOOL IS JUDGED: BY CAPABILITY PLUS PROVENANCE, NOT NAME ALONE.
 #
 # This used to be MUTATING_TOOLS -- a frozenset of seven names. Enumerating beat
 # pattern-matching (the first version was a pattern guess and it missed
@@ -55,7 +55,7 @@ CONFIG_KEY = "delegate_wave_route_repo_changes"
 # mutating tool -- added upstream next month, or by a plugin this afternoon --
 # is offered, silently, because nobody thought to add its name here.
 #
-# Every registered tool now declares repo_access at registration:
+# Every tool resolves to one of these capabilities:
 #
 #   "write"            calling it can change the working tree from THIS
 #                      process, or run something that can
@@ -71,14 +71,16 @@ CONFIG_KEY = "delegate_wave_route_repo_changes"
 # honest, and leaves room for a future tool that mutates directly to be
 # classified "write" even though it lives on the same server.
 #
-# and this module asks the registry rather than consulting a list. A new
-# mutating tool is withheld the day it appears, without being named anywhere.
+# Built-ins are classified centrally in tools/repo_access.py. Registration-time
+# declarations remain the extension surface for plugins and MCP tools. Explicit
+# metadata wins, but an undeclared extension never inherits a built-in manifest
+# capability merely because it shadows the same name.
 #
 # UNDECLARED MEANS WITHHELD. That is the load-bearing half.
 #
-# A tool with no repo_access -- a new built-in whose author did not classify it,
-# a plugin, an MCP server's tool -- is treated as "write" and withheld while the
-# switch is on. The alternative is a default of "harmless", which converts every
+# A tool with no resolved repo_access -- an unlisted built-in, plugin, or MCP
+# tool -- is treated as "write" and withheld while the switch is on. The
+# alternative is a default of "harmless", which converts every
 # oversight into a silent hole in the guarantee. Erring towards withholding costs
 # a tool the model could have used and is visible immediately; erring the other
 # way costs the guarantee and is invisible until a transcript shows Hermes
@@ -86,7 +88,7 @@ CONFIG_KEY = "delegate_wave_route_repo_changes"
 #
 # The cost is real and deliberate: with the switch on, an unclassified tool
 # disappears. tests/test_delegate_routing.py asserts that every registered
-# built-in declares one, so that cost lands on whoever adds a tool, at the time
+# built-in has a manifest entry, so that cost lands on whoever adds a tool, at the time
 # they add it, rather than on the guarantee.
 #
 # MCP TOOLS declare through their server's config (repo_access on the server
@@ -99,7 +101,7 @@ _VALID_ACCESS = frozenset({"write", "delegated_write", "read", "none"})
 
 
 def _declared_access(name, registry_obj=None):
-    """What one tool declared, normalised, or None when it declared nothing."""
+    """One tool's resolved access, normalised, or None when undeclared."""
     try:
         from tools.registry import repo_access_of
     except Exception:  # pragma: no cover - import cycle guard

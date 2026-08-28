@@ -34,8 +34,10 @@ def test_off_by_default_so_an_existing_install_is_unchanged():
 
 
 class _FakeEntry:
-    def __init__(self, repo_access):
+    def __init__(self, repo_access, *, toolset="test", handler=None):
         self.repo_access = repo_access
+        self.toolset = toolset
+        self.handler = handler or (lambda: None)
 
 
 class _FakeRegistry:
@@ -52,6 +54,17 @@ class _FakeRegistry:
 
     def get_entry(self, name, scope=None):
         return self._entries.get(name)
+
+
+class _ProvenanceRegistry(_FakeRegistry):
+    """A registry whose entries can model extension provenance."""
+
+    def __init__(self, entries, plugin_handlers=()):
+        self._entries = entries
+        self._plugin_handlers = set(plugin_handlers)
+
+    def _plugin_owner_of(self, handler):
+        return "hermes_plugins.test" if handler in self._plugin_handlers else None
 
 
 def test_on_withholds_every_way_of_changing_a_repository():
@@ -114,13 +127,61 @@ def test_a_tool_missing_from_the_registry_entirely_is_withheld():
     assert filter_tools({"ghost_tool", "read_file"}, ON, reg) == {"read_file"}
 
 
+def test_undeclared_plugin_override_does_not_inherit_builtin_manifest_by_name():
+    """A plugin replacing a harmless built-in does not inherit its permission."""
+    plugin_handler = lambda: None
+    reg = _ProvenanceRegistry(
+        {"read_file": _FakeEntry(None, toolset="file", handler=plugin_handler)},
+        plugin_handlers={plugin_handler},
+    )
+
+    assert filter_tools({"read_file"}, ON, reg) == set()
+
+
+def test_plugin_cannot_launder_builtin_trust_through_a_core_handler(monkeypatch):
+    """Registration records the plugin caller, not only handler provenance."""
+    from tools.registry import ToolRegistry, registration_origin
+
+    reg = ToolRegistry()
+    monkeypatch.setattr(reg, "_caller_module", lambda: "hermes_plugins.test")
+    reg.register(
+        name="read_file",
+        toolset="file",
+        schema={"name": "read_file", "parameters": {}},
+        handler=lambda: None,  # defined in this core test module, not the plugin
+    )
+
+    entry = reg.get_entry("read_file")
+    assert registration_origin(entry, reg) == "plugin"
+    assert filter_tools({"read_file"}, ON, reg) == set()
+
+
+def test_undeclared_mcp_tool_does_not_inherit_builtin_manifest_by_name():
+    """Dynamic tools also remain undeclared even when their name collides."""
+    reg = _ProvenanceRegistry({
+        "read_file": _FakeEntry(None, toolset="mcp-hostile"),
+    })
+
+    assert filter_tools({"read_file"}, ON, reg) == set()
+
+
+def test_explicit_extension_capability_wins_over_origin_and_manifest():
+    plugin_handler = lambda: None
+    reg = _ProvenanceRegistry(
+        {"patch": _FakeEntry("read", toolset="file", handler=plugin_handler)},
+        plugin_handlers={plugin_handler},
+    )
+
+    assert filter_tools({"patch"}, ON, reg) == {"patch"}
+
+
 def test_case_and_whitespace_in_a_declaration_are_tolerated():
     """Declarations are written by hand, in config as well as in code."""
     reg = _FakeRegistry({"a": " Read ", "b": "NONE", "c": "Write"})
     assert filter_tools({"a", "b", "c"}, ON, reg) == {"a", "b"}
 
 
-def test_every_registered_builtin_declares_its_capability():
+def test_every_registered_builtin_has_manifest_capability():
     """WHERE THE COST OF FAILING CLOSED IS PAID.
 
     Undeclared means withheld, so an unclassified tool silently disappears while
@@ -128,17 +189,33 @@ def test_every_registered_builtin_declares_its_capability():
     time they add it, instead of onto the person wondering where their tool went.
     """
     import model_tools  # noqa: F401  -- triggers builtin discovery
-    from tools.registry import registry
+    from tools.registry import registration_origin, registry
+    from tools.repo_access import BUILTIN_REPO_ACCESS
 
     undeclared = sorted(
         name for name, entry in registry._tools.items()
-        if not getattr(entry, "repo_access", None)
-        and not name.startswith("mcp__")  # MCP declares via its server config
+        if registration_origin(entry, registry) == "builtin"
+        and name not in BUILTIN_REPO_ACCESS
     )
     assert not undeclared, (
-        "these registered tools declare no repo_access and will be withheld "
+        "these registered built-ins have no manifest capability and will be withheld "
         f"whenever delegate-wave routing is on: {undeclared}"
     )
+
+    invalid = {
+        name: access for name, access in BUILTIN_REPO_ACCESS.items()
+        if access not in {"write", "delegated_write", "read", "none"}
+    }
+    assert not invalid, f"invalid built-in repository capabilities: {invalid}"
+
+
+def test_missing_builtin_manifest_entry_is_withheld(monkeypatch):
+    """The manifest is authorization, not documentation."""
+    import model_tools  # noqa: F401
+    from tools.repo_access import BUILTIN_REPO_ACCESS
+
+    monkeypatch.delitem(BUILTIN_REPO_ACCESS, "read_file")
+    assert filter_tools({"read_file"}, ON) == set()
 
 
 def test_the_seven_known_mutators_still_declare_write():
@@ -155,8 +232,9 @@ def test_the_seven_known_mutators_still_declare_write():
         entry = registry._tools.get(tool)
         if entry is None:
             continue  # not every install has every toolset available
-        assert entry.repo_access == "write", (
-            f"{tool} now declares {entry.repo_access!r}; it is a mutation vector"
+        from tools.registry import repo_access_of
+        assert repo_access_of(tool) == "write", (
+            f"{tool} now resolves to {repo_access_of(tool)!r}; it is a mutation vector"
         )
 
 
@@ -403,7 +481,9 @@ def test_process_cannot_be_used_to_reach_a_shell_that_is_already_running():
     if entry is None:
         pytest.skip("process tool not registered in this install")
 
-    assert entry.repo_access == "write", (
+    from tools.registry import repo_access_of
+
+    assert repo_access_of("process") == "write", (
         "process sends arbitrary stdin via its write/submit actions; declaring "
         "it harmless leaves a route to a running shell while terminal is withheld"
     )

@@ -1387,7 +1387,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,
-    repo_access="none",
 )
 
 

@@ -1917,5 +1917,4 @@ registry.register(
     check_fn=check_cronjob_requirements,
     emoji="⏰",
     # Schedules commands, so it is deferred shell access.
-    repo_access="write",
 )

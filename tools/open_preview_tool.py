@@ -90,5 +90,4 @@ registry.register(
     schema=OPEN_PREVIEW_SCHEMA,
     handler=lambda args, **kw: open_preview_tool(url=args.get("url", ""), label=args.get("label", "")),
     emoji="🖼️",
-    repo_access="none",
 )

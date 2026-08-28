@@ -1,9 +1,12 @@
 # Declared repository capability — evidence
 
-`route_repo_changes` used to withhold seven tools by name. It now withholds
-whatever declares `repo_access="write"`, plus anything that declares nothing at
-all. Design notes live in `tools/delegate_routing.py`; this file records what was
-actually observed, so the next reader does not have to re-run it to believe it.
+`route_repo_changes` used to withhold seven tools by name. At the frozen proof
+commit below, it withheld whatever declared `repo_access="write"` inline, plus
+anything that declared nothing at all. The current tree preserves that behavior
+with built-ins classified in `tools/repo_access.py`; plugins and MCP tools still
+declare explicitly and fail closed when undeclared. Design notes live in
+`tools/delegate_routing.py`; this file records what was actually observed, so the
+next reader does not have to re-run it to believe it.
 
 Commit `80477f6531`, tag `routing-declared-capability`, branch
 `session-external-turns`, on top of `225e9b37`.

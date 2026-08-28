@@ -3325,5 +3325,4 @@ registry.register(
     # into a read half and a mutate half is the way to get that back; until
     # someone does, the whole tool is withheld, because a per-action capability
     # is not something the registry can express today.
-    repo_access="write",
 )

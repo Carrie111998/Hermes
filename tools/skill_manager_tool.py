@@ -1861,5 +1861,4 @@ registry.register(
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id")),
     emoji="📝",
-    repo_access="none",
 )

@@ -688,5 +688,4 @@ registry.register(
     ),
     check_fn=_browser_cdp_check,
     emoji="🧪",
-    repo_access="none",
 )

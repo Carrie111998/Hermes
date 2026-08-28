@@ -190,5 +190,4 @@ registry.register(
     ),
     check_fn=check_react_requirements,
     emoji="💛",
-    repo_access="none",
 )

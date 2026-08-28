@@ -561,5 +561,4 @@ registry.register(
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",
-    repo_access="none",
 )

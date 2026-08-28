@@ -523,7 +523,6 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="👥",
-    repo_access="none",
 )
 
 registry.register(
@@ -576,7 +575,6 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="📋",
-    repo_access="none",
 )
 
 registry.register(
@@ -650,7 +648,6 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="✉️",
-    repo_access="none",
 )
 
 
@@ -688,7 +685,6 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="🔍",
-    repo_access="none",
 )
 
 
@@ -738,5 +734,4 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="🎨",
-    repo_access="none",
 )

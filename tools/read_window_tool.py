@@ -68,5 +68,4 @@ registry.register(
     schema=READ_WINDOW_BELOW_SCHEMA,
     handler=lambda args, **kw: read_window_below_tool(callback=kw.get("callback")),
     emoji="🪟",
-    repo_access="none",
 )

@@ -208,12 +208,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides", "repo_access",
+        "origin",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 repo_access=None):
+                 repo_access=None, origin=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -232,7 +233,9 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
-        # WHAT THIS TOOL CAN DO TO A REPOSITORY. See tools/delegate_routing.py.
+        # EXPLICIT repository capability for extensions. Built-ins normally
+        # resolve through tools/repo_access.py; plugins and MCP tools must set
+        # this themselves. See tools/delegate_routing.py.
         #
         #   "write"  calling it can change the working tree, or run something
         #            that can -- shells, code execution, desktop control.
@@ -242,23 +245,54 @@ class ToolEntry:
         #            while routing is on. delegate-wave's own session_start.
         #   "read"   reads repository contents and cannot change them.
         #   "none"   does not touch the repository at all.
-        #   None     UNDECLARED. Treated as "write" by the routing filter, which
-        #            is the whole point: a tool nobody classified is withheld
-        #            rather than offered. A new mutating tool is blocked the day
-        #            it is added, without anyone remembering to list its name.
+        #   None     consult the built-in manifest only when provenance says
+        #            this is core; otherwise UNDECLARED and withheld.
         self.repo_access = repo_access
+        # Assigned automatically by ToolRegistry.register(). This preserves
+        # caller provenance even when a plugin registers a core-defined
+        # callable whose handler module alone would look built-in.
+        self.origin = origin
+
+
+def registration_origin(entry, registry_obj=None):
+    """Return ``builtin``, ``plugin`` or ``mcp`` for a registered entry.
+
+    Plugin provenance is checked before toolset because a plugin may override a
+    built-in without changing its toolset. This is intentionally public: policy
+    and tests should not duplicate the registry's ownership rules or guess from
+    names.
+    """
+    reg = registry_obj if registry_obj is not None else registry
+    recorded = getattr(entry, "origin", None)
+    if recorded in {"builtin", "plugin", "mcp"}:
+        return recorded
+    if reg._plugin_owner_of(entry.handler) is not None:
+        return "plugin"
+    if entry.toolset.startswith("mcp-"):
+        return "mcp"
+    return "builtin"
 
 
 def repo_access_of(name, registry_obj=None):
-    """The declared repository capability of one tool, or None if undeclared.
-
-    Separate from the ToolRegistry class so the routing filter can ask about a
-    name without importing policy into the registry: the registry records what a
-    tool declared, and delegate_routing decides what to do about it.
-    """
+    """Resolve explicit metadata, then the built-in manifest, else undeclared."""
     reg = registry_obj if registry_obj is not None else registry
     entry = reg.get_entry(name)
-    return getattr(entry, "repo_access", None) if entry is not None else None
+    if entry is None:
+        return None
+
+    explicit = getattr(entry, "repo_access", None)
+    if explicit is not None:
+        return explicit
+
+    # Test registries and third-party registry implementations have no trusted
+    # provenance resolver. Failing closed is safer than assuming they are core.
+    if not hasattr(reg, "_plugin_owner_of"):
+        return None
+    if registration_origin(entry, reg) != "builtin":
+        return None
+
+    from tools.repo_access import BUILTIN_REPO_ACCESS
+    return BUILTIN_REPO_ACCESS.get(name)
 
 
 class _PluginOverridePolicy:
@@ -900,6 +934,11 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 repo_access=repo_access,
+                origin=(
+                    "plugin" if owner is not None
+                    else "mcp" if toolset.startswith("mcp-")
+                    else "builtin"
+                ),
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
