@@ -107,8 +107,9 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # The venv interpreter, NOT its resolved base: resolving would strip the
+    # venv's site-packages back off.
+    assert exec_line.split(" ")[0].strip('"') == sys.executable
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
 
@@ -135,8 +136,7 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
-    hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.write_text(f"#!{sys.executable}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
@@ -147,6 +147,41 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     # Console-script with the venv's own interpreter in the shebang: correct
     # as-is, prefixing would only add noise.
     assert exec_line == f"{hermes_bin} desktop"
+
+
+# Regression: `venv/bin/python3` is a symlink to the base interpreter under uv,
+# virtualenv and `python -m venv --symlinks`. Resolving sys.executable to
+# compare it against the shebang can never match a venv console script, so the
+# check inverted and `Exec=` got the base interpreter — which has none of the
+# venv's site-packages. The entry then died on `import hermes_cli`, silently,
+# because Terminal=false.
+def test_exec_leaves_symlinked_venv_python_shebang_alone(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+
+    base_bin = tmp_path / "base" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python3.11"
+    base_python.write_text("", encoding="utf-8")
+    base_python.chmod(0o755)
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python3"
+    venv_python.symlink_to(base_python)
+
+    hermes_bin = venv_bin / "hermes"
+    hermes_bin.write_text(f"#!{venv_python}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{Path(hermes_bin).resolve()} desktop"
+    assert str(base_python) not in exec_line
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
