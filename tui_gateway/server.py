@@ -5993,8 +5993,9 @@ def _gateway_owned_model_target(session: dict) -> tuple[str, str, Path] | None:
     if not isinstance(session, dict):
         return None
 
-    source = _session_source(session).strip().lower()
-    directly_gateway_owned = _is_gateway_owned_source(source)
+    runtime_source = _session_source(session).strip().lower()
+    source = runtime_source
+    directly_gateway_owned = _is_gateway_owned_source(runtime_source)
 
     agent = session.get("agent")
     db = getattr(agent, "_session_db", None) or _get_db()
@@ -6012,6 +6013,19 @@ def _gateway_owned_model_target(session: dict) -> tuple[str, str, Path] | None:
         raise RuntimeError(
             f"The {source} conversation routing record could not be read, so its model was not changed."
         ) from exc
+
+    # A messaging transcript resumed into Desktop is represented by a local
+    # ``source=desktop`` replay runtime even though its durable row still owns
+    # the Telegram/Discord/etc. origin and gateway routing key.  The renderer
+    # correctly session-scopes that model pick from the stored row, so authority
+    # resolution on this side must use the same durable origin.  Ignoring it
+    # lets an offline gateway appear to accept the pick by mutating only the
+    # replay agent; when the gateway later starts, the real conversation keeps
+    # its old provider/model.
+    stored_source = str(row.get("source") or "").strip().lower()
+    if _is_gateway_owned_source(stored_source):
+        source = stored_source
+        directly_gateway_owned = True
 
     if not directly_gateway_owned:
         handoff_state = str(row.get("handoff_state") or "").strip().lower()

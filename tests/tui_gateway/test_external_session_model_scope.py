@@ -209,6 +209,41 @@ def test_completed_desktop_handoff_updates_the_gateway_owned_peer(
     ]
 
 
+def test_desktop_replay_uses_the_stored_messaging_origin(monkeypatch, tmp_path):
+    calls = []
+    db = _DB({
+        "id": "stored-telegram-session",
+        "session_key": "agent:main:telegram:dm:7616809568",
+        "source": "telegram",
+    })
+    session = {
+        "agent": SimpleNamespace(_session_db=db),
+        "profile_home": str(tmp_path),
+        "session_key": "stored-telegram-session",
+        # Resuming a messaging transcript in Desktop creates a local replay
+        # runtime.  The persisted row above remains the origin authority.
+        "source": "desktop",
+    }
+    monkeypatch.setattr(
+        "gateway.control_socket.set_gateway_session_model_override",
+        lambda home, **kwargs: calls.append((home, kwargs)) or {"applied": True},
+    )
+
+    server._sync_gateway_owned_model_override(session, _result())
+
+    assert calls == [
+        (
+            tmp_path,
+            {
+                "session_key": "agent:main:telegram:dm:7616809568",
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "base_url": "https://api.openai.com/v1",
+            },
+        )
+    ]
+
+
 def test_incomplete_desktop_handoff_remains_locally_owned(monkeypatch, tmp_path):
     db = _DB({
         "id": "desktop-session",
@@ -334,6 +369,98 @@ def test_confirmed_telegram_pick_updates_gateway_without_mutating_replay_agent(
     assert response["warning"] == "saved transcript record could not be updated"
     assert calls == [(session, "gpt-5.6-sol")]
     assert agent.model == "z-ai/glm-5.2"
+
+
+def test_offline_gateway_cannot_commit_a_desktop_replay_only_switch(
+    monkeypatch, tmp_path
+):
+    switch_calls = []
+    db = _DB({
+        "id": "stored-telegram-session",
+        "session_key": "agent:main:telegram:dm:7616809568",
+        "source": "telegram",
+    })
+
+    def apply_to_replay(**kwargs):
+        switch_calls.append(kwargs)
+        agent.model = kwargs["new_model"]
+        agent.provider = kwargs["new_provider"]
+
+    agent = SimpleNamespace(
+        _session_db=db,
+        model="z-ai/glm-5.2",
+        provider="nous",
+        base_url="https://inference-api.nousresearch.com/v1",
+        api_key="old-token",
+        switch_model=apply_to_replay,
+    )
+    session = {
+        "agent": agent,
+        "history": [],
+        "profile_home": str(tmp_path),
+        "session_key": "stored-telegram-session",
+        "source": "desktop",
+    }
+    parsed = SimpleNamespace(
+        model_input="gpt-5.6-sol",
+        explicit_provider="openai-codex",
+        is_global=False,
+        is_session=True,
+        is_once=False,
+    )
+    gateway_available = False
+
+    def set_gateway_model(*_args, **_kwargs):
+        return {"applied": True} if gateway_available else None
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model", lambda **_kw: _switch_result()
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_selection_guards.combined_selection_warning",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "gateway.control_socket.set_gateway_session_model_override", set_gateway_model
+    )
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_args: None)
+    monkeypatch.setattr(
+        server, "_persist_live_session_system_prompt", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        server, "_append_model_switch_marker", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="telegram gateway is unavailable"):
+        server._apply_model_switch(
+            "desktop-replay",
+            session,
+            "gpt-5.6-sol --provider openai-codex --session",
+            parsed_flags=parsed,
+        )
+
+    assert switch_calls == []
+    assert agent.model == "z-ai/glm-5.2"
+    assert agent.provider == "nous"
+    assert "model_override" not in session
+
+    # Starting the gateway later does not silently apply a choice that was
+    # reported as failed.  An explicit retry succeeds on both authorities.
+    gateway_available = True
+    response = server._apply_model_switch(
+        "desktop-replay",
+        session,
+        "gpt-5.6-sol --provider openai-codex --session",
+        parsed_flags=parsed,
+    )
+
+    assert response["value"] == "gpt-5.6-sol"
+    assert len(switch_calls) == 1
+    assert agent.model == "gpt-5.6-sol"
+    assert agent.provider == "openai-codex"
+    assert session["model_override"]["model"] == "gpt-5.6-sol"
 
 
 def test_busy_telegram_switch_updates_gateway_before_local_deferral(

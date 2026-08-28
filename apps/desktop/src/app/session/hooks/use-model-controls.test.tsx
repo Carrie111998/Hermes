@@ -83,6 +83,7 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    notifyError.mockClear()
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
@@ -317,6 +318,46 @@ describe('useModelControls', () => {
       key: 'model',
       value: 'gpt-5.6-sol --provider openai-codex --session'
     })
+  })
+
+  it('rolls back a Telegram-origin pick when its gateway owner is offline', async () => {
+    $activeSessionId.set('telegram-runtime')
+    setSelectedStoredSessionId('telegram-stored')
+    setCurrentModel('z-ai/glm-5.2')
+    setCurrentProvider('nous')
+    setCurrentModelSource('default')
+    setMessagingSessions([
+      {
+        ended_at: null,
+        id: 'telegram-stored',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 1,
+        message_count: 1,
+        model: 'z-ai/glm-5.2',
+        output_tokens: 0,
+        preview: 'hello',
+        source: 'telegram',
+        started_at: 1,
+        title: 'Telegram chat',
+        tool_call_count: 0
+      }
+    ])
+
+    const requestGateway = vi.fn(async () => {
+      throw new Error("The telegram gateway is unavailable, so this conversation's model was not changed.")
+    })
+
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(controls.selectModel({ model: 'gpt-5.6-sol', provider: 'openai-codex' })).resolves.toBe(false)
+
+    expect($currentModel.get()).toBe('z-ai/glm-5.2')
+    expect($currentProvider.get()).toBe('nous')
+    expect(getCurrentModelSource()).toBe('default')
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Model switch failed')
   })
 
   it('keeps a completed messaging handoff scoped to that conversation in the primary pane', async () => {
