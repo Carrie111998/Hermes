@@ -301,6 +301,19 @@ def test_repair_controller_dedupes_exact_head_and_preserves_merge_authority(
     assert second.created == 0
     task = kanban.tasks[0]
     assert task.assignee == "pr-repair-steward"
+    assert 'Before the first push' in task.instructions
+    assert task.instructions.index("Before the first push") < task.instructions.index(
+        "After your own verified normal push"
+    )
+    assert "immediately before every GitHub write" not in task.instructions
+    assert "require both base and head identity to remain exact" not in task.instructions
+    assert "merge remains gated" in task.instructions
+    assert 'After your own verified normal push' in task.instructions
+    assert 'unchanged base SHA, base branch, head repository, and head branch' in task.instructions
+    assert 'billing or spending-limit' in task.instructions
+    assert 'exact command, cwd, exit code' in task.instructions
+    assert 'does not resolve actions_not_green' in task.instructions
+    assert 'Do not call kanban_complete while acknowledgement is missing' in task.instructions
     assert task.initial_status == "running"
     assert task.max_runtime_seconds == 1200
     assert f"git merge --no-ff --no-edit {'b' * 40}" in task.instructions
@@ -367,7 +380,10 @@ def test_repair_controller_routes_a_stale_pr_base_into_the_refresh_lane(
     assert "git fetch --quiet --no-tags --no-recurse-submodules" in (
         kanban.tasks[0].instructions
     )
-    assert "require `FETCH_HEAD` to equal" in kanban.tasks[0].instructions
+    assert f"git cat-file -e {'c' * 40}^{{commit}}" in kanban.tasks[0].instructions
+    assert "must not be compared to the immutable target base SHA" in (
+        kanban.tasks[0].instructions
+    )
     assert "-m hermes_cli.main github-pr-feedback complete-feedback" in (
         kanban.tasks[0].instructions
     )
@@ -393,6 +409,35 @@ def test_repair_controller_routes_a_stale_pr_base_into_the_refresh_lane(
         kanban.tasks[0].instructions
     )
     assert "pr-maintenance-receipt:v1" in kanban.tasks[0].instructions
+    ledger.close()
+
+
+def test_merge_conflict_targets_the_current_base_snapshot(tmp_path: Path) -> None:
+    configured = policy(tmp_path, merge_maintainer=True)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    kanban = Kanban()
+
+    class CurrentBaseConflictGitHub(BehindBaseGitHub):
+        def get_merge_state(self, repository: str, number: int):
+            return replace(
+                merge_state(mergeable=False, status="DIRTY"), base_branch="stable"
+            )
+
+    result = RepairController(
+        configured,
+        ledger,
+        CurrentBaseConflictGitHub(),
+        kanban,
+        LocalGit(),
+    ).scan()
+
+    assert result.created == 1
+    task = kanban.tasks[0]
+    assert "merge_conflict" in task.evidence["triggers"]
+    assert task.evidence["target_base_sha"] == "c" * 40
+    assert f"git cat-file -e {'c' * 40}^{{commit}}" in task.instructions
+    assert f"git merge --no-ff --no-edit {'c' * 40}" in task.instructions
+    assert "b" * 40 not in task.instructions
     ledger.close()
 
 

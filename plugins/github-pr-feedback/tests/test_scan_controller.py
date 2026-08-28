@@ -700,6 +700,19 @@ def test_failed_exact_head_static_receipt_immediately_dispatches_one_typed_fixer
     assert task.max_runtime_seconds == 60 * 60
     assert task.max_retries == 2
     assert task.idempotency_key.endswith(":typed-fixer-v3")
+    assert 'Before the first push' in task.instructions
+    assert task.instructions.index("Before the first push") < task.instructions.index(
+        "After your own verified normal push"
+    )
+    assert "immediately before every GitHub write" not in task.instructions
+    assert "require both base and head identity to remain exact" not in task.instructions
+    assert "merge remains gated" in task.instructions
+    assert 'After your own verified normal push' in task.instructions
+    assert 'unchanged base SHA, base branch, head repository, and head branch' in task.instructions
+    assert 'billing or spending-limit' in task.instructions
+    assert 'exact command, cwd, exit code' in task.instructions
+    assert 'does not resolve actions_not_green' in task.instructions
+    assert 'Do not call kanban_complete while acknowledgement is missing' in task.instructions
     assert "first 90 seconds" in task.instructions
     assert "git status --short --branch" in task.instructions
     assert (
@@ -1563,6 +1576,19 @@ def test_auto_dispatch_starts_an_admitted_exact_head_repair_ready_with_push_and_
     assert "post a factual PR reply" in task.instructions
     assert "Do not merge" in task.instructions
     assert "still equals the expected receipt SHA" in task.instructions
+    assert 'Before the first push' in task.instructions
+    assert task.instructions.index("Before the first push") < task.instructions.index(
+        "After your own verified normal push"
+    )
+    assert "immediately before every GitHub write" not in task.instructions
+    assert "require both base and head identity to remain exact" not in task.instructions
+    assert "merge remains gated" in task.instructions
+    assert 'After your own verified normal push' in task.instructions
+    assert 'unchanged base SHA, base branch, head repository, and head branch' in task.instructions
+    assert 'billing or spending-limit' in task.instructions
+    assert 'exact command, cwd, exit code' in task.instructions
+    assert 'does not resolve actions_not_green' in task.instructions
+    assert 'Do not call kanban_complete while acknowledgement is missing' in task.instructions
     assert "complete-feedback" in task.instructions
     assert f"env HERMES_HOME='{control_home}' hermes github-pr-feedback complete-feedback" in (
         task.instructions

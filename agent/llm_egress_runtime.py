@@ -27,13 +27,17 @@ from agent.llm_egress_firewall import (
     UntrustedProvenanceSegment,
     ValidatedToolSyntaxSegment,
     DestinationClass,
+    GeneratedContextKey,
+    GeneratedContextSegment,
     classify_destination,
     source_grant_digest,
     static_literal_sha256,
     validate_sanitized_text,
     content_free_violation_locations,
+    redact_remote_unsafe_text,
     validate_tool_syntax,
 )
+from agent.message_sanitization import tool_result_id_variants
 from agent.source_provenance import DEFAULT_POLICY_DIGEST, SourceProvenanceRegistry
 
 
@@ -67,6 +71,12 @@ _PROTECTED_REMOTE_PROVIDERS = frozenset({
 logger = logging.getLogger(__name__)
 
 _VALIDATED_SYNTAX_TOOL_NAMES = frozenset({"terminal"})
+_REMOTE_KANBAN_PROJECTION_TOOL_NAMES = frozenset({"kanban_show"})
+_REMOTE_KANBAN_PROJECTION_ELISION = (
+    "kanban_show completed locally. The bounded task assignment is already "
+    "present in your worker context; do not request or repeat the raw board "
+    "record remotely. Continue with the assigned work or use a lifecycle tool."
+)
 _APPLICATION_IDENTIFIER_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_-])(?:t_[0-9a-f]{8}|[0-9a-f]{40}|[0-9a-f]{64}|"
     r"[a-z][a-z0-9]{0,31}(?:[_-][a-z][a-z0-9]{0,31}){1,7}"
@@ -204,6 +214,27 @@ def _approved_sanitized(text: str, *, cap: int) -> SanitizedSegment:
     return SanitizedSegment(text)
 
 
+def _split_utf8_chunks(text: str, cap: int) -> list[str]:
+    """Split text into UTF-8-safe chunks no larger than ``cap`` bytes."""
+
+    chunks: list[str] = []
+    pending: list[str] = []
+    pending_bytes = 0
+    for character in text:
+        character_bytes = len(character.encode("utf-8"))
+        if character_bytes > cap:
+            raise ValueError("sanitized segment exceeds byte cap")
+        if pending and pending_bytes + character_bytes > cap:
+            chunks.append("".join(pending))
+            pending = []
+            pending_bytes = 0
+        pending.append(character)
+        pending_bytes += character_bytes
+    if pending:
+        chunks.append("".join(pending))
+    return chunks
+
+
 def _approved_sanitized_segments(
     text: str,
     *,
@@ -214,9 +245,10 @@ def _approved_sanitized_segments(
 
     Normal callers may provide multiple bounded messages or exact-grant-separated
     segments. Protected Kanban context has an additional deterministic source
-    boundary: complete lines from the locally projected task payload. Those
-    lines may be packed into independently bounded segments without changing
-    the provider-visible text. A single oversized line is never split.
+    boundary: complete lines from the locally projected task payload are packed
+    into independently bounded segments without changing provider-visible text.
+    Oversized individual lines are split only at UTF-8 character boundaries;
+    the firewall re-scans adjacent chunks as one logical span.
     """
 
     if not allow_line_split or len(text.encode("utf-8")) <= cap:
@@ -228,7 +260,15 @@ def _approved_sanitized_segments(
     for line in text.splitlines(keepends=True):
         line_bytes = len(line.encode("utf-8"))
         if line_bytes > cap:
-            raise ValueError("sanitized segment exceeds byte cap")
+            if pending:
+                segments.append(_approved_sanitized(pending, cap=cap))
+                pending = ""
+                pending_bytes = 0
+            segments.extend(
+                _approved_sanitized(chunk, cap=cap)
+                for chunk in _split_utf8_chunks(line, cap)
+            )
+            continue
         if pending and pending_bytes + line_bytes > cap:
             segments.append(_approved_sanitized(pending, cap=cap))
             pending = ""
@@ -342,8 +382,10 @@ def _segment_protected_context(
     return segments[0] if len(segments) == 1 else OutboundText(tuple(segments))
 
 
-def _recognized_syntax_tool_call_ids(value: Any) -> frozenset[str]:
-    """Bind output admission to a preceding call of an exact recognized tool."""
+def _recognized_tool_call_ids(
+    value: Any, tool_names: frozenset[str]
+) -> frozenset[str]:
+    """Bind a narrow output handling rule to an exact prior tool call."""
 
     recognized: set[str] = set()
 
@@ -357,23 +399,24 @@ def _recognized_syntax_tool_call_ids(value: Any) -> frozenset[str]:
             )
             if (
                 item.get("type") in {"function", "function_call"}
-                and direct_name in _VALIDATED_SYNTAX_TOOL_NAMES
+                and direct_name in tool_names
             ):
                 call_id = item.get("call_id") or item.get("id")
                 if isinstance(call_id, str):
-                    recognized.add(call_id)
+                    recognized.update(tool_result_id_variants(call_id))
             tool_calls = item.get("tool_calls")
             if isinstance(tool_calls, list):
                 for call in tool_calls:
                     if not isinstance(call, Mapping):
                         continue
                     function = call.get("function")
+                    call_id = call.get("call_id") or call.get("id")
                     if (
                         isinstance(function, Mapping)
-                        and function.get("name") in _VALIDATED_SYNTAX_TOOL_NAMES
-                        and isinstance(call.get("id"), str)
+                        and function.get("name") in tool_names
+                        and isinstance(call_id, str)
                     ):
-                        recognized.add(call["id"])
+                        recognized.update(tool_result_id_variants(call_id))
             for child in item.values():
                 visit(child)
         elif isinstance(item, (list, tuple)):
@@ -382,6 +425,12 @@ def _recognized_syntax_tool_call_ids(value: Any) -> frozenset[str]:
 
     visit(value)
     return frozenset(recognized)
+
+
+def _recognized_syntax_tool_call_ids(value: Any) -> frozenset[str]:
+    """Return preceding terminal calls eligible for strict syntax parsing."""
+
+    return _recognized_tool_call_ids(value, _VALIDATED_SYNTAX_TOOL_NAMES)
 
 
 def _segment_protected_tool_result(
@@ -481,8 +530,12 @@ def _typed_payload(
     sanitized_cap: int,
     field_name: str | None = None,
     syntax_tool_call_ids: frozenset[str] = frozenset(),
+    elided_kanban_tool_call_ids: frozenset[str] = frozenset(),
     protected_tool_content: bool = False,
+    elide_kanban_tool_content: bool = False,
     protected_kanban_context: bool = False,
+    generated_context: bool = False,
+    redact_generated_context: bool = False,
     registry: SourceProvenanceRegistry | None = None,
     request_identity: tuple[str, str, str, str] = ("", "", "", ""),
 ) -> Any:
@@ -496,6 +549,16 @@ def _typed_payload(
                 used_grants,
                 sanitized_cap=sanitized_cap,
             )
+        if elide_kanban_tool_content:
+            # The protected remote worker already received its bounded task
+            # assignment at spawn.  ``kanban_show`` is a local state refresh;
+            # forwarding its arbitrary card text would turn board content into
+            # a remote egress payload.  Replace the result rather than trust,
+            # redact, or transmit it.  This preserves the fail-closed boundary
+            # for every other tool result while avoiding a fallback loop.
+            return GeneratedContextSegment(_REMOTE_KANBAN_PROJECTION_ELISION)
+        if generated_context and redact_generated_context:
+            return GeneratedContextSegment(redact_remote_unsafe_text(value))
         if protected_kanban_context:
             return _segment_protected_context(
                 value,
@@ -527,7 +590,16 @@ def _typed_payload(
                 or value.get("type") == "function_call_output"
             )
         )
-        typed: dict[str, Any] = {}
+        is_elided_kanban_tool_result = (
+            isinstance(output_call_id, str)
+            and output_call_id in elided_kanban_tool_call_ids
+            and (
+                value.get("role") == "tool"
+                or value.get("type") == "function_call_output"
+            )
+        )
+        typed: dict[Any, Any] = {}
+        context_mapping = value.get("role") in {"system", "developer"}
         for key, item in value.items():
             if key == "_source_provenance":
                 continue
@@ -544,17 +616,35 @@ def _typed_payload(
                     policy_digest=request_identity[3],
                 )
                 continue
-            typed[key] = _typed_payload(
+            typed_key = (
+                GeneratedContextKey(key)
+                if generated_context and redact_generated_context
+                else key
+            )
+            typed[typed_key] = _typed_payload(
                 item,
                 grant_texts,
                 used_grants,
                 sanitized_cap=sanitized_cap,
                 field_name=key,
                 syntax_tool_call_ids=syntax_tool_call_ids,
+                elided_kanban_tool_call_ids=elided_kanban_tool_call_ids,
                 protected_tool_content=(
                     is_recognized_tool_result and key in {"content", "output"}
                 ),
+                elide_kanban_tool_content=(
+                    is_elided_kanban_tool_result and key in {"content", "output"}
+                ),
                 protected_kanban_context=protected_kanban_context,
+                generated_context=(
+                    redact_generated_context
+                    and (
+                        generated_context
+                        or context_mapping
+                        or key in {"instructions", "system_prompt", "tools"}
+                    )
+                ),
+                redact_generated_context=redact_generated_context,
                 registry=registry,
                 request_identity=request_identity,
             )
@@ -568,8 +658,12 @@ def _typed_payload(
                 sanitized_cap=sanitized_cap,
                 field_name=field_name,
                 syntax_tool_call_ids=syntax_tool_call_ids,
+                elided_kanban_tool_call_ids=elided_kanban_tool_call_ids,
                 protected_tool_content=protected_tool_content,
+                elide_kanban_tool_content=elide_kanban_tool_content,
                 protected_kanban_context=protected_kanban_context,
+                generated_context=generated_context,
+                redact_generated_context=redact_generated_context,
                 registry=registry,
                 request_identity=request_identity,
             )
@@ -624,6 +718,14 @@ def _route_for_agent(agent: Any, route: Any | None) -> Any:
         base_url=base_url,
         api_mode=api_mode,
     )
+
+
+def _route_field(route: Any, name: str, default: Any = None) -> Any:
+    """Read route fields from both provider objects and serialized mappings."""
+
+    if isinstance(route, Mapping):
+        return route.get(name, default)
+    return getattr(route, name, default)
 
 
 def _restore_source_provenance_sidecar(
@@ -683,13 +785,27 @@ def authorize_agent_sdk_kwargs(
     sdk_control_keys: Sequence[str] = _SDK_CONTROL_KEYS,
 ) -> tuple[dict[str, Any], AuthorizedEgress]:
     controls = {key: kwargs[key] for key in sdk_control_keys if key in kwargs}
+    resolved_route = _route_for_agent(agent, route)
+    route_provider = _route_field(resolved_route, "provider", "")
+    protected_provider_route = provider_uses_egress_firewall(route_provider)
+    protected_remote_marker = (
+        os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1"
+    )
+    # The marker is deliberately process-local, but a fallback/reconstructed
+    # worker still carries its task identity. Re-derive the protected Kanban
+    # boundary from that durable identity plus the exact provider route so a
+    # fallback cannot turn private task context into a repeated egress block.
+    protected_kanban_remote = protected_remote_marker or (
+        bool(str(os.environ.get("HERMES_KANBAN_TASK") or "").strip())
+        and protected_provider_route
+    )
     sidecar = kwargs.get("_hermes_source_provenance")
     body = {
         key: value
         for key, value in kwargs.items()
         if key not in controls and key not in _INTERNAL_EGRESS_KEYS
     }
-    if os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1":
+    if protected_kanban_remote:
         body = _sanitize_protected_kanban_body(body)
     body = _restore_source_provenance_sidecar(body, sidecar)
     session_id = str(getattr(agent, "session_id", "") or "")
@@ -713,6 +829,24 @@ def authorize_agent_sdk_kwargs(
         getattr(agent, "_llm_egress_max_sanitized_bytes", 32_768)
     )
     used_grants: dict[str, SourceGrant] = {}
+    # Protected providers must use the bounded-context path regardless of
+    # whether the worker inherited the dispatcher marker.  The marker is
+    # still required for path redaction and the reduced Kanban toolset, but it
+    # is not a safe prerequisite for transport framing: fallback/provider
+    # resolution can rebuild the agent without preserving that process-global
+    # flag.  Without this route-derived guard, a large protected request raises
+    # ValueError while typing, bypassing the firewall's content-free receipt
+    # and triggering a provider fallback loop.
+    protected_remote_context = protected_remote_marker or protected_provider_route
+    # Generated framing (system/developer messages and tool schema) is
+    # application-owned.  It can use the established non-secret path/base64
+    # redaction on every protected cloud route, including ordinary chat and
+    # goal-judge calls.  User content and unbound tool results do not become
+    # generated context and remain fail-closed.
+    redact_protected_generated_context = (
+        str(route_provider or "").strip().lower() == "openai-codex"
+        or protected_provider_route
+    )
     typed_body = _typed_payload(
         body,
         _grant_texts(grants),
@@ -720,12 +854,16 @@ def authorize_agent_sdk_kwargs(
         sanitized_cap=sanitized_segment_cap,
         syntax_tool_call_ids=(
             _recognized_syntax_tool_call_ids(body)
-            if os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1"
+            if protected_kanban_remote
             else frozenset()
         ),
-        protected_kanban_context=(
-            os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1"
+        elided_kanban_tool_call_ids=(
+            _recognized_tool_call_ids(body, _REMOTE_KANBAN_PROJECTION_TOOL_NAMES)
+            if protected_kanban_remote and protected_provider_route
+            else frozenset()
         ),
+        protected_kanban_context=protected_remote_context,
+        redact_generated_context=redact_protected_generated_context,
         registry=registry if isinstance(registry, SourceProvenanceRegistry) else None,
         request_identity=(session_id, turn_id, request_id, policy_digest),
     )
@@ -775,7 +913,7 @@ def authorize_agent_sdk_kwargs(
     try:
         authorization = firewall.authorize(
             request,
-            _route_for_agent(agent, route),
+            resolved_route,
             grants=tuple(used_grants.values()),
         )
     except EgressBlocked:
@@ -802,9 +940,9 @@ def dispatch_authorized_agent_request(
 ) -> Any:
     resolved_route = _route_for_agent(agent, route)
     destination = classify_destination(
-        str(getattr(resolved_route, "provider", "") or ""),
-        getattr(resolved_route, "base_url", None),
-        getattr(resolved_route, "api_mode", None),
+        str(_route_field(resolved_route, "provider", "") or ""),
+        _route_field(resolved_route, "base_url"),
+        _route_field(resolved_route, "api_mode"),
     )
     if destination in {DestinationClass.LOCAL_PROCESS, DestinationClass.LOOPBACK}:
         return callback(dict(kwargs))

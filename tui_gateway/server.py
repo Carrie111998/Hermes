@@ -895,7 +895,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
-<<<<<<< HEAD
     _desktop_automatic_cleanup = bool(
         end_reason in _AUTOMATIC_SESSION_END_REASONS
         and _session_source(session).strip().lower() == "desktop"

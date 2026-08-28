@@ -8424,6 +8424,10 @@ class DispatchResult:
     Surfaces the auto-assignment to telemetry / CLI / dashboard so the
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
+    auto_reassigned_invalid: list[str] = field(default_factory=list)
+    """Task ids created by an automated router whose assignee profile no
+    longer exists and was repaired to ``kanban.default_assignee`` before
+    spawning. Human/control-plane lanes are never rewritten."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -8869,9 +8873,13 @@ def heartbeat_worker(
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
+    default_max_runtime_seconds: Optional[int] = None,
     signal_fn=None,
 ) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+    """Terminate workers whose runtime limit has elapsed.
+
+    ``default_max_runtime_seconds`` bounds tasks that do not carry an
+    explicit per-task override. An explicit task value always wins.
 
     Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
     ``timed_out`` event and restores the task's source phase so the next
@@ -8894,7 +8902,7 @@ def enforce_max_runtime(
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -8906,7 +8914,13 @@ def enforce_max_runtime(
         # intentionally records the first time a task ever started, so retries
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
-        if elapsed < int(row["max_runtime_seconds"]):
+        limit = row["max_runtime_seconds"]
+        if limit is None:
+            try:
+                limit = int(default_max_runtime_seconds)
+            except (TypeError, ValueError):
+                limit = None
+        if limit is None or limit <= 0 or elapsed < limit:
             continue
 
         pid = int(row["worker_pid"])
@@ -8949,14 +8963,14 @@ def enforce_max_runtime(
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
+                    "limit_seconds": int(limit),
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    error=f"elapsed {int(elapsed)}s > limit {int(limit)}s",
                     metadata=payload,
                 )
                 _append_event(
@@ -8971,7 +8985,7 @@ def enforce_max_runtime(
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                error=f"elapsed {int(elapsed)}s > limit {int(limit)}s",
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
@@ -9498,8 +9512,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # timeouts / nonzero exits neither consume nor extend it, and a
     # below-budget violation does not tick the unified
     # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
+    # A per-task ``max_retries`` bounds expensive repeated work, but a clean
+    # exit without a terminal Kanban call needs one recovery turn to receive
+    # its prior-attempt receipt reminder.  Preserve that minimum even when a
+    # bounded producer set ``max_retries=1``; otherwise the task is blocked
+    # before the worker can correct missing bookkeeping.  Systemic same-error
     # crashes still trip immediately.
     auto_blocked: list[str] = []
     if crash_details:
@@ -9519,10 +9536,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 task_override = (
                     trow["max_retries"] if "max_retries" in trow.keys() else None
                 )
-                violation_limit = (
+                violation_limit = max(
+                    2,
                     int(task_override)
                     if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT,
                 )
                 if streak < violation_limit:
                     # Below budget: the task is already back at ``ready``
@@ -10480,8 +10498,16 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 
 def count_running_model_overrides_other_boards(
     board: Optional[str] = None,
+    *,
+    model_key_resolver: Optional[Callable[[Any], Optional[tuple[str, str]]]] = None,
 ) -> dict[tuple[str, str], int]:
-    """Count explicit running provider/model pairs on every other board."""
+    """Count running provider/model pairs on every other board.
+
+    ``model_key_resolver`` lets the dispatcher account for an effective route
+    that is selected from a profile at spawn time (not persisted as a task
+    override).  The default retains the historical explicit-override-only
+    behavior for callers that do not opt in.
+    """
     try:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
     except Exception:
@@ -10503,15 +10529,18 @@ def count_running_model_overrides_other_boards(
             other = connect(board=slug)
             try:
                 rows = other.execute(
-                    "SELECT provider_override, model_override, COUNT(*) AS n "
-                    "FROM tasks WHERE status = 'running' "
-                    "AND provider_override IS NOT NULL AND provider_override != '' "
-                    "AND model_override IS NOT NULL AND model_override != '' "
-                    "GROUP BY provider_override, model_override"
+                    "SELECT assignee, provider_override, model_override "
+                    "FROM tasks WHERE status = 'running'"
                 ).fetchall()
                 for row in rows:
-                    key = (row["provider_override"], row["model_override"])
-                    counts[key] = counts.get(key, 0) + int(row["n"])
+                    if model_key_resolver is not None:
+                        key = model_key_resolver(row)
+                    else:
+                        provider = (row["provider_override"] or "").strip()
+                        model = (row["model_override"] or "").strip()
+                        key = (provider, model) if provider and model else None
+                    if key is not None:
+                        counts[key] = counts.get(key, 0) + 1
             finally:
                 other.close()
         except Exception:
@@ -10551,6 +10580,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    default_max_runtime_seconds: Optional[int] = None,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -10588,6 +10618,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -10610,6 +10641,7 @@ def dispatch_once(
                 max_in_progress=max_in_progress,
                 failure_limit=failure_limit,
                 stale_timeout_seconds=stale_timeout_seconds,
+                default_max_runtime_seconds=default_max_runtime_seconds,
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
@@ -10639,6 +10671,7 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    default_max_runtime_seconds: Optional[int] = None,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -10732,7 +10765,9 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(
+        conn, default_max_runtime_seconds=default_max_runtime_seconds,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -10804,7 +10839,8 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, provider_override, model_override FROM tasks "
+        "SELECT id, assignee, created_by, provider_override, model_override "
+        "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10893,23 +10929,71 @@ def _dispatch_once_locked(
     ) else None
     _per_model_running: dict[tuple[str, str], int] = {}
     if _per_model_cap is not None:
+        # Local-first selection happens at spawn time, so a task normally has
+        # no persisted override even though several profiles may resolve to the
+        # same single-concurrency Ollama model.  Counting only explicit fields
+        # made the advertised per-model cap ineffective for those workers and
+        # allowed them to starve one another until the board timeout.
+        local_first_enabled = _kanban_local_first_enabled()
+        effective_route_cache: dict[str, Optional[tuple[str, str]]] = {}
+
+        def _route_value(row: Any, field: str) -> Any:
+            """Read a route field from either a SQLite row or a claimed Task."""
+            try:
+                return row[field]
+            except (KeyError, TypeError, IndexError):
+                return getattr(row, field, None)
+
+        def _model_key_for_row(row: Any) -> Optional[tuple[str, str]]:
+            provider = (_route_value(row, "provider_override") or "").strip()
+            model = (_route_value(row, "model_override") or "").strip()
+            if provider and model:
+                return provider, model
+            if not local_first_enabled:
+                return None
+            assignee = str(_route_value(row, "assignee") or "").strip()
+            if not assignee:
+                return None
+            if assignee not in effective_route_cache:
+                route: Optional[tuple[str, str]] = None
+                try:
+                    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+                    import yaml
+
+                    profile_path = Path(resolve_profile_env(normalize_profile_name(assignee))) / "config.yaml"
+                    loaded = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+                    route = _resolve_local_first_route(loaded)
+                except Exception:
+                    # A profile parse problem is handled by the existing spawn
+                    # failure path.  Do not invent a route or block unrelated
+                    # explicitly-routed work here.
+                    route = None
+                effective_route_cache[assignee] = route
+            return effective_route_cache[assignee]
+
         for mrow in conn.execute(
-            "SELECT provider_override, model_override, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' "
-            "AND provider_override IS NOT NULL AND provider_override != '' "
-            "AND model_override IS NOT NULL AND model_override != '' "
-            "GROUP BY provider_override, model_override"
+            "SELECT assignee, provider_override, model_override FROM tasks "
+            "WHERE status = 'running'"
         ):
-            _per_model_running[(mrow["provider_override"], mrow["model_override"])] = int(
-                mrow["n"]
-            )
-        for key, count in count_running_model_overrides_other_boards(board).items():
+            key = _model_key_for_row(mrow)
+            if key is not None:
+                _per_model_running[key] = _per_model_running.get(key, 0) + 1
+        for key, count in count_running_model_overrides_other_boards(
+            board, model_key_resolver=_model_key_for_row
+        ).items():
             _per_model_running[key] = _per_model_running.get(key, 0) + count
 
-    def _explicit_model_key(row) -> Optional[tuple[str, str]]:
-        provider = (row["provider_override"] or "").strip()
-        model = (row["model_override"] or "").strip()
-        return (provider, model) if provider and model else None
+    else:
+        def _model_key_for_row(row: Any) -> Optional[tuple[str, str]]:
+            try:
+                provider_value = row["provider_override"]
+                model_value = row["model_override"]
+            except (KeyError, TypeError, IndexError):
+                provider_value = getattr(row, "provider_override", None)
+                model_value = getattr(row, "model_override", None)
+            provider = (provider_value or "").strip()
+            model = (model_value or "").strip()
+            return (provider, model) if provider and model else None
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10973,7 +11057,13 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
+        # Repair stale generated assignments, but preserve explicit human /
+        # control-plane lanes. Decomposition already validates the roster at
+        # creation time; this covers the remaining lifecycle hole where a
+        # profile is removed after a generated card was persisted. Rewriting
+        # only known automated producers prevents a missing profile from
+        # stranding generated work while keeping terminal-pulled work
+        # intentionally non-spawnable.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
         # control-plane lane (e.g. an interactive Claude Code terminal
@@ -10988,14 +11078,52 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+            generated_by = (row["created_by"] or "").strip().lower()
+            generated_task = generated_by in {
+                "auto-decomposer",
+                "decomposer",
+                "specialist-routing",
+            }
+            if (
+                generated_task
+                and _default_assignee
+                and _default_assignee_resolved
+                and profile_exists(_default_assignee)
+            ):
+                if not dry_run:
+                    try:
+                        with write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET assignee = ?, "
+                                "consecutive_failures = 0, last_failure_error = NULL "
+                                "WHERE id = ? AND assignee = ?",
+                                (_default_assignee, row["id"], row_assignee),
+                            )
+                            _append_event(
+                                conn, row["id"], "assigned",
+                                {
+                                    "assignee": _default_assignee,
+                                    "source": "kanban.invalid_assignee_fallback",
+                                    "previous_assignee": row_assignee,
+                                },
+                            )
+                    except Exception:
+                        _log.warning(
+                            "kanban dispatch: failed to repair invalid generated "
+                            "assignee=%r on task %s",
+                            row_assignee,
+                            row["id"],
+                            exc_info=True,
+                        )
+                        result.skipped_nonspawnable.append(row["id"])
+                        continue
+                row_assignee = _default_assignee
+                result.auto_reassigned_invalid.append(row["id"])
+            else:
+                # Control-plane and explicitly human-assigned lanes remain
+                # visible as non-spawnable and are never silently reassigned.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -11010,7 +11138,7 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
-        model_key = _explicit_model_key(row)
+        model_key = _model_key_for_row(row)
         if (
             _per_model_cap is not None
             and model_key is not None
@@ -11119,11 +11247,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
-            claimed_model_key = (
-                (claimed.provider_override or "").strip(),
-                (claimed.model_override or "").strip(),
-            )
-            if _per_model_cap is not None and all(claimed_model_key):
+            claimed_model_key = _model_key_for_row(claimed)
+            if _per_model_cap is not None and claimed_model_key is not None:
                 _per_model_running[claimed_model_key] = (
                     _per_model_running.get(claimed_model_key, 0) + 1
                 )
@@ -11176,7 +11301,7 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
-        model_key = _explicit_model_key(row)
+        model_key = _model_key_for_row(row)
         if (
             _per_model_cap is not None
             and model_key is not None
@@ -11263,11 +11388,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
-            claimed_model_key = (
-                (claimed.provider_override or "").strip(),
-                (claimed.model_override or "").strip(),
-            )
-            if _per_model_cap is not None and all(claimed_model_key):
+            claimed_model_key = _model_key_for_row(claimed)
+            if _per_model_cap is not None and claimed_model_key is not None:
                 _per_model_running[claimed_model_key] = (
                     _per_model_running.get(claimed_model_key, 0) + 1
                 )
@@ -11543,6 +11665,92 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_LOCAL_KANBAN_PROVIDERS = frozenset({"ollama", "ollama-launch", "local"})
+
+
+def _local_route_candidates(raw: Any) -> list[Mapping[str, Any]]:
+    """Normalize a profile's configured model-route list for local selection."""
+    if isinstance(raw, Mapping):
+        return [raw]
+    if isinstance(raw, (list, tuple)):
+        return [item for item in raw if isinstance(item, Mapping)]
+    return []
+
+
+def _resolve_local_first_route(
+    profile_config: Optional[Mapping[str, Any]],
+) -> Optional[tuple[str, str]]:
+    """Return the first usable local route from a profile configuration.
+
+    Kanban workers receive task-owned paths, attachments, and tool results. A
+    remote primary therefore often cannot be authorized by the egress policy;
+    waiting for that rejection and then falling back wastes a full model turn.
+    When the operator enables ``kanban.local_first``, choose the profile's
+    already-configured local route before spawning. This function is pure so
+    route precedence is testable without starting a worker or contacting a
+    provider. Unknown providers are deliberately ignored.
+    """
+    if not isinstance(profile_config, Mapping):
+        return None
+
+    candidates: list[Mapping[str, Any]] = []
+    primary = profile_config.get("model")
+    candidates.extend(_local_route_candidates(primary))
+    # ``fallback_model`` is the effective profile fallback schema in current
+    # installs. ``fallback_providers`` remains supported for older profiles.
+    candidates.extend(_local_route_candidates(profile_config.get("fallback_model")))
+    candidates.extend(
+        _local_route_candidates(profile_config.get("fallback_providers"))
+    )
+    for entry in candidates:
+        provider = str(entry.get("provider") or "").strip().lower()
+        model = str(entry.get("model") or entry.get("default") or "").strip()
+        if provider in _LOCAL_KANBAN_PROVIDERS and model:
+            return provider, model
+
+    providers = profile_config.get("providers")
+    if isinstance(providers, Mapping):
+        for provider, raw_provider in providers.items():
+            provider_name = str(provider or "").strip().lower()
+            if provider_name not in _LOCAL_KANBAN_PROVIDERS:
+                continue
+            if not isinstance(raw_provider, Mapping):
+                continue
+            model = str(raw_provider.get("default_model") or "").strip()
+            if model:
+                return provider_name, model
+    return None
+
+
+def _kanban_local_first_enabled() -> bool:
+    """Read the explicit operator opt-in for local-first Kanban spawning."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return False
+    kanban = cfg.get("kanban") if isinstance(cfg, Mapping) else None
+    return bool(isinstance(kanban, Mapping) and kanban.get("local_first"))
+
+
+def _resolve_explicit_local_task_route(
+    task: Task,
+) -> Optional[tuple[str, str]]:
+    """Return an explicitly pinned local task route, if one was supplied.
+
+    ``kanban.local_first`` is a policy for avoiding doomed remote attempts;
+    it must not erase a deliberate per-card local model selection.  The
+    provider is required here so a model name cannot be guessed to be local
+    from its spelling alone.
+    """
+    provider = str(task.provider_override or "").strip().lower()
+    model = str(task.model_override or "").strip()
+    if provider in _LOCAL_KANBAN_PROVIDERS and model:
+        return provider, model
+    return None
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -11614,6 +11822,7 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    parsed_profile: Optional[Mapping[str, Any]] = None
     try:
         profile_home = resolve_profile_env(profile_arg)
         env["HERMES_HOME"] = profile_home
@@ -11628,7 +11837,9 @@ def _default_spawn(
             import yaml
 
             try:
-                parsed_profile = yaml.safe_load(profile_config.read_text(encoding="utf-8"))
+                parsed_profile = yaml.safe_load(
+                    profile_config.read_text(encoding="utf-8")
+                )
             except (OSError, yaml.YAMLError) as exc:
                 raise ValueError(
                     f"invalid profile config for {profile_arg}: {profile_config}: {exc}"
@@ -11791,7 +12002,35 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
+    explicit_local_route = _resolve_explicit_local_task_route(task)
+    # ``local_first`` is a default-route policy, not a directive to erase a
+    # card's deliberate provider/model selection.  Remote task pins still go
+    # through the normal egress firewall and may fail closed or activate the
+    # configured fallback chain; silently replacing them here sends tasks to
+    # the wrong capability class (for example, PR repair to a small local
+    # model) and can turn a bounded job into a long provider-stall loop.
+    has_explicit_task_model = bool(str(task.model_override or "").strip())
+    local_first_route = (
+        _resolve_local_first_route(parsed_profile)
+        if _kanban_local_first_enabled() and not has_explicit_task_model
+        else None
+    )
+    selected_local_route = explicit_local_route or local_first_route
+    if selected_local_route is not None:
+        # An explicit local task pin has precedence over the profile's local
+        # fallback.  Explicit remote task pins are handled by the branch
+        # below, where the provider is preserved and the normal fail-closed
+        # egress policy remains authoritative.
+        local_provider, local_model = selected_local_route
+        _log.info(
+            "kanban worker %s: local route %s/%s selected before spawn (%s)",
+            task.id,
+            local_provider,
+            local_model,
+            "explicit task pin" if explicit_local_route else "profile local-first",
+        )
+        cmd.extend(["-m", local_model, "--provider", local_provider])
+    elif task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -12002,6 +12241,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+    # Every detached worker must make a durable terminal transition.  This is
+    # deliberately part of the generated context (rather than profile prose)
+    # so it survives profile/model changes and reaches bounded cron/scout
+    # workers that finish successfully but otherwise exit with rc=0.
+    lines.append("## Completion contract")
+    lines.append(
+        "Before your worker exits, call kanban_complete with a factual result, "
+        "or call kanban_block only for a concrete unresolved prerequisite. "
+        "A no-op or unavailable-evidence outcome is still a completion when "
+        "the task permits it; never exit with only conversational text."
+    )
+    lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has

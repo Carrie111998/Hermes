@@ -181,6 +181,493 @@ def test_runtime_denies_unsafe_text_before_provider_callback(tmp_path, text):
     assert calls == []
 
 
+def test_codex_generated_context_is_redacted_without_using_untrusted_budget(tmp_path):
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+    context = (
+        "Hermes generated instructions.\n" * 3000
+        + "Workspace: /Users/private/project/file.py\n"
+        + "Protocol sample: c2VjcmV0LXBheWxvYWQ=\n"
+    )
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "gpt-5.6-terra",
+            "input": [{"role": "system", "content": context}],
+            "tools": [{"type": "function", "description": context}],
+        },
+    )
+
+    wire = json.loads(receipt.payload_bytes)
+    rendered = json.dumps(wire)
+    assert receipt.allowed
+    assert "<private-path>" in rendered
+    assert "<redacted-base64>" in rendered
+    assert "/Users/private/project/file.py" not in rendered
+    assert "c2VjcmV0LXBheWxvYWQ=" not in rendered
+    assert len(receipt.payload_bytes) > 32_768
+
+
+def test_codex_generated_context_redaction_honors_mapping_routes(tmp_path):
+    agent = _agent(tmp_path)
+    route = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-terra",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+    }
+    generated = "Workspace: /Users/private/project/file.py\n" + (
+        "Protocol sample: c2VjcmV0LXBheWxvYWQ=\n"
+    )
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "gpt-5.6-terra",
+            "instructions": generated,
+            "tools": [{
+                "type": "function",
+                "description": generated,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "c2VjcmV0LXBheWxvYWQ=": {"type": "string"},
+                    },
+                },
+            }],
+        },
+        route=route,
+    )
+
+    rendered = json.dumps(json.loads(receipt.payload_bytes))
+    assert receipt.allowed
+    assert authorized["instructions"] != generated
+    assert authorized["instructions"] == (
+        "Workspace: <private-path>\n"
+        "Protocol sample: <redacted-base64>\n"
+    )
+    assert "<private-path>" in rendered
+    assert "<redacted-base64>" in rendered
+    assert "/Users/private/project/file.py" not in rendered
+    assert rendered.count("c2VjcmV0LXBheWxvYWQ=") == 1
+
+
+def test_codex_generated_tool_schema_preserves_encoded_property_names(tmp_path):
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+    property_name = "c2VjcmV0LXBheWxvYWQ="
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "gpt-5.6-terra",
+            "tools": [{
+                "type": "function",
+                "parameters": {
+                    "type": "object",
+                    "properties": {property_name: {"type": "string"}},
+                },
+            }],
+        },
+    )
+
+    assert receipt.allowed
+    assert authorized["tools"][0]["parameters"]["properties"] == {
+        property_name: {"type": "string"}
+    }
+
+
+def test_codex_generated_context_still_hard_blocks_secrets(tmp_path):
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "gpt-5.6-terra",
+                "input": [{"role": "system", "content": "token=super-secret-value"}],
+            },
+        )
+
+    assert "secret_detected" in exc_info.value.decision.reason_codes
+
+
+def test_codex_user_content_private_path_is_not_silently_redacted(tmp_path):
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "gpt-5.6-terra",
+                "input": [{"role": "user", "content": "Read /Users/private/file.py"}],
+            },
+        )
+
+    assert "private_absolute_path" in exc_info.value.decision.reason_codes
+
+
+def test_protected_codex_elides_bound_kanban_show_result(tmp_path, monkeypatch):
+    """Board data remains local instead of causing a remote fallback loop."""
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+    call_id = "call_kanban_show_123"
+    board_text = (
+        '{"task":{"body":"untrusted c2VjcmV0LXBheWxvYWQ= '
+        'token=super-secret-value /Users/private/source.py"}}'
+    )
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "gpt-5.6-terra",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": "kanban_show", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "kanban_show",
+                    "tool_call_id": call_id,
+                    "content": board_text,
+                },
+            ],
+        },
+    )
+
+    rendered = authorized["messages"][1]["content"]
+    assert receipt.allowed
+    assert rendered.startswith("kanban_show completed locally.")
+    assert "c2VjcmV0LXBheWxvYWQ=" not in rendered
+    assert "super-secret-value" not in rendered
+    assert "/Users/private/source.py" not in rendered
+
+
+def test_protected_codex_elides_responses_kanban_show_output(tmp_path, monkeypatch):
+    """Responses API function output follows the same no-egress boundary."""
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+    call_id = "call_kanban_show_responses"
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "gpt-5.6-terra",
+            "input": [
+                {
+                    "id": call_id,
+                    "call_id": call_id,
+                    "type": "function_call",
+                    "function": {"name": "kanban_show", "arguments": "{}"},
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "c2VjcmV0LXBheWxvYWQ= token=super-secret-value",
+                },
+            ],
+        },
+    )
+
+    rendered = authorized["input"][1]["output"]
+    assert receipt.allowed
+    assert rendered.startswith("kanban_show completed locally.")
+    assert "c2VjcmV0LXBheWxvYWQ=" not in rendered
+    assert "super-secret-value" not in rendered
+
+
+def test_protected_nous_elides_bound_kanban_show_result(tmp_path, monkeypatch):
+    """The same safe projection covers protected free-provider workers."""
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safe_projection")
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+    call_id = "call_kanban_show_nous"
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "poolside/laguna-xs-2.1:free",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": "kanban_show", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": "c2VjcmV0LXBheWxvYWQ= token=super-secret-value",
+                },
+            ],
+        },
+    )
+
+    assert receipt.allowed
+    assert authorized["messages"][1]["content"].startswith(
+        "kanban_show completed locally."
+    )
+
+
+def test_protected_nous_elides_canonicalized_kanban_show_result(tmp_path, monkeypatch):
+    """Bridge-id normalization cannot turn a real board result untrusted."""
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safe_projection")
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "poolside/laguna-xs-2.1:free",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_kanban_show|fc_response_item",
+                            "type": "function",
+                            "function": {"name": "kanban_show", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_kanban_show",
+                    "content": "c2VjcmV0LXBheWxvYWQ=",
+                },
+            ],
+        },
+    )
+
+    assert receipt.allowed
+    assert authorized["messages"][1]["content"].startswith(
+        "kanban_show completed locally."
+    )
+
+
+def test_protected_nous_keeps_unbound_kanban_output_blocked(tmp_path, monkeypatch):
+    """Provider broadening never treats an asserted call ID as trusted."""
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safe_projection")
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "poolside/laguna-xs-2.1:free",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_unbound_kanban_show",
+                        "content": "c2VjcmV0LXBheWxvYWQ=",
+                    }
+                ],
+            },
+        )
+
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
+def test_protected_nous_redacts_generated_cloud_system_context(tmp_path):
+    """Generated cloud framing may be redacted, unlike user/source content."""
+
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+    generated = "Hermes framing.\n" * 3_000 + (
+        "Workspace: /Users/private/worktree\n"
+        "Protocol sample: c2VjcmV0LXBheWxvYWQ="
+    )
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "poolside/laguna-xs-2.1:free",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": generated,
+                }
+            ],
+        },
+    )
+
+    assert receipt.allowed
+    assert "<private-path>" in authorized["messages"][0]["content"]
+    assert "<redacted-base64>" in authorized["messages"][0]["content"]
+    assert "/Users/private/worktree" not in authorized["messages"][0]["content"]
+    assert "c2VjcmV0LXBheWxvYWQ=" not in authorized["messages"][0]["content"]
+    assert len(receipt.payload_bytes) > 32_768
+
+
+def test_protected_nous_generated_context_allows_numeric_output_cap(tmp_path):
+    """A numeric JSON control must not be misclassified as base64 text."""
+
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "poolside/laguna-xs-2.1:free",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Generated schema example: c2VjcmV0LXBheWxvYWQ=",
+                }
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert receipt.allowed
+    assert authorized["max_tokens"] == 4096
+    assert "<redacted-base64>" in authorized["messages"][0]["content"]
+
+
+def test_protected_nous_keeps_generated_cloud_secrets_blocked(tmp_path):
+    """Redaction never converts secrets into remote-safe text."""
+
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "poolside/laguna-xs-2.1:free",
+                "messages": [
+                    {"role": "system", "content": "token=super-secret-value"}
+                ],
+            },
+        )
+
+    assert "secret_detected" in exc_info.value.decision.reason_codes
+
+
+def test_protected_nous_keeps_user_kanban_content_blocked(tmp_path, monkeypatch):
+    """The cloud framing allowance never promotes task/source input."""
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safe_projection")
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "poolside/laguna-xs-2.1:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "c2VjcmV0LXBheWxvYWQ=",
+                    }
+                ],
+            },
+        )
+
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
+def test_protected_codex_does_not_elide_unbound_kanban_show_result(
+    tmp_path, monkeypatch
+):
+    """Only an actual prior Kanban tool call may discard its output."""
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "gpt-5.6-terra",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_name": "kanban_show",
+                        "tool_call_id": "call_unbound_kanban_show",
+                        "content": "c2VjcmV0LXBheWxvYWQ=",
+                    }
+                ],
+            },
+        )
+
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
+def test_protected_codex_does_not_elide_unbound_responses_kanban_output(
+    tmp_path, monkeypatch
+):
+    """Responses output without the actual prior call remains fail-closed."""
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_mode = "codex_responses"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "gpt-5.6-terra",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_unbound_kanban_show",
+                        "output": "c2VjcmV0LXBheWxvYWQ=",
+                    }
+                ],
+            },
+        )
+
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
 def test_runtime_does_not_manufacture_boundaries_for_oversized_sanitized_text(
     tmp_path,
 ):
@@ -214,6 +701,74 @@ def test_protected_kanban_splits_large_line_bounded_context_without_changing_wir
 
     assert authorized["messages"][0]["content"] == text
     assert json.loads(receipt.payload_bytes)["messages"][0]["content"] == text
+
+
+def test_protected_kanban_splits_single_oversized_line_without_relaxing_cap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    agent._llm_egress_max_sanitized_bytes = 128_000
+    text = "ordinary bounded repair context " * 2_000
+    assert "\n" not in text
+    assert len(text.encode("utf-8")) > 32_768
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {"model": "test-model", "messages": [{"role": "system", "content": text}]},
+    )
+
+    assert authorized["messages"][0]["content"] == text
+    assert json.loads(receipt.payload_bytes)["messages"][0]["content"] == text
+
+
+def test_protected_provider_route_splits_without_dispatcher_marker(
+    tmp_path, monkeypatch
+):
+    """Route protection must survive provider/fallback agent reconstruction."""
+    monkeypatch.delenv("HERMES_KANBAN_PROTECTED_REMOTE", raising=False)
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.model = "tencent/hy3:free"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+    agent._llm_egress_max_sanitized_bytes = 128_000
+
+    text = "bounded protected repair context. " * 2_000
+    assert len(text.encode("utf-8")) > 32_768
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {"model": agent.model, "messages": [{"role": "system", "content": text}]},
+    )
+
+    assert authorized["messages"][0]["content"] == text
+    assert json.loads(receipt.payload_bytes)["messages"][0]["content"] == text
+
+
+def test_reconstructed_kanban_worker_redacts_paths_without_marker(
+    tmp_path, monkeypatch
+):
+    """Task identity must restore protected redaction after fallback rebuild."""
+    monkeypatch.delenv("HERMES_KANBAN_PROTECTED_REMOTE", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_01234567")
+    agent = _agent(tmp_path)
+    agent.provider = "nous"
+    agent.model = "tencent/hy3:free"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+    path = "/Users/private/hermes/worktree/kanban.db"
+
+    authorized, receipt = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [{"role": "system", "content": f"Inspect {path}"}],
+        },
+    )
+
+    wire = json.loads(receipt.payload_bytes)
+    assert path not in authorized["messages"][0]["content"]
+    assert "<private-path>" in authorized["messages"][0]["content"]
+    assert wire["messages"][0]["content"] == authorized["messages"][0]["content"]
 
 
 @pytest.mark.parametrize(
@@ -272,6 +827,7 @@ def test_protected_kanban_admits_exact_pr_receipt_decomposer_structure(
         task_id="t_ff23ef8a",
         title="PR repair: acme/widget#103",
         body=body,
+        handoffs="(no root handoff comments were recorded)",
         roster=roster,
         default_assignee="pr-repair-steward",
     )

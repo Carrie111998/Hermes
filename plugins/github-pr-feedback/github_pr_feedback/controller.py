@@ -1632,6 +1632,41 @@ def _worker_capability_preflight(identity_command: str) -> str:
     )
 
 
+def _worker_write_contract() -> str:
+    """Keep repair, feedback and CI-fixer handoffs on the same write protocol."""
+
+    return (
+        "Before editing, verify local HEAD equals the receipt SHA and record the canonical base "
+        "SHA/branch and head repository/branch; require every identity supplied by the receipt. "
+        "The generated local worktree branch is not the remote PR head branch. Verify the push "
+        "destination explicitly; never infer it from origin or the local branch name. "
+        "Before the first push, re-read the canonical PR and require that its head still equals "
+        "the expected receipt SHA, with unchanged base SHA, base branch, head repository, and head branch. "
+        "After your own verified normal push, obtain the full resolved SHA with literal "
+        "`git rev-parse --verify HEAD`; before any reply or acknowledgement require canonical "
+        "head to equal that resolved SHA, not the old receipt SHA. Keep all other identity fields "
+        "unchanged; stop on any external head/base drift. For an evidenced no-change resolution, "
+        "use the unchanged receipt SHA; do not create an empty commit or unnecessary push. "
+        "Read current review comments, reviews, check conclusions and failing job annotations "
+        "before deciding what remains. A successful fetch/merge or 'Already up to date' "
+        "does not resolve actions_not_green and is not test evidence. If annotations prove a "
+        "billing or spending-limit failure prevented hosted jobs from starting, run the equivalent "
+        "safe repository-owned local CI/static/test lane from the verified checkout when available. "
+        "Keep networked/live/paper execution boundaries intact. Post the exact command, cwd, exit code "
+        "and result, including an exact blocker if no safe equivalent is available. Local diagnostic "
+        "success does not make hosted checks green or replace a required CI receipt. Do not change "
+        "billing, workflow permissions, required checks, egress policy, or safety gates. "
+        "If billing remains the unresolved actions_not_green trigger for this repair, post a "
+        "factual blocked reply; do not emit a completed maintenance marker or acknowledge that "
+        "trigger as resolved. A separately verified code-feedback fix may be acknowledged without "
+        "claiming hosted CI passed; merge remains gated. "
+        "For resolved work, run the supplied literal complete-feedback command and inspect its "
+        "successful result after the factual reply. Do not claim that command is unavailable "
+        "without attempting it and recording its actual error. Do not call kanban_complete while "
+        "acknowledgement is missing; call kanban_block with the exact remaining prerequisite. "
+    )
+
+
 def _task(
     policy: PluginPolicy,
     receipt: FeedbackReceipt,
@@ -1701,9 +1736,9 @@ def _task(
         "literal repository-owned command or stop with its exact blocker. Validate the reported issue "
         "against the exact receipt worktree before editing. If confirmed, make only the bounded fix, "
         "run focused verification, commit and push to the verified PR head branch, and post a factual "
-        "PR reply with the commit and test evidence. Before any GitHub write, re-read the canonical PR "
-        "and require that its head still equals the expected receipt SHA; otherwise stop fail-closed. "
-        "Do not merge; merge remains controlled by deterministic safety gates. After the verified "
+        "PR reply with the commit and test evidence. "
+        + _worker_write_contract()
+        + "Do not merge; merge remains controlled by deterministic safety gates. After the verified "
         "push and factual reply, acknowledge this exact feedback with `"
         f"{_governed_command_prefix(control_home)} complete-feedback "
         f"--repository {shlex.quote(receipt.repository)} --pr-number "
@@ -1911,8 +1946,8 @@ def _ci_failure_task(
         "edit tools are available in the exact receipt worktree. Block only after an exact tool "
         "failure, identity drift, or a genuinely ambiguous broad repair, and report the literal "
         "failed operation and error. "
-        "Re-read the canonical pull request and require both its base and head to equal the receipt "
-        "identities before editing and immediately before every GitHub write. Run focused "
+        + _worker_write_contract()
+        + "Run focused "
         "verification plus the affected CI lane. Keep all required checks, tests, validation, "
         "and safety gates intact. Commit and push normally to the existing verified PR head branch, "
         "then post one factual reply with commit and test evidence. Do not approve or merge the pull "
