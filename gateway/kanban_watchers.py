@@ -1629,23 +1629,17 @@ class GatewayKanbanWatchersMixin:
             return out
 
         def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+            """Return whether any board has work admitted by this tick's gates.
 
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
+            The health probe receives the same routing, capacity, memory, and
+            review settings used by ``dispatch_once`` above. In particular,
+            unassigned rows are admitted when ``default_assignee`` resolves,
+            while dependency-blocked, capped, guarded, and invalid rows are
+            intentionally idle for this tick.
             """
             # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
+            # actually on. With ``review_dispatch`` off, a task parked in
+            # 'review' is correctly idle waiting for a human.
             _review_probe = _kb.review_dispatch_enabled()
             try:
                 boards = _kb.list_boards(include_archived=False)
@@ -1656,9 +1650,22 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    health_context = {
+                        "default_assignee": default_assignee,
+                        "max_spawn": max_spawn,
+                        "max_in_progress": max_in_progress,
+                        "max_in_progress_per_profile": max_in_progress_per_profile,
+                        "board": slug,
+                        # Use one sample for both lanes so this probe describes
+                        # one dispatcher tick rather than two drifting reads.
+                        "memory_pressure": _kb._memory_pressure_level(),
+                        "review_dispatch": _review_probe,
+                    }
+                    if _kb.has_spawnable_ready(conn, **health_context):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _review_probe and _kb.has_spawnable_review(
+                        conn, **health_context
+                    ):
                         return True
                 except Exception:
                     continue
