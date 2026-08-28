@@ -160,6 +160,19 @@ def _exec_help(ctx: CommandContext) -> CommandReply:
     from agent.i18n import t
     from hermes_cli.commands import gateway_help_lines
 
+    if (ctx.args or "").strip().lower() == "skills":
+        try:
+            from agent.skill_commands import get_skill_commands
+
+            skill_cmds = get_skill_commands()
+        except Exception:
+            skill_cmds = {}
+        lines = [t("gateway.help.skill_header", count=len(skill_cmds))]
+        for cmd in sorted(skill_cmds):
+            description = skill_cmds[cmd].get("description", "").strip()
+            lines.append(f"`{cmd}` — {description}")
+        return CommandReply("\n".join(lines), format="markdown")
+
     lines = [
         t("gateway.help.header"),
         *gateway_help_lines(),
