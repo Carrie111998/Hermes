@@ -128,6 +128,20 @@ class TestGlobalPolicy:
         assert "Shared policy: classify instruction scope first" in block
         assert store.format_for_system_prompt("user") is None
 
+    def test_global_policy_uses_distinct_header_without_memory_quota(
+        self, tmp_path, monkeypatch
+    ):
+        policy = tmp_path / "GLOBAL.md"
+        policy.write_text("Shared policy: use one source", encoding="utf-8")
+        monkeypatch.setattr("tools.memory_tool.get_global_policy_path", lambda: policy)
+
+        from tools.memory_tool import load_global_policy_block
+
+        block = load_global_policy_block()
+        assert "GLOBAL POLICY (shared across all Hermes profiles)" in block
+        assert "MEMORY (your personal notes)" not in block
+        assert "chars]" not in block
+
     def test_global_policy_snapshot_is_sanitized_and_frozen(self, tmp_path, monkeypatch):
         policy = tmp_path / "GLOBAL.md"
         policy.write_text("Shared policy: use the canonical source", encoding="utf-8")

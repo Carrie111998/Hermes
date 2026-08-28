@@ -147,6 +147,22 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_includes_canonical_global_policy(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = Path(tmp) / "GLOBAL.md"
+            policy.write_text(
+                "Shared policy: long-running work needs a hard budget",
+                encoding="utf-8",
+            )
+            with patch("tools.memory_tool.get_global_policy_path", return_value=policy):
+                prompt = _build_child_system_prompt("Run the checks")
+
+        self.assertIn("GLOBAL POLICY (shared across all Hermes profiles)", prompt)
+        self.assertIn("long-running work needs a hard budget", prompt)
+
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])

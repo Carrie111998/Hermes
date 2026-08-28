@@ -1194,6 +1194,18 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    # Focused children deliberately skip profile memory and identity, but the
+    # machine-wide operating policy must still apply. Use the same canonical
+    # loader as main-agent prompt assembly; never copy policy text here.
+    try:
+        from tools.memory_tool import load_global_policy_block
+
+        global_policy_block = load_global_policy_block()
+    except Exception:
+        logger.debug("subagent: global policy load failed", exc_info=True)
+        global_policy_block = ""
+    if global_policy_block.strip():
+        parts.append("\n" + global_policy_block.strip())
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
