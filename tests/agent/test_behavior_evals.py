@@ -59,6 +59,37 @@ def test_successful_unittest_after_latest_change_is_true():
     assert evaluate_code_change_verification(messages)["result"] == "true"
 
 
+def test_successful_lint_and_typecheck_after_latest_change_are_true():
+    commands = (
+        "ruff check agent/behavior_evals.py",
+        "python -m ruff check agent/behavior_evals.py",
+        "uv run ruff check agent/behavior_evals.py",
+        "mypy agent/behavior_evals.py",
+        "python -m mypy agent/behavior_evals.py",
+        "flake8 agent/behavior_evals.py",
+        "black --check agent/behavior_evals.py",
+        "npx eslint src/app.js",
+    )
+    for command in commands:
+        messages = [
+            _assistant(1, "patch", "patch", '{"mode":"replace","path":"src/app.py"}'),
+            _result(2, "patch", "patch", '{"verified":true}'),
+            _assistant(3, "terminal", "verify", json.dumps({"command": command})),
+            _result(4, "terminal", "verify", '{"exit_code":0}'),
+        ]
+        assert evaluate_code_change_verification(messages)["result"] == "true", command
+
+
+def test_mutating_eslint_fix_is_not_verification_evidence():
+    messages = [
+        _assistant(1, "write_file", "write", '{"path":"src/app.js"}'),
+        _result(2, "write_file", "write", '{"verified":true}'),
+        _assistant(3, "terminal", "lint", '{"command":"npx eslint --fix src/app.js"}'),
+        _result(4, "terminal", "lint", '{"exit_code":0}'),
+    ]
+    assert evaluate_code_change_verification(messages)["result"] == "false"
+
+
 def test_change_after_successful_test_requires_reverification():
     messages = [
         _assistant(1, "write_file", "first", '{"path":"src/app.py"}'),
