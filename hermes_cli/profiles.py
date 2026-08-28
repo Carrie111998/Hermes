@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import iter_skill_index_files
 from hermes_constants import (
     clear_named_profile_deleted,
     mark_named_profile_deleted,
@@ -839,7 +839,11 @@ def _skills_dir_signature(skills_dir: Path) -> float:
 def _count_skills(profile_dir: Path) -> int:
     """Count installed skills in a profile (cached by skills-dir signature)."""
     skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
+    try:
+        skills_dir_exists = skills_dir.is_dir()
+    except OSError:
+        return 0
+    if not skills_dir_exists:
         return 0
 
     key = str(skills_dir)
@@ -853,11 +857,10 @@ def _count_skills(profile_dir: Path) -> int:
     ):
         return cached[2]
 
-    count = 0
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        count += 1
+    try:
+        count = sum(1 for _ in iter_skill_index_files(skills_dir, "SKILL.md"))
+    except OSError:
+        count = 0
     _SKILL_COUNT_CACHE[key] = (signature, now, count)
     return count
 

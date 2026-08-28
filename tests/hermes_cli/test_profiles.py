@@ -489,6 +489,30 @@ class TestListProfiles:
         assert "alpha" in names
         assert "beta" in names
 
+    def test_unreadable_skill_tree_does_not_hide_profile(
+        self, profile_env, monkeypatch,
+    ):
+        create_profile("blocked", no_alias=True)
+        skills_dir = get_profile_dir("blocked") / "skills"
+        readable_skill = skills_dir / "readable"
+        readable_skill.mkdir()
+        (readable_skill / "SKILL.md").write_text("# Readable", encoding="utf-8")
+        blocked_tree = skills_dir / "blocked-junction"
+        blocked_tree.mkdir()
+
+        real_scandir = os.scandir
+
+        def scandir_with_blocked_tree(path):
+            if os.fspath(path) == os.fspath(blocked_tree):
+                raise OSError(448, "untrusted mount point", str(path))
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir_with_blocked_tree)
+
+        listed = {profile.name: profile for profile in list_profiles()}
+        assert "blocked" in listed
+        assert listed["blocked"].skill_count == 1
+
 
 # ===================================================================
 # TestActiveProfile
