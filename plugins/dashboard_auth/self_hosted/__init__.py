@@ -617,8 +617,22 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 id_token
             )
-        except jwt.PyJWKClientError as exc:
+        except jwt.exceptions.PyJWKClientConnectionError as exc:
+            # The IDP's JWKS endpoint could not be fetched: neither confirm nor
+            # deny, so the middleware answers 503 instead of logging a valid
+            # user out on a transient outage.
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.InvalidTokenError as exc:
+            # Not an ID token this provider issued. Providers stack (the
+            # middleware documents exactly this: a nous session hitting the
+            # self-hosted provider and vice versa), and an unrecognised token
+            # is None per the contract, so the caller gets a clean 401 rather
+            # than a 503 it will keep retrying.
+            raise InvalidCodeError(f"not an ID token from this issuer: {exc}") from exc
+        except jwt.PyJWKClientError as exc:
+            # No JWK matches the token's kid, and PyJWT already refreshed the
+            # set once. The endpoint answered, so this is a foreign token.
+            raise InvalidCodeError(f"no matching signing key: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 

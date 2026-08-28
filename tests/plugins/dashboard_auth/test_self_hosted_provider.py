@@ -564,12 +564,35 @@ class TestVerifySession:
     def test_jwks_unreachable_raises(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair)
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
-            "fetch failed"
+        # PyJWT raises this subclass when the JWKS endpoint cannot be fetched,
+        # the one case where the token can be neither confirmed nor denied.
+        bad_client.get_signing_key_from_jwt.side_effect = (
+            jwt.exceptions.PyJWKClientConnectionError("fetch failed")
         )
         provider._jwks_client = bad_client
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
+
+    def test_foreign_opaque_token_returns_none(self, provider):
+        """A session minted by another stacked provider is unrecognised, not
+        an outage: returning None lets the middleware reach a clean 401."""
+        stale_client = MagicMock()
+        stale_client.get_signing_key_from_jwt.side_effect = jwt.DecodeError(
+            "Not enough segments"
+        )
+        provider._jwks_client = stale_client
+        assert provider.verify_session(access_token="opaque-other-session") is None
+
+    def test_unknown_signing_key_returns_none(self, provider, rsa_keypair):
+        """No JWK matches the token's kid after PyJWT's own refresh: foreign
+        token, not an unreachable IDP."""
+        token = _mint_id_token(rsa_keypair)
+        other_client = MagicMock()
+        other_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
+            'Unable to find a signing key that matches: "kid42"'
+        )
+        provider._jwks_client = other_client
+        assert provider.verify_session(access_token=token) is None
 
     def test_jwks_client_sends_explicit_http_headers(self):
         provider = oidc_plugin.SelfHostedOIDCProvider(

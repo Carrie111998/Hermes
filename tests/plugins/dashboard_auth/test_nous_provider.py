@@ -590,14 +590,47 @@ class TestVerifySession:
 
     def test_jwks_unreachable_raises_provider_error(self, provider, rsa_keypair):
         token = _mint_token(rsa_keypair)
-        # Replace the patched client so it raises.
+        # Replace the patched client so it raises. PyJWT raises this subclass
+        # (not the bare PyJWKClientError) when the JWKS endpoint cannot be
+        # fetched, which is the only case where we can neither confirm nor
+        # deny the token and therefore must surface a 503.
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
-            "fetch failed"
+        bad_client.get_signing_key_from_jwt.side_effect = (
+            jwt.exceptions.PyJWKClientConnectionError("fetch failed")
         )
         provider._jwks_client = bad_client
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
+
+    def test_foreign_opaque_token_returns_none(self, provider):
+        """A token this provider did not mint is "not mine", not "IDP down".
+
+        The dashboard stacks providers, and a session cookie minted by another
+        one (or left over from a previous auth configuration) is an opaque
+        string PyJWT cannot even split into segments. Raising ProviderError
+        here makes the middleware answer 503 for every request carrying that
+        cookie, so the caller never receives the 401 that would send it back
+        to the login page: a desktop client retries the "unreachable gateway"
+        forever instead of asking the user to sign in again.
+        """
+        stale_client = MagicMock()
+        stale_client.get_signing_key_from_jwt.side_effect = jwt.DecodeError(
+            "Not enough segments"
+        )
+        provider._jwks_client = stale_client
+        assert provider.verify_session(access_token="opaque-basic-session") is None
+
+    def test_unknown_signing_key_returns_none(self, provider, rsa_keypair):
+        """No JWK matches the token's kid, after PyJWT already refreshed the
+        set once. The endpoint answered, so this is a foreign token rather
+        than an outage."""
+        token = _mint_token(rsa_keypair)
+        other_issuer_client = MagicMock()
+        other_issuer_client.get_signing_key_from_jwt.side_effect = (
+            jwt.PyJWKClientError('Unable to find a signing key that matches: "kid42"')
+        )
+        provider._jwks_client = other_issuer_client
+        assert provider.verify_session(access_token=token) is None
 
 
 # ---------------------------------------------------------------------------

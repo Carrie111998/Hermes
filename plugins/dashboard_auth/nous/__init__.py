@@ -436,8 +436,25 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 access_token
             )
-        except jwt.PyJWKClientError as exc:
+        except jwt.exceptions.PyJWKClientConnectionError as exc:
+            # The JWKS endpoint could not be fetched: we can neither confirm
+            # nor deny this token, so the middleware must answer 503 and keep
+            # the session rather than logging a valid user out on an outage.
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.InvalidTokenError as exc:
+            # Not something this provider minted. The dashboard stacks
+            # providers, so a session cookie from another one (or left over
+            # from a previous auth configuration) lands here as a string PyJWT
+            # cannot even parse. Contract: unrecognised tokens are None, which
+            # lets the middleware try the next provider and end on a clean 401.
+            # Reporting it as an outage instead strands the caller: it keeps
+            # retrying an "unreachable" gateway and never returns to /login.
+            raise InvalidCodeError(f"not a Nous Portal token: {exc}") from exc
+        except jwt.PyJWKClientError as exc:
+            # No JWK matches the token's kid, and PyJWT already refreshed the
+            # set once before raising. The endpoint answered, so this is a
+            # foreign token, not an outage.
+            raise InvalidCodeError(f"no matching signing key: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 
