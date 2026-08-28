@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import wraps
 import logging
 import os
 import random
@@ -43,6 +44,15 @@ from hermes_cli.auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _pin_pool_auth_authority(operation):
+    """Run a pool method against the authority captured when it was loaded."""
+    @wraps(operation)
+    def pinned(self, *args, **kwargs):
+        with auth_mod._use_auth_authority(self._auth_authority_binding):
+            return operation(self, *args, **kwargs)
+    return pinned
 
 
 def _load_config_safe() -> Optional[dict]:
@@ -712,6 +722,7 @@ def _write_through_provider_state_to_global_root(
 
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
+        self._auth_authority_binding = auth_mod._capture_auth_authority()
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
@@ -838,14 +849,17 @@ class CredentialPool:
                     return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        # Self-locking (RLock): snapshotting self._entries must not race a
-        # concurrent rotation when called from the deferred refresh path.
-        with self._lock:
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=removed_ids,
-            )
+        # Pool objects remain bound to the credential authority from load time;
+        # later config changes must not redirect an existing object's writes.
+        with auth_mod._use_auth_authority(self._auth_authority_binding):
+            # Self-locking (RLock): snapshotting self._entries must not race a
+            # concurrent rotation when called from the deferred refresh path.
+            with self._lock:
+                write_credential_pool(
+                    self.provider,
+                    [entry.to_dict() for entry in self._entries],
+                    removed_ids=removed_ids,
+                )
 
     def _is_terminal_auth_failure(
         self,
@@ -967,6 +981,7 @@ class CredentialPool:
             logger.debug("Failed to sync from credentials file: %s", exc)
         return entry
 
+    @_pin_pool_auth_authority
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Codex device_code pool entry from auth.json if tokens differ.
 
@@ -1055,6 +1070,7 @@ class CredentialPool:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
 
+    @_pin_pool_auth_authority
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
 
@@ -1152,6 +1168,7 @@ class CredentialPool:
             logger.debug("Failed to sync xAI OAuth entry from credential pool: %s", exc)
         return entry
 
+    @_pin_pool_auth_authority
     def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Nous pool entry from auth.json if tokens differ.
 
@@ -1367,6 +1384,7 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
+    @_pin_pool_auth_authority
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
@@ -2425,11 +2443,7 @@ class CredentialPool:
                 replace(entry, priority=new_priority)
                 for new_priority, entry in enumerate(self._entries)
             ]
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=[removed.id],
-            )
+            self._persist(removed_ids=[removed.id])
             if self._current_id == removed.id:
                 self._current_id = None
             return removed
@@ -3192,6 +3206,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
+@auth_mod._pin_auth_authority
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)

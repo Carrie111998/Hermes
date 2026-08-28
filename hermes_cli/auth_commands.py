@@ -245,6 +245,7 @@ def _format_exhausted_status(entry) -> str:
     return f" {label}{reason_text}{code} ({wait} left)"
 
 
+@auth_mod._pin_auth_authority
 def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     configured_provider = _configured_provider_entry(provider)
@@ -559,6 +560,7 @@ def auth_list_command(args) -> None:
         print()
 
 
+@auth_mod._pin_auth_authority
 def auth_remove_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     target = getattr(args, "target", None)
@@ -597,6 +599,7 @@ def auth_remove_command(args) -> None:
         print(line)
 
 
+@auth_mod._pin_auth_authority
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     pool = load_pool(provider)
