@@ -342,6 +342,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
+    p_create.add_argument("--target-repo", default=None,
+                          help="Explicit machine-readable target repo for this task "
+                               "(highest-authority routing signal). Canonical repo name "
+                               "(erp-kit, erp-control-plane, hermes-agent) or absolute "
+                               "repo path. Overrides project.primary_path. Used to "
+                               "create the worktree in the correct repo; UNKNOWN blocks "
+                               "dispatch before worktree creation.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -1506,6 +1513,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
+            target_repo=getattr(args, "target_repo", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),

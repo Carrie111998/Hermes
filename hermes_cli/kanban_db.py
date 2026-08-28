@@ -922,6 +922,9 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    # Highest-authority repo routing signal. Absolute path or canonical repo
+    # name; None on legacy cards (resolve via precedence with UNKNOWN → block).
+    target_repo: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -1021,6 +1024,7 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            target_repo=row["target_repo"] if "target_repo" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1200,6 +1204,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Machine-readable explicit target repo for this task (highest-authority
+    -- routing signal). Absolute path or canonical repo name of the worktree
+    -- repo the task MUST land in. NULL = legacy card: resolve via precedence
+    -- fallback (component/repo mapping, artifact/file ownership, conservative
+    -- body/path inference) with UNKNOWN → fail-closed block BEFORE worktree
+    -- creation when ambiguous. Never falls back to an arbitrary repo.
+    target_repo          TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -2337,6 +2348,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "target_repo" not in cols:
+        _add_column_if_missing(conn, "tasks", "target_repo", "target_repo TEXT")
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -2906,6 +2919,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    target_repo: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2991,6 +3005,46 @@ def create_task(
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
     project_repo: Optional[str] = None
+    # An explicit target_repo (highest-authority routing signal) anchors the
+    # task in that repo even when no first-class project is involved. It must
+    # NOT be gated on project_id: a task can name a target repo without a
+    # project link. For legacy cards (no explicit target_repo) we still accept
+    # a strong body/artifact signal so a card that names a canonical repo does
+    # not silently route to the project default.
+    if target_repo:
+        tr = str(target_repo).strip()
+        if tr in CANONICAL_REPO_MAP:
+            project_repo = CANONICAL_REPO_MAP[tr]
+        elif os.path.isabs(tr):
+            project_repo = tr
+        else:
+            # Unknown explicit target name: do NOT persist a relative junk path.
+            # Leave project_repo None so create_task never writes a bogus
+            # workspace path; dispatch fail-closes later on target_repo UNKNOWN.
+            project_repo = None
+        if workspace_kind == "scratch" and project_repo:
+            workspace_kind = "worktree"
+    else:
+        # Legacy: consult the deterministic repo mapping on title+body. A
+        # deterministic (high/medium, single-repo) body/artifact signal wins
+        # over project.primary_path fallback, because an explicit --project does
+        # NOT force a single repo — a project may contain multiple repos and
+        # primary_path is only a default. If the body clearly names one repo,
+        # that is the more precise intent. Ambiguity leaves project_repo None
+        # (project default applies) and dispatch fail-closes on UNKNOWN.
+        _probe = _resolve_target_repo(
+            Task(
+                id="", title=title, body=body, assignee=None, status="ready",
+                priority=0, created_by=None, created_at=0, started_at=None,
+                completed_at=None, workspace_kind=workspace_kind,
+                workspace_path=None, claim_lock=None, claim_expires=None,
+                tenant=None, branch_name=None, project_id=project_id,
+            )
+        )
+        if _probe.confidence in ("high", "medium") and _probe.repo:
+            project_repo = _probe.repo
+            if workspace_kind == "scratch":
+                workspace_kind = "worktree"
     if project_id is not None:
         project_id = str(project_id).strip() or None
     if project_id:
@@ -3052,16 +3106,37 @@ def create_task(
         if project_obj is None:
             # A project id/slug that doesn't resolve must not crash task
             # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
+            # create the task as an ordinary (scratch) task. BUT an explicit
+            # target_repo (without a project) still warrants a worktree
+            # anchored in that repo.
             project_id = None
+            if target_repo:
+                tr = str(target_repo).strip()
+                repo_path = CANONICAL_REPO_MAP[tr] if tr in CANONICAL_REPO_MAP else tr
+                if workspace_kind == "scratch":
+                    workspace_kind = "worktree"
+                project_repo = repo_path
         else:
             # Canonicalise (a slug may have been passed) and anchor the
-            # worktree under the project's primary repo.
+            # worktree under the project's repo.
             project_id = project_obj.id
-            if workspace_kind == "scratch" and project_obj.primary_path:
+            if workspace_kind == "scratch" and (project_obj.primary_path or target_repo):
                 workspace_kind = "worktree"
-            if (
-                workspace_kind == "worktree"
+            # TARGET_REPO has higher authority than project.primary_path.
+            # An explicit target_repo on the card overrides the project's
+            # primary repo anchor (multi-repo projects: the task's repo is
+            # decided by target_repo, not by the project default).
+            if target_repo:
+                tr = str(target_repo).strip()
+                if tr in CANONICAL_REPO_MAP:
+                    project_repo = CANONICAL_REPO_MAP[tr]
+                elif os.path.isabs(tr):
+                    project_repo = tr
+                # else: unknown target name → leave project_repo as-is; dispatch
+                # fail-closes on UNKNOWN rather than persisting bogus path.
+            elif (
+                project_repo is None
+                and workspace_kind == "worktree"
                 and workspace_path is None
                 and project_obj.primary_path
             ):
@@ -3194,12 +3269,30 @@ def create_task(
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
+                # `project_repo` may come from an explicit target_repo, a
+                # project's primary_path, or a deterministic body/artifact
+                # signal (legacy). Any of them anchors the worktree path here.
+                target_is_repo_anchor = bool(project_repo) and workspace_kind == "worktree"
+                if target_is_repo_anchor:
+                    # project_repo is either the explicit target_repo (highest
+                    # authority), the project's primary repo, or the body-signal
+                    # repo. Resolve a canonical target_repo NAME to its path.
+                    anchor = project_repo
+                    if anchor is None and target_repo:
+                        resolved_name = str(target_repo).strip()
+                        if resolved_name in CANONICAL_REPO_MAP:
+                            anchor = CANONICAL_REPO_MAP[resolved_name]
+                        elif os.path.isabs(resolved_name):
+                            anchor = resolved_name
+                        else:
+                            # Unknown explicit target name: keep None → no
+                            # workspace_path set; dispatch will fail-closed.
+                            anchor = None
+                    if anchor and not workspace_path:
                         workspace_path = os.path.join(
-                            project_repo, ".worktrees", task_id
+                            anchor, ".worktrees", task_id
                         )
-                    if not branch_name:
+                    if not branch_name and project_obj is not None:
                         # _pdb was imported above when project_obj was resolved.
                         try:
                             branch_name = _pdb.branch_name_for(
@@ -3213,12 +3306,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, target_repo, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3233,6 +3326,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        target_repo,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -3264,6 +3358,7 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "target_repo": target_repo,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -6515,6 +6610,215 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+@dataclass(frozen=True)
+class TargetRepoResolution:
+    """Result of resolving a task's target repo with provenance.
+
+    ``UNKNOWN`` confidence means the repo could not be resolved with enough
+    certainty; dispatch MUST NOT proceed to a default/arbitrary repo — it
+    blocks before worktree creation.
+    """
+    repo: Optional[str]          # absolute path to the repo root (resolved)
+    source: Optional[str]        # which precedence level produced the answer
+    confidence: str              # 'high' | 'medium' | 'low' | 'UNKNOWN'
+    evidence: Optional[str]      # human-readable reason / locating signal
+
+
+# Known component → canonical repo path mapping (2nd precedence tier for legacy
+# cards). Keys are canonical repo names / top-level component names that may
+# appear in a task's body or artifacts. Values are the canonical absolute repo
+# root. This is a deterministic mapping, NOT a fuzzy name heuristic.
+CANONICAL_REPO_MAP: dict[str, str] = {
+    # Hermes core (dispatcher / kanban / worker kernel).
+    "hermes-agent": "/home/windows/.hermes/hermes-agent",
+    # ERP application plane.
+    "erp-kit": "/home/windows/src/projects/erp-saas/repos/erp-kit",
+    # ERP control plane (provisioning / tenant factory).
+    "erp-control-plane": "/home/windows/src/projects/erp-saas/repos/erp-control-plane",
+}
+
+# Strong artifact → canonical repo signals (3rd precedence tier). A task whose
+# body names one of these canonical file paths belongs to that repo.
+ARTIFACT_OWNERSHIP: dict[str, str] = {
+    # control-plane unique modules
+    "repos/erp-control-plane/": CANONICAL_REPO_MAP["erp-control-plane"],
+    "erp-control-plane/src/orchestrator.": CANONICAL_REPO_MAP["erp-control-plane"],
+    "erp-control-plane/src/jobs.": CANONICAL_REPO_MAP["erp-control-plane"],
+    "erp-control-plane/src/registry.": CANONICAL_REPO_MAP["erp-control-plane"],
+    # erp-kit unique paths
+    "repos/erp-kit/": CANONICAL_REPO_MAP["erp-kit"],
+    "erp-kit/src/components/": CANONICAL_REPO_MAP["erp-kit"],
+    "erp-kit/app/routes/": CANONICAL_REPO_MAP["erp-kit"],
+    # hermes-agent (dispatcher/kernel) unique paths
+    "hermes_cli/kanban_db.py": CANONICAL_REPO_MAP["hermes-agent"],
+    "hermes_cli/kanban.py": CANONICAL_REPO_MAP["hermes-agent"],
+}
+
+
+def _task_project_primary_path(task: Task) -> Optional[str]:
+    """Resolve the project.primary_path for a task (deterministic single repo)
+    when the task is project-anchored. Returns None if no project or the
+    project has no primary repo. read-only, best-effort.
+    """
+    if not task.project_id:
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+        with _pdb.connect_closing() as pc:
+            proj = _pdb.get_project(pc, task.project_id)
+        if proj is not None and proj.primary_path:
+            return str(proj.primary_path)
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_target_repo(task: Task, project_primary_path: Optional[str] = None) -> TargetRepoResolution:
+    """Resolve the single repo a task's worktree MUST land in.
+
+    Precedence (highest to lowest):
+      1. explicit ``task.target_repo`` metadata (machine-readable, first class)
+      2. canonical component/artifact signals (deterministic repo mapping)
+      3. project.primary_path -- a legitimate fallback for tasks that are
+         explicitly project-anchored (``--project`` gives an unambiguous single
+         repo) or where no body/artifact signal contradicts it. Keeps legacy
+         project-linked cards working.
+      4. conservative body/path inference
+      5. UNKNOWN → block BEFORE worktree creation
+
+    ``project.primary_path`` is NOT an unconditional default: it only applies
+    when the other higher tiers don't resolve, and never when a body/artifact
+    signal names a different repo (that is ambiguity → UNKNOWN). Never guess.
+
+    Ambiguity is fail-closed: if multiple repos are plausible, return UNKNOWN.
+    """
+    # Tier 1: explicit target_repo metadata (highest authority).
+    if task.target_repo:
+        explicit = str(task.target_repo).strip()
+        if explicit in CANONICAL_REPO_MAP:
+            return TargetRepoResolution(
+                CANONICAL_REPO_MAP[explicit], "target_repo_metadata", "high", f"explicit target_repo={explicit}"
+            )
+        # absolute path form
+        if os.path.isabs(explicit):
+            return TargetRepoResolution(explicit, "target_repo_metadata", "high", f"explicit target_repo path={explicit}")
+        # unknown name in explicit metadata: fail closed, do not guess.
+        return TargetRepoResolution(None, "target_repo_metadata", "UNKNOWN", f"explicit target_repo={explicit} not in canonical map")
+
+    body = task.body or task.title or ""
+
+    # Tier 2: canonical component/artifact signals.
+    # a) deterministic name mapping
+    matched_names = [name for name in CANONICAL_REPO_MAP if _mentions_repo(body, name)]
+    # b) artifact/file ownership
+    owned = sorted({repo for (pat, repo) in ARTIFACT_OWNERSHIP.items() if pat in body})
+    unique_owned = sorted(set(owned))
+
+    # Combine: gather candidate repos from both name + artifact signals.
+    candidates: set[str] = set()
+    for name in matched_names:
+        candidates.add(CANONICAL_REPO_MAP[name])
+    candidates.update(unique_owned)
+    candidates.discard(None)
+
+    # If exactly one non-project signal points at a repo, and it does NOT
+    # contradict the project anchor, use it (body/artifact wins over default but
+    # must not contradict an explicit project anchor without being ambiguous).
+    unique_signal = sorted(candidates)
+    if len(unique_signal) == 1:
+        sig = unique_signal[0]
+        if project_primary_path and os.path.realpath(sig) != os.path.realpath(project_primary_path):
+            # Body names a repo different from the project anchor → ambiguity?
+            # The body signal is authoritative here only if high-precision
+            # artifact ownership; a bare "erp-control-plane" mention vs an
+            # erp-kit project anchor is NOT ambiguous if the card clearly names
+            # one repo. Since _mentions_repo now requires word-boundary tokens
+            # and the card named exactly one canonical repo, trust that signal.
+            return TargetRepoResolution(sig, "component_or_artifact", "high",
+                                        f"body uniquely names repo {os.path.basename(sig)}")
+        return TargetRepoResolution(sig, "component_or_artifact", "high",
+                                    f"body uniquely names repo {os.path.basename(sig)}")
+    if len(unique_signal) > 1:
+        # Multiple genuine repo signals → ambiguous. Fail closed.
+        return TargetRepoResolution(None, "component_or_artifact", "UNKNOWN",
+                                    f"body names multiple repos: {sorted(unique_signal)}")
+
+    # Tier 3: project.primary_path fallback (explicit project anchor). This is
+    # the backward-compatible path for project-linked cards with no repo
+    # signals and no explicit target_repo. Only used when it does not conflict
+    # with any body signal (none present here).
+    if project_primary_path:
+        return TargetRepoResolution(project_primary_path, "project_primary_path", "medium",
+                                    f"project-anchored task; primary_path={project_primary_path}")
+
+    # Tier 4: conservative exact body/path inference.
+    for name, root in CANONICAL_REPO_MAP.items():
+        if body.strip() == name:
+            return TargetRepoResolution(root, "body_inference", "low", f"body equals canonical repo name {name}")
+
+    # Tier 5: UNKNOWN → block (never default/arbitrary).
+    return TargetRepoResolution(None, None, "UNKNOWN", "no deterministic signal for target repo in card")
+
+
+def _mentions_repo(text: str, repo_name: str) -> bool:
+    """Conservative repo-name mention: word-boundary-correct token.
+
+    ``erp-kit`` must NOT match inside ``erp-kit-foo`` or ``ferp-kitx``. Because
+    repo names/commonly contain hyphens (e.g. ``erp-kit``) and ``\\w`` does not
+    include ``-``, we must treat ``-`` as a boundary character too — otherwise
+    ``erp-kit`` would match inside ``erp-kit-foo`` (the ``-f`` is not ``\\w``).
+    Both the preceding and following char must be a non-token boundary
+    (whitespace, punctuation, quote, path separator, hyphen, start/end).
+    """
+    import re as _re
+    pattern = _re.compile(r"(?<![\w-])" + _re.escape(repo_name) + r"(?![\w-])")
+    return bool(pattern.search(text))
+
+
+def _require_resolved_target_repo(task: Task, default_anchor: Optional[str] = None) -> TargetRepoResolution:
+    """Resolve and refuse to proceed if UNKNOWN (fail-closed safety boundary).
+
+    Separates the safety check so the dispatch site cannot accidentally fall
+    through to an arbitrary repo when resolution is inconclusive. Project-anchored
+    tasks resolve to their project repo; cards with no signal but a board
+    ``default_workdir`` fall back to that pre-existing deterministic anchor.
+    Only cards with NO signal, NO project and NO default anchor are blocked.
+    """
+    res = _resolve_target_repo(task, project_primary_path=_task_project_primary_path(task) or default_anchor)
+    if res.confidence == "UNKNOWN" or not res.repo:
+        raise ValueError(
+            f"TARGET_REPO UNKNOWN for task {task.id}: {res.evidence} — "
+            f"blocking BEFORE worktree creation. Set an explicit target_repo "
+            f"on the card or provide a deterministic repo signal."
+        )
+    return res
+
+
+def _validate_worktree_matches_target(task: Task, workspace, default_anchor: Optional[str] = None) -> None:
+    """Postcondition: the materialized worktree's git repo == TARGET_REPO.
+
+    ``WORKTREE_CREATED != TARGET_REPO_CORRECT`` — an existing worktree for the
+    wrong repo (e.g. a legacy card that landed under erp-kit but whose target
+    is erp-control-plane) is rejected rather than silently run there.
+    """
+    res = _resolve_target_repo(task, project_primary_path=_task_project_primary_path(task) or default_anchor)
+    if res.confidence == "UNKNOWN" or not res.repo:
+        raise ValueError(f"TARGET_REPO UNKNOWN for task {task.id} during worktree validation")
+    root = _git_toplevel(Path(workspace) if isinstance(workspace, (str, Path)) else workspace)
+    if root is None:
+        # Not inside a git repo (scratch-like) — not a worktree; skip the
+        # repo equality check (target only applies to worktree tasks).
+        return
+    expected = Path(res.repo).resolve(strict=False)
+    actual = root.resolve(strict=False)
+    if actual != expected:
+        raise ValueError(
+            f"DISPATCH_BLOCKED: worktree repo {actual} != TARGET_REPO {expected} "
+            f"(task {task.id}, target source {res.source}). Refusing to run on the wrong "
+            f"repo; resolve the card to the correct target first."
+        )
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -8636,8 +8940,18 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
+            _default_anchor = None
+            if claimed.workspace_kind == "worktree":
+                _default_anchor = (read_board_metadata(board if board else get_current_board()).get("default_workdir") or "").strip() or None
+            # TARGET_REPO resolution + fail-closed guard BEFORE worktree
+            # creation. Never create a worktree first then discover the
+            # mismatch. Safety boundary: TARGET_REPO_UNKNOWN != permission to
+            # default; WORKTREE_CREATED != target correct.
+            if claimed.workspace_kind == "worktree":
+                _require_resolved_target_repo(claimed, default_anchor=_default_anchor)
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                _validate_worktree_matches_target(claimed, workspace, default_anchor=_default_anchor)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -8728,8 +9042,18 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
+            _default_anchor = None
+            if claimed.workspace_kind == "worktree":
+                _default_anchor = (read_board_metadata(board if board else get_current_board()).get("default_workdir") or "").strip() or None
+            # TARGET_REPO resolution + fail-closed guard BEFORE worktree
+            # creation. Never create a worktree first then discover the
+            # mismatch. Safety boundary: TARGET_REPO_UNKNOWN != permission to
+            # default; WORKTREE_CREATED != target correct.
+            if claimed.workspace_kind == "worktree":
+                _require_resolved_target_repo(claimed, default_anchor=_default_anchor)
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                _validate_worktree_matches_target(claimed, workspace, default_anchor=_default_anchor)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
