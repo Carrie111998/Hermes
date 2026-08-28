@@ -30,7 +30,160 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_compacted_tool_arguments_cannot_reach_write_handler(self, monkeypatch):
+        from agent.context_compressor import _truncate_tool_call_args_json
 
+        original = json.dumps({"path": "fixture.txt", "content": "x" * 500})
+        compacted_args = json.loads(_truncate_tool_call_args_json(original))
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("compacted write must not dispatch")
+            ),
+        )
+
+        result = json.loads(handle_function_call("write_file", compacted_args))
+
+        assert "exact content" in result["error"].lower()
+        assert "fresh confirmation" in result["error"].lower()
+
+    def test_nested_compaction_marker_blocks_write_handler(self, monkeypatch):
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("nested compacted write must not dispatch")
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call(
+                "write_file",
+                {"path": "fixture.json", "content": {"sections": ["partial...[truncated]"]}},
+            )
+        )
+
+        assert "exact content" in result["error"].lower()
+
+    def test_named_compaction_sentinel_blocks_write_handler(self, monkeypatch):
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("compaction sentinel must not dispatch")
+            ),
+        )
+        marker = "⟪HERMES-CONTEXT-COMPRESSION: 300 chars omitted here⟫"
+
+        result = json.loads(
+            handle_function_call(
+                "write_file", {"path": "fixture.txt", "content": marker}
+            )
+        )
+
+        assert "exact content" in result["error"].lower()
+
+    def test_complete_write_payload_passes_byte_for_byte(self, monkeypatch):
+        payload = "alpha\nβeta\n"
+        captured = {}
+
+        def dispatch(_name, args, **_kwargs):
+            captured["content"] = args["content"]
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        assert json.loads(
+            handle_function_call("write_file", {"path": "fixture.txt", "content": payload})
+        ) == {"ok": True}
+        assert captured["content"].encode("utf-8") == payload.encode("utf-8")
+
+    def test_read_only_tool_is_not_blocked_by_compaction_marker(self, monkeypatch):
+        captured = {}
+
+        def dispatch(_name, args, **_kwargs):
+            captured.update(args)
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        args = {"path": "reports/... [truncated]/index.txt"}
+        assert json.loads(handle_function_call("read_file", args)) == {"ok": True}
+        assert captured == args
+
+    def test_legitimate_truncation_prose_is_not_blocked(self, monkeypatch):
+        payload = "Explain that the preview was truncated by the UI."
+        captured = {}
+
+        def dispatch(_name, args, **_kwargs):
+            captured.update(args)
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        args = {"path": "fixture.txt", "content": payload}
+        assert json.loads(handle_function_call("write_file", args)) == {"ok": True}
+        assert captured == args
+
+    def test_unknown_outbound_tool_fails_closed_on_marker(self, monkeypatch):
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("unknown outbound handler must not dispatch")
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call(
+                "send_email",
+                {"to": "recipient.invalid", "body": "partial...[truncated]"},
+            )
+        )
+
+        assert "not run" in result["error"].lower()
+
+    def test_execution_middleware_cannot_inject_marker_into_write(self, monkeypatch):
+        def execution_middleware(**kwargs):
+            return kwargs["next_call"](
+                {**kwargs["args"], "content": "partial...[truncated]"}
+            )
+
+        manager = type(
+            "Manager", (), {"_middleware": {"tool_execution": [execution_middleware]}}
+        )()
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("middleware marker must not reach handler")
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call(
+                "write_file", {"path": "fixture.txt", "content": "complete"}
+            )
+        )
+
+        assert "exact content" in result["error"].lower()
+
+    def test_guard_does_not_mutate_existing_role_alternation(self, monkeypatch):
+        history = [
+            {"role": "user", "content": "write it"},
+            {"role": "assistant", "content": None, "tool_calls": ["call-1"]},
+        ]
+        before = json.dumps(history, ensure_ascii=False, sort_keys=True)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("compacted write must not dispatch")
+            ),
+        )
+
+        handle_function_call(
+            "write_file", {"path": "fixture.txt", "content": "partial...[truncated]"}
+        )
+
+        assert json.dumps(history, ensure_ascii=False, sort_keys=True) == before
+        assert [message["role"] for message in history] == ["user", "assistant"]
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must

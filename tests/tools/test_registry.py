@@ -108,6 +108,26 @@ class TestGetDefinitions:
         names = {d["function"]["name"] for d in defs}
         assert names == {"t1", "t2"}
 
+    def test_read_only_metadata_does_not_change_prompt_schema(self):
+        write_reg = ToolRegistry()
+        read_reg = ToolRegistry()
+        schema = _make_schema("stable")
+        write_reg.register(
+            name="stable", toolset="s1", schema=schema, handler=_dummy_handler
+        )
+        read_reg.register(
+            name="stable",
+            toolset="s1",
+            schema=schema,
+            handler=_dummy_handler,
+            read_only=True,
+        )
+
+        assert write_reg.get_definitions({"stable"}) == read_reg.get_definitions({"stable"})
+        write_entry = write_reg.get_entry("stable")
+        read_entry = read_reg.get_entry("stable")
+        assert write_entry is not None and write_entry.read_only is False
+        assert read_entry is not None and read_entry.read_only is True
 
     def test_reuses_shared_check_fn_once_per_call(self):
         reg = ToolRegistry()

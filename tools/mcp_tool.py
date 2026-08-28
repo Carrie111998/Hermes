@@ -7232,6 +7232,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, mcp_tool.name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                "read_only": _annotation_read_only_hint(mcp_tool),
             }
         )
 
@@ -7255,6 +7256,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                "read_only": True,
             }
         )
 
@@ -7362,6 +7364,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            read_only=candidate["read_only"],
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
@@ -7519,6 +7522,10 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            read_only=(
+                isinstance(raw.get("annotations"), dict)
+                and raw["annotations"].get("readOnlyHint") is True
+            ),
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
@@ -7552,6 +7559,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
+            read_only=True,
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue

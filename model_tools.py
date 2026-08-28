@@ -791,6 +791,59 @@ def _resolve_active_context_length() -> int:
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
+# Context compressors use these exact marker shapes when shortening historical
+# strings. A later model turn must not mistake that synthetic copy for complete
+# outbound content. Requiring either the compression sentinel or an ellipsis-
+# bracket marker keeps ordinary prose such as "the preview was truncated" valid.
+_SYNTHETIC_TRUNCATION_MARKER_RE = re.compile(
+    r"(?:"
+    r"(?:\.\.\.|…)[ \t]*\[truncated\](?:\.\.\.)?"
+    r"|⟪HERMES-CONTEXT-COMPRESSION:"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _contains_synthetic_truncation_marker(value: Any) -> bool:
+    """Find compactor markers in JSON-like arguments, including nested leaves."""
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if _SYNTHETIC_TRUNCATION_MARKER_RE.search(item):
+                return True
+            continue
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            identity = id(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pending.extend(item)
+    return False
+
+
+def _compacted_side_effect_error(tool_name: str, args: Any) -> Optional[str]:
+    """Return a fail-closed error for marker-bearing write-capable calls."""
+    if not _contains_synthetic_truncation_marker(args):
+        return None
+    entry = registry.get_entry(tool_name)
+    if entry is not None and entry.read_only is True:
+        return None
+    return (
+        f"Blocked potentially side-effecting tool '{tool_name}': its arguments "
+        "contain a synthetic truncation marker from compacted history, so exact "
+        "content cannot be verified. Recover the exact content from the original "
+        "source, then obtain fresh confirmation before retrying. The tool was NOT run."
+    )
+
 
 # =========================================================================
 # Tool error sanitization
@@ -1466,6 +1519,25 @@ def handle_function_call(
                 )
                 return result
 
+        compaction_block = _compacted_side_effect_error(function_name, function_args)
+        if compaction_block is not None:
+            result = tool_error(compaction_block)
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                status="blocked",
+                error_type="compacted_tool_arguments",
+                error_message=compaction_block,
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
+
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
         # are unaffected when it is unset.
@@ -1543,6 +1615,9 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    block = _compacted_side_effect_error(function_name, next_args)
+                    if block is not None:
+                        return tool_error(block)
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1551,6 +1626,9 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    block = _compacted_side_effect_error(function_name, next_args)
+                    if block is not None:
+                        return tool_error(block)
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
