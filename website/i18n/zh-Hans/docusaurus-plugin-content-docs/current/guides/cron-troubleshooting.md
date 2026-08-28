@@ -117,7 +117,7 @@ Skill 名称区分大小写，必须与已安装 skill 的文件夹名称完全�
 
 ### 检查 3：依赖交互式工具的 skill
 
-Cron 任务运行时，`cronjob` 和 `clarify` 工具集会被禁用。这可防止递归创建 cron 和交互式提示。Cron 输出投递由任务的 `deliver` 设置通过调度器处理；cron 上下文中没有 agent 可调用的 `send_message` 工具。
+Cron 任务运行时，`cronjob`、`messaging` 和 `clarify` 工具集均被禁用。这可防止递归创建 cron、直接发送消息（投递由调度器处理）以及交互式提示。若某 skill 依赖这些工具集，它将无法在 cron 上下文中运行。
 
 请查阅该 skill 的文档，确认其支持非交互式（headless）模式。
 
