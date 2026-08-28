@@ -19,6 +19,7 @@ def test_repair_node_deps_runs_config_migration_on_version_bump(capsys):
     completion = MagicMock()
     with (
         patch.object(update_cmd, "_update_node_dependencies", return_value=[]),
+        patch.object(update_cmd, "_rebuild_desktop_after_update", return_value=True),
         patch.object(update_cmd, "_m") as m,
         patch.object(update_cmd, "_reload_config_modules"),
         patch.object(update_cmd, "_run_config_check_fresh", return_value=(37, 38)),
@@ -30,7 +31,10 @@ def test_repair_node_deps_runs_config_migration_on_version_bump(capsys):
             return_value={"env_added": [], "config_added": ["migrated to v38"], "warnings": []},
         ) as mock_migrate,
     ):
-        update_cmd._repair_node_deps_on_current_checkout(completion)
+        update_cmd._repair_node_deps_on_current_checkout(
+            completion,
+            had_desktop_app_before_update=False,
+        )
 
     m.return_value._build_web_ui.assert_called_once()
     mock_migrate.assert_called_once_with(interactive=False, quiet=True)
@@ -46,6 +50,7 @@ def test_repair_node_deps_up_to_date_config(capsys):
     completion = MagicMock()
     with (
         patch.object(update_cmd, "_update_node_dependencies", return_value=[]),
+        patch.object(update_cmd, "_rebuild_desktop_after_update", return_value=True),
         patch.object(update_cmd, "_m") as m,
         patch.object(update_cmd, "_reload_config_modules"),
         patch.object(update_cmd, "_run_config_check_fresh", return_value=(38, 38)),
@@ -53,7 +58,10 @@ def test_repair_node_deps_up_to_date_config(capsys):
         patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
         patch.object(update_cmd, "_run_migrate_config_fresh") as mock_migrate,
     ):
-        update_cmd._repair_node_deps_on_current_checkout(completion)
+        update_cmd._repair_node_deps_on_current_checkout(
+            completion,
+            had_desktop_app_before_update=False,
+        )
 
     m.return_value._build_web_ui.assert_called_once()
     mock_migrate.assert_not_called()

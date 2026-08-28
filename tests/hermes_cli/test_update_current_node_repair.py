@@ -21,7 +21,10 @@ def test_current_checkout_repairs_failed_node_deps(capsys):
     with patch.object(
         update_cmd, "_update_node_dependencies", return_value=["ui-tui, web workspaces"]
     ), patch.object(update_cmd, "_m") as m:
-        update_cmd._repair_node_deps_on_current_checkout(completion)
+        update_cmd._repair_node_deps_on_current_checkout(
+            completion,
+            had_desktop_app_before_update=False,
+        )
 
     m.return_value._build_web_ui.assert_not_called()
     completion.assert_called_once()
@@ -36,8 +39,13 @@ def test_current_checkout_healthy_node_deps_reports_up_to_date():
     completion = MagicMock()
     with patch.object(
         update_cmd, "_update_node_dependencies", return_value=[]
+    ), patch.object(
+        update_cmd, "_rebuild_desktop_after_update", return_value=True
     ), patch.object(update_cmd, "_m") as m:
-        update_cmd._repair_node_deps_on_current_checkout(completion)
+        update_cmd._repair_node_deps_on_current_checkout(
+            completion,
+            had_desktop_app_before_update=False,
+        )
 
     # The refresh pairs with the web build like every other call site.
     m.return_value._build_web_ui.assert_called_once()
