@@ -342,7 +342,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "claim", "comment", "complete", "edit", "block", "unblock",
                             "archive", "tail", "dispatch", "stats", "notify-subscribe",
                             "notify-list", "notify-unsubscribe", "log", "runs",
-                            "heartbeat", "assignees", "context", "specify", "gc"),
+                            "heartbeat", "assignees", "context", "specify", "gc",
+                            "routing-lane"),
                busy_policy="dispatch"),
     # One definition drives the CLI help entry, tab-completion, the gateway
     # command list, the Telegram bot menu and the Slack slash map. The verbs

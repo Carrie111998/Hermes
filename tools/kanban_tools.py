@@ -298,6 +298,53 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
+# Set once the worker's run has been stamped with its session, so the bind is
+# a one-shot per process without being rate-limited into a 60s delay.
+_session_bound_run_ids: set = set()
+
+
+def bind_worker_session_from_env() -> bool:
+    """Stamp ``task_runs.session_id`` for this worker's own run. Best-effort.
+
+    This is the cost JOIN KEY: with ``task_runs.profile`` it resolves to that
+    profile's ``state.db.session_model_usage``, where token and cost figures
+    already live. Called on every agent activity tick, but it writes at most
+    once per run per process, and the write itself is idempotent — a second
+    call is a no-op, so a retry can never corrupt the key.
+
+    It can never stamp a sibling run: ``_worker_run_id`` returns a run id only
+    when ``HERMES_KANBAN_RUN_ID`` belongs to the task this worker was spawned
+    for, and the UPDATE is keyed on that run id.
+
+    Emitting the run-linked routing record is deliberately NOT done here — it
+    belongs at the run's terminal point, where the outcome and the usage join
+    are actually known.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return False
+    run_id = _worker_run_id(tid)
+    if run_id is None or run_id in _session_bound_run_ids:
+        return False
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    if not session_id:
+        # The session is not bound yet. Return without marking the run done,
+        # so the next tick retries rather than losing the key for this run.
+        return False
+    try:
+        kb, conn = _connect()
+        try:
+            stored = kb.record_run_session_id(conn, run_id, session_id)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("session bind: failed", exc_info=True)
+        return False
+    if stored:
+        _session_bound_run_ids.add(run_id)
+    return stored
+
+
 def heartbeat_current_worker_from_env() -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.

@@ -348,3 +348,300 @@ def test_recording_a_session_id_changes_no_run_state(board):
     finally:
         conn.close()
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# The supported surface, the session bind, and the run-linked record
+# ---------------------------------------------------------------------------
+
+def _run_cli(argv):
+    import argparse
+    import contextlib
+    import io
+
+    from hermes_cli.kanban import build_parser, kanban_command
+
+    root = argparse.ArgumentParser(prog="hermes")
+    sub = root.add_subparsers(dest="command")
+    build_parser(sub)
+    args = root.parse_args(argv)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = kanban_command(args)
+    return code, out.getvalue(), err.getvalue()
+
+
+def _lane_of(task_id):
+    conn = kb.connect()
+    try:
+        return conn.execute(
+            "SELECT routing_lane FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["routing_lane"]
+    finally:
+        conn.close()
+
+
+def test_the_cli_surface_records_a_lane(board, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.kanban._configured_routing_lanes",
+        lambda: (["coding_routine", "review_only"], True))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+    finally:
+        conn.close()
+    code, out, _err = _run_cli(
+        ["kanban", "routing-lane", tid, "coding_routine", "--selected-by", "Rick"])
+    assert code == 0
+    assert "coding_routine" in out
+    assert _lane_of(tid) == "coding_routine"
+
+
+def test_an_unconfigured_lane_is_refused_with_the_real_list(board, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.kanban._configured_routing_lanes",
+        lambda: (["coding_routine", "review_only"], True))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+    finally:
+        conn.close()
+    code, _out, err = _run_cli(["kanban", "routing-lane", tid, "made_up"])
+    assert code == 2
+    assert "not a configured lane" in err
+    assert "coding_routine" in err and "review_only" in err
+    assert _lane_of(tid) is None, "a refused lane must not be recorded"
+
+
+def test_with_no_routing_config_the_lane_lands_with_a_visible_warning(
+    board, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.kanban._configured_routing_lanes", lambda: ([], False))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+    finally:
+        conn.close()
+    code, _out, err = _run_cli(["kanban", "routing-lane", tid, "coding_routine"])
+    assert code == 0
+    assert "no `routing:` section" in err
+    assert _lane_of(tid) == "coding_routine"
+
+
+def test_the_cli_can_clear_a_lane(board, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.kanban._configured_routing_lanes",
+        lambda: (["coding_routine"], True))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+    finally:
+        conn.close()
+    _run_cli(["kanban", "routing-lane", tid, "coding_routine"])
+    code, out, _err = _run_cli(["kanban", "routing-lane", tid, "--clear"])
+    assert code == 0 and "Cleared" in out
+    assert _lane_of(tid) is None
+
+
+def test_the_cli_refuses_an_unknown_task(board, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.kanban._configured_routing_lanes", lambda: (["x"], True))
+    code, _out, err = _run_cli(["kanban", "routing-lane", "t_nope", "x"])
+    assert code == 1 and "no such task" in err
+
+
+def test_the_cli_never_changes_task_state(board, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.kanban._configured_routing_lanes",
+        lambda: (["coding_routine"], True))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+        before = dict(conn.execute(
+            "SELECT status, assignee, gate_state FROM tasks WHERE id = ?",
+            (tid,)).fetchone())
+    finally:
+        conn.close()
+    _run_cli(["kanban", "routing-lane", tid, "coding_routine"])
+    conn = kb.connect()
+    try:
+        after = dict(conn.execute(
+            "SELECT status, assignee, gate_state FROM tasks WHERE id = ?",
+            (tid,)).fetchone())
+    finally:
+        conn.close()
+    assert after == before
+
+
+def test_the_worker_bind_stamps_its_own_run_only(board, monkeypatch):
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        mine = kb.create_task(conn, title="mine", assignee="coder")
+        other = kb.create_task(conn, title="other", assignee="coder")
+        kb.claim_task(conn, mine)
+        kb.claim_task(conn, other)
+        my_run = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (mine,)
+        ).fetchone()["current_run_id"]
+        other_run = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (other,)
+        ).fetchone()["current_run_id"]
+    finally:
+        conn.close()
+
+    kt._session_bound_run_ids.clear()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", mine)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(my_run))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-mine")
+    assert kt.bind_worker_session_from_env() is True
+
+    conn = kb.connect()
+    try:
+        rows = {r["id"]: r["session_id"] for r in conn.execute(
+            "SELECT id, session_id FROM task_runs")}
+    finally:
+        conn.close()
+    assert rows[my_run] == "sess-mine"
+    assert rows[other_run] is None, "a sibling run must never be stamped"
+
+
+def test_the_bind_is_a_one_shot_and_retry_safe(board, monkeypatch):
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+        kb.claim_task(conn, tid)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["current_run_id"]
+    finally:
+        conn.close()
+    kt._session_bound_run_ids.clear()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    # No session yet: it must NOT mark the run done, so the next tick retries.
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    assert kt.bind_worker_session_from_env() is False
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-1")
+    assert kt.bind_worker_session_from_env() is True
+    assert kt.bind_worker_session_from_env() is False, "one shot per run"
+
+    conn = kb.connect()
+    try:
+        stored = conn.execute(
+            "SELECT session_id FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()["session_id"]
+    finally:
+        conn.close()
+    assert stored == "sess-1"
+
+
+def test_a_routed_run_writes_a_run_linked_terminal_record(board, tmp_path):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+        kb.set_routing_lane(conn, tid, "coding_routine", selected_by="Rick")
+        kb.claim_task(conn, tid)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["current_run_id"]
+        kb.record_run_session_id(conn, run_id, "sess-term")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    lines = _routing_lines(tmp_path)
+    terminal = [line for line in lines if line.get("run_ref")]
+    assert terminal, f"no run-linked record was written: {lines}"
+    rec = terminal[-1]
+    assert rec["task_id"] == tid
+    assert rec["run_ref"] == f"task_run:{run_id}"
+    assert rec["session_id"] == "sess-term"
+    assert rec["profile"] == "coder"
+    assert rec["lane"] == "coding_routine"
+    assert rec["selection"] == "manual"
+    assert rec["outcome"] == "completed"
+    assert rec["cost_status"] in ("joined", "unavailable")
+
+
+def test_an_unrouted_run_writes_no_routing_record(board, tmp_path):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    assert _routing_lines(tmp_path) == [], (
+        "a task with no lane is the unchanged default path"
+    )
+
+
+def test_the_usage_join_is_read_not_recomputed(board, tmp_path):
+    """When state.db carries usage for the session, it is joined verbatim."""
+    import sqlite3
+
+    from hermes_cli import routing_audit
+
+    state = tmp_path / "home" / "state.db"
+    raw = sqlite3.connect(state)
+    raw.executescript(
+        """
+        CREATE TABLE session_model_usage (
+          session_id TEXT, task TEXT, model TEXT, billing_provider TEXT,
+          input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+          cache_write_tokens INTEGER, reasoning_tokens INTEGER,
+          api_call_count INTEGER, last_seen INTEGER);
+        INSERT INTO session_model_usage VALUES
+          ('sess-j','', 'm','p', 10, 20, 5, 0, 1, 3, 1),
+          ('sess-j','', 'm','p',  1,  2, 0, 0, 0, 1, 2);
+        """
+    )
+    raw.commit()
+    raw.close()
+    usage = routing_audit.usage_for_session("sess-j")
+    assert usage == {
+        "input_tokens": 11, "output_tokens": 22, "cache_read_tokens": 5,
+        "reasoning_tokens": 1, "api_call_count": 4,
+    }
+    assert routing_audit.usage_for_session("sess-absent") is None
+    assert routing_audit.usage_for_session("") is None
+
+
+def test_a_credential_shaped_lane_never_reaches_the_log(board, tmp_path):
+    secret = "glpat-NOTAREALKEY-ABCDEFGHIJKLMNOP"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="coder")
+        kb.set_routing_lane(conn, tid, secret, selected_by=secret)
+    finally:
+        conn.close()
+    raw = (tmp_path / "home" / "logs" / "routing.jsonl").read_text()
+    assert secret not in raw
+    assert "NOTAREALKEY" not in raw
+
+
+def test_credential_values_are_redacted_in_any_field(board, tmp_path):
+    from hermes_cli import routing_audit
+
+    secret = "glpat-NOTAREALKEY-ABCDEFGHIJKLMNOP"
+    routing_audit.record_routing_decision(
+        task_id="t_1", lane="coding_routine", note=secret,
+        nested={"inner": secret}, listed=[secret],
+    )
+    raw = (tmp_path / "home" / "logs" / "routing.jsonl").read_text()
+    assert "NOTAREALKEY" not in raw
+    assert json.loads(raw.splitlines()[-1])["selection"] == "manual"
+
+
+def test_selection_cannot_be_overridden_by_a_caller(board, tmp_path):
+    from hermes_cli import routing_audit
+
+    routing_audit.record_routing_decision(
+        task_id="t_1", lane="x", selection="automatic")
+    assert _routing_lines(tmp_path)[-1]["selection"] == "manual"

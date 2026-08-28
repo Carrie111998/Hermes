@@ -3012,7 +3012,12 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        # observed_cwd (commit-7 confinement evidence) and session_id (the
+        # cost join key) were absent here while present in SCHEMA_SQL, so a
+        # drift rebuild silently DROPPED both and their data. The copy is
+        # ``old ∩ new``: every column a fresh board has must appear here.
+        # test_rebuilt_schema_matches_fresh now enforces that for every table.
+        " error TEXT, observed_cwd TEXT, session_id TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -4474,6 +4479,59 @@ def _append_event(
     )
 
 
+def _emit_terminal_routing_record(
+    conn: sqlite3.Connection, task_id: str, run_id: int, outcome: str,
+) -> None:
+    """Append the run-linked routing record when the task declared a lane.
+
+    M3A-ROUTING-POLICY §4.3: every substantial routed run appends one line to
+    ``logs/routing.jsonl``. This is that line, and it is written at the run's
+    terminal point because that is where the outcome and the usage join are
+    both known.
+
+    Token and cost figures are **joined, never recomputed**: the run's
+    ``session_id`` (stamped at worker bind) resolves against this profile's
+    ``state.db.session_model_usage``. When the join is unavailable the record
+    still lands with ``cost_status: "unavailable"`` — a routed run with no
+    numbers is more honest than a routed run with invented ones.
+
+    Best-effort throughout: a record must never fail the run it describes.
+    """
+    try:
+        row = conn.execute(
+            "SELECT t.routing_lane AS lane, t.project_id AS project_id, "
+            "       r.profile AS profile, r.session_id AS session_id, "
+            "       r.started_at AS started_at, r.ended_at AS ended_at "
+            "  FROM tasks t JOIN task_runs r ON r.id = ? "
+            " WHERE t.id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if row is None or not row["lane"]:
+            return
+        runtime = None
+        if row["started_at"] and row["ended_at"]:
+            runtime = int(row["ended_at"]) - int(row["started_at"])
+
+        from hermes_cli import routing_audit
+
+        usage = routing_audit.usage_for_session(row["session_id"] or "")
+        routing_audit.record_routing_decision(
+            task_id=task_id,
+            project_id=row["project_id"],
+            lane=row["lane"],
+            run_ref=f"task_run:{run_id}",
+            session_id=row["session_id"],
+            profile=row["profile"],
+            outcome=outcome,
+            runtime_seconds=runtime,
+            cost_status="joined" if usage else "unavailable",
+            **(usage or {}),
+        )
+    except Exception:
+        # Never raise out of a run's terminal path for an audit line.
+        pass
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4528,6 +4586,11 @@ def _end_run(
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
+    # The run's terminal point: outcome is known and the session key is
+    # stamped, so the run-linked routing record can be joined and written.
+    # Emitted only for a task that declared a lane (§4.3), and never allowed
+    # to fail the run it describes.
+    _emit_terminal_routing_record(conn, task_id, run_id, outcome)
     return run_id
 
 

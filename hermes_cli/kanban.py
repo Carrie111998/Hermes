@@ -805,6 +805,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    p_lane = sub.add_parser(
+        "routing-lane",
+        help="Record the routing lane for a task (manual choice, never inferred)",
+        description=(
+            "Declare which configured routing lane a task belongs to. The "
+            "choice is yours or a PM agent's; Hermes never infers a lane from "
+            "prompt text. Recording one changes no status and schedules "
+            "nothing — it labels the card and writes an audit record."
+        ),
+    )
+    p_lane.add_argument("task_id", help="Task id (t_…)")
+    p_lane.add_argument(
+        "lane", nargs="?", default=None,
+        help="Configured lane name (omit with --clear to remove one)",
+    )
+    p_lane.add_argument(
+        "--clear", action="store_true", help="Remove the task's lane",
+    )
+    p_lane.add_argument(
+        "--selected-by", default=None,
+        help="Who chose it. A display label, not an identity claim.",
+    )
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1022,6 +1045,81 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 # Command dispatch
 # ---------------------------------------------------------------------------
 
+def _configured_routing_lanes() -> "tuple[list[str], bool]":
+    """``(lane names, routing_is_configured)`` from config.yaml.
+
+    Read here rather than in ``kanban_db`` on purpose: the database primitive
+    stays config-independent, and the SURFACE is what tells an operator whether
+    the lane they typed is a real configured route.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        routing = (load_config() or {}).get("routing") or {}
+        lanes = routing.get("lanes") or {}
+        if isinstance(lanes, dict):
+            return sorted(str(k) for k in lanes), bool(routing)
+        if isinstance(lanes, list):
+            return sorted(str(x) for x in lanes), bool(routing)
+        return [], bool(routing)
+    except Exception:
+        return [], False
+
+
+def _cmd_routing_lane(args: argparse.Namespace) -> int:
+    """Record a manual routing lane. Never infers, never schedules."""
+    from hermes_cli import kanban_db as kb
+
+    task_id = str(getattr(args, "task_id", "") or "").strip()
+    lane = getattr(args, "lane", None)
+    clearing = bool(getattr(args, "clear", False))
+    if clearing:
+        lane = None
+    elif not (isinstance(lane, str) and lane.strip()):
+        print(
+            "kanban routing-lane: give a lane name, or --clear to remove one",
+            file=sys.stderr,
+        )
+        return 2
+
+    if lane is not None:
+        configured, has_routing = _configured_routing_lanes()
+        if configured and lane not in configured:
+            print(
+                f"kanban routing-lane: {lane!r} is not a configured lane. "
+                f"Configured lanes: {', '.join(configured)}",
+                file=sys.stderr,
+            )
+            return 2
+        if not has_routing:
+            # Visible diagnostic rather than silence: the lane is recorded,
+            # but the operator must not be left believing it names a route
+            # that config.yaml actually defines.
+            print(
+                "kanban routing-lane: warning — config.yaml has no `routing:` "
+                "section, so this lane is recorded but names no configured "
+                "route.",
+                file=sys.stderr,
+            )
+
+    conn = kb.connect(board=getattr(args, "board", None))
+    try:
+        ok = kb.set_routing_lane(
+            conn, task_id, lane,
+            selected_by=getattr(args, "selected_by", None),
+        )
+    finally:
+        conn.close()
+    if not ok:
+        print(f"kanban routing-lane: no such task: {task_id}", file=sys.stderr)
+        return 1
+    if lane is None:
+        print(f"Cleared the routing lane for {task_id}.")
+    else:
+        print(f"Recorded lane {lane!r} for {task_id} (manual selection).")
+    return 0
+
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …`` argparse dispatch.
 
@@ -1140,6 +1238,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "routing-lane": _cmd_routing_lane,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
