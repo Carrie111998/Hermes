@@ -5,7 +5,6 @@ from hermes_cli.cli_output import line_input
 
 import json
 import math
-import os
 import stat
 import sys
 import time
@@ -534,7 +533,7 @@ def _safe_recovery_source(path: Path) -> bytes:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
         raise SystemExit(f"Recovery source must be a regular non-reparse file: {path}")
     try:
-        return path.read_bytes()
+        return auth_mod._auth_store._read_auth_bytes(path)
     except OSError as exc:
         raise SystemExit(f"Cannot read recovery source: {path}") from exc
 
