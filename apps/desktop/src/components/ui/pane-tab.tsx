@@ -21,7 +21,7 @@ const TAB =
 
 // Full height: with the strip's rule removed there is no last-pixel row to
 // leave uncovered, so tabs fill the bar and no sliver of gutter shows through.
-const TAB_HORIZONTAL = 'h-full min-w-0 max-w-48 not-first:border-l not-first:border-l-(--ui-stroke-quaternary)'
+const TAB_HORIZONTAL = 'h-full min-w-0 max-w-48 pr-5 not-first:border-l not-first:border-l-(--ui-stroke-quaternary)'
 
 const TAB_VERTICAL =
   'w-full max-h-48 justify-center not-first:border-t not-first:border-t-(--ui-stroke-quaternary) [writing-mode:vertical-rl]'
