@@ -49,7 +49,7 @@ from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
-    extract_persisted_path,
+    extract_persisted_path, sanitize_tool_result_for_sink,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
@@ -316,7 +316,7 @@ def _emit_terminal_post_tool_call(
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
-            result=result,
+            result=sanitize_tool_result_for_sink(result),
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
             tool_call_id=tool_call_id or "",
@@ -1449,7 +1449,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     agent,
                     function_name=function_name,
                     function_args=function_args,
-                    result=result,
+                    result=sanitize_tool_result_for_sink(result),
                     effective_task_id=effective_task_id,
                     tool_call_id=tool_call_id,
                     duration_ms=int(duration * 1000),
@@ -1457,7 +1457,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+                logger.info("tool %s failed (%.2fs): %s", function_name, duration, sanitize_tool_result_for_sink(result)[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (
@@ -1719,7 +1719,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 agent,
                 function_name=name,
                 function_args=args,
-                result=function_result,
+                result=sanitize_tool_result_for_sink(function_result),
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 duration_ms=int((timeout_s or 0.0) * 1000),
@@ -1737,7 +1737,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     agent,
                     function_name=name,
                     function_args=args,
-                    result=function_result,
+                    result=sanitize_tool_result_for_sink(function_result),
                     effective_task_id=effective_task_id,
                     tool_call_id=tool_call_id,
                     status="cancelled",
@@ -1751,7 +1751,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     agent,
                     function_name=name,
                     function_args=args,
-                    result=function_result,
+                    result=sanitize_tool_result_for_sink(function_result),
                     effective_task_id=effective_task_id,
                     tool_call_id=tool_call_id,
                     status="error",
@@ -1770,7 +1770,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     agent,
                     function_name=function_name,
                     function_args=function_args,
-                    result=function_result,
+                    result=sanitize_tool_result_for_sink(function_result),
                     effective_task_id=effective_task_id,
                     tool_call_id=tool_call_id,
                     status="error",
@@ -1808,13 +1808,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
             if agent.verbose_logging:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
-                logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
+                logging.debug("Tool result (%d chars): %s", len(function_result), sanitize_tool_result_for_sink(function_result))
 
         agent._current_tool = None
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
-        display_function_result = function_result
+        display_function_result = sanitize_tool_result_for_sink(function_result)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -2101,7 +2101,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "message_agent":
             # Bot Mode teammate DM (tools/bot_mode_dm.py) — injected, not
             # registered: only a canonical Bot Chat session carries the
@@ -2126,7 +2126,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('message_agent', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('message_agent', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -2158,7 +2158,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "memory":
             def _execute(next_args: dict) -> Any:
                 target = next_args.get("target", "memory")
@@ -2197,7 +2197,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "clarify":
             def _execute(next_args: dict) -> Any:
                 from tools.clarify_tool import clarify_tool as _clarify_tool
@@ -2220,7 +2220,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "read_terminal":
             def _execute(next_args: dict) -> Any:
                 from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
@@ -2241,7 +2241,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "desktop_preview":
             def _execute(next_args: dict) -> Any:
                 if (next_args.get("action") or "").strip() == "read":
@@ -2265,7 +2265,28 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('desktop_preview', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('desktop_preview', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
+        elif function_name == "read_preview":
+            def _execute(next_args: dict) -> Any:
+                from tools.read_preview_tool import read_preview_tool as _read_preview_tool
+                return _read_preview_tool(
+                    start=next_args.get("start"),
+                    count=next_args.get("count"),
+                    callback=getattr(agent, "read_preview_callback", None),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('read_preview', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "drive_preview":
             def _execute(next_args: dict) -> Any:
                 from tools.drive_preview_tool import drive_preview_tool as _drive_preview_tool
@@ -2293,7 +2314,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('drive_preview', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('drive_preview', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "annotate_preview":
             def _execute(next_args: dict) -> Any:
                 from tools.annotate_preview_tool import annotate_preview_tool as _annotate_preview_tool
@@ -2316,7 +2337,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('annotate_preview', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('annotate_preview', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "read_window_below":
             def _execute(next_args: dict) -> Any:
                 from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
@@ -2335,7 +2356,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('read_window_below', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('read_window_below', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "tour":
             def _execute(next_args: dict) -> Any:
                 from tools.tour_tool import tour_tool as _tour_tool
@@ -2362,7 +2383,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('tour', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('tour', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "setup_mcp":
             def _execute(next_args: dict) -> Any:
                 from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
@@ -2384,7 +2405,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('setup_mcp', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('setup_mcp', function_args, tool_duration, result=sanitize_tool_result_for_sink(function_result))}")
         elif function_name == "delegate_task":
             _action_arg = str(function_args.get("action") or "").strip().lower()
             tasks_arg = function_args.get("tasks")
@@ -2668,8 +2689,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_result, (_ToolTimeoutResult, _ToolCancelledResult)
         )
         if isinstance(function_result, str):
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+            result_preview = sanitize_tool_result_for_sink(function_result) if agent.verbose_logging else (
+                sanitize_tool_result_for_sink(function_result)[:200] if len(function_result) > 200 else sanitize_tool_result_for_sink(function_result)
             )
             _result_len = len(function_result)
         else:
@@ -2696,7 +2717,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent,
                 function_name=function_name,
                 function_args=function_args,
-                result=function_result,
+                result=sanitize_tool_result_for_sink(function_result),
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 duration_ms=int(tool_duration * 1000),
@@ -2710,8 +2731,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 failed=_is_error_result,
                 tool_call_id=tool_call_id,
             )
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+            result_preview = sanitize_tool_result_for_sink(function_result) if agent.verbose_logging else (
+                sanitize_tool_result_for_sink(function_result)[:200] if len(function_result) > 200 else sanitize_tool_result_for_sink(function_result)
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -2736,10 +2757,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if agent.verbose_logging:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
-            _log_result = _multimodal_text_summary(function_result)
+            _log_result = sanitize_tool_result_for_sink(_multimodal_text_summary(function_result))
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
-        display_function_result = function_result
+        display_function_result = sanitize_tool_result_for_sink(function_result)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,

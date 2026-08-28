@@ -142,16 +142,24 @@ def _is_host_side_env(env) -> bool:
         return False
 
 
-def _write_to_spillover(content: str, filename: str):
-    """Write content host-side to $HERMES_HOME/cache/spillover.
+def sanitize_tool_result_for_sink(content: str) -> str:
+    """Force-redact result text before it reaches a non-model sink."""
+    if not isinstance(content, str) or not content:
+        return content
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(
+        redact_sensitive_text(content, force=True, file_read=True, redact_url_credentials=True),
+        force=True, redact_url_credentials=True,
+    )
 
-    Returns the absolute path string on success, None on failure.
-    """
+
+def _write_to_spillover(content: str, filename: str):
+    """Write sanitized content to host spillover; return path or None."""
     try:
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
         path = spill_dir / filename
-        path.write_text(content, encoding="utf-8", errors="replace")
+        path.write_text(sanitize_tool_result_for_sink(content), encoding="utf-8", errors="replace")
     except OSError as exc:
         logger.warning("Spillover write failed for %s: %s", filename, exc)
         return None
@@ -160,16 +168,7 @@ def _write_to_spillover(content: str, filename: str):
 
 
 def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
-    """Return the path where a remote backend can read *host_path*, or None.
-
-    ``cache/spillover`` is one of the auto-mounted/synced cache dirs
-    (tools/credential_files.py), so on docker it is bind-mounted and on
-    modal/ssh/daytona it is file-synced into the sandbox. Translate the
-    host path with the same helper the image tools use, force a sync for
-    synced backends, then PROBE readability — a persistent docker
-    container created before spillover joined the mount list won't have
-    the bind mount, and must fall back to the in-sandbox write.
-    """
+    """Return the readable remote path for a host spill, if mounted."""
     try:
         from tools.credential_files import to_agent_visible_cache_path
 
@@ -345,12 +344,13 @@ def maybe_persist_tool_result(
         return content
 
     filename = _safe_result_filename(tool_use_id)
-    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    safe_content = sanitize_tool_result_for_sink(content)
+    preview, has_more = generate_preview(safe_content, max_chars=config.preview_size)
 
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
     # caches, pruned by gateway housekeeping) regardless of backend.
-    host_path = _write_to_spillover(content, filename)
+    host_path = _write_to_spillover(safe_content, filename)
 
     if _is_host_side_env(env):
         if host_path is not None:
@@ -376,7 +376,7 @@ def maybe_persist_tool_result(
         storage_dir = _resolve_storage_dir(env)
         remote_path = f"{storage_dir}/{filename}"
         try:
-            if _write_to_sandbox(content, remote_path, env):
+            if _write_to_sandbox(safe_content, remote_path, env):
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
