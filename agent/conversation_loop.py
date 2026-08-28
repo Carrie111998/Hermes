@@ -37,6 +37,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.i18n import t
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -2055,7 +2056,7 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
-        agent._touch_activity(f"starting API call #{api_call_count}")
+        agent._touch_activity(t("status.api_call_start", n=api_call_count))
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -3532,8 +3533,7 @@ def run_conversation(
                         _backoff_touch_counter += 1
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                             agent._touch_activity(
-                                f"retry backoff ({retry_count}/{max_retries}), "
-                                f"{int(sleep_end - time.time())}s remaining"
+                                t("status.retry_backoff", c=retry_count, m=max_retries, s=int(sleep_end - time.time()))
                             )
                     if _retry.restart_with_redirected_messages:
                         break  # rebuild this iteration from the correction
@@ -4410,7 +4410,7 @@ def run_conversation(
                     api_request_id,
                     outcome="success",
                 )
-                agent._touch_activity(f"API call #{api_call_count} completed")
+                agent._touch_activity(t("status.api_call_done", n=api_call_count))
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -5172,7 +5172,7 @@ def run_conversation(
                 retry_count += 1
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
-                    f"API error recovery (attempt {retry_count}/{max_retries})"
+                    t("status.api_error_recovery", c=retry_count, m=max_retries)
                 )
                 
                 error_type = type(api_error).__name__
@@ -6636,8 +6636,7 @@ def run_conversation(
                     _backoff_touch_counter += 1
                     if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                         agent._touch_activity(
-                            f"error retry backoff ({retry_count}/{max_retries}), "
-                            f"{int(sleep_end - time.time())}s remaining"
+                            t("status.error_retry_backoff", c=retry_count, m=max_retries, s=int(sleep_end - time.time()))
                         )
                 if _retry.restart_with_redirected_messages:
                     # Leave the retry loop — the check right below rebuilds this
@@ -7654,7 +7653,7 @@ def run_conversation(
                 # timeout (HERMES_AGENT_TIMEOUT, default 1800s) and the
                 # gateway kills the session before the next activity
                 # touch fires (#69559, #69131).
-                agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
+                agent._touch_activity(t("status.tool_results_continue", n=api_call_count))
                 # Continue loop for next response
                 continue
             
@@ -7918,8 +7917,7 @@ def run_conversation(
                             _backoff_touch_counter += 1
                             if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                                 agent._touch_activity(
-                                    f"empty response retry backoff ({agent._empty_content_retries}/{_empty_retry_budget}), "
-                                    f"{int(sleep_end - time.time())}s remaining"
+                                    t("status.empty_retry_backoff", c=agent._empty_content_retries, m=_empty_retry_budget, s=int(sleep_end - time.time()))
                                 )
                         continue
 
