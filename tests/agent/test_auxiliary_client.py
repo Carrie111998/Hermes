@@ -2129,8 +2129,68 @@ class TestTransientTransportRetry:
             "A timeout is model-specific — the failed model must be forwarded "
             "so a same-provider sibling can be tried, not skipped wholesale."
         )
+        assert kwargs.get("failure_scope").value == "model"
+        assert kwargs.get("failed_base_url") == "https://integrate.api.nvidia.com/v1"
 
 
+class TestFailureScopeFallbackEligibility:
+    @staticmethod
+    def _entry(model):
+        return {
+            "provider": "custom",
+            "model": model,
+            "base_url": "https://gateway.example/v1",
+        }
+
+    def test_endpoint_failure_skips_same_endpoint_sibling(self, monkeypatch):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+        from agent.backend_identity import FailureScope, classify_failure_scope
+
+        entry = self._entry("model-b")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": [entry]},
+        )
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=AssertionError("endpoint sibling must be skipped before resolution"),
+        ):
+            result = _try_configured_fallback_chain(
+                task="title_generation",
+                failed_provider="custom",
+                failed_model=None,
+                failed_base_url="https://gateway.example/v1",
+                failure_scope=classify_failure_scope("connection error"),
+            )
+
+        assert result == (None, None, "")
+        assert classify_failure_scope("connection error") is FailureScope.ENDPOINT
+
+    def test_timeout_allows_same_endpoint_sibling_model(self, monkeypatch):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+        from agent.backend_identity import FailureScope, classify_failure_scope
+
+        entry = self._entry("model-b")
+        sibling_client = MagicMock()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": [entry]},
+        )
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(sibling_client, "model-b"),
+        ):
+            result = _try_configured_fallback_chain(
+                task="title_generation",
+                failed_provider="custom",
+                failed_model="model-a",
+                failed_base_url="https://gateway.example/v1",
+                failure_scope=classify_failure_scope("timeout"),
+            )
+
+        assert result[0] is sibling_client
+        assert result[1:] == ("model-b", "fallback_chain[0](custom)")
+        assert classify_failure_scope("timeout") is FailureScope.MODEL
 
 
 class TestAuxClientNoSdkRetries:

@@ -32,7 +32,6 @@ class TestClassifyFailureScope:
         for reason in (
             "rate limit",
             "timeout",
-            "connection error",
             "model incompatible with route",
             "invalid provider response",
         ):
@@ -43,6 +42,15 @@ class TestClassifyFailureScope:
         assert classify_failure_scope("weird new error") is FailureScope.MODEL
         assert classify_failure_scope(None) is FailureScope.MODEL
         assert classify_failure_scope("") is FailureScope.MODEL
+
+    def test_endpoint_unreachable_reason_invalidates_endpoint(self):
+        assert classify_failure_scope("connection error") is FailureScope.ENDPOINT
+
+    def test_endpoint_failure_skips_same_endpoint_sibling_models(self):
+        failed = _id("custom", "model-a", "http://gateway:9000/v1")
+        sibling = _id("custom", "model-b", "http://gateway:9000/v1")
+        scope = classify_failure_scope("connection error")
+        assert should_skip_candidate(sibling, failed, scope)
 
 
 class TestSameDeployment:

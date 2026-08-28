@@ -5708,6 +5708,8 @@ def _try_main_agent_model_fallback(
     task: str = None,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    failed_base_url: Optional[str] = None,
+    failure_scope: Any = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -5716,9 +5718,9 @@ def _try_main_agent_model_fallback(
     layer: if nothing the user asked for can serve the request, try the
     main chat model before giving up.
 
-    ``failed_model`` narrows the same-provider skip to the exact
-    (provider, model) pair that just failed, mirroring
-    :func:`_try_configured_fallback_chain`.  This matters for self-hosted /
+    ``failure_scope`` selects the identity axis invalidated by the failure,
+    mirroring :func:`_try_configured_fallback_chain`.  This matters for
+    self-hosted /
     custom endpoints serving several models behind one provider label: the
     aux compression model timing out says nothing about the health of the
     main agent model deployed on the same URL (real incident: aux
@@ -5726,9 +5728,11 @@ def _try_main_agent_model_fallback(
     identical endpoint was serving 448K-token turns fine — the
     provider-label skip discarded the one fallback that would have worked).
 
-    - Model-specific runtime failures (timeout, connection, rate limit,
-      model-incompatible, invalid response) pass ``failed_model``: skip the
-      main model only when it IS the exact model that failed.
+    - Model-specific runtime failures (timeout, rate limit, model-incompatible,
+      invalid response) pass ``failed_model``: skip the main model only when it
+      IS the exact model that failed.
+    - Endpoint failures pass ``failed_base_url``: skip every model behind the
+      unreachable endpoint, even when its provider or model differs.
     - Provider-wide failures (auth 401, payment 402) and legacy callers
       leave ``failed_model`` as None, keeping the whole-provider skip —
       the shared credentials/account are broken, so the main model on the
@@ -5759,10 +5763,20 @@ def _try_main_agent_model_fallback(
     )
 
     skip_model = (failed_model or "").strip().lower() or None
+    if failure_scope is None:
+        failure_scope = FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL
     if should_skip_candidate(
-        BackendIdentity.build(provider=main_provider, model=main_model),
-        BackendIdentity.build(provider=failed_provider, model=skip_model),
-        FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL,
+        BackendIdentity.build(
+            provider=main_provider,
+            model=main_model,
+            base_url=_read_main_base_url(),
+        ),
+        BackendIdentity.build(
+            provider=failed_provider,
+            model=skip_model,
+            base_url=failed_base_url,
+        ),
+        failure_scope,
     ):
         # The thing that failed IS the main model (or the failure was
         # provider-wide) — nothing to fall back to.
@@ -5876,6 +5890,8 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    failed_base_url: Optional[str] = None,
+    failure_scope: Any = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5883,15 +5899,13 @@ def _try_configured_fallback_chain(
     entry in order.  Each entry must have at least ``provider``; ``model``,
     ``base_url``, and ``api_key`` are optional.
 
-    ``failed_model`` narrows the skip check to the exact (provider, model)
-    pair that just failed, rather than the whole provider. Without it every
-    entry sharing the failed provider is skipped (the original behaviour).
-    Callers pass it only when a sibling model on the same provider could
-    plausibly recover:
+    ``failure_scope`` selects the identity axis invalidated by the failure.
+    ``failed_model`` and ``failed_base_url`` provide the corresponding failed
+    identity fields. Without an explicit scope, legacy callers retain the
+    original model-vs-provider behavior:
 
-    - Model-specific runtime failures (timeout, connection, rate limit,
-      model-incompatible, invalid response) pass ``failed_model`` so a
-      chain that intentionally lists several models under the same provider
+    - Model-specific runtime failures (timeout, rate limit, model-incompatible,
+      invalid response) pass ``failed_model`` so a chain that intentionally lists several models under the same provider
       — e.g. two more NVIDIA NIM models after the primary NIM model times
       out — is not skipped wholesale. Only the exact model that failed is
       skipped; the siblings still run instead of jumping straight to the
@@ -5914,22 +5928,19 @@ def _try_configured_fallback_chain(
         return None, None, ""
 
     skip_model = (failed_model or "").strip().lower() or None
-    # Identity + scope semantics owned by agent.backend_identity (#59561,
-    # #72468): a failed_model means the failure was model-scoped (timeout /
-    # connection / rate limit) — only the exact deployment is skipped; no
-    # failed_model means provider-wide (auth/payment) — the whole credential
-    # surface is skipped.
+    # Identity + scope semantics are owned by agent.backend_identity.
     from agent.backend_identity import (
         BackendIdentity,
         FailureScope,
         should_skip_candidate,
     )
 
+    if failure_scope is None:
+        failure_scope = FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL
     failed_ident = BackendIdentity.build(
-        provider=failed_provider, model=skip_model,
-    )
-    failure_scope = (
-        FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL
+        provider=failed_provider,
+        model=skip_model,
+        base_url=failed_base_url,
     )
     tried = []
     min_ctx = _task_minimum_context_length(task)
@@ -6054,6 +6065,9 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    failed_model: Optional[str] = None,
+    failed_base_url: Optional[str] = None,
+    failure_scope: Any = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -6075,9 +6089,19 @@ def _try_main_fallback_chain(
     if not chain:
         return None, None, ""
 
+    from agent.backend_identity import BackendIdentity, FailureScope, should_skip_candidate
+
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
-    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    skip = {p for p in (main_norm, "auto") if p}
+    skip_model = (failed_model or "").strip().lower() or None
+    if failure_scope is None:
+        failure_scope = FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL
+    failed_ident = BackendIdentity.build(
+        provider=failed_provider,
+        model=skip_model,
+        base_url=failed_base_url,
+    )
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -6090,7 +6114,15 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        if fb_norm in skip:
+        if fb_norm in skip or should_skip_candidate(
+            BackendIdentity.build(
+                provider=fb_provider,
+                model=fb_model,
+                base_url=str(entry.get("base_url") or ""),
+            ),
+            failed_ident,
+            failure_scope,
+        ):
             tried.append(f"{label} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm):
@@ -10490,20 +10522,22 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_timeout_error(first_err):
+                reason = "timeout"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
-            # Narrow the configured-chain skip to the exact model that
-            # failed ONLY for model-specific failures. Auth (401) and
-            # payment (402) errors are provider-wide — the credentials or
-            # account behind every model on that provider are the same — so
-            # a sibling model can't recover; keep skipping the whole
-            # provider so the main-agent-model safety net is still reached.
+            # Keep the failure scope attached to the failed route. Endpoint
+            # failures invalidate every model behind that URL; timeouts,
+            # rate limits, and model errors invalidate only one deployment.
+            from agent.backend_identity import FailureScope, classify_failure_scope
+            failure_scope = classify_failure_scope(reason)
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                final_model if failure_scope is FailureScope.MODEL else None
             )
+            _failed_base_url = _base_info or resolved_base_url
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
@@ -10513,21 +10547,30 @@ def _call_llm_impl(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    failed_base_url=_failed_base_url,
+                    failure_scope=failure_scope)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=_chain_failed_model,
+                        failed_base_url=_failed_base_url,
+                        failure_scope=failure_scope)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    failed_base_url=_failed_base_url,
+                    failure_scope=failure_scope)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        failed_base_url=_failed_base_url,
+                        failure_scope=failure_scope)
 
             if fb_client is not None:
                 _record_route_info(
@@ -11188,20 +11231,22 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_timeout_error(first_err):
+                reason = "timeout"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
-            # Narrow the configured-chain skip to the exact model that
-            # failed ONLY for model-specific failures. Auth (401) and
-            # payment (402) errors are provider-wide — the credentials or
-            # account behind every model on that provider are the same — so
-            # a sibling model can't recover; keep skipping the whole
-            # provider so the main-agent-model safety net is still reached.
+            # Keep the failure scope attached to the failed route. Endpoint
+            # failures invalidate every model behind that URL; timeouts,
+            # rate limits, and model errors invalidate only one deployment.
+            from agent.backend_identity import FailureScope, classify_failure_scope
+            failure_scope = classify_failure_scope(reason)
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                final_model if failure_scope is FailureScope.MODEL else None
             )
+            _failed_base_url = _base_info or resolved_base_url
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
@@ -11211,21 +11256,30 @@ async def _async_call_llm_impl(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    failed_base_url=_failed_base_url,
+                    failure_scope=failure_scope)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=_chain_failed_model,
+                        failed_base_url=_failed_base_url,
+                        failure_scope=failure_scope)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    failed_base_url=_failed_base_url,
+                    failure_scope=failure_scope)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        failed_base_url=_failed_base_url,
+                        failure_scope=failure_scope)
 
             if fb_client is not None:
                 # Convert sync fallback client to async

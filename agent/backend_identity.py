@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 class FailureScope(Enum):
     """Which identity axis a failure invalidates."""
 
-    #: Timeout, overload/429, connection blip, model-incompatible, invalid
-    #: response: evidence against ONE model deployment only.
+    #: Timeout, overload/429, model-incompatible, invalid response: evidence
+    #: against ONE model deployment only.
     MODEL = "model"
     #: Auth 401 / payment 402: evidence against the shared credential —
     #: every model reached with it is equally dead.
@@ -62,7 +62,10 @@ _REASON_SCOPES = {
     "rate limit": FailureScope.MODEL,
     "model incompatible with route": FailureScope.MODEL,
     "invalid provider response": FailureScope.MODEL,
-    "connection error": FailureScope.MODEL,
+    "connection error": FailureScope.ENDPOINT,
+    "endpoint unreachable": FailureScope.ENDPOINT,
+    "dns failure": FailureScope.ENDPOINT,
+    "connection refused": FailureScope.ENDPOINT,
     "timeout": FailureScope.MODEL,
 }
 
