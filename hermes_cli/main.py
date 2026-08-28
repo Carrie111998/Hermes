@@ -10750,6 +10750,17 @@ def cmd_update(args):
     )
 
     if is_managed():
+        if getattr(args, "commit", None) is not None:
+            try:
+                from hermes_cli.update_contract import (
+                    record_pinned_preflight_refusal_receipt,
+                )
+
+                record_pinned_preflight_refusal_receipt(
+                    "managed installation cannot run a source-pinned self-update."
+                )
+            except Exception:
+                pass
         managed_error("update Hermes Agent")
         return
 
@@ -10778,16 +10789,31 @@ def cmd_update(args):
     # exit 1 errors).
     from hermes_cli.update_contract import (
         evaluate_update_admission,
+        record_pinned_preflight_refusal_receipt,
         record_refusal_receipt,
     )
 
     refusal = evaluate_update_admission(PROJECT_ROOT)
     if refusal is not None:
         print(refusal.message)
-        record_refusal_receipt(refusal)
+        record_refusal_receipt(
+            refusal,
+            step_name=(
+                "pinned_target_preflight"
+                if getattr(args, "commit", None) is not None
+                else "admission"
+            ),
+        )
         sys.exit(2)
 
     if getattr(args, "check", False):
+        if getattr(args, "commit", None) is not None:
+            detail = "--check cannot be combined with --commit; --commit applies an update."
+            record_pinned_preflight_refusal_receipt(
+                detail, stop_reason="check-with-commit"
+            )
+            print(f"✗ {detail}")
+            sys.exit(2)
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
         branch = _resolve_update_branch(args)
@@ -10817,7 +10843,16 @@ def cmd_update(args):
 
     _update_lock = UpdateLock()
     if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
+        detail = describe_holder(_update_lock.holder)
+        if getattr(args, "commit", None) is not None:
+            # Lock contention prevents the exact target from reaching the
+            # implementation-level receipt boundary. Record the pinned refusal
+            # here so coordinators can distinguish a safe deferral from an
+            # unobserved host; normal unpinned contention remains unchanged.
+            record_pinned_preflight_refusal_receipt(
+                detail, stop_reason="update-lock-held"
+            )
+        print(detail)
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 

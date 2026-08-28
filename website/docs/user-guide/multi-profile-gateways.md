@@ -523,6 +523,38 @@ hermes-gateways restart
 
 User-modified skills are never overwritten.
 
+### Coordinated host-by-host rollout
+
+For a fleet rollout, select the repository's approved **full commit ID** from
+an approved branch, then run the same command independently on every host:
+
+```bash
+hermes update --commit <40-or-64-character-SHA>
+```
+
+The supplied ID must exactly equal the repository's full object ID and be
+reachable from the selected `--branch` (default: `main`). Hermes refreshes the
+selected branch's `origin/<branch>` tracking ref and validates that pinned target
+**before** it creates an update backup, pauses managed gateways, or cleans
+generated checkout churn. Every pinned admission refusal or fetch failure still
+writes a machine-readable update receipt, so fleet tooling can distinguish a
+host refusal from a host that never attempted the update. Hermes refuses
+abbreviated IDs, automatic branch switching, non-fast-forward changes, and both
+error-triggered ZIP fallback. In pinned mode it also refuses automatic index,
+autostash, or stash-conflict resets: it stops and preserves the stash/working
+tree for explicit recovery. If pinned validation, local-change preservation, or
+a post-merge critical syntax check fails, Hermes reports failure without a
+reset, branch-tip substitution, or alternate-source fallback; a successfully
+selected pinned target remains checked out for explicit operator recovery.
+
+This is a **checkout-level** operation: profiles that share a checkout also
+share its source tree, virtual environment, and update lock, so do not run
+updates concurrently for them. Run in parallel only for distinct
+`repo + HERMES_HOME` installations. After the code update Hermes attempts to
+restart managed gateways; system-scoped or manually managed gateways can still
+require an operator restart, and the update reports that incomplete state as a
+failure rather than healthy completion.
+
 ## Troubleshooting
 
 ### "Could not find service in domain for user gui: 501"

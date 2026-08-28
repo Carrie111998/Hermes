@@ -113,13 +113,10 @@ def evaluate_update_admission(project_root: Path) -> Optional[UpdateRefusal]:
     return None
 
 
-def record_refusal_receipt(refusal: UpdateRefusal) -> None:
-    """Write a minimal ``refused`` receipt for a blocked update attempt.
-
-    Gives fleet tooling a durable record that an update was ATTEMPTED and
-    refused ("not updatable in place, use <command>") instead of a silent
-    nothing. Best-effort; never raises.
-    """
+def _write_refusal_receipt(
+    *, step_name: str, detail: str, stop_reason: str
+) -> None:
+    """Best-effort common receipt writer for pre-update refusals."""
     try:
         from hermes_cli.update_receipt import (
             begin_update_receipt,
@@ -128,11 +125,35 @@ def record_refusal_receipt(refusal: UpdateRefusal) -> None:
         )
 
         begin_update_receipt()
-        record_step(
-            "admission",
-            False,
-            f"not updatable in place ({refusal.code}); use: {refusal.update_command}",
-        )
-        finalize_update_receipt("refused", stop_reason=refusal.code)
+        record_step(step_name, False, detail)
+        finalize_update_receipt("refused", stop_reason=stop_reason)
     except Exception as exc:
         logger.debug("Could not record refusal receipt: %s", exc)
+
+
+def record_refusal_receipt(
+    refusal: UpdateRefusal, *, step_name: str = "admission"
+) -> None:
+    """Write a minimal ``refused`` receipt for a blocked update attempt.
+
+    ``step_name`` remains ``admission`` for existing package/image callers.
+    Source-pinned callers pass ``pinned_target_preflight`` so fleet reducers can
+    distinguish their exact-target refusal from a host that never attempted an
+    update. Best-effort; never raises.
+    """
+    _write_refusal_receipt(
+        step_name=step_name,
+        detail=f"not updatable in place ({refusal.code}); use: {refusal.update_command}",
+        stop_reason=refusal.code,
+    )
+
+
+def record_pinned_preflight_refusal_receipt(
+    detail: str, *, stop_reason: str = "managed-install"
+) -> None:
+    """Persist a pinned-request refusal that happens before update admission."""
+    _write_refusal_receipt(
+        step_name="pinned_target_preflight",
+        detail=detail,
+        stop_reason=stop_reason,
+    )

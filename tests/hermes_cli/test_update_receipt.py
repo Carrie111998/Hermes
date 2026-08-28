@@ -196,6 +196,177 @@ class TestCommandBoundaryFinalization:
         assert ur.finalize_pending_update_receipt(2, "sys.exit(2)") is None
         assert ur.read_latest_receipt() is None
 
+    def test_managed_pinned_request_writes_preflight_refusal_receipt(
+        self, receipt_home, monkeypatch
+    ):
+        """A managed install is still an observable pinned-update refusal."""
+        from types import SimpleNamespace
+
+        from hermes_cli import main as hermes_main
+
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: True)
+        monkeypatch.setattr("hermes_cli.config.managed_error", lambda _action: None)
+        args = SimpleNamespace(
+            check=False,
+            gateway=False,
+            plan=False,
+            branch=None,
+            commit="a" * 40,
+        )
+
+        hermes_main.cmd_update(args)
+
+        latest = ur.read_latest_receipt()
+        assert latest is not None
+        assert latest["outcome"] == "refused"
+        steps = {step["name"]: step for step in latest["steps"]}
+        assert steps["pinned_target_preflight"]["ok"] is False
+        assert "managed" in steps["pinned_target_preflight"]["detail"]
+
+    def test_check_and_pinned_target_refusal_writes_preflight_receipt(
+        self, receipt_home, monkeypatch, capsys
+    ):
+        """The apply-only flag conflict is an observable pinned refusal too."""
+        from types import SimpleNamespace
+
+        from hermes_cli import main as hermes_main
+
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+        monkeypatch.setattr(
+            "hermes_cli.update_contract.evaluate_update_admission",
+            lambda _root: None,
+        )
+        args = SimpleNamespace(
+            check=True,
+            gateway=False,
+            plan=False,
+            branch=None,
+            commit="a" * 40,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            hermes_main.cmd_update(args)
+
+        assert exc_info.value.code == 2
+        assert "--check cannot be combined with --commit" in capsys.readouterr().out
+        latest = ur.read_latest_receipt()
+        assert latest is not None
+        assert latest["outcome"] == "refused"
+        steps = {step["name"]: step for step in latest["steps"]}
+        assert steps["pinned_target_preflight"]["ok"] is False
+        assert "--check cannot be combined" in steps["pinned_target_preflight"]["detail"]
+
+    def test_pinned_target_lock_refusal_writes_preflight_receipt(
+        self, receipt_home, monkeypatch
+    ):
+        """Lock contention is a durable pinned-target refusal, not a silent exit."""
+        from types import SimpleNamespace
+
+        from hermes_cli import main as hermes_main
+        from hermes_cli.update_lock import UpdateHolder
+
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+        monkeypatch.setattr(
+            "hermes_cli.update_contract.evaluate_update_admission",
+            lambda _root: None,
+        )
+        monkeypatch.setattr(
+            hermes_main,
+            "_install_hangup_protection",
+            lambda gateway_mode: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            hermes_main, "_finalize_update_output", lambda state: None, raising=False
+        )
+
+        class _FakeLock:
+            holder = UpdateHolder(pid=731, age_seconds=9)
+
+            def acquire(self):
+                return False
+
+            def release(self):
+                raise AssertionError("A lock we did not acquire must not be released")
+
+        import hermes_cli.update_lock as update_lock_mod
+
+        monkeypatch.setattr(update_lock_mod, "UpdateLock", _FakeLock)
+        args = SimpleNamespace(
+            check=False,
+            gateway=False,
+            branch=None,
+            yes=False,
+            force=False,
+            force_venv=False,
+            commit="a" * 40,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            hermes_main.cmd_update(args)
+
+        assert exc_info.value.code == 2
+        latest = ur.read_latest_receipt()
+        assert latest is not None
+        assert latest["outcome"] == "refused"
+        step = latest["steps"][-1]
+        assert step["name"] == "pinned_target_preflight"
+        assert step["ok"] is False
+        assert "Another Hermes update is already running" in step["detail"]
+        assert latest["stop_reason"] == "update-lock-held"
+        assert ur._current is None
+
+    def test_cmd_update_persists_invalid_pinned_target_refusal(self, receipt_home, monkeypatch):
+        """Exact-target admission refusals are visible to fleet coordinators."""
+        from types import SimpleNamespace
+
+        from hermes_cli import main as hermes_main
+
+        monkeypatch.setattr(
+            hermes_main,
+            "_install_hangup_protection",
+            lambda gateway_mode: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            hermes_main, "_finalize_update_output", lambda state: None, raising=False
+        )
+
+        class _FakeLock:
+            holder = None
+
+            def acquire(self):
+                return True
+
+            def release(self):
+                pass
+
+        import hermes_cli.update_lock as update_lock_mod
+
+        monkeypatch.setattr(update_lock_mod, "UpdateLock", _FakeLock)
+        args = SimpleNamespace(
+            check=False,
+            gateway=False,
+            branch=None,
+            yes=False,
+            force=False,
+            force_venv=False,
+            commit="not-a-full-object-id",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            hermes_main.cmd_update(args)
+
+        assert exc_info.value.code == 2
+        latest = ur.read_latest_receipt()
+        assert latest is not None
+        assert latest["outcome"] == "refused"
+        assert latest["exit_code"] == 2
+        assert latest["steps"][-1]["name"] == "pinned_target_preflight"
+        assert latest["steps"][-1]["ok"] is False
+        assert "40- or 64-character" in latest["steps"][-1]["detail"]
+        assert ur._current is None
+
     def test_cmd_update_boundary_finalizes_on_early_exit(
         self, receipt_home, monkeypatch
     ):
