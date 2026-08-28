@@ -6,7 +6,7 @@ import { I18nProvider } from '@/i18n'
 import { $providerWaitSessions, setSessionProviderWait } from '@/store/provider-wait'
 import { $activeSessionId, $turnStartedAt } from '@/store/session'
 
-import { ResponseLoadingIndicator } from './status'
+import { resolveThreadActivityPhase, ResponseLoadingIndicator } from './status'
 
 function renderIndicator() {
   return render(
@@ -84,5 +84,35 @@ describe('status line', () => {
     const { container } = renderIndicator()
 
     expect(container.querySelector('[role="status"]')?.hasAttribute('data-conversation-scaffold')).toBe(true)
+  })
+})
+
+describe('resolveThreadActivityPhase', () => {
+  const base = {
+    awaitingInput: false,
+    busy: true,
+    compacting: false,
+    providerWait: '',
+    quiet: false,
+    stalled: false
+  }
+
+  it('prioritizes user input over every other active signal', () => {
+    expect(resolveThreadActivityPhase({ ...base, awaitingInput: true, compacting: true, stalled: true })).toBe('input-required')
+  })
+
+  it('keeps provider wording instead of guessing a wait deadline', () => {
+    expect(resolveThreadActivityPhase({ ...base, providerWait: 'waiting on local-model' })).toBe('provider-wait')
+  })
+
+  it('distinguishes compaction, stalled, quiet, and ordinary running work', () => {
+    expect(resolveThreadActivityPhase({ ...base, compacting: true })).toBe('compacting')
+    expect(resolveThreadActivityPhase({ ...base, stalled: true })).toBe('stalled')
+    expect(resolveThreadActivityPhase({ ...base, quiet: true })).toBe('quiet-running')
+    expect(resolveThreadActivityPhase(base)).toBe('running')
+  })
+
+  it('does not claim a running phase for an idle session', () => {
+    expect(resolveThreadActivityPhase({ ...base, busy: false })).toBe('idle')
   })
 })
