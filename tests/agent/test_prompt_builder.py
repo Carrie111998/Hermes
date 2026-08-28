@@ -1176,3 +1176,48 @@ class TestDescriptionTruncationBoundary:
         assert _extract_desc({"description": "Short one."}) == "Short one."
         assert _extract_desc({"description": ""}) == ""
         assert _extract_desc({}) == ""
+
+
+def test_a_snapshot_from_an_older_build_cannot_serve_stale_truncations(
+    monkeypatch, tmp_path
+):
+    """Descriptions are cached POST-truncation.
+
+    The disk snapshot is validated against SKILL.md mtime/size, so changing
+    where `extract_skill_description` cuts does not invalidate it — the files
+    did not change, only our code did. Without a version bump the improvement
+    ships to nobody holding a snapshot.
+    """
+    import json
+
+    from agent.prompt_builder import (
+        _SKILLS_PROMPT_CACHE,
+        _SKILLS_SNAPSHOT_VERSION,
+        build_skills_system_prompt,
+        clear_skills_system_prompt_cache,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    d = tmp_path / "skills" / "tools" / "objects"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: objects\ndescription: Create and review Durable Objects. "
+        "Use when building stateful apps.\n---\n"
+    )
+
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    assert "Use when bu..." not in build_skills_system_prompt()
+
+    snap = tmp_path / ".skills_prompt_snapshot.json"
+    payload = json.loads(snap.read_text())
+    entries = payload.get("skills") or payload.get("entries") or []
+    rows = entries if isinstance(entries, list) else list(entries.values())
+    for row in rows:
+        if isinstance(row, dict) and row.get("frontmatter_name") == "objects":
+            row["description"] = "Create and review Durable Objects. Use when bu..."
+    payload["version"] = _SKILLS_SNAPSHOT_VERSION - 1
+    snap.write_text(json.dumps(payload))
+
+    _SKILLS_PROMPT_CACHE.clear()
+
+    assert "Use when bu..." not in build_skills_system_prompt()

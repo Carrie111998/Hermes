@@ -1519,7 +1519,12 @@ _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # org-shared skills; older snapshots are discarded and rebuilt.
 # 3: index entries carry `tags`, so v2 snapshots (which have none) must be
 # discarded rather than silently rendering tagless lines forever.
-_SKILLS_SNAPSHOT_VERSION = 3
+# 4: descriptions are stored ALREADY TRUNCATED, so a change to where
+# extract_skill_description cuts does not reach a machine holding a v3
+# snapshot — the manifest validates SKILL.md mtime/size, and those files did
+# not change, only our code did. Any edit to the truncation rule needs a bump
+# here or it silently ships to nobody.
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
