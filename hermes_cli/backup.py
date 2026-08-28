@@ -672,13 +672,19 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
             fd_dir = f"/proc/{pid}/fd"
             try:
                 fds = os.listdir(fd_dir)
-            except OSError:
+            except FileNotFoundError:
+                # The process exited after the /proc PID listing.
                 continue
+            except OSError:
+                return None
             for fd in fds:
                 try:
                     target = os.readlink(f"{fd_dir}/{fd}")
-                except OSError:
+                except FileNotFoundError:
+                    # The descriptor closed after its directory was listed.
                     continue
+                except OSError:
+                    return None
                 if _canonical(target) in watched:
                     pids.append(pid)
                     break
@@ -709,8 +715,9 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     the WAL journal is updated correctly, and all connections (old and
     new) converge on the restored data.
 
-    Falls back to the unlink+move approach on failure so restore never
-    blocks on a transient error.
+    Falls back to the unlink+move approach only after holder inspection
+    proves no other process has the database or its sidecars open. Refuses
+    the destructive fallback when holder inspection is unavailable.
     """
     try:
         dst_conn = sqlite3.connect(str(dst))
@@ -739,6 +746,15 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
         # the common case where no other process holds the DB open.
         try:
             holders = _foreign_db_holder_pids(dst)
+            if holders is None:
+                logger.error(
+                    "Refusing unlink+move restore of %s: database-holder "
+                    "inspection is unavailable, so the destructive fallback "
+                    "cannot be proven safe. Resolve the SQLite restore error "
+                    "and retry.",
+                    dst,
+                )
+                return False
             if holders:
                 # Replacing the inode under a live holder is the #90950
                 # corruption class: the holder keeps writing through a
