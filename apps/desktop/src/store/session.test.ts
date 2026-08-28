@@ -45,6 +45,7 @@ import {
   resolveComposerSessionKey,
   sessionBelongsToProfile,
   sessionPinId,
+  setComposerSelectionOwner,
   setConnection,
   setCurrentCwd,
   setCurrentCwdTransient,
@@ -104,6 +105,31 @@ describe('composer model persistence scope', () => {
 
     expect($currentModel.get()).toBe('grok-4')
     expect($currentProvider.get()).toBe('xai-oauth')
+  })
+
+  it('uses the live registry owner when the connection descriptor is stale', () => {
+    const remote = (profile: string) =>
+      ({ baseUrl: 'https://aibox.example', connectionId: 'aibox', mode: 'remote', profile }) as never
+
+    setConnection(remote('fred'))
+    setCurrentModel('grok-4')
+    setCurrentProvider('xai-oauth')
+    setCurrentModelSource('manual')
+
+    // ensureGatewayAgent publishes this coordinate even if getConnectionFor
+    // fails and $connection therefore still describes fred.
+    setComposerSelectionOwner('aibox', 'fred-work')
+    setCurrentModel('local/model')
+    setCurrentProvider('custom:local')
+    setCurrentModelSource('default')
+
+    setComposerSelectionOwner('aibox', 'fred')
+    expect($currentModel.get()).toBe('grok-4')
+    expect($currentProvider.get()).toBe('xai-oauth')
+
+    setComposerSelectionOwner('aibox', 'fred-work')
+    expect($currentModel.get()).toBe('local/model')
+    expect($currentProvider.get()).toBe('custom:local')
   })
 })
 
