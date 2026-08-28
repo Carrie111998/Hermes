@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 
 from tools.vision_tools import (
+    VISION_ANALYZE_SCHEMA,
     _build_native_vision_tool_result,
     _handle_vision_analyze,
     _supports_media_in_tool_results,
@@ -73,6 +74,18 @@ def _track_validated_frame_loads(monkeypatch):
 
     monkeypatch.setattr(ImageSequence, "Iterator", tracking_iterator)
     return loaded_frames
+
+
+# ─── Tool guidance ────────────────────────────────────────────────────────────
+
+
+def test_schema_does_not_prompt_duplicate_native_attachment_load():
+    """A native attachment path is a tool handle, not a reload instruction."""
+    description = VISION_ANALYZE_SCHEMA["description"].lower()
+
+    assert "already attached" in description
+    assert "answer directly" in description
+    assert "call this any time the user references an image" not in description
 
 
 # ─── _supports_media_in_tool_results ─────────────────────────────────────────
