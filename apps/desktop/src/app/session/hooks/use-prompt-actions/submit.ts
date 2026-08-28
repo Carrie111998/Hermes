@@ -12,12 +12,15 @@ import {
   stopVoicePlayback,
   takeVoicePlaybackInterrupted
 } from '@/lib/voice-playback'
+import { isWorkspaceSendBlocked } from '@/lib/workspace-send-gate'
 import {
   $composerAttachments,
   type ComposerAttachment,
   mainComposerScope,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching, currentGatewaySwitchGeneration } from '@/store/gateway-switch'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
@@ -98,6 +101,15 @@ const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
   setMessages
 }
 
+function workspaceSendBlocked(capturedGeneration?: number): boolean {
+  return isWorkspaceSendBlocked({
+    capturedGeneration,
+    currentGeneration: capturedGeneration === undefined ? undefined : currentGatewaySwitchGeneration(),
+    gatewaySwitching: $gatewaySwitching.get(),
+    pendingConnectionId: $pendingConnectionId.get()
+  })
+}
+
 /** The prompt submit pipeline, extracted from usePromptActions. */
 export function useSubmitPrompt(deps: SubmitPromptDeps) {
   const {
@@ -175,6 +187,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         !hasSendable ||
         (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
       ) {
+        return false
+      }
+
+      const capturedSwitchGeneration = currentGatewaySwitchGeneration()
+
+      // Sessions-switch barrier: fail closed before any turn side effects.
+      // Bot Mode talking across machines is not a switch and does not set
+      // $pendingConnectionId / $gatewaySwitching.
+      if (workspaceSendBlocked()) {
         return false
       }
 
@@ -722,6 +743,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         seedOptimistic(sessionId)
       }
 
+      if (workspaceSendBlocked(capturedSwitchGeneration)) {
+        return abortForSessionSwitch(sessionId)
+      }
+
       try {
         // Attach runs BEFORE prompt.submit, so a stale runtime id fails there
         // first and submit's own recovery never runs — that asymmetry is why
@@ -752,6 +777,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(liveSessionId)
         const text = buildContextText(syncedAttachments)
+
+        if (workspaceSendBlocked(capturedSwitchGeneration)) {
+          return abortForSessionSwitch(liveSessionId)
+        }
 
         const submitParams = (targetId: string) => ({
           session_id: targetId,

@@ -61,6 +61,11 @@ export function isCurrentGatewaySwitch(token: GatewaySwitchToken): boolean {
   return token === latestSwitchToken
 }
 
+/** Read-only view of the latest switch token for stale-generation send checks. */
+export function currentGatewaySwitchGeneration(): GatewaySwitchToken {
+  return latestSwitchToken
+}
+
 export function registerGatewaySwitchLifecycle(lifecycle: GatewaySwitchLifecycle): () => void {
   switchLifecycle = lifecycle
 

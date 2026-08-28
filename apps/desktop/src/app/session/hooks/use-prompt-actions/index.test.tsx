@@ -1665,7 +1665,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
   it('restores a degenerate slash payload to the composer instead of losing it', async () => {
     setComposerDraft('')
 
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1695,7 +1695,7 @@ describe('usePromptActions desktop slash pickers', () => {
 
   it('resumes an exact session id even when it is not in the loaded sidebar cache', async () => {
     const resumeStoredSession = vi.fn(async () => undefined)
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1715,7 +1715,7 @@ describe('usePromptActions desktop slash pickers', () => {
 
   it('opens the memory graph overlay for /journey and its aliases instead of hitting the backend', async () => {
     const openMemoryGraph = vi.fn()
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1810,7 +1810,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
     const seeds: Record<string, unknown>[] = []
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1841,7 +1841,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
   it('arms turnStartedAt at submit time instead of waiting for message.start', async () => {
     const seeds: Record<string, unknown>[] = []
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1869,7 +1869,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
   it('keeps a live turn clock when a second seed races it (?? guard)', async () => {
     const seeds: Record<string, unknown>[] = []
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
     const preArmed = Date.now() - 12_345
 
     let handle: HarnessHandle | null = null
@@ -1894,7 +1894,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
   it('flags prompt.submit with interrupted:true after a voice-playback barge', async () => {
     const { markVoicePlaybackInterrupted } = await import('@/lib/voice-playback')
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1930,7 +1930,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // busyRef lags $busy by one effect tick on the busy→false settle edge, so a
     // drained queue send would otherwise hit the busy guard and silently no-op.
     const busyRef = { current: true }
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1962,7 +1962,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     const updates: { sessionId: string; state: Record<string, unknown>; storedSessionId: null | string | undefined }[] =
       []
 
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     render(
@@ -2106,7 +2106,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // two ids were resolved in the same tick, so the explicit target IS
     // authoritative. Validating this caller against the (empty) binding would
     // null the target and silently drop the kickoff into nowhere.
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     render(
@@ -2280,7 +2280,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
       busy: true
     })
     const busyRef = { current: false }
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -2539,7 +2539,7 @@ describe('usePromptActions restoreToMessage', () => {
   })
 
   it('rewinds to the target user turn and resubmits its text', async () => {
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
     let lastState: Record<string, unknown> = {}
 
     let handle: HarnessHandle | null = null
@@ -2640,7 +2640,7 @@ describe('usePromptActions restoreToMessage', () => {
   })
 
   it('rejects non-user targets and unknown ids without touching the gateway', async () => {
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -2654,7 +2654,7 @@ describe('usePromptActions restoreToMessage', () => {
   })
 
   it('uses the clicked runtime user ordinal when the rendered message id is stale', async () => {
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let lastState: Record<string, unknown> = {}
     let handle: HarnessHandle | null = null
@@ -3638,7 +3638,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
   it('clears the active and cached turn clocks when stopping a turn', async () => {
     const states: Record<string, unknown>[] = []
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
     $turnStartedAt.set(1_700_000_000_000)
 
     let handle: HarnessHandle | null = null
@@ -3861,7 +3861,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
     let boundRuntimeId: string | null = null
     const createBackendSessionForSend = vi.fn(async () => 'brand-new-session-WRONG')
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     const resumeStoredSession = vi.fn(async (storedSessionId: string) => {
       expect(storedSessionId).toBe(STORED_SESSION_ID)
@@ -3901,7 +3901,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: 'rt-wrong-profile' }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-wrong-profile' }
     let boundRuntimeId: string | null = null
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     const resumeStoredSession = vi.fn(async () => {
       selectedStoredSessionIdRef.current = STORED_SESSION_ID
@@ -3938,7 +3938,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
   it('submits directly when the routed stored session already owns the live runtime', async () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: RECOVERED_SESSION_ID }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_ID }
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
     const resumeStoredSession = vi.fn()
 
     let handle: HarnessHandle | null = null
@@ -3975,7 +3975,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     let boundRuntimeId: string | null = null
 
     const createBackendSessionForSend = vi.fn(async () => 'brand-new-session-WRONG')
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     const resumeStoredSession = vi.fn(async () => {
       if (!recoverySucceeds) {
@@ -4471,7 +4471,7 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
       return NEW_RUNTIME_ID
     })
 
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     let handle: HarnessHandle | null = null
     render(
@@ -5215,7 +5215,7 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
 
   it('does not eagerly re-upload a chip already attached to this session', async () => {
     $connection.set({ mode: 'remote' } as never)
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     $composerAttachments.set([
       {
@@ -5254,7 +5254,7 @@ describe('uploadComposerAttachment remote read failures', () => {
       }
     })
 
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
 
     await expect(
       uploadComposerAttachment(
@@ -5464,7 +5464,7 @@ describe('usePromptActions stale-closure session routing', () => {
   })
 
   it('regenerates against the CURRENT session, not the stale closure session', async () => {
-    const requestGateway = vi.fn(async () => ({}) as never) as unknown as GatewayMock
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never) as unknown as GatewayMock
 
     const { handle, updated } = await renderWithStaleClosure(requestGateway, [
       { id: 'u1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
@@ -5490,7 +5490,7 @@ describe('usePromptActions stale-closure session routing', () => {
   })
 
   it('restores a checkpoint in the CURRENT session, not the stale closure session', async () => {
-    const requestGateway = vi.fn(async () => ({}) as never) as unknown as GatewayMock
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never) as unknown as GatewayMock
 
     const { handle, updated } = await renderWithStaleClosure(requestGateway, [
       { id: 'u1', parts: [textPart('first prompt')], role: 'user', timestamp: 0 },
@@ -5513,7 +5513,7 @@ describe('usePromptActions stale-closure session routing', () => {
   })
 
   it('edits a message in the CURRENT session, not the stale closure session', async () => {
-    const requestGateway = vi.fn(async () => ({}) as never) as unknown as GatewayMock
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never) as unknown as GatewayMock
 
     const { handle, updated } = await renderWithStaleClosure(requestGateway, [
       { id: 'u1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
@@ -5611,5 +5611,102 @@ describe('usePromptActions editMessage stale-target recovery (#82462)', () => {
     expect(
       (submitCalls[0]?.[1] as { truncate_before_user_ordinal?: unknown } | undefined)?.truncate_before_user_ordinal
     ).toBeUndefined()
+  })
+})
+
+describe('usePromptActions Sessions-switch send gate', () => {
+  afterEach(async () => {
+    cleanup()
+    const { $pendingConnectionId } = await import('@/store/connections')
+    const { $gatewaySwitching, endGatewaySwitch } = await import('@/store/gateway-switch')
+    $pendingConnectionId.set(null)
+    endGatewaySwitch()
+    $gatewaySwitching.set(false)
+    vi.restoreAllMocks()
+  })
+
+  it('does not dispatch prompt.submit while a phase-1 dial is pending', async () => {
+    const { $pendingConnectionId } = await import('@/store/connections')
+    $pendingConnectionId.set('pop-os-hermes')
+
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    expect(await handle!.submitText('hello from the composer')).toBe(false)
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
+  })
+
+  it('does not dispatch prompt.submit while phase-2 commit is in flight', async () => {
+    const { $gatewaySwitching } = await import('@/store/gateway-switch')
+    $gatewaySwitching.set(true)
+
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    expect(await handle!.submitText('hello from the composer')).toBe(false)
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
+  })
+
+  it('aborts before prompt.submit when a Sessions switch starts after submit began', async () => {
+    const { beginGatewaySwitch } = await import('@/store/gateway-switch')
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        throw new Error('prompt.submit must not dispatch after a Sessions switch')
+      }
+
+      return {} as never
+    })
+
+    const activeSessionIdRef = { current: null as string | null }
+    const selectedStoredSessionIdRef = { current: null as string | null }
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={async () => {
+          beginGatewaySwitch()
+          activeSessionIdRef.current = RUNTIME_SESSION_ID
+          selectedStoredSessionIdRef.current = RUNTIME_SESSION_ID
+
+          return RUNTIME_SESSION_ID
+        }}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+
+    expect(await handle!.submitText('hello after a click')).toBe(false)
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('session.resume')
+  })
+
+  it('leaves a queued drain queued and does not replay prompt.submit from the blocked attempt', async () => {
+    const { $pendingConnectionId } = await import('@/store/connections')
+    $pendingConnectionId.set('local')
+    const requestGateway = vi.fn(async (_method: string) => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    expect(
+      await handle!.submitText('queued follow-up', {
+        fromQueue: true,
+        sessionId: RUNTIME_SESSION_ID,
+        storedSessionId: RUNTIME_SESSION_ID
+      })
+    ).toBe(false)
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
   })
 })

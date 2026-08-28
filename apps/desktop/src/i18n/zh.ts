@@ -2039,6 +2039,10 @@ export const zh: Translations = {
       gatewayUnreachable: gateway => `${gateway} · 无法连接`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `切换到 ${gateway} 上的 ${name}`,
+      consequence: 'Sessions moves to this gateway; the open chat stays on its current machine.',
+      switching: (name, gateway) => `Switching Sessions to ${name} on ${gateway}…`,
+      switchFailed: (name, gateway, previous) =>
+        `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
       deleteOn: gateway => `（位于 ${gateway}）`
     },
     remoteOverride: {
@@ -2537,6 +2541,7 @@ export const zh: Translations = {
     steer: '引导当前运行',
     stop: '停止',
     send: '发送',
+    sessionsSwitchingSendBlocked: "Can't send while Sessions is switching.",
     speaking: '讲话中',
     transcribing: '转写中',
     thinking: '思考中',

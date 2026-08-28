@@ -1855,6 +1855,10 @@ export const en: Translations = {
       gatewayUnreachable: gateway => `${gateway} · unreachable`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `Switch to ${name} on ${gateway}`,
+      consequence: 'Sessions moves to this gateway; the open chat stays on its current machine.',
+      switching: (name, gateway) => `Switching Sessions to ${name} on ${gateway}…`,
+      switchFailed: (name, gateway, previous) =>
+        `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
       deleteOn: gateway => ` on ${gateway}`
     },
     remoteOverride: {
@@ -2358,6 +2362,7 @@ export const en: Translations = {
     steer: 'Steer the current run',
     stop: 'Stop',
     send: 'Send',
+    sessionsSwitchingSendBlocked: "Can't send while Sessions is switching.",
     speaking: 'Speaking',
     transcribing: 'Transcribing',
     thinking: 'Thinking',

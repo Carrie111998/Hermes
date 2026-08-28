@@ -1575,6 +1575,9 @@ export interface Translations {
       gatewayUnreachable: (gateway: string) => string
       onGateway: (name: string, gateway: string) => string
       switchTo: (name: string, gateway: string) => string
+      consequence: string
+      switching: (name: string, gateway: string) => string
+      switchFailed: (name: string, gateway: string, previous: string) => string
       deleteOn: (gateway: string) => string
     }
     remoteOverride: {
@@ -2006,6 +2009,7 @@ export interface Translations {
     steer: string
     stop: string
     send: string
+    sessionsSwitchingSendBlocked: string
     speaking: string
     transcribing: string
     thinking: string

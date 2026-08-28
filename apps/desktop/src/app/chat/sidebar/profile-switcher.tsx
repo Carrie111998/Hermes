@@ -171,6 +171,7 @@ export function ProfileRail() {
   // Route key of the at-rest square whose switch is dialing (spinner on that
   // square, not in the statusbar — the previous source stays painted).
   const [pendingRoute, setPendingRoute] = useState<null | string>(null)
+  const [fleetSwitchStatus, setFleetSwitchStatus] = useState<null | string>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useFleetRoster(multipleConnections)
@@ -227,11 +228,22 @@ export function ProfileRail() {
 
   const switchToRest = (agent: FleetAgent) => {
     const key = fleetRouteKey(agent.connectionId, agent.profile)
+    const previous = activeConnection ? p.fleet.onGateway(gatewayProfile, activeConnection.label) : gatewayProfile
+
     triggerHaptic('selection')
     setPendingRoute(key)
+    setFleetSwitchStatus(p.fleet.switching(agent.profile, agent.connectionLabel))
 
     void selectConnection(agent.connectionId, { profile: agent.profile })
-      .catch((error: unknown) => notifyError(error, p.switchConnectionFailed(agent.connectionLabel)))
+      .then(() => {
+        setFleetSwitchStatus(current =>
+          current === p.fleet.switching(agent.profile, agent.connectionLabel) ? null : current
+        )
+      })
+      .catch((error: unknown) => {
+        notifyError(error, p.switchConnectionFailed(agent.connectionLabel))
+        setFleetSwitchStatus(p.fleet.switchFailed(agent.profile, agent.connectionLabel, previous))
+      })
       .finally(() => setPendingRoute(current => (current === key ? null : current)))
   }
 
@@ -404,6 +416,11 @@ export function ProfileRail() {
       data-tour="profile-rail"
       role="group"
     >
+      {fleetSwitchStatus ? (
+        <span aria-label={fleetSwitchStatus} aria-live="polite" role="status">
+          {fleetSwitchStatus}
+        </span>
+      ) : null}
       {/* Fleet: every gateway carries its own home square inside its group, so
           the pinned pill is purely the "all profiles on this gateway" toggle. */}
       {fleet && (
@@ -485,14 +502,31 @@ export function ProfileRail() {
                       data-slot="profile-rail-gateway"
                       role="group"
                     >
-                      {defaultProfile && (
-                        <ProfilePill
-                          active={onDefault}
-                          glyph="home"
-                          label={profileLabel(defaultProfile)}
-                          onSelect={() => selectProfile(defaultProfile.name)}
-                        />
-                      )}
+                      {defaultProfile &&
+                        (onDefault ? (
+                          <FleetActiveTuple
+                            connectionId={activeConnection?.id}
+                            glyph="home"
+                            label={
+                              activeConnection
+                                ? p.fleet.onGateway(profileLabel(defaultProfile), activeConnection.label)
+                                : profileLabel(defaultProfile)
+                            }
+                          />
+                        ) : (
+                          <ProfilePill
+                            active={false}
+                            connectionId={activeConnection?.id}
+                            description={p.fleet.consequence}
+                            glyph="home"
+                            label={
+                              activeConnection
+                                ? p.fleet.switchTo(profileLabel(defaultProfile), activeConnection.label)
+                                : profileLabel(defaultProfile)
+                            }
+                            onSelect={() => selectProfile(defaultProfile.name)}
+                          />
+                        ))}
                       {activeStrip}
                     </span>
                   </Fragment>
@@ -807,7 +841,8 @@ function ProfileDropdown({
             </DropdownMenuLabel>
             {[group.defaultAgent, ...group.named].map(agent => (
               <DropdownMenuItem
-                aria-label={p.fleet.onGateway(agent.profile, group.label)}
+                aria-description={p.fleet.consequence}
+                aria-label={p.fleet.switchTo(agent.profile, group.label)}
                 className="min-w-0"
                 key={agent.profile}
                 onSelect={() => onSelectRest(agent)}
@@ -861,11 +896,13 @@ interface ProfilePillProps {
   pending?: boolean
   slot?: string
   connectionId?: string
+  description?: string
 }
 
 function ProfilePill({
   active,
   connectionId,
+  description,
   glyph,
   label,
   muted = false,
@@ -877,6 +914,7 @@ function ProfilePill({
     <Tip label={label}>
       <Button
         aria-busy={pending || undefined}
+        aria-description={description}
         aria-label={label}
         aria-pressed={active}
         className={cn(
@@ -897,6 +935,22 @@ function ProfilePill({
           <Codicon name={glyph} size="0.875rem" />
         )}
       </Button>
+    </Tip>
+  )
+}
+
+function FleetActiveTuple({ connectionId, glyph, label }: { connectionId?: string; glyph: string; label: string }) {
+  return (
+    <Tip label={label}>
+      <span
+        aria-label={label}
+        className="inline-flex size-6 shrink-0 items-center justify-center rounded-[4px] bg-(--ui-control-active-background) text-foreground"
+        data-connection-id={connectionId}
+        data-slot="profile-rail-active-tuple"
+        role="status"
+      >
+        <Codicon name={glyph} size="0.875rem" />
+      </span>
     </Tip>
   )
 }
@@ -984,8 +1038,9 @@ function FleetRestGroup({
         <ProfilePill
           active={false}
           connectionId={group.connectionId}
+          description={p.fleet.consequence}
           glyph="home"
-          label={p.fleet.onGateway(group.defaultAgent.profile, group.label)}
+          label={p.fleet.switchTo(group.defaultAgent.profile, group.label)}
           muted
           onSelect={() => onSelect(group.defaultAgent)}
           pending={pendingRoute === defaultKey}
@@ -1037,7 +1092,7 @@ function RestSquare({
   const p = t.profiles
   const hue = color ?? 'var(--ui-text-quaternary)'
   const [pickerOpen, setPickerOpen] = useState(false)
-  const label = p.fleet.onGateway(agent.profile, agent.connectionLabel)
+  const label = p.fleet.switchTo(agent.profile, agent.connectionLabel)
 
   const pickColor = (next: null | string) => {
     onRecolor(next)
@@ -1055,6 +1110,7 @@ function RestSquare({
                 <TooltipTrigger asChild>
                   <button
                     aria-busy={pending || undefined}
+                    aria-description={p.fleet.consequence}
                     aria-label={label}
                     className="relative grid size-5 shrink-0 select-none place-items-center rounded-[3px] text-[0.5625rem] font-semibold uppercase leading-none opacity-35 transition-opacity hover:opacity-100 aria-busy:opacity-100"
                     data-connection-id={agent.connectionId}
