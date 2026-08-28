@@ -1354,9 +1354,7 @@ async def web_extract_tool(
                             break
                         if fetched.get("error"):
                             continue
-                        _content = (
-                            fetched.get("raw_content", "") or fetched.get("content", "")
-                        )
+                        _content = fetched.get("content", "")
                         if _content:
                             _extract_cache_put(
                                 fetch_urls[fetched_pos],
@@ -1428,10 +1426,10 @@ async def web_extract_tool(
             if result.get("error"):
                 continue
             url = result.get("url", "")
-            raw_content = result.get("raw_content", "") or result.get("content", "")
-            if not raw_content:
+            content = result.get("content", "")
+            if not content:
                 continue
-            clean = convert_base64_images_to_links(raw_content)
+            clean = convert_base64_images_to_links(content)
             model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
             result["content"] = model_text
             if truncated:

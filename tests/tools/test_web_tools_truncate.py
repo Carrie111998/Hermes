@@ -67,6 +67,39 @@ class TestCharLimitConfig:
 
 
 class TestEndToEnd:
+    def test_web_extract_returns_provider_clean_content(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        class FakeProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{
+                    "url": urls[0],
+                    "title": "Page",
+                    "content": "clean provider content",
+                    "raw_content": "raw provider content",
+                }]
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
+            serialized_result = asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(["https://example.com/clean"])
+            )
+
+        result = json.loads(serialized_result)
+
+        assert result["results"][0]["content"] == "clean provider content"
+        assert "raw_content" not in result["results"][0]
+        assert "raw_content" not in serialized_result
+        assert "raw provider content" not in serialized_result
+
     def test_web_extract_truncates_large_page_no_llm(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         big = "\n".join(f"para {i} " + "y" * 80 for i in range(3000))
