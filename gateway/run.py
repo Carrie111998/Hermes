@@ -26204,8 +26204,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 lines.append(output)
         omitted = len(entries) - len(shown)
         if omitted:
+            omitted_description = (
+                "status update" if has_supervision_loss else "completion"
+            )
             lines.append(
-                f"\n- … and {omitted} more completion(s); inspect them with "
+                f"\n- … and {omitted} more {omitted_description}(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
         lines.append(

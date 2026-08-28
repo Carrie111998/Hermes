@@ -524,6 +524,25 @@ def test_coalesced_format_bounds_details_and_reports_omitted_count():
     assert "and 2 more completion(s)" in text
 
 
+def test_coalesced_format_calls_omitted_lost_events_status_updates():
+    async def _format():
+        loop = asyncio.get_running_loop()
+        entries = []
+        for index in range(11):
+            event = _completion_event(
+                started_at=float(index), session_id=f"proc_lost_{index}"
+            )
+            event["exit_code"] = None
+            event["completion_reason"] = "lost"
+            entries.append((f"event-{index}", event, loop.create_future()))
+        return GatewayRunner._format_coalesced_process_completions(entries)
+
+    text = asyncio.run(_format())
+
+    assert "and 1 more status update(s)" in text
+    assert "completion(s)" not in text
+
+
 def test_coalesced_format_force_redacts_output_when_redaction_disabled(monkeypatch):
     """A user setting cannot disable the gateway's outbound secret floor."""
     import agent.redact as redact_module
