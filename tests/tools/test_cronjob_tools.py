@@ -246,6 +246,49 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_accepts_fireAt_alias(self):
+        from cron.jobs import get_job
+
+        fire_at = "2030-01-15T14:00:00+00:00"
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                fireAt=fire_at,
+                name="One-shot",
+            )
+        )
+
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["schedule"]["run_at"] == fire_at
+
+    def test_update_accepts_fireAt_alias(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 1h"))
+        fire_at = "2030-01-15T14:30:00+00:00"
+
+        updated = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": created["job_id"],
+                    "fireAt": fire_at,
+                },
+            )
+        )
+
+        assert updated["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["schedule"]["run_at"] == fire_at
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
