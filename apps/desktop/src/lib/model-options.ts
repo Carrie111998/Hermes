@@ -109,10 +109,15 @@ interface ModelOptionsRequest {
   sessionId?: null | string
 }
 
-export function modelOptionsQueryKey(profile: null | string | undefined, sessionId?: null | string) {
+export function modelOptionsQueryKey(
+  profile: null | string | undefined,
+  sessionId?: null | string,
+  ownerConnectionId?: null | string
+) {
   const profileKey = (profile ?? '').trim() || 'default'
+  const ownerKey = (ownerConnectionId ?? '').trim()
 
-  return ['model-options', profileKey, sessionId || 'global'] as const
+  return ['model-options', profileKey, sessionId || 'global', ...(ownerKey ? ['owner', ownerKey] : [])] as const
 }
 
 function hasSelectableModels(options: ModelOptionsResponse | null | undefined): boolean {

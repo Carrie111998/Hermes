@@ -199,6 +199,19 @@ describe('modelOptionsQueryKey', () => {
   it('keeps session catalogs inside the owning profile namespace', () => {
     expect(modelOptionsQueryKey(' compass ', 'session-1')).toEqual(['model-options', 'compass', 'session-1'])
   })
+
+  it('isolates identical profile and session names across registry connections', () => {
+    expect(modelOptionsQueryKey('default', 'session-1', 'source-a')).toEqual([
+      'model-options',
+      'default',
+      'session-1',
+      'owner',
+      'source-a'
+    ])
+    expect(modelOptionsQueryKey('default', 'session-1', 'source-a')).not.toEqual(
+      modelOptionsQueryKey('default', 'session-1', 'source-b')
+    )
+  })
 })
 
 describe('manualPickRemoved', () => {

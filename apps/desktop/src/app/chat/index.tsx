@@ -81,6 +81,7 @@ import { advanceTranscriptWindow, type TranscriptWindowState } from './transcrip
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
+  modelOptionsOwnerConnectionId?: string
   modelOptionsProfile?: string
   modelMenuContent?: React.ReactNode
   requestModelOptionsForOwner?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -359,6 +360,7 @@ export const ChatView = memo(function ChatView(props: ChatViewProps) {
 const ChatViewContent = memo(function ChatViewContent({
   className,
   gateway,
+  modelOptionsOwnerConnectionId,
   modelOptionsProfile,
   modelMenuContent,
   requestModelOptionsForOwner,
@@ -529,7 +531,11 @@ const ChatViewContent = memo(function ChatViewContent({
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
-    queryKey: modelOptionsQueryKey(modelOptionsProfile || activeGatewayProfile, activeSessionId),
+    queryKey: modelOptionsQueryKey(
+      modelOptionsProfile || activeGatewayProfile,
+      activeSessionId,
+      modelOptionsOwnerConnectionId
+    ),
     queryFn: () =>
       requestModelOptions({
         gateway: gateway || undefined,
