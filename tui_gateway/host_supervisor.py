@@ -86,16 +86,35 @@ def _default_registry_path() -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
+    # Never call os.kill(pid, 0) directly: on Windows CPython maps sig=0 to
+    # CTRL_C_EVENT (they collide at the C level) and routes it through
+    # GenerateConsoleCtrlEvent(0, pid), broadcasting Ctrl+C to the entire
+    # console process group containing the target PID. A read-only status
+    # check would then kill the process it inspects — and sibling processes
+    # sharing its console. See bpo-14484 and CONTRIBUTING.md rule 1.
+    # gateway.status._pid_exists is the canonical psutil-backed probe (with
+    # a ctypes OpenProcess/WaitForSingleObject fallback on Windows) and also
+    # handles zombie processes (issue #42126).
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        from gateway.status import _pid_exists
     except Exception:
+        # Log louder than debug so a missing probe (import-time failure of a
+        # transitive dep) is not silently indistinguishable from "process
+        # dead" — otherwise reconcile_startup_orphan concludes the old host
+        # died, removes the registry, and can spawn a second compute host
+        # alongside the live one.
+        logger.warning(
+            "gateway.status._pid_exists unavailable — treating pid=%s as gone",
+            pid,
+            exc_info=True,
+        )
+        return False
+    try:
+        return bool(_pid_exists(int(pid)))
+    except Exception:
+        logger.debug("pid liveness probe failed for pid=%s", pid, exc_info=True)
         return False
 
 
@@ -531,6 +550,39 @@ class HostSupervisor:
         return is_compute_host_identity(pid)
 
     def _terminate_pid(self, pid: int, *, timeout: float = _SHUTDOWN_TIMEOUT_SECS) -> None:
+        # Route through gateway.status.terminate_pid so the escalation path
+        # works on Windows too. signal.SIGKILL does not exist on Windows and
+        # a bare SIGTERM there does not cascade to child processes;
+        # terminate_pid(..., force=True) uses `taskkill /T /F` instead.
+        try:
+            from gateway.status import terminate_pid
+        except Exception:
+            logger.debug(
+                "gateway.status.terminate_pid unavailable; falling back to os.kill",
+                exc_info=True,
+            )
+            terminate_pid = None
+        if terminate_pid is not None:
+            try:
+                terminate_pid(pid)
+            except ProcessLookupError:
+                return
+            except Exception:
+                logger.debug("failed to SIGTERM compute host pid=%s", pid, exc_info=True)
+                return
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if not _pid_alive(pid):
+                    return
+                time.sleep(0.05)
+            try:
+                terminate_pid(pid, force=True)
+            except ProcessLookupError:
+                return
+            except Exception:
+                logger.debug("failed to force-kill compute host pid=%s", pid, exc_info=True)
+            return
+        # Fallback path (should not fire in practice): use os.kill directly.
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -543,12 +595,13 @@ class HostSupervisor:
             if not _pid_alive(pid):
                 return
             time.sleep(0.05)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, sigkill)
         except ProcessLookupError:
             return
         except Exception:
-            logger.debug("failed to SIGKILL compute host pid=%s", pid, exc_info=True)
+            logger.debug("failed to force-kill compute host pid=%s", pid, exc_info=True)
 
     def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
         if proc.poll() is not None:
