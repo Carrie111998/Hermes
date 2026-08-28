@@ -5988,6 +5988,86 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+def _gateway_owned_model_target(session: dict) -> tuple[str, str, Path] | None:
+    """Return the live gateway routing target for a messaging session."""
+    if not isinstance(session, dict):
+        return None
+
+    source = _session_source(session).strip().lower()
+    directly_gateway_owned = _is_gateway_owned_source(source)
+
+    agent = session.get("agent")
+    db = getattr(agent, "_session_db", None) or _get_db()
+    stored_session_id = str(session.get("session_key") or "").strip()
+    if db is None or not stored_session_id:
+        if not directly_gateway_owned:
+            return None
+        raise RuntimeError(
+            f"The {source} conversation routing record is unavailable, so its model was not changed."
+        )
+
+    try:
+        row = db.get_session(stored_session_id) or {}
+    except Exception as exc:
+        raise RuntimeError(
+            f"The {source} conversation routing record could not be read, so its model was not changed."
+        ) from exc
+
+    if not directly_gateway_owned:
+        handoff_state = str(row.get("handoff_state") or "").strip().lower()
+        handoff_platform = str(row.get("handoff_platform") or "").strip().lower()
+        if handoff_state != "completed" or not _is_gateway_owned_source(
+            handoff_platform
+        ):
+            return None
+        source = handoff_platform
+
+    gateway_session_key = str(row.get("session_key") or "").strip()
+    if not gateway_session_key:
+        raise RuntimeError(
+            f"The {source} conversation has no live gateway routing key, so its model was not changed."
+        )
+
+    profile_home = session.get("profile_home")
+    home = Path(profile_home) if profile_home else Path(get_hermes_home())
+    return source, gateway_session_key, home
+
+
+def _sync_gateway_owned_model_override(
+    session: dict, result: Any
+) -> dict[str, Any] | None:
+    """Apply a Desktop/TUI model pick to its live messaging owner."""
+    target = _gateway_owned_model_target(session)
+    if target is None:
+        return
+    source, gateway_session_key, home = target
+
+    from gateway.control_socket import (
+        GatewayControlTimeoutError,
+        set_gateway_session_model_override,
+    )
+
+    try:
+        response = set_gateway_session_model_override(
+            home,
+            session_key=gateway_session_key,
+            model=str(getattr(result, "new_model", "") or ""),
+            provider=str(getattr(result, "target_provider", "") or ""),
+            base_url=str(getattr(result, "base_url", "") or ""),
+        )
+    except GatewayControlTimeoutError as exc:
+        raise RuntimeError(
+            f"The {source} gateway did not confirm the model change in time, "
+            "so its outcome is unknown. Refresh the session before retrying."
+        ) from exc
+    if not response or response.get("applied") is not True:
+        raise RuntimeError(
+            f"The {source} gateway is unavailable, so this conversation's model was not changed. "
+            "Keep the gateway running and retry."
+        )
+    return response
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -5997,6 +6077,7 @@ def _apply_model_switch(
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
     persist_override: bool | None = None,
+    apply_local_agent: bool = True,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_switch_args,
@@ -6094,7 +6175,7 @@ def _apply_model_switch(
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
-    if agent:
+    if agent and apply_local_agent:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -6140,7 +6221,13 @@ def _apply_model_switch(
                 "confirm_message": confirm_msg,
             }
 
-    if agent:
+    gateway_response = None
+    if not persist_global and not one_turn and isinstance(session, dict):
+        # Update the external owner before mutating the local replay agent.
+        # A failed bridge is therefore a clean no-op, not split-brain state.
+        gateway_response = _sync_gateway_owned_model_override(session, result)
+
+    if agent and apply_local_agent:
         try:
             agent.switch_model(
                 new_model=result.new_model,
@@ -6187,7 +6274,12 @@ def _apply_model_switch(
     # contamination bug). agent.switch_model() above already mutated the right
     # agent in place; the override dict makes that choice survive a rebuild
     # without touching shared process state.
-    if pin_session_override and isinstance(session, dict) and not one_turn:
+    if (
+        apply_local_agent
+        and pin_session_override
+        and isinstance(session, dict)
+        and not one_turn
+    ):
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
@@ -6197,9 +6289,18 @@ def _apply_model_switch(
         }
     if persist_global:
         _persist_model_switch(result)
+    response_warning = result.warning_message or ""
+    if gateway_response:
+        durability_warning = str(
+            gateway_response.get("durability_warning") or ""
+        ).strip()
+        if durability_warning:
+            response_warning = "\n\n".join(
+                part for part in (response_warning, durability_warning) if part
+            )
     return {
         "value": result.new_model,
-        "warning": result.warning_message or "",
+        "warning": response_warning,
         "confirm_required": False,
         "scope": "once" if one_turn else ("global" if persist_global else "session"),
     }
@@ -13528,6 +13629,7 @@ def _(rid, params: dict) -> dict:
                         getattr(parsed, "explicit_provider", "") or ""
                     ).strip()
                     confirmed = bool(params.get("confirm_expensive_model", False))
+                    bridge_warning = ""
                     # Run the selection guards HERE, not only at apply time.
                     # This branch used to answer confirm_required=False without
                     # consulting them, so a client that implements the confirm
@@ -13566,6 +13668,35 @@ def _(rid, params: dict) -> dict:
                                     "deferred": False,
                                 },
                             )
+                    # The local replay agent cannot be mutated while it is
+                    # streaming, but an external messaging peer has a separate
+                    # gateway-owned runtime. Apply that peer now, then retain
+                    # the pending switch so this replay catches up next turn.
+                    if _gateway_owned_model_target(session) is not None:
+                        resolved = _apply_model_switch(
+                            params.get("session_id", ""),
+                            session,
+                            value,
+                            confirm_expensive_model=confirmed,
+                            parsed_flags=parsed,
+                            apply_local_agent=False,
+                        )
+                        if resolved.get("confirm_required"):
+                            return _ok(
+                                rid,
+                                {
+                                    "key": key,
+                                    "value": resolved["value"],
+                                    "warning": resolved.get("warning", ""),
+                                    "confirm_required": True,
+                                    "confirm_message": resolved.get(
+                                        "confirm_message", ""
+                                    ),
+                                    "scope": "session",
+                                    "deferred": False,
+                                },
+                            )
+                        bridge_warning = str(resolved.get("warning") or "")
                     session["pending_model_switch"] = {
                         "raw": value,
                         "confirm_expensive_model": confirmed,
@@ -13581,7 +13712,7 @@ def _(rid, params: dict) -> dict:
                         {
                             "key": key,
                             "value": pending_model,
-                            "warning": "",
+                            "warning": bridge_warning,
                             "confirm_required": False,
                             "confirm_message": "",
                             "scope": "session",

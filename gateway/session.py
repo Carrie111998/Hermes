@@ -3072,6 +3072,19 @@ class SessionStore:
                 return default
             return entry.metadata.get(key, default)
 
+    def has_session(self, session_key: str) -> bool:
+        """Whether this store currently owns a live routing entry."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return session_key in self._entries
+
+    def get_session_id(self, session_key: str) -> Optional[str]:
+        """Return the transcript ID currently owned by a routing key."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return entry.session_id if entry is not None else None
+
     def set_session_metadata(
         self,
         session_key: str,
@@ -3101,7 +3114,7 @@ class SessionStore:
 
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
-    ) -> None:
+    ) -> bool:
         """Persist (or clear) the session-scoped /model override.
 
         Only non-secret keys (model/provider/base_url — see
@@ -3109,17 +3122,21 @@ class SessionStore:
         are re-resolved at rehydration time via the normal runtime provider
         resolution.  Pass ``None`` (or a dict with no persistable values)
         to clear the persisted override, e.g. on /new.
+
+        Returns ``False`` when the routing key is no longer owned; callers
+        that bridge another process can then fail without recreating it.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
-                return
+                return False
             cleaned = sanitize_model_override(override)
             if entry.model_override == cleaned:
-                return
+                return True
             entry.model_override = cleaned
             self._save()
+            return True
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

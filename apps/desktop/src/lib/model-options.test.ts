@@ -5,6 +5,7 @@ import { getGlobalModelOptions } from '@/hermes'
 import {
   firstSelectableCatalogModel,
   manualPickRemoved,
+  MODEL_OPTIONS_REQUEST_TIMEOUT_MS,
   modelOptionsQueryKey,
   reconcileSelectionAfterCatalogRefresh,
   requestModelOptions,
@@ -35,7 +36,11 @@ describe('requestModelOptions', () => {
 
     await expect(requestModelOptions({ gateway: gateway as never, sessionId: null })).resolves.toBe(gatewayPayload)
 
-    expect(gateway.request).toHaveBeenCalledWith('model.options', { explicit_only: true })
+    expect(gateway.request).toHaveBeenCalledWith(
+      'model.options',
+      { explicit_only: true },
+      MODEL_OPTIONS_REQUEST_TIMEOUT_MS
+    )
     expect(getGlobalModelOptions).not.toHaveBeenCalled()
   })
 
@@ -111,11 +116,15 @@ describe('requestModelOptions', () => {
 
     await requestModelOptions({ gateway: gateway as never, refresh: true, sessionId: 'session-1' })
 
-    expect(gateway.request).toHaveBeenCalledWith('model.options', {
-      explicit_only: true,
-      refresh: true,
-      session_id: 'session-1'
-    })
+    expect(gateway.request).toHaveBeenCalledWith(
+      'model.options',
+      {
+        explicit_only: true,
+        refresh: true,
+        session_id: 'session-1'
+      },
+      MODEL_OPTIONS_REQUEST_TIMEOUT_MS
+    )
     expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true })
   })
 
@@ -151,7 +160,11 @@ describe('requestModelOptions', () => {
       routedPayload
     )
 
-    expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, session_id: 'tile-1' })
+    expect(request).toHaveBeenCalledWith(
+      'model.options',
+      { explicit_only: true, session_id: 'tile-1' },
+      MODEL_OPTIONS_REQUEST_TIMEOUT_MS
+    )
     expect(gateway.request).not.toHaveBeenCalled()
   })
 

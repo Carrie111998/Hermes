@@ -101,13 +101,25 @@ interface ModelOptionsRequest {
   /** Owner-routed RPC. When set, catalog reads hit this dispatcher instead of
    *  `gateway.request` — a tile's model menu must not query the ambient
    *  chrome socket (#93892). */
-  request?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  request?: <T>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ) => Promise<T>
   /** Profile for the REST recovery path. Must match the catalog owner so a
    *  secondary tile does not fall back to the launch profile's models. */
   profile?: null | string
   refresh?: boolean
   sessionId?: null | string
 }
+
+/**
+ * A model menu is an interactive control, not an open-ended background load.
+ * Bound the owner-routed RPC so a stale/disconnected messaging-session owner
+ * becomes a recoverable error instead of an infinite loading spinner.
+ */
+export const MODEL_OPTIONS_REQUEST_TIMEOUT_MS = 15_000
 
 export function modelOptionsQueryKey(profile: null | string | undefined, sessionId?: null | string) {
   const profileKey = (profile ?? '').trim() || 'default'
@@ -159,7 +171,7 @@ export async function requestModelOptions({
     let gatewayOptions: ModelOptionsResponse | undefined
 
     try {
-      gatewayOptions = await dispatch<ModelOptionsResponse>('model.options', params)
+      gatewayOptions = await dispatch<ModelOptionsResponse>('model.options', params, MODEL_OPTIONS_REQUEST_TIMEOUT_MS)
     } catch (error) {
       gatewayError = error
     }

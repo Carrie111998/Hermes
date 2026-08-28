@@ -12,7 +12,10 @@ import {
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setMessagingSessions,
+  setSelectedStoredSessionId,
+  setSessions
 } from '@/store/session'
 import type * as SessionStates from '@/store/session-states'
 
@@ -85,6 +88,9 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
+    setMessagingSessions([])
+    setSelectedStoredSessionId(null)
+    setSessions([])
   })
 
   afterEach(() => {
@@ -95,6 +101,9 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
+    setMessagingSessions([])
+    setSelectedStoredSessionId(null)
+    setSessions([])
   })
 
   it('applies the global model when there is no active runtime session', async () => {
@@ -274,6 +283,76 @@ describe('useModelControls', () => {
       value: 'claude-sonnet-4.6 --provider anthropic --global'
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+  })
+
+  it('keeps a Telegram-origin primary-pane model change scoped to that conversation', async () => {
+    $activeSessionId.set('telegram-runtime')
+    setSelectedStoredSessionId('telegram-stored')
+    setMessagingSessions([
+      {
+        ended_at: null,
+        id: 'telegram-stored',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 1,
+        message_count: 1,
+        model: 'z-ai/glm-5.2',
+        output_tokens: 0,
+        preview: 'hello',
+        source: 'telegram',
+        started_at: 1,
+        title: 'Telegram chat',
+        tool_call_count: 0
+      }
+    ])
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'gpt-5.6-sol' }) as never)
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(controls.selectModel({ model: 'gpt-5.6-sol', provider: 'openai-codex' })).resolves.toBe(true)
+
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: 'telegram-runtime',
+      key: 'model',
+      value: 'gpt-5.6-sol --provider openai-codex --session'
+    })
+  })
+
+  it('keeps a completed messaging handoff scoped to that conversation in the primary pane', async () => {
+    $activeSessionId.set('handoff-runtime')
+    setSelectedStoredSessionId('handoff-stored')
+    setSessions([
+      {
+        ended_at: null,
+        handoff_platform: 'telegram',
+        handoff_state: 'completed',
+        id: 'handoff-stored',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 1,
+        message_count: 1,
+        model: 'z-ai/glm-5.2',
+        output_tokens: 0,
+        preview: 'hello',
+        source: 'desktop',
+        started_at: 1,
+        title: 'Handed off Telegram chat',
+        tool_call_count: 0
+      }
+    ])
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'gpt-5.6-sol' }) as never)
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await controls.selectModel({ model: 'gpt-5.6-sol', provider: 'openai-codex' })
+
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: 'handoff-runtime',
+      key: 'model',
+      value: 'gpt-5.6-sol --provider openai-codex --session'
+    })
   })
 
   it('keeps a mid-turn pick painted and skips the refetch that would repaint the old model', async () => {
