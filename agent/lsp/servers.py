@@ -19,6 +19,7 @@ keeps cold-start fast — we don't probe binaries until needed.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -794,6 +795,51 @@ def _spawn_powershell_es(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
+def _spawn_fsautocomplete(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+    """Spawn Ionide's fsautocomplete F# language server.
+
+    fsautocomplete is a ``dotnet tool``.  Resolution order matches the
+    other auto-installable servers (config override, PATH, then
+    :func:`agent.lsp.install.try_install`), and ``try_install`` also
+    probes ``~/.dotnet/tools`` / ``$DOTNET_CLI_HOME/tools`` because
+    ``dotnet tool install -g`` often leaves that directory off PATH.
+
+    ``AutomaticWorkspaceInit`` is required: without it the server
+    waits for custom ``fsharp/workspacePeek`` + ``fsharp/workspaceLoad``
+    requests that Hermes never sends, so diagnostics would stay empty.
+    ``--state-directory`` keeps FSAC's workspace cache out of the
+    user's repo and under ``<HERMES_HOME>/lsp/``.
+    """
+    bin_path = _resolve_override(ctx, "fsautocomplete") or _which("fsautocomplete")
+    if bin_path is None:
+        from agent.lsp.install import try_install
+        bin_path = try_install("fsautocomplete", ctx.install_strategy)
+        if bin_path is None:
+            return None
+    from hermes_constants import get_hermes_home
+
+    digest = hashlib.sha256(os.path.abspath(root).encode("utf-8")).hexdigest()[:16]
+    state_dir = os.path.join(str(get_hermes_home()), "lsp", "fsautocomplete", digest)
+    os.makedirs(state_dir, exist_ok=True)
+    init: Dict[str, Any] = {"AutomaticWorkspaceInit": True}
+    init.update(ctx.init_overrides.get("fsautocomplete", {}))
+    env = dict(ctx.env_overrides.get("fsautocomplete", {}))
+    if "DOTNET_ROOT" not in env:
+        dotnet = _which("dotnet")
+        if dotnet:
+            try:
+                env["DOTNET_ROOT"] = os.path.dirname(os.path.realpath(dotnet))
+            except OSError:
+                pass
+    return SpawnSpec(
+        command=[bin_path, "--state-directory", state_dir],
+        workspace_root=root,
+        cwd=root,
+        env=env,
+        initialization_options=init,
+    )
+
+
 def hermes_lsp_session_dir() -> str:
     """Return (and create) the dir for PSES session/log scratch files."""
     from hermes_constants import get_hermes_home
@@ -961,6 +1007,66 @@ def _root_powershell(file_path: str, workspace: str) -> Optional[str]:
         workspace,
         ["PSScriptAnalyzerSettings.psd1"],
     )
+
+
+_FSHARP_EXACT_MARKERS = (
+    "paket.dependencies",
+    "global.json",
+    "Directory.Build.props",
+    "Directory.Packages.props",
+)
+
+
+def _fsharp_dir_markers(directory: str) -> Tuple[bool, bool]:
+    """Return ``(has_sln, has_proj_or_other)`` for one directory."""
+    has_sln = False
+    has_proj = False
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False, False
+    for name in names:
+        lowered = name.lower()
+        if lowered.endswith(".sln") or lowered.endswith(".slnx"):
+            has_sln = True
+        elif lowered.endswith(".fsproj") or name in _FSHARP_EXACT_MARKERS:
+            has_proj = True
+        if has_sln and has_proj:
+            break
+    return has_sln, has_proj
+
+
+def _root_fsharp(file_path: str, workspace: str) -> Optional[str]:
+    """Resolve the F# project root for fsautocomplete.
+
+    ``nearest_root`` only matches exact filenames, so ``*.sln`` /
+    ``*.fsproj`` can't go through it. Walk up from the file preferring
+    a solution, then a project/paket/global.json marker, then the git
+    workspace. fsautocomplete's AutomaticWorkspaceInit peeks inside
+    whatever root we hand it, so a solution directory is the best
+    starting point.
+    """
+    start = os.path.abspath(file_path)
+    if not os.path.isdir(start):
+        start = os.path.dirname(start)
+    workspace_abs = os.path.abspath(workspace) if workspace else None
+    found_proj: Optional[str] = None
+    cur = start
+    for _ in range(64):
+        has_sln, has_proj = _fsharp_dir_markers(cur)
+        if has_sln:
+            return cur
+        if has_proj and found_proj is None:
+            found_proj = cur
+        # Don't walk out of the git workspace — AutomaticWorkspaceInit
+        # peeks downward from whatever root we return.
+        if workspace_abs is not None and cur == workspace_abs:
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return found_proj or workspace
 
 
 # ---------------------------------------------------------------------------
@@ -1158,6 +1264,13 @@ SERVERS: List[ServerDef] = [
         resolve_root=_root_powershell,
         build_spawn=_spawn_powershell_es,
         description="PowerShell — PowerShellEditorServices (manual bundle)",
+    ),
+    ServerDef(
+        server_id="fsautocomplete",
+        extensions=(".fs", ".fsi", ".fsx"),
+        resolve_root=_root_fsharp,
+        build_spawn=_spawn_fsautocomplete,
+        description="F# — fsautocomplete (Ionide)",
     ),
 ]
 

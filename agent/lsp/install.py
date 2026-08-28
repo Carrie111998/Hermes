@@ -15,6 +15,9 @@ Strategies:
 - ``off`` — same as ``manual`` for now (kept distinct so we can
   evolve behavior later, e.g. logging differently).
 
+Package-manager backends: ``npm``, ``go``, ``pip``, and ``dotnet``
+(``dotnet tool install --tool-path``).
+
 The actual installs happen synchronously the first time a server is
 needed and concurrent calls to :func:`try_install` for the same
 package are deduplicated via a per-package lock.
@@ -109,6 +112,16 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     # require a manual bundle install and probe for the pwsh host so
     # `hermes lsp status` reports the host's presence.
     "powershell": {"strategy": "manual", "pkg": "", "bin": "pwsh"},
+    # F# — fsautocomplete is a .NET global tool.  Auto-install via
+    # ``dotnet tool install --tool-path <HERMES_HOME>/lsp/bin``.  The
+    # binary is also probed in ``~/.dotnet/tools`` (see
+    # :func:`_dotnet_tools_dir`) because ``dotnet tool install -g``
+    # often leaves that directory off PATH.
+    "fsautocomplete": {
+        "strategy": "dotnet",
+        "pkg": "fsautocomplete",
+        "bin": "fsautocomplete",
+    },
 }
 
 
@@ -129,6 +142,27 @@ def hermes_lsp_bin_dir() -> Path:
     p = get_hermes_home() / "lsp" / "bin"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _dotnet_tools_dir() -> Optional[Path]:
+    """Return the .NET global-tools directory if it exists.
+
+    ``dotnet tool install --global`` installs here, but the installer
+    only prints a PATH hint — it does not always mutate the user's
+    shell rc.  Probing the directory directly lets Hermes find
+    fsautocomplete (and future ``dotnet tool`` language servers) even
+    when ``~/.dotnet/tools`` is missing from PATH.
+
+    Honours ``DOTNET_CLI_HOME`` the same way the dotnet CLI does:
+    when set, tools live in ``$DOTNET_CLI_HOME/tools`` and the
+    default ``~/.dotnet/tools`` is ignored.
+    """
+    cli_home = os.environ.get("DOTNET_CLI_HOME")
+    if cli_home:
+        candidate = Path(cli_home) / "tools"
+        return candidate if candidate.is_dir() else None
+    home_tools = Path.home() / ".dotnet" / "tools"
+    return home_tools if home_tools.is_dir() else None
 
 
 def _native_binary_candidates(base: Path) -> list[Path]:
@@ -158,6 +192,15 @@ def _existing_binary(name: str) -> Optional[str]:
             on_path = shutil.which(f"{name}{suffix}")
             if on_path:
                 return on_path
+    # ``dotnet tool install -g`` installs into ~/.dotnet/tools (or
+    # $DOTNET_CLI_HOME/tools) without always putting that directory
+    # on PATH.  Probe it so fsautocomplete and future dotnet-tool
+    # servers are visible to ``hermes lsp status`` / spawn.
+    tools_dir = _dotnet_tools_dir()
+    if tools_dir is not None:
+        for cand in _native_binary_candidates(tools_dir / name):
+            if cand.exists() and os.access(cand, os.X_OK):
+                return str(cand)
     return None
 
 
@@ -229,6 +272,8 @@ def _do_install(pkg: str) -> Optional[str]:
         return _install_go(recipe.get("pkg", pkg), bin_name)
     if strategy == "pip":
         return _install_pip(recipe.get("pkg", pkg), bin_name)
+    if strategy == "dotnet":
+        return _install_dotnet(recipe.get("pkg", pkg), bin_name)
 
     logger.warning("[install] unknown strategy %r for %s", strategy, pkg)
     return None
@@ -338,6 +383,50 @@ def _install_go(pkg: str, bin_name: str) -> Optional[str]:
     if bin_path.exists():
         return str(bin_path)
     logger.warning("[install] go install for %s succeeded but bin %s not found", pkg, bin_name)
+    return None
+
+
+def _install_dotnet(pkg: str, bin_name: str) -> Optional[str]:
+    """Install a .NET global tool into ``<HERMES_HOME>/lsp/bin``.
+
+    Uses ``dotnet tool install --tool-path`` so the binary lands in
+    the Hermes-owned staging dir rather than the user's
+    ``~/.dotnet/tools``.  Requires ``dotnet`` on PATH.
+    """
+    dotnet = shutil.which("dotnet")
+    if dotnet is None:
+        logger.info("[install] cannot install %s: dotnet not on PATH", pkg)
+        return None
+    staging = hermes_lsp_bin_dir()
+    try:
+        logger.info("[install] dotnet tool install --tool-path %s %s", staging, pkg)
+        proc = subprocess.run(
+            [dotnet, "tool", "install", "--tool-path", str(staging), pkg],
+            check=False,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=600,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "[install] dotnet tool install failed for %s: %s",
+                pkg,
+                (proc.stderr or "").strip()[:500],
+            )
+            return None
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("[install] dotnet tool install errored for %s: %s", pkg, e)
+        return None
+    for cand in _native_binary_candidates(staging / bin_name):
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    logger.warning(
+        "[install] dotnet tool install for %s succeeded but bin %s not found",
+        pkg,
+        bin_name,
+    )
     return None
 
 
