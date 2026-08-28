@@ -1996,8 +1996,29 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         runner = None
     if runner is not None:
         try:
-            from gateway.config import Platform
-            live_adapter = runner.adapters.get(Platform.MATRIX)
+            # The live adapter's aiohttp session (and asyncio.wait_for/timeout
+            # context) is bound to the gateway's own event loop
+            # (runner._gateway_loop). Cron's standalone-delivery fallback
+            # runs this coroutine inside a *fresh* loop via asyncio.run()
+            # whenever the live-adapter delivery attempt itself failed or
+            # timed out (see cron/scheduler.py around line 2022) — reusing
+            # the gateway-loop-bound adapter from that fresh loop raises
+            # "Timeout context manager should be used inside a task"
+            # because asyncio's timeout machinery is loop-affine. Only take
+            # the fast path when we're actually executing on the gateway's
+            # own loop; otherwise fall through to the ephemeral adapter,
+            # which is safe from any thread/loop.
+            current_loop = asyncio.get_running_loop()
+            gateway_loop = getattr(runner, "_gateway_loop", None)
+            if gateway_loop is not None and current_loop is not gateway_loop:
+                logger.debug(
+                    "Matrix: live gateway adapter found but current loop != "
+                    "gateway loop; using ephemeral adapter to avoid a "
+                    "cross-loop timeout-context error"
+                )
+            else:
+                from gateway.config import Platform
+                live_adapter = runner.adapters.get(Platform.MATRIX)
         except Exception:
             logger.warning(
                 "Matrix: live gateway adapter lookup failed; falling back to an "
