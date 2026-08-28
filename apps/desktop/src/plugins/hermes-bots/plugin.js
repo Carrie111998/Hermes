@@ -311,6 +311,9 @@ const $botsPaneVisible = atom(false)
 /** An explicit open landed: {key, openedRegistryId}. This transient view
  *  observation is empty only for the legacy newChat draft fallback. */
 const $openBotChat = atom(null)
+// Shared between the visible Bots header action and the composer middleware:
+// a slash-triggered probe can ask the mounted pane for the existing confirm UI.
+const $pendingBotRollover = atom(null)
 /** A session owns the main workspace. The roster highlight and the home /
  *  Cronjobs lifecycles all key off this rather than reading host.state
  *  conditionally from render. */
@@ -5652,6 +5655,47 @@ let botOpenGeneration = 0
 /** The one canonical title. (profile, CANONICAL_CHAT_TITLE) IS the bot's
  *  forever-chat identity — see the header above. */
 const CANONICAL_CHAT_TITLE = 'Bot Chat'
+
+async function performBotSessionRollover(target, { force = false, refresh = null } = {}) {
+  const { executeBotRollover } = await import('./bot-session-rollover.mjs')
+  const result = await executeBotRollover({
+    target,
+    force,
+    request: requestForBot,
+    profileForBot: bot => backendTargetProfile(botConnectionRoute(bot), bot.name),
+    refresh: refresh || (() => queryClient.invalidateQueries({ queryKey: ROSTER_KEY })),
+    open: async (bot, storedId, summary) => {
+      await openStoredBotChat(bot, storedId, summary)
+      $openBotChat.set({
+        key: botRosterKey(bot),
+        openedRegistryId: String(storedId),
+        openedSessionId: String(storedId)
+      })
+    }
+  })
+
+  if (result?.confirmation_required) {
+    $pendingBotRollover.set(target)
+  }
+
+  return result
+}
+
+function botHistoryContentText(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map(part => (typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : ''))
+      .filter(Boolean)
+      .join('\n')
+  }
+  if (content == null) return ''
+  try {
+    return JSON.stringify(content, null, 2)
+  } catch {
+    return String(content)
+  }
+}
 
 async function openStoredBotChat(owner, storedId, summary) {
   if (!storedId || typeof host.openSession !== 'function') {
@@ -14835,6 +14879,12 @@ function BotsPane() {
   const [activityFilter, setActivityFilter] = useState('all')
   const [gatewayFilter, setGatewayFilter] = useState('all')
   const [collapsedRosterSections, setCollapsedRosterSections] = useState(() => new Set())
+  const [historyBot, setHistoryBot] = useState(null)
+  const [historyRows, setHistoryRows] = useState([])
+  const [historyMessages, setHistoryMessages] = useState([])
+  const [historySelected, setHistorySelected] = useState(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
   const hiddenSectionRef = useRef(null)
   const activityToasts = useValue($activityToasts)
   const groupChatName = useValue($groupChatWorkspace)
@@ -14849,6 +14899,7 @@ function BotsPane() {
   const rosterHydrated = useValue($rosterHydrated)
   const selectionHydrated = useValue($selectedRosterHydrated)
   const selectedRosterKey = useValue($selectedRosterKey)
+  const pendingRollover = useValue($pendingBotRollover)
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
   // retry immediately instead of waiting out the poll interval.
@@ -14890,6 +14941,79 @@ function BotsPane() {
 
     return activityOf(b) - activityOf(a)
   })
+  const selectedActionBot = selectedRosterBot(roster, selectedRosterKey)
+  const selectedCanonical = selectedActionBot?.canonical_session || null
+  const selectedActionTarget = selectedCanonical
+    ? {
+        bot: selectedActionBot,
+        canonical: selectedCanonical,
+        expectedCurrentSessionId: String(selectedCanonical.resolved_id || selectedCanonical.id || '')
+      }
+    : null
+
+  const runBotRollover = async (target, force = false) => {
+    if (!target) return
+    try {
+      const result = await performBotSessionRollover(target, {
+        force,
+        refresh: async () => {
+          await refetch()
+        }
+      })
+      if (!result?.confirmation_required) {
+        $pendingBotRollover.set(null)
+        host.notify?.({ kind: 'success', message: 'Started a fresh Bot session. Previous history is preserved.' })
+      }
+    } catch (rolloverError) {
+      host.notifyError?.(
+        rolloverError,
+        rolloverError?.rolloverCommitted
+          ? 'The fresh Bot session was created but could not be opened. Click the Bot again to retry opening it.'
+          : 'Could not start a fresh Bot session. Nothing was changed; try again.'
+      )
+      throw rolloverError
+    }
+  }
+
+  const loadBotHistory = async bot => {
+    if (!bot) return
+    setHistoryBot(bot)
+    setHistoryRows([])
+    setHistoryMessages([])
+    setHistorySelected(null)
+    setHistoryError('')
+    setHistoryLoading(true)
+    try {
+      const result = await requestForBot(bot, 'session.bot_history', {
+        profile: backendTargetProfile(botConnectionRoute(bot), bot.name),
+        limit: 50
+      })
+      setHistoryRows(Array.isArray(result?.sessions) ? result.sessions : [])
+    } catch (historyLoadError) {
+      setHistoryError(historyLoadError?.message || 'Could not load previous Bot sessions.')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  const loadBotHistoryTranscript = async row => {
+    if (!historyBot || !row?.id) return
+    setHistorySelected(row)
+    setHistoryMessages([])
+    setHistoryError('')
+    setHistoryLoading(true)
+    try {
+      const result = await requestForBot(historyBot, 'session.bot_history', {
+        profile: backendTargetProfile(botConnectionRoute(historyBot), historyBot.name),
+        session_id: row.id
+      })
+      setHistoryMessages(Array.isArray(result?.messages) ? result.messages : [])
+    } catch (historyLoadError) {
+      setHistoryError(historyLoadError?.message || 'Could not read that Bot session.')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
   // React Query can briefly report neither loading nor data while the plugin
   // and the persisted connection registry hydrate. Keep that transition in a
   // neutral loading state instead of flashing the first-run "No bots" copy.
@@ -15196,6 +15320,30 @@ function BotsPane() {
                     'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
                   onClick: () => setActivityToasts(!activityToasts),
                   children: jsx(Codicon, { name: activityToasts ? 'bell' : 'bell-slash' })
+                })
+              }),
+              jsx(Tip, {
+                label: selectedActionTarget ? 'New Bot Session' : 'Select a Bot to start a new session',
+                children: jsx('button', {
+                  type: 'button',
+                  'aria-label': 'New Bot Session',
+                  disabled: !selectedActionTarget,
+                  className:
+                    'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35',
+                  onClick: () => void runBotRollover(selectedActionTarget).catch(() => undefined),
+                  children: jsx(Codicon, { name: 'new-file' })
+                })
+              }),
+              jsx(Tip, {
+                label: selectedActionBot ? 'Previous Bot Sessions' : 'Select a Bot to view previous sessions',
+                children: jsx('button', {
+                  type: 'button',
+                  'aria-label': 'Previous Bot Sessions',
+                  disabled: !selectedActionBot,
+                  className:
+                    'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35',
+                  onClick: () => void loadBotHistory(selectedActionBot),
+                  children: jsx(Codicon, { name: 'history' })
                 })
               }),
               jsxs(DropdownMenu, {
@@ -15523,6 +15671,152 @@ function BotsPane() {
                       ]
                     })
                   }),
+      jsx(Dialog, {
+        open: Boolean(historyBot),
+        onOpenChange: value => {
+          if (!value) {
+            setHistoryBot(null)
+            setHistoryRows([])
+            setHistoryMessages([])
+            setHistorySelected(null)
+            setHistoryError('')
+          }
+        },
+        children: jsxs(DialogContent, {
+          className: 'max-w-3xl',
+          children: [
+            jsxs(DialogHeader, {
+              children: [
+                jsx(DialogTitle, { children: 'Previous Bot Sessions' }),
+                jsx(DialogDescription, {
+                  children: historyBot
+                    ? `Read-only history for ${displayName(historyBot, botRosterMeta(historyBot, allMeta))}. Starting a fresh session never deletes these transcripts.`
+                    : 'Read-only Bot history.'
+                })
+              ]
+            }),
+            historyError
+              ? jsxs('div', {
+                  className: 'grid gap-2 rounded-md bg-(--chrome-action-hover) p-2 text-xs text-(--ui-text-secondary)',
+                  children: [
+                    jsx('div', { children: historyError }),
+                    jsx(Button, {
+                      variant: 'secondary',
+                      size: 'sm',
+                      className: 'justify-self-start',
+                      onClick: () =>
+                        historySelected
+                          ? void loadBotHistoryTranscript(historySelected)
+                          : void loadBotHistory(historyBot),
+                      children: 'Retry'
+                    })
+                  ]
+                })
+              : null,
+            historyLoading
+              ? jsx('div', {
+                  className: 'flex min-h-40 items-center justify-center',
+                  children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+                })
+              : historySelected
+                ? jsxs('div', {
+                    className: 'grid min-h-0 gap-2',
+                    children: [
+                      jsx(Button, {
+                        variant: 'ghost',
+                        size: 'sm',
+                        className: 'justify-self-start',
+                        onClick: () => {
+                          setHistorySelected(null)
+                          setHistoryMessages([])
+                          setHistoryError('')
+                        },
+                        children: '← All previous sessions'
+                      }),
+                      jsx(ScrollArea, {
+                        className: 'h-[55vh] rounded-md border border-(--ui-stroke-tertiary)',
+                        children: jsx('div', {
+                          className: 'grid gap-3 p-3',
+                          children: historyMessages.length
+                            ? historyMessages.map((message, index) =>
+                                jsxs(
+                                  'div',
+                                  {
+                                    className: 'grid gap-1',
+                                    children: [
+                                      jsx('div', {
+                                        className: 'text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)',
+                                        children: message.role || 'message'
+                                      }),
+                                      jsx('pre', {
+                                        className: 'whitespace-pre-wrap break-words font-sans text-xs leading-5 text-(--ui-text-secondary)',
+                                        children: botHistoryContentText(message.content)
+                                      })
+                                    ]
+                                  },
+                                  message.id || `${message.role || 'message'}:${index}`
+                                )
+                              )
+                            : jsx(EmptyState, {
+                                icon: 'history',
+                                title: 'No stored messages',
+                                description: 'This retired session has no transcript rows.'
+                              })
+                        })
+                      })
+                    ]
+                  })
+                : historyRows.length
+                  ? jsx(ScrollArea, {
+                      className: 'max-h-[55vh]',
+                      children: jsx('div', {
+                        className: 'grid gap-1',
+                        children: historyRows.map(row =>
+                          jsxs(
+                            'button',
+                            {
+                              type: 'button',
+                              className:
+                                'grid w-full gap-0.5 rounded-md px-2.5 py-2 text-left transition-colors hover:bg-(--chrome-action-hover)',
+                              onClick: () => void loadBotHistoryTranscript(row),
+                              children: [
+                                jsx('span', {
+                                  className: 'text-xs font-medium text-(--ui-text-secondary)',
+                                  children: new Date((row.started_at || 0) * 1000).toLocaleString()
+                                }),
+                                jsx('span', {
+                                  className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+                                  children: `${row.message_count || 0} messages${row.preview ? ` · ${row.preview}` : ''}`
+                                })
+                              ]
+                            },
+                            row.id
+                          )
+                        )
+                      })
+                    })
+                  : jsx(EmptyState, {
+                      icon: 'history',
+                      title: 'No previous Bot sessions',
+                      description: 'When you start a fresh Bot session, the retired transcript will remain available here.'
+                    })
+          ]
+        })
+      }),
+      jsx(ConfirmDialog, {
+        open: Boolean(pendingRollover),
+        title: 'Stop active work and start fresh?',
+        description:
+          'This Bot is currently working or compressing. Hermes will stop that work, preserve this transcript as history, and open a genuinely empty Bot session.',
+        confirmLabel: 'Stop and Start Fresh',
+        busyLabel: 'Starting…',
+        doneLabel: 'Started',
+        onClose: () => $pendingBotRollover.set(null),
+        onConfirm: async () => {
+          if (!pendingRollover) return
+          await runBotRollover(pendingRollover, true)
+        }
+      }),
       jsx(CreateAgentDialog, {
         open: createOpen,
         onClose: () => {
@@ -16114,36 +16408,52 @@ export default {
         handler: async draft => {
           const text = draft.text || ''
 
-          // /new inside a bot's canonical forever-chat would fork the
-          // relationship into a scratch session — the one thing Bots mode
-          // promises never happens. Reroute to /compact (same felt effect:
-          // fresh working context, SAME conversation) and say so. Only
-          // guards the canonical chat: Sessions-mode scratchpads on the
-          // same profile keep full /new freedom.
-          const slashNew = /^\/(new|reset)\s*$/.exec(text.trim())
+          // Bot Mode /new and /reset are real canonical-session rollovers.
+          // Match the exact selected roster owner (connection + profile) and
+          // the focused STORED id (registry root or compression tip). A same-
+          // named bot elsewhere and every Sessions-mode chat pass through.
+          if (/^\/(?:new|reset)\s*$/i.test(text.trim())) {
+            const { botRolloverCommand, focusedCanonicalBot } = await import('./bot-session-rollover.mjs')
+            const rolloverCommand = botRolloverCommand(text)
+            const target = focusedCanonicalBot({
+              roster: $lastRoster.get(),
+              selectedKey: $selectedRosterKey.get(),
+              focusedStoredSessionId:
+                host.state.focusedStoredSessionId?.get?.() ??
+                host.state.activeSessionId?.get?.() ??
+                host.activeSessionId?.get?.() ??
+                null,
+              botsMode: $botsPaneVisible.get(),
+              keyForBot: botRosterKey
+            })
 
-          if (slashNew) {
-            const activeBot = $selectedBot.get()
-            // Canonical identity is the profile's "Bot Chat" registry row —
-            // read it from the roster cache (canonical_session, resolved
-            // server-side by name), matching either the durable row id or
-            // the compression-lineage tip currently on screen.
-            const roster = $lastRoster.get()
-            const row = Array.isArray(roster) ? roster.find(bot => bot?.name === activeBot) : null
-            const canonical = row?.canonical_session || null
-            const currentId = host.activeSessionId?.get?.() ?? null
-            const canonicalIds = [canonical?.id, canonical?.resolved_id].filter(Boolean).map(String)
+            if (target) {
+              try {
+                const result = await performBotSessionRollover(target)
+                if (result?.confirmation_required) {
+                  host.notify?.({
+                    kind: 'info',
+                    title: 'Active work needs confirmation',
+                    message: 'Use the Bots pane confirmation to stop the current work and start fresh.'
+                  })
+                } else {
+                  host.notify?.({
+                    kind: 'success',
+                    message: `/${rolloverCommand} started a fresh Bot session. Previous history is preserved.`
+                  })
+                }
+              } catch (rolloverError) {
+                host.notifyError?.(
+                  rolloverError,
+                  rolloverError?.rolloverCommitted
+                    ? `/${rolloverCommand} created the fresh Bot session, but it could not be opened. Click the Bot again to retry.`
+                    : `/${rolloverCommand} could not start a fresh Bot session. Nothing was changed; try again.`
+                )
+              }
 
-            if (activeBot && currentId && canonicalIds.includes(String(currentId))) {
-              host.notify({
-                kind: 'info',
-                title: 'This chat never resets',
-                message:
-                  'Bot chats are one continuous conversation — compacting instead. ' +
-                  'For a throwaway session with this agent, use Sessions mode.'
-              })
-
-              return { ...draft, text: '/compact' }
+              // Consume the slash text. It is never submitted to the model and
+              // never rewritten to /compact.
+              return null
             }
           }
 

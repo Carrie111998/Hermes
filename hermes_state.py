@@ -6112,6 +6112,267 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def rollover_bot_session(
+        self,
+        *,
+        new_session_id: str,
+        expected_current_session_id: str,
+        force: bool = False,
+        canonical_title: str = "Bot Chat",
+    ) -> Dict[str, Any]:
+        """Atomically replace one profile's canonical Bot Chat with a fresh row.
+
+        The exact *canonical_title* is the registry; no separately persisted
+        client pointer participates.  The old compression lineage remains in
+        the database as visible history, while the new row is unrelated and
+        carries only the bot/session configuration required to rebuild the
+        same profile identity.
+
+        Live compression and turn leases are checked inside the same
+        ``BEGIN IMMEDIATE`` transaction as the title transfer.  A non-forced
+        call is therefore a race-safe probe.  Expired/dead leases are reclaimed
+        without confirmation; a forced call deletes live leases to fence late
+        writes/publication before committing the boundary.
+        """
+        new_id = str(new_session_id or "").strip()
+        expected = str(expected_current_session_id or "").strip()
+        title = str(canonical_title or "").strip()
+        if not new_id:
+            raise ValueError("new_session_id required")
+        if not expected:
+            raise ValueError("expected_current_session_id required")
+        if not title:
+            raise ValueError("canonical_title required")
+
+        def _config(row: sqlite3.Row) -> Dict[str, Any]:
+            raw = row["model_config"]
+            if not raw:
+                return {}
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, json.JSONDecodeError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        def _is_continuation(
+            child: sqlite3.Row, parent_id: str, parent_end_reason: Optional[str]
+        ) -> bool:
+            if parent_end_reason != "compression" or child["source"] == "tool":
+                return False
+            cfg = _config(child)
+            return (
+                cfg.get("_branched_from") != parent_id
+                and cfg.get("_delegate_from") != parent_id
+                and cfg.get("_reset_from") != parent_id
+            )
+
+        def _lineage(conn, registry_row: sqlite3.Row) -> List[sqlite3.Row]:
+            root = registry_row
+            seen = {str(root["id"])}
+            for _ in range(100):
+                parent_id = str(root["parent_session_id"] or "")
+                if not parent_id:
+                    break
+                parent = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (parent_id,)
+                ).fetchone()
+                if (
+                    parent is None
+                    or str(parent["id"]) in seen
+                    or not _is_continuation(root, parent_id, parent["end_reason"])
+                ):
+                    break
+                root = parent
+                seen.add(str(root["id"]))
+
+            rows = [root]
+            current = root
+            for _ in range(100):
+                candidates = conn.execute(
+                    "SELECT child.* FROM sessions AS child "
+                    "WHERE child.parent_session_id = ? "
+                    "ORDER BY "
+                    "CASE "
+                    "  WHEN child.end_reason = 'compression' THEN 0 "
+                    "  WHEN child.ended_at IS NULL THEN 1 "
+                    "  ELSE 2 "
+                    "END, "
+                    f"{_sql_session_last_active('child')} DESC, "
+                    "child.started_at DESC, child.id DESC",
+                    (current["id"],),
+                ).fetchall()
+                child = next(
+                    (
+                        row
+                        for row in candidates
+                        if str(row["id"]) not in seen
+                        and _is_continuation(
+                            row, str(current["id"]), current["end_reason"]
+                        )
+                    ),
+                    None,
+                )
+                if child is None:
+                    break
+                rows.append(child)
+                seen.add(str(child["id"]))
+                current = child
+            return rows
+
+        def _holder_is_stale(holder: str, expires_at: Any, now: float) -> bool:
+            try:
+                expired = float(expires_at) <= now
+            except (TypeError, ValueError):
+                expired = True
+            return expired or _compression_lock_holder_process_is_dead(holder)
+
+        def _do(conn):
+            registry = conn.execute(
+                "SELECT * FROM sessions WHERE title = ? LIMIT 1", (title,)
+            ).fetchone()
+            if registry is None:
+                raise RuntimeError(f"canonical Bot Chat not found: {title}")
+
+            lineage = _lineage(conn, registry)
+            lineage_ids = [str(row["id"]) for row in lineage]
+            root = lineage[0]
+            tip = lineage[-1]
+
+            # Idempotent concurrent follower: once another BEGIN IMMEDIATE
+            # writer has transferred the title, the new canonical row is the
+            # answer.  It must not mint a second row or retire the winner.
+            if expected not in lineage_ids:
+                return {
+                    "created": False,
+                    "confirmation_required": False,
+                    "active_reasons": [],
+                    "previous_session_id": None,
+                    "previous_resolved_id": None,
+                    "current_session_id": str(registry["id"]),
+                }
+
+            now = time.time()
+            active_reasons: set[str] = set()
+            placeholders = ",".join("?" for _ in lineage_ids)
+
+            for lock in conn.execute(
+                f"SELECT session_id, holder, expires_at FROM compression_locks "
+                f"WHERE session_id IN ({placeholders})",
+                lineage_ids,
+            ).fetchall():
+                if _holder_is_stale(lock["holder"], lock["expires_at"], now):
+                    conn.execute(
+                        "DELETE FROM compression_locks "
+                        "WHERE session_id = ? AND holder = ?",
+                        (lock["session_id"], lock["holder"]),
+                    )
+                else:
+                    active_reasons.add("compression")
+
+            lease_keys = list(dict.fromkeys((str(root["id"]), *lineage_ids)))
+            lease_ph = ",".join("?" for _ in lease_keys)
+            for lease in conn.execute(
+                f"SELECT conversation_id, holder, expires_at "
+                f"FROM session_turn_leases WHERE conversation_id IN ({lease_ph})",
+                lease_keys,
+            ).fetchall():
+                if _holder_is_stale(lease["holder"], lease["expires_at"], now):
+                    conn.execute(
+                        "DELETE FROM session_turn_leases "
+                        "WHERE conversation_id = ? AND holder = ?",
+                        (lease["conversation_id"], lease["holder"]),
+                    )
+                else:
+                    active_reasons.add("turn")
+
+            if active_reasons and not force:
+                return {
+                    "created": False,
+                    "confirmation_required": True,
+                    "active_reasons": sorted(active_reasons),
+                    "previous_session_id": str(root["id"]),
+                    "previous_resolved_id": str(tip["id"]),
+                    "current_session_id": str(root["id"]),
+                }
+
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (new_id,)
+            ).fetchone():
+                raise RuntimeError(f"new Bot Chat session id already exists: {new_id}")
+
+            if force:
+                conn.execute(
+                    f"DELETE FROM compression_locks WHERE session_id IN ({placeholders})",
+                    lineage_ids,
+                )
+                conn.execute(
+                    f"DELETE FROM session_turn_leases "
+                    f"WHERE conversation_id IN ({lease_ph})",
+                    lease_keys,
+                )
+
+            retired_title = (
+                f"{title} (retired {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now))} "
+                f"{str(root['id'])[:12]})"
+            )
+            renamed = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = 'bot_rollover' "
+                "WHERE id = ? AND title = ?",
+                (retired_title, root["id"], title),
+            )
+            if renamed.rowcount != 1:
+                raise RuntimeError("canonical Bot Chat title changed during rollover")
+
+            conn.execute(
+                f"UPDATE sessions SET hidden = 0 WHERE id IN ({placeholders})",
+                lineage_ids,
+            )
+            retired = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'bot_rollover' "
+                "WHERE id = ?",
+                (now, tip["id"]),
+            )
+            if retired.rowcount != 1:
+                raise RuntimeError("canonical Bot Chat tip disappeared during rollover")
+
+            # No gateway peer/routing columns, parent, counters, activity,
+            # cooldowns, or messages are copied.  The row is immediately
+            # durable so title-registry lookups and relaunches cannot observe
+            # an empty window between retiring the old chat and first prompt.
+            conn.execute(
+                """INSERT INTO sessions (
+                       id, source, model, model_config, system_prompt,
+                       system_prompt_hash, started_at, cwd, git_branch,
+                       git_repo_root, profile_name, title, title_source, hidden
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                (
+                    new_id,
+                    tip["source"],
+                    tip["model"],
+                    tip["model_config"],
+                    tip["system_prompt"],
+                    tip["system_prompt_hash"],
+                    now,
+                    tip["cwd"],
+                    tip["git_branch"],
+                    tip["git_repo_root"],
+                    tip["profile_name"],
+                    title,
+                    self.TITLE_SOURCE_USER,
+                ),
+            )
+
+            return {
+                "created": True,
+                "confirmation_required": False,
+                "active_reasons": sorted(active_reasons),
+                "previous_session_id": str(root["id"]),
+                "previous_resolved_id": str(tip["id"]),
+                "current_session_id": new_id,
+            }
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def record_gateway_session_peer(
         self,
         session_id: str,

@@ -353,6 +353,8 @@ _LONG_HANDLERS = frozenset(
         # so a delayed status rehydrate cannot block runtime readiness, prompt
         # submission, or interrupts queued behind it on the same socket.
         "session.active_list",
+        "session.bot_history",
+        "session.bot_rollover",
         "session.branch",
         "session.compress",
         "session.list",
@@ -9441,6 +9443,25 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     marker = read_turn_marker(home, session_key)
     if marker is None:
         return None
+    if session.get("_bot_rollover"):
+        clear_turn_marker(home, session_key)
+        return None
+    try:
+        with _session_db(session) as db:
+            row = db.get_session(session_key) if db is not None else None
+            if row and db is not None:
+                tip_id = db.get_compression_tip(session_key) or session_key
+                if tip_id != session_key:
+                    row = db.get_session(tip_id) or row
+        if row and row.get("end_reason") == "bot_rollover":
+            clear_turn_marker(home, session_key)
+            return None
+    except Exception:
+        logger.debug(
+            "could not verify bot-rollover auto-continue boundary for %s",
+            session_key,
+            exc_info=True,
+        )
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
@@ -13094,6 +13115,13 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        # An explicit Bot-session rollover is a terminal conversation boundary.
+        # The old thread may finish its current Python stack, but it must never
+        # schedule goal/restart/notification follow-ups after the new unrelated
+        # canonical row exists.
+        if session.get("_bot_rollover"):
             return
 
         # Chain a goal-continuation turn if the judge said so. We do

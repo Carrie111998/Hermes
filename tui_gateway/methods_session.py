@@ -277,6 +277,282 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5006, str(e))
 
 
+@method("session.bot_rollover")
+def _(rid, params: dict) -> dict:
+    """Replace the owning profile's canonical Bot Chat with a fresh DB row.
+
+    ``force=false`` is a race-safe probe: meaningful live work returns
+    ``confirmation_required`` without moving the title.  ``force=true`` asks
+    the live runtime to stop and lets SessionDB fence compression/turn leases
+    in the same transaction as the title transfer.
+    """
+    expected = str(params.get("expected_current_session_id") or "").strip()
+    new_id = str(params.get("new_session_id") or "").strip() or uuid.uuid4().hex[:8]
+    force = is_truthy_value(params.get("force", False))
+    if not expected:
+        return _err(rid, 4002, "expected_current_session_id required")
+
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5006)
+        try:
+            canonical = db.get_session_by_title(BOT_CHAT_TITLE)
+            if canonical is None:
+                return _err(rid, 4007, "canonical Bot Chat not found")
+            lineage = db.get_compression_lineage(canonical["id"]) or [canonical["id"]]
+            lineage_ids = {str(value) for value in lineage if value}
+            try:
+                resolved = db.resolve_resume_session_id(canonical["id"]) or canonical["id"]
+            except Exception:
+                resolved = canonical["id"]
+            lineage_ids.add(str(resolved))
+
+            matches = []
+            # A concurrent winner may already have transferred the title.
+            # In that follower case, the current canonical lineage is the NEW
+            # session and must not be marked closing merely because this RPC
+            # still presents the retired expected id.
+            if expected in lineage_ids:
+                with _sessions_lock:
+                    candidates = list(_sessions.items())
+            else:
+                candidates = []
+            for ui_sid, session in candidates:
+                agent = session.get("agent")
+                owned = {
+                    str(session.get("session_key") or ""),
+                    str(getattr(agent, "session_id", "") or ""),
+                }
+                if owned & lineage_ids:
+                    matches.append((ui_sid, session))
+
+            running = []
+            marked = []
+            for ui_sid, session in matches:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        running.append((ui_sid, session))
+                    else:
+                        marked.append(
+                            (
+                                session,
+                                session.get("_closing"),
+                                session.get("_bot_rollover"),
+                            )
+                        )
+                        session["_closing"] = True
+
+            if running and not force:
+                for session, old_closing, old_rollover in marked:
+                    with session["history_lock"]:
+                        if old_closing is None:
+                            session.pop("_closing", None)
+                        else:
+                            session["_closing"] = old_closing
+                        if old_rollover is None:
+                            session.pop("_bot_rollover", None)
+                        else:
+                            session["_bot_rollover"] = old_rollover
+                return _ok(
+                    rid,
+                    {
+                        "created": False,
+                        "confirmation_required": True,
+                        "active_reasons": ["turn"],
+                        "previous_session_id": canonical["id"],
+                        "previous_resolved_id": resolved,
+                        "current_session_id": canonical["id"],
+                    },
+                )
+
+            if force:
+                for ui_sid, session in running:
+                    with session["history_lock"]:
+                        marked.append(
+                            (
+                                session,
+                                session.get("_closing"),
+                                session.get("_bot_rollover"),
+                            )
+                        )
+                        session["_closing"] = True
+
+            try:
+                result = db.rollover_bot_session(
+                    new_session_id=new_id,
+                    expected_current_session_id=expected,
+                    force=force,
+                    canonical_title=BOT_CHAT_TITLE,
+                )
+            except Exception:
+                for session, old_closing, old_rollover in marked:
+                    with session["history_lock"]:
+                        if old_closing is None:
+                            session.pop("_closing", None)
+                        else:
+                            session["_closing"] = old_closing
+                        if old_rollover is None:
+                            session.pop("_bot_rollover", None)
+                        else:
+                            session["_bot_rollover"] = old_rollover
+                raise
+
+            if result.get("confirmation_required"):
+                for session, old_closing, old_rollover in marked:
+                    with session["history_lock"]:
+                        if old_closing is None:
+                            session.pop("_closing", None)
+                        else:
+                            session["_closing"] = old_closing
+                        if old_rollover is None:
+                            session.pop("_bot_rollover", None)
+                        else:
+                            session["_bot_rollover"] = old_rollover
+                return _ok(rid, result)
+
+            if result.get("created"):
+                for ui_sid, session in matches:
+                    with session["history_lock"]:
+                        session["_closing"] = True
+                        session["_bot_rollover"] = True
+                        session["_turn_cancel_requested"] = True
+                        session["queued_prompt"] = None
+                        session.pop("queued_prompts", None)
+                        session.pop("_auto_continue_scheduled", None)
+                    _retire_turn_marker(session, *lineage_ids)
+                if force:
+                    # Commit the DB boundary first. Clearing the turn lease and
+                    # compression lock is the durable publication fence; only
+                    # then interrupt the old runtime. A failed DB transaction
+                    # therefore leaves the live turn and its queue untouched.
+                    for ui_sid, session in running:
+                        try:
+                            _interrupt_session_turn(
+                                ui_sid, session, request_id=f"bot-rollover-{rid}"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Bot rollover live-turn interrupt failed for %s",
+                                ui_sid,
+                                exc_info=True,
+                            )
+                    # Manual compression does not set session.running. Ask
+                    # every matching agent to abort; its now-deleted DB lease
+                    # makes any late publication fail closed without waiting.
+                    try:
+                        from agent.interrupt_compat import request_hard_interrupt
+
+                        for _ui_sid, session in matches:
+                            request_hard_interrupt(session.get("agent"))
+                    except Exception:
+                        pass
+
+            current = db.get_session(result["current_session_id"])
+            previous_id = result.get("previous_session_id")
+            previous = db.get_session(previous_id) if previous_id else None
+            previous_tip_id = result.get("previous_resolved_id") or previous_id
+            previous_tip = db.get_session(previous_tip_id) if previous_tip_id else None
+
+            def summary(row, *, count_row=None):
+                if row is None:
+                    return None
+                counter = count_row or row
+                return {
+                    "id": row["id"],
+                    "resolved_id": counter["id"],
+                    "title": row.get("title") or "",
+                    "started_at": row.get("started_at") or 0,
+                    "message_count": counter.get("message_count") or 0,
+                    "source": row.get("source") or "",
+                }
+
+            return _ok(
+                rid,
+                {
+                    **result,
+                    "current_session": summary(current),
+                    "previous_session": summary(previous, count_row=previous_tip),
+                },
+            )
+        except Exception as exc:
+            return _err(rid, 5006, f"Bot session rollover failed: {exc}")
+
+
+@method("session.bot_history")
+def _(rid, params: dict) -> dict:
+    """List or read retired Bot Chat lineages without reopening them.
+
+    This is deliberately read-only: ordinary ``session.resume`` clears an
+    explicit end boundary so the conversation can run again, which is the
+    wrong contract for a previous Bot session. Bots mode uses this focused
+    browser to keep ``bot_rollover`` durable while still exposing every old
+    message.
+    """
+    retired_prefix = "Bot Chat (retired "
+
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5006)
+        try:
+            def retired_summary(root):
+                if not root or not str(root.get("title") or "").startswith(retired_prefix):
+                    return None
+                tip_id = db.get_compression_tip(root["id"]) or root["id"]
+                tip = db.get_session(tip_id) or root
+                if tip.get("end_reason") != "bot_rollover":
+                    return None
+                return {
+                    "id": root["id"],
+                    "resolved_id": tip["id"],
+                    "title": root.get("title") or "",
+                    "started_at": root.get("started_at") or 0,
+                    "last_active": tip.get("last_activity_at") or tip.get("started_at") or 0,
+                    "message_count": tip.get("message_count") or 0,
+                    "source": root.get("source") or "",
+                    "preview": tip.get("preview") or "",
+                }
+
+            requested = str(params.get("session_id") or "").strip()
+            if requested:
+                root = db.get_session(requested)
+                summary = retired_summary(root)
+                if summary is None:
+                    return _err(rid, 4007, "retired Bot session not found")
+                messages = db.get_messages_as_conversation(
+                    summary["resolved_id"],
+                    include_ancestors=True,
+                    include_row_ids=True,
+                )
+                return _ok(
+                    rid,
+                    {
+                        "session": summary,
+                        "messages": _history_to_messages(messages),
+                    },
+                )
+
+            limit = max(1, min(200, int(params.get("limit", 50) or 50)))
+            rows = db.list_sessions_rich(
+                limit=max(limit * 2, 100),
+                order_by_last_active=True,
+                include_hidden=True,
+                compact_rows=True,
+                project_compression_tips=False,
+            )
+            sessions = []
+            for row in rows:
+                summary = retired_summary(db.get_session(row["id"]))
+                if summary is not None:
+                    sessions.append(summary)
+                    if len(sessions) >= limit:
+                        break
+            return _ok(rid, {"sessions": sessions})
+        except Exception as exc:
+            return _err(rid, 5006, f"Bot history failed: {exc}")
+
+
 @method("session.most_recent")
 def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.
