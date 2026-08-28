@@ -163,6 +163,28 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert state.interrupted_prompt_text == "original request"
 
 
+@pytest.mark.asyncio
+async def test_acp_cancel_accepts_none_final_response():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+
+    def interrupted_run(**_kwargs):
+        state.cancel_event.set()
+        return {
+            "final_response": None,
+            "messages": [],
+            "interrupted": True,
+        }
+
+    fake.run_conversation = interrupted_run
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="long-running request")],
+    )
+
+    assert response.stop_reason == "cancelled"
+
+
 
 
 
