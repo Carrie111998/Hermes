@@ -468,7 +468,7 @@ test('replay buffers sequence gaps and a tombstone preserves history while closi
   })
 })
 
-test('replay preserves opaque attachment ids in the renderer attachment shape', () => {
+test('replay preserves user and Bot attachment ids in the renderer attachment shape', () => {
   const replayed = reduceHostedRoomEvents(createHostedRoomReplayState({ roomId: 'room-1' }), [
     event(
       1,
@@ -476,11 +476,19 @@ test('replay preserves opaque attachment ids in the renderer attachment shape', 
       'message.user',
       { text: 'Review these', thread_id: 'thread-1', attachments: attachmentManifest() },
       { kind: 'user', id: 'desktop' }
+    ),
+    event(
+      2,
+      'event-member-with-attachments',
+      'message.member',
+      { text: 'Draft attached', thread_id: 'thread-1', attachments: attachmentManifest() },
+      { kind: 'member', id: 'research', display_name: 'Research', profile: 'research' }
     )
   ])
 
   assert.deepEqual(replayed.messages[0].images, attachmentManifest())
-  assert.doesNotMatch(JSON.stringify(replayed.messages[0]), /stage:|refs/)
+  assert.deepEqual(replayed.messages[1].images, attachmentManifest())
+  assert.doesNotMatch(JSON.stringify(replayed.messages), /stage:|refs/)
 })
 
 test('friendly status output uses typed reason codes without exposing coordination jargon', () => {
