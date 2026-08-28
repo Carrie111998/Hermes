@@ -11942,6 +11942,29 @@ def _is_electron_packaged_web_dist(path: str) -> bool:
     return "app.asar" in path.replace("\\", "/")
 
 
+def _desktop_runtime_discovery_can_follow_bind(
+    args,
+    *,
+    dashboard_public_url: str,
+    environ=None,
+) -> bool:
+    """Return whether runtime discovery may safely follow the ready socket.
+
+    Dashboard auth providers are plugins, so ordinary dashboards, public URLs,
+    and non-loopback binds must retain pre-bind discovery. The packaged Desktop
+    headless backend is different: its authenticated loopback control socket is
+    useful before agent plugins and MCP servers finish loading, while the agent
+    build path already waits for those registries before taking a tool snapshot.
+    """
+    env = os.environ if environ is None else environ
+    return bool(
+        getattr(args, "headless_backend", False)
+        and env.get("HERMES_DESKTOP") == "1"
+        and getattr(args, "host", "") in {"127.0.0.1", "localhost", "::1"}
+        and not dashboard_public_url.strip()
+    )
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     _token_file = getattr(args, "ssh_session_token_file", None)
@@ -11972,6 +11995,30 @@ def cmd_dashboard(args):
     # ready sentinel. Resolved once and threaded through the re-exec, the
     # build gate, and start_server.
     _headless_backend = getattr(args, "headless_backend", False)
+    _dashboard_public_url = ""
+    try:
+        from hermes_cli.config import read_raw_config as _read_raw_dashboard_config
+
+        _raw_dashboard = _read_raw_dashboard_config() or {}
+        _dashboard_section = _raw_dashboard.get("dashboard") or {}
+        if isinstance(_dashboard_section, dict):
+            _dashboard_public_url = str(
+                _dashboard_section.get("public_url") or ""
+            ).strip()
+    except Exception:
+        # Failure to prove that no public URL is configured keeps the
+        # conservative pre-bind discovery order.
+        _dashboard_public_url = "<unresolved>"
+    _dashboard_public_url = (
+        os.environ.get("HERMES_DASHBOARD_PUBLIC_URL", "").strip()
+        or _dashboard_public_url
+    )
+    _defer_desktop_runtime_discovery = (
+        _desktop_runtime_discovery_can_follow_bind(
+            args,
+            dashboard_public_url=_dashboard_public_url,
+        )
+    )
     _ssh_owner_nonce = getattr(args, "ssh_owner_nonce", None)
     if _ssh_owner_nonce and not re.fullmatch(r"[0-9a-f]{16}", _ssh_owner_nonce):
         raise SystemExit("--ssh-owner-nonce must be 16 lowercase hex characters")
@@ -12212,14 +12259,15 @@ def cmd_dashboard(args):
     # save ~500ms startup; we have to trigger it explicitly here because
     # the dashboard's server-side runtime depends on plugin-registered
     # providers (image_gen, web, dashboard_auth, …).
-    try:
-        from hermes_cli.plugins import discover_plugins
-        discover_plugins()
-    except Exception as exc:
-        # Discovery failures must not block dashboard startup outright —
-        # log and proceed; the gate's fail-closed branch will surface
-        # the missing-provider state if it matters.
-        print(f"⚠ Plugin discovery failed: {exc}", file=sys.stderr)
+    if not _defer_desktop_runtime_discovery:
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+        except Exception as exc:
+            # Discovery failures must not block dashboard startup outright —
+            # log and proceed; the gate's fail-closed branch will surface
+            # the missing-provider state if it matters.
+            print(f"⚠ Plugin discovery failed: {exc}", file=sys.stderr)
 
     # Desktop chat uses the dashboard's in-process /api/ws gateway, which builds
     # agents via tui_gateway.server._make_agent.  That path only snapshots the
@@ -12228,18 +12276,25 @@ def cmd_dashboard(args):
     # this, a profile's configured MCP servers never connect, so desktop
     # sessions show no MCP tools.  Spawn discovery in the background here so a
     # slow/dead server can't block dashboard startup.
-    try:
-        from hermes_cli.mcp_startup import start_background_mcp_discovery
+    if not _defer_desktop_runtime_discovery:
+        try:
+            from hermes_cli.mcp_startup import start_background_mcp_discovery
 
-        start_background_mcp_discovery(
-            logger=logger,
-            thread_name="dashboard-mcp-discovery",
-        )
-    except Exception:
-        logger.debug(
-            "Background MCP tool discovery failed at dashboard startup",
-            exc_info=True,
-        )
+            start_background_mcp_discovery(
+                logger=logger,
+                thread_name="dashboard-mcp-discovery",
+            )
+        except Exception:
+            logger.debug(
+                "Background MCP tool discovery failed at dashboard startup",
+                exc_info=True,
+            )
+
+    # web_server consumes this one-shot import policy before mounting plugin
+    # API routes. Only the verified local Desktop path reaches this branch;
+    # dashboard/public paths retain the established eager ordering above.
+    if _defer_desktop_runtime_discovery:
+        os.environ["HERMES_DEFER_DESKTOP_PLUGIN_API_MOUNT"] = "1"
 
     from hermes_cli.web_server import start_server
 
@@ -12262,6 +12317,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        defer_runtime_discovery=_defer_desktop_runtime_discovery,
     )
 
 

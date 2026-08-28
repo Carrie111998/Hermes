@@ -142,6 +142,17 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+# One-shot import policy set only by cmd_dashboard's verified local Desktop
+# serve path. Consume the marker now so unrelated child processes cannot
+# inherit a Desktop-only startup policy.
+_DEFER_DESKTOP_PLUGIN_API_MOUNT = (
+    env_var_enabled("HERMES_DEFER_DESKTOP_PLUGIN_API_MOUNT")
+    and os.getenv("HERMES_DESKTOP") == "1"
+    and os.getenv("HERMES_SERVE_HEADLESS") == "1"
+)
+os.environ.pop("HERMES_DEFER_DESKTOP_PLUGIN_API_MOUNT", None)
+_deferred_plugin_api_routes_ready = threading.Event()
+
 
 def _process_start_marker(pid: int) -> str:
     """Return a cross-runtime marker for the current incarnation of ``pid``.
@@ -383,6 +394,39 @@ def _eager_reconcile_own_session_db() -> None:
         )
 
 
+def _start_desktop_services_after_bind(app: "FastAPI") -> threading.Event:
+    """Arm Desktop cron and orphan cleanup behind the bound-socket event."""
+    ready = threading.Event()
+    app.state.desktop_post_bind = ready
+    stop = threading.Event()
+
+    def _reap_gateway_orphans() -> None:
+        ready.wait()
+        try:
+            from hermes_cli.gateway import _reap_unsupervised_gateway_orphans
+
+            _reap_unsupervised_gateway_orphans()
+        except Exception:
+            _log.exception("Desktop startup: orphan gateway reap failed")
+
+    def _start_cron() -> None:
+        ready.wait()
+        if not stop.is_set():
+            _start_desktop_cron_ticker(stop)
+
+    threading.Thread(
+        target=_reap_gateway_orphans,
+        daemon=True,
+        name="desktop-gateway-orphan-reaper",
+    ).start()
+    threading.Thread(
+        target=_start_cron,
+        daemon=True,
+        name="desktop-cron-ticker",
+    ).start()
+    return stop
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -434,29 +478,15 @@ async def _lifespan(app: "FastAPI"):
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
     cron_stop: "threading.Event | None" = None
-    cron_thread: "threading.Thread | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
-        # Before forking a fresh gateway, reap any orphan left by a previous
-        # serve session. Graceful shutdown reaps the managed child, but an
-        # abnormal exit (crash, SIGKILL, power loss, forced update) reparents
-        # the old gateway to launchd (PPID=1). It keeps holding the QQ
-        # WebSocket, and a newly forked gateway then races the same credential,
-        # splitting messages across parallel session trees (#77276).
-        try:
-            from hermes_cli.gateway import _reap_unsupervised_gateway_orphans
-
-            _reap_unsupervised_gateway_orphans()
-        except Exception:
-            _log.exception("Desktop startup: orphan gateway reap failed")
-
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+        # The socket, auth/health probes, and renderer do not depend on cron or
+        # process cleanup. Keep those services enabled on every Desktop run,
+        # but do not let their imports and Windows process scans delay the
+        # readiness sentinel. _serve sets this event immediately after bind.
+        # The gateway-start endpoint repeats orphan cleanup at its own
+        # correctness boundary, so moving this startup sweep after bind does
+        # not let a replacement gateway race stale credentials.
+        cron_stop = _start_desktop_services_after_bind(app)
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
@@ -523,6 +553,27 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _wait_for_deferred_plugin_api_routes(request: Request, call_next):
+    """Avoid a transient plugin-route 404 during local Desktop startup."""
+    if (
+        _DEFER_DESKTOP_PLUGIN_API_MOUNT
+        and request.url.path.startswith("/api/plugins/")
+        and not _deferred_plugin_api_routes_ready.is_set()
+    ):
+        ready = await asyncio.to_thread(
+            _deferred_plugin_api_routes_ready.wait,
+            10.0,
+        )
+        if not ready:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Plugin routes are still loading"},
+                headers={"Retry-After": "1"},
+            )
+    return await call_next(request)
 
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
@@ -19250,8 +19301,52 @@ def _mount_plugin_api_routes():
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
 
 
-# Mount plugin API routes before the SPA catch-all.
-_mount_plugin_api_routes()
+def _run_deferred_runtime_discovery() -> None:
+    """Load Desktop agent/plugin routes and MCP servers off the bind path."""
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        _log.warning("Deferred Desktop plugin discovery failed", exc_info=True)
+
+    if _DEFER_DESKTOP_PLUGIN_API_MOUNT:
+        try:
+            _mount_plugin_api_routes()
+        except Exception:
+            _log.warning("Deferred Desktop plugin API mount failed", exc_info=True)
+        finally:
+            _deferred_plugin_api_routes_ready.set()
+
+    try:
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(
+            logger=_log,
+            thread_name="desktop-mcp-discovery",
+        )
+    except Exception:
+        _log.debug(
+            "Deferred Desktop MCP discovery failed to start",
+            exc_info=True,
+        )
+
+
+def _schedule_deferred_runtime_discovery(delay: float = 0.75):
+    """Schedule runtime discovery after the renderer can connect and paint."""
+    timer = threading.Timer(delay, _run_deferred_runtime_discovery)
+    timer.daemon = True
+    timer.name = "desktop-runtime-discovery-delay"
+    timer.start()
+    return timer
+
+
+# Public Dashboard and ordinary serve paths preserve the established import
+# ordering. The verified local Desktop headless path has no SPA catch-all and
+# mounts these routes just after the socket binds instead.
+if not _DEFER_DESKTOP_PLUGIN_API_MOUNT:
+    _mount_plugin_api_routes()
+    _deferred_plugin_api_routes_ready.set()
 
 # Mount the dashboard auth routes (/login, /auth/*, /api/auth/*) before the
 # SPA catch-all so /{full_path:path} doesn't swallow them.  These are
@@ -19627,6 +19722,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    defer_runtime_discovery: bool = False,
 ):
     """Start the web UI server.
 
@@ -20003,6 +20099,13 @@ def start_server(
                 print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
+
+            desktop_post_bind = getattr(app.state, "desktop_post_bind", None)
+            if isinstance(desktop_post_bind, threading.Event):
+                desktop_post_bind.set()
+            if defer_runtime_discovery:
+                _schedule_deferred_runtime_discovery()
+
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
