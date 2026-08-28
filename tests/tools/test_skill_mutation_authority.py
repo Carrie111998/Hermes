@@ -293,3 +293,74 @@ def test_independent_same_name_creates_serialize_across_categories(tmp_path):
     assert sum(result["success"] is True for result in results) == 1
     created = list((hermes_home / "skills").glob("*/test-skill/SKILL.md"))
     assert len(created) == 1
+
+
+def test_reversed_two_skill_batches_serialize_without_deadlock(tmp_path):
+    """Global identity ordering admits reversed plans without AB/BA deadlock."""
+    repo = Path(__file__).resolve().parents[2]
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    os.environ["HERMES_HOME"] = str(hermes_home)
+
+    from tools.skill_manager_tool import _create_skill
+
+    alpha = _SKILL.replace("test-skill", "alpha")
+    beta = _SKILL.replace("test-skill", "beta")
+    assert _create_skill("alpha", alpha)["success"] is True
+    assert _create_skill("beta", beta)["success"] is True
+
+    release = tmp_path / "release"
+    processes = []
+    outputs = []
+    for marker, order in (("A", ("alpha", "beta")), ("B", ("beta", "alpha"))):
+        ready = tmp_path / f"ready-{marker}"
+        output = tmp_path / f"result-{marker}.json"
+        outputs.append(output)
+        operations = [
+            {
+                "name": name,
+                "action": "patch",
+                "old_string": "body",
+                "new_string": f"winner-{marker}",
+            }
+            for name in order
+        ]
+        code = (
+            "import json, os, sys, time\n"
+            "from pathlib import Path\n"
+            f"os.environ['HERMES_HOME'] = {str(hermes_home)!r}\n"
+            f"sys.path.insert(0, {str(repo)!r})\n"
+            "from tools.skill_manager_tool import skill_manage\n"
+            f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+            "deadline = time.monotonic() + 10\n"
+            f"while not Path({str(release)!r}).exists():\n"
+            "    assert time.monotonic() < deadline\n"
+            "    time.sleep(0.01)\n"
+            f"result = skill_manage(action='', name='', operations={operations!r})\n"
+            f"Path({str(output)!r}).write_text(result, encoding='utf-8')\n"
+        )
+        processes.append(subprocess.Popen(
+            [sys.executable, "-c", code],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        ))
+
+    _wait_for_paths(tmp_path / "ready-A", tmp_path / "ready-B")
+    release.write_text("go", encoding="utf-8")
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stdout + stderr
+
+    results = [json.loads(path.read_text(encoding="utf-8")) for path in outputs]
+    assert sum(result["success"] is True for result in results) == 1
+    alpha_text = (hermes_home / "skills" / "alpha" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    beta_text = (hermes_home / "skills" / "beta" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert ("winner-A" in alpha_text and "winner-A" in beta_text) or (
+        "winner-B" in alpha_text and "winner-B" in beta_text
+    )

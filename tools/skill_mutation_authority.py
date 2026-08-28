@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 from utils import atomic_write_text
 
@@ -39,6 +39,9 @@ _pending_apply_precondition: "contextvars.ContextVar[Optional[Dict[str, Any]]]" 
 )
 _pending_apply_payload: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = (
     contextvars.ContextVar("pending_apply_payload", default=None)
+)
+_batch_authority_active: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "batch_authority_active", default=False
 )
 
 PendingCapture = Callable[..., Tuple[Optional[Dict[str, Any]], Optional[str]]]
@@ -119,6 +122,11 @@ def _canonical_identity(identity: MutationIdentity) -> str:
         except OSError:
             return f"path:{identity}"
     return identity
+
+
+def canonical_mutation_identity(identity: MutationIdentity) -> str:
+    """Expose the stable global order key for composite admission."""
+    return _canonical_identity(identity)
 
 
 def _shared_lock_dir() -> Path:
@@ -260,6 +268,22 @@ def skill_mutation_lease(identity: MutationIdentity):
 
 
 @contextlib.contextmanager
+def multi_skill_mutation_lease(identities: Iterable[MutationIdentity]):
+    """Acquire deduplicated identities in one deterministic global order."""
+    unique: Dict[str, MutationIdentity] = {}
+    for identity in identities:
+        unique.setdefault(_canonical_identity(identity), identity)
+    ordered = [unique[key] for key in sorted(unique)]
+    with contextlib.ExitStack() as stack:
+        for identity in ordered:
+            admitted = stack.enter_context(skill_mutation_lease(identity))
+            if not admitted:
+                yield False
+                return
+        yield True
+
+
+@contextlib.contextmanager
 def bind_pending_apply(precondition: Dict[str, Any], payload: Dict[str, Any]):
     """Bind one approved pre-image to the mutator that will consume it."""
     expected_token = _pending_apply_precondition.set(precondition)
@@ -269,6 +293,20 @@ def bind_pending_apply(precondition: Dict[str, Any], payload: Dict[str, Any]):
     finally:
         _pending_apply_payload.reset(payload_token)
         _pending_apply_precondition.reset(expected_token)
+
+
+def bound_pending_precondition() -> Optional[Dict[str, Any]]:
+    """Return the staged precondition bound to the current replay."""
+    return _pending_apply_precondition.get()
+
+
+def enter_batch_authority() -> contextvars.Token:
+    """Mark nested single-operation boundaries as batch-authorized."""
+    return _batch_authority_active.set(True)
+
+
+def exit_batch_authority(token: contextvars.Token) -> None:
+    _batch_authority_active.reset(token)
 
 
 def _tool_error(message: str, **extra: Any) -> str:
@@ -339,6 +377,7 @@ def apply_pending_skill_write(
     precondition: Optional[Dict[str, Any]],
     *,
     capture_pending_precondition: PendingCapture,
+    capture_pending_batch_precondition: Optional[Callable[..., Tuple[Optional[Dict[str, Any]], Optional[str]]]] = None,
     mutate: SkillMutator,
 ) -> str:
     """Consume a staged pre-image through the real skill mutator."""
@@ -351,13 +390,25 @@ def apply_pending_skill_write(
             error_code="missing_precondition",
         )
 
-    current, error = capture_pending_precondition(
-        payload.get("action", ""),
-        payload.get("name", ""),
-        content=payload.get("content"),
-        category=payload.get("category"),
-        file_path=payload.get("file_path"),
-    )
+    is_batch = payload.get("action") == "batch"
+    if is_batch:
+        if capture_pending_batch_precondition is None:
+            return _tool_error(
+                "Batch replay cannot derive composite mutation authority.",
+                conflict=True,
+                error_code="invalid_batch_precondition",
+            )
+        current, error = capture_pending_batch_precondition(
+            payload.get("operations")
+        )
+    else:
+        current, error = capture_pending_precondition(
+            payload.get("action", ""),
+            payload.get("name", ""),
+            content=payload.get("content"),
+            category=payload.get("category"),
+            file_path=payload.get("file_path"),
+        )
     if error or current is None:
         return _tool_error(
             f"Could not verify the pending skill write safely: {error}",
@@ -369,6 +420,12 @@ def apply_pending_skill_write(
 
     _after_pending_precondition_check()
     with bind_pending_apply(precondition, payload):
+        if is_batch:
+            return mutate(
+                action="batch",
+                name=payload.get("name", ""),
+                operations=payload.get("operations"),
+            )
         return mutate(
             action=payload.get("action", ""),
             name=payload.get("name", ""),
@@ -391,6 +448,12 @@ def refuse_if_pending_precondition_stale(
     payload = _pending_apply_payload.get()
     if expected is None or payload is None:
         return None
+    if expected.get("kind") == "skill_batch":
+        if _batch_authority_active.get():
+            return None
+        return precondition_check_failed_error(
+            "composite batch authority was not retained at the write boundary"
+        )
     current, err = capture_pending_precondition(
         payload.get("action", ""),
         payload.get("name", ""),

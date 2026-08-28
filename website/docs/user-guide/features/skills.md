@@ -603,15 +603,18 @@ reviewed with the same familiar approve/deny flow as dangerous commands:
 ```
 
 New proposals record the exact target state they were based on. Approval
-rechecks that state **at the write itself** (under a per-skill cross-process
-lease shared with the Desktop editor) and refuses the write if the skill
-changed meanwhile; conflicted records remain pending for diff review or
-rejection. If a security scan later rejects a write, Hermes restores the
-previous bytes only when it still owns what it published — a newer Desktop
-edit that landed during the scan is left in place. Legacy records created
-without a target-state precondition also remain reviewable and rejectable,
-but fail closed on approval because Hermes cannot prove that replaying them
-would preserve newer work.
+rechecks that state **at the write itself** under cross-process leases shared
+with the Desktop editor and refuses the write if a skill changed meanwhile;
+conflicted records remain pending for diff review or rejection. An
+`operations` batch records one composite precondition over every touched skill
+tree (and both the logical name and destination for creates), so one conflict
+refuses the entire batch before any operation runs. Its leases remain held for
+the complete transaction. If a security scan or later operation rejects a
+write, Hermes restores previous bytes only when it still owns the generation
+it published — a newer Desktop edit is left in place. Legacy records created
+without the required target-state precondition also remain reviewable and
+rejectable, but fail closed on approval because Hermes cannot prove that
+replaying them would preserve newer work.
 
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or

@@ -189,6 +189,100 @@ def test_skill_approval_preserves_newer_edit_when_pending_rewrite_is_stale(
     assert wa.get_pending(wa.SKILLS, pending_id) is not None
 
 
+def test_stale_existing_skill_refuses_entire_pending_batch(hermes_home):
+    """One changed whole-tree generation prevents every operation."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _write_file, skill_manage
+
+    alpha = _SKILL.replace("test-skill", "alpha")
+    beta = _SKILL.replace("test-skill", "beta")
+    alpha_created = _create_skill("alpha", alpha)
+    beta_created = _create_skill("beta", beta)
+    assert alpha_created["success"] is True, alpha_created
+    assert beta_created["success"] is True, beta_created
+
+    _set_approval("skills", True)
+    staged = json.loads(skill_manage(
+        action="",
+        name="",
+        operations=[
+            {
+                "name": "alpha",
+                "action": "patch",
+                "old_string": "body",
+                "new_string": "stale alpha batch bytes",
+            },
+            {
+                "name": "beta",
+                "action": "patch",
+                "old_string": "body",
+                "new_string": "beta batch bytes must not publish",
+            },
+        ],
+    ))
+    assert staged["staged"] is True, staged
+
+    edited = _write_file(
+        "alpha",
+        "references/newer.md",
+        "newer Desktop supporting bytes",
+    )
+    assert edited["success"] is True, edited
+    result = handle_pending_subcommand(
+        wa.SKILLS, ["approve", staged["pending_id"]]
+    )
+
+    assert "Approved 0" in result
+    assert Path(alpha_created["skill_md"]).read_text(encoding="utf-8") == alpha
+    assert (
+        Path(alpha_created["skill_md"]).parent / "references" / "newer.md"
+    ).read_text(encoding="utf-8") == "newer Desktop supporting bytes"
+    assert Path(beta_created["skill_md"]).read_text(encoding="utf-8") == beta
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_pending_create_batch_refuses_same_name_in_other_category(hermes_home):
+    """Create authority binds both logical name and destination absence."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    fresh = _SKILL.replace("test-skill", "fresh")
+    _set_approval("skills", True)
+    staged = json.loads(skill_manage(
+        action="",
+        name="",
+        operations=[
+            {
+                "name": "fresh",
+                "action": "create",
+                "category": "category-a",
+                "content": fresh,
+            },
+            {
+                "name": "fresh",
+                "action": "write_file",
+                "file_path": "references/a.md",
+                "file_content": "queued",
+            },
+        ],
+    ))
+    assert staged["staged"] is True, staged
+
+    competing = _create_skill("fresh", fresh, "category-b")
+    assert competing["success"] is True, competing
+    result = handle_pending_subcommand(
+        wa.SKILLS, ["approve", staged["pending_id"]]
+    )
+
+    home = Path(hermes_home)
+    assert "Approved 0" in result
+    assert (home / "skills" / "category-b" / "fresh" / "SKILL.md").exists()
+    assert not (home / "skills" / "category-a" / "fresh").exists()
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
 def test_legacy_pending_skill_write_without_precondition_fails_closed(hermes_home):
     """Old queue records are reviewable but never safe to replay blindly."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
