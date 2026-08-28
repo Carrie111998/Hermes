@@ -1,9 +1,16 @@
 """Native Responses preflight must count the checkpoint-pruned wire (#96155)."""
 
+import hashlib
 from types import SimpleNamespace
 
 from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.native_compaction import (
+    NATIVE_OWNERSHIP_VERSION,
+    OWNER_NATIVE,
+    PHASE_CHECKPOINT_ACCEPTED,
+    native_compaction_route_key,
+)
 from agent.turn_context import _preflight_request_tokens
 
 
@@ -23,6 +30,23 @@ def _codex_agent(**over):
     )
     for key, value in over.items():
         setattr(agent, key, value)
+    route_key = native_compaction_route_key(agent)
+    digest = hashlib.sha256(b"blob").hexdigest()
+    agent._native_compaction_ownership_cache = {
+        "session_id": "",
+        "document": {
+            "version": NATIVE_OWNERSHIP_VERSION,
+            "routes": {
+                route_key: {
+                    "version": NATIVE_OWNERSHIP_VERSION,
+                    "route_key": route_key,
+                    "owner": OWNER_NATIVE,
+                    "phase": PHASE_CHECKPOINT_ACCEPTED,
+                    "checkpoint_digests": [digest],
+                }
+            },
+        },
+    }
     return agent
 
 

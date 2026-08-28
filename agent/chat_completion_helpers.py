@@ -1888,6 +1888,12 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
             is_github_responses=is_github_responses,
+            messages=_msgs_for_codex,
+        )
+        _native_checkpoint_digests = list(
+            (getattr(agent, "native_compaction_ownership_state", None) or {}).get(
+                "checkpoint_digests", []
+            )
         )
 
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
@@ -1942,6 +1948,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
             context_management=_context_management,
+            native_compaction_checkpoint_digests=_native_checkpoint_digests,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────

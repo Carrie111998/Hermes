@@ -6,6 +6,7 @@ gpt-5.1/gpt-5.2 fail server-side (HTTP 500 / stream stall) with no
 structured rejection — hence the hard model-family gate these tests pin.
 """
 
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,10 @@ def _agent(
         codex_responses_compact_threshold=threshold,
         context_compressor=compressor,
     )
+
+
+def _known_checkpoint_digest(encrypted: str) -> list[str]:
+    return [hashlib.sha256(encrypted.encode("utf-8")).hexdigest()]
 
 
 class TestModelGate:
@@ -168,7 +173,7 @@ class TestRejectionMatcher:
             "Error code: 400 - Unknown parameter: 'context_management'"
         )
         assert is_native_compaction_rejection(
-            "invalid value for compact_threshold"
+            "invalid value for compact_threshold", 400
         )
 
     def test_generic_errors_do_not_match(self):
@@ -204,13 +209,15 @@ class TestRejectionMatcher:
         msg = "Unknown parameter: 'context_management'"
         assert is_native_compaction_rejection(msg, 400)
 
-    def test_unknown_status_preserves_message_only_matching(self):
-        # Transports that surface only a string keep working.
+    def test_unknown_status_requires_embedded_400(self):
         assert is_native_compaction_rejection(
             "Error code: 400 - Unknown parameter: 'context_management'", None
         )
-        assert is_native_compaction_rejection(
+        assert not is_native_compaction_rejection(
             "unsupported field compact_threshold", "not-a-number"
+        )
+        assert not is_native_compaction_rejection(
+            "TimeoutError: Error code: 400 invalid context_management", None
         )
 
 
@@ -350,6 +357,7 @@ class TestResponseCapture:
             ],
             current_issuer_kind="codex_backend",
             native_compaction_eligible=True,
+            native_compaction_checkpoint_digests=_known_checkpoint_digest("blob123"),
         )
         replayed = [item for item in items if item.get("type") == "compaction"]
         assert len(replayed) == 1
@@ -379,6 +387,126 @@ class TestResponseCapture:
             native_compaction_eligible=True,
         )
         assert all(item.get("type") != "compaction" for item in items)
+
+
+class TestNativePrimaryOwnershipRegression:
+    def test_accepted_checkpoint_keeps_local_automatic_compression_out_of_episode(
+        self, monkeypatch, tmp_path
+    ):
+        """One growth episode has exactly one automatic compaction owner."""
+        import run_agent
+        from agent.context_compressor import is_compaction_summary_message
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **_kw: [])
+        monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+        monkeypatch.setattr(
+            "agent.title_generator.maybe_auto_title", lambda *_args, **_kwargs: None
+        )
+
+        agent = run_agent.AIAgent(
+            api_key="fixture-token",
+            base_url="https://api.openai.com/v1",
+            provider="openai-api",
+            api_mode="codex_responses",
+            model="gpt-5.6",
+            quiet_mode=True,
+            max_iterations=4,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+        agent.codex_responses_native_compaction = True
+        agent.codex_responses_compact_threshold = 4_000
+        agent.context_compressor.context_length = 40_000
+        agent.context_compressor.threshold_tokens = 10_000
+        agent._session_db = SessionDB(tmp_path / "state.db")
+        agent._cached_system_prompt = "fixture system"
+
+        def response(text, *, checkpoint=None, input_tokens):
+            output = []
+            if checkpoint is not None:
+                output.append(
+                    SimpleNamespace(
+                        type="compaction",
+                        encrypted_content=checkpoint,
+                        status="completed",
+                    )
+                )
+            output.append(
+                SimpleNamespace(
+                    type="message",
+                    status="completed",
+                    phase="final_answer",
+                    content=[SimpleNamespace(type="output_text", text=text)],
+                    id=f"msg_{text}",
+                )
+            )
+            return SimpleNamespace(
+                output=output,
+                usage=SimpleNamespace(
+                    input_tokens=input_tokens,
+                    output_tokens=2,
+                    total_tokens=input_tokens + 2,
+                ),
+                status="completed",
+                model="gpt-5.6",
+            )
+
+        responses = iter(
+            [
+                response(
+                    "checkpointed",
+                    checkpoint="opaque-native-checkpoint",
+                    input_tokens=5_000,
+                ),
+                response("done", input_tokens=5_000),
+            ]
+        )
+        requests = []
+        monkeypatch.setattr(
+            agent,
+            "_interruptible_api_call",
+            lambda kwargs: requests.append(kwargs) or next(responses),
+        )
+
+        local_summaries = []
+
+        def generate_summary(turns_to_summarize, focus_topic=None, memory_context=""):
+            local_summaries.append(len(turns_to_summarize))
+            return "## Active Task\nHermes local compression owned this episode."
+
+        agent.context_compressor._generate_summary = generate_summary
+        agent._compression_feasibility_checked = True
+
+        history = []
+        for index in range(20):
+            history.extend(
+                [
+                    {"role": "user", "content": f"turn-{index}-" + "u" * 2_000},
+                    {"role": "assistant", "content": f"reply-{index}"},
+                ]
+            )
+
+        first = agent.run_conversation(
+            "n" * 18_000,
+            conversation_history=history,
+        )
+        result = agent.run_conversation(
+            "m" * 30_000,
+            conversation_history=first["messages"],
+        )
+
+        assert result["completed"] is True
+        assert len(requests) == 2
+        assert requests[1]["input"][0] == {
+            "type": "compaction",
+            "encrypted_content": "opaque-native-checkpoint",
+        }
+        assert local_summaries == []
+        resumed, _display = agent._session_db.get_resume_conversations(agent.session_id)
+        assert not any(is_compaction_summary_message(message) for message in resumed)
 
 
 class TestAgentInitConfig:
@@ -551,7 +679,11 @@ class TestPrunePreCheckpointItems:
             },
             {"role": "user", "content": "follow-up"},
         ]
-        items = _chat_messages_to_responses_input(msgs, native_compaction_eligible=True)
+        items = _chat_messages_to_responses_input(
+            msgs,
+            native_compaction_eligible=True,
+            native_compaction_checkpoint_digests=_known_checkpoint_digest("blob"),
+        )
         assert items[0] == {"type": "compaction", "encrypted_content": "blob"}
         users = [i["content"] for i in items if i.get("role") == "user"]
         assert users == ["the goal", "follow-up"]
@@ -577,8 +709,8 @@ class TestCheckpointGatedOnCurrentEligibility:
     """A captured checkpoint must not outlive the native gate.
 
     The checkpoint is persisted in the ``codex_reasoning_items`` sidecar, so
-    it survives a mid-session model swap, ``compression.enabled: false``, the
-    rejection kill switch and a resumed session. Every one of those closes the
+    it survives a mid-session model swap, ``compression.enabled: false``, a
+    route-local fallback and a resumed session. Every one of those closes the
     gate; if the wire kept being restructured around the stale checkpoint,
     pre-checkpoint history would be deleted from requests that were never
     natively compacted — on a model that cannot even decrypt the blob.
@@ -630,6 +762,7 @@ class TestCheckpointGatedOnCurrentEligibility:
             self._history(),
             current_issuer_kind="codex_backend",
             native_compaction_eligible=True,
+            native_compaction_checkpoint_digests=_known_checkpoint_digest("blob"),
         )
         assert items[0]["type"] == "compaction"
         assert {"role": "assistant", "content": "on it"} not in items
@@ -642,7 +775,7 @@ class TestCheckpointGatedOnCurrentEligibility:
         assert {"role": "assistant", "content": "on it"} in items
 
     def test_build_kwargs_without_field_does_not_prune(self):
-        """Model swapped out of the gpt-5.6 family / kill switch fired:
+        """Model swapped out of the gpt-5.6 family / route fallback fired:
         the gate returns None, so the wire must be the pre-feature one."""
         from agent.transports.codex import ResponsesApiTransport
 
@@ -663,6 +796,7 @@ class TestCheckpointGatedOnCurrentEligibility:
             messages=self._history(),
             is_codex_backend=True,
             context_management=[{"type": "compaction", "compact_threshold": 4000}],
+            native_compaction_checkpoint_digests=_known_checkpoint_digest("blob"),
         )
         assert kwargs["input"][0]["type"] == "compaction"
         assert {"role": "assistant", "content": "on it"} not in kwargs["input"]

@@ -388,6 +388,9 @@ class ResponsesApiTransport(ProviderTransport):
             native_compaction_eligible=_native_compaction_active(
                 kwargs.get("context_management")
             ),
+            native_compaction_checkpoint_digests=kwargs.get(
+                "native_compaction_checkpoint_digests"
+            ),
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -590,6 +593,9 @@ class ResponsesApiTransport(ProviderTransport):
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
                 native_compaction_eligible=native_compaction_active,
+                native_compaction_checkpoint_digests=params.get(
+                    "native_compaction_checkpoint_digests"
+                ),
             ),
             "store": False,
         }

@@ -2713,6 +2713,20 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    from agent.native_compaction import (
+        OWNER_NATIVE,
+        native_compaction_ownership,
+        suppress_automatic_local_compaction,
+        transition_native_compaction_to_local,
+    )
+
+    if not force and suppress_automatic_local_compaction(
+        agent, messages, approx_tokens
+    ):
+        return messages, getattr(agent, "_cached_system_prompt", None) or system_message
+    if force and native_compaction_ownership(agent, messages).get("owner") == OWNER_NATIVE:
+        transition_native_compaction_to_local(agent, "manual_compression")
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )

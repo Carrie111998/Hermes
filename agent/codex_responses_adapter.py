@@ -48,7 +48,10 @@ def _classify_responses_issuer(
     if is_codex_backend:
         return "codex_backend"
     if base_url:
-        return f"other:{base_url}"
+        from agent.native_compaction import canonical_responses_endpoint
+
+        endpoint = canonical_responses_endpoint(base_url)
+        return f"other:{endpoint}" if endpoint else "other"
     return "other"
 
 
@@ -462,6 +465,22 @@ def _normalize_responses_message_status(value: Any, *, default: str = "completed
     return default
 
 
+def _sidecar_mapping(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return a plain mapping for persisted dict or SDK-model sidecars."""
+    if isinstance(raw, dict):
+        return raw
+    model_dump = getattr(raw, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except (AttributeError, TypeError, ValueError):
+            return None
+    attributes = getattr(raw, "__dict__", None)
+    return dict(attributes) if isinstance(attributes, dict) else None
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
@@ -470,6 +489,7 @@ def _chat_messages_to_responses_input(
     replay_encrypted_reasoning: bool = True,
     current_issuer_kind: Optional[str] = None,
     native_compaction_eligible: bool = False,
+    native_compaction_checkpoint_digests: Any = None,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -523,8 +543,8 @@ def _chat_messages_to_responses_input(
     items, and restructuring the wire around them
     (``prune_pre_checkpoint_items``). Checkpoints are persisted in the
     ``codex_reasoning_items`` sidecar and survive a mid-session model swap,
-    a ``compression.enabled: false`` flip, the rejection kill switch and a
-    resumed session; without this flag a single captured checkpoint would
+    a ``compression.enabled: false`` flip, route-local fallback, and a resumed
+    session; without this flag a single captured checkpoint would
     keep deleting every pre-checkpoint item from every later request, on a
     model that cannot decrypt the blob (#85914). Default False = pre-feature
     wire, which is also correct for every caller that never sends
@@ -534,6 +554,15 @@ def _chat_messages_to_responses_input(
     conversation is still on the wire.
     """
     items: List[Dict[str, Any]] = []
+    known_checkpoint_digests = {
+        digest
+        for digest in (
+            native_compaction_checkpoint_digests
+            if isinstance(native_compaction_checkpoint_digests, list)
+            else ()
+        )
+        if isinstance(digest, str)
+    }
     # Parallel to `items`: the raw chat message each converted item came
     # from. Pruning needs this to read a canonical summary carrier's
     # up-to-date, provenance-tagged content directly — the converted `item`
@@ -574,7 +603,8 @@ def _chat_messages_to_responses_input(
                 )
                 has_codex_reasoning = False
                 if isinstance(codex_reasoning, list):
-                    for ri in codex_reasoning:
+                    for raw_reasoning in codex_reasoning:
+                        ri = _sidecar_mapping(raw_reasoning)
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
                             if item_id and item_id in seen_item_ids:
@@ -584,7 +614,7 @@ def _chat_messages_to_responses_input(
                             # AND only while this request still asks for
                             # server-side compaction. Once the gate closes
                             # (model swapped out of the gpt-5.6 family,
-                            # compression disabled, rejection kill switch),
+                            # compression disabled, route-local fallback),
                             # the persisted checkpoint must not be replayed —
                             # replaying it is what makes the wire restructure
                             # below erase pre-checkpoint history forever.
@@ -600,6 +630,15 @@ def _chat_messages_to_responses_input(
                             # request with HTTP 400 invalid_encrypted_content.
                             # Unstamped (legacy) items pass through.
                             item_issuer = ri.get("_issuer_kind")
+                            if ri.get("type") == "compaction":
+                                encrypted = ri.get("encrypted_content")
+                                if not isinstance(encrypted, str) or not encrypted.strip():
+                                    continue
+                                checkpoint_digest = hashlib.sha256(
+                                    encrypted.encode("utf-8")
+                                ).hexdigest()
+                                if checkpoint_digest not in known_checkpoint_digests:
+                                    continue
                             if (
                                 current_issuer_kind is not None
                                 and item_issuer is not None
@@ -641,16 +680,18 @@ def _chat_messages_to_responses_input(
                 replayed_message_items = 0
                 if isinstance(codex_message_items, list):
                     for raw_item in codex_message_items:
-                        if not isinstance(raw_item, dict):
+                        message_item = _sidecar_mapping(raw_item)
+                        if not isinstance(message_item, dict):
                             continue
-                        if raw_item.get("type") != "message" or raw_item.get("role") != "assistant":
+                        if message_item.get("type") != "message" or message_item.get("role") != "assistant":
                             continue
-                        raw_content_parts = raw_item.get("content")
+                        raw_content_parts = message_item.get("content")
                         if not isinstance(raw_content_parts, list):
                             continue
 
                         normalized_content_parts = []
-                        for part in raw_content_parts:
+                        for raw_part in raw_content_parts:
+                            part = _sidecar_mapping(raw_part)
                             if not isinstance(part, dict):
                                 continue
                             part_type = str(part.get("type") or "").strip()
@@ -669,10 +710,10 @@ def _chat_messages_to_responses_input(
                         replay_item = {
                             "type": "message",
                             "role": "assistant",
-                            "status": _normalize_responses_message_status(raw_item.get("status")),
+                            "status": _normalize_responses_message_status(message_item.get("status")),
                             "content": normalized_content_parts,
                         }
-                        item_id = raw_item.get("id")
+                        item_id = message_item.get("id")
                         if (
                             not is_github_responses
                             and isinstance(item_id, str)
@@ -681,7 +722,7 @@ def _chat_messages_to_responses_input(
                             stripped_id = item_id.strip()
                             if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
                                 replay_item["id"] = stripped_id
-                        phase = raw_item.get("phase")
+                        phase = message_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()
                         items.append(replay_item)
@@ -901,6 +942,7 @@ def estimate_native_responses_preflight_tokens(
         is_codex_backend=is_codex_backend,
         is_xai_responses=is_xai_responses,
         is_github_responses=is_github_responses,
+        messages=messages,
     )
     if not context_management:
         return None
@@ -920,6 +962,11 @@ def estimate_native_responses_preflight_tokens(
                 base_url=getattr(agent, "base_url", None),
             ),
             native_compaction_eligible=True,
+            native_compaction_checkpoint_digests=list(
+                (getattr(agent, "native_compaction_ownership_state", None) or {}).get(
+                    "checkpoint_digests", []
+                )
+            ),
         )
     except Exception:
         logger.debug(
@@ -1686,8 +1733,8 @@ def _normalize_codex_response(
             # OpenAI/Codex routes). The encrypted blob stands in for the
             # pruned older context on subsequent requests. It rides the
             # codex_reasoning_items sidecar so it inherits persistence
-            # (state.db), session replay, the cross-issuer guard, and the
-            # invalid-encrypted-content kill switch without new state.
+            # (state.db), session replay, and the cross-issuer guard. Replay
+            # authorization additionally comes from route-scoped ownership.
             encrypted = getattr(item, "encrypted_content", None)
             if isinstance(encrypted, str) and encrypted:
                 raw_item = {"type": "compaction", "encrypted_content": encrypted}

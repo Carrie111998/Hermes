@@ -8397,6 +8397,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def mutate_session_model_config_value(
+        self,
+        session_id: str,
+        key: str,
+        mutator: Callable[[Any], Any],
+        default: Any = None,
+    ) -> Any:
+        """Atomically read, mutate, and persist one model-config value."""
+        if not session_id or not key or not callable(mutator):
+            return default
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return default
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(raw, dict):
+                config = dict(raw)
+
+            updated = mutator(config.get(key, default))
+            if updated is None:
+                config.pop(key, None)
+            else:
+                config[key] = updated
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config) if config else None, session_id),
+            )
+            return updated
+
+        return self._execute_write(_do)
+
     def get_session_model_config_value(
         self, session_id: str, key: str, default: Any = None
     ) -> Any:

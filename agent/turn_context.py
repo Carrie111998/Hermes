@@ -884,14 +884,21 @@ def build_turn_context(
             _idle_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
             )()
-            if _should_idle_compact(
+            _idle_should_compact = _should_idle_compact(
                 enabled=agent.compression_enabled,
                 idle_after_seconds=_idle_after,
                 idle_gap_seconds=_idle_gap,
                 tokens=_idle_tokens,
                 floor_tokens=_idle_floor,
                 cooldown_active=bool(_idle_cooldown),
-            ):
+            )
+            if _idle_should_compact:
+                from agent.native_compaction import suppress_automatic_local_compaction
+
+                _idle_should_compact = not suppress_automatic_local_compaction(
+                    agent, messages, _idle_tokens
+                )
+            if _idle_should_compact:
                 logger.info(
                     "Idle compaction: %ss idle >= %ss, ~%s tokens > %s floor "
                     "(session %s)",
@@ -1051,6 +1058,12 @@ def build_turn_context(
                         _compress_block_reason = _info(_preflight_tokens)[1]
                     except Exception:
                         _compress_block_reason = None
+        if _should_compress_now:
+            from agent.native_compaction import suppress_automatic_local_compaction
+
+            _should_compress_now = not suppress_automatic_local_compaction(
+                agent, messages, _preflight_tokens
+            )
         if _should_compress_now:
             _preflight_compressed = True
             # Compression is actually running (block cleared / was never
@@ -1216,6 +1229,12 @@ def build_turn_context(
                         _preflight_exc,
                     )
                     _wants_engine_preflight = False
+            if _wants_engine_preflight:
+                from agent.native_compaction import suppress_automatic_local_compaction
+
+                _wants_engine_preflight = not suppress_automatic_local_compaction(
+                    agent, messages, _preflight_tokens
+                )
             if _wants_engine_preflight:
                 logger.info(
                     "Engine-driven preflight maintenance: %s requested "

@@ -8,6 +8,8 @@ reliance on the canonical ``agent.context_compressor`` provenance check (not
 an ad-hoc heuristic), whole-or-drop truncation, and idempotency.
 """
 
+import hashlib
+
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
@@ -263,6 +265,10 @@ def _checkpoint_message(item_id: str = "rs_cp1", blob: str = "cp_blob_1"):
     }
 
 
+def _checkpoint_digests(blob: str = "cp_blob_1") -> list[str]:
+    return [hashlib.sha256(blob.encode("utf-8")).hexdigest()]
+
+
 class TestChatMessagesToResponsesInputSummaryCarrierLoss:
     """Adapter-level witnesses for the second blocking review (#90976):
     ``prune_pre_checkpoint_items`` only ever saw whatever ``_is_summary_item``
@@ -311,7 +317,9 @@ class TestChatMessagesToResponsesInputSummaryCarrierLoss:
         ]
 
         items = _chat_messages_to_responses_input(
-            messages, native_compaction_eligible=True,
+            messages,
+            native_compaction_eligible=True,
+            native_compaction_checkpoint_digests=_checkpoint_digests(),
         )
 
         # The summary survives, exactly once, as a plain message item —
@@ -361,7 +369,9 @@ class TestChatMessagesToResponsesInputSummaryCarrierLoss:
         ]
 
         items = _chat_messages_to_responses_input(
-            messages, native_compaction_eligible=True,
+            messages,
+            native_compaction_eligible=True,
+            native_compaction_checkpoint_digests=_checkpoint_digests(),
         )
 
         assert not any(

@@ -409,6 +409,13 @@ def finalize_turn(
                 # checks with truthy auto-attributes — a bare truthiness check
                 # here called _micro_compact on a mock and spliced its (empty-
                 # iterating) return value over the transcript, wiping it.
+                _native_suppresses_micro = False
+                if _compressor and final_response:
+                    from agent.native_compaction import suppress_automatic_local_compaction
+
+                    _native_suppresses_micro = suppress_automatic_local_compaction(
+                        agent, messages
+                    )
                 if (
                     _compressor
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
@@ -429,6 +436,7 @@ def finalize_turn(
                     # archive_and_compact the CANONICAL session rows — the
                     # exact write class _persist_disabled exists to stop.
                     and not getattr(agent, "_persist_disabled", False)
+                    and not _native_suppresses_micro
                 ):
                     _before = len(messages)
                     _compacted = _compressor._micro_compact(messages)

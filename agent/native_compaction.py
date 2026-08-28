@@ -23,14 +23,12 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   most would 400 on the unknown parameter, and none can mint or decrypt
   the compaction blob.
 
-Ownership model: Hermes' local compression stays fully armed as the
-fallback owner. The native threshold is clamped safely below the local
-compressor's trigger so the server compacts first; if it doesn't (native
-disabled mid-session, provider hiccup, non-eligible route), the local
-summarizer fires exactly as before. There is no new custody state — the
-captured compaction items ride the existing ``codex_reasoning_items``
-sidecar, which already handles persistence (state.db), gateway session
-replay, cross-issuer stamping, and the encrypted-replay kill switch.
+Ownership model: an eligible native route/model owns automatic compaction.
+Hermes' local summarizer is suppressed until ownership transfers because of
+a structured rejection, malformed checkpoint, explicit manual compression,
+or hard-boundary starvation. Ownership is route-scoped and persisted in the
+session's existing ``model_config`` JSON; opaque checkpoints continue to ride
+the existing ``codex_reasoning_items`` sidecar.
 
 This module stays free of transport/adapter dependencies so the transport,
 adapter, and conversation loop can share the gate without import cycles. The
@@ -42,7 +40,10 @@ introduces no cycle.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
+import sqlite3
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -60,6 +61,25 @@ DEFAULT_COMPACT_THRESHOLD = 200_000
 # Model-family gate. Substring match on the lowercased model id so dated
 # snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
 _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
+
+NATIVE_OWNERSHIP_METADATA_KEY = "native_compaction_ownership"
+NATIVE_OWNERSHIP_VERSION = 1
+NATIVE_HARD_EMERGENCY_RESERVE_TOKENS = 8_192
+
+OWNER_NATIVE = "native"
+OWNER_LOCAL = "local"
+PHASE_AWAITING_CHECKPOINT = "awaiting_checkpoint"
+PHASE_CHECKPOINT_ACCEPTED = "checkpoint_accepted"
+PHASE_LOCAL_FALLBACK = "local_fallback"
+
+_LOCAL_FALLBACK_REASONS = frozenset(
+    {
+        "structured_rejection",
+        "malformed_checkpoint",
+        "hard_emergency_no_checkpoint",
+        "manual_compression",
+    }
+)
 
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
@@ -80,6 +100,522 @@ def is_direct_openai_route(
     except ValueError:
         return False
     return hostname == "api.openai.com"
+
+
+def canonical_responses_endpoint(base_url: Any) -> str:
+    """Return a stable, credential-free endpoint identity."""
+    try:
+        parsed = urlsplit(str(base_url or ""))
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if not parsed.scheme or not hostname:
+        return ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = (parsed.scheme.lower(), port) in {("http", 80), ("https", 443)}
+    authority = hostname if port is None or default_port else f"{hostname}:{port}"
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{authority}{path}"
+
+
+def _responses_route_flags(agent: Any):
+    """Use the canonical Responses route classifier owned by the adapter."""
+    from agent.codex_responses_adapter import classify_responses_route
+
+    return classify_responses_route(agent)
+
+
+def native_compaction_route_key(agent: Any) -> str:
+    """Stable route/model key for session-scoped ownership."""
+    flags = _responses_route_flags(agent)
+    route_kind = "codex" if flags.is_codex_backend else "api"
+    return "|".join(
+        (
+            str(getattr(agent, "api_mode", None) or ""),
+            str(getattr(agent, "provider", None) or "").lower(),
+            canonical_responses_endpoint(getattr(agent, "base_url", None)),
+            str(getattr(agent, "model", None) or "").lower(),
+            route_kind,
+        )
+    )
+
+
+def native_compaction_route_eligible(
+    agent: Any,
+    *,
+    is_codex_backend: Optional[bool] = None,
+    is_xai_responses: Optional[bool] = None,
+    is_github_responses: Optional[bool] = None,
+) -> bool:
+    """Whether the current route/model owns automatic native compaction."""
+    flags = _responses_route_flags(agent)
+    codex_backend = (
+        flags.is_codex_backend
+        if is_codex_backend is None
+        else bool(is_codex_backend)
+    )
+    xai_responses = (
+        flags.is_xai_responses
+        if is_xai_responses is None
+        else bool(is_xai_responses)
+    )
+    github_responses = (
+        flags.is_github_responses
+        if is_github_responses is None
+        else bool(is_github_responses)
+    )
+    if getattr(agent, "api_mode", "codex_responses") != "codex_responses":
+        return False
+    if not bool(getattr(agent, "codex_responses_native_compaction", False)):
+        return False
+    if not bool(getattr(agent, "compression_enabled", True)):
+        return False
+    if getattr(agent, "compression_checkpoint_required", False) is True:
+        return False
+    if xai_responses or github_responses:
+        return False
+    if not is_native_compaction_model(getattr(agent, "model", None)):
+        return False
+    return is_direct_openai_route(
+        getattr(agent, "base_url", None), is_codex_backend=codex_backend
+    )
+
+
+def _checkpoint_items(messages: Any) -> List[Dict[str, Any]]:
+    checkpoints: List[Dict[str, Any]] = []
+    for message in messages if isinstance(messages, list) else ():
+        if not isinstance(message, dict):
+            continue
+        sidecar = message.get("codex_reasoning_items")
+        for item in sidecar if isinstance(sidecar, list) else ():
+            if isinstance(item, dict) and item.get("type") == "compaction":
+                checkpoints.append(item)
+    return checkpoints
+
+
+def is_usable_compaction_checkpoint(item: Any) -> bool:
+    """A replayable checkpoint has non-empty ciphertext and a good status."""
+    status = item.get("status") if isinstance(item, dict) else None
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "compaction"
+        and isinstance(item.get("encrypted_content"), str)
+        and bool(item["encrypted_content"].strip())
+        and not (
+            isinstance(status, str)
+            and status.strip().lower()
+            in {"failed", "incomplete", "cancelled", "canceled"}
+        )
+    )
+
+
+def has_usable_compaction_checkpoint(items: Any) -> bool:
+    return any(
+        is_usable_compaction_checkpoint(item)
+        for item in (items if isinstance(items, list) else ())
+    )
+
+
+def _current_native_issuer_kind(agent: Any) -> str:
+    flags = _responses_route_flags(agent)
+    if flags.is_codex_backend:
+        return "codex_backend"
+    endpoint = canonical_responses_endpoint(getattr(agent, "base_url", None))
+    return f"other:{endpoint}" if endpoint else "other"
+
+
+def _checkpoint_digest(item: Dict[str, Any]) -> str:
+    return hashlib.sha256(item["encrypted_content"].encode("utf-8")).hexdigest()
+
+
+def _compatible_checkpoint_items(
+    agent: Any,
+    messages: Any,
+    *,
+    known_digests: Any = (),
+) -> List[Dict[str, Any]]:
+    """Return usable checkpoints authorized by this exact route/model."""
+    current_issuer = _current_native_issuer_kind(agent)
+    known = {
+        digest
+        for digest in (known_digests if isinstance(known_digests, list) else ())
+        if isinstance(digest, str)
+    }
+    compatible = []
+    for item in _checkpoint_items(messages):
+        if not is_usable_compaction_checkpoint(item):
+            continue
+        if _checkpoint_digest(item) not in known:
+            continue
+        issuer = item.get("_issuer_kind")
+        if issuer is None or issuer == current_issuer:
+            compatible.append(item)
+    return compatible
+
+
+def _default_native_state(route_key: str) -> Dict[str, Any]:
+    return {
+        "version": NATIVE_OWNERSHIP_VERSION,
+        "route_key": route_key,
+        "owner": OWNER_NATIVE,
+        "phase": PHASE_AWAITING_CHECKPOINT,
+        "reason": "eligible_route",
+        "checkpoint_digests": [],
+        "latest_request_generation": 0,
+        "latest_request_tokens": None,
+        "checkpoint_generation": None,
+        "episode_start_generation": None,
+        "episode_start_tokens": None,
+    }
+
+
+def _ownership_default_document() -> Dict[str, Any]:
+    return {"version": NATIVE_OWNERSHIP_VERSION, "routes": {}}
+
+
+def _cache_ownership_document(agent: Any, document: Dict[str, Any]) -> None:
+    session_id = str(getattr(agent, "session_id", None) or "")
+    agent._native_compaction_ownership_cache = {
+        "session_id": session_id,
+        "document": document,
+    }
+    initial = getattr(agent, "_session_init_model_config", None)
+    if isinstance(initial, dict):
+        updated = dict(initial)
+        updated[NATIVE_OWNERSHIP_METADATA_KEY] = document
+        agent._session_init_model_config = updated
+
+
+def _load_ownership_document(agent: Any) -> Dict[str, Any]:
+    session_id = str(getattr(agent, "session_id", None) or "")
+    document = _ownership_default_document()
+    session_db = getattr(agent, "_session_db", None)
+    getter = getattr(session_db, "get_session_model_config_value", None)
+    if session_id and callable(getter) and not getattr(agent, "_persist_disabled", False):
+        try:
+            persisted = getter(session_id, NATIVE_OWNERSHIP_METADATA_KEY, None)
+            if isinstance(persisted, dict) and isinstance(persisted.get("routes"), dict):
+                document = persisted
+        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError):
+            logger.warning("native ownership metadata read failed", exc_info=True)
+    else:
+        cached = getattr(agent, "_native_compaction_ownership_cache", None)
+        if isinstance(cached, dict) and cached.get("session_id") == session_id:
+            candidate = cached.get("document")
+            if isinstance(candidate, dict) and isinstance(candidate.get("routes"), dict):
+                document = candidate
+    _cache_ownership_document(agent, document)
+    return document
+
+
+def _persist_ownership_document(agent: Any, document: Dict[str, Any]) -> None:
+    _cache_ownership_document(agent, document)
+    session_id = str(getattr(agent, "session_id", None) or "")
+    session_db = getattr(agent, "_session_db", None)
+    setter = getattr(session_db, "patch_session_model_config", None)
+    if not session_id or not callable(setter) or getattr(agent, "_persist_disabled", False):
+        return
+    try:
+        ensure = getattr(agent, "_ensure_db_session", None)
+        if callable(ensure):
+            ensure()
+        setter(session_id, {NATIVE_OWNERSHIP_METADATA_KEY: document})
+    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError):
+        logger.warning("native ownership metadata write failed", exc_info=True)
+
+
+def _mutate_ownership_route(agent: Any, route_key: str, mutator) -> Dict[str, Any]:
+    """Merge one route atomically so local fallback can never flip back."""
+    session_id = str(getattr(agent, "session_id", None) or "")
+    session_db = getattr(agent, "_session_db", None)
+    atomic = getattr(session_db, "mutate_session_model_config_value", None)
+
+    def update_document(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict) and isinstance(raw.get("routes"), dict):
+            document = dict(raw)
+            document["routes"] = dict(raw["routes"])
+        else:
+            document = _ownership_default_document()
+        document["version"] = NATIVE_OWNERSHIP_VERSION
+        prior = document["routes"].get(route_key)
+        updated = mutator(dict(prior) if isinstance(prior, dict) else None)
+        if isinstance(updated, dict):
+            updated["version"] = NATIVE_OWNERSHIP_VERSION
+            updated["route_key"] = route_key
+            document["routes"][route_key] = updated
+        return document
+
+    if (
+        session_id
+        and callable(atomic)
+        and not getattr(agent, "_persist_disabled", False)
+    ):
+        try:
+            ensure = getattr(agent, "_ensure_db_session", None)
+            if callable(ensure):
+                ensure()
+            document = atomic(
+                session_id,
+                NATIVE_OWNERSHIP_METADATA_KEY,
+                update_document,
+                _ownership_default_document(),
+            )
+            if not isinstance(document, dict):
+                document = _ownership_default_document()
+        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError):
+            logger.warning("native ownership metadata atomic write failed", exc_info=True)
+            document = update_document(_load_ownership_document(agent))
+    else:
+        document = update_document(_load_ownership_document(agent))
+        _persist_ownership_document(agent, document)
+
+    _cache_ownership_document(agent, document)
+    state = document.get("routes", {}).get(route_key)
+    return dict(state) if isinstance(state, dict) else _default_native_state(route_key)
+
+
+def native_compaction_ownership(agent: Any, messages: Any = None) -> Dict[str, Any]:
+    """Return the monotonic ownership record for the current route/model."""
+    route_key = native_compaction_route_key(agent)
+    if not native_compaction_route_eligible(agent):
+        state = {
+            "version": NATIVE_OWNERSHIP_VERSION,
+            "route_key": route_key,
+            "owner": OWNER_LOCAL,
+            "phase": PHASE_LOCAL_FALLBACK,
+            "reason": "native_ineligible",
+            "checkpoint_digests": [],
+        }
+        agent.native_compaction_ownership_state = dict(state)
+        return state
+
+    document = _load_ownership_document(agent)
+    state = document.get("routes", {}).get(route_key)
+    if not isinstance(state, dict):
+        state = _default_native_state(route_key)
+    compatible = _compatible_checkpoint_items(
+        agent,
+        messages,
+        known_digests=state.get("checkpoint_digests", []),
+    )
+    if (
+        state.get("owner") == OWNER_NATIVE
+        and compatible
+        and state.get("phase") != PHASE_CHECKPOINT_ACCEPTED
+    ):
+        def accept_existing(prior):
+            if not isinstance(prior, dict) or prior.get("owner") != OWNER_NATIVE:
+                return prior
+            updated = dict(prior)
+            updated["phase"] = PHASE_CHECKPOINT_ACCEPTED
+            updated["reason"] = "usable_checkpoint"
+            updated["checkpoint_digests"] = list(
+                dict.fromkeys(
+                    [
+                        *updated.get("checkpoint_digests", []),
+                        *(_checkpoint_digest(item) for item in compatible),
+                    ]
+                )
+            )[-16:]
+            return updated
+
+        state = _mutate_ownership_route(agent, route_key, accept_existing)
+    agent.native_compaction_ownership_state = dict(state)
+    return state
+
+
+def transition_native_compaction_to_local(agent: Any, reason: str) -> Dict[str, Any]:
+    """Transfer this route to durable local ownership exactly once."""
+    if reason not in _LOCAL_FALLBACK_REASONS:
+        raise ValueError(f"unsupported native compaction fallback reason: {reason}")
+    route_key = native_compaction_route_key(agent)
+    current = native_compaction_ownership(agent)
+    if current.get("owner") == OWNER_LOCAL:
+        return current
+
+    def transfer(prior):
+        if isinstance(prior, dict) and prior.get("owner") == OWNER_LOCAL:
+            return prior
+        previous = prior or {}
+        return {
+            "owner": OWNER_LOCAL,
+            "phase": PHASE_LOCAL_FALLBACK,
+            "reason": reason,
+            "checkpoint_digests": list(previous.get("checkpoint_digests", [])),
+            "latest_request_generation": int(
+                previous.get("latest_request_generation", 0) or 0
+            ),
+            "checkpoint_generation": previous.get("checkpoint_generation"),
+        }
+
+    state = _mutate_ownership_route(agent, route_key, transfer)
+    agent.native_compaction_ownership_state = dict(state)
+    return state
+
+
+def begin_native_compaction_request(
+    agent: Any, request_tokens: Optional[int] = None
+) -> Optional[int]:
+    """Allocate the current route's next monotonic request generation."""
+    if not native_compaction_route_eligible(agent):
+        return None
+    route_key = native_compaction_route_key(agent)
+
+    def advance(prior):
+        state = dict(prior) if isinstance(prior, dict) else _default_native_state(route_key)
+        if state.get("owner") == OWNER_LOCAL:
+            return state
+        generation = state.get("latest_request_generation", 0)
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            generation = 0
+        state["latest_request_generation"] = generation + 1
+        try:
+            state["latest_request_tokens"] = max(0, int(request_tokens or 0))
+        except (TypeError, ValueError):
+            state["latest_request_tokens"] = 0
+        return state
+
+    state = _mutate_ownership_route(agent, route_key, advance)
+    if state.get("owner") != OWNER_NATIVE:
+        return None
+    generation = state.get("latest_request_generation")
+    return generation if isinstance(generation, int) else None
+
+
+def observe_native_compaction_response(
+    agent: Any,
+    response: Any,
+    *,
+    request_generation: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Accept only a fresh, usable checkpoint from the current route."""
+    if not native_compaction_route_eligible(agent):
+        return native_compaction_ownership(agent)
+    output = response.get("output") if isinstance(response, dict) else getattr(response, "output", None)
+    output_items = list(output) if isinstance(output, list) else []
+    compactions = []
+    for raw in output_items:
+        item = raw if isinstance(raw, dict) else getattr(raw, "__dict__", {})
+        if isinstance(item, dict) and item.get("type") == "compaction":
+            compactions.append(item)
+    if not compactions:
+        return native_compaction_ownership(agent)
+
+    observed = native_compaction_ownership(agent)
+    if (
+        request_generation is not None
+        and request_generation != observed.get("latest_request_generation")
+    ):
+        state = observed
+        accepted_digests: set[str] = set()
+    else:
+        usable = [item for item in compactions if is_usable_compaction_checkpoint(item)]
+        if not usable:
+            accepted_digests = set()
+            state = transition_native_compaction_to_local(agent, "malformed_checkpoint")
+        else:
+            route_key = native_compaction_route_key(agent)
+            response_digests = [_checkpoint_digest(item) for item in usable]
+            accepted_digests = set()
+
+            def accept_response(prior):
+                state = dict(prior) if isinstance(prior, dict) else _default_native_state(route_key)
+                if state.get("owner") == OWNER_LOCAL:
+                    return state
+                latest = state.get("latest_request_generation", 0)
+                generation = latest if request_generation is None else request_generation
+                if generation != latest:
+                    return state
+                digests = list(state.get("checkpoint_digests", []))
+                for digest in response_digests:
+                    if digest not in digests:
+                        digests.append(digest)
+                        accepted_digests.add(digest)
+                if not accepted_digests:
+                    return state
+                request_tokens = state.get("latest_request_tokens")
+                if not isinstance(request_tokens, int) or isinstance(request_tokens, bool):
+                    request_tokens = None
+                state.update(
+                    owner=OWNER_NATIVE,
+                    phase=PHASE_CHECKPOINT_ACCEPTED,
+                    reason="usable_checkpoint",
+                    checkpoint_digests=digests[-16:],
+                    checkpoint_generation=generation,
+                    episode_start_generation=generation,
+                    episode_start_tokens=request_tokens,
+                )
+                return state
+
+            state = _mutate_ownership_route(agent, route_key, accept_response)
+            if state.get("owner") == OWNER_LOCAL:
+                accepted_digests.clear()
+
+    filtered = []
+    for raw in output_items:
+        item = raw if isinstance(raw, dict) else getattr(raw, "__dict__", {})
+        if not (isinstance(item, dict) and item.get("type") == "compaction"):
+            filtered.append(raw)
+        elif is_usable_compaction_checkpoint(item) and _checkpoint_digest(item) in accepted_digests:
+            filtered.append(raw)
+    if len(filtered) != len(output_items):
+        if isinstance(response, dict):
+            response["output"] = filtered
+        else:
+            response.output = filtered
+    agent.native_compaction_ownership_state = dict(state)
+    return state
+
+
+def native_hard_emergency_boundary(agent: Any) -> Optional[int]:
+    compressor = getattr(agent, "context_compressor", None)
+    context_length = getattr(compressor, "context_length", None)
+    if (
+        not isinstance(context_length, int)
+        or isinstance(context_length, bool)
+        or context_length <= 0
+    ):
+        return None
+    return max(1_024, context_length - NATIVE_HARD_EMERGENCY_RESERVE_TOKENS)
+
+
+def suppress_automatic_local_compaction(
+    agent: Any,
+    messages: Any,
+    approx_tokens: Optional[int] = None,
+) -> bool:
+    """True while native owns this episode; transfer at the hard boundary."""
+    state = native_compaction_ownership(agent, messages)
+    if state.get("owner") != OWNER_NATIVE:
+        return False
+    boundary = native_hard_emergency_boundary(agent)
+    if boundary is None:
+        return True
+    if approx_tokens is None:
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        approx_tokens = estimate_messages_tokens_rough(messages)
+    try:
+        current_tokens = max(0, int(approx_tokens or 0))
+    except (TypeError, ValueError):
+        current_tokens = 0
+
+    at_boundary = current_tokens >= boundary
+    if state.get("phase") == PHASE_CHECKPOINT_ACCEPTED:
+        episode_start = state.get("episode_start_tokens")
+        checkpoint_generation = state.get("checkpoint_generation")
+        if (
+            isinstance(episode_start, int)
+            and not isinstance(episode_start, bool)
+            and state.get("episode_start_generation") == checkpoint_generation
+        ):
+            at_boundary = max(0, current_tokens - episode_start) >= boundary
+    if at_boundary:
+        transition_native_compaction_to_local(agent, "hard_emergency_no_checkpoint")
+        return False
+    return True
 
 
 def resolve_compact_threshold(
@@ -142,36 +678,25 @@ def native_compaction_context_management(
     is_codex_backend: bool,
     is_xai_responses: bool = False,
     is_github_responses: bool = False,
+    messages: Any = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Return the ``context_management`` payload for this request, or None.
 
     None means "do not send the field" — the request is byte-identical to
-    pre-feature behavior. All gates are re-checked per request so a
-    mid-session model switch or the in-session kill switch
-    (``agent.codex_responses_native_compaction = False``, set by the
-    conversation loop's rejection recovery) takes effect on the next call.
+    pre-feature behavior. All gates and route-scoped ownership are re-checked
+    per request, so model/provider switches and durable fallback transitions
+    take effect on the next call.
     """
-    if not bool(getattr(agent, "codex_responses_native_compaction", False)):
-        return None
-    # compression.enabled: false disables ALL automatic compaction, native
-    # included — mirrors the codex_app_server_auto contract.
-    if not bool(getattr(agent, "compression_enabled", True)):
-        return None
-    # compression.checkpoint_required: server-side compaction is a lossy
-    # boundary the provider owns — no pre-compress checkpoint can run before
-    # the server replaces older context. Keep the checkpoint-aware Hermes
-    # compressor authoritative instead of silently letting the server
-    # compact. Explicit-True check matches the compress_context() gate.
-    if getattr(agent, "compression_checkpoint_required", False) is True:
-        _warn_native_compaction_suppressed_by_checkpoint_gate()
-        return None
-    if is_xai_responses or is_github_responses:
-        return None
-    if not is_native_compaction_model(getattr(agent, "model", None)):
-        return None
-    if not is_direct_openai_route(
-        getattr(agent, "base_url", None), is_codex_backend=is_codex_backend
+    if not native_compaction_route_eligible(
+        agent,
+        is_codex_backend=is_codex_backend,
+        is_xai_responses=is_xai_responses,
+        is_github_responses=is_github_responses,
     ):
+        if getattr(agent, "compression_checkpoint_required", False) is True:
+            _warn_native_compaction_suppressed_by_checkpoint_gate()
+        return None
+    if native_compaction_ownership(agent, messages).get("owner") != OWNER_NATIVE:
         return None
 
     compressor = getattr(agent, "context_compressor", None)
@@ -311,7 +836,7 @@ def prune_pre_checkpoint_items(
 
     last_cp = None
     for i, item in enumerate(items):
-        if isinstance(item, dict) and item.get("type") == "compaction":
+        if is_usable_compaction_checkpoint(item):
             last_cp = i
     if last_cp is None:
         return items
@@ -320,8 +845,7 @@ def prune_pre_checkpoint_items(
     first_cp = last_cp
     while (
         first_cp > 0
-        and isinstance(items[first_cp - 1], dict)
-        and items[first_cp - 1].get("type") == "compaction"
+        and is_usable_compaction_checkpoint(items[first_cp - 1])
     ):
         first_cp -= 1
 
@@ -434,17 +958,16 @@ def is_native_compaction_rejection(error: Any, status_code: Any = None) -> bool:
     """True when a provider error is a STRUCTURED rejection of the
     context_management field.
 
-    Used by the conversation loop's one-shot recovery: strip the field,
-    disable native compaction for the rest of the session, retry. Matching
-    is deliberately narrow — a transient 5xx/timeout whose body merely
-    ECHOES the request (and therefore contains the field name) must NOT
-    permanently downgrade native compaction for the session (#82777).
+    Used by the conversation loop's one-shot recovery: transfer this route to
+    local ownership, strip the field, and retry. Matching is deliberately
+    narrow — a transient 5xx/timeout whose body merely ECHOES the request
+    (and therefore contains the field name) must NOT permanently downgrade
+    native compaction for the route (#82777).
 
-    Two conditions, both required when a status is known:
+    Two conditions are always required:
 
-    * ``status_code`` is 400 (or unknown/None — some transports surface
-      only a message string; field-name matching alone is then the best
-      available signal, preserving pre-#82777 behavior for them), and
+    * ``status_code`` parses to 400, or the message explicitly embeds the
+      SDK-style ``Error code: 400`` marker, and
     * the error text names ``context_management`` / ``compact_threshold``
       alongside rejection language ("unknown", "unsupported", "invalid",
       "unexpected", "not permitted"...). A bare field-name echo without
@@ -453,12 +976,24 @@ def is_native_compaction_rejection(error: Any, status_code: Any = None) -> bool:
     text = str(error or "").lower()
     if "context_management" not in text and "compact_threshold" not in text:
         return False
-    if status_code is not None:
+    parsed_status = None
+    if status_code is not None and not isinstance(status_code, bool):
         try:
-            if int(status_code) != 400:
-                return False
+            parsed_status = int(status_code)
         except (TypeError, ValueError):
             pass
+    if parsed_status is None:
+        if re.search(
+            r"(?:\btimeout(?:error)?\b|\btimed\s+out\b|\bconnection\s+reset\b|"
+            r"\bhttp\s+5\d\d\b|\b5xx\b)",
+            text,
+        ):
+            return False
+        embedded = re.search(r"\berror\s+code\s*:\s*(\d{3})\b", text)
+        if embedded is not None:
+            parsed_status = int(embedded.group(1))
+    if parsed_status != 400:
+        return False
     rejection_markers = (
         "unknown", "unsupported", "invalid", "unexpected", "not permitted",
         "not allowed", "unrecognized", "extra field", "no such", "bad request",
@@ -501,9 +1036,9 @@ def merge_interim_reasoning_items(
     kept_checkpoints = [
         item
         for item in (prior_items if isinstance(prior_items, list) else [])
-        if isinstance(item, dict) and item.get("type") == "compaction"
+        if is_usable_compaction_checkpoint(item)
     ]
     new_list = list(new_items) if isinstance(new_items, list) else []
-    if has_compaction_checkpoint(new_list) or not kept_checkpoints:
+    if has_usable_compaction_checkpoint(new_list) or not kept_checkpoints:
         return new_list
     return kept_checkpoints + new_list

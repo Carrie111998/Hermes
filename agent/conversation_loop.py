@@ -2674,7 +2674,7 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
-        if (
+        _pre_api_compression_requested = bool(
             agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
             and len(messages) > 1
@@ -2683,7 +2683,15 @@ def run_conversation(
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
-        ):
+        )
+        _native_suppresses_pre_api = False
+        if _pre_api_compression_requested:
+            from agent.native_compaction import suppress_automatic_local_compaction
+
+            _native_suppresses_pre_api = suppress_automatic_local_compaction(
+                agent, messages, request_pressure_tokens
+            )
+        if _pre_api_compression_requested and not _native_suppresses_pre_api:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -2883,10 +2891,12 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _native_request_generation = None
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            _native_request_generation = None
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -3209,6 +3219,16 @@ def run_conversation(
                     )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
+
+                if (
+                    agent.api_mode == "codex_responses"
+                    and api_kwargs.get("context_management")
+                ):
+                    from agent.native_compaction import begin_native_compaction_request
+
+                    _native_request_generation = begin_native_compaction_request(
+                        agent, request_pressure_tokens
+                    )
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -5112,33 +5132,37 @@ def run_conversation(
 
                 # ── Native compaction rejection recovery ──────────────
                 # Provider explicitly rejected the ``context_management``
-                # field (structured 400 naming the param). One-shot: turn
-                # native compaction off for the rest of the session and
-                # retry — the next _build_api_kwargs re-resolves the gate
-                # and omits the field, and Hermes' local compression takes
-                # over as the sole owner. Generic 4xx/5xx/timeouts do NOT
-                # match (see is_native_compaction_rejection) and take the
-                # normal retry path.
+                # field (structured 400 naming the param). One-shot: transfer
+                # this route to durable local ownership and retry. The next
+                # _build_api_kwargs re-resolves ownership and omits the field.
+                # Generic 4xx/5xx/timeouts do NOT match (see
+                # is_native_compaction_rejection) and take the normal retry
+                # path.
                 if (
                     agent.api_mode == "codex_responses"
                     and not _retry.native_compaction_reject_retry_attempted
                     and bool(getattr(agent, "codex_responses_native_compaction", False))
                 ):
-                    from agent.native_compaction import is_native_compaction_rejection
+                    from agent.native_compaction import (
+                        is_native_compaction_rejection,
+                        transition_native_compaction_to_local,
+                    )
                     if is_native_compaction_rejection(
                         api_error, getattr(api_error, "status_code", None)
                     ):
                         _retry.native_compaction_reject_retry_attempted = True
-                        agent.codex_responses_native_compaction = False
+                        transition_native_compaction_to_local(
+                            agent, "structured_rejection"
+                        )
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Provider rejected native compaction "
-                            f"(context_management) — disabled for this session, "
-                            f"local compression stays active. Retrying...",
+                            f"(context_management) — using local compression "
+                            f"for this route. Retrying...",
                             force=True,
                         )
                         logger.warning(
-                            "%sNative compaction rejection recovery: disabled "
-                            "codex_responses_native for this session and retrying",
+                            "%sNative compaction rejection recovery: transferred "
+                            "this route to local ownership and retrying",
                             agent.log_prefix,
                         )
                         continue
@@ -6758,6 +6782,14 @@ def run_conversation(
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
+            if agent.api_mode == "codex_responses":
+                from agent.native_compaction import observe_native_compaction_response
+
+                observe_native_compaction_response(
+                    agent,
+                    response,
+                    request_generation=_native_request_generation,
+                )
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
@@ -7546,11 +7578,19 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if (
+                _post_tool_compression_requested = bool(
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
-                ):
+                )
+                _native_suppresses_post_tool = False
+                if _post_tool_compression_requested:
+                    from agent.native_compaction import suppress_automatic_local_compaction
+
+                    _native_suppresses_post_tool = suppress_automatic_local_compaction(
+                        agent, messages, _real_tokens
+                    )
+                if _post_tool_compression_requested and not _native_suppresses_post_tool:
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was
                     # never blocked) — reset the blocked-overflow warning
@@ -7631,7 +7671,14 @@ def run_conversation(
                     # minimal test doubles (SimpleNamespace compressors) lack the
                     # method — treat absence as a no-op.
                     _prune = getattr(_compressor, "prune_tool_results_only", None)
+                    _native_suppresses_prune = False
                     if callable(_prune):
+                        from agent.native_compaction import suppress_automatic_local_compaction
+
+                        _native_suppresses_prune = suppress_automatic_local_compaction(
+                            agent, messages, _real_tokens
+                        )
+                    if callable(_prune) and not _native_suppresses_prune:
                         try:
                             _pruned_msgs, _pruned_n = _prune(
                                 messages, current_tokens=_real_tokens
