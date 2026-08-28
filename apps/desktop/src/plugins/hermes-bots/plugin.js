@@ -441,8 +441,9 @@ function focusedRosterOwner(owner) {
 
 /** Optional secondary navigation inside the Bots pane (group-chat rooms). */
 
-/** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
- *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
+/** Group-chat rooms: { [group]: { log, pending, watermarks, epoch, running } }.
+ *  Log + pending messages + watermarks persist via plugin storage;
+ *  epoch/running/runSequence are runtime-only. */
 const $groupChats = atom({})
 /** Group whose room view is open in the Bots pane (secondary navigation
  *  inside the pane; a normal row click returns to the roster). */
@@ -1052,6 +1053,7 @@ function durableGroupChatRooms(all = $groupChats.get()) {
     }
     durable[name] = {
       log: room.log,
+      pending: Array.isArray(room.pending) ? room.pending : [],
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
       stranded: room.stranded || {},
@@ -1494,7 +1496,14 @@ function handleSessionsGatewayTransition() {
   // client's stale cache hide a room written by another Desktop/mobile client.
   void pullGroupChatServerState()
     .catch(() => false)
-    .then(() => scheduleGroupChatServerSync($groupChats.get()))
+    .then(() => {
+      scheduleGroupChatServerSync($groupChats.get())
+      for (const [name, room] of Object.entries($groupChats.get())) {
+        if (!room.running && room.pending?.length) {
+          scheduleQueuedGroupRecovery(name, room.members)
+        }
+      }
+    })
 }
 
 // ── cross-connection bot relay ────────────────────────────────────────────
@@ -7080,6 +7089,7 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
 
       durable[name] = {
         log: room.log,
+        pending: Array.isArray(room.pending) ? room.pending : [],
         watermarks: room.watermarks,
         sessions: room.sessions || {},
         sessionOwners: room.sessionOwners || {},
@@ -7179,6 +7189,7 @@ async function disbandGroupChat(group, members) {
       if (name !== group && Array.isArray(room.log)) {
         durable[name] = {
           log: room.log,
+          pending: Array.isArray(room.pending) ? room.pending : [],
           watermarks: room.watermarks,
           sessions: room.sessions || {},
           sessionOwners: room.sessionOwners || {},
@@ -7254,6 +7265,15 @@ async function renameGroupChat(oldName, newName, members) {
 
   if (taken.has(next)) {
     host.notify({ kind: 'error', message: `A group named “${next}” already exists.` })
+    return null
+  }
+
+  // Active drives and recovery timers are keyed by the room name. Do not move
+  // that ownership out from under them; once the room and its durable queue
+  // are idle the same rename is safe and preserves the immutable roomId.
+  const currentRoom = $groupChats.get()[oldName]
+  if (currentRoom?.running || currentRoom?.interruptingQueue || currentRoom?.pending?.length) {
+    host.notify({ kind: 'error', message: 'Wait for the room and its queued messages to finish before renaming it.' })
     return null
   }
 
@@ -7855,7 +7875,10 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
     // delivered (the #93127 commit check decides its fate, not this loop).
     const roomDuringPoll = $groupChats.get()[group] || {}
 
-    if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && (roomDuringPoll.holds || {})[memberKey]) {
+    if (
+      (roomDuringPoll.epoch || 0) !== dispatchEpoch &&
+      ((roomDuringPoll.holds || {})[memberKey] || dispatchEpoch <= (roomDuringPoll.cancelledThroughEpoch ?? -1))
+    ) {
       return null
     }
 
@@ -8204,16 +8227,37 @@ function unaddressedGroupMentions(group, members, thread) {
  *
  *  `members` is the live roster when the caller has one (the workspace);
  *  falls back to the room's durable roster so a two-arg call still works. */
-async function stopGroupThread(group, thread, members = null) {
+async function stopGroupThread(
+  group,
+  thread,
+  members = null,
+  { preservePending = false, preserveQueueClaim = false } = {}
+) {
   const room = $groupChats.get()[group] || {}
   const roster = Array.isArray(members) && members.length ? members : room.members || []
   const turnName = room.turn || null
   const stamp = { at: Date.now(), byMessageId: null, thread: thread || null }
 
   updateGroupChat(group, r => {
+    const stoppedEpoch = r.epoch || 0
     r.epoch = (r.epoch || 0) + 1
+    // The interrupt RPC only acknowledges cancellation; it does not wait for
+    // the old renderer poll to observe it. Keep a generation fence so that
+    // poll cannot consume a promoted turn after interrupt-and-send restores
+    // the user's sticky holds.
+    r.cancelledThroughEpoch = Math.max(r.cancelledThroughEpoch ?? -1, stoppedEpoch)
     r.running = false
     r.turn = null
+
+    // Explicit Stop is terminal for sends waiting behind this run. The
+    // interrupt-and-send transition opts out while its selected item owns the
+    // room and the remainder of the FIFO must survive.
+    if (!preservePending) {
+      r.pending = []
+    }
+    if (!preserveQueueClaim) {
+      r.interruptingQueue = null
+    }
 
     // Same hold shape applyGroupHoldDirective mints for "@all stop" — the
     // held-skip path (watermark consume + 'held' activity note) and every
@@ -8248,8 +8292,11 @@ async function stopGroupThread(group, thread, members = null) {
     } catch {
       /* best-effort — the epoch/hold legs above already stopped the room;
          the abandoned poll loop exits on its staleness check */
+      return false
     }
   }
+
+  return true
 }
 
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
@@ -8581,6 +8628,11 @@ async function runGroupChatRounds(group, members, thread) {
         return r
       })
 
+      // Busy sends stay outside the live log until the current drive settles,
+      // then advance FIFO. This avoids prompt.submit's busy redirect/interrupt
+      // policy and gives the UI a real, cancellable queue item meanwhile.
+      scheduleQueuedGroupRecovery(group, members)
+
       // #89545: the loop's harvest pass only ran at the top of each round of
       // an ACTIVE loop — a member whose turn timed out after the final round
       // stayed stranded until the user's NEXT send. Poll for the late reply
@@ -8632,11 +8684,318 @@ async function harvestStrandedUntilSettled(group, members, thread) {
   recordGroupActivity(group, { kind: 'failed', member: null, thread })
 }
 
-/** User send into a group room. `thread` continues that thread (its reply
- *  box); omitted/null mints a NEW thread — the main composer's Slack shape.
- *  Appends, bumps the room epoch (supersedes any running loop at its next
- *  member boundary), and starts the turn drive for the target thread.
- *  Returns the thread id the message landed in. */
+function runQueuedGroupMessage(group, members, queued, { claimed = false } = {}) {
+  const roster = Array.isArray(members) && members.length ? members : ($groupChats.get()[group] || {}).members || []
+  const roomBefore = $groupChats.get()[group] || {}
+
+  if (
+    !queued ||
+    !roster.length ||
+    roomBefore.running ||
+    (roomBefore.interruptingQueue && (!claimed || roomBefore.interruptingQueue.id !== queued.id))
+  ) {
+    return false
+  }
+
+  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
+  const sent = appendGroupChatEntry(group, { kind: 'user', name: 'You' }, queued.text, queued.thread, queued.images)
+
+  updateGroupChat(group, room => {
+    room.pending = (room.pending || []).filter(item => item.id !== queued.id)
+    if (claimed) {
+      room.interruptingQueue = null
+    }
+    room.members = durableGroupChatMembers(roster)
+    room.epoch = (room.epoch || 0) + 1
+    room.runSequence = (room.runSequence || 0) + 1
+    room.running = true
+    room.holds = applyGroupHoldDirective(
+      room.holds,
+      parseGroupChatMentions(queued.text, roster),
+      queued.text,
+      { at: sent?.at, byMessageId: sent?.id, thread: queued.thread },
+      roster.map(member => groupMemberKey(member))
+    )
+    return room
+  })
+
+  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: queued.thread })
+  void runGroupChatRounds(group, roster, queued.thread).catch(() => {
+    updateGroupChat(group, room => {
+      room.running = false
+      room.turn = null
+      return room
+    })
+    scheduleQueuedGroupRecovery(group, roster)
+  })
+  return true
+}
+
+/** Start the oldest queued send once no drive owns the room. Exactly one
+ * caller can win because the atom mutation and `running = true` are
+ * synchronous on the renderer thread. */
+function drainQueuedGroupMessage(group, members = null) {
+  const room = $groupChats.get()[group] || {}
+  const next = Array.isArray(room.pending) ? room.pending[0] : null
+
+  if (room.running || room.interruptingQueue || !next) {
+    return false
+  }
+
+  return runQueuedGroupMessage(group, members, next)
+}
+
+/** A restored room has no trustworthy renderer-side `running` flag. Check the
+ * durable member sessions before replaying its oldest queued send so a window
+ * reload cannot submit into backend work that survived the renderer. Unknown
+ * session state fails closed and leaves the durable queue untouched. */
+async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId = null) {
+  const recoveryGeneration = groupQueueRecoveryGeneration
+  const before = $groupChats.get()[group] || {}
+  const roster = Array.isArray(members) && members.length ? members : before.members || []
+  const queued = messageId
+    ? before.pending?.find(item => item.id === messageId)
+    : before.pending?.[0]
+
+  if (before.running || before.interruptingQueue || !queued) {
+    return false
+  }
+
+  for (const member of roster) {
+    const sessionId = (before.sessions || {})[groupMemberKey(member)]
+
+    if (!sessionId) {
+      continue
+    }
+
+    let state
+    try {
+      state = await requestForBot(member, 'session.resume', {
+        session_id: sessionId,
+        profile: member.name
+      })
+    } catch {
+      return false
+    }
+
+    if (
+      groupQueueRecoveryDisposed ||
+      recoveryGeneration !== groupQueueRecoveryGeneration
+    ) {
+      return false
+    }
+
+    const hasBusyState =
+      state &&
+      typeof state === 'object' &&
+      (Object.prototype.hasOwnProperty.call(state, 'inflight') ||
+        Object.prototype.hasOwnProperty.call(state, 'running'))
+
+    if (
+      !hasBusyState ||
+      state.inflight ||
+      state.running ||
+      state.pending_clarify ||
+      state.pending_approval
+    ) {
+      return false
+    }
+  }
+
+  const current = $groupChats.get()[group] || {}
+  if (
+    groupQueueRecoveryDisposed ||
+    recoveryGeneration !== groupQueueRecoveryGeneration ||
+    current.running ||
+    current.interruptingQueue ||
+    !(current.pending || []).some(item => item.id === queued.id)
+  ) {
+    return false
+  }
+
+  return runQueuedGroupMessage(group, roster, queued)
+}
+
+const groupQueueRecoveryTimers = new Map()
+const GROUP_QUEUE_RECOVERY_INTERVAL_MS = 5000
+const GROUP_QUEUE_RECOVERY_MAX_TRIES = 120
+let groupQueueRecoveryDisposed = false
+let groupQueueRecoveryGeneration = 0
+
+/** Retry a durable queue after ambiguous submit failures or renderer reloads.
+ * Every attempt rechecks backend session state; the bound prevents a dead
+ * gateway from creating a permanent timer. Manual Send now remains available. */
+function scheduleQueuedGroupRecovery(group, members = null, attempt = 0) {
+  if (
+    groupQueueRecoveryDisposed ||
+    groupQueueRecoveryTimers.has(group) ||
+    typeof setTimeout !== 'function'
+  ) {
+    return
+  }
+  const recoveryGeneration = groupQueueRecoveryGeneration
+
+  const run = async () => {
+    if (
+      groupQueueRecoveryDisposed ||
+      recoveryGeneration !== groupQueueRecoveryGeneration
+    ) {
+      return
+    }
+    const room = $groupChats.get()[group] || {}
+
+    if (room.running || room.interruptingQueue || !room.pending?.length) {
+      groupQueueRecoveryTimers.delete(group)
+      return
+    }
+
+    const drained = await drainQueuedGroupMessageWhenIdle(group, members)
+    if (recoveryGeneration !== groupQueueRecoveryGeneration) {
+      return
+    }
+    if (drained) {
+      groupQueueRecoveryTimers.delete(group)
+      return
+    }
+
+    const current = $groupChats.get()[group] || {}
+    if (
+      !groupQueueRecoveryDisposed &&
+      attempt + 1 < GROUP_QUEUE_RECOVERY_MAX_TRIES &&
+      !current.running &&
+      !current.interruptingQueue &&
+      current.pending?.length
+    ) {
+      const timer = setTimeout(
+        () => {
+          groupQueueRecoveryTimers.delete(group)
+          scheduleQueuedGroupRecovery(group, members, attempt + 1)
+        },
+        GROUP_QUEUE_RECOVERY_INTERVAL_MS
+      )
+      groupQueueRecoveryTimers.set(group, timer)
+    } else {
+      groupQueueRecoveryTimers.delete(group)
+    }
+  }
+
+  // Reserve the group synchronously so concurrent settle/error paths cannot
+  // launch duplicate status probes before the async attempt starts.
+  groupQueueRecoveryTimers.set(group, null)
+  void run()
+}
+
+function stopQueuedGroupRecovery() {
+  groupQueueRecoveryDisposed = true
+  groupQueueRecoveryGeneration += 1
+  for (const timer of groupQueueRecoveryTimers.values()) {
+    if (timer !== null) {
+      clearTimeout(timer)
+    }
+  }
+  groupQueueRecoveryTimers.clear()
+}
+
+function cancelQueuedGroupMessage(group, messageId) {
+  const room = $groupChats.get()[group]
+
+  if (
+    !room ||
+    room.interruptingQueue?.id === messageId ||
+    !(room.pending || []).some(item => item.id === messageId)
+  ) {
+    return false
+  }
+
+  updateGroupChat(group, current => {
+    current.pending = current.pending.filter(item => item.id !== messageId)
+    return current
+  })
+  return true
+}
+
+function keepWaitingForQueuedGroupMessage(group, messageId) {
+  const room = $groupChats.get()[group]
+
+  if (
+    !room ||
+    room.interruptingQueue?.id === messageId ||
+    !(room.pending || []).some(item => item.id === messageId)
+  ) {
+    return false
+  }
+
+  updateGroupChat(group, current => {
+    current.pending = current.pending.map(item =>
+      item.id === messageId ? { ...item, decisionAt: Date.now() } : item
+    )
+    return current
+  })
+  return true
+}
+
+/** Claim one queued send before crossing the async interrupt boundary. The
+ * claim remains the room owner until promotion, so composer sends stay queued
+ * and repeat actions cannot start a second drive. */
+async function interruptForQueuedGroupMessage(group, messageId, members = null) {
+  const room = $groupChats.get()[group] || {}
+  const queued = (room.pending || []).find(item => item.id === messageId)
+
+  if (!queued || room.interruptingQueue) {
+    return false
+  }
+
+  const priorHolds = { ...(room.holds || {}) }
+  const roster = Array.isArray(members) && members.length ? members : room.members || []
+
+  if (!room.running) {
+    return drainQueuedGroupMessageWhenIdle(group, roster, messageId)
+  }
+
+  updateGroupChat(group, current => {
+    if (current.interruptingQueue || !(current.pending || []).some(item => item.id === messageId)) {
+      return current
+    }
+    // Keep the claimed item in the durable FIFO while the interrupt RPC is in
+    // flight. A window close or crash must not lose the user's message.
+    current.interruptingQueue = queued
+    return current
+  })
+
+  if (($groupChats.get()[group] || {}).interruptingQueue?.id !== messageId) {
+    return false
+  }
+
+  const interrupted = await stopGroupThread(group, queued.thread, roster, {
+    preservePending: true,
+    preserveQueueClaim: true
+  })
+  const current = $groupChats.get()[group] || {}
+
+  if (!interrupted) {
+    if (current.interruptingQueue?.id === messageId) {
+      updateGroupChat(group, latest => {
+        latest.interruptingQueue = null
+        latest.holds = priorHolds
+        return latest
+      })
+    }
+    return false
+  }
+
+  if (current.interruptingQueue?.id !== messageId || current.running) {
+    return false
+  }
+
+  updateGroupChat(group, current => {
+    current.holds = priorHolds
+    return current
+  })
+  return runQueuedGroupMessage(group, roster, queued, { claimed: true })
+}
+
+/** User send into a group room. A busy room stores the send in a durable FIFO
+ * instead of submitting into the member's already-live gateway session. */
 function sendToGroupChat(group, members, text, thread, images) {
   const trimmed = String(text || '').trim()
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
@@ -8646,56 +9005,28 @@ function sendToGroupChat(group, members, text, thread, images) {
   }
 
   const target = thread || mintGroupThreadId()
+  const room = $groupChats.get()[group] || {}
+  const queued = {
+    id: groupChatEntryId(),
+    at: Date.now(),
+    text: trimmed,
+    thread: target,
+    ...(attached.length ? { images: attached } : {}),
+    queuedBehindRun: Math.max(1, Number(room.runSequence || 1))
+  }
 
-  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  // Refresh the durable room roster on every send. This backfills rooms made
-  // by older Desktop builds and keeps the gateway mirror complete even when
-  // members overlap across multiple groups.
-  updateGroupChat(group, room => {
-    room.members = durableGroupChatMembers(members)
-    return room
-  })
-  const sent = appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
-
-  const wasRunning = ($groupChats.get()[group] || {}).running === true
-
-  updateGroupChat(group, room => {
-    room.epoch = (room.epoch || 0) + 1
-    room.running = true
-    // #93129: user text is the ONLY input that changes member holds. An
-    // explicit "stop @member" sets a sticky hold; "@member resume" (or
-    // @all resume, or any direct non-stop mention of the held member)
-    // releases it. Bot replies never flow through this function.
-    room.holds = applyGroupHoldDirective(
-      room.holds,
-      parseGroupChatMentions(trimmed, members),
-      trimmed,
-      { at: sent?.at, byMessageId: sent?.id, thread: target },
-      members.map(member => groupMemberKey(member))
-    )
-    return room
-  })
-
-  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
-
-  if (!wasRunning) {
-    void runGroupChatRounds(group, members, target).catch(() => {
-      updateGroupChat(group, r => {
-        r.running = false
-        return r
-      })
+  if (room.running || room.interruptingQueue || room.pending?.length) {
+    updateGroupChat(group, current => {
+      current.members = durableGroupChatMembers(members)
+      current.pending = [...(current.pending || []), queued]
+      return current
     })
+    recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
+    if (!room.running && !room.interruptingQueue) {
+      scheduleQueuedGroupRecovery(group, members)
+    }
   } else {
-    // A loop is live; it bails at its next boundary. Chain the fresh loop
-    // after a short settle so exactly one drive owns the room.
-    setTimeout(() => {
-      void runGroupChatRounds(group, members, target).catch(() => {
-        updateGroupChat(group, r => {
-          r.running = false
-          return r
-        })
-      })
-    }, 250)
+    runQueuedGroupMessage(group, members, queued)
   }
 
   return target
@@ -13327,6 +13658,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
+  const pendingQueue = Array.isArray(room.pending) ? room.pending : []
+  const [queueNow, setQueueNow] = useState(() => Date.now())
   const composerKey = groupComposerDraftKey(group, room)
   const composerKeyRef = useRef(composerKey)
   const [composerDraft, setComposerDraft] = useState(() => groupComposerDraftSnapshot(composerKey))
@@ -13391,6 +13724,15 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // already near the bottom, so reading history is never yanked away.
   const bottomSentinelRef = useRef(null)
   const stickToBottomRef = useRef(true)
+
+  useEffect(() => {
+    if (!pendingQueue.length) {
+      return undefined
+    }
+
+    const timer = setInterval(() => setQueueNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [pendingQueue.length])
 
   useEffect(() => {
     const sentinel = bottomSentinelRef.current
@@ -13571,8 +13913,32 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // epoch bump + holds the loop marched on to the next member. Thread scope:
   // the run being stopped is the one the latest activity belongs to.
   const stopRoomRun = async () => {
+    const queuedCount = (room.pending || []).length
     await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
-    host.notify({ kind: 'success', message: `Stopped ${group} — remaining turns are held until you resume` })
+    host.notify({
+      kind: 'success',
+      message: queuedCount
+        ? `Stopped ${group} — cancelled ${queuedCount} queued ${queuedCount === 1 ? 'message' : 'messages'}`
+        : `Stopped ${group} — remaining turns are held until you resume`
+    })
+  }
+
+  const cancelQueued = queued => {
+    if (!cancelQueuedGroupMessage(group, queued.id)) {
+      host.notifyError?.(new Error('queued message not found'), 'That queued message is no longer waiting')
+    }
+  }
+
+  const interruptQueued = async queued => {
+    const promoted = await interruptForQueuedGroupMessage(group, queued.id, memberDescriptors())
+
+    if (!promoted) {
+      const stillWaiting = ($groupChats.get()[group]?.pending || []).some(item => item.id === queued.id)
+      host.notifyError?.(
+        new Error(stillWaiting ? 'group interrupt failed' : 'queued message not found'),
+        stillWaiting ? 'Could not interrupt the current turn; the message is still queued' : 'That queued message is no longer waiting'
+      )
+    }
   }
 
   const activityPanel = jsxs('div', {
@@ -14081,6 +14447,67 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             ...roomClarifies.map(entry =>
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
+            pendingQueue.length
+              ? jsx('div', {
+                  className: 'grid gap-1 border-t border-(--ui-stroke-tertiary) px-2 py-1.5 text-[0.7rem]',
+                  children: pendingQueue.map(queued => {
+                    const waitedMs = Math.max(0, queueNow - Number(queued.at || queueNow))
+                    const decisionAge = Math.max(0, queueNow - Number(queued.decisionAt || queued.at || queueNow))
+                    const overdue = decisionAge >= 60_000
+                    const interrupting = room.interruptingQueue?.id === queued.id
+
+                    return jsxs('div', {
+                      className: 'grid gap-1',
+                      children: [
+                        jsxs('div', {
+                          className: 'flex items-center gap-1.5',
+                          children: [
+                            jsx(Codicon, { name: 'clock', className: 'shrink-0 text-(--ui-accent)' }),
+                            jsx('span', {
+                              className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+                              children: interrupting
+                                ? 'Interrupting current turn…'
+                                : room.running
+                                  ? `Queued — room agent busy (run #${queued.queuedBehindRun || 1}) · ${Math.floor(waitedMs / 1000)}s`
+                                  : `Queued — room stopped · ${Math.floor(waitedMs / 1000)}s`
+                            }),
+                            jsx(Button, {
+                              type: 'button',
+                              variant: 'text',
+                              size: 'inline',
+                              disabled: interrupting,
+                              'aria-label': 'Cancel queued group message',
+                              onClick: () => cancelQueued(queued),
+                              children: 'Cancel'
+                            })
+                          ]
+                        }),
+                        !interrupting && (overdue || !room.running)
+                          ? jsxs('div', {
+                              className: 'flex items-center justify-end gap-2 text-[0.65rem]',
+                              children: [
+                                jsx(Button, {
+                                  type: 'button',
+                                  variant: 'textStrong',
+                                  size: 'inline',
+                                  onClick: () => void interruptQueued(queued),
+                                  children: room.running ? 'Interrupt & send' : 'Send now'
+                                }),
+                                jsx(Button, {
+                                  type: 'button',
+                                  variant: 'text',
+                                  size: 'inline',
+                                  onClick: () => keepWaitingForQueuedGroupMessage(group, queued.id),
+                                  children: 'Keep waiting'
+                                })
+                              ]
+                            })
+                          : null
+                      ]
+                    }, `queued:${queued.id}`)
+                  })
+                })
+              : null,
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
@@ -15705,6 +16132,8 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+    groupQueueRecoveryDisposed = false
+    groupQueueRecoveryGeneration += 1
     startFaceClock()
     // The cross-connection relay rides every gateway socket this Desktop
     // holds: roster sync + envelope drain/deliver/reply loops.
@@ -15840,6 +16269,7 @@ export default {
                   // Pre-thread entries get synthetic thread ids on hydrate so
                   // every UI/engine path can assume entry.thread exists.
                   log: assignLegacyThreads(room.log),
+                  pending: Array.isArray(room.pending) ? room.pending : [],
                   watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
@@ -15895,6 +16325,11 @@ export default {
           // empty overwrite and then rendering an empty conversation.
           await pullGroupChatServerState().catch(() => false)
           scheduleGroupChatServerSync($groupChats.get())
+          for (const [roomName, room] of Object.entries($groupChats.get())) {
+            if (!room.running && Array.isArray(room.pending) && room.pending.length) {
+              scheduleQueuedGroupRecovery(roomName, room.members)
+            }
+          }
         })
         .catch(() => undefined)
     } catch {
@@ -15937,6 +16372,7 @@ export default {
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
         stopGroupChatServerSync()
+        stopQueuedGroupRecovery()
         if (typeof unbindProfileListener === 'function') {
           unbindProfileListener()
         }

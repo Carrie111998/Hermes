@@ -198,7 +198,7 @@ test('an untyped failed member turn keeps the message-classification fallback', 
   assert.equal(Object.values(gc.$botAttention.get())[0]?.reason, 'missing_config')
 })
 
-test('a newer send interrupts the previous run and records cancelled in the CURRENT epoch', async () => {
+test('a newer send waits behind the previous run and starts only after it settles', async () => {
   const gates = [null, null]
   const gate = n => {
     gates[n] = gates[n] || { promise: null, resolve: null }
@@ -216,23 +216,27 @@ test('a newer send interrupts the previous run and records cancelled in the CURR
   for (let i = 0; i < 50 && gc.calls.length < 1; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }
-  gc.sendToGroupChat('Busy', member, 'second ask, supersede')
-  for (let i = 0; i < 50 && gc.calls.length < 2; i++) {
+  gc.sendToGroupChat('Busy', member, 'second ask, queue')
+  for (let i = 0; i < 10; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }
 
-  gates[2].resolve('from the new run')
+  assert.equal(gc.calls.length, 1, 'the busy member receives no concurrent submit')
+  assert.equal(gc.$groupChats.get().Busy.pending.length, 1)
+
+  gates[1].resolve('from the first run')
+  for (let i = 0; i < 50 && gc.calls.length < 2; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(gc.calls.length, 2, 'the queued send starts after the first run settles')
+  gates[2].resolve('from the queued run')
   await drain(gc, 'Busy')
-  gates[1].resolve('late from the old run')
-  await new Promise(resolve => setImmediate(resolve))
-  await new Promise(resolve => setImmediate(resolve))
 
   const epoch = (gc.$groupChats.get().Busy || {}).epoch || 0
   const events = feed(gc, 'Busy')
-  assert.equal(events.some(e => e.kind === 'cancelled'), true, 'the superseded loop reports its own interruption')
-  // The view shows only the current run: every visible event is this epoch.
+  assert.equal(events.some(e => e.kind === 'cancelled'), false, 'FIFO draining does not manufacture cancellation')
   assert.equal(gc.currentGroupActivity('Busy').every(e => (e.epoch || 0) === epoch), true)
-  assert.equal(gc.currentGroupActivity('Busy').some(e => e.kind === 'cancelled'), true)
+  assert.equal(gc.$groupChats.get().Busy.pending.length, 0)
 })
 
 test('epoch filtering drops events from a superseded run', () => {
