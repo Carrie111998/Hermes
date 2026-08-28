@@ -20,6 +20,7 @@ time — no import cycle).
 """
 
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -198,7 +199,7 @@ def _reset_session_models(db, args):
             target_api_mode=target.get("api_mode"),
             dry_run=bool(getattr(args, "dry_run", False)),
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"Error: session model reset failed: {exc}")
         return 1
 

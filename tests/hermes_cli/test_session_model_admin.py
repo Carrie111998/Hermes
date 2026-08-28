@@ -1,6 +1,7 @@
 """Behavior tests for safe session model-route audit and reset."""
 
 import json
+import sqlite3
 from argparse import Namespace
 from pathlib import Path
 
@@ -421,6 +422,47 @@ def test_sessions_reset_model_uses_profile_default_and_prints_verification(
     assert rc in (None, 0)
     assert "backup:" in output
     assert "remaining non-target sessions: 0" in output
+
+
+def test_sessions_reset_model_reports_sqlite_failure(tmp_path, monkeypatch, capsys):
+    import hermes_state
+    import hermes_cli.sessions_cmd as sessions_cmd
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(
+        sessions_cmd,
+        "_resolve_session_model_target",
+        lambda _args: {
+            "model": "new/model",
+            "provider": "openrouter",
+            "base_url": "",
+            "api_mode": "",
+        },
+    )
+    monkeypatch.setattr(
+        SessionDB,
+        "reset_session_model_routes",
+        lambda self, **kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database or disk is full")
+        ),
+    )
+
+    rc = sessions_cmd.cmd_sessions(
+        Namespace(
+            sessions_action="reset-model",
+            all=True,
+            dry_run=False,
+            to=None,
+            provider=None,
+        )
+    )
+
+    assert rc == 1
+    assert (
+        "Error: session model reset failed: database or disk is full"
+        in capsys.readouterr().out
+    )
 
 
 def test_doctor_route_diagnostics_are_read_only(tmp_path):
