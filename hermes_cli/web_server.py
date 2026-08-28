@@ -4681,11 +4681,17 @@ def _spawn_hermes_action(
     name: str,
     *,
     env_overrides: Optional[Dict[str, str]] = None,
+    cmd_override: Optional[List[str]] = None,
 ) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
     Uses the running interpreter's ``hermes_cli.main`` module so the action
     inherits the same venv/PYTHONPATH the web server is using.
+
+    ``cmd_override``, when given, replaces the derived ``hermes <subcommand>``
+    argv entirely (e.g. to spawn a wrapper script instead of the raw CLI)
+    while keeping the same log file / ``_ACTION_PROCS`` / ``_ACTION_COMMANDS``
+    bookkeeping, so status polling for ``name`` keeps working unmodified.
     """
     log_file_name = _ACTION_LOG_FILES[name]
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4695,7 +4701,12 @@ def _spawn_hermes_action(
         f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
     )
 
-    cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
+    cmd = cmd_override or [
+        _dashboard_spawn_executable(),
+        "-m",
+        "hermes_cli.main",
+        *subcommand,
+    ]
 
     # The dashboard runs *inside* the gateway process, so os.environ carries
     # _HERMES_GATEWAY=1. Inheriting it makes a spawned `hermes gateway restart`
@@ -5106,11 +5117,30 @@ async def update_hermes():
         return response
 
     action_id = secrets.token_hex(16)
+    # On Trevor's ai-server install, `hermes update` is normally triggered from
+    # inside the already-running gateway process, and the raw `python -m
+    # hermes_cli.main update` invocation has no LaunchDaemon-aware pause: it
+    # restarts the gateway mid-request and Desktop's un-backed-off WebSocket
+    # reconnect loop hammers the restarting process, which drained file
+    # descriptors into an EMFILE that got misread as ~/.hermes/auth.json
+    # corruption and wiped live OAuth credentials (2026-07-31 incident).
+    # ~/.hermes/scripts/hermes-safe-update.sh exists specifically to pause the
+    # LaunchDaemons first and was built to self-detach safely from exactly this
+    # call site (running_under_hermes_service() + submit_detached_if_needed()).
+    # Prefer it when present; every other install falls back to the original
+    # raw-update behavior unchanged.
+    safe_update_script = "/Users/aiserver/.hermes/scripts/hermes-safe-update.sh"
+    cmd_override = (
+        ["/bin/bash", safe_update_script]
+        if os.path.exists(safe_update_script)
+        else None
+    )
     try:
         proc = _spawn_hermes_action(
             ["update"],
             "hermes-update",
             env_overrides={"HERMES_ACTION_ID": action_id},
+            cmd_override=cmd_override,
         )
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
