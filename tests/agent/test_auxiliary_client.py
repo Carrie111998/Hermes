@@ -1766,7 +1766,7 @@ class TestStaleFallbackCandidateSkip:
         assert healthy_fb.chat.completions.create.call_count == 1
 
     def test_non_auth_fallback_error_still_raises(self, monkeypatch):
-        """A non-auth error from the fallback candidate propagates unchanged."""
+        """A non-auth error is retained until fallback siblings are exhausted."""
         primary_client = MagicMock()
         primary_client.base_url = "https://chatgpt.com/backend-api/codex"
         primary_client.chat.completions.create.side_effect = self._timeout_err()
@@ -2132,6 +2132,37 @@ class TestTransientTransportRetry:
         assert kwargs.get("failure_scope").value == "model"
         assert kwargs.get("failed_base_url") == "https://integrate.api.nvidia.com/v1"
 
+    def test_connection_reset_is_model_scoped_and_forwarded(self, monkeypatch):
+        """A transient reset must not invalidate every model at the endpoint."""
+        primary = MagicMock()
+        primary.base_url = "https://gateway.example/v1"
+        primary.chat.completions.create.side_effect = ConnectionResetError(
+            "connection reset by peer"
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://gateway.example/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+        monkeypatch.setattr(
+            "agent.auxiliary_client._transient_retry_count", lambda: 0
+        )
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1,
+            p2,
+            p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "sibling-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+        ):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert mock_chain.call_args.kwargs["failure_scope"].value == "model"
+        assert mock_chain.call_args.kwargs["failed_model"] == "some-model"
+
 
 class TestFailureScopeFallbackEligibility:
     @staticmethod
@@ -2160,11 +2191,11 @@ class TestFailureScopeFallbackEligibility:
                 failed_provider="custom",
                 failed_model=None,
                 failed_base_url="https://gateway.example/v1",
-                failure_scope=classify_failure_scope("connection error"),
+                failure_scope=classify_failure_scope("connection refused"),
             )
 
         assert result == (None, None, "")
-        assert classify_failure_scope("connection error") is FailureScope.ENDPOINT
+        assert classify_failure_scope("connection refused") is FailureScope.ENDPOINT
 
     def test_timeout_allows_same_endpoint_sibling_model(self, monkeypatch):
         from agent.auxiliary_client import _try_configured_fallback_chain

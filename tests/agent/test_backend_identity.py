@@ -44,12 +44,13 @@ class TestClassifyFailureScope:
         assert classify_failure_scope("") is FailureScope.MODEL
 
     def test_endpoint_unreachable_reason_invalidates_endpoint(self):
-        assert classify_failure_scope("connection error") is FailureScope.ENDPOINT
+        assert classify_failure_scope("connection refused") is FailureScope.ENDPOINT
+        assert classify_failure_scope("connection error") is FailureScope.MODEL
 
     def test_endpoint_failure_skips_same_endpoint_sibling_models(self):
         failed = _id("custom", "model-a", "http://gateway:9000/v1")
         sibling = _id("custom", "model-b", "http://gateway:9000/v1")
-        scope = classify_failure_scope("connection error")
+        scope = classify_failure_scope("connection refused")
         assert should_skip_candidate(sibling, failed, scope)
 
 
@@ -111,6 +112,18 @@ class TestSameCredentialSurface:
         b = _id("proxy-b", "m", "http://gw:9000/v1")
         assert not same_credential_surface(a, b)
 
+    def test_same_entry_key_proves_credential_across_labels(self):
+        a = _id("proxy-a", "m", "https://gw/v1")
+        b = _id("proxy-b", "m", "https://gw/v1")
+        a = BackendIdentity.build(provider=a.provider, model=a.model, base_url=a.base_url, api_key="same-key")
+        b = BackendIdentity.build(provider=b.provider, model=b.model, base_url=b.base_url, api_key="same-key")
+        assert same_credential_surface(a, b)
+
+    def test_different_entry_keys_do_not_share_credential(self):
+        a = BackendIdentity.build(provider="custom", model="m", base_url="https://gw/v1", api_key="key-a")
+        b = BackendIdentity.build(provider="custom", model="m", base_url="https://gw/v1", api_key="key-b")
+        assert not same_credential_surface(a, b)
+
 
 
 class TestSameEndpoint:
@@ -125,9 +138,24 @@ class TestSameEndpoint:
             _id("a", "m", "http://h1/v1"), _id("a2", "m", "http://h2/v1")
         )
 
-    def test_unknown_url_falls_back_to_provider_default(self):
-        assert same_endpoint(_id("openrouter", "m1"), _id("openrouter", "m2"))
-        assert not same_endpoint(_id("openrouter", "m"), _id("nous", "m"))
+    def test_missing_url_does_not_claim_same_endpoint(self):
+        assert not same_endpoint(_id("openrouter", "m1"), _id("openrouter", "m2"))
+        assert not same_endpoint(
+            _id("openrouter", "m", "https://tenant-a/v1"),
+            _id("openrouter", "m"),
+        )
+
+    def test_same_provider_alternate_endpoint_is_not_same_endpoint(self):
+        assert not same_endpoint(
+            _id("custom", "m", "https://tenant-a/v1"),
+            _id("custom", "m", "https://tenant-b/v1"),
+        )
+
+    def test_path_and_query_case_are_route_sensitive(self):
+        a = _id("custom", "m", "https://gw.example/v1/Models?Tenant=ABC")
+        b = _id("custom", "m", "https://gw.example/v1/models?tenant=abc")
+        assert not same_endpoint(a, b)
+        assert not same_deployment(a, b)
 
 
 class TestUnknownAxesNeverStrand:
