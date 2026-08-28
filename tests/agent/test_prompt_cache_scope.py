@@ -392,8 +392,9 @@ class TestPerResponseRunNonceIsolation:
     Hermes Studio group chat builds ``gc_run_<room>_<profile>_<name>_<uuid4hex>``
     for every reply and destroys it when the reply completes
     (``groupRuntimeSessionId``), so every conversation-affinity hint Hermes
-    derives from that id changes per reply and the room never lands back on a
-    warm prefix.
+    derives from that id is re-keyed on every reply. What is demonstrated here
+    is the routing/affinity mechanism moving per response; no provider cache
+    telemetry or billing outcome is measured or claimed.
 
     The normalizer cannot repair that from the id alone: a physical session id
     is an identity, and Hermes' public session API lets a client choose one
@@ -475,15 +476,16 @@ class TestPerResponseRunNonceIsolation:
             _cache_scope_from_session_id(self.RESPONSE_1) == self.RESPONSE_1
         )
 
-    def test_lineage_walk_cannot_resolve_these_rows(self, db):
-        """The rows carry no lineage, so no semantic owner resolves them today.
+    def test_parentless_rows_resolve_to_their_own_scope(self, db):
+        """A row with no lineage is its own scope — permanently.
 
         The Studio bridge creates the row with ``create_session(id, source,
         model)`` — no ``parent_session_id`` — so ``resolve_prompt_cache_scope``
-        correctly returns the physical id and the per-response token reaches
-        the wire. Fixing that needs the host to declare the logical
-        conversation (a stable session id, or an explicit key), not a syntax
-        rule here.
+        returns the physical id. This is the invariant, not a defect record:
+        an owner Hermes was never told about must never be guessed. #96811
+        closes the gap by having the host declare the logical conversation (a
+        stable session id, or an explicit key); rows that still declare
+        nothing keep resolving exactly like this.
         """
         db.create_session(self.RESPONSE_1, source="studio")
         db.create_session(self.RESPONSE_2, source="studio")
@@ -491,11 +493,17 @@ class TestPerResponseRunNonceIsolation:
         assert resolve_prompt_cache_scope(_agent(self.RESPONSE_1, db)) == self.RESPONSE_1
         assert resolve_prompt_cache_scope(_agent(self.RESPONSE_2, db)) == self.RESPONSE_2
 
-    def test_affinity_keys_churn_per_response_today(self):
-        """Records the reported cost symptom on every affinity surface.
+    def test_distinct_ids_keep_distinct_affinity_keys(self):
+        """Every affinity surface isolates two distinct physical ids.
 
-        Not a guard for a change in this PR — it documents what a
-        host-supplied logical identity would have to make stable.
+        This is the isolation invariant restated at the wire layer, and it is
+        also the reported symptom: Studio hands these two ids to the same
+        logical conversation, so the routing/affinity key moves per response.
+
+        It stays true after #96811. The logical identity is supplied one layer
+        up — ``cache_scope_id`` here, the ambient conversation context for the
+        provider profiles — and these call sites pass neither, exactly as an
+        undeclared conversation would.
         """
         from agent.transports.chat_completions import _add_prompt_cache_key
         from agent.transports.codex import ResponsesApiTransport
@@ -535,8 +543,14 @@ class TestPerResponseRunNonceIsolation:
         assert chat_key(self.RESPONSE_1) != chat_key(self.RESPONSE_2)
 
     @pytest.mark.parametrize("profile_name", ["openrouter", "nous"])
-    def test_provider_sticky_key_churns_per_response_today(self, profile_name):
-        """OpenRouter/Nous route by this key; it moves on every reply."""
+    def test_distinct_ids_keep_distinct_provider_sticky_keys(self, profile_name):
+        """OpenRouter/Nous route by this key, and it isolates distinct ids.
+
+        Same invariant as above on the sticky-routing surface: two ids of one
+        Studio conversation re-key it on every reply, and a declared logical
+        identity would arrive through the conversation contextvar, not from
+        re-reading this id.
+        """
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
