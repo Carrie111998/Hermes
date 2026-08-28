@@ -177,6 +177,7 @@ def test_group_without_valid_activity_is_skipped(tmp_path) -> None:
     data = _load(path)
     data["lastActivityAt"] = None
     path.write_text(json.dumps(data), encoding="utf-8")
+    os.utime(path, (NOW - 2 * DAY, NOW - 2 * DAY))
 
     result = _worker(tmp_path / "a").run_once()
 
@@ -194,6 +195,7 @@ def test_group_identity_is_namespaced_by_identifier_type(tmp_path) -> None:
     session_data["sessionId"] = "same-identifier"
     session_data["lastActivityAt"] = int((NOW - 600) * 1000)
     session_path.write_text(json.dumps(session_data), encoding="utf-8")
+    os.utime(session_path, (NOW - 600, NOW - 600))
 
     result = _worker(tmp_path / "a").run_once()
 
@@ -299,6 +301,30 @@ def test_skips_already_archived_without_rewrite(tmp_path) -> None:
     assert path.stat().st_mtime == before
 
 
+def test_archiver_spares_target_that_becomes_recent_before_transform(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_record(tmp_path / "a", "chip1")
+    actual_read = Path.read_bytes
+    calls = {"target": 0}
+
+    def racing_read(candidate: Path) -> bytes:
+        if candidate == path:
+            calls["target"] += 1
+            if calls["target"] == 1:
+                current = json.loads(actual_read(path).decode("utf-8"))
+                current["lastActivityAt"] = int((NOW - 60) * 1000)
+                path.write_text(json.dumps(current), encoding="utf-8")
+        return actual_read(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read)
+
+    result = _worker(tmp_path / "a").run_once()
+
+    assert result["archived"] == 0
+    assert _load(path)["isArchived"] is False
+
+
 def test_archiver_retries_from_fresh_bytes_and_preserves_concurrent_field(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -373,6 +399,29 @@ def test_unreadable_record_counts_skipped(tmp_path) -> None:
 
     assert result["skipped"] == 1
     assert result["archived"] == 0
+
+
+def test_unreadable_root_fail_closes_all_archival(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    readable = tmp_path / "a"
+    unreadable = tmp_path / "b"
+    path = _write_record(readable, "chip1")
+    _write_record(unreadable, "other")
+    actual_scandir = os.scandir
+
+    def guarded_scandir(root):
+        if Path(root) == unreadable:
+            raise PermissionError("transient root failure")
+        return actual_scandir(root)
+
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+
+    result = _worker(readable, unreadable).run_once()
+
+    assert result["archived"] == 0
+    assert result["skipped"] == 1
+    assert _load(path)["isArchived"] is False
 
 
 def test_second_run_within_interval_throttles(tmp_path) -> None:

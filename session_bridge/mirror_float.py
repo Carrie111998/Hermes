@@ -666,10 +666,13 @@ class IdleChipArchiveWorker:
         records: list[tuple[Path, dict[str, Any], tuple[str, str]]] = []
         group_last_ms: dict[tuple[str, str], float] = {}
         group_paths: dict[tuple[str, str], list[Path]] = {}
+        scan_complete = True
         for root in self._registry_roots:
             try:
                 entries = list(os.scandir(root))
             except OSError:
+                skipped += 1
+                scan_complete = False
                 continue
             for entry in entries:
                 if not (
@@ -695,6 +698,14 @@ class IdleChipArchiveWorker:
                 if activity is not None:
                     group_last_ms[key] = max(group_last_ms.get(key, activity), activity)
 
+        if not scan_complete:
+            return {
+                "examined": examined,
+                "archived": 0,
+                "skipped": skipped,
+                "throttled": 0,
+            }
+
         idle_floor_ms = (wall_now - self._idle_seconds) * 1000
         for path, data, key in records:
             if data.get("isArchived") or not self._is_chip(data):
@@ -713,6 +724,9 @@ class IdleChipArchiveWorker:
                 if current.get("isArchived") or not self._is_chip(current):
                     return False
                 if self._group_key(current, path.name) != key:
+                    return False
+                current_activity = self._activity_ms(current)
+                if current_activity is None or current_activity >= idle_floor_ms:
                     return False
                 return current.__setitem__("isArchived", True) is None
 
