@@ -140,6 +140,7 @@ def _build_browser_env() -> dict:
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
+    env["PATH"] = _merge_browser_path(env.get("PATH", ""))
     return env
 
 try:
