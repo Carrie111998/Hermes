@@ -1012,9 +1012,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                             # shutdown path skips the settle join by design because
                             # the process is exiting). Stamping ended_at then makes
                             # later compression rotation abort on the "parent
-                            # already ended" guard. Leave the row live; the turn's
-                            # own finalization, a later resume (reopen_session),
-                            # or the startup orphan sweep closes it when done.
+                            # already ended" guard. Leave the row live; a later
+                            # resume (reopen_session) or the startup orphan sweep
+                            # closes it. Turn finalisation does not close it.
                             _mid_turn = bool(session.get("running"))
                             if not _mid_turn:
                                 _run_thread = session.get("_run_thread")
