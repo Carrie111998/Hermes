@@ -207,7 +207,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, hostedRoomPollFingerprint, shouldRefreshHostedRoom, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -2634,6 +2634,41 @@ test('hosted member descriptors preserve identity and resolve peers through nego
   assert.equal(member.memberId, 'member-2-reviewer')
   assert.equal(member.connectionId, 'peer-connection')
   assert.equal(member.sourceMissing, false)
+})
+
+test('unchanged idle hosted rooms skip state and log replay', () => {
+  const gc = load(() => '(pass)')
+  const listed = { revision: 4, latest_seq: 12 }
+  const fingerprint = gc.hostedRoomPollFingerprint(listed)
+
+  assert.equal(gc.shouldRefreshHostedRoom(listed, null, fingerprint), true)
+  assert.equal(gc.shouldRefreshHostedRoom(listed, {
+    running: false,
+    hostedStatus: { state: 'ready' }
+  }, fingerprint), false)
+  assert.equal(gc.shouldRefreshHostedRoom({ ...listed, latest_seq: 13 }, {
+    running: false,
+    hostedStatus: { state: 'ready' }
+  }, fingerprint), true)
+})
+
+test('active hosted rooms keep polling while blocked rooms wait for explicit retry', () => {
+  const gc = load(() => '(pass)')
+  const listed = { revision: 4, latest_seq: 12 }
+  const fingerprint = gc.hostedRoomPollFingerprint(listed)
+
+  assert.equal(gc.shouldRefreshHostedRoom(listed, {
+    running: true,
+    hostedStatus: { state: 'working' }
+  }, fingerprint), true)
+  assert.equal(gc.shouldRefreshHostedRoom(listed, {
+    running: false,
+    hostedStatus: { state: 'queued' }
+  }, fingerprint), true)
+  assert.equal(gc.shouldRefreshHostedRoom(listed, {
+    running: false,
+    hostedStatus: { state: 'blocked' }
+  }, fingerprint), false)
 })
 
 test('durableGroupChatRooms excludes tombstoned rooms — the remote-merge persist path\'s own durable-map builder, independent of updateGroupChat\'s inline one', () => {

@@ -573,6 +573,7 @@ const HOSTED_ROOM_UNSUPPORTED_REPROBE_MS = 30000
 const $hostedRoomCapabilities = atom({})
 const $hostedRoomOutbox = atom({ version: 1, commands: [] })
 const $hostedRoomCleanup = atom({ version: 1, operations: [] })
+const hostedRoomPollCache = new Map()
 let hostedRoomSyncTimer = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = false
@@ -1753,7 +1754,40 @@ function hostedMemberDescriptors(room, connectionId, connectionLabel, sources = 
   })
 }
 
+const HOSTED_ROOM_ACTIVE_STATES = new Set([
+  'sending',
+  'queued',
+  'working',
+  'stopping'
+])
+
+function hostedRoomPollFingerprint(room) {
+  return `${Math.max(0, Number(room?.revision || 0))}:${Math.max(0, Number(room?.latest_seq || 0))}`
+}
+
+/** Idle hosted rooms are immutable between list revisions. Avoid replaying
+ * every room log every five seconds; active rooms keep polling until their
+ * terminal event advances latest_seq. */
+function shouldRefreshHostedRoom(listedRoom, existing, cachedFingerprint) {
+  if (!existing) return true
+  if (
+    existing.running ||
+    HOSTED_ROOM_ACTIVE_STATES.has(String(existing?.hostedStatus?.state || ''))
+  ) {
+    return true
+  }
+  return cachedFingerprint !== hostedRoomPollFingerprint(listedRoom)
+}
+
+function clearHostedRoomPollCacheForConnection(connectionId) {
+  const prefix = `${String(connectionId || '')}::`
+  for (const key of hostedRoomPollCache.keys()) {
+    if (key.startsWith(prefix)) hostedRoomPollCache.delete(key)
+  }
+}
+
 function markHostedConnectionUnavailable(connectionId, { unsupported = false } = {}) {
+  clearHostedRoomPollCacheForConnection(connectionId)
   for (const [name, room] of Object.entries($groupChats.get())) {
     if (String(room?.hostedConnectionId || '') !== connectionId) continue
     updateGroupChat(name, current => ({
@@ -1867,6 +1901,18 @@ async function refreshHostedRooms() {
         const roomName = String(listedRoom?.name || '').trim()
 
         if (!roomId || !roomName) continue
+        const existingEntry = Object.entries($groupChats.get()).find(
+          ([, room]) => String(room?.roomId || '') === roomId
+        )
+        const pollKey = `${connectionId}::${roomId}`
+        const pollFingerprint = hostedRoomPollFingerprint(listedRoom)
+        if (!shouldRefreshHostedRoom(
+          listedRoom,
+          existingEntry?.[1] || null,
+          hostedRoomPollCache.get(pollKey)
+        )) {
+          continue
+        }
         let serverState
         try {
           serverState = await requestHostedConnection(route, 'groups.state', { room_id: roomId })
@@ -1876,9 +1922,6 @@ async function refreshHostedRooms() {
         }
         if (hostedRoomSyncDisposed) return
         const roomState = serverState?.room || listedRoom
-        const existingEntry = Object.entries($groupChats.get()).find(
-          ([, room]) => String(room?.roomId || '') === roomId
-        )
         let existingName = existingEntry?.[0] || roomName
         let existing = existingEntry?.[1] || {}
         if (existingEntry && existingName !== roomName) {
@@ -1957,6 +2000,7 @@ async function refreshHostedRooms() {
             running: Boolean(driverStatus.working)
           }
         }, { sync: false })
+        hostedRoomPollCache.set(pollKey, pollFingerprint)
       }
       for (const [name, room] of Object.entries($groupChats.get())) {
         if (
@@ -1973,6 +2017,7 @@ async function refreshHostedRooms() {
           Array.isArray(room.members) ? room.members : [],
           { hostedAlreadyDisbanded: true }
         )
+        hostedRoomPollCache.delete(`${connectionId}::${String(room.roomId)}`)
       }
     }
 
@@ -2002,6 +2047,7 @@ function scheduleHostedRoomSync(delay = HOSTED_ROOM_SYNC_INTERVAL_MS) {
 
 async function startHostedRoomSync(storage) {
   hostedRoomSyncDisposed = false
+  hostedRoomPollCache.clear()
   const client = await import('./hosted-room-client.js')
   let persisted = null
 
@@ -2030,6 +2076,7 @@ async function startHostedRoomSync(storage) {
 
 function stopHostedRoomSync() {
   hostedRoomSyncDisposed = true
+  hostedRoomPollCache.clear()
   if (hostedRoomSyncTimer && typeof window !== 'undefined') {
     window.clearTimeout(hostedRoomSyncTimer)
   }
