@@ -2486,7 +2486,17 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
 
     summary: Dict[str, Set[str]] = {}
     for pkey in platforms:
-        summary[pkey] = _get_platform_tools(config, pkey)
+        # Scope the summary to the configurable-toolset universe for this
+        # platform. The ``--summary`` denominator is
+        # ``_get_effective_configurable_toolsets()``, but the raw
+        # ``_get_platform_tools`` set also contains MCP server names and
+        # non-configurable recovered toolsets (e.g. ``kanban``), so ``count``
+        # could exceed ``total`` (``28/25``) and render ``✓ <mcp-server>`` /
+        # ``✓ kanban`` rows. Match the interactive checklist's scope
+        # (``_checklist_toolset_keys``) so the two CLI surfaces agree (#97015).
+        enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
+        universe = _checklist_toolset_keys(pkey)
+        summary[pkey] = enabled & universe
     return summary
 
 
