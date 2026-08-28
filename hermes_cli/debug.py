@@ -802,6 +802,9 @@ def _diagnostic_truncate_text(value: str, max_bytes: int) -> tuple[str, bool]:
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
         return value, False
+    # Loss-tolerant UTF-8 prefix: drop at most one partial trailing codepoint.
+    # errors="ignore" is deliberate so a U+FFFD replacement cannot enlarge the
+    # already-truncated value against the global diagnostic byte budget.
     return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 
 

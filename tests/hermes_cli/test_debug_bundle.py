@@ -117,3 +117,49 @@ def test_bundle_commit_cleans_incomplete_staging(diagnostic_home, monkeypatch):
 
     assert destination.read_text(encoding="utf-8") == "old"
     assert list(destination.parent.glob("*.tmp")) == []
+
+
+def test_diagnostic_output_path_rejects_reserved_device_names(diagnostic_home):
+    from hermes_cli.debug import DiagnosticBundleError, _diagnostic_output_path
+
+    for name in ("CON.txt", "con.txt", "AUX.log"):
+        with pytest.raises(DiagnosticBundleError, match="invalid diagnostic output name"):
+            _diagnostic_output_path(name)
+
+
+def test_diagnostic_truncate_text_is_utf8_safe_and_bounded():
+    from hermes_cli.debug import _diagnostic_truncate_text
+
+    kept, truncated = _diagnostic_truncate_text("abcdefg", 3)
+    assert kept == "abc"
+    assert truncated is True
+    kept, truncated = _diagnostic_truncate_text("abcdefg", 7)
+    assert kept == "abcdefg"
+    assert truncated is False
+    value = "x" * 5 + "\U0001F600" + "y" * 10
+    kept, truncated = _diagnostic_truncate_text(value, 6)
+    assert truncated is True
+    encoded = kept.encode("utf-8")
+    assert len(encoded) <= 6
+    encoded.decode("utf-8")
+    assert kept == "xxxxx"
+
+
+def test_bundle_staging_file_lives_in_diagnostics_dir(diagnostic_home, monkeypatch):
+    import tempfile as tempfile_module
+
+    from hermes_cli.debug import collect_local_diagnostic_bundle, write_local_diagnostic_bundle
+
+    captured = {}
+    real_mkstemp = tempfile_module.mkstemp
+
+    def spy_mkstemp(*args, **kwargs):
+        captured["dir"] = kwargs.get("dir")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr("hermes_cli.debug.tempfile.mkstemp", spy_mkstemp)
+    document = collect_local_diagnostic_bundle()
+    destination = write_local_diagnostic_bundle(document, "staged.json")
+    assert captured["dir"] == str(destination.parent)
+    assert captured["dir"] != tempfile_module.gettempdir()
+    assert destination.read_bytes()
