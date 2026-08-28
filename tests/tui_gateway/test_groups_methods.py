@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+
 import pytest
 
 import tui_gateway.server as srv
@@ -56,6 +59,12 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
     assert "groups.state" in result["methods"]
     assert "groups.send" in result["methods"]
     assert result["room_link"]["enabled"] is False
+    assert "groups.attachment.put" in result["methods"]
+    assert "groups.attachment.read" in result["methods"]
+    assert "attachment_same_gateway_delivery" in result["features"]
+    assert "groups.desktop.claim" in result["methods"]
+    assert "groups.desktop.renew" in result["methods"]
+    assert "groups.desktop.complete" in result["methods"]
 
 
 def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch):
@@ -380,7 +389,10 @@ def test_create_list_send_and_log_roundtrip(home):
         )
     )
     assert replay["latest_seq"] == replay["cursor"] == 1
-    assert replay["events"][0]["payload"] == {"text": "hello"}
+    assert replay["events"][0]["payload"] == {
+        "text": "hello",
+        "thread_id": "event-1",
+    }
 
 
 def test_rpc_retry_is_idempotent_and_conflict_is_visible(home):
@@ -403,6 +415,146 @@ def test_rpc_retry_is_idempotent_and_conflict_is_visible(home):
     )
     assert conflict["error"]["code"] == 4111
     assert "different content" in conflict["error"]["message"]
+
+
+def test_attachment_put_send_read_roundtrip_is_bounded_and_recipient_scoped(home):
+    _create_room()
+    encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+    put_params = {
+        "room_id": "room-1",
+        "upload_id": "upload-1",
+        "kind": "image",
+        "name": "diagram.png",
+        "mime": "image/png",
+        "content_base64": encoded,
+    }
+    first = _result(srv._methods["groups.attachment.put"](1, put_params))["attachment"]
+    repeated = _result(srv._methods["groups.attachment.put"](2, put_params))["attachment"]
+    assert repeated["attachment_id"] == first["attachment_id"]
+    assert repeated["idempotent"] is True
+
+    before_send = srv._methods["groups.attachment.read"](
+        3,
+        {
+            "room_id": "room-1",
+            "attachment_id": first["attachment_id"],
+            "purpose": "viewer",
+        },
+    )
+    assert before_send["error"]["code"] == 4141
+
+    manifest = {
+        key: first[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }
+    sent = _result(
+        srv._methods["groups.send"](
+            4,
+            {
+                "room_id": "room-1",
+                "event_id": "event-attachment-1",
+                "payload": {
+                    "text": "",
+                    "thread_id": "thread-1",
+                    "attachments": [manifest],
+                },
+            },
+        )
+    )
+    assert sent["event"]["payload"]["attachments"] == [manifest]
+    assert "content_base64" not in sent["event"]["payload"]
+
+    hosted_read = srv._methods["groups.attachment.read"](
+        5,
+        {
+            "room_id": "room-1",
+            "attachment_id": first["attachment_id"],
+            "purpose": "viewer",
+            "event_id": "event-attachment-1",
+        },
+    )
+    assert base64.b64decode(_result(hosted_read)["content_base64"]) == b"\x89PNG\r\n\x1a\nimage"
+    denied = srv._methods["groups.attachment.read"](
+        6,
+        {
+            "room_id": "room-1",
+            "attachment_id": first["attachment_id"],
+            "purpose": "desktop-command",
+        },
+    )
+    assert denied["error"]["code"] == 4141
+
+
+def test_classic_attachment_read_requires_room_authority_and_live_command_lease(home):
+    from gateway import desktop_room_mailbox
+    from gateway.hosted_room_attachments import HostedRoomAttachmentStore
+    from gateway.hosted_rooms import default_db_path as hosted_db_path
+
+    db = desktop_room_mailbox.default_db_path()
+    store = HostedRoomAttachmentStore(hosted_db_path())
+    stored = store.put(
+        room_id="classic-room",
+        upload_id="upload-classic-1",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=b"release notes",
+    )
+    manifest = {
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }
+    store.commit_message(
+        room_id="classic-room",
+        event_id="messaging:classic-attachment",
+        manifest=[manifest],
+        recipient_member_ids=("desktop", "viewer"),
+    )
+    desktop_room_mailbox.enqueue_command(
+        db,
+        command_id="messaging:classic-attachment",
+        room_id="classic-room",
+        authority_hash=hashlib.sha256(b"authority:test").hexdigest(),
+        action="send",
+        payload={"message": "", "attachments": [manifest]},
+    )
+    command = desktop_room_mailbox.claim_commands(
+        db,
+        consumer_id="desktop:test",
+        room_authorities=[{
+            "room_id": "classic-room",
+            "authority_token": "authority:test",
+        }],
+    )[0]
+    params = {
+        "room_id": "classic-room",
+        "attachment_id": stored["attachment_id"],
+        "purpose": "desktop-command",
+        "event_id": "messaging:classic-attachment",
+        "consumer_id": "desktop:test",
+        "lease_token": command["lease_token"],
+        "authority_token": "authority:test",
+    }
+
+    denied = srv._methods["groups.attachment.read"](
+        1,
+        {**params, "authority_token": "authority:wrong"},
+    )
+    assert denied["error"]["code"] == 4141
+    read = _result(srv._methods["groups.attachment.read"](2, params))
+    assert base64.b64decode(read["content_base64"]) == b"release notes"
+    viewer = _result(
+        srv._methods["groups.attachment.read"](
+            3,
+            {
+                "room_id": "classic-room",
+                "attachment_id": stored["attachment_id"],
+                "event_id": "messaging:classic-attachment",
+                "purpose": "viewer",
+            },
+        )
+    )
+    assert base64.b64decode(viewer["content_base64"]) == b"release notes"
 
 
 def test_send_does_not_trust_client_supplied_actor_identity(home):
