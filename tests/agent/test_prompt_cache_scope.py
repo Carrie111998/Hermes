@@ -386,14 +386,22 @@ class TestAuxiliaryRuntimeThreading:
             aux.reset_runtime_main(token)
 
 
-class TestPerResponseRunNonce:
+class TestPerResponseRunNonceIsolation:
     """Issue #96570 — hosts that mint one physical session per RESPONSE.
 
     Hermes Studio group chat builds ``gc_run_<room>_<profile>_<name>_<uuid4hex>``
     for every reply and destroys it when the reply completes
-    (``groupRuntimeSessionId``). Every conversation-affinity hint Hermes sends
-    is derived from that id, so each reply of one room landed in a different
-    cache bucket and was billed as a full prefix-cache miss.
+    (``groupRuntimeSessionId``), so every conversation-affinity hint Hermes
+    derives from that id changes per reply and the room never lands back on a
+    warm prefix.
+
+    The normalizer cannot repair that from the id alone: a physical session id
+    is an identity, and Hermes' public session API lets a client choose one
+    freely (``POST /v1/sessions`` honors ``body["id"]``/``body["session_id"]``).
+    These tests pin the isolation invariant that any future scope rule has to
+    keep — collapsing a trailing token because it *looks* like per-run noise
+    merges independent conversations, which is the failure class already
+    recorded on #79017.
     """
 
     RUN = "gc_run_room42_default_Worker"
@@ -405,57 +413,77 @@ class TestPerResponseRunNonce:
         {"role": "user", "content": "hi"},
     ]
 
-    def test_consecutive_responses_share_one_scope(self):
-        assert (
-            _cache_scope_from_session_id(self.RESPONSE_1)
-            == _cache_scope_from_session_id(self.RESPONSE_2)
-            == self.RUN
+    @staticmethod
+    def _prompt_cache_key(session_id: str) -> str:
+        from agent.transports.codex import ResponsesApiTransport
+
+        return ResponsesApiTransport().build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "system", "content": "same"}],
+            tools=[],
+            session_id=session_id,
+        )["prompt_cache_key"]
+
+    def test_external_uuid_identity_remains_isolated(self):
+        """Two independent API-supplied ids may differ only in a trailing hex.
+
+        ``POST /v1/sessions`` preserves a client-provided id verbatim, so a
+        whole trailing 32-hex token is not per-run noise by construction.
+        """
+        first = "customer_chat_11111111111141118111111111111111"
+        second = "customer_chat_22222222222242228222222222222222"
+
+        assert _cache_scope_from_session_id(first) != _cache_scope_from_session_id(
+            second
+        )
+        assert self._prompt_cache_key(first) != self._prompt_cache_key(second)
+
+    def test_studio_truncation_does_not_merge_members(self):
+        """Studio truncates the semantic prefix BEFORE appending the nonce.
+
+        ``groupRuntimeSessionId`` slices its ``gc_run_<room>_<profile>_<name>``
+        prefix to 96 characters and only then appends the per-response token,
+        so two members of one room whose names diverge past that boundary are
+        distinguished *only* by that token. Any rule that drops it merges two
+        distinct agents onto one affinity key.
+        """
+        room = "mabc1234qwerty"
+        profile = "default"
+        common_name = "A" * 70
+
+        first = (
+            f"gc_run_{room}_{profile}_{common_name}Worker"[:96]
+            + "_11111111111141118111111111111111"
+        )
+        second = (
+            f"gc_run_{room}_{profile}_{common_name}Reviewer"[:96]
+            + "_22222222222242228222222222222222"
         )
 
-    def test_distinct_rooms_and_members_stay_isolated(self):
-        """Normalizing the nonce must not merge unrelated conversations."""
-        other_room = f"gc_run_room7_default_Worker_{'0' * 32}"
-        other_member = f"gc_run_room42_default_Reviewer_{'0' * 32}"
+        assert first != second
+        assert _cache_scope_from_session_id(first) != _cache_scope_from_session_id(
+            second
+        )
 
-        scope = _cache_scope_from_session_id(self.RESPONSE_1)
-        assert scope != _cache_scope_from_session_id(other_room)
-        assert scope != _cache_scope_from_session_id(other_member)
-
-    @pytest.mark.parametrize(
-        "session_id",
-        [
-            "20260827_140233_a1b2c3d4",  # CLI / gateway: <ts>_<8 hex>
-            "api_1756300000_a1b2c3d4",  # API server
-            "bg_140233_a1b2c3",  # background task: <hhmmss>_<6 hex>
-            "550e8400-e29b-41d4-a716-446655440000",  # bare str(uuid4())
-            "chat_0123456789abcdef",  # 16-hex slice
-            "root-sess",
-            "",
-        ],
-    )
-    def test_hermes_native_ids_are_untouched(self, session_id):
-        """Only a WHOLE uuid4 hex is stripped — no native id shape has one."""
-        assert _cache_scope_from_session_id(session_id) == session_id
-
-    def test_cron_normalization_takes_precedence(self):
+    def test_cron_normalization_stays_the_only_carve_out(self):
+        """The one accepted exception: cron's per-fire timestamp (#51395)."""
         assert (
             _cache_scope_from_session_id("cron_backup_20260814_120000")
             == "cron_backup"
         )
+        assert (
+            _cache_scope_from_session_id(self.RESPONSE_1) == self.RESPONSE_1
+        )
 
-    def test_a_bare_nonce_keeps_its_own_scope(self):
-        """No logical base left to key on — the id must stay as-is."""
-        nonce = "5f2c1ab9d4e34f7a8b0c6d1e2f3a4b5c"
-        assert _cache_scope_from_session_id(nonce) == nonce
-        assert _cache_scope_from_session_id(f"_{nonce}") == f"_{nonce}"
-
-    def test_lineage_walk_cannot_fix_this_alone(self, db):
-        """The rows carry no lineage, so the normalizer is the only lever.
+    def test_lineage_walk_cannot_resolve_these_rows(self, db):
+        """The rows carry no lineage, so no semantic owner resolves them today.
 
         The Studio bridge creates the row with ``create_session(id, source,
-        model)`` — no ``parent_session_id``, no ``session_key`` — so
-        ``resolve_prompt_cache_scope`` correctly returns the physical id and
-        the per-response nonce survives to the wire without this fix.
+        model)`` — no ``parent_session_id`` — so ``resolve_prompt_cache_scope``
+        correctly returns the physical id and the per-response token reaches
+        the wire. Fixing that needs the host to declare the logical
+        conversation (a stable session id, or an explicit key), not a syntax
+        rule here.
         """
         db.create_session(self.RESPONSE_1, source="studio")
         db.create_session(self.RESPONSE_2, source="studio")
@@ -463,38 +491,37 @@ class TestPerResponseRunNonce:
         assert resolve_prompt_cache_scope(_agent(self.RESPONSE_1, db)) == self.RESPONSE_1
         assert resolve_prompt_cache_scope(_agent(self.RESPONSE_2, db)) == self.RESPONSE_2
 
-    def test_prompt_cache_key_stable_across_responses(self):
-        """OpenAI/Codex Responses: same room, same routing key."""
+    def test_affinity_keys_churn_per_response_today(self):
+        """Records the reported cost symptom on every affinity surface.
+
+        Not a guard for a change in this PR — it documents what a
+        host-supplied logical identity would have to make stable.
+        """
+        from agent.transports.chat_completions import _add_prompt_cache_key
         from agent.transports.codex import ResponsesApiTransport
 
         transport = ResponsesApiTransport()
         base = dict(model="gpt-5.5", messages=self.SYS, tools=[])
-        k1 = transport.build_kwargs(**base, session_id=self.RESPONSE_1)
-        k2 = transport.build_kwargs(**base, session_id=self.RESPONSE_2)
-
-        assert k1["prompt_cache_key"] == k2["prompt_cache_key"]
-
-    def test_xai_conv_id_stable_across_responses(self):
-        """xAI pins its prompt cache to a backend via this header."""
-        from agent.transports.codex import ResponsesApiTransport
-
-        transport = ResponsesApiTransport()
-        base = dict(
-            model="grok-4", messages=self.SYS, tools=[], is_xai_responses=True
-        )
-        k1 = transport.build_kwargs(**base, session_id=self.RESPONSE_1)
-        k2 = transport.build_kwargs(**base, session_id=self.RESPONSE_2)
-
         assert (
-            k1["extra_headers"]["x-grok-conv-id"]
-            == k2["extra_headers"]["x-grok-conv-id"]
-            == self.RUN
+            transport.build_kwargs(**base, session_id=self.RESPONSE_1)[
+                "prompt_cache_key"
+            ]
+            != transport.build_kwargs(**base, session_id=self.RESPONSE_2)[
+                "prompt_cache_key"
+            ]
         )
 
-    def test_chat_completions_key_stable_across_responses(self):
-        from agent.transports.chat_completions import _add_prompt_cache_key
+        xai = dict(model="grok-4", messages=self.SYS, tools=[], is_xai_responses=True)
+        assert (
+            transport.build_kwargs(**xai, session_id=self.RESPONSE_1)["extra_headers"][
+                "x-grok-conv-id"
+            ]
+            != transport.build_kwargs(**xai, session_id=self.RESPONSE_2)[
+                "extra_headers"
+            ]["x-grok-conv-id"]
+        )
 
-        def key(session_id):
+        def chat_key(session_id):
             kwargs: dict = {}
             _add_prompt_cache_key(
                 kwargs,
@@ -505,11 +532,11 @@ class TestPerResponseRunNonce:
             )
             return kwargs.get("prompt_cache_key")
 
-        assert key(self.RESPONSE_1) == key(self.RESPONSE_2)
+        assert chat_key(self.RESPONSE_1) != chat_key(self.RESPONSE_2)
 
     @pytest.mark.parametrize("profile_name", ["openrouter", "nous"])
-    def test_provider_sticky_key_stable_across_responses(self, profile_name):
-        """OpenRouter/Nous route by this key — it must not change per reply."""
+    def test_provider_sticky_key_churns_per_response_today(self, profile_name):
+        """OpenRouter/Nous route by this key; it moves on every reply."""
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -527,4 +554,4 @@ class TestPerResponseRunNonce:
             finally:
                 reset_conversation_context(token)
 
-        assert keys[0] == keys[1] == self.RUN
+        assert keys[0] != keys[1]
