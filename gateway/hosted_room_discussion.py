@@ -1140,6 +1140,7 @@ def _make_task_plan(
         turn_id=turn_id,
     )
     payload = {
+        "recipient_member_ids": [candidate.member_id for candidate in room.members],
         "target_member_id": member.member_id,
         "target_profile": member.profile,
         "prompt": prompt,
@@ -1387,7 +1388,7 @@ def reconstruct_task_plan(
     if not required_payload <= frozenset(payload) or (
         frozenset(payload)
         - required_payload
-        - {"attachments", "target_member_id"}
+        - {"attachments", "recipient_member_ids", "target_member_id"}
     ):
         raise DiscussionReconstructionError("driver task payload shape changed")
     match = _TURN_ID_RE.fullmatch(identity.turn_id)
@@ -1434,6 +1435,10 @@ def reconstruct_task_plan(
         member = None
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
+    if payload.get("recipient_member_ids") != [
+        candidate.member_id for candidate in room.members
+    ]:
+        raise DiscussionReconstructionError("task recipient roster changed")
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise DiscussionReconstructionError("task prompt is missing")

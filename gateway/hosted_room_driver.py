@@ -51,7 +51,11 @@ _TASK_PAYLOAD_REQUIRED_FIELDS = frozenset({
     "prompt",
     "source_event_seq",
 })
-_TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({"attachments", "target_member_id"})
+_TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({
+    "attachments",
+    "recipient_member_ids",
+    "target_member_id",
+})
 _LEASE_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -253,6 +257,16 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
         normalized["target_member_id"] = _identifier(
             value["target_member_id"], label="target_member_id"
         )
+    if "recipient_member_ids" in value:
+        raw_recipients = value["recipient_member_ids"]
+        if not isinstance(raw_recipients, list) or not 1 <= len(raw_recipients) <= 6:
+            raise DriverValidationError("recipient_member_ids must contain 1-6 members")
+        recipients = [
+            _identifier(item, label="recipient_member_id") for item in raw_recipients
+        ]
+        if len(set(recipients)) != len(recipients):
+            raise DriverValidationError("recipient_member_ids must be unique")
+        normalized["recipient_member_ids"] = recipients
     if "attachments" in value:
         from gateway.hosted_room_attachments import validate_task_manifest
 

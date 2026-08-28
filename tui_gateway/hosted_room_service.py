@@ -754,10 +754,9 @@ class HostedRoomService:
 
         digest = plan.identity.task_id.removeprefix("dtask:")
         event_id = f"dmessage:{digest}"
-        recipient_ids = tuple(member.member_id for member in discussion.validate_room(
-            room,
-            local_profiles=self.local_profiles(),
-        ).members)
+        recipient_ids = tuple(plan.payload.get("recipient_member_ids") or ())
+        if not recipient_ids:
+            raise RuntimeError("room output artifact recipient roster is missing")
         normalized = dict(result)
         normalized["attachments"] = self.attachments.commit_message(
             room_id=str(room["room_id"]),

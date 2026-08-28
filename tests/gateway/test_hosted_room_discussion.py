@@ -234,10 +234,16 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     assert first.payload == {
         "target_member_id": "member-research",
         "target_profile": "research",
+        "recipient_member_ids": [
+            "member-research",
+            "member-build",
+            "member-review",
+        ],
         "prompt": first.payload["prompt"],
         "source_event_seq": user["seq"],
     }
     assert set(first.payload) == {
+        "recipient_member_ids",
         "target_member_id",
         "target_profile",
         "prompt",
