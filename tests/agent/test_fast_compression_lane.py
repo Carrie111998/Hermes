@@ -2,7 +2,9 @@
 
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 def _resolve(config, *, provider="ollama", model="qwen3:8b", requested_model=None):
@@ -475,3 +477,135 @@ def test_explicit_caller_max_tokens_keeps_provider_quirk_handling():
     request = client.chat.completions.create.call_args.kwargs
     assert "max_tokens" not in request
     assert "max_completion_tokens" not in request
+
+
+class TestAsyncCompressionFastLaneParity:
+    """async_call_llm / _call_fallback_candidate_async must apply the same
+    certified fast-lane controls as their sync counterparts.
+
+    Before this fix, resolve_compression_fast_lane and
+    _compression_fast_lane_controls were only wired into the sync
+    call_llm/_call_fallback_candidate_sync paths — async_call_llm's own
+    docstring ("Same as call_llm() but async") was inaccurate: the async
+    path never certified a route or applied a cap/reasoning override.
+    """
+
+    @pytest.mark.asyncio
+    async def test_certified_fast_lane_sends_the_configured_cap_to_its_provider(self):
+        from agent.auxiliary_client import async_call_llm
+
+        config = {
+            "provider": "ollama",
+            "model": "qwen3:8b",
+            "reasoning_effort": "none",
+            "max_output_tokens": 1400,
+        }
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:11434/v1"
+        response = object()
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "qwen3:8b")),
+            patch("agent.auxiliary_client._validate_llm_response", return_value=response),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summary request"}],
+            )
+        assert result is response
+
+        request = client.chat.completions.create.call_args.kwargs
+        assert request["max_tokens"] == 1400
+        assert request["extra_body"]["reasoning"] == {"enabled": False}
+
+    @pytest.mark.asyncio
+    async def test_uncertified_effective_primary_route_does_not_receive_fast_cap(self):
+        from agent.auxiliary_client import async_call_llm
+
+        config = {
+            "provider": "ollama",
+            "model": "qwen3:8b",
+            "reasoning_effort": "none",
+            "max_output_tokens": 1400,
+        }
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:11434/v1"
+        response = object()
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "server-selected-model"),
+            ),
+            patch("agent.auxiliary_client._validate_llm_response", return_value=response),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summary request"}],
+            )
+        assert result is response
+
+        request = client.chat.completions.create.call_args.kwargs
+        assert "max_tokens" not in request
+        assert "max_completion_tokens" not in request
+        assert "reasoning" not in request.get("extra_body", {})
+
+    @pytest.mark.asyncio
+    async def test_fallback_cap_requires_independent_route_certification(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        response = object()
+
+        async def _request_for(entry):
+            config = {
+                "fallback_chain": [entry],
+                "provider": "ollama",
+                "model": "qwen3:8b",
+                "reasoning_effort": "none",
+                "max_output_tokens": 1400,
+            }
+            client = MagicMock()
+            client.base_url = "http://127.0.0.1:11434/v1"
+            client.chat.completions.create = AsyncMock(return_value=response)
+            with (
+                patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+                patch("agent.auxiliary_client._validate_llm_response", return_value=response),
+            ):
+                result = await _call_fallback_candidate_async(
+                    client,
+                    "qwen3:14b",
+                    "fallback_chain[0](ollama)",
+                    task="compression",
+                    messages=[{"role": "user", "content": "summary request"}],
+                    temperature=None,
+                    max_tokens=None,
+                    tools=None,
+                    effective_timeout=300,
+                    effective_extra_body={"reasoning": {"enabled": False, "effort": "none"}},
+                    reasoning_config=None,
+                )
+                assert result is response
+            return client.chat.completions.create.call_args.kwargs
+
+        uncertified = await _request_for({"provider": "ollama", "model": "qwen3:14b"})
+        certified = await _request_for(
+            {
+                "provider": "ollama",
+                "model": "qwen3:14b",
+                "reasoning_effort": "none",
+                "max_output_tokens": 900,
+            }
+        )
+
+        assert "max_tokens" not in uncertified
+        assert "max_completion_tokens" not in uncertified
+        assert "reasoning" not in uncertified.get("extra_body", {})
+        assert certified["max_tokens"] == 900
+        assert certified["extra_body"]["reasoning"] == {
+            "enabled": False,
+            "effort": "none",
+        }
