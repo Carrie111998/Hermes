@@ -1190,7 +1190,26 @@ function Test-ManagedNodeInUse {
 # at the top to populate $script:UvCmd from the managed location.
 # Throws if uv is not findable -- the caller's stage then surfaces a
 # clean error via the stage-driver's try/catch.
+function Set-UvPythonIsolationEnv {
+    # Contain every uv python write inside Hermes' own tree, regardless of
+    # whether the uv ENGINE is Hermes' managed binary or the user's own uv
+    # (tier-1).  uv respects UV_PYTHON_INSTALL_DIR / _BIN / _REGISTRY for all
+    # python acquisition: with these set, `uv python install` and
+    # `uv venv --python` write into $HermesHome\python and never touch the
+    # user's uv python store, ~/.local/bin shims, or the Windows python
+    # registry.  Overrides any inherited values -- Hermes must never write
+    # into a directory the user configured for their own toolchain.
+    # Mirrors managed_python_env() in hermes_cli/managed_uv.py -- keep in sync.
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $HermesHome "python"
+    $env:UV_PYTHON_INSTALL_BIN = "0"
+    $env:UV_PYTHON_INSTALL_REGISTRY = "0"
+}
+
 function Resolve-UvCmd {
+    # Isolate all uv python writes (install / venv acquisition) inside
+    # Hermes' tree up front, whatever engine this process ends up using.
+    Set-UvPythonIsolationEnv
+
     # Already resolved (default invocation path: Install-Uv ran earlier
     # in the same process and set $script:UvCmd).
     if ($script:UvCmd) {

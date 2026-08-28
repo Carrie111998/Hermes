@@ -47,6 +47,7 @@ function Get-RewrittenDefinition {
 Invoke-Expression (Get-RewrittenDefinition -Name 'Get-ManagedUvPath')
 Invoke-Expression (Get-RewrittenDefinition -Name 'Test-UserUvUsable')
 Invoke-Expression (Get-RewrittenDefinition -Name 'Move-LegacyManagedUv')
+Invoke-Expression (Get-RewrittenDefinition -Name 'Set-UvPythonIsolationEnv')
 
 # install.ps1's write helpers (failure paths only here).
 function Write-Info    { Write-Host "[info]  $args" }
@@ -96,6 +97,27 @@ Write-Host "install.ps1 Get-ManagedUvPath (private location)"
 $managed = Get-ManagedUvPath
 Assert-Equal (Join-Path (Join-Path $script:HermesHome "uv") "uv.exe") $managed `
     'managed uv lives in the private uv\ dir, not bin\'
+
+Write-Host ""
+Write-Host "install.ps1 Set-UvPythonIsolationEnv (uv python write containment)"
+
+# Save the harness's own env; restore after.
+$savedUvInstallDir = $env:UV_PYTHON_INSTALL_DIR
+$savedUvBin = $env:UV_PYTHON_INSTALL_BIN
+$savedUvRegistry = $env:UV_PYTHON_INSTALL_REGISTRY
+
+# An inherited value must be OVERRIDDEN, not respected -- Hermes never writes
+# into a dir the user configured for their own toolchain.
+$env:UV_PYTHON_INSTALL_DIR = "C:\Users\me\my-own-pythons"
+Set-UvPythonIsolationEnv
+Assert-Equal (Join-Path $script:HermesHome "python") $env:UV_PYTHON_INSTALL_DIR `
+    'inherited UV_PYTHON_INSTALL_DIR overridden to Hermes\python'
+Assert-Equal "0" $env:UV_PYTHON_INSTALL_BIN 'UV_PYTHON_INSTALL_BIN=0 (no ~/.local/bin shims)'
+Assert-Equal "0" $env:UV_PYTHON_INSTALL_REGISTRY 'UV_PYTHON_INSTALL_REGISTRY=0 (no Windows registry)'
+
+$env:UV_PYTHON_INSTALL_DIR = $savedUvInstallDir
+$env:UV_PYTHON_INSTALL_BIN = $savedUvBin
+$env:UV_PYTHON_INSTALL_REGISTRY = $savedUvRegistry
 
 Write-Host ""
 Write-Host "install.ps1 Test-UserUvUsable (tier-1 PATH probe)"
