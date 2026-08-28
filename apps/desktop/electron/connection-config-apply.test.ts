@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { configuredLocalProfilesFromConfig } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
 
 describe('applyConnectionConfigAtomically', () => {
@@ -41,6 +42,38 @@ describe('applyConnectionConfigAtomically', () => {
 
     expect(writeConfig.mock.calls).toEqual([['remote-config'], ['local-config']])
     expect(writeRegistry.mock.calls).toEqual([['remote-registry'], ['local-registry']])
+  })
+
+  it('restores the prior persisted local identity when apply activation fails', async () => {
+    const previousConfig: Record<string, unknown> = {
+      mode: 'remote',
+      profiles: { 'mac-cockpit': { mode: 'local' } }
+    }
+
+    const nextConfig: Record<string, unknown> = { mode: 'remote', profiles: { replacement: { mode: 'local' } } }
+    let persistedConfig = JSON.stringify(previousConfig)
+    let persistedRegistry = JSON.stringify({ primary: 'pop-os-hermes' })
+
+    await expect(
+      applyConnectionConfigAtomically({
+        previousConfig,
+        previousRegistry: { primary: 'pop-os-hermes' },
+        nextConfig,
+        nextRegistry: { primary: 'local' },
+        writeConfig: value => {
+          persistedConfig = JSON.stringify(value)
+        },
+        writeRegistry: value => {
+          persistedRegistry = JSON.stringify(value)
+        },
+        apply: async () => {
+          throw new Error('activation failed')
+        }
+      })
+    ).rejects.toThrow('activation failed')
+
+    expect(configuredLocalProfilesFromConfig(JSON.parse(persistedConfig))).toEqual(['mac-cockpit'])
+    expect(JSON.parse(persistedRegistry)).toEqual({ primary: 'pop-os-hermes' })
   })
 
   it('rolls legacy state back when the registry write fails', async () => {

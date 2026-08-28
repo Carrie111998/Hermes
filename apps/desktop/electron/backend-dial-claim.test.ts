@@ -169,13 +169,22 @@ describe('main.ts wiring for #90812', () => {
     expect(body).toContain('ensureBackend(profile)')
   })
 
-  it('routes the roster-enumeration probe through the single-owner claim', () => {
+  it('keeps roster enumeration outside every backend dial claim', () => {
     const handlerStart = mainSource.indexOf('async function enumerateRegistryAgentSources')
     expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 3_700)
+    const body = mainSource.slice(handlerStart, handlerStart + 5_000)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connection.id, null)')
-    expect(body).toContain('ensureRegistryBackend(connection.id, null)')
+    expect(body).toContain('enumerateRegistryAgentSourcesObservational({')
+    expect(body).not.toContain('backendDialClaims.run(')
+    expect(body).not.toContain('ensureRegistryBackend(')
+    expect(body).not.toContain('ensureBackend(')
+    expect(body).not.toContain('dialDelegate(')
+    expect(body).not.toContain('startHermes(')
+    expect(body).not.toContain('backendPool.set(')
+    expect(body).not.toContain('backendPool.delete(')
+    expect(body).not.toContain('lastActiveAt =')
+    expect(body).not.toContain('setLastUsedConnection(')
+    expect(body).toContain('probeSshProfileInventory(connection)')
     expect(body).toContain("getJsonForBackend(descriptor, '/api/profiles'")
   })
 
