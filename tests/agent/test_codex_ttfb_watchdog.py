@@ -61,6 +61,33 @@ def _make_codex_agent(tmp_path, monkeypatch):
 
 
 
+def test_generic_streaming_codex_route_bypasses_generic_ttfb(monkeypatch):
+    """Codex streaming keeps ownership of its native watchdogs."""
+    from agent import chat_completion_helpers as h
+
+    response = SimpleNamespace(ok=True)
+    calls = []
+    agent = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        platform="cli",
+        _interrupt_requested=False,
+        _interruptible_api_call=lambda kwargs: calls.append(kwargs) or response,
+        _emit_stream_start=lambda: None,
+        _emit_stream_end=lambda **_kwargs: None,
+    )
+
+    def unexpected_generic_resolver(*_args, **_kwargs):
+        raise AssertionError("Codex must not use the generic TTFB resolver")
+
+    monkeypatch.setattr(h, "resolve_stream_ttfb_timeout", unexpected_generic_resolver)
+
+    assert h.interruptible_streaming_api_call(
+        agent, {"model": "gpt-5.5", "input": "hi"}
+    ) is response
+    assert calls == [{"model": "gpt-5.5", "input": "hi"}]
+
+
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     """The no-first-byte watchdog should surface the same actionable hint as the
     stale-call timeout path when the model matches the silent-hang heuristic."""
@@ -68,6 +95,7 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.4")
+    assert getattr(agent, "_codex_stream_last_event_ts", None) is None
 
     closes: list = []
     statuses: list[str] = []
@@ -117,6 +145,7 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.4")
+    assert getattr(agent, "_codex_stream_last_event_ts", None) is None
 
     closes: list = []
     dummy_client = SimpleNamespace()
