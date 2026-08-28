@@ -164,12 +164,18 @@ function Start-UiServer([string]$HtmlPath) {
         $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
         $listener.Start()
         $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+        # BeginInvoke only queues the dedicated runspace. Do not advertise the
+        # loopback URL until that runspace has actually reached its accept loop:
+        # a loaded Windows runner can otherwise receive the URL while no thread
+        # is available to answer /progress yet.
+        $ready = [System.Threading.ManualResetEventSlim]::new($false)
 
         $rs = [runspacefactory]::CreateRunspace()
         $rs.Open()
         $rs.SessionStateProxy.SetVariable("Listener", $listener)
         $rs.SessionStateProxy.SetVariable("State", $script:UiState)
         $rs.SessionStateProxy.SetVariable("HtmlBytes", [System.IO.File]::ReadAllBytes($HtmlPath))
+        $rs.SessionStateProxy.SetVariable("Ready", $ready)
 
         $ps = [powershell]::Create()
         $ps.Runspace = $rs
@@ -182,7 +188,15 @@ function Start-UiServer([string]$HtmlPath) {
                 $Stream.Flush()
             }
             while ($true) {
-                try { $client = $Listener.AcceptTcpClient() } catch { break }  # Stop() ends the loop
+                try {
+                    # Register the accept with the OS before advertising the
+                    # loopback URL. Setting Ready before a blocking synchronous
+                    # AcceptTcpClient call only proves this runspace was queued;
+                    # a loaded runner could still leave /progress unanswered.
+                    $accept = $Listener.BeginAcceptTcpClient($null, $null)
+                    $Ready.Set()
+                    $client = $Listener.EndAcceptTcpClient($accept)
+                } catch { break }  # Stop() ends a pending accept
                 try {
                     $client.ReceiveTimeout = 2000
                     $stream = $client.GetStream()
@@ -211,10 +225,16 @@ function Start-UiServer([string]$HtmlPath) {
             }
         })
         [void]$ps.BeginInvoke()
+        if (-not $ready.Wait(5000)) {
+            throw "progress listener did not enter its accept loop within 5 seconds"
+        }
 
-        return @{ Listener = $listener; Runspace = $rs; PowerShell = $ps; Port = $port; BrowserProc = $null; Profile = $null }
+        return @{ Listener = $listener; Runspace = $rs; PowerShell = $ps; Ready = $ready; Port = $port; BrowserProc = $null; Profile = $null }
     } catch {
         try { if ($listener) { $listener.Stop() } } catch {}
+        try { if ($ps) { $ps.Stop() } } catch {}
+        try { if ($rs) { $rs.Close() } } catch {}
+        try { if ($ready) { $ready.Dispose() } } catch {}
         return $null
     }
 }
@@ -224,6 +244,7 @@ function Stop-UiServer([switch]$LeaveWindow) {
     try { $script:UiServer.Listener.Stop() } catch {}
     try { $script:UiServer.PowerShell.Stop() } catch {}
     try { $script:UiServer.Runspace.Close() } catch {}
+    try { if ($script:UiServer.Ready) { $script:UiServer.Ready.Dispose() } } catch {}
     # On success the window closes itself out from under the user (the whole
     # point); on error we LEAVE it — the page holds the failure state and the
     # user closes it when they've read it.
