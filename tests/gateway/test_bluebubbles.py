@@ -448,6 +448,55 @@ class TestBlueBubblesUpdatedMessageHandling:
         assert mark_read.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_retraction_retry_dedupes_across_sender_representations(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "mark_read", AsyncMock(return_value=False))
+
+        await self._dispatch(
+            adapter,
+            {
+                "type": "new-message",
+                "data": {
+                    "guid": "MSG-RETRACTION-ALIAS",
+                    "text": "remove this",
+                    "handle": {"address": "user@example.com"},
+                    "isFromMe": False,
+                    "chats": [{"guid": "any;-;user@example.com"}],
+                },
+            },
+        )
+        identifier_retry = {
+            "type": "updated-message",
+            "data": {
+                "guid": "MSG-RETRACTION-ALIAS",
+                "chatIdentifier": "user@example.com",
+                "isFromMe": False,
+                "dateRetracted": 123456789,
+            },
+        }
+        handle_retry = {
+            **identifier_retry,
+            "data": {
+                **identifier_retry["data"],
+                "handle": {"address": "user@example.com"},
+            },
+        }
+
+        await self._dispatch(adapter, identifier_retry)
+        await self._dispatch(adapter, handle_retry)
+
+        assert len(handled) == 2
+        assert "remove this" in handled[1].text
+
+    @pytest.mark.asyncio
     async def test_tapback_text_is_forwarded_as_reaction_event(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         handled = []
@@ -476,6 +525,42 @@ class TestBlueBubblesUpdatedMessageHandling:
         assert handled[0].text == "Reaction: User liked this message: Smoke test passed"
         assert handled[0].source.chat_id == "user@example.com"
         mark_read.assert_awaited_once_with("user@example.com")
+
+    @pytest.mark.asyncio
+    async def test_tapback_retry_dedupes_across_sender_representations(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "mark_read", AsyncMock(return_value=False))
+
+        identifier_retry = {
+            "type": "new-message",
+            "data": {
+                "guid": "TAPBACK-ALIAS",
+                "text": "Liked “Alias-safe”",
+                "chatIdentifier": "user@example.com",
+                "isFromMe": False,
+            },
+        }
+        handle_retry = {
+            **identifier_retry,
+            "data": {
+                **identifier_retry["data"],
+                "handle": {"address": "user@example.com"},
+            },
+        }
+
+        await self._dispatch(adapter, identifier_retry)
+        await self._dispatch(adapter, handle_retry)
+
+        assert len(handled) == 1
+        assert handled[0].text == "Reaction: User liked this message: Alias-safe"
 
     @pytest.mark.asyncio
     async def test_removed_tapback_text_is_forwarded_as_reaction_removal(self, monkeypatch):

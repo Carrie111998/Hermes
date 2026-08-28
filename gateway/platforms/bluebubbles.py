@@ -946,20 +946,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         record: Dict[str, Any],
         message_id: Optional[str],
         text: str,
+        routing_identity: Optional[str],
         *,
         is_tapback: bool,
     ) -> Optional[tuple[Any, ...]]:
         """Return a bounded-cache key for a dispatchable update/reaction event."""
         if not message_id:
             return None
-        sender = self._value(
-            record.get("handle", {}).get("address")
-            if isinstance(record.get("handle"), dict)
-            else None,
-            record.get("sender"),
-            record.get("from"),
-            record.get("address"),
-        )
+        # Use the same canonical identity selected for routing. BlueBubbles can
+        # replay one physical update with the address first in chatIdentifier
+        # and later in handle.address; direct-field extraction would split the
+        # semantic dedupe key even though both route to the same DM.
+        sender = routing_identity
         if is_tapback:
             return (
                 "tapback",
@@ -1217,6 +1215,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             record,
             message_id,
             tapback_text or text,
+            session_chat_id,
             is_tapback=is_tapback,
         )
         if self._has_seen_update_event(update_event_key):
