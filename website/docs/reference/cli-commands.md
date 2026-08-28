@@ -785,7 +785,7 @@ Manage dynamic webhook subscriptions for event-driven agent activation. Requires
 
 | Subcommand | Description |
 |------------|-------------|
-| `subscribe` / `add` | Create a webhook route. Returns the URL and HMAC secret to configure on your service. |
+| `subscribe` / `add` | Create a webhook route. Prints its route URL, bound provider/signature mode, secret/token, and any available provider-specific header guidance. |
 | `list` / `ls` | Show all agent-created subscriptions. |
 | `remove` / `rm` | Delete a dynamic subscription. Static routes from config.yaml are not affected. |
 | `test` | Send a test POST to verify a subscription is working. |
@@ -799,16 +799,23 @@ hermes webhook subscribe <name> [options]
 | Option | Description |
 |--------|-------------|
 | `--prompt` | Prompt template with `{dot.notation}` payload references. |
-| `--events` | Comma-separated event types to accept (e.g. `issues,pull_request`). Empty = all. |
+| `--events` | Comma-separated event filters. GitHub permits one authenticated body class (`check_run`, `pull_request`, `push`, `issues`, or `ping`); GitLab permits one exact header value. Empty disables filtering: route-bound GitHub/GitLab requests resolve as `unknown`, while body-authoritative providers can still resolve an authenticated payload event. |
+| `--provider` | Explicit provider contract (default: `github`), such as `github`, `gitlab`, `svix`, `standard_webhooks`, `stripe`, `hermes`, or `generic`. |
+| `--signature-mode` | Explicit verifier override, including recommended `generic_v2` for generic senders. |
+| `--route-profile` | Gateway profile authorized to receive the route (default: `default`). Every explicit named profile uses `/p/<profile>/webhooks/<name>`, even in single-profile mode (where it must name that running profile); multiplex mode only permits several served names. The top-level `--profile` flag instead selects which local Hermes profile runs the CLI. |
 | `--description` | Human-readable description. |
 | `--skills` | Comma-separated skill names to load for the agent run. |
-| `--deliver` | Delivery target: `log` (default), `telegram`, `discord`, `slack`, `github_comment`. |
+| `--deliver` | Delivery target: `log` (default), `telegram`, `discord`, `slack`, `github_comment`. `github_comment` also requires route-bound `deliver_extra.repo` and positive `deliver_extra.pr_number`; the current CLI has no flags for those fields, so use a complete static route (or a carefully edited complete dynamic entry with fresh secret) for that target. |
 | `--deliver-chat-id` | Target chat/channel ID for cross-platform delivery. |
-| `--secret` | Custom HMAC secret. Auto-generated if omitted. |
+| `--secret` | Custom provider verification secret/token. Auto-generated if omitted. |
 | `--deliver-only` | Skip the agent — deliver the rendered `--prompt` as the literal message. Zero LLM cost, sub-second delivery. Requires `--deliver` to be a real target (not `log`). |
-| `--script` | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin; JSON stdout replaces the payload, and empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. See [Script Filters and Transforms](../user-guide/messaging/webhooks.md#script-filters-and-transforms). |
+| `--script` | Filter/transform script under the active profile's `$HERMES_HOME/scripts/` (normally `~/.hermes/scripts/`). The webhook payload is passed as JSON on stdin; JSON stdout replaces the payload, while empty stdout or `[SILENT]` suppresses delivery. Static script defects block listener startup; invalid dynamic candidates are skipped or withdrawn. A timeout or nonzero exit after execution starts returns HTTP 500 as indeterminate and durably fences retries for the same delivery identity. See [Script Filters and Transforms](../user-guide/messaging/webhooks.md#script-filters-and-transforms). |
 
-Subscriptions persist to `~/.hermes/webhook_subscriptions.json` and are hot-reloaded by the webhook adapter without a gateway restart.
+Subscriptions persist to the active profile's `$HERMES_HOME/webhook_subscriptions.json` (normally `~/.hermes/webhook_subscriptions.json`; named profiles normally use `~/.hermes/profiles/<name>/webhook_subscriptions.json`) and are hot-reloaded without a gateway restart. The adapter checks at connect time and before each incoming webhook: metadata changes load on that next check, while unchanged metadata receives a bounded SHA-256 content recheck at most about once per second.
+
+`subscribe` defaults to `--provider github`; that default is not provider auto-detection. Set `--provider` (and `--signature-mode` where applicable) for every non-GitHub sender. `hermes webhook test` generates a provider-shaped default body, but `--payload` sends exactly the JSON you supply: signing a custom body does not make it satisfy a GitHub event classifier or another provider's payload contract.
+
+When the webhook bind is omitted, loopback, or wildcard (`0.0.0.0` / `::`), `subscribe` prints a **Local test URL**. Do not give that URL to an external provider. Put the same route path behind a public HTTPS reverse proxy—for example, `/p/ops/webhooks/build` must remain `/p/ops/webhooks/build` on the public URL. A configured non-loopback bind is labeled **Callback URL** instead. `hermes webhook test` intentionally posts directly to the configured/local gateway address; it does not test your public reverse proxy.
 
 ## `hermes doctor`
 

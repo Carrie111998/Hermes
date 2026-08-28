@@ -322,8 +322,7 @@ class TestWebhookEndpoints:
     def _setup(self, _isolate_hermes_home):
         self.client, _ = _client()
 
-
-    def test_create_webhook_persists_script(self):
+    def _enable_webhook_platform(self):
         from hermes_cli.config import load_config, save_config
 
         cfg = load_config()
@@ -332,6 +331,9 @@ class TestWebhookEndpoints:
             "extra": {"host": "0.0.0.0", "port": 8644},
         }
         save_config(cfg)
+
+    def test_create_webhook_persists_script(self):
+        self._enable_webhook_platform()
 
         r = self.client.post(
             "/api/webhooks",
@@ -346,6 +348,74 @@ class TestWebhookEndpoints:
 
         subs = self.client.get("/api/webhooks").json()["subscriptions"]
         assert subs[0]["script"] == "todoist_filter.py"
+
+    def test_create_and_list_project_exact_deliver_chat_id_without_list_secret(self):
+        import json
+
+        self._enable_webhook_platform()
+        create = self.client.post(
+            "/api/webhooks",
+            json={
+                "name": "callback-route",
+                "deliver": "discord",
+                "deliver_chat_id": "channel-123",
+            },
+        )
+
+        assert create.status_code == 200
+        created = create.json()
+        assert created["deliver_chat_id"] == "channel-123"
+        assert created["secret_set"] is True
+        assert isinstance(created.get("secret"), str)
+        assert "deliver_extra" not in created
+
+        listed = self.client.get("/api/webhooks").json()
+        route = listed["subscriptions"][0]
+        assert route["deliver_chat_id"] == "channel-123"
+        assert route["secret_set"] is True
+        assert "secret" not in route
+        assert "deliver_extra" not in route
+        assert created["secret"] not in json.dumps(listed)
+
+    def test_omitted_deliver_chat_id_does_not_invent_binding(self):
+        self._enable_webhook_platform()
+
+        create = self.client.post(
+            "/api/webhooks",
+            json={"name": "no-binding", "deliver": "log"},
+        )
+
+        assert create.status_code == 200
+        assert create.json()["deliver_chat_id"] is None
+        route = self.client.get("/api/webhooks").json()["subscriptions"][0]
+        assert route["deliver_chat_id"] is None
+        assert "deliver_extra" not in route
+
+    def test_malformed_deliver_extra_does_not_invent_binding(self):
+        from hermes_cli.web_server import _webhook_route_summary
+
+        malformed_routes = [
+            {},
+            {"deliver_extra": None},
+            {"deliver_extra": "not-an-object"},
+            {"deliver_extra": ["channel-123"]},
+            {"deliver_extra": {"chat_id": 123}},
+            {"deliver_extra": {"chat_id": True}},
+            {"deliver_extra": {"chat_id": {"nested": "channel-123"}}},
+            {"deliver_extra": {"other": "channel-123"}},
+        ]
+        for route in malformed_routes:
+            summary = _webhook_route_summary("probe", route, "http://localhost:8644")
+            assert summary["deliver_chat_id"] is None
+            assert "deliver_extra" not in summary
+
+        exact = _webhook_route_summary(
+            "probe",
+            {"deliver_extra": {"chat_id": "channel-123"}},
+            "http://localhost:8644",
+        )
+        assert exact["deliver_chat_id"] == "channel-123"
+        assert "deliver_extra" not in exact
 
     def test_enable_platform_starts_gateway_restart(self, monkeypatch):
         import hermes_cli.web_server as ws

@@ -74,6 +74,36 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
+def test_default_stamp_aliases_named_primary_only_when_multiplex_is_off(monkeypatch):
+    """Unprofiled durable routes remain usable on a named single-profile home."""
+
+    runner, primary_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    runner._active_profile_name = lambda: "dev"
+
+    assert (
+        runner._authorization_adapter(Platform.WECOM, profile="default")
+        is primary_adapter
+    )
+
+
+def test_explicit_default_profile_uses_its_secondary_registry_when_active_is_named(
+    monkeypatch,
+):
+    """A named active gateway cannot borrow its adapter for default egress."""
+
+    runner, named_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    default_adapter = SimpleNamespace(send=AsyncMock())
+    runner._active_profile_name = lambda: "dev"
+    runner._profile_adapters["default"] = {Platform.WECOM: default_adapter}
+
+    assert runner.adapters[Platform.WECOM] is named_adapter
+    assert (
+        runner._authorization_adapter(Platform.WECOM, profile="default")
+        is default_adapter
+    )
+
+
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
     """Unauthorized-DM behavior must read the secondary adapter's dm_policy."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)

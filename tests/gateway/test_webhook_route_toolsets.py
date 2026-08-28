@@ -1,137 +1,395 @@
-"""Per-route webhook toolset overrides (adapter.toolsets_for_source).
+"""Durable per-webhook-operation toolset authority.
 
-A webhook route config may carry a ``toolsets`` list that replaces the
-platform-level ``platform_toolsets.webhook`` resolution for runs triggered by
-that route only. The gateway validates the override through the same
-``_get_platform_tools`` path as platform config, so restricted/unknown names
-behave identically to a manually configured platform toolset list.
+Route toolsets are validated once, before dispatch, and persisted in the
+operation ledger. Agent execution consumes only that exact durable grant.
+Missing, malformed, or unreadable authority is an explicit deny-all result;
+mutable route or platform configuration is never consulted as a fallback.
 """
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.webhook import WebhookAdapter
+from gateway.platforms.webhook_auth import WebhookLocalBypassReceipt
+from gateway.platforms.webhook_contract import (
+    WebhookContractError,
+    WebhookEnvelope,
+    WebhookRouteConfig,
+)
+from gateway.platforms.webhook_ledger import (
+    AdmitDisposition,
+    WebhookOperationLedger,
+)
 from gateway.run import GatewayRunner
 from hermes_cli.tools_config import _get_platform_tools
 
 
 class _Src:
-    def __init__(self, chat_id):
+    def __init__(self, chat_id: str):
         self.chat_id = chat_id
 
 
-def _make_adapter(routes):
-    wa = object.__new__(WebhookAdapter)
-    wa._routes = routes
-    return wa
+class _BrokenLedger:
+    def lookup_session(self, _session_key: str):
+        raise RuntimeError("injected ledger failure")
 
 
-def _make_runner(adapter):
-    gr = object.__new__(GatewayRunner)
-    gr._adapter_for_source = lambda source: adapter
-    return gr
+def _make_adapter(ledger, *, routes=None, runner=None) -> WebhookAdapter:
+    adapter = object.__new__(WebhookAdapter)
+    adapter._operation_ledger = ledger
+    adapter._routes = routes or {}
+    adapter.gateway_runner = runner
+    return adapter
+
+
+def _make_runner(adapter) -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    runner._adapter_for_source = lambda source: adapter
+    return runner
+
+
+def _prepared_authority(
+    tmp_path: Path,
+    grant_snapshot: dict,
+    *,
+    trace_id: str = "trace-1",
+):
+    ledger = WebhookOperationLedger(tmp_path / f"{trace_id}.db")
+    body = json.dumps(
+        {"event": "push", "trace": trace_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    route = WebhookRouteConfig.bind(
+        "mon",
+        {"provider": "generic", "profile": "default"},
+        headers={},
+        request_profile="default",
+    )
+    receipt = WebhookLocalBypassReceipt._issue(route, body, {})
+    envelope = WebhookEnvelope.from_receipt(
+        receipt,
+        raw_body=body,
+        media_type="application/json",
+        trace_id=trace_id,
+    )
+    admitted = ledger.admit(envelope)
+    assert admitted.disposition is AdmitDisposition.ACCEPTED
+    assert admitted.authority is not None
+    prepared = ledger.prepare(
+        admitted.authority,
+        event_snapshot={"v": 1, "kind": "agent", "prompt": "inspect"},
+        target_snapshot={"v": 1, "kind": "log", "profile": "default"},
+        grant_snapshot=grant_snapshot,
+    )
+    return ledger, prepared
 
 
 BASE_CONFIG = {"platform_toolsets": {"webhook": ["web", "vision", "clarify"]}}
 
 
-class TestWebhookAdapterToolsetsForSource:
-    def test_route_with_toolsets_returns_list(self):
-        wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal", "file"]}})
-        assert wa.toolsets_for_source(_Src("webhook:mon:d1")) == ["terminal", "file"]
-
-    def test_route_without_toolsets_returns_none(self):
-        wa = _make_adapter({"plain": {"secret": "x"}})
-        assert wa.toolsets_for_source(_Src("webhook:plain:d1")) is None
-
-    def test_unknown_route_returns_none(self):
-        wa = _make_adapter({})
-        assert wa.toolsets_for_source(_Src("webhook:ghost:d1")) is None
-
-    def test_non_webhook_chat_id_returns_none(self):
-        wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
-        assert wa.toolsets_for_source(_Src("telegram:123")) is None
-
-    def test_empty_or_non_list_toolsets_returns_none(self):
-        wa = _make_adapter(
-            {
-                "empty": {"secret": "x", "toolsets": []},
-                "str": {"secret": "x", "toolsets": "terminal"},
-                "blank": {"secret": "x", "toolsets": ["  ", ""]},
-            }
+class TestWebhookAdapterDurableGrant:
+    def test_returns_exact_persisted_grant(self, tmp_path: Path):
+        ledger, authority = _prepared_authority(
+            tmp_path,
+            {"v": 1, "toolsets": ["terminal", "file"]},
         )
-        assert wa.toolsets_for_source(_Src("webhook:empty:d")) is None
-        assert wa.toolsets_for_source(_Src("webhook:str:d")) is None
-        assert wa.toolsets_for_source(_Src("webhook:blank:d")) is None
+        adapter = _make_adapter(ledger)
+        source = _Src(authority.session_key)
 
-    def test_base_adapter_default_is_none(self):
-        # Non-webhook adapters inherit a None default: no override anywhere.
-        wa = _make_adapter({})
+        assert adapter.resolved_toolsets_for_source(source) == ["terminal", "file"]
+        assert adapter.toolsets_for_source(source) == ["terminal", "file"]
+
+    def test_mutable_route_cannot_replace_persisted_grant(self, tmp_path: Path):
+        ledger, authority = _prepared_authority(
+            tmp_path,
+            {"v": 1, "toolsets": ["web"]},
+        )
+        routes = {"mon": {"toolsets": ["terminal"]}}
+        adapter = _make_adapter(ledger, routes=routes)
+        source = _Src(authority.session_key)
+
+        assert adapter.resolved_toolsets_for_source(source) == ["web"]
+        routes["mon"]["toolsets"] = ["file", "terminal"]
+        assert adapter.resolved_toolsets_for_source(source) == ["web"]
+
+    def test_missing_authority_is_deny_all_even_when_route_is_wider(
+        self,
+        tmp_path: Path,
+    ):
+        ledger = WebhookOperationLedger(tmp_path / "state.db")
+        adapter = _make_adapter(
+            ledger,
+            routes={"mon": {"toolsets": ["terminal", "file"]}},
+        )
+
+        assert adapter.resolved_toolsets_for_source(_Src("webhook:missing")) == []
+        assert adapter.toolsets_for_source(_Src("webhook:missing")) == []
+
+    @pytest.mark.parametrize(
+        "grant_snapshot",
+        [
+            pytest.param({}, id="missing-version"),
+            pytest.param({"v": 2, "toolsets": ["terminal"]}, id="wrong-version"),
+            pytest.param({"v": 1}, id="missing-list"),
+            pytest.param({"v": 1, "toolsets": "terminal"}, id="string-list"),
+            pytest.param({"v": 1, "toolsets": ["terminal", ""]}, id="blank"),
+            pytest.param({"v": 1, "toolsets": ["terminal", 7]}, id="non-string"),
+        ],
+    )
+    def test_malformed_persisted_grant_is_deny_all(
+        self,
+        tmp_path: Path,
+        grant_snapshot: dict,
+    ):
+        ledger, authority = _prepared_authority(
+            tmp_path,
+            grant_snapshot,
+            trace_id=f"malformed-{abs(hash(repr(grant_snapshot)))}",
+        )
+        adapter = _make_adapter(ledger)
+
+        assert adapter.resolved_toolsets_for_source(_Src(authority.session_key)) == []
+
+    def test_ledger_failure_and_blank_source_are_deny_all(self):
+        adapter = _make_adapter(_BrokenLedger())
+
+        assert adapter.resolved_toolsets_for_source(_Src("webhook:mon:d")) == []
+        assert adapter.resolved_toolsets_for_source(_Src("")) == []
+
+    def test_base_adapter_has_no_exact_or_legacy_override(self):
+        adapter = object.__new__(WebhookAdapter)
+        source = _Src("webhook:mon:d")
+
+        assert BasePlatformAdapter.resolved_toolsets_for_source(adapter, source) is None
+        assert BasePlatformAdapter.toolsets_for_source(adapter, source) is None
+
+
+class TestAdmissionTimeResolution:
+    def test_declared_route_grant_is_normalized_and_validated_once(
+        self,
+        monkeypatch,
+    ):
+        runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False))
+        adapter = _make_adapter(None, runner=runner)
+        original_config = {
+            "platform_toolsets": {"webhook": ["vision"]},
+            "unrelated": {"preserved": True},
+        }
+        seen = []
+
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: original_config,
+        )
+
+        def resolve(config, platform_key):
+            seen.append((config, platform_key))
+            return {"terminal", "web"}
+
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", resolve)
+
+        resolved = adapter._resolve_admitted_toolsets(
+            {"toolsets": [" terminal ", "web", "terminal"]},
+            _Src("webhook:default:mon:generic:trace"),
+        )
+
+        assert resolved == ["terminal", "web"]
+        assert len(seen) == 1
+        resolved_config, platform_key = seen[0]
+        assert platform_key == "webhook"
+        assert resolved_config["platform_toolsets"]["webhook"] == [
+            "terminal",
+            "web",
+        ]
+        assert original_config == {
+            "platform_toolsets": {"webhook": ["vision"]},
+            "unrelated": {"preserved": True},
+        }
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("terminal", id="not-list"),
+            pytest.param(["terminal", ""], id="blank"),
+            pytest.param(["terminal", 7], id="non-string"),
+        ],
+    )
+    def test_invalid_declared_route_grant_fails_before_dispatch(self, raw):
+        runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False))
+        adapter = _make_adapter(None, runner=runner)
+
+        with pytest.raises(WebhookContractError, match="toolset"):
+            adapter._resolve_admitted_toolsets(
+                {"toolsets": raw},
+                _Src("webhook:default:mon:generic:trace"),
+            )
+
+    def test_empty_declared_grant_is_explicit_deny_all(self, monkeypatch):
+        runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False))
+        adapter = _make_adapter(None, runner=runner)
+
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("empty grant must not broaden through live config")
+            ),
+        )
+
         assert (
-            BasePlatformAdapter.toolsets_for_source(wa, _Src("webhook:mon:d")) is None
+            adapter._resolve_admitted_toolsets(
+                {"toolsets": []},
+                _Src("webhook:default:mon:generic:trace"),
+            )
+            == []
+        )
+
+    def test_missing_gateway_runner_is_deny_all(self):
+        adapter = _make_adapter(None, runner=None)
+
+        assert (
+            adapter._resolve_admitted_toolsets(
+                {"toolsets": ["terminal"]},
+                _Src("webhook:default:mon:generic:trace"),
+            )
+            == []
         )
 
 
-class TestGatewayResolveEnabledToolsetsForSource:
-    def test_override_replaces_platform_resolution(self):
-        wa = _make_adapter(
-            {"mon": {"secret": "x", "toolsets": ["terminal", "file", "web"]}}
+class TestGatewayConsumesExactGrant:
+    def test_exact_grant_bypasses_mutable_resolution(self, tmp_path, monkeypatch):
+        ledger, authority = _prepared_authority(
+            tmp_path,
+            {"v": 1, "toolsets": ["web", "terminal", "web"]},
         )
-        gr = _make_runner(wa)
-        res = GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
+        adapter = _make_adapter(
+            ledger,
+            routes={"mon": {"toolsets": ["file"]}},
         )
-        assert "terminal" in res and "file" in res and "web" in res
-        assert "vision" not in res  # platform list fully replaced, not merged
+        runner = _make_runner(adapter)
+        config = {"platform_toolsets": {"webhook": ["vision"]}}
 
-    def test_override_validated_like_platform_config(self):
-        # Contract: resolving with an override is byte-identical to resolving
-        # the same list configured as platform_toolsets.webhook.
-        override = ["terminal", "file", "web", "discord_admin"]
-        wa = _make_adapter({"mon": {"secret": "x", "toolsets": override}})
-        gr = _make_runner(wa)
-        res = GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("durable grant must not be re-resolved")
+            ),
         )
-        expected = sorted(
-            _get_platform_tools(
-                {"platform_toolsets": {"webhook": list(override)}}, "webhook"
+
+        resolved, has_override, failed = (
+            GatewayRunner._resolve_toolset_authority_for_source(
+                runner,
+                config,
+                _Src(authority.session_key),
+                "webhook",
             )
         )
-        assert res == expected
-        # discord_admin is platform-restricted to discord — must be dropped.
-        assert "discord_admin" not in res
 
-    def test_no_override_uses_platform_resolution(self):
-        wa = _make_adapter({"plain": {"secret": "x"}})
-        gr = _make_runner(wa)
-        res = GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, BASE_CONFIG, _Src("webhook:plain:d"), "webhook"
-        )
-        assert res == sorted(_get_platform_tools(BASE_CONFIG, "webhook"))
-        assert "terminal" not in res
+        assert resolved == ["web", "terminal"]
+        assert has_override is True
+        assert failed is False
+        assert config == {"platform_toolsets": {"webhook": ["vision"]}}
 
-    def test_adapter_exception_falls_back_to_platform_resolution(self):
-        wa = _make_adapter({})
-        wa.toolsets_for_source = lambda source: (_ for _ in ()).throw(
-            RuntimeError("boom")
+    def test_exact_empty_grant_is_deny_all(self, tmp_path, monkeypatch):
+        ledger, authority = _prepared_authority(
+            tmp_path,
+            {"v": 1, "toolsets": []},
         )
-        gr = _make_runner(wa)
-        res = GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
-        )
-        assert res == sorted(_get_platform_tools(BASE_CONFIG, "webhook"))
+        adapter = _make_adapter(ledger)
+        runner = _make_runner(adapter)
 
-    def test_missing_adapter_falls_back_to_platform_resolution(self):
-        gr = _make_runner(None)
-        res = GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("deny-all must not be re-resolved")
+            ),
         )
-        assert res == sorted(_get_platform_tools(BASE_CONFIG, "webhook"))
 
-    def test_original_config_not_mutated(self):
-        cfg = {"platform_toolsets": {"webhook": ["web"]}}
-        wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
-        gr = _make_runner(wa)
-        GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, cfg, _Src("webhook:mon:d"), "webhook"
+        resolved, has_override, failed = (
+            GatewayRunner._resolve_toolset_authority_for_source(
+                runner,
+                BASE_CONFIG,
+                _Src(authority.session_key),
+                "webhook",
+            )
         )
-        assert cfg["platform_toolsets"]["webhook"] == ["web"]
+
+        assert resolved == []
+        assert has_override is True
+        assert failed is False
+
+    def test_missing_durable_authority_does_not_fall_back_to_platform_config(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        adapter = _make_adapter(
+            WebhookOperationLedger(tmp_path / "state.db"),
+            routes={"mon": {"toolsets": ["terminal"]}},
+        )
+        runner = _make_runner(adapter)
+
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("missing authority must be deny-all")
+            ),
+        )
+
+        resolved, has_override, failed = (
+            GatewayRunner._resolve_toolset_authority_for_source(
+                runner,
+                BASE_CONFIG,
+                _Src("webhook:missing"),
+                "webhook",
+            )
+        )
+
+        assert resolved == []
+        assert has_override is True
+        assert failed is False
+
+    def test_unreadable_durable_authority_does_not_fall_back(self, monkeypatch):
+        runner = _make_runner(_make_adapter(_BrokenLedger()))
+
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("ledger failure must be deny-all")
+            ),
+        )
+
+        resolved, has_override, failed = (
+            GatewayRunner._resolve_toolset_authority_for_source(
+                runner,
+                BASE_CONFIG,
+                _Src("webhook:mon:d"),
+                "webhook",
+            )
+        )
+
+        assert resolved == []
+        assert has_override is True
+        assert failed is False
+
+    def test_missing_webhook_adapter_fails_closed(self):
+        runner = _make_runner(None)
+
+        resolved, has_override, failed = (
+            GatewayRunner._resolve_toolset_authority_for_source(
+                runner,
+                BASE_CONFIG,
+                _Src("webhook:mon:d"),
+                "webhook",
+            )
+        )
+
+        assert resolved == []
+        assert has_override is True
+        assert failed is True

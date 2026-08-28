@@ -9,8 +9,9 @@ with 429.
 The correct order is:
 1. Read body
 2. Validate HMAC signature (reject 401 if invalid)
-3. Rate limit check (reject 429 if over limit)
-4. Process the webhook
+3. Resolve durable replay identity
+4. Return duplicate/conflict without consuming execution quota
+5. Rate-limit only newly accepted work
 """
 
 import hashlib
@@ -53,7 +54,21 @@ def _github_signature(body: bytes, secret: str) -> str:
     ).hexdigest()
 
 
-SIMPLE_PAYLOAD = {"event": "test", "data": "hello"}
+SIMPLE_PAYLOAD = {
+    "ref": "refs/heads/main",
+    "before": "0" * 40,
+    "after": "1" * 40,
+    "created": False,
+    "deleted": False,
+    "forced": False,
+    "commits": [],
+    "head_commit": None,
+    "repository": {"id": 801, "full_name": "org/repo"},
+    "pusher": {"name": "octocat"},
+    "sender": {"id": 901, "login": "octocat"},
+    "event": "test",
+    "data": "hello",
+}
 
 
 class TestSignatureBeforeRateLimit:
@@ -75,6 +90,7 @@ class TestSignatureBeforeRateLimit:
         routes = {
             route_name: {
                 "secret": secret,
+                "provider": "github",
                 "events": ["push"],
                 "prompt": "Event: {event}",
                 "deliver": "log",
@@ -139,4 +155,64 @@ class TestSignatureBeforeRateLimit:
         # The valid event should have been captured
         assert len(captured_events) == 1
 
+    @pytest.mark.asyncio
+    async def test_valid_replay_flood_does_not_starve_fresh_delivery(self):
+        secret = "replay-safe-rate-secret"
+        route_name = "test-route"
+        adapter = _make_adapter(
+            {
+                route_name: {
+                    "secret": secret,
+                    "provider": "github",
+                    "events": ["push"],
+                    "prompt": "Event: {after}",
+                    "deliver": "log",
+                }
+            },
+            rate_limit=2,
+        )
+        async def handle_message(_event):
+            return None
 
+        adapter.handle_message = handle_message
+        app = _create_app(adapter)
+        first_payload = dict(SIMPLE_PAYLOAD, after="1" * 40)
+        first_body = json.dumps(first_payload).encode()
+        first_headers = {
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": _github_signature(first_body, secret),
+        }
+
+        async with TestClient(TestServer(app)) as client:
+            first = await client.post(
+                f"/webhooks/{route_name}",
+                data=first_body,
+                headers=first_headers,
+            )
+            assert first.status == 202
+
+            for _ in range(10):
+                replay = await client.post(
+                    f"/webhooks/{route_name}",
+                    data=first_body,
+                    headers=first_headers,
+                )
+                assert replay.status in {200, 202}
+
+            fresh_payload = dict(SIMPLE_PAYLOAD, after="2" * 40)
+            fresh_body = json.dumps(fresh_payload).encode()
+            fresh = await client.post(
+                f"/webhooks/{route_name}",
+                data=fresh_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Event": "push",
+                    "X-Hub-Signature-256": _github_signature(
+                        fresh_body,
+                        secret,
+                    ),
+                },
+            )
+
+        assert fresh.status == 202

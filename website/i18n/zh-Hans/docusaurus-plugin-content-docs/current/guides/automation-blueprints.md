@@ -51,33 +51,29 @@ Format as a clean digest. If no new issues, respond with [SILENT]." \
 
 ### 自动 PR 代码审查
 
-PR 开启时自动进行审查，并直接在 PR 上发布审查评论。
+静态路由会在 PR 开启或更新时获取 diff，并把最终审查直接发布到 PR；受限的 CLI 备选方案只把基于元数据的审查清单写入日志。
 
 **触发方式：** GitHub webhook
 
-**方式 A——动态订阅（CLI）：**
+**方式 A——动态订阅（CLI，仅元数据分类）：**
+
+动态 CLI 有意不能授予 `terminal` toolset，也不能设置 `github_comment` 所需的 `deliver_extra.repo` / `pr_number`。因此这个可直接运行的版本只根据已认证的 PR 元数据起草清单并写入日志。需要获取 diff 并评论 PR 时，请使用下方的完整静态路由。
 
 ```bash
 hermes webhook subscribe github-pr-review \
+  --provider github \
+  --signature-mode github \
   --events "pull_request" \
-  --prompt "Review this pull request:
+  --prompt "Triage this pull request from its metadata:
 Repository: {repository.full_name}
 PR #{pull_request.number}: {pull_request.title}
 Author: {pull_request.user.login}
 Action: {action}
-Diff URL: {pull_request.diff_url}
+Description: {pull_request.body}
 
-Fetch the diff with: curl -sL {pull_request.diff_url}
-
-Review for:
-- Security issues (injection, auth bypass, secrets in code)
-- Performance concerns (N+1 queries, unbounded loops, memory leaks)
-- Code quality (naming, duplication, error handling)
-- Missing tests for new behavior
-
-Post a concise review. If the PR is a trivial docs/typo change, say so briefly." \
-  --skill github-code-review \
-  --deliver github_comment
+Summarize the likely review areas and draft questions for a human reviewer. Do not claim to have inspected the diff." \
+  --skills github-code-review \
+  --deliver log
 ```
 
 **方式 B——静态路由（config.yaml）：**
@@ -91,20 +87,30 @@ platforms:
       secret: "your-global-secret"
       routes:
         github-pr-review:
+          provider: github
+          signature_mode: github
           events: ["pull_request"]
           secret: "github-webhook-secret"
+          filters:
+            - field: "action"
+              in: ["opened", "synchronize", "reopened"]
+          toolsets: ["terminal"]
           prompt: |
             Review PR #{pull_request.number}: {pull_request.title}
             Repository: {repository.full_name}
             Author: {pull_request.user.login}
-            Diff URL: {pull_request.diff_url}
-            Review for security, performance, and code quality.
+            Run: gh pr diff {pull_request.number} --repo {repository.full_name}
+            Review the diff for security, performance, and code quality.
+            Return only the concise review text. Do not post it yourself;
+            the github_comment delivery target below posts the final response.
           skills: ["github-code-review"]
           deliver: "github_comment"
           deliver_extra:
             repo: "{repository.full_name}"
             pr_number: "{pull_request.number}"
 ```
+
+这里的 `terminal` 命令在配置的 terminal 后端中运行；`github_comment` 投递使用的 `gh` 则在 gateway 主机上运行。因此，若 terminal 后端是 Docker 或 SSH，两处都必须具备各自所需的 `gh`/认证。该路由的 secret 会绑定 provider、toolset、prompt、skill 和投递目标；以后修改任一字段时必须换用全新 secret，并同步更新 GitHub webhook。
 
 然后在 GitHub 中：**Settings → Webhooks → Add webhook** → Payload URL：`http://your-server:8644/webhooks/github-pr-review`，Content type：`application/json`，Secret：`github-webhook-secret`，Events：**Pull requests**。
 
@@ -168,8 +174,12 @@ If no vulnerabilities, respond with [SILENT]." \
 **触发方式：** API 调用（webhook）
 
 ```bash
+DEPLOY_WEBHOOK_SECRET="replace-with-a-random-secret"
 hermes webhook subscribe deploy-verify \
+  --provider generic \
+  --signature-mode generic_v2 \
   --events "deployment" \
+  --secret "$DEPLOY_WEBHOOK_SECRET" \
   --prompt "A deployment just completed:
 Service: {service}
 Environment: {environment}
@@ -177,32 +187,44 @@ Version: {version}
 Deployed by: {deployer}
 
 Run these verification steps:
-1. Check if the service is responding: curl -s -o /dev/null -w '%{http_code}' {health_url}
-2. Search recent logs for errors: check the deployment payload for any error indicators
-3. Verify the version matches: curl -s {health_url}/version
+1. Use web extraction to check whether {health_url} responds successfully
+2. Inspect the deployment payload's error summary: {errors}
+3. Use web extraction to verify that {version_url} reports version {version}
 
-Report: deployment status (healthy/degraded/failed), response time, any errors found.
+Report: deployment status (healthy/degraded/failed), observed versions, and any errors found.
 If healthy, keep it brief. If degraded or failed, provide detailed diagnostics." \
   --deliver telegram
 ```
 
+在 CI 中使用同一个 `DEPLOY_WEBHOOK_SECRET`。此 prompt 只使用默认 webhook toolset 中的 web 提取能力，不要求动态订阅自行授予 terminal。
+
 你的 CI/CD 流水线触发方式：
 
 ```bash
+BODY='{"event_type":"deployment","service":"api","environment":"prod","version":"2.1.0","deployer":"ci","health_url":"https://api.example.com/health","version_url":"https://api.example.com/version","errors":[]}'
+TIMESTAMP=$(date +%s)
+SIG=$(printf '%s.%s' "$TIMESTAMP" "$BODY" | openssl dgst -sha256 -hmac "$DEPLOY_WEBHOOK_SECRET" -hex | awk '{print $2}')
+
 curl -X POST http://your-server:8644/webhooks/deploy-verify \
   -H "Content-Type: application/json" \
-  -H "X-Hub-Signature-256: sha256=$(echo -n '{"service":"api","environment":"prod","version":"2.1.0","deployer":"ci","health_url":"https://api.example.com/health"}' | openssl dgst -sha256 -hmac 'your-secret' | cut -d' ' -f2)" \
-  -d '{"service":"api","environment":"prod","version":"2.1.0","deployer":"ci","health_url":"https://api.example.com/health"}'
+  -H "X-Webhook-Timestamp: $TIMESTAMP" \
+  -H "X-Webhook-Signature-V2: $SIG" \
+  -d "$BODY"
 ```
 
 ### 告警分类
 
-将监控告警与近期变更关联，起草响应方案。适用于 Datadog、PagerDuty、Grafana 或任何能 POST JSON 的告警系统。
+将监控告警与近期变更关联，起草响应方案。这个通用蓝图适用于任何能发送 Hermes Generic V2 签名的告警系统，或位于原始告警系统前方的可信中继。
 
 **触发方式：** API 调用（webhook）
 
 ```bash
+ALERT_WEBHOOK_SECRET="replace-with-a-random-secret"
 hermes webhook subscribe alert-triage \
+  --provider generic \
+  --signature-mode generic_v2 \
+  --events "alert" \
+  --secret "$ALERT_WEBHOOK_SECRET" \
   --prompt "Monitoring alert received:
 Alert: {alert.name}
 Severity: {alert.severity}
@@ -221,6 +243,8 @@ Investigate:
 Be concise. This goes to the on-call channel." \
   --deliver slack
 ```
+
+在已签名 JSON 正文顶层加入 `"event_type": "alert"`，并严格按上一个部署示例计算 `X-Webhook-Timestamp` 与 `X-Webhook-Signature-V2`。服务商请求头不会自动选择验证器；若发送方已有 Hermes 支持的原生契约，应改用对应的 provider 路由。
 
 ### 可用性监控
 
@@ -346,14 +370,16 @@ hermes cron create "0 8 * * *" \
 
 ## GitHub 事件自动化
 
-### Issue 自动打标签
+### Issue 分类建议
 
-自动对新 issue 打标签并回复。
+自动为新 issue 起草标签和初始回复，并写入日志供人工审核。
 
 **触发方式：** GitHub webhook
 
 ```bash
 hermes webhook subscribe github-issues \
+  --provider github \
+  --signature-mode github \
   --events "issues" \
   --prompt "New GitHub issue received:
 Repository: {repository.full_name}
@@ -367,15 +393,17 @@ If this is a new issue (action=opened):
 1. Read the issue title and body carefully
 2. Suggest appropriate labels (bug, feature, docs, security, question)
 3. If it's a bug report, check if you can identify the affected component from the description
-4. Post a helpful initial response acknowledging the issue
+4. Draft a helpful initial response acknowledging the issue
 
 If this is a label or assignment change, respond with [SILENT]." \
-  --deliver github_comment
+  --deliver log
 ```
+
+此动态蓝图只记录标签建议与回复草稿。当前 CLI 不能绑定 `github_comment` 所需的 `repo` 和 `pr_number`；若结果必须发布到 GitHub，请使用带显式 `deliver_extra` 目标的完整静态 PR 路由。
 
 ### CI 失败分析
 
-分析 CI 失败原因并在 PR 上发布诊断信息。
+分析 CI 失败原因并把诊断信息写入日志。一个 check run 可能关联零个或多个 pull request，因此此蓝图不会假定单一 GitHub 评论目标。
 
 **触发方式：** GitHub webhook
 
@@ -387,54 +415,67 @@ platforms:
     extra:
       routes:
         ci-failure:
+          provider: github
+          signature_mode: github
           events: ["check_run"]
           secret: "ci-secret"
+          toolsets: ["web"]
           prompt: |
             CI check failed:
             Repository: {repository.full_name}
             Check: {check_run.name}
             Status: {check_run.conclusion}
-            PR: #{check_run.pull_requests.0.number}
+            Associated PRs: {check_run.pull_requests}
             Details URL: {check_run.details_url}
 
             If conclusion is "failure":
-            1. Fetch the log from the details URL if accessible
+            1. Use web extraction to inspect the details URL if it is publicly accessible
             2. Identify the likely cause of failure
             3. Suggest a fix
             If conclusion is "success", respond with [SILENT].
-          deliver: "github_comment"
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{check_run.pull_requests.0.number}"
+          deliver: "log"
 ```
 
-### 跨仓库自动移植变更
+### 规划跨仓库移植
 
-某仓库 PR 合并后，自动将等效变更移植到另一个仓库。
+某仓库 PR 合并后，检查其 diff，并为另一个仓库准备具体移植计划。
 
 **触发方式：** GitHub webhook
 
-```bash
-hermes webhook subscribe auto-port \
-  --events "pull_request" \
-  --prompt "PR merged in the source repository:
-Repository: {repository.full_name}
-PR #{pull_request.number}: {pull_request.title}
-Author: {pull_request.user.login}
-Action: {action}
-Merge commit: {pull_request.merge_commit_sha}
+```yaml
+# config.yaml route
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        auto-port-plan:
+          provider: github
+          signature_mode: github
+          events: ["pull_request"]
+          secret: "auto-port-secret"
+          filters:
+            - field: "action"
+              equals: "closed"
+            - field: "pull_request.merged"
+              equals: true
+          toolsets: ["terminal"]
+          prompt: |
+            A pull request merged in {repository.full_name}:
+            PR #{pull_request.number}: {pull_request.title}
+            Merge commit: {pull_request.merge_commit_sha}
 
-If action is 'closed' and pull_request.merged is true:
-1. Fetch the diff: curl -sL {pull_request.diff_url}
-2. Analyze what changed
-3. Determine if this change needs to be ported to the Go SDK equivalent
-4. If yes, create a branch, apply the equivalent changes, and open a PR on the target repo
-5. Reference the original PR in the new PR description
+            Run:
+            gh pr diff {pull_request.number} --repo {repository.full_name}
 
-If action is not 'closed' or not merged, respond with [SILENT]." \
-  --skill github-pr-workflow \
-  --deliver log
+            Analyze the diff and prepare a file-by-file porting plan for org/go-sdk.
+            Include a proposed PR title and body that reference the original PR.
+            Do not clone, edit, push, or open a PR; return the plan only.
+          skills: ["github-pr-workflow"]
+          deliver: log
 ```
+
+这里显式授予 `terminal`，因为动态订阅不能增加路由级 toolset。`gh pr diff` 在配置的 terminal 后端中运行；该环境必须安装并认证 `gh`。
 
 ---
 
@@ -447,7 +488,11 @@ If action is not 'closed' or not merged, respond with [SILENT]." \
 **触发方式：** API 调用（webhook）
 
 ```bash
+STRIPE_WEBHOOK_SECRET="whsec_replace_with_your_endpoint_secret"
 hermes webhook subscribe stripe-payments \
+  --provider stripe \
+  --signature-mode stripe \
+  --secret "$STRIPE_WEBHOOK_SECRET" \
   --events "payment_intent.succeeded,payment_intent.payment_failed,charge.dispute.created" \
   --prompt "Stripe event received:
 Event type: {type}
@@ -469,6 +514,8 @@ For payment_intent.succeeded:
 Keep responses concise for the ops channel." \
   --deliver slack
 ```
+
+`STRIPE_WEBHOOK_SECRET` 必须是 Stripe 为该 endpoint 提供的 `whsec_...` signing secret；不要使用任意生成的 HMAC secret。Stripe 的 `Stripe-Signature` 请求头和正文 `type` 提供认证契约与事件类型。
 
 ### 每日营收摘要
 
@@ -581,7 +628,7 @@ Keep the outline to ~300 words. This is a starting point, not a finished post." 
 | `{issue.number}` | Issue 编号 |
 | `{repository.full_name}` | `owner/repo` |
 | `{action}` | 事件动作（opened、closed 等） |
-| `{__raw__}` | 完整 JSON payload（截断至 4000 字符） |
+| `{__raw__}` | 最多 4,000 UTF-8 字节、带明确截断元数据的可解析原始 payload 信封 |
 | `{sender.login}` | 触发事件的 GitHub 用户 |
 
 ### [SILENT] 模式

@@ -407,7 +407,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `HASS_URL` | Home Assistant URL（默认：`http://homeassistant.local:8123`） |
 | `WEBHOOK_ENABLED` | 启用 webhook 平台适配器（`true`/`false`） |
 | `WEBHOOK_PORT` | 接收 webhook 的 HTTP 服务器端口（默认：`8644`） |
-| `WEBHOOK_SECRET` | webhook 签名验证的全局 HMAC 密钥（当路由未指定自己的密钥时作为回退） |
+| `WEBHOOK_SECRET` | 仅供恰好一条已认证 webhook 路由使用的全局 HMAC 回退值；多路由必须各用唯一密钥 |
 | `API_SERVER_ENABLED` | 启用 OpenAI 兼容 API 服务器（`true`/`false`）。与其他平台并行运行。 |
 | `API_SERVER_KEY` | API 服务器认证的 Bearer token。非回环绑定时强制执行。 |
 | `API_SERVER_CORS_ORIGINS` | 允许直接调用 API 服务器的逗号分隔浏览器来源（例如 `http://localhost:3000,http://127.0.0.1:3000`）。默认：禁用。 |

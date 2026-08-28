@@ -30,9 +30,10 @@ from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_adapter(routes, **extra_kw) -> WebhookAdapter:
     """Create a WebhookAdapter with the given routes."""
-    extra = {"host": "0.0.0.0", "port": 0, "routes": routes}
+    extra = {"host": "127.0.0.1", "port": 0, "routes": routes}
     extra.update(extra_kw)
     config = PlatformConfig(enabled=True, extra=extra)
     return WebhookAdapter(config)
@@ -48,9 +49,7 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
 
 def _github_signature(body: bytes, secret: str) -> str:
     """Compute X-Hub-Signature-256 for *body* using *secret*."""
-    return "sha256=" + hmac.new(
-        secret.encode(), body, hashlib.sha256
-    ).hexdigest()
+    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
 # A realistic GitHub pull_request event payload (trimmed)
@@ -58,6 +57,9 @@ GITHUB_PR_PAYLOAD = {
     "action": "opened",
     "number": 42,
     "pull_request": {
+        "id": 701,
+        "number": 42,
+        "state": "open",
         "title": "Add webhook adapter",
         "body": "This PR adds a generic webhook platform adapter.",
         "html_url": "https://github.com/org/repo/pull/42",
@@ -77,8 +79,8 @@ GITHUB_PR_PAYLOAD = {
 # Test 1: GitHub PR webhook triggers agent
 # ===================================================================
 
-class TestGitHubPRWebhook:
 
+class TestGitHubPRWebhook:
     @pytest.mark.asyncio
     async def test_github_pr_webhook_triggers_agent(self):
         """POST with a realistic GitHub PR payload should:
@@ -91,6 +93,7 @@ class TestGitHubPRWebhook:
         routes = {
             "github-pr": {
                 "secret": secret,
+                "provider": "github",
                 "events": ["pull_request"],
                 "prompt": (
                     "Review PR #{number} by {sender.login}: "
@@ -128,7 +131,11 @@ class TestGitHubPRWebhook:
             assert data["status"] == "accepted"
             assert data["route"] == "github-pr"
             assert data["event"] == "pull_request"
-            assert data["delivery_id"] == "gh-delivery-001"
+            # GitHub's delivery header is not covered by the body MAC, so it
+            # remains diagnostic-only and cannot become execution authority.
+            delivery_id = data["delivery_id"]
+            assert delivery_id != "gh-delivery-001"
+            assert len(delivery_id) == 32
 
         # Let the asyncio.create_task fire
         await asyncio.sleep(0.05)
@@ -140,15 +147,15 @@ class TestGitHubPRWebhook:
         assert event.source.chat_type == "webhook"
         assert event.source.platform == Platform.WEBHOOK
         assert "github-pr" in event.source.chat_id
-        assert event.message_id == "gh-delivery-001"
+        assert event.message_id == delivery_id
 
 
 # ===================================================================
 # Test 2: Skills injected into prompt
 # ===================================================================
 
-class TestSkillsInjection:
 
+class TestSkillsInjection:
     @pytest.mark.asyncio
     async def test_skills_injected_into_prompt(self):
         """When a route has skills: [code-review], the adapter should
@@ -157,6 +164,7 @@ class TestSkillsInjection:
         routes = {
             "pr-review": {
                 "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
                 "events": ["pull_request"],
                 "prompt": "Review this PR: {pull_request.title}",
                 "skills": ["code-review"],
@@ -177,12 +185,15 @@ class TestSkillsInjection:
         )
 
         # The imports are lazy (inside the handler), so patch the source module
-        with patch(
-            "agent.skill_commands.build_skill_invocation_message",
-            return_value=skill_content,
-        ) as mock_build, patch(
-            "agent.skill_commands.get_skill_commands",
-            return_value={"/code-review": {"name": "code-review"}},
+        with (
+            patch(
+                "agent.skill_commands.build_skill_invocation_message",
+                return_value=skill_content,
+            ) as mock_build,
+            patch(
+                "agent.skill_commands.get_skill_commands",
+                return_value={"/code-review": {"name": "code-review"}},
+            ),
         ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
@@ -209,8 +220,8 @@ class TestSkillsInjection:
 # Test 3: Cross-platform delivery (webhook → Telegram)
 # ===================================================================
 
-class TestCrossPlatformDelivery:
 
+class TestCrossPlatformDelivery:
     @pytest.mark.asyncio
     async def test_cross_platform_delivery(self):
         """When deliver='telegram', the response is routed to the
@@ -218,6 +229,7 @@ class TestCrossPlatformDelivery:
         routes = {
             "alerts": {
                 "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
                 "prompt": "Alert: {message}",
                 "deliver": "telegram",
                 "deliver_extra": {"chat_id": "12345"},
@@ -229,15 +241,23 @@ class TestCrossPlatformDelivery:
         # Set up a mock gateway runner with a mock Telegram adapter
         mock_tg_adapter = AsyncMock()
         mock_tg_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_tg_adapter.config = PlatformConfig(enabled=True, token="fake")
 
         mock_runner = MagicMock()
-        mock_runner.adapters = {Platform.TELEGRAM: mock_tg_adapter}
+        mock_runner.adapters = {
+            Platform.WEBHOOK: adapter,
+            Platform.TELEGRAM: mock_tg_adapter,
+        }
         mock_runner.config = GatewayConfig(
             platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}
         )
+        mock_runner._authorization_adapter = None
+        # MagicMock otherwise fabricates a callable profile-config resolver,
+        # making this narrow delivery double look like a full GatewayRunner.
+        mock_runner._resolve_profile_home_for_source = None
         adapter.gateway_runner = mock_runner
 
-        # First, simulate a webhook POST to set up delivery_info
+        # First, admit and durably prepare the exact target authority.
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
@@ -247,28 +267,45 @@ class TestCrossPlatformDelivery:
             )
             assert resp.status == 202
 
-        # The adapter should have stored delivery info
-        chat_id = "webhook:alerts:alert-001"
-        assert chat_id in adapter._delivery_info
+        # Delivery target lookup is keyed by the execution trace, not the
+        # provider-controlled retry ID.
+        await asyncio.sleep(0.05)
+        event = adapter.handle_message.await_args.args[0]
+        chat_id = event.source.chat_id
+        assert chat_id.startswith("webhook:default:alerts:github:")
+        assert "alert-001" not in chat_id
+        assert event.webhook_authority.target_snapshot == {
+            "v": 1,
+            "kind": "platform",
+            "profile": "default",
+            "platform": "telegram",
+            "chat_id": "12345",
+        }
 
         # Now call send() as if the agent has finished
-        result = await adapter.send(chat_id, "I've acknowledged the alert.")
+        await adapter.on_processing_start(event)
+        result = await adapter.send(
+            chat_id,
+            "I've acknowledged the alert.",
+            metadata={"notify": True},
+        )
 
         assert result.success is True
         mock_tg_adapter.send.assert_awaited_once_with(
             "12345", "I've acknowledged the alert.", metadata=None
         )
-        # Delivery info is retained after send() so interim status messages
-        # don't strand the final response (TTL-based cleanup happens on POST).
-        assert chat_id in adapter._delivery_info
+        settled = adapter._operation_ledger.lookup_session(chat_id)
+        assert settled is not None
+        assert settled.delivery is not None
+        assert settled.delivery.content == "I've acknowledged the alert."
 
 
 # ===================================================================
 # Test 4: GitHub comment delivery via gh CLI
 # ===================================================================
 
-class TestGitHubCommentDelivery:
 
+class TestGitHubCommentDelivery:
     @pytest.mark.asyncio
     async def test_github_comment_delivery(self):
         """When deliver='github_comment', the adapter invokes
@@ -276,6 +313,7 @@ class TestGitHubCommentDelivery:
         routes = {
             "pr-bot": {
                 "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
                 "prompt": "Review: {pull_request.title}",
                 "deliver": "github_comment",
                 "deliver_extra": {
@@ -287,54 +325,73 @@ class TestGitHubCommentDelivery:
         adapter = _make_adapter(routes)
         adapter.handle_message = AsyncMock()
 
-        # POST a webhook to set up delivery info
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/webhooks/pr-bot",
-                json=GITHUB_PR_PAYLOAD,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-GitHub-Delivery": "gh-comment-001",
-                },
-            )
-            assert resp.status == 202
-
-        chat_id = "webhook:pr-bot:gh-comment-001"
-        assert chat_id in adapter._delivery_info
-
-        # Verify deliver_extra was rendered with payload data
-        delivery = adapter._delivery_info[chat_id]
-        assert delivery["deliver_extra"]["repo"] == "org/repo"
-        assert delivery["deliver_extra"]["pr_number"] == "42"
-
-        # Mock subprocess.run and call send()
+        # Mock the exact executable resolution and subprocess target mutation.
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "Comment posted"
         mock_result.stderr = ""
 
-        with patch(
-            "gateway.platforms.webhook.subprocess.run",
-            return_value=mock_result,
-        ) as mock_run:
+        with (
+            patch(
+                "gateway.platforms.webhook_route_authority.shutil.which",
+                return_value="/usr/bin/gh",
+            ),
+            patch(
+                "gateway.platforms.webhook_delivery.subprocess.run",
+                return_value=mock_result,
+            ) as mock_run,
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/pr-bot",
+                    json=GITHUB_PR_PAYLOAD,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": "gh-comment-001",
+                    },
+                )
+                assert resp.status == 202
+
+            await asyncio.sleep(0.05)
+            event = adapter.handle_message.await_args.args[0]
+            chat_id = event.source.chat_id
+            assert chat_id.startswith("webhook:default:pr-bot:github:")
+            assert "gh-comment-001" not in chat_id
+            assert event.webhook_authority.target_snapshot == {
+                "v": 1,
+                "kind": "github_comment",
+                "profile": "default",
+                "repo": "org/repo",
+                "pr_number": 42,
+            }
+
+            await adapter.on_processing_start(event)
             result = await adapter.send(
-                chat_id, "LGTM! The code looks great."
+                chat_id,
+                "LGTM! The code looks great.",
+                metadata={"notify": True},
             )
 
         assert result.success is True
-        mock_run.assert_called_once_with(
-            [
-                "gh", "pr", "comment", "42",
-                "--repo", "org/repo",
-                "--body", "LGTM! The code looks great.",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
-        # Delivery info is retained after send() so interim status messages
-        # don't strand the final response (TTL-based cleanup happens on POST).
-        assert chat_id in adapter._delivery_info
+        mock_run.assert_called_once()
+        command = mock_run.call_args.args[0]
+        assert command == [
+            "/usr/bin/gh",
+            "pr",
+            "comment",
+            "42",
+            "--repo",
+            "org/repo",
+            "--body",
+            "LGTM! The code looks great.",
+        ]
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert kwargs["timeout"] == 30
+        assert kwargs["check"] is False
+        assert kwargs["env"]["GH_PROMPT_DISABLED"] == "1"
+        settled = adapter._operation_ledger.lookup_session(chat_id)
+        assert settled is not None
+        assert settled.delivery is not None

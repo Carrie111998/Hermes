@@ -6,6 +6,7 @@ import pytest
 import stat
 from argparse import Namespace
 
+from gateway.platforms.webhook_store import WebhookRouteStoreCorruptError
 from hermes_cli.webhook import (
     webhook_command,
     _get_webhook_base_url,
@@ -98,13 +99,21 @@ class TestPersistence:
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("broken{{{")
-        assert _load_subscriptions() == {}
+        with pytest.raises(WebhookRouteStoreCorruptError):
+            _load_subscriptions()
+        assert path.read_text(encoding="utf-8") == "broken{{{"
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
     def test_save_creates_secret_file_owner_only_under_permissive_umask(self):
         old_umask = os.umask(0o022)
         try:
-            _save_subscriptions({"demo": {"secret": "TOPSECRET", "prompt": "x"}})
+            _save_subscriptions({
+                "demo": {
+                    "provider": "generic",
+                    "secret": "TOPSECRET",
+                    "prompt": "x",
+                }
+            })
         finally:
             os.umask(old_umask)
 
@@ -120,7 +129,13 @@ class TestPersistence:
         path.write_text(json.dumps({"old": {"secret": "stale", "prompt": "x"}}))
         path.chmod(0o644)
 
-        _save_subscriptions({"demo": {"secret": "FRESH", "prompt": "x"}})
+        _save_subscriptions({
+            "demo": {
+                "provider": "generic",
+                "secret": "FRESH",
+                "prompt": "x",
+            }
+        })
 
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert "FRESH" in path.read_text(encoding="utf-8")
@@ -152,4 +167,3 @@ class TestWebhookEnabledGate:
         )
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
-

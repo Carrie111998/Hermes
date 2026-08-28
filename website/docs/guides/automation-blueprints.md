@@ -19,7 +19,7 @@ For parameterized blueprints with forms instead of cron syntax, see the [Automat
 | **GitHub Event** | Fires on PR opens, pushes, issues, CI results | Webhook platform (`hermes webhook subscribe`) |
 | **API Call** | External service POSTs JSON to your endpoint | Webhook platform (config.yaml routes or `hermes webhook subscribe`) |
 
-All three support delivery to Telegram, Discord, Slack, SMS, email, GitHub comments, or local files.
+Webhook routes can deliver to the gateway log, Telegram, Discord, Slack, Signal, SMS, or a fully bound GitHub PR comment target. Scheduled tasks have their own configured delivery choices.
 :::
 
 ---
@@ -51,14 +51,16 @@ Format as a clean digest. If no new issues, respond with [SILENT]." \
 
 ### Automatic PR Code Review
 
-Review every pull request automatically when it's opened. Posts a review comment directly on the PR.
+Review every pull request automatically when it's opened. The static route posts the final review directly on the PR; the constrained CLI alternative logs a metadata-only review checklist.
 
 **Trigger:** GitHub webhook
 
-**Option A — Dynamic subscription (CLI):**
+**Option A — Dynamic subscription (CLI, metadata-only review to the log):**
 
 ```bash
 hermes webhook subscribe github-pr-review \
+  --provider github \
+  --signature-mode github \
   --events "pull_request" \
   --prompt "Review this pull request:
 Repository: {repository.full_name}
@@ -67,18 +69,14 @@ Author: {pull_request.user.login}
 Action: {action}
 Diff URL: {pull_request.diff_url}
 
-Fetch the diff with: curl -sL {pull_request.diff_url}
-
-Review for:
-- Security issues (injection, auth bypass, secrets in code)
-- Performance concerns (N+1 queries, unbounded loops, memory leaks)
-- Code quality (naming, duplication, error handling)
-- Missing tests for new behavior
-
-Post a concise review. If the PR is a trivial docs/typo change, say so briefly." \
+Based only on the signed webhook metadata, identify the likely review focus and
+return a concise checklist for a human reviewer. Do not claim to have inspected
+the diff or post anything to GitHub." \
   --skills github-code-review \
-  --deliver github_comment
+  --deliver log
 ```
+
+The dynamic CLI does not expose per-route `toolsets` or the `repo` and `pr_number` authority required by `github_comment`. Use the static route below when the agent must fetch the diff and post the result to GitHub.
 
 **Option B — Static route (config.yaml):**
 
@@ -88,17 +86,24 @@ platforms:
     enabled: true
     extra:
       port: 8644
-      secret: "your-global-secret"
       routes:
         github-pr-review:
+          provider: github
+          signature_mode: github
           events: ["pull_request"]
           secret: "github-webhook-secret"
+          filters:
+            - field: "action"
+              in: ["opened", "synchronize", "reopened"]
+          toolsets: ["terminal"]
           prompt: |
             Review PR #{pull_request.number}: {pull_request.title}
             Repository: {repository.full_name}
             Author: {pull_request.user.login}
-            Diff URL: {pull_request.diff_url}
+            Fetch the diff with:
+            gh pr diff {pull_request.number} --repo {repository.full_name}
             Review for security, performance, and code quality.
+            Return only the review text; do not post it yourself.
           skills: ["github-code-review"]
           deliver: "github_comment"
           deliver_extra:
@@ -107,6 +112,8 @@ platforms:
 ```
 
 Then in GitHub: **Settings → Webhooks → Add webhook** → Payload URL: `http://your-server:8644/webhooks/github-pr-review`, Content type: `application/json`, Secret: `github-webhook-secret`, Events: **Pull requests**.
+
+The agent's `gh pr diff` command runs in the configured terminal backend, while the adapter's final `gh pr comment` delivery runs on the gateway host. Install and authenticate `gh` in both places when they are different machines or containers.
 
 ### Docs Drift Detection
 
@@ -168,8 +175,12 @@ Trigger smoke tests after every deployment. Your CI/CD pipeline POSTs to the web
 **Trigger:** API call (webhook)
 
 ```bash
+DEPLOY_WEBHOOK_SECRET="replace-with-a-random-secret"
 hermes webhook subscribe deploy-verify \
+  --provider generic \
+  --signature-mode generic_v2 \
   --events "deployment" \
+  --secret "$DEPLOY_WEBHOOK_SECRET" \
   --prompt "A deployment just completed:
 Service: {service}
 Environment: {environment}
@@ -177,11 +188,11 @@ Version: {version}
 Deployed by: {deployer}
 
 Run these verification steps:
-1. Check if the service is responding: curl -s -o /dev/null -w '%{http_code}' {health_url}
-2. Search recent logs for errors: check the deployment payload for any error indicators
-3. Verify the version matches: curl -s {health_url}/version
+1. Use web extraction to check whether {health_url} responds successfully
+2. Inspect the deployment payload's error summary: {errors}
+3. Use web extraction to verify that {version_url} reports version {version}
 
-Report: deployment status (healthy/degraded/failed), response time, any errors found.
+Report: deployment status (healthy/degraded/failed), observed versions, and any errors found.
 If healthy, keep it brief. If degraded or failed, provide detailed diagnostics." \
   --deliver telegram
 ```
@@ -189,20 +200,30 @@ If healthy, keep it brief. If degraded or failed, provide detailed diagnostics."
 Your CI/CD pipeline triggers it:
 
 ```bash
+BODY='{"event_type":"deployment","service":"api","environment":"prod","version":"2.1.0","deployer":"ci","health_url":"https://api.example.com/health","version_url":"https://api.example.com/version","errors":[]}'
+TIMESTAMP=$(date +%s)
+SIG=$(printf '%s.%s' "$TIMESTAMP" "$BODY" | openssl dgst -sha256 -hmac "$DEPLOY_WEBHOOK_SECRET" -hex | awk '{print $2}')
+
 curl -X POST http://your-server:8644/webhooks/deploy-verify \
   -H "Content-Type: application/json" \
-  -H "X-Hub-Signature-256: sha256=$(echo -n '{"service":"api","environment":"prod","version":"2.1.0","deployer":"ci","health_url":"https://api.example.com/health"}' | openssl dgst -sha256 -hmac 'your-secret' | cut -d' ' -f2)" \
-  -d '{"service":"api","environment":"prod","version":"2.1.0","deployer":"ci","health_url":"https://api.example.com/health"}'
+  -H "X-Webhook-Timestamp: $TIMESTAMP" \
+  -H "X-Webhook-Signature-V2: $SIG" \
+  -d "$BODY"
 ```
 
 ### Alert Triage
 
-Correlate monitoring alerts with recent changes to draft a response. Works with Datadog, PagerDuty, Grafana, or any alerting system that can POST JSON.
+Correlate monitoring alerts with recent changes to draft a response. This generic recipe works with any alerting system, or a trusted relay in front of it, that can send Hermes Generic V2 signatures.
 
 **Trigger:** API call (webhook)
 
 ```bash
+ALERT_WEBHOOK_SECRET="replace-with-a-random-secret"
 hermes webhook subscribe alert-triage \
+  --provider generic \
+  --signature-mode generic_v2 \
+  --events "alert" \
+  --secret "$ALERT_WEBHOOK_SECRET" \
   --prompt "Monitoring alert received:
 Alert: {alert.name}
 Severity: {alert.severity}
@@ -221,6 +242,8 @@ Investigate:
 Be concise. This goes to the on-call channel." \
   --deliver slack
 ```
+
+Send a top-level `"event_type": "alert"` in the signed JSON body and calculate `X-Webhook-Timestamp` and `X-Webhook-Signature-V2` exactly as in the deploy example above. Provider-specific headers never select a verifier automatically; use a provider-specific route instead when the sender has a supported native contract.
 
 ### Uptime Monitor
 
@@ -346,14 +369,16 @@ hermes cron create "0 8 * * *" \
 
 ## GitHub Event Automations
 
-### Issue Auto-Labeling
+### Issue Triage Drafts
 
-Automatically label and respond to new issues.
+Draft labels and an initial response for new issues, then log them for review.
 
 **Trigger:** GitHub webhook
 
 ```bash
 hermes webhook subscribe github-issues \
+  --provider github \
+  --signature-mode github \
   --events "issues" \
   --prompt "New GitHub issue received:
 Repository: {repository.full_name}
@@ -367,15 +392,17 @@ If this is a new issue (action=opened):
 1. Read the issue title and body carefully
 2. Suggest appropriate labels (bug, feature, docs, security, question)
 3. If it's a bug report, check if you can identify the affected component from the description
-4. Post a helpful initial response acknowledging the issue
+4. Draft a helpful initial response acknowledging the issue
 
 If this is a label or assignment change, respond with [SILENT]." \
-  --deliver github_comment
+  --deliver log
 ```
+
+This dynamic recipe logs label suggestions and a response draft. The CLI cannot bind the `repo` and `pr_number` fields required by `github_comment`; use a static route with an explicit `deliver_extra` target if the result must be posted to GitHub.
 
 ### CI Failure Analysis
 
-Analyze CI failures and post diagnostics on the PR.
+Analyze CI failures and log diagnostics. A check run can reference zero or multiple pull requests, so this recipe does not assume one fixed GitHub comment target.
 
 **Trigger:** GitHub webhook
 
@@ -387,54 +414,67 @@ platforms:
     extra:
       routes:
         ci-failure:
+          provider: github
+          signature_mode: github
           events: ["check_run"]
           secret: "ci-secret"
+          toolsets: ["web"]
           prompt: |
             CI check failed:
             Repository: {repository.full_name}
             Check: {check_run.name}
             Status: {check_run.conclusion}
-            PR: #{check_run.pull_requests.0.number}
+            Associated PRs: {check_run.pull_requests}
             Details URL: {check_run.details_url}
 
             If conclusion is "failure":
-            1. Fetch the log from the details URL if accessible
+            1. Use web extraction to inspect the details URL if it is publicly accessible
             2. Identify the likely cause of failure
             3. Suggest a fix
             If conclusion is "success", respond with [SILENT].
-          deliver: "github_comment"
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{check_run.pull_requests.0.number}"
+          deliver: "log"
 ```
 
-### Auto-Port Changes Across Repos
+### Plan Cross-Repo Ports
 
-When a PR merges in one repo, automatically port the equivalent change to another.
+When a PR merges in one repo, inspect its diff and prepare a concrete porting plan for another repository.
 
 **Trigger:** GitHub webhook
 
-```bash
-hermes webhook subscribe auto-port \
-  --events "pull_request" \
-  --prompt "PR merged in the source repository:
-Repository: {repository.full_name}
-PR #{pull_request.number}: {pull_request.title}
-Author: {pull_request.user.login}
-Action: {action}
-Merge commit: {pull_request.merge_commit_sha}
+```yaml
+# config.yaml route
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        auto-port-plan:
+          provider: github
+          signature_mode: github
+          events: ["pull_request"]
+          secret: "auto-port-secret"
+          filters:
+            - field: "action"
+              equals: "closed"
+            - field: "pull_request.merged"
+              equals: true
+          toolsets: ["terminal"]
+          prompt: |
+            A pull request merged in {repository.full_name}:
+            PR #{pull_request.number}: {pull_request.title}
+            Merge commit: {pull_request.merge_commit_sha}
 
-If action is 'closed' and pull_request.merged is true:
-1. Fetch the diff: curl -sL {pull_request.diff_url}
-2. Analyze what changed
-3. Determine if this change needs to be ported to the Go SDK equivalent
-4. If yes, create a branch, apply the equivalent changes, and open a PR on the target repo
-5. Reference the original PR in the new PR description
+            Run:
+            gh pr diff {pull_request.number} --repo {repository.full_name}
 
-If action is not 'closed' or not merged, respond with [SILENT]." \
-  --skills github-pr-workflow \
-  --deliver log
+            Analyze the diff and prepare a file-by-file porting plan for org/go-sdk.
+            Include a proposed PR title and body that reference the original PR.
+            Do not clone, edit, push, or open a PR; return the plan only.
+          skills: ["github-pr-workflow"]
+          deliver: log
 ```
+
+The `terminal` grant is explicit because dynamic subscriptions cannot add per-route toolsets. The `gh pr diff` command runs in the configured terminal backend, where `gh` must be installed and authenticated.
 
 ---
 
@@ -447,8 +487,12 @@ Track payment events and get summaries of failures.
 **Trigger:** API call (webhook)
 
 ```bash
+STRIPE_WEBHOOK_SECRET="whsec_replace_with_your_endpoint_secret"
 hermes webhook subscribe stripe-payments \
+  --provider stripe \
+  --signature-mode stripe \
   --events "payment_intent.succeeded,payment_intent.payment_failed,charge.dispute.created" \
+  --secret "$STRIPE_WEBHOOK_SECRET" \
   --prompt "Stripe event received:
 Event type: {type}
 Amount: {data.object.amount} cents ({data.object.currency})
@@ -581,7 +625,7 @@ Keep the outline to ~300 words. This is a starting point, not a finished post." 
 | `{issue.number}` | Issue number |
 | `{repository.full_name}` | `owner/repo` |
 | `{action}` | Event action (opened, closed, etc.) |
-| `{__raw__}` | Full JSON payload (truncated at 4000 chars) |
+| `{__raw__}` | Parseable raw-payload envelope bounded to 4,000 UTF-8 bytes, with explicit truncation metadata |
 | `{sender.login}` | GitHub user who triggered the event |
 
 ### The [SILENT] Pattern

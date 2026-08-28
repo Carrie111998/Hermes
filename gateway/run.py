@@ -95,6 +95,9 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # 180s budget (is_reconnect=True preserves the offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_WEBHOOK_RECOVERY_RETRY_INITIAL_SECONDS = 1.0
+_WEBHOOK_RECOVERY_RETRY_MAX_SECONDS = 60.0
+_WEBHOOK_RECOVERY_PUMP_IDLE_SECONDS = 0.05
 # End reasons that mean the USER deliberately closed this thread of work
 # (/new -> session_reset / new_session, an explicit exit, or a /switch).
 # Shared by _classify_completion_target (pre-flight verdict) and
@@ -4249,6 +4252,41 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+def _classify_adapter_construction_failure(
+    platform: "Platform",
+    exc: BaseException,
+) -> Optional[tuple[str, str]]:
+    """Return a fatal config descriptor for deterministic constructor errors.
+
+    Most adapter-construction exceptions are programming errors or transient
+    dependency/storage failures and must retain their existing behavior.  The
+    webhook constructor has two narrower failure classes that cannot heal by
+    retrying the same immutable configuration:
+
+    * ``WebhookConfigurationError`` for invalid typed numeric/config values;
+    * ``WebhookLedgerConfigurationError`` when configured limits conflict with
+      already-persisted durable authority.
+
+    Import lazily because ``gateway.platforms.webhook`` itself imports runner
+    helpers at execution time.  ``_create_adapter`` has already loaded that
+    module before either exception can reach this classifier.
+    """
+
+    if platform is not Platform.WEBHOOK:
+        return None
+
+    from gateway.platforms.webhook import WebhookConfigurationError
+    from gateway.platforms.webhook_ledger import WebhookLedgerConfigurationError
+
+    if not isinstance(
+        exc,
+        (WebhookConfigurationError, WebhookLedgerConfigurationError),
+    ):
+        return None
+    message = str(exc).strip() or "Webhook configuration is invalid"
+    return "webhook_configuration_invalid", message
+
+
 # Max seconds between platform reconnect retries (primary watcher and
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
@@ -5463,6 +5501,14 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # A webhook operation owns exactly one durable outbound target. Token
+        # previews and multi-chunk streaming finals would create multiple
+        # external effects for that one authority record, so no display
+        # override may enable streaming on this transport.
+        from gateway.config import Platform as _StreamingPlatform
+
+        if ctx.source.platform == _StreamingPlatform.WEBHOOK:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -7376,6 +7422,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._webhook_recovery_retry_task: Optional[asyncio.Task] = None
+        self._webhook_recovery_retry_adapter = None
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -12034,7 +12082,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             drained += 1
         return drained
 
-    async def _finish_startup_restore(self) -> None:
+    async def _finish_startup_restore(
+        self,
+        *,
+        before_gate_release: Optional[Callable[[], Awaitable[Any]]] = None,
+    ) -> None:
         """Wait (BOUNDED) for startup auto-resume, then release + drain inbound.
 
         The wait is bounded by ``_startup_restore_drain_timeout_secs`` so that
@@ -12088,6 +12140,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         self._startup_restore_tasks = []
         drained = await self._drain_startup_restore_queue()
+        if before_gate_release is not None:
+            # Webhook recovery must claim every dead durable owner while fresh
+            # HTTP admission is still closed. The recovery method schedules
+            # replay carriers synchronously; they run only after this coroutine
+            # releases the startup flag below.
+            await before_gate_release()
         self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
@@ -12493,6 +12551,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
 
+        # Resolve the transport authority before touching the process-wide
+        # restart breaker.  A domain adapter can own recovery through a
+        # stronger ledger (webhook does), in which case its session marker is
+        # evidence for that ledger rather than permission for this generic
+        # replay path.  Counting such a marker here would let webhook-only
+        # restarts advance -- and eventually trip -- a breaker for work this
+        # scheduler is forbidden to run.
+        generic_candidates = []
+        for entry in candidates:
+            source = entry.origin
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                logger.debug(
+                    "Skipping auto-resume for %s: adapter not ready for %s",
+                    entry.session_key,
+                    getattr(source.platform, "value", source.platform),
+                )
+                continue
+            if not getattr(adapter, "allows_automatic_session_resume", True):
+                logger.info(
+                    "Skipping generic auto-resume for %s: %s owns restart "
+                    "recovery through its operation ledger",
+                    entry.session_key,
+                    getattr(source.platform, "value", source.platform),
+                )
+                continue
+            generic_candidates.append((entry, adapter))
+
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
         # boot must not accrue toward the breaker. If too many such boots have
@@ -12503,7 +12589,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
+        if generic_candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
 
@@ -12517,7 +12603,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
-        for entry in candidates:
+        for entry, adapter in generic_candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
@@ -12528,14 +12614,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
-            adapter = self._adapter_for_source(source)
-            if adapter is None:
-                logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s",
-                    entry.session_key,
-                    getattr(source.platform, "value", source.platform),
-                )
-                continue
 
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
@@ -12595,6 +12673,208 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 scheduled,
             )
         return scheduled
+
+    def _webhook_recovery_should_stop(self) -> bool:
+        """Return whether webhook recovery must stay fenced for shutdown."""
+
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        running = getattr(self, "_running", None)
+        return bool(
+            running is False
+            or getattr(self, "_draining", False)
+            or getattr(self, "_external_drain_active", False)
+            or (
+                shutdown_event is not None
+                and callable(getattr(shutdown_event, "is_set", None))
+                and shutdown_event.is_set()
+            )
+        )
+
+    def _schedule_webhook_recovery_retry(self, adapter) -> None:
+        """Keep a fenced listener recoverable after a transient ledger fault."""
+
+        background_tasks = getattr(self, "_background_tasks", None)
+        if not isinstance(background_tasks, set):
+            return
+        if GatewayRunner._webhook_recovery_should_stop(self):
+            return
+        if (getattr(self, "adapters", None) or {}).get(Platform.WEBHOOK) is not adapter:
+            return
+
+        existing = getattr(self, "_webhook_recovery_retry_task", None)
+        if existing is not None and not existing.done():
+            if (
+                getattr(self, "_webhook_recovery_retry_adapter", None)
+                is adapter
+            ):
+                return
+            # A reconnect may replace the published adapter while its old
+            # recovery retry is sleeping.  The stale task must not prevent
+            # the replacement from establishing its own retry loop.
+            existing.cancel()
+
+        task = asyncio.create_task(self._retry_webhook_recovery(adapter))
+        self._webhook_recovery_retry_task = task
+        self._webhook_recovery_retry_adapter = adapter
+        background_tasks.add(task)
+
+        def cleanup(completed: asyncio.Task) -> None:
+            background_tasks.discard(completed)
+            if getattr(self, "_webhook_recovery_retry_task", None) is completed:
+                self._webhook_recovery_retry_task = None
+                self._webhook_recovery_retry_adapter = None
+
+        task.add_done_callback(cleanup)
+
+    async def _retry_webhook_recovery(self, adapter) -> None:
+        """Retry exact-adapter recovery with bounded exponential backoff."""
+
+        if getattr(adapter, "_recovery_last_error", False):
+            delay = _WEBHOOK_RECOVERY_RETRY_INITIAL_SECONDS
+        elif getattr(adapter, "_recovery_backlog_pending", False):
+            delay = (
+                0.0
+                if getattr(adapter, "_recovery_last_progress", False)
+                else _WEBHOOK_RECOVERY_PUMP_IDLE_SECONDS
+            )
+        else:
+            delay = _WEBHOOK_RECOVERY_RETRY_INITIAL_SECONDS
+        while (getattr(self, "adapters", None) or {}).get(Platform.WEBHOOK) is adapter:
+            if GatewayRunner._webhook_recovery_should_stop(self):
+                return
+            await asyncio.sleep(delay)
+            # Drain can begin while this retry is asleep.  Recheck before
+            # touching the durable ledger: stop() intentionally cancels the
+            # general background set only after adapter teardown, so relying
+            # on late cancellation here can otherwise schedule carriers or
+            # reopen admission during shutdown.
+            if GatewayRunner._webhook_recovery_should_stop(self):
+                return
+            if (
+                (getattr(self, "adapters", None) or {}).get(Platform.WEBHOOK)
+                is not adapter
+            ):
+                return
+            await self._recover_webhook_operations(trigger="retry")
+            if getattr(adapter, "_accepting_webhooks", False):
+                logger.info("Webhook operation recovery retry succeeded")
+                return
+            if getattr(adapter, "_recovery_last_error", False):
+                delay = min(
+                    max(delay, _WEBHOOK_RECOVERY_RETRY_INITIAL_SECONDS) * 2,
+                    _WEBHOOK_RECOVERY_RETRY_MAX_SECONDS,
+                )
+            elif getattr(adapter, "_recovery_backlog_pending", False):
+                delay = (
+                    0.0
+                    if getattr(adapter, "_recovery_last_progress", False)
+                    else _WEBHOOK_RECOVERY_PUMP_IDLE_SECONDS
+                )
+            else:
+                delay = _WEBHOOK_RECOVERY_RETRY_INITIAL_SECONDS
+
+    async def _recover_webhook_operations(self, *, trigger: str) -> int:
+        """Run webhook-owned recovery after runtime registries are authoritative."""
+
+        adapter = (getattr(self, "adapters", None) or {}).get(Platform.WEBHOOK)
+        recover = getattr(adapter, "recover_pending_operations", None)
+        if not callable(recover):
+            return 0
+        if GatewayRunner._webhook_recovery_should_stop(self):
+            try:
+                adapter._accepting_webhooks = False
+            except Exception:
+                pass
+            return 0
+        try:
+            recovered = int(await recover(trigger=trigger) or 0)
+            try:
+                adapter._recovery_last_error = False
+            except Exception:
+                pass
+            # connect() deliberately leaves runner-owned webhook listeners
+            # closed. Open this exact published adapter only after recovery
+            # has atomically claimed every replay-safe durable carrier.
+            if (getattr(self, "adapters", None) or {}).get(Platform.WEBHOOK) is adapter:
+                backlog = bool(
+                    getattr(adapter, "_recovery_backlog_pending", False)
+                )
+                adapter._accepting_webhooks = not (
+                    GatewayRunner._webhook_recovery_should_stop(self) or backlog
+                )
+                update_status = getattr(
+                    self, "_update_platform_runtime_status", None
+                )
+                if callable(update_status) and adapter._accepting_webhooks:
+                    update_status(
+                        Platform.WEBHOOK.value,
+                        platform_state="connected",
+                        error_code=None,
+                        error_message=None,
+                        needs_attention=False,
+                        retrying_since=None,
+                    )
+                elif callable(update_status) and backlog:
+                    update_status(
+                        Platform.WEBHOOK.value,
+                        platform_state="retrying",
+                        error_code="webhook_recovery_pending",
+                        error_message="Durable webhook recovery is still in progress",
+                    )
+                if backlog:
+                    schedule_retry = getattr(
+                        self, "_schedule_webhook_recovery_retry", None
+                    )
+                    if callable(schedule_retry):
+                        schedule_retry(adapter)
+                else:
+                    retry_task = getattr(
+                        self, "_webhook_recovery_retry_task", None
+                    )
+                    current_task = asyncio.current_task()
+                    if (
+                        retry_task is not None
+                        and retry_task is not current_task
+                        and not retry_task.done()
+                    ):
+                        retry_task.cancel()
+            return recovered
+        except Exception:
+            # A listener with unreconciled durable ownership cannot safely
+            # admit fresh operations: identical retries could remain stuck
+            # behind dead owners, while new work would obscure the outage.
+            # Keep the transport connected for diagnostics but close its
+            # admission gate until an operator restarts or reconnects it.
+            try:
+                adapter._accepting_webhooks = False
+                adapter._recovery_last_error = True
+            except Exception:
+                pass
+            update_status = getattr(self, "_update_platform_runtime_status", None)
+            if callable(update_status):
+                update_status(
+                    Platform.WEBHOOK.value,
+                    platform_state="retrying",
+                    error_code="webhook_recovery_failed",
+                    error_message="Durable webhook recovery failed",
+                )
+            logger.exception("Webhook operation recovery failed (%s)", trigger)
+            schedule_retry = getattr(self, "_schedule_webhook_recovery_retry", None)
+            if (
+                callable(schedule_retry)
+                and not GatewayRunner._webhook_recovery_should_stop(self)
+            ):
+                schedule_retry(adapter)
+            return 0
+
+    async def _finish_startup_with_webhook_recovery(self) -> None:
+        """Claim webhook recovery before releasing fresh startup admission."""
+
+        await self._finish_startup_restore(
+            before_gate_release=lambda: self._recover_webhook_operations(
+                trigger="startup"
+            )
+        )
 
     def _startup_should_abort(self) -> bool:
         return (
@@ -13212,7 +13492,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             enabled_platform_count += 1
 
-            adapter = self._create_adapter(platform, platform_config)
+            try:
+                adapter = self._create_adapter(platform, platform_config)
+            except Exception as exc:
+                classified = _classify_adapter_construction_failure(platform, exc)
+                if classified is None:
+                    # Do not launder arbitrary constructor bugs into a parked
+                    # configuration failure.  The pre-existing fail-loud path
+                    # remains authoritative for every untyped exception.
+                    raise
+                error_code, error_message = classified
+                logger.error(
+                    "✗ %s configuration error: %s",
+                    platform.value,
+                    error_message,
+                )
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="fatal",
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+                startup_nonretryable_errors.append(
+                    f"{platform.value}: {error_message}"
+                )
+                continue
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 _pval = platform.value
@@ -13360,10 +13664,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if hasattr(adapter, "_voice_input_callback"):
                     adapter._voice_input_callback = self._handle_voice_channel_input
                 connected_count += 1
-                self._update_platform_runtime_status(
-                    platform.value, platform_state="connected", error_code=None, error_message=None,
-                )
-                logger.info("\u2713 %s connected", platform.value)
+                if platform is Platform.WEBHOOK:
+                    # The socket is bound, but the shared intake gate stays
+                    # closed until startup recovery fences/claims every durable
+                    # carrier.  Publishing "connected" here makes runtime
+                    # health lie while every POST correctly returns 503.
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="retrying",
+                        error_code="webhook_recovery_pending",
+                        error_message="Durable webhook recovery is pending",
+                    )
+                    logger.info(
+                        "\u2713 %s listener connected; durable recovery pending",
+                        platform.value,
+                    )
+                else:
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="connected",
+                        error_code=None,
+                        error_message=None,
+                    )
+                    logger.info("\u2713 %s connected", platform.value)
             else:  # outcome == "failed"
                 logger.warning("\u2717 %s failed to connect", platform.value)
                 # Defensive cleanup: a failed connect() may have allocated resources
@@ -13613,7 +13936,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # confirmed-delivered has its answer in the ledger — redelivering it
         # is strictly cheaper and more correct than re-running the whole turn.
         self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
+        await self._finish_startup_with_webhook_recovery()
 
         # Surface state.db init failures to the user's messaging platforms
         # so they know persistence is broken before losing data (#88235).
@@ -14838,6 +15161,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 adapter = None
+                published = False
                 try:
                     adapter = self._create_adapter(platform, platform_config)
                     if not adapter:
@@ -14866,23 +15190,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     success = await self._connect_adapter_with_timeout(
                         adapter, platform, is_reconnect=True
                     )
+                    # stop() flips both flags before adapter teardown, while a
+                    # reconnect connect() may still be in flight.  Publishing
+                    # after that boundary would put a fresh adapter behind the
+                    # teardown snapshot and could run webhook recovery during
+                    # drain.  The still-unowned candidate must be disposed here.
+                    if not self._running or getattr(self, "_draining", False):
+                        await _dispose_unused_adapter(adapter)
+                        return
                     if success:
                         self.adapters[platform] = adapter
+                        published = True
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
-                        self._update_platform_runtime_status(
-                            platform.value,
-                            platform_state="connected",
-                            error_code=None,
-                            error_message=None,
-                            needs_attention=False,
-                            retrying_since=None,
+                        if platform is Platform.WEBHOOK:
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="retrying",
+                                error_code="webhook_recovery_pending",
+                                error_message=(
+                                    "Durable webhook recovery is pending"
+                                ),
+                                needs_attention=False,
+                                retrying_since=None,
+                            )
+                            logger.info(
+                                "✓ %s listener reconnected; durable recovery pending",
+                                platform.value,
+                            )
+                        else:
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="connected",
+                                error_code=None,
+                                error_message=None,
+                                needs_attention=False,
+                                retrying_since=None,
+                            )
+                            logger.info(
+                                "✓ %s reconnected successfully", platform.value
+                            )
+                        await self._recover_webhook_operations(
+                            trigger=f"reconnect:{platform.value}"
                         )
-                        logger.info("✓ %s reconnected successfully", platform.value)
+                        if platform is Platform.WEBHOOK:
+                            if getattr(adapter, "_accepting_webhooks", False):
+                                logger.info(
+                                    "✓ %s durable recovery completed",
+                                    platform.value,
+                                )
+                            else:
+                                logger.warning(
+                                    "%s listener remains fenced while durable "
+                                    "recovery retries",
+                                    platform.value,
+                                )
 
                         # Final responses rejected while this adapter was down
                         # are still owned by this live process, so startup
@@ -14972,8 +15338,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # etc.) already drop out of the queue via the
                         # `not fatal_error_retryable` branch above, so anything
                         # reaching here is by definition retryable.
+                except asyncio.CancelledError:
+                    # Cancellation while connect() is in flight bypasses the
+                    # Exception arm on modern Python.  Dispose only while this
+                    # watcher still owns the candidate; once published, normal
+                    # gateway shutdown owns adapter teardown.
+                    if adapter is not None and not published:
+                        await _dispose_unused_adapter(adapter)
+                    raise
                 except Exception as e:
-                    if adapter is not None:
+                    if adapter is not None and not published:
                         # An exception escaping the connect call path
                         # (DNS timeout, aiohttp server.start() crash, etc.)
                         # leaves the adapter in the same unowned state as
@@ -14981,6 +15355,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # resources don't accumulate while the watcher
                         # keeps retrying.
                         await _dispose_unused_adapter(adapter)
+                    classified = _classify_adapter_construction_failure(
+                        platform,
+                        e,
+                    )
+                    if classified is not None:
+                        error_code, error_message = classified
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="fatal",
+                            error_code=error_code,
+                            error_message=error_message,
+                        )
+                        logger.warning(
+                            "Reconnect %s: non-retryable configuration error "
+                            "(%s), removing from retry queue",
+                            platform.value,
+                            error_message,
+                        )
+                        if self._failed_platforms.get(platform) is info:
+                            del self._failed_platforms[platform]
+                        continue
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="retrying",
@@ -16015,6 +16410,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
                                 profile_name,
+                            )
+                            await self._recover_webhook_operations(
+                                trigger=(
+                                    f"profile-reconnect:{profile_name}:{platform.value}"
+                                )
                             )
                             await self._redeliver_failed_obligations_for_platform(
                                 platform, profile=profile_name
@@ -22739,7 +23139,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         voice_mode = self._voice_mode.get(voice_key)
         is_voice_input = (event.message_type == MessageType.VOICE)
 
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
+        if getattr(adapter, "owns_final_delivery_ledger", False) is True:
+            # That adapter owns one exact durable final carrier. Generic
+            # auto-TTS would add a voice effect before Base hands over the
+            # prepared text, and an inherited send_voice fallback could turn
+            # an audio failure into the text that consumes the carrier.
+            return False
+
         adapter_auto_tts = False
         if adapter and hasattr(adapter, "_should_auto_tts_for_chat"):
             try:
@@ -22798,6 +23205,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         audio_path = None
         actual_paths: List[str] = []
         try:
+            adapter = self._adapter_for_source(event.source)
+            if getattr(adapter, "owns_final_delivery_ledger", False) is True:
+                # Defense in depth for direct/future callers that bypass the
+                # decision helper: synthesis itself is outside the adapter's
+                # one-carrier final-delivery authority.
+                return
+
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
             tts_text = _strip_markdown_for_tts(text)
@@ -22833,8 +23247,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not result.get("success") or not actual_paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
-
-            adapter = self._adapter_for_source(event.source)
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
@@ -23102,13 +23514,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
 
-    def _resolve_enabled_toolsets_for_source(
+    def _resolve_toolset_authority_for_source(
         self,
         user_config: dict,
         source: "SessionSource",
         platform_key: str,
-    ) -> list:
-        """Resolve enabled toolsets for an agent run, honoring per-source overrides.
+    ) -> tuple[list, bool, bool]:
+        """Resolve toolsets and retain the per-source authority verdict.
 
         Asks the receiving adapter for a ``toolsets_for_source()`` override
         (e.g. per-route webhook toolsets). When present, the override list is
@@ -23117,25 +23529,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         so unknown names and platform-restricted toolsets are dropped rather
         than trusted. When absent, falls back to standard
         ``platform_toolsets.<platform>`` resolution.
+
+        Returns ``(enabled_toolsets, has_source_override, resolution_failed)``.
+        The latter two values matter at delegation boundaries: a remote
+        executor that cannot carry the exact source override must not silently
+        replace it with its own process-level toolsets, and an adapter error
+        must not be mistaken for "no override" there.
         """
         from hermes_cli.tools_config import _get_platform_tools
 
         override = None
+        resolution_failed = False
         try:
             adapter = self._adapter_for_source(source)
+            if (
+                adapter is None
+                and platform_key == Platform.WEBHOOK.value
+            ):
+                # Every admitted webhook grant lives in its transport's
+                # durable operation ledger. If that adapter is no longer
+                # registered, mutable platform defaults are not a substitute
+                # for the missing per-operation authority.
+                return [], True, True
             if adapter is not None:
+                exact_resolver = getattr(adapter, "resolved_toolsets_for_source", None)
+                if callable(exact_resolver):
+                    exact = exact_resolver(source)
+                    if exact is not None:
+                        if not isinstance(exact, list) or any(
+                            not isinstance(value, str) or not value for value in exact
+                        ):
+                            return [], True, True
+                        # This is an immutable, admission-time resolved carrier.
+                        # Re-running _get_platform_tools here could add a newly
+                        # enabled MCP server or plugin default and widen it.
+                        return list(dict.fromkeys(exact)), True, False
                 override = adapter.toolsets_for_source(source)
         except Exception:
-            override = None
+            resolution_failed = True
+            logger.warning(
+                "Failed to resolve per-source toolset authority for %s/%s",
+                platform_key,
+                getattr(source, "chat_id", ""),
+                exc_info=True,
+            )
 
-        if override and isinstance(override, list):
+        if isinstance(override, list):
+            if not override:
+                return [], True, False
             cfg = dict(user_config)
             pts = dict(cfg.get("platform_toolsets") or {})
             pts[platform_key] = [str(t) for t in override]
             cfg["platform_toolsets"] = pts
-            return sorted(_get_platform_tools(cfg, platform_key))
+            return sorted(_get_platform_tools(cfg, platform_key)), True, False
 
-        return sorted(_get_platform_tools(user_config, platform_key))
+        return (
+            sorted(_get_platform_tools(user_config, platform_key)),
+            False,
+            resolution_failed,
+        )
+
+    def _resolve_enabled_toolsets_for_source(
+        self,
+        user_config: dict,
+        source: "SessionSource",
+        platform_key: str,
+    ) -> list:
+        """Resolve enabled toolsets for a local agent run."""
+        enabled_toolsets, _, resolution_failed = (
+            self._resolve_toolset_authority_for_source(
+                user_config,
+                source,
+                platform_key,
+            )
+        )
+        if resolution_failed:
+            # A per-source authority resolver is an admission boundary. An
+            # exception cannot mean "use the broader live platform default"
+            # for local execution any more than it can at the proxy boundary.
+            return []
+        return enabled_toolsets
 
     async def _run_background_task_inner(
         self,
@@ -28426,6 +28899,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # The proxy's SSE response is only an inbound transport for assembling
+        # the remote result.  A webhook operation still owns exactly one
+        # durable outbound final, so it must never create the downstream
+        # GatewayStreamConsumer that previews/edits platform messages.  The
+        # source-authority gate currently rejects webhook proxy delegation;
+        # keep this execution-boundary guard for any future authority carrier
+        # that makes the path reachable.
+        if source.platform == Platform.WEBHOOK:
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -28745,22 +29227,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 name = get_active_profile_name() or "default"
             
             profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
+            # An explicit/stamped profile is durable execution authority. It
+            # must never degrade to the process-global home after that profile
+            # is removed or becomes unreadable: doing so would substitute a
+            # different profile's config, memory, tools, and credentials.
             if explicit_profile and not profile_exists(name):
                 logger.warning(
                     "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
+                    "rejecting explicit profile authority",
                     explicit_profile,
                     source.platform.value,
                     source.chat_id,
                     getattr(source, "guild_id", None),
                 )
-                return get_hermes_home()
+                raise ProfileRouteRejected(explicit_profile)
+            if explicit_profile and (
+                getattr(getattr(self, "config", None), "multiplex_profiles", False)
+                is True
+            ):
+                try:
+                    served = {
+                        profile_name
+                        for profile_name, _home in _multiplex_profile_homes(
+                            self.config
+                        )
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to resolve served profiles for explicit source "
+                        "%s/%s, rejecting profile %s",
+                        source.platform.value,
+                        source.chat_id,
+                        explicit_profile,
+                        exc_info=True,
+                    )
+                    raise ProfileRouteRejected(explicit_profile) from exc
+                if name not in served:
+                    logger.warning(
+                        "Profile %r is no longer served for source %s/%s "
+                        "(guild_id=%s), rejecting explicit profile authority",
+                        explicit_profile,
+                        source.platform.value,
+                        source.chat_id,
+                        getattr(source, "guild_id", None),
+                    )
+                    raise ProfileRouteRejected(explicit_profile)
             return profile_dir
         except ProfileRouteRejected:
             raise
-        except Exception:
+        except Exception as exc:
             # Catch normalization errors, path errors, etc.
+            if explicit_profile:
+                logger.warning(
+                    "Failed to resolve explicit profile directory for %s/%s "
+                    "(guild_id=%s), rejecting profile %s",
+                    source.platform.value,
+                    source.chat_id,
+                    getattr(source, "guild_id", None),
+                    explicit_profile,
+                    exc_info=True,
+                )
+                raise ProfileRouteRejected(explicit_profile) from exc
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
                 "falling back to global HERMES_HOME: %s",
@@ -28804,6 +29331,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            # The OpenAI-compatible proxy endpoint currently chooses
+            # ``platform_toolsets.api_server`` in the remote process and has
+            # no request-bound carrier for a source-specific override. Resolve
+            # the admitted source authority before crossing that boundary and
+            # fail closed when it cannot be preserved. In particular, a
+            # webhook route pinned to a constrained toolset must never be
+            # widened to the proxy server's process-level capabilities.
+            proxy_user_config = _load_gateway_config()
+            proxy_platform_key = _platform_config_key(source.platform)
+            (
+                _proxy_enabled_toolsets,
+                has_source_toolset_override,
+                source_toolset_resolution_failed,
+            ) = self._resolve_toolset_authority_for_source(
+                proxy_user_config,
+                source,
+                proxy_platform_key,
+            )
+            if has_source_toolset_override or source_toolset_resolution_failed:
+                failure_reason = (
+                    "proxy_source_toolset_resolution_failed"
+                    if source_toolset_resolution_failed
+                    else "proxy_source_toolsets_unsupported"
+                )
+                logger.error(
+                    "Refusing proxy delegation for %s/%s: source toolset "
+                    "authority cannot be enforced by the remote API "
+                    "(reason=%s, resolved=%s)",
+                    proxy_platform_key,
+                    source.chat_id,
+                    failure_reason,
+                    _proxy_enabled_toolsets,
+                )
+                return {
+                    "final_response": (
+                        "⚠️ Proxy mode cannot enforce this source's toolset policy; "
+                        "the request was not delegated."
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "failed": True,
+                    "completed": False,
+                    "failure_reason": failure_reason,
+                }
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
