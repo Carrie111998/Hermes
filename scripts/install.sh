@@ -2425,7 +2425,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel error \
                 >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
@@ -2541,7 +2541,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local tui_npm_log
         tui_npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel error \
                 >"$tui_npm_log" 2>&1; then
             log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
             if [ -s "$tui_npm_log" ]; then
