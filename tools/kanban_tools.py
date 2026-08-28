@@ -2353,6 +2353,174 @@ KANBAN_LINK_SCHEMA = {
 # Registration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# PM tools — project rows and plan revisions
+# ---------------------------------------------------------------------------
+#
+# Drafting a plan is not approving one. These two tools write the artifacts a
+# human gate is *about*; nothing here changes a task status, clears
+# ``gate_state``, or writes ``pm_approvals``. Crossing a plan gate requires an
+# attestation from a separately authenticated surface, which has no local
+# constructor and does not ship — see hermes_cli/approval_broker.py.
+#
+# They are orchestrator-scoped (``_check_kanban_orchestrator_mode``): a
+# dispatcher-spawned worker closes its own task and has no business authoring
+# the project's plan. Delegated children are refused twice — by the check_fn
+# and again at the handler.
+
+PROJECT_ENSURE_SCHEMA = {
+    "name": "project_ensure",
+    "description": (
+        "Create or fetch a project row (id, name, current plan revision). "
+        "Idempotent: calling it again returns the existing row and never "
+        "renames it. Call this before plan_submit. This does NOT create tasks "
+        "and does not approve anything."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project_id": {
+                "type": "string",
+                "description": "Stable project identifier, e.g. 'billing-v2'.",
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Human-readable name. Used ONLY when the project is "
+                    "created; an existing project is never renamed here."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["project_id"],
+    },
+}
+
+PLAN_SUBMIT_SCHEMA = {
+    "name": "plan_submit",
+    "description": (
+        "Record the next plan revision for a project and make it current. "
+        "Drafting is not approving: this writes an artifact and touches no "
+        "task, status, or gate. A human approves it through a separately "
+        "authenticated surface. Submitting a new revision supersedes the "
+        "previous one, so a plan already parked at a gate becomes stale and "
+        "can no longer be approved."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project_id": {
+                "type": "string",
+                "description": "Project id. Must already exist (project_ensure).",
+            },
+            "body": {
+                "type": "string",
+                "description": "The full plan text. Markdown is supported.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["project_id", "body"],
+    },
+}
+
+
+def _pm_actor() -> str:
+    """Display label for who drafted a plan. NOT an identity boundary.
+
+    Hermes runs as the same OS user as its agents, so this is provenance for a
+    human reader, exactly like ``pm_approvals.operator_display``.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return str(get_active_profile_name() or "default")
+    except Exception:
+        return os.environ.get("HERMES_PROFILE") or "default"
+
+
+def _handle_project_ensure(args: dict, **kw) -> str:
+    denial = _reject_delegated_child_mutation("project_ensure")
+    if denial:
+        return denial
+    project_id = str(args.get("project_id") or "").strip()
+    if not project_id:
+        return tool_error("project_ensure requires a non-empty project_id.")
+    name = args.get("name")
+    name = str(name).strip() if isinstance(name, str) and name.strip() else None
+
+    kb, conn = _connect(args.get("board"))
+    try:
+        row = kb.ensure_pm_project(conn, project_id=project_id, name=name)
+    except Exception as exc:
+        return tool_error(f"project_ensure failed: {exc}")
+    finally:
+        conn.close()
+    return _ok(
+        project_id=row["id"],
+        name=row["name"],
+        plan_revision=row["plan_revision"],
+    )
+
+
+def _handle_plan_submit(args: dict, **kw) -> str:
+    denial = _reject_delegated_child_mutation("plan_submit")
+    if denial:
+        return denial
+    project_id = str(args.get("project_id") or "").strip()
+    if not project_id:
+        return tool_error("plan_submit requires a non-empty project_id.")
+    body = args.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return tool_error(
+            "plan_submit requires a non-empty body: the full plan text."
+        )
+
+    kb, conn = _connect(args.get("board"))
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM pm_projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if exists is None:
+            return tool_error(
+                f"plan_submit: project {project_id!r} does not exist. "
+                f"Call project_ensure first."
+            )
+        plan = kb.submit_plan(
+            conn, project_id=project_id, body=body, proposed_by=_pm_actor(),
+        )
+    except Exception as exc:
+        return tool_error(f"plan_submit failed: {exc}")
+    finally:
+        conn.close()
+    return _ok(
+        project_id=plan["project_id"],
+        revision=plan["revision"],
+        proposed_by=plan["proposed_by"],
+        note=(
+            "Recorded. Approval is a separate, authenticated human step and is "
+            "not available to an agent."
+        ),
+    )
+
+
+registry.register(
+    name="project_ensure",
+    toolset="kanban",
+    schema=PROJECT_ENSURE_SCHEMA,
+    handler=_handle_project_ensure,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📁",
+)
+
+registry.register(
+    name="plan_submit",
+    toolset="kanban",
+    schema=PLAN_SUBMIT_SCHEMA,
+    handler=_handle_plan_submit,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📝",
+)
+
 registry.register(
     name="kanban_show",
     toolset="kanban",
