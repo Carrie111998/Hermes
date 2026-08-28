@@ -2423,6 +2423,23 @@ def _park_stashed_changes(stash_ref: str) -> None:
     print(f"  Restore manually with: git stash apply {stash_ref}")
 
 
+def _should_prompt_for_stash_restore(
+    auto_stash_ref: str | None,
+    keep_stash: bool,
+    assume_yes: bool,
+    gateway_mode: bool,
+    stdin_isatty: bool,
+    stdout_isatty: bool,
+) -> bool:
+    """Return whether an interactive stash-restore question is meaningful."""
+    return bool(
+        auto_stash_ref is not None
+        and not keep_stash
+        and not assume_yes
+        and (gateway_mode or (stdin_isatty and stdout_isatty))
+    )
+
+
 def _restore_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
@@ -7812,10 +7829,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
-        prompt_for_restore = (
-            auto_stash_ref is not None
-            and not assume_yes
-            and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
+        prompt_for_restore = _m()._should_prompt_for_stash_restore(
+            auto_stash_ref,
+            keep_stash,
+            assume_yes,
+            gateway_mode,
+            sys.stdin.isatty(),
+            sys.stdout.isatty(),
         )
 
         # Check if there are updates. On shallow checkouts `rev-list --count`
