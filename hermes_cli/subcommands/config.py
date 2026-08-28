@@ -43,8 +43,8 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     config_set.add_argument(
         "--force",
         action="store_true",
-        help="Skip the unknown-key notice printed after writing a key the "
-        "running version doesn't recognize (the value is saved either way).",
+        help="Bypass config key/value validation for advanced custom plugin "
+        "settings, and allow replacing a mapping section with a scalar.",
     )
 
     # config unset
