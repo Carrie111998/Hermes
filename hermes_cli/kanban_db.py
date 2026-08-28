@@ -10929,12 +10929,22 @@ def _dispatch_once_locked(
     ) else None
     _per_model_running: dict[tuple[str, str], int] = {}
     if _per_model_cap is not None:
-        # Local-first selection happens at spawn time, so a task normally has
-        # no persisted override even though several profiles may resolve to the
-        # same single-concurrency Ollama model.  Counting only explicit fields
-        # made the advertised per-model cap ineffective for those workers and
-        # allowed them to starve one another until the board timeout.
-        local_first_enabled = _kanban_local_first_enabled()
+        # A task normally has no persisted override -- it just runs its
+        # assignee's profile default -- even though several profiles may
+        # resolve to the same single-concurrency local model (Ollama).
+        # Counting only explicit per-task fields made the advertised
+        # per-model cap ineffective for those workers and let them starve
+        # one another with connection timeouts until the board timeout
+        # (live incident, 2026-08-28: qwen3.5:4b/devstral-small-2:24b via
+        # ollama-launch across ~14 profiles). This fallback resolution is
+        # deliberately unconditional on kanban.local_first: that flag
+        # controls whether local-first SUBSTITUTION happens at spawn time
+        # (a real behavior change, and one with its own history of
+        # surprises -- see the explicit-task-model-pin incident this cap's
+        # own accounting exists to protect against), which is an
+        # unrelated concern from whether we accurately COUNT what a task
+        # will actually run for capacity purposes. _resolve_local_first_route
+        # is pure/read-only, so using it here has no spawn-time effect.
         effective_route_cache: dict[str, Optional[tuple[str, str]]] = {}
 
         def _route_value(row: Any, field: str) -> Any:
@@ -10949,8 +10959,6 @@ def _dispatch_once_locked(
             model = (_route_value(row, "model_override") or "").strip()
             if provider and model:
                 return provider, model
-            if not local_first_enabled:
-                return None
             assignee = str(_route_value(row, "assignee") or "").strip()
             if not assignee:
                 return None
