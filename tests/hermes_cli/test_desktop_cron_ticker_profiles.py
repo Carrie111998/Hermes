@@ -70,6 +70,28 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert builtin.start_kwargs["profile_homes"] == homes
 
 
+def test_secondary_profile_backend_ticks_only_its_own_store(
+    monkeypatch, _providers, tmp_path
+):
+    """Only the long-lived primary backend may enumerate every profile store."""
+    _sp, builtin = _providers
+    import hermes_cli.profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "coder")
+    monkeypatch.setattr(
+        profiles_mod,
+        "profiles_to_serve",
+        lambda **_kw: [
+            ("default", tmp_path / "root"),
+            ("coder", tmp_path / "profiles" / "coder"),
+        ],
+    )
+
+    ws._start_desktop_cron_ticker(threading.Event(), interval=8)
+
+    assert builtin.start_kwargs == {"interval": 8}
+
+
 def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod

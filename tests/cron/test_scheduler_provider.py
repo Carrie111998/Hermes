@@ -640,3 +640,91 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_installs_each_profiles_secret_scope(tmp_path):
+    """A worker claimed by another profile must still use the job owner's secrets.
+
+    The tick context is copied into cron worker threads.  Scoping only
+    HERMES_HOME lets a documentation job be claimed by the issue-engineer
+    backend while credential and delivery lookups fall back to Gollum's ambient
+    process environment.
+    """
+    from agent import secret_scope
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "documentation-engineer"
+    for home, token in ((p1, "default-token"), (p2, "bilbo-token")):
+        (home / "cron").mkdir(parents=True)
+        (home / ".env").write_text(
+            f"TELEGRAM_BOT_TOKEN={token}\n", encoding="utf-8"
+        )
+
+    observed = []
+    stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        scope = secret_scope.current_secret_scope() or {}
+        observed.append((str(get_hermes_home()), scope.get("TELEGRAM_BOT_TOKEN")))
+        if len(observed) >= 2:
+            stop.set()
+        return 0
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+             patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+            thread = threading.Thread(
+                target=InProcessCronScheduler().start,
+                args=(stop,),
+                kwargs={
+                    "interval": 0,
+                    "profile_homes": [
+                        ("default", p1),
+                        ("documentation-engineer", p2),
+                    ],
+                },
+                daemon=True,
+            )
+            thread.start()
+            thread.join(timeout=5)
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert not thread.is_alive()
+    assert observed[:2] == [
+        (str(p1), "default-token"),
+        (str(p2), "bilbo-token"),
+    ]
+
+
+def test_multiplex_profile_scope_does_not_borrow_ambient_secret(
+    tmp_path, monkeypatch
+):
+    """A Desktop multiplexer must fail closed on a profile scope miss."""
+    from agent import secret_scope
+    from cron.scheduler_provider import _multiplex_profile_scope
+
+    profile_home = tmp_path / "documentation-engineer"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "ambient-default-token")
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(False)
+    try:
+        with _multiplex_profile_scope(profile_home):
+            assert secret_scope.current_secret_scope() == {}
+            assert secret_scope.get_secret("TELEGRAM_BOT_TOKEN") is None
+
+        # The authority boundary is context-local: ordinary single-profile
+        # callers still honor credentials injected into the process environment.
+        assert (
+            secret_scope.get_secret("TELEGRAM_BOT_TOKEN")
+            == "ambient-default-token"
+        )
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+

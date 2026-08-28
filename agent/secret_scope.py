@@ -11,12 +11,13 @@ This module provides a fail-closed, context-local secret scope:
 - ``set_secret_scope(mapping)`` installs the active profile's secrets for the
   current task (a contextvar, so it propagates into the agent's worker thread
   via ``copy_context()`` exactly like the HERMES_HOME override).
-- ``get_secret(name)`` reads from that scope. When multiplexing is **active**
-  and no scope is set, it RAISES rather than silently falling back to
-  ``os.environ`` — an un-migrated or newly-added call site fails loud at that
-  exact line instead of leaking another profile's value. When multiplexing is
-  **off** (the default), it transparently reads ``os.environ`` so the
-  single-profile gateway and every non-gateway caller behave exactly as before.
+- ``get_secret(name)`` reads from that scope. When process-wide multiplexing is
+  **active**, or a Desktop cron context marks its scope authoritative, an absent
+  scoped key never falls through to ``os.environ``. An unscoped read under
+  process-wide multiplexing RAISES instead of silently using another profile's
+  value. When neither isolation mode applies, it transparently reads
+  ``os.environ`` so the single-profile gateway and every non-gateway caller
+  behave exactly as before.
 
 Design rationale lives in ``docs/design/multiplexing-gateway.md`` (Workstream A).
 """
@@ -56,6 +57,9 @@ def is_multiplex_active() -> bool:
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
+_SECRET_SCOPE_AUTHORITATIVE: ContextVar[bool] = ContextVar(
+    "_SECRET_SCOPE_AUTHORITATIVE", default=False
+)
 
 
 class UnscopedSecretError(RuntimeError):
@@ -85,6 +89,20 @@ def reset_secret_scope(token: Token) -> None:
 def current_secret_scope() -> Optional[Mapping[str, str]]:
     """Return the active secret mapping, or None when no scope is installed."""
     return _SECRET_SCOPE.get()
+
+
+def set_secret_scope_authoritative(authoritative: bool = True) -> Token:
+    """Make scope misses fail closed in the current execution context.
+
+    Unlike the process-global multiplex flag, this is safe for Desktop cron
+    worker contexts that coexist with ordinary single-profile work.
+    """
+    return _SECRET_SCOPE_AUTHORITATIVE.set(bool(authoritative))
+
+
+def reset_secret_scope_authoritative(token: Token) -> None:
+    """Restore the previous context-local scope-authority setting."""
+    _SECRET_SCOPE_AUTHORITATIVE.reset(token)
 
 
 # ── genuinely-global env vars (NOT per-profile secrets) ──────────────────
@@ -153,16 +171,17 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
     1. Genuinely-global vars (``_is_global_env``) always read ``os.environ`` —
        they are deployment settings, not profile secrets.
-    2. When a secret scope is installed (multiplexed turn), read from it. Under
-       multiplexing the scope is authoritative — an absent key returns
-       ``default`` and we do NOT fall through to ``os.environ``, because in a
-       multiplexer ``os.environ`` may hold another profile's value. When
-       multiplexing is OFF, a scope miss falls through to ``os.environ``:
-       single-profile deployments legitimately provide credentials via the
-       process environment (systemd ``Environment=``, secret-manager wrappers
-       like ``pass-cli run`` / ``op run``, plain shell exports) rather than
-       ``<home>/.env``, and the scope — installed unconditionally around e.g.
-       every cron job — must stay a ``.env`` overlay, not a blindfold.
+    2. When a secret scope is installed, read from it. Under process-wide
+       multiplexing, or when the current context explicitly marks the scope
+       authoritative, an absent key returns ``default`` and we do NOT fall
+       through to ``os.environ``, because the process environment may hold
+       another profile's value. When neither isolation mode applies, a scope
+       miss falls through to ``os.environ``: single-profile deployments
+       legitimately provide credentials via the process environment (systemd
+       ``Environment=``, secret-manager wrappers like ``pass-cli run`` /
+       ``op run``, plain shell exports) rather than ``<home>/.env``, and the
+       scope — installed unconditionally around e.g. every cron job — must stay
+       a ``.env`` overlay, not a blindfold.
     3. No scope installed:
        - multiplex INACTIVE (default deployment): read ``os.environ`` —
          identical to the legacy ``os.getenv`` behavior every caller had before.
@@ -178,7 +197,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
+        if _MULTIPLEX_ACTIVE or _SECRET_SCOPE_AUTHORITATIVE.get():
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.
