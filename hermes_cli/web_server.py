@@ -427,6 +427,25 @@ def _start_desktop_services_after_bind(app: "FastAPI") -> threading.Event:
     return stop
 
 
+def _start_desktop_services_immediately() -> threading.Event:
+    """Start Desktop-owned services for non-uvicorn lifespan consumers."""
+    try:
+        from hermes_cli.gateway import _reap_unsupervised_gateway_orphans
+
+        _reap_unsupervised_gateway_orphans()
+    except Exception:
+        _log.exception("Desktop startup: orphan gateway reap failed")
+
+    stop = threading.Event()
+    threading.Thread(
+        target=_start_desktop_cron_ticker,
+        args=(stop,),
+        daemon=True,
+        name="desktop-cron-ticker",
+    ).start()
+    return stop
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -479,14 +498,22 @@ async def _lifespan(app: "FastAPI"):
     # dashboard` is unaffected — it relies on its own gateway.
     cron_stop: "threading.Event | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
-        # The socket, auth/health probes, and renderer do not depend on cron or
-        # process cleanup. Keep those services enabled on every Desktop run,
-        # but do not let their imports and Windows process scans delay the
-        # readiness sentinel. _serve sets this event immediately after bind.
-        # The gateway-start endpoint repeats orphan cleanup at its own
-        # correctness boundary, so moving this startup sweep after bind does
-        # not let a replacement gateway race stale credentials.
-        cron_stop = _start_desktop_services_after_bind(app)
+        if getattr(app.state, "defer_desktop_services_until_bind", False):
+            # The socket, auth/health probes, and renderer do not depend on cron
+            # or process cleanup. Keep those services enabled on every packaged
+            # Desktop run, but do not let their imports and Windows process
+            # scans delay the readiness sentinel. _serve sets this event
+            # immediately after bind. The gateway-start endpoint repeats orphan
+            # cleanup at its own correctness boundary, so moving this startup
+            # sweep after bind does not let a replacement gateway race stale
+            # credentials.
+            cron_stop = _start_desktop_services_after_bind(app)
+        else:
+            # Lifespan can also be owned directly (for example by an ASGI host
+            # or TestClient) with no uvicorn bind phase to release the deferred
+            # workers. Preserve the established startup behavior unless
+            # start_server explicitly selected the post-bind Desktop path.
+            cron_stop = _start_desktop_services_immediately()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
@@ -19738,6 +19765,10 @@ def start_server(
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
     """
+    # _lifespan is also exercised without start_server, so the post-bind policy
+    # must be explicit rather than inferred from HERMES_DESKTOP alone. Reset it
+    # on every invocation to avoid leaking one server's policy into another.
+    app.state.defer_desktop_services_until_bind = bool(defer_runtime_discovery)
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
