@@ -132,6 +132,214 @@ def test_patch_redacts_toml_secret_key_assignment(
     )
 
 
+_INLINE_TOML_SECRET_ASSIGNMENT = (
+    'mcp = { exaApiKey = "syntheticOpaqueInlineTomlSecret" }'
+)
+_INLINE_TOML_SECRET = "syntheticOpaqueInlineTomlSecret"
+_INLINE_TOML_REDACTED = 'mcp = { exaApiKey = "«redacted-secret»" }'
+
+
+def test_read_file_redacts_secret_in_toml_inline_table(tmp_path):
+    config = tmp_path / "providers.toml"
+    config.write_text(f"{_INLINE_TOML_SECRET_ASSIGNMENT}\n", encoding="utf-8")
+
+    result = json.loads(
+        read_file_tool(str(config), task_id="config-redaction-inline-toml-read")
+    )
+
+    assert _INLINE_TOML_SECRET not in result["content"]
+    assert _INLINE_TOML_REDACTED in result["content"]
+
+
+def test_search_redacts_secret_in_toml_inline_table(tmp_path):
+    config = tmp_path / "providers.toml"
+    config.write_text(f"{_INLINE_TOML_SECRET_ASSIGNMENT}\n", encoding="utf-8")
+
+    result = json.loads(
+        search_tool(
+            pattern="exaApiKey",
+            target="content",
+            path=str(tmp_path),
+            task_id="config-redaction-inline-toml-search",
+        )
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert _INLINE_TOML_SECRET not in rendered
+    assert any(
+        match["content"] == _INLINE_TOML_REDACTED for match in result["matches"]
+    )
+
+
+def test_patch_redacts_secret_in_toml_inline_table(tmp_path):
+    replacement = f"replacement{_INLINE_TOML_SECRET}"
+    config = tmp_path / "providers.toml"
+    config.write_text(f"{_INLINE_TOML_SECRET_ASSIGNMENT}\n", encoding="utf-8")
+
+    result = json.loads(
+        patch_tool(
+            path=str(config),
+            old_string=_INLINE_TOML_SECRET,
+            new_string=replacement,
+            task_id="config-redaction-inline-toml-patch",
+        )
+    )
+
+    assert result["success"] is True
+    assert _INLINE_TOML_SECRET not in result["diff"]
+    assert replacement not in result["diff"]
+    assert _INLINE_TOML_REDACTED in result["diff"]
+    assert config.read_text(encoding="utf-8") == (
+        f"{_INLINE_TOML_SECRET_ASSIGNMENT.replace(_INLINE_TOML_SECRET, replacement)}\n"
+    )
+
+
+_QUOTED_YAML_SECRET_ASSIGNMENTS = [
+    pytest.param(
+        '"api.key": syntheticOpaqueDoubleQuotedYamlSecret',
+        "syntheticOpaqueDoubleQuotedYamlSecret",
+        '"api.key": «redacted-secret»',
+        id="double-quoted-dotted-key",
+    ),
+    pytest.param(
+        "'api_key': syntheticOpaqueSingleQuotedYamlSecret",
+        "syntheticOpaqueSingleQuotedYamlSecret",
+        "'api_key': «redacted-secret»",
+        id="single-quoted-key",
+    ),
+]
+
+
+@pytest.mark.parametrize("assignment,secret,redacted", _QUOTED_YAML_SECRET_ASSIGNMENTS)
+def test_read_file_redacts_quoted_yaml_secret_key_assignment(
+    tmp_path, assignment, secret, redacted
+):
+    config = tmp_path / "providers.yaml"
+    config.write_text(f"{assignment}\n", encoding="utf-8")
+
+    result = json.loads(
+        read_file_tool(str(config), task_id="config-redaction-quoted-yaml-read")
+    )
+
+    assert secret not in result["content"]
+    assert redacted in result["content"]
+
+
+@pytest.mark.parametrize("assignment,secret,redacted", _QUOTED_YAML_SECRET_ASSIGNMENTS)
+def test_search_redacts_quoted_yaml_secret_key_assignment(
+    tmp_path, assignment, secret, redacted
+):
+    config = tmp_path / "providers.yaml"
+    config.write_text(f"{assignment}\n", encoding="utf-8")
+
+    result = json.loads(
+        search_tool(
+            pattern="api",
+            target="content",
+            path=str(tmp_path),
+            task_id="config-redaction-quoted-yaml-search",
+        )
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert secret not in rendered
+    assert any(match["content"] == redacted for match in result["matches"])
+
+
+@pytest.mark.parametrize("assignment,secret,redacted", _QUOTED_YAML_SECRET_ASSIGNMENTS)
+def test_patch_redacts_quoted_yaml_secret_key_assignment(
+    tmp_path, assignment, secret, redacted
+):
+    replacement = f"replacement{secret}"
+    config = tmp_path / "providers.yaml"
+    config.write_text(f"{assignment}\n", encoding="utf-8")
+
+    result = json.loads(
+        patch_tool(
+            path=str(config),
+            old_string=secret,
+            new_string=replacement,
+            task_id="config-redaction-quoted-yaml-patch",
+        )
+    )
+
+    assert result["success"] is True
+    assert secret not in result["diff"]
+    assert replacement not in result["diff"]
+    assert redacted in result["diff"]
+    assert (
+        config.read_text(encoding="utf-8")
+        == f"{assignment.replace(secret, replacement)}\n"
+    )
+
+
+def _escaped_json_secret_config():
+    value = 'syntheticEscapedJsonHead"syntheticEscapedJsonTail'
+    return value, json.dumps({"apiKey": value}, ensure_ascii=False)
+
+
+def test_read_file_redacts_complete_escaped_json_string_and_keeps_json_valid(tmp_path):
+    secret, serialized = _escaped_json_secret_config()
+    config = tmp_path / "providers.json"
+    config.write_text(f"{serialized}\n", encoding="utf-8")
+
+    result = json.loads(
+        read_file_tool(str(config), task_id="config-redaction-escaped-json-read")
+    )
+    redacted_line = result["content"].splitlines()[0].split("|", 1)[1]
+
+    assert all(part not in result["content"] for part in secret.split('"'))
+    assert json.loads(redacted_line) == {"apiKey": "«redacted-secret»"}
+
+
+def test_search_redacts_complete_escaped_json_string_and_keeps_json_valid(tmp_path):
+    secret, serialized = _escaped_json_secret_config()
+    config = tmp_path / "providers.json"
+    config.write_text(f"{serialized}\n", encoding="utf-8")
+
+    result = json.loads(
+        search_tool(
+            pattern="apiKey",
+            target="content",
+            path=str(tmp_path),
+            task_id="config-redaction-escaped-json-search",
+        )
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert all(part not in rendered for part in secret.split('"'))
+    assert len(result["matches"]) == 1
+    assert json.loads(result["matches"][0]["content"]) == {
+        "apiKey": "«redacted-secret»"
+    }
+
+
+def test_patch_redacts_complete_escaped_json_strings_and_keeps_json_valid(tmp_path):
+    secret, serialized = _escaped_json_secret_config()
+    replacement_head = "replacementEscapedJsonHead"
+    config = tmp_path / "providers.json"
+    config.write_text(f"{serialized}\n", encoding="utf-8")
+
+    result = json.loads(
+        patch_tool(
+            path=str(config),
+            old_string=secret.split('"', 1)[0],
+            new_string=replacement_head,
+            task_id="config-redaction-escaped-json-patch",
+        )
+    )
+
+    assert result["success"] is True
+    assert all(part not in result["diff"] for part in secret.split('"'))
+    assert replacement_head not in result["diff"]
+    redacted_json = json.dumps({"apiKey": "«redacted-secret»"}, ensure_ascii=False)
+    assert f"-{redacted_json}" in result["diff"]
+    assert f"+{redacted_json}" in result["diff"]
+    assert json.loads(config.read_text(encoding="utf-8"))["apiKey"].startswith(
+        replacement_head
+    )
+
+
 def test_read_file_preserves_editable_json_example_in_mjs_source(tmp_path):
     example = "syntheticEditableJsonExample24680"
     source = tmp_path / "config.mjs"

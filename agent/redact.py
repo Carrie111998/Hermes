@@ -235,22 +235,26 @@ _TOML_SECRET_ASSIGN_RE = re.compile(
     rf")",
     re.MULTILINE,
 )
+_TOML_INLINE_KEY_RE = re.compile(
+    rf"(?P<toml_inline_key>{_TOML_KEY_SEGMENT}"
+    rf"(?:[ \t]*+\.[ \t]*+{_TOML_KEY_SEGMENT})*+)"
+    rf"(?P<toml_inline_sep>[ \t]*+=[ \t]*+)",
+)
 
-# Unquoted YAML / colon config (e.g. ``password: secret``,
-# ``spring.datasource.password: hunter2``). The secret keyword must be part of
-# the KEY (anchored to the start of the line/indent), and the value is a single
-# whitespace-free token — so prose like ``note: secret meeting`` (keyword in the
-# value) and ``error: token expired`` are left alone. Bare ``auth`` is excluded
-# from the key set so ``Authorization:`` / ``author:`` don't match (the former
-# is masked by _AUTH_HEADER_RE); ``auth_token``/``auth-token`` still match via
-# the ``token`` keyword. Both quoted and unquoted scalar values are supported.
-_YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
-# NOTE(perf): possessive quantifiers wherever the successor is disjoint; the
-# leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
+
+# YAML / colon config assignments. Keys may be plain scalars or single-/double-
+# quoted scalars; quoted keys are common when they contain dots. Keep the match
+# line-anchored and newline-bounded so prose/source snippets do not become a
+# broader redaction surface. Secret semantics are validated from the decoded-ish
+# key spelling in the callback rather than embedded in this structural regex.
+_YAML_KEY = r'(?:[A-Za-z0-9_.\-]++|"(?:\\[^\r\n]|[^"\\\r\n])*+"|\'(?:\'\'|[^\'\r\n])*+\')'
 _YAML_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*+(?:\d+\|)?[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)"
-    rf"(:[ \t]*+)(['\"]?)([^\s&]+?)\3(?=[\s&]|$)",
-    re.IGNORECASE | re.MULTILINE,
+    rf"(?P<yaml_prefix>^[ \t]*+(?:\d+\|)?[ \t]*+)"
+    rf"(?P<yaml_key>{_YAML_KEY})"
+    rf"(?P<yaml_sep>:[ \t]*+)"
+    rf"(?P<yaml_quote>['\"]?)(?P<yaml_value>[^\s&]+?)(?P=yaml_quote)"
+    rf"(?=[\s&]|$)",
+    re.MULTILINE,
 )
 
 # Word-boundary validation for the mixed/lowercase key patterns above
@@ -340,13 +344,117 @@ def _key_has_secret_keyword(key: str) -> bool:
             return True
     return False
 
-# JSON field pattern. Match a bounded key and validate secret-bearing word
-# boundaries in the callback so provider names such as ``exaApiKey`` and
-# ``braveSearchApiKey`` are covered without treating words like ``monkey`` as
-# credentials.
+# JSON field pattern. Match bounded key names and a complete JSON string value,
+# including escaped quotes/backslashes. Stopping at the first escaped quote can
+# leak the remaining tail and turn otherwise valid JSON into invalid output.
+_JSON_STRING_BODY = r'(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\x00-\x1f])*+'
 _JSON_FIELD_RE = re.compile(
-    r'("([A-Za-z0-9_.-]{1,128})")\s*:\s*"([^"]+)"',
+    rf'(?P<json_key>"(?P<json_key_name>[A-Za-z0-9_.-]{{1,128}})")'
+    rf'(?P<json_sep>\s*+:\s*+)"(?P<json_value>{_JSON_STRING_BODY})"',
 )
+
+def _toml_string_end(text: str, start: int) -> tuple[int, int] | None:
+    """Return ``(exclusive_end, quote_width)`` for a TOML string at *start*.
+
+    The scan is linear and newline-bounded for ordinary strings. Triple-quoted
+    strings are recognized so braces inside them are never mistaken for inline
+    tables, even though inline-table secret values currently use scalar strings.
+    """
+    quote = text[start]
+    width = 3 if text.startswith(quote * 3, start) else 1
+    i = start + width
+    while i < len(text):
+        if text.startswith(quote * width, i):
+            return i + width, width
+        if quote == '"' and text[i] == "\\":
+            i += 2
+            continue
+        if width == 1 and text[i] in "\r\n":
+            return None
+        i += 1
+    return None
+
+
+def _redact_toml_inline_tables(text: str, value_mask) -> str:
+    """Redact scalar secret assignments inside structural TOML inline tables.
+
+    This small scanner tracks table/array nesting and skips strings and comments,
+    so dict-like text inside an ordinary TOML string is not treated as syntax.
+    Key and scalar-value token regexes are line-bounded and possessive; the
+    surrounding scan is iterative and linear rather than recursively parsing
+    nested inline tables.
+    """
+    stack: list[list[object]] = []  # [container delimiter, expects_key]
+    replacements: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if ch == "#":
+            newline = text.find("\n", i + 1)
+            i = len(text) if newline == -1 else newline + 1
+            continue
+
+        if stack and stack[-1][0] == "{" and stack[-1][1]:
+            if ch in " \t":
+                i += 1
+                continue
+            key_match = _TOML_INLINE_KEY_RE.match(text, i)
+            stack[-1][1] = False
+            if key_match:
+                key = key_match.group("toml_inline_key")
+                i = key_match.end()
+                if _key_has_secret_keyword(key) and i < len(text):
+                    if text[i] in "\"'":
+                        string_info = _toml_string_end(text, i)
+                        if string_info is not None:
+                            end, quote_width = string_info
+                            value_start = i + quote_width
+                            value_end = end - quote_width
+                            value = text[value_start:value_end]
+                            if not _ENV_LOOKUP_VALUE_RE.match(value):
+                                replacements.append(
+                                    (value_start, value_end, value_mask(value))
+                                )
+                            i = end
+                            continue
+                    else:
+                        value_end = i
+                        while (
+                            value_end < len(text)
+                            and text[value_end] not in " \t\r\n,#}"
+                        ):
+                            value_end += 1
+                        if value_end > i:
+                            value = text[i:value_end]
+                            if not _ENV_LOOKUP_VALUE_RE.match(value):
+                                replacements.append((i, value_end, value_mask(value)))
+                            i = value_end
+                            continue
+                continue
+
+        if ch in "\"'":
+            string_info = _toml_string_end(text, i)
+            if string_info is None:
+                break
+            i = string_info[0]
+            continue
+        if ch == "{":
+            stack.append(["{", True])
+        elif ch == "[":
+            stack.append(["[", False])
+        elif ch == "}" and stack and stack[-1][0] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1][0] == "[":
+            stack.pop()
+        elif ch == "," and stack and stack[-1][0] == "{":
+            stack[-1][1] = True
+        i += 1
+
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
+
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
 # bare-credential form, and Proxy-Authorization. The credential token is masked
@@ -970,6 +1078,7 @@ def redact_sensitive_text(
             )
 
         text = _TOML_SECRET_ASSIGN_RE.sub(_redact_toml_assignment, text)
+        text = _redact_toml_inline_tables(text, value_mask)
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -1041,7 +1150,10 @@ def redact_sensitive_text(
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
             def _redact_json(m):
-                key, key_name, value = m.group(1), m.group(2), m.group(3)
+                key = m.group("json_key")
+                key_name = m.group("json_key_name")
+                sep = m.group("json_sep")
+                value = m.group("json_value")
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
                 # not a leaked secret value.
@@ -1049,15 +1161,23 @@ def redact_sensitive_text(
                     return m.group(0)
                 if key_name.casefold() != "bearer" and not _key_has_secret_keyword(key_name):
                     return m.group(0)
-                return f'{key}: "{value_mask(value)}"'
+                return f'{key}{sep}"{value_mask(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # YAML / colon config: password: *** (quoted or unquoted scalar).
         # Skip URLs — web-URL query params pass through by design.
-        if ":" in text and "://" not in text:
+        if (
+            ":" in text
+            and "://" not in text
+            and _CFG_SECRET_WORD_RE.search(text)
+        ):
             def _redact_yaml(m):
-                key, sep, quote, value = (
-                    m.group(1), m.group(2), m.group(3), m.group(4)
+                prefix, key, sep, quote, value = (
+                    m.group("yaml_prefix"),
+                    m.group("yaml_key"),
+                    m.group("yaml_sep"),
+                    m.group("yaml_quote"),
+                    m.group("yaml_value"),
                 )
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): api_key: os.getenv('X') is a code snippet,
@@ -1069,7 +1189,7 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{quote}{value_mask(value)}{quote}"
+                return f"{prefix}{key}{sep}{quote}{value_mask(value)}{quote}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
