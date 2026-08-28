@@ -19797,6 +19797,26 @@ def start_server(
     except Exception as exc:
         _log.debug("exit-flush signal handlers not installed: %s", exc)
 
+    # ── v0.20.5 stdout-hijack regression guard ────────────────────────────
+    # tui_gateway/server.py performs a module-level ``sys.stdout = sys.stderr``
+    # to reserve real stdout for its stdio JSON-RPC protocol. This backend is
+    # an HTTP+WS server (`serve`/`dashboard`) that never speaks that protocol;
+    # importing tui_gateway (for the signal handlers / WS routing above) would
+    # silently divert the ``HERMES_*_READY`` port announcement to stderr. The
+    # desktop only watches child.stdout, so that would hang boot for 90s and
+    # loop. Restore real stdout once the tui_gateway import has settled.
+    if sys.stdout is sys.stderr:
+        restored_stdout = getattr(sys, "__stdout__", None)
+        if restored_stdout is None:
+            try:
+                from tui_gateway import server as _tui_gateway_server_mod
+
+                restored_stdout = getattr(_tui_gateway_server_mod, "_real_stdout", None)
+            except Exception:
+                restored_stdout = None
+        if restored_stdout is not None:
+            sys.stdout = restored_stdout
+
     # ── #93608: machine-readable port-conflict detection ──────────────
     # uvicorn's own bind_socket() would catch the EADDRINUSE and exit 1
     # with a bare ERROR line — indistinguishable from "backend broken".
