@@ -2829,6 +2829,7 @@ export const en: Translations = {
       noModels: 'No models found',
       editModels: 'Edit Models…',
       refreshModels: 'Refresh Models',
+      portalCta: 'Connect Nous Portal',
       fast: 'Fast'
     },
     modelOptions: {
