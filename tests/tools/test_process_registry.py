@@ -415,6 +415,104 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
 
 
 # =========================================================================
+# PTY reap accounting (issue #96362)
+# =========================================================================
+
+
+class _ReapPty:
+    """Minimal PTY double: one chunk, then EOF, with a scriptable wait()."""
+
+    def __init__(self, exitstatus=0, wait_error=None):
+        self.exitstatus = exitstatus
+        self._wait_error = wait_error
+        self._chunks = [b"done\n"]
+
+    def isalive(self):
+        return bool(self._chunks)
+
+    def read(self, _n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        raise EOFError
+
+    def wait(self):
+        if self._wait_error is not None:
+            raise self._wait_error
+        return self.exitstatus
+
+
+def _run_pty_loop(registry, monkeypatch, pty, sid):
+    session = _make_session(sid=sid)
+    session._pty = pty
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+    registry._pty_reader_loop(session)
+    return session
+
+
+def test_pty_reader_loop_reports_a_real_exit_status(registry, monkeypatch):
+    session = _run_pty_loop(registry, monkeypatch, _ReapPty(exitstatus=3), "proc_pty_ok")
+
+    assert session.exited is True
+    assert session.exit_code == 3
+    assert session.completion_reason == "exited"
+
+
+def test_pty_reader_loop_does_not_call_a_failed_reap_a_clean_exit(registry, monkeypatch):
+    """A failed wait() left exit_code None while claiming completion_reason
+    'exited', so the agent saw a finished command with a null exit code."""
+    pty = _ReapPty(exitstatus=None, wait_error=OSError("no child processes"))
+    session = _run_pty_loop(registry, monkeypatch, pty, "proc_pty_wait_fail")
+
+    assert session.exited is True
+    assert session.exit_code == -1
+    assert session.completion_reason == "lost"
+    assert session.termination_source == "pty_wait_failed"
+
+
+def test_pty_reader_loop_never_reports_a_null_exit_code(registry, monkeypatch):
+    """wait() succeeded but the backend exposes no status (pywinpty)."""
+    session = _run_pty_loop(registry, monkeypatch, _ReapPty(exitstatus=None), "proc_pty_no_status")
+
+    assert session.exit_code == -1
+    assert session.completion_reason == "exited"
+
+
+def test_pty_reader_loop_keeps_an_explicit_kill_labelled_killed(registry, monkeypatch):
+    session = _make_session(sid="proc_pty_killed")
+    session._pty = _ReapPty(exitstatus=None, wait_error=OSError("no child processes"))
+    session.completion_reason = "killed"
+    session.exit_code = -9
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+
+    registry._pty_reader_loop(session)
+
+    assert session.completion_reason == "killed"
+    assert session.exit_code == -9
+
+
+def test_lost_pty_completion_names_the_pty_not_a_vanished_backend():
+    from tools.process_registry import format_process_notification
+
+    text = format_process_notification(
+        {
+            "type": "completion",
+            "session_id": "proc_pty_wait_fail",
+            "exit_code": -1,
+            "completion_reason": "lost",
+            "termination_source": "pty_wait_failed",
+            "output": "",
+        }
+    )
+
+    assert "PTY could not be reaped" in text
+    assert "process backend disappeared" not in text
+
+
+# =========================================================================
 # Orphaned-pipe reconciliation (issue #17327)
 # =========================================================================
 
