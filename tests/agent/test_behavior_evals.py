@@ -87,6 +87,16 @@ def test_any_mutating_eslint_segment_invalidates_verification_evidence():
         "npx eslint --fix src/app.js; pytest -q",
         "eslint src/app.js && eslint --fix src/app.js",
         "pytest -q || npx eslint src/app.js --fix",
+        "CI=1 npx eslint --fix src/app.js; pytest -q",
+        "env FOO=1 eslint --fix src/app.js && pytest -q",
+        "pnpm exec eslint --fix src/app.js; pytest -q",
+        "yarn eslint --fix src/app.js; pytest -q",
+        "npx --yes eslint --fix src/app.js; pytest -q",
+        "./node_modules/.bin/eslint --fix src/app.js; pytest -q",
+        'bash -c "eslint --fix src/app.js"; pytest -q',
+        "eslint \\\n --fix src/app.js; pytest -q",
+        "eslint.cmd --fix src/app.js; pytest -q",
+        "eslint.exe src/app.js --fix; pytest -q",
     )
     for command in commands:
         messages = [

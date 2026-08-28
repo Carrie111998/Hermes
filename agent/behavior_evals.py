@@ -56,8 +56,8 @@ _TEST_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 _MUTATING_ESLINT_RE = re.compile(
-    r"(?:^|[;&|()]\s*)(?:npx\s+)?eslint\b[^;&|\n]*"
-    r"(?:^|\s)--fix(?:\s|=|$)",
+    r"(?<![\w-])eslint(?:\.(?:cmd|exe|js))?(?![\w-])[\s\S]*?"
+    r"--fix(?![-\w])",
     re.IGNORECASE,
 )
 _PATCH_PATH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.MULTILINE)
