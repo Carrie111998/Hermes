@@ -857,18 +857,16 @@ def _compression_threshold_for_model(
 # only ids that are structurally rot-proof.
 #
 # Order is measured, not guessed — p50 on a real titling prompt against the
-# Nous catalog: gpt-mini-latest 1.40s, claude-haiku-latest 1.55s,
-# gemini-flash-latest 2.13s, step-3.7-flash 7.84s, grok-4.1-fast 8.05s. So the
+# Nous catalog: gpt-mini-latest 1.40s, gemini-flash-latest 2.13s,
+# step-3.7-flash 7.84s, grok-4.1-fast 8.05s. So the
 # first family a provider actually serves is also the fastest it can offer.
 _FAST_MODEL_FAMILIES: tuple = (
     "gpt-mini-latest",
     "gpt-nano-latest",
-    "claude-haiku-latest",
     "gemini-flash-latest",
     "gpt-5.4-nano",
     "gpt-5.4-mini",
     "gpt-5-mini",
-    "haiku-4.5",
     "gemini-3.6-flash",
     "flash-lite",
     "-nano",

@@ -1180,7 +1180,7 @@ DEFAULT_CONFIG = {
         },
         "approval": {
             "provider": "auto",
-            "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
+            "model": "",           # fast/cheap model recommended (e.g. gpt-5.4-mini, gemini-flash)
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -2213,7 +2213,7 @@ DEFAULT_CONFIG = {
                     {"provider": "openai-codex", "model": "gpt-5.5"},
                     {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
                 ],
-                "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                "aggregator": {"provider": "openai-codex", "model": "gpt-5.5"},
                 "max_tokens": 4096,
                 "enabled": True,
             }
