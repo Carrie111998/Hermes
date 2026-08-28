@@ -10,7 +10,6 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 
 import asyncio
 import logging
-import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +25,7 @@ from hermes_cli.config import (
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
 from hermes_cli.mcp_security import validate_mcp_server_entry
-from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
+from tools.mcp_tool import _ENV_VAR_PATTERN, _sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -394,7 +393,16 @@ def _probe_single_server(
     try:
         _run_on_mcp_loop(_probe(), timeout=connect_timeout + 10)
     except BaseException as exc:
-        raise _unwrap_exception_group(exc) from None
+        unwrapped = _unwrap_exception_group(exc)
+        # Probe errors can echo request headers (e.g. an HTTP client exception
+        # containing "Authorization: Bearer <token>"). This raise is the single
+        # seam every consumer funnels through — CLI test/add/login and the
+        # dashboard test endpoint — so scrub credential patterns here before
+        # the message reaches any display surface. (#97460)
+        sanitized = _sanitize_error(str(unwrapped))
+        if sanitized != str(unwrapped):
+            raise RuntimeError(sanitized) from None
+        raise unwrapped from None
     finally:
         _stop_mcp_loop_if_idle()
 
@@ -774,13 +782,14 @@ def cmd_mcp_test(args):
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
-                # Mask the value (accepts ${VAR} and Cursor-style ${env:VAR})
-                resolved = _ENV_VAR_PATTERN.sub(lambda m: os.getenv(_env_ref_name(m.group(1)), ""), v)
-                if len(resolved) > 8:
-                    masked = resolved[:4] + "***" + resolved[-4:]
+                # A first4/last4 preview of a resolved credential is a
+                # reusable fragment — redact fully instead. Keep the on-disk
+                # `${VAR}` template visible when present (it carries no
+                # secret); a literal value never reaches the screen. (#97460)
+                if _ENV_VAR_PATTERN.search(v):
+                    print(f"    {k}: {v}")
                 else:
-                    masked = "***"
-                print(f"    {k}: {masked}")
+                    print(f"    {k}: [REDACTED]")
     else:
         _info("Auth: none")
 

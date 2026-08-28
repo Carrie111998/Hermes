@@ -199,9 +199,15 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
         # FastAPI event loop is never blocked.
         tools, token_present = await asyncio.to_thread(_probe_scoped)
     except Exception as exc:
+        # Defense in depth on top of the probe-seam scrub in
+        # ``_probe_single_server``: this JSON body goes straight to the
+        # browser, so anything that still looks like a credential gets
+        # redacted here too. (#97460)
+        from tools.mcp_tool import _sanitize_error
+
         return {
             "ok": False,
-            "error": str(exc),
+            "error": _sanitize_error(str(exc)),
             "tools": [],
         }
     if not token_present:

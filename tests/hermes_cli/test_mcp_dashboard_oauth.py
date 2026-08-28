@@ -139,3 +139,34 @@ def test_flow_status_does_not_expose_authorization_code():
     assert body["status"] == "approved"
     assert "secret-code" not in response.text
     assert "secret-state" not in response.text
+
+
+def test_mcp_test_endpoint_redacts_bearer_from_error(monkeypatch, tmp_path):
+    """The dashboard MCP test endpoint must not return raw Bearer values.
+
+    Defense in depth on top of the probe-seam scrub: the JSON error body goes
+    straight to the browser. (#97460)
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._get_mcp_servers",
+        lambda: {"ink": {"url": "https://mcp.ml.ink/mcp"}},
+    )
+
+    def exploding_probe(name, config, **kw):
+        raise RuntimeError(
+            "Connect failed: Authorization: Bearer SYNTH_DASH_BEARER_99887766 rejected"
+        )
+
+    monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", exploding_probe)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._oauth_tokens_present", lambda name: True
+    )
+
+    response = _client().post("/api/mcp/servers/ink/test")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "[REDACTED]" in body["error"]
+    assert "SYNTH_DASH_BEARER_99887766" not in body["error"]

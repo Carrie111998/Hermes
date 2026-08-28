@@ -340,6 +340,110 @@ class TestMcpTest:
         assert captured["outer_timeout"] == 310.0
         assert captured["shutdown"] is True
 
+    def test_test_auth_display_shows_template_not_resolved_secret(self, tmp_path, capsys, monkeypatch):
+        """``hermes mcp test`` must not print any fragment of a resolved credential.
+
+        With the env var set, ``load_config`` resolves ``${VAR}`` to the raw
+        secret before ``cmd_mcp_test`` sees it — a first4/last4 preview of that
+        value is a reusable credential fragment, so it must be fully redacted.
+        (#97460)
+        """
+        monkeypatch.setenv("MCP_SYNTH_SECRET", "SYNTH_ABCDEFGHIJKL_MNOP")
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "headers": {"Authorization": "Bearer ${MCP_SYNTH_SECRET}"},
+            },
+        })
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="ink"))
+        out = capsys.readouterr().out
+        assert "Authorization: [REDACTED]" in out
+        for fragment in ("SYNTH_ABCDEFGHIJKL_MNOP", "SYNTH_ABCD", "MNOP"):
+            assert fragment not in out
+
+    def test_test_auth_display_shows_template_when_env_unset(self, tmp_path, capsys, monkeypatch):
+        """With the env var unset the on-disk ``${VAR}`` template survives
+        ``load_config`` and is safe to show as-is. (#97460)"""
+        monkeypatch.delenv("MCP_SYNTH_SECRET", raising=False)
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "headers": {"Authorization": "Bearer ${MCP_SYNTH_SECRET}"},
+            },
+        })
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="ink"))
+        out = capsys.readouterr().out
+        assert "Bearer ${MCP_SYNTH_SECRET}" in out
+
+    def test_test_auth_display_redacts_literal_credentials(self, tmp_path, capsys, monkeypatch):
+        """A literal (non-template) credential header is fully redacted."""
+        monkeypatch.setenv("MCP_SYNTH_LITERAL", "LITERAL_SECRET_9876XYZQ")
+        literal = os.environ["MCP_SYNTH_LITERAL"]
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "headers": {"X-Api-Key": literal},
+            },
+        })
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="ink"))
+        out = capsys.readouterr().out
+        assert "X-Api-Key: [REDACTED]" in out
+        assert literal not in out
+
+    def test_probe_error_scrubs_bearer_from_exception_text(self, monkeypatch, tmp_path):
+        """Probe exceptions are scrubbed at the single raise seam.
+
+        HTTP client errors can echo ``Authorization: Bearer <token>``; every
+        consumer (CLI test/add/login, dashboard test endpoint) funnels through
+        this raise, so scrubbing here covers them all. (#97460)
+        """
+        import tools.mcp_tool as mcp_tool
+        from hermes_cli import mcp_config
+
+        _seed_config(tmp_path, {"ink": {"url": "https://mcp.ml.ink/mcp"}})
+
+        def exploding_run(coro, timeout):
+            coro.close()
+            bearer = "Bearer SYNTH_BEARER_98765XYZ"
+            raise RuntimeError(
+                f'Connect failed: request headers '
+                f'"Authorization: {bearer}" rejected (401)'
+            )
+
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(mcp_tool, "_stop_mcp_loop_if_idle", lambda: None)
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", exploding_run)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            mcp_config._probe_single_server(
+                "ink", {"url": "https://mcp.ml.ink/mcp"}
+            )
+        text = str(excinfo.value)
+        assert "[REDACTED]" in text
+        for fragment in ("SYNTH_BEARER_98765XYZ", "SYNTH_BEARER", "XYZ"):
+            assert fragment not in text
+
 
 # ---------------------------------------------------------------------------
 # Tests: env var interpolation
