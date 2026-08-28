@@ -645,6 +645,21 @@ def _model_supports_prompt_cache(model_id: str) -> bool:
     return any(pattern in model_lower for pattern in _CACHE_POINT_PATTERNS)
 
 
+# Nova accepts cachePoint blocks in the system list and the messages array
+# but rejects them inside toolConfig.tools — Bedrock fails the whole request
+# with "extraneous key [cachePoint] is not permitted" (#97281), so tool-level
+# cache markers stay Anthropic-only.
+_CACHE_POINT_TOOL_PATTERNS = [
+    "anthropic.claude",
+]
+
+
+def _model_supports_tool_cache_point(model_id: str) -> bool:
+    """Return True if the model accepts a cachePoint block in toolConfig.tools."""
+    model_lower = model_id.lower()
+    return any(pattern in model_lower for pattern in _CACHE_POINT_TOOL_PATTERNS)
+
+
 def is_anthropic_bedrock_model(model_id: str) -> bool:
     """Return True if the model is an Anthropic Claude model on Bedrock.
 
@@ -1263,7 +1278,7 @@ def build_converse_kwargs(
             # Strip tools for known non-tool-calling models and warn the user.
             # Ref: PR #7920 feedback from @ptlally, pattern from PR #4346.
             if _model_supports_tool_use(model):
-                if cache_enabled:
+                if _model_supports_tool_cache_point(model):
                     converse_tools = converse_tools + [{"cachePoint": {"type": "default"}}]
                 kwargs["toolConfig"] = {"tools": converse_tools}
             else:

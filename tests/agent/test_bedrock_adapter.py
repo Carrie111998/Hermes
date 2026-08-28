@@ -504,8 +504,8 @@ class TestBuildConverseKwargs:
 
 
     def test_cache_point_added_for_supported_model(self):
-        """Claude and Nova on the Converse path get cachePoint markers on
-        system, tools, and the message before the newest turn."""
+        """Claude on the Converse path gets cachePoint markers on system, tools,
+        and the message before the newest turn."""
         from agent.bedrock_adapter import build_converse_kwargs
         tools = [{"type": "function", "function": {
             "name": "test", "description": "Test", "parameters": {},
@@ -528,6 +528,33 @@ class TestBuildConverseKwargs:
         marked = kwargs["messages"][-2]["content"]
         assert marked[-1] == {"cachePoint": {"type": "default"}}
         assert kwargs["messages"][-1]["content"][-1] != {"cachePoint": {"type": "default"}}
+
+    def test_nova_gets_system_and_message_cache_point_but_not_tools(self):
+        """Nova rejects cachePoint inside toolConfig.tools ("extraneous key
+        [cachePoint] is not permitted" ValidationException, #97281) while still
+        accepting it in the system list and the messages array, so those two
+        markers must survive the tool-marker restriction."""
+        from agent.bedrock_adapter import build_converse_kwargs
+        tools = [{"type": "function", "function": {
+            "name": "test", "description": "Test", "parameters": {},
+        }}]
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "First"},
+            {"role": "assistant", "content": "Reply"},
+            {"role": "user", "content": "Second"},
+        ]
+        kwargs = build_converse_kwargs(
+            model="us.amazon.nova-pro-v1:0",
+            messages=messages,
+            tools=tools,
+        )
+        assert kwargs["system"][-1] == {"cachePoint": {"type": "default"}}
+        assert all(
+            t != {"cachePoint": {"type": "default"}} for t in kwargs["toolConfig"]["tools"]
+        )
+        marked = kwargs["messages"][-2]["content"]
+        assert marked[-1] == {"cachePoint": {"type": "default"}}
 
     def test_no_cache_point_for_unsupported_model(self):
         from agent.bedrock_adapter import build_converse_kwargs
