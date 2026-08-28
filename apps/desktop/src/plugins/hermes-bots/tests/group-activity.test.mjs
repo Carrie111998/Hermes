@@ -217,15 +217,18 @@ test('a newer send interrupts the previous run and records cancelled in the CURR
     await new Promise(resolve => setImmediate(resolve))
   }
   gc.sendToGroupChat('Busy', member, 'second ask, supersede')
+  for (let i = 0; i < 10; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(gc.calls.length, 1, 'the superseding turn waits for the member already in flight')
+
+  gates[1].resolve('late from the old run')
   for (let i = 0; i < 50 && gc.calls.length < 2; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }
-
+  assert.equal(gc.calls.length, 2, 'the superseding turn starts after ownership is released')
   gates[2].resolve('from the new run')
   await drain(gc, 'Busy')
-  gates[1].resolve('late from the old run')
-  await new Promise(resolve => setImmediate(resolve))
-  await new Promise(resolve => setImmediate(resolve))
 
   const epoch = (gc.$groupChats.get().Busy || {}).epoch || 0
   const events = feed(gc, 'Busy')

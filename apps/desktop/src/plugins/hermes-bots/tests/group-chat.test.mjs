@@ -177,7 +177,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             stored: session.stored,
             title: session.title
           })
-          const reply = turnScript(session.profile, params.text, calls.length, session)
+          const reply = await turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
           return {}
         }
@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, runGroupChatMemberTurn, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -402,6 +402,139 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   const betaSession = gc.sessions.get(betaFirst.stored)
   assert.equal(alphaSession.messages.some(message => String(message.content).includes('BETA_ONLY')), false)
   assert.equal(betaSession.messages.some(message => String(message.content).includes('ALPHA_ONLY')), false)
+})
+
+test('one member cannot run two turns concurrently across threads in the same room', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  const gc = load(async (_profile, prompt) => {
+    if (prompt === 'first thread') {
+      markFirstStarted()
+      await firstGate
+      return 'first reply'
+    }
+    return 'second reply'
+  })
+  const member = { name: 'research', title: '' }
+
+  const first = gc.runGroupChatMemberTurn('Room', member, 'first thread', 'thread-a', [])
+  await firstStarted
+  const second = gc.runGroupChatMemberTurn('Room', member, 'second thread', 'thread-b', [])
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(gc.calls.length, 1, 'the second thread must not submit into a busy member session')
+
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, second]), ['first reply', 'second reply'])
+  assert.equal(gc.calls.length, 2)
+  assert.equal(gc.calls[0].prompt, 'first thread')
+  assert.equal(gc.calls[1].prompt, 'second thread')
+})
+
+test('a queued member turn is dropped before inference when its thread is superseded', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  const gc = load(async (_profile, prompt) => {
+    if (prompt === 'blocking turn') {
+      markFirstStarted()
+      await firstGate
+    }
+    return `${prompt} reply`
+  })
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch = 1
+    room.log.push({ id: 'user:1', from: { kind: 'user', name: 'You' }, text: 'old', at: 1, thread: 'thread-a' })
+    return room
+  })
+
+  const first = gc.runGroupChatMemberTurn('Room', member, 'blocking turn', 'thread-b', [])
+  await firstStarted
+  const queued = gc.runGroupChatMemberTurn('Room', member, 'obsolete turn', 'thread-a', [])
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch += 1
+    room.log.push({ id: 'user:2', from: { kind: 'user', name: 'You' }, text: 'newer', at: 2, thread: 'thread-a' })
+    return room
+  })
+
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, queued]), ['blocking turn reply', null])
+  assert.equal(gc.calls.length, 1, 'the superseded queued turn must spend no inference')
+})
+
+test('a cross-thread epoch bump preserves queued work for the original thread', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  const gc = load(async (_profile, prompt) => {
+    if (prompt === 'blocking turn') {
+      markFirstStarted()
+      await firstGate
+    }
+    return `${prompt} reply`
+  })
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch = 1
+    room.log.push({ id: 'user:1', from: { kind: 'user', name: 'You' }, text: 'old', at: 1, thread: 'thread-a' })
+    return room
+  })
+
+  const first = gc.runGroupChatMemberTurn('Room', member, 'blocking turn', 'thread-b', [])
+  await firstStarted
+  const queued = gc.runGroupChatMemberTurn('Room', member, 'still current', 'thread-a', [])
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch += 1
+    room.log.push({ id: 'user:2', from: { kind: 'user', name: 'You' }, text: 'other thread', at: 2, thread: 'thread-c' })
+    return room
+  })
+
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, queued]), ['blocking turn reply', 'still current reply'])
+  assert.equal(gc.calls.length, 2)
+})
+
+test('stranded harvesting waits for the member session flight', async () => {
+  let releaseTurn
+  let markTurnStarted
+  const turnGate = new Promise(resolve => { releaseTurn = resolve })
+  const turnStarted = new Promise(resolve => { markTurnStarted = resolve })
+  const gc = load(async () => {
+    markTurnStarted()
+    await turnGate
+    return 'finished'
+  })
+  const member = { name: 'research', title: '' }
+
+  const turn = gc.runGroupChatMemberTurn('Room', member, 'work', 'thread-a', [])
+  await turnStarted
+  gc.updateGroupChat('Room', room => {
+    room.stranded = { research: { before: 999, thread: 'thread-a' } }
+    return room
+  })
+
+  const resumesBeforeHarvest = gc.requests.filter(request => request.method === 'session.resume').length
+  const harvest = gc.harvestStrandedGroupReply('Room', member)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(
+    gc.requests.filter(request => request.method === 'session.resume').length,
+    resumesBeforeHarvest,
+    'harvest must not inspect the transcript while a member turn owns it'
+  )
+
+  releaseTurn()
+  await turn
+  await harvest
+  assert.equal(gc.$groupChats.get().Room.stranded.research, undefined)
 })
 
 test('recreating a same-name group after disband mints fresh member sessions', async () => {
