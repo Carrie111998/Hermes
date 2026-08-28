@@ -80,5 +80,85 @@ class TestReadFileSchemaGating(unittest.TestCase):
         self.assertNotEqual(err, "Unsupported document type: 'x.epub'")
 
 
+class TestNeedsOcrPath(unittest.TestCase):
+    """anydoc>=0.2 NeedsOcrError wiring: hosted OCR attempt + typed warning
+    (maintainer caveats: #1 nous-gateway Parse was live-probed HTTP 500 →
+    attempt-and-fall-through; #2 warning recommends LOCAL OCR skills)."""
+
+    def _fake_mod(self, hosted_result=None, hosted_exc=None):
+        class NeedsOcrError(Exception):
+            def __init__(self, pages):
+                super().__init__("needs ocr")
+                self.pages = pages
+
+        calls = []
+
+        class Mod:
+            pass
+
+        mod = Mod()
+        mod.NeedsOcrError = NeedsOcrError
+
+        def to_markdown(path, **kw):
+            calls.append(kw)
+            if not kw:
+                raise NeedsOcrError([2, 3])
+            if hosted_exc is not None:
+                raise hosted_exc
+            return hosted_result
+
+        mod.to_markdown = to_markdown
+        return mod, calls
+
+    def test_hosted_success_returns_ocr_text(self):
+        from tools import read_extract as rx
+
+        mod, calls = self._fake_mod(hosted_result="OCR TEXT")
+        with patch.object(rx, "_anydoc", return_value=mod),              patch.object(rx, "_hosted_ocr_config",
+                          return_value=(True, "key", None)),              patch.object(rx.os.path, "getsize", return_value=10):
+            out = rx._extract_anydoc("scan.pdf")
+        self.assertEqual(out, "OCR TEXT\n")
+        self.assertEqual(calls[1].get("ocr"), "hosted")
+
+    def test_hosted_failure_warns_and_prefers_local_skills(self):
+        from tools import read_extract as rx
+
+        mod, _ = self._fake_mod(hosted_exc=RuntimeError("HTTP 500"))
+        with patch.object(rx, "_anydoc", return_value=mod),              patch.object(rx, "_hosted_ocr_config",
+                          return_value=(True, "key", "https://gw")),              patch.object(rx.os.path, "getsize", return_value=10):
+            out = rx._extract_anydoc("scan.pdf")
+        self.assertIn("[NEEDS OCR", out)
+        self.assertIn("pages 2, 3", out)
+        self.assertIn("attempted and failed", out)
+        # Maintainer caveat #2: local OCR guidance leads after a failure.
+        self.assertIn("Prefer LOCAL OCR", out)
+        self.assertIn("skills_list", out)
+
+    def test_disabled_warns_without_attempt(self):
+        from tools import read_extract as rx
+
+        mod, calls = self._fake_mod()
+        with patch.object(rx, "_anydoc", return_value=mod),              patch.object(rx, "_hosted_ocr_config",
+                          return_value=(False, None, None)),              patch.object(rx.os.path, "getsize", return_value=10):
+            out = rx._extract_anydoc("scan.pdf")
+        self.assertIn("[NEEDS OCR", out)
+        self.assertEqual(len(calls), 1)  # no hosted attempt
+        self.assertIn("hosted_ocr: true", out)  # teaches the enable path
+        self.assertIn("skills_list", out)  # and local OCR
+
+    def test_pin_lockstep(self):
+        """pyproject core pin and lazy_deps self-heal pin must match."""
+        import re
+        from pathlib import Path
+
+        py = Path("pyproject.toml").read_text(encoding="utf-8")
+        lz = Path("tools/lazy_deps.py").read_text(encoding="utf-8")
+        m1 = re.search(r'"firecrawl-anydoc==([\d.]+)"', py)
+        m2 = re.search(r'"firecrawl-anydoc==([\d.]+)"', lz)
+        self.assertIsNotNone(m1)
+        self.assertIsNotNone(m2)
+        self.assertEqual(m1.group(1), m2.group(1))
+
+
 if __name__ == "__main__":
     unittest.main()
