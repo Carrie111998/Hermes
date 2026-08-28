@@ -37,7 +37,8 @@ export function routedSessionIsLoading({
   messagesEmpty,
   resumeExhausted,
   routeSessionMismatch,
-  routedSessionView
+  routedSessionView,
+  startupNavigationPending = false
 }: {
   activeSessionId: string | null
   knownHistory: boolean
@@ -45,8 +46,17 @@ export function routedSessionIsLoading({
   resumeExhausted: boolean
   routeSessionMismatch: boolean
   routedSessionView: boolean
+  startupNavigationPending?: boolean
 }): boolean {
-  if (resumeExhausted || !routedSessionView) {
+  if (resumeExhausted) {
+    return false
+  }
+
+  if (startupNavigationPending) {
+    return true
+  }
+
+  if (!routedSessionView) {
     return false
   }
 

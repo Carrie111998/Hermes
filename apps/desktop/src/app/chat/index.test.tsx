@@ -17,7 +17,8 @@ import {
   $gatewayState,
   $messages,
   $selectedStoredSessionId,
-  $sessions
+  $sessions,
+  $startupNavigationPending
 } from '@/store/session'
 
 const threadRenderCount = vi.hoisted(() => ({ current: 0 }))
@@ -48,7 +49,14 @@ vi.mock('@/lib/model-options', () => ({
 }))
 vi.mock('./chat-drop-overlay', () => ({ ChatDropOverlay: () => null }))
 vi.mock('./chat-swap-overlay', () => ({ ChatSwapOverlay: () => null, ChatSyncBadge: () => null }))
-vi.mock('./composer', () => ({ ChatBar: () => null, ChatBarFallback: () => null }))
+vi.mock('./composer', async () => {
+  const React = await import('react')
+
+  return {
+    ChatBar: () => React.createElement('div', { 'data-testid': 'chat-bar' }),
+    ChatBarFallback: () => null
+  }
+})
 vi.mock('./hooks/use-file-drop-zone', () => ({
   useFileDropZone: () => ({ dragKind: null, dropHandlers: {} })
 }))
@@ -86,6 +94,7 @@ describe('ChatView render isolation', () => {
     $messages.set([assistantMessage('assistant-1', 'Stable historical answer')])
     $selectedStoredSessionId.set('stored-1')
     $sessions.set([{ id: 'stored-1', message_count: 1, title: 'Stable chat' } as never])
+    $startupNavigationPending.set(false)
   })
 
   afterEach(() => {
@@ -103,6 +112,7 @@ describe('ChatView render isolation', () => {
     $messages.set([])
     $selectedStoredSessionId.set(null)
     $sessions.set([])
+    $startupNavigationPending.set(false)
   })
 
   it('does not re-render chat history when an unrelated parent idle tick updates', () => {
@@ -160,5 +170,48 @@ describe('ChatView render isolation', () => {
     // memo(ChatView) with stable props must absorb the parent's idle tick —
     // the transcript (Thread) must not re-render. This is PR #38470's contract.
     expect(threadRenderCount.current).toBe(1)
+  })
+
+  it('does not expose a fresh composer while remembered startup navigation is unresolved', () => {
+    $activeSessionId.set(null)
+    $freshDraftReady.set(true)
+    $messages.set([])
+    $selectedStoredSessionId.set(null)
+    $startupNavigationPending.set(true)
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/']}>
+          <ChatView
+            gateway={null}
+            maxVoiceRecordingSeconds={120}
+            onAddContextRef={vi.fn()}
+            onAddUrl={vi.fn()}
+            onAttachDroppedItems={vi.fn()}
+            onAttachImageBlob={vi.fn()}
+            onCancel={vi.fn()}
+            onDeleteSelectedSession={vi.fn()}
+            onEdit={vi.fn()}
+            onPasteClipboardImage={vi.fn()}
+            onPickFiles={vi.fn()}
+            onPickFolders={vi.fn()}
+            onPickImages={vi.fn()}
+            onReload={vi.fn()}
+            onRemoveAttachment={vi.fn()}
+            onRetryResume={vi.fn()}
+            onSteer={vi.fn()}
+            onSubmit={vi.fn()}
+            onThreadMessagesChange={vi.fn()}
+            onToggleSelectedPin={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    expect(screen.queryByTestId('chat-bar')).toBeNull()
   })
 })

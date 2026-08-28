@@ -31,6 +31,7 @@ interface RouteResumeOptions {
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: (focus: boolean) => unknown
+  startupNavigationPending?: boolean
 }
 
 // Bounded auto-retry for a stranded session window. A resume can fail terminally
@@ -84,7 +85,8 @@ export function useRouteResume({
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   selectedStoredSessionIdRef,
-  startFreshSessionDraft
+  startFreshSessionDraft,
+  startupNavigationPending = false
 }: RouteResumeOptions) {
   const lastPathnameRef = useRef<string | null>(null)
   const seenGatewayStateRef = useRef(false)
@@ -195,6 +197,7 @@ export function useRouteResume({
 
     if (
       isNewChatRoute(locationPathname) &&
+      !startupNavigationPending &&
       !creatingSessionRef.current &&
       (selectedStoredSessionId || activeSessionId || !freshDraftReady) &&
       !rawHashLooksLikeSession()
@@ -217,7 +220,8 @@ export function useRouteResume({
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
-    startFreshSessionDraft
+    startFreshSessionDraft,
+    startupNavigationPending
   ])
 
   // Bounded auto-retry: when the routed session's resume failed terminally

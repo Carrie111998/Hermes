@@ -721,6 +721,11 @@ export const $messagesEmpty = computed($messages, messages => messages.length ==
 export const $lastVisibleMessageIsUser = computed($messages, lastVisibleMessageIsUser)
 
 export const $freshDraftReady = atom(false)
+// Cold-start navigation restore is decided after the profile and its session
+// rows arrive. Claim the foreground before that async validation so the `/`
+// route cannot briefly expose a usable fresh composer that a remembered
+// session then replaces.
+export const $startupNavigationPending = atom(false)
 export const $busy = atom(false)
 export const $awaitingResponse = atom(false)
 // Stored-session id whose most recent resume FAILED terminally (the gateway RPC
@@ -1071,6 +1076,7 @@ export const markSessionRead = (storedSessionId: string | null | undefined) => {
 
 export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($messages, next)
 export const setFreshDraftReady = (next: Updater<boolean>) => updateAtom($freshDraftReady, next)
+export const setStartupNavigationPending = (next: Updater<boolean>) => updateAtom($startupNavigationPending, next)
 export const setResumeFailedSessionId = (next: Updater<string | null>) => updateAtom($resumeFailedSessionId, next)
 
 export const requestSessionResume = (sessionId: string, ownerRoute?: SessionOwnerRoute) => {

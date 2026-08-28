@@ -2,7 +2,14 @@ import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
-import { _resetLegacyDiscardForTests } from '@/store/session'
+import {
+  $activeSessionId,
+  $messages,
+  $selectedStoredSessionId,
+  $startupNavigationPending,
+  _resetLegacyDiscardForTests
+} from '@/store/session'
+import { saveTranscriptTail } from '@/store/transcript-tail-cache'
 import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -46,6 +53,10 @@ describe('useDesktopIntegrations', () => {
   beforeEach(() => {
     window.localStorage.clear()
     _resetLegacyDiscardForTests()
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    $messages.set([])
+    $startupNavigationPending.set(false)
     vi.mocked(requestMcpInstallFromDeepLink).mockClear()
     navigate = vi.fn()
     // Every test starts as a main window; only the HUD describe flips this.
@@ -73,9 +84,14 @@ describe('useDesktopIntegrations', () => {
     }
 
     vi.restoreAllMocks()
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    $messages.set([])
+    $startupNavigationPending.set(false)
   })
 
   function render({
+    activeSessionId = null as string | null,
     activeProfile = 'default',
     locationPathname = '/',
     profileReady = false,
@@ -85,6 +101,7 @@ describe('useDesktopIntegrations', () => {
   } = {}) {
     return renderHook(
       ({
+        activeSessionId,
         activeProfile,
         locationPathname,
         profileReady,
@@ -92,6 +109,7 @@ describe('useDesktopIntegrations', () => {
         routedSessionId,
         sessions
       }: {
+        activeSessionId?: string | null
         activeProfile: string
         locationPathname: string
         profileReady: boolean
@@ -100,6 +118,7 @@ describe('useDesktopIntegrations', () => {
         sessions: readonly SessionInfo[]
       }) =>
         useDesktopIntegrations({
+          activeSessionId: activeSessionId ?? null,
           activeProfile,
           chatOpen: false,
           hasPreview: false,
@@ -114,6 +133,7 @@ describe('useDesktopIntegrations', () => {
         }),
       {
         initialProps: {
+          activeSessionId,
           activeProfile,
           locationPathname,
           profileReady,
@@ -135,6 +155,105 @@ describe('useDesktopIntegrations', () => {
 
       // no navigation should have occurred
       expect(navigate).not.toHaveBeenCalled()
+    })
+
+    it('paints the exact connection-scoped transcript before profile readiness', () => {
+      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'remembered-session')
+      saveTranscriptTail(
+        'remembered-session',
+        [{ id: 'cached-message', role: 'assistant', parts: [{ type: 'text', text: 'cached hello' }] }],
+        { connectionId: 'local', profile: 'default' }
+      )
+
+      render({ profileReady: false })
+
+      expect(navigate).not.toHaveBeenCalled()
+      expect($selectedStoredSessionId.get()).toBe('remembered-session')
+      expect($messages.get()).toMatchObject([{ id: 'cached-message', role: 'assistant' }])
+      expect($activeSessionId.get()).toBeNull()
+      expect($startupNavigationPending.get()).toBe(true)
+    })
+
+    it('uses the last-opened session when its persisted chat route is torn', () => {
+      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/older-session')
+      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'newer-session')
+      saveTranscriptTail(
+        'older-session',
+        [{ id: 'wrong-chat', role: 'assistant', parts: [{ type: 'text', text: 'wrong chat' }] }],
+        { connectionId: 'local', profile: 'default' }
+      )
+      saveTranscriptTail(
+        'newer-session',
+        [{ id: 'right-chat', role: 'assistant', parts: [{ type: 'text', text: 'right chat' }] }],
+        { connectionId: 'local', profile: 'default' }
+      )
+
+      const result = render({ profileReady: false })
+
+      expect($selectedStoredSessionId.get()).toBe('newer-session')
+      expect($messages.get()).toMatchObject([{ id: 'right-chat' }])
+
+      result.rerender({
+        activeSessionId: null,
+        activeProfile: 'default',
+        locationPathname: '/',
+        profileReady: true,
+        resumeExhaustedSessionId: null,
+        routedSessionId: null,
+        sessions: [
+          session({ id: 'older-session', profile: 'default' }),
+          session({ id: 'newer-session', profile: 'default' })
+        ]
+      })
+
+      expect(navigate).toHaveBeenCalledWith('/newer-session', { replace: true })
+      expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBe('/newer-session')
+    })
+
+    it('keeps startup navigation pending until the remembered runtime binds', () => {
+      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'remembered-session')
+      saveTranscriptTail(
+        'remembered-session',
+        [{ id: 'cached-message', role: 'assistant', parts: [{ type: 'text', text: 'cached hello' }] }],
+        { connectionId: 'local', profile: 'default' }
+      )
+
+      const result = render({ profileReady: false })
+
+      result.rerender({
+        activeSessionId: null,
+        activeProfile: 'default',
+        locationPathname: '/',
+        profileReady: true,
+        resumeExhaustedSessionId: null,
+        routedSessionId: null,
+        sessions: [session({ id: 'remembered-session', profile: 'default' })]
+      })
+      expect($startupNavigationPending.get()).toBe(true)
+
+      result.rerender({
+        activeSessionId: null,
+        activeProfile: 'default',
+        locationPathname: '/remembered-session',
+        profileReady: true,
+        resumeExhaustedSessionId: null,
+        routedSessionId: 'remembered-session',
+        sessions: [session({ id: 'remembered-session', profile: 'default' })]
+      })
+      expect($startupNavigationPending.get()).toBe(true)
+
+      result.rerender({
+        activeSessionId: 'runtime-session',
+        activeProfile: 'default',
+        locationPathname: '/remembered-session',
+        profileReady: true,
+        resumeExhaustedSessionId: null,
+        routedSessionId: 'remembered-session',
+        sessions: [session({ id: 'remembered-session', profile: 'default' })]
+      })
+
+      expect($startupNavigationPending.get()).toBe(false)
+      expect($messages.get()).toMatchObject([{ id: 'cached-message' }])
     })
 
     it('restores on profileReady when remembered route exists and owns the session', () => {
@@ -167,6 +286,7 @@ describe('useDesktopIntegrations', () => {
       expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBe('/remembered-session')
 
       result.rerender({
+        activeSessionId: null,
         activeProfile: 'default',
         locationPathname: '/',
         profileReady: true,
@@ -325,6 +445,7 @@ describe('useDesktopIntegrations', () => {
 
       // Now switch to ops.
       rerender({
+        activeSessionId: null,
         activeProfile: 'ops',
         locationPathname: '/ops-session',
         profileReady: true,
@@ -391,6 +512,7 @@ describe('useDesktopIntegrations', () => {
 
       // Remembering effect fires on route change.
       rerender({
+        activeSessionId: null,
         activeProfile: 'default',
         locationPathname: '/settings',
         profileReady: true,

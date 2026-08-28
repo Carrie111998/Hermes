@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { commandFocusedPreview } from '@/app/chat/right-rail/preview-nav'
@@ -17,13 +17,20 @@ import {
 import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
 import {
+  $activeSessionId,
+  $connection,
+  $selectedStoredSessionId,
   getRememberedRoute,
   getRememberedSessionId,
+  getSessionOwnerHint,
   sessionBelongsToProfile,
+  setMessages,
   setRememberedRoute,
-  setRememberedSessionId
+  setRememberedSessionId,
+  setStartupNavigationPending
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
+import { loadTranscriptTail } from '@/store/transcript-tail-cache'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
 import { isBrowserWindow, isHudWindow, isSecondaryWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
@@ -33,7 +40,34 @@ import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionR
 
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
 
+interface RememberedStartupTarget {
+  conflict: boolean
+  lastSessionId: null | string
+  route: null | string
+  routeSessionId: null | string
+  sessionId: null | string
+}
+
+function rememberedStartupTarget(profile: string): RememberedStartupTarget {
+  const route = getRememberedRoute(profile)
+  const routeSessionIdValue = route ? routeSessionId(route) : null
+  const lastSessionId = getRememberedSessionId(profile)
+  const conflict = Boolean(routeSessionIdValue && lastSessionId && routeSessionIdValue !== lastSessionId)
+
+  return {
+    conflict,
+    lastSessionId,
+    route,
+    routeSessionId: routeSessionIdValue,
+    // A chat-shaped route is redundant navigation state. The explicit
+    // last-opened session is the chat authority; a non-chat route remains the
+    // route authority. This also heals a shutdown between the two writes.
+    sessionId: lastSessionId || routeSessionIdValue
+  }
+}
+
 interface DesktopIntegrationsParams {
+  activeSessionId: null | string
   activeProfile: string
   chatOpen: boolean
   hasPreview: boolean
@@ -55,6 +89,7 @@ interface DesktopIntegrationsParams {
  * "talks to the desktop shell" surface reads as one unit.
  */
 export function useDesktopIntegrations({
+  activeSessionId,
   activeProfile,
   locationPathname,
   navigate,
@@ -90,6 +125,86 @@ export function useDesktopIntegrations({
   }, [])
 
   const restoredRef = useRef(false)
+  const pendingSessionRef = useRef<string | null>(null)
+  const prepaintedSessionRef = useRef<string | null>(null)
+
+  const clearProvisionalSessionPaint = useCallback(() => {
+    const id = prepaintedSessionRef.current
+
+    if (!id) {
+      return
+    }
+
+    prepaintedSessionRef.current = null
+
+    // Clear only provisional state owned by this hook. A user-driven open or
+    // a runtime that bound while boot was settling wins and stays visible.
+    if ($selectedStoredSessionId.get() === id && !$activeSessionId.get()) {
+      $selectedStoredSessionId.set(null)
+      setMessages([])
+    }
+  }, [])
+
+  // Claim remembered startup navigation before paint, not after the profile's
+  // async session refresh. Otherwise `/` exposes a real fresh composer for the
+  // whole refresh window and the remembered session can replace text the user
+  // already started entering. This is a presentation claim only: ownership is
+  // still checked against the live session list below.
+  useLayoutEffect(() => {
+    if (isHudWindow() || isBrowserWindow()) {
+      setStartupNavigationPending(false)
+
+      return
+    }
+
+    if (restoredRef.current) {
+      return
+    }
+
+    if (locationPathname !== NEW_CHAT_ROUTE) {
+      setStartupNavigationPending(false)
+
+      return
+    }
+
+    const remembered = rememberedStartupTarget(activeProfile)
+
+    const restorableNonSessionRoute =
+      !!remembered.route &&
+      remembered.route !== NEW_CHAT_ROUTE &&
+      !remembered.routeSessionId &&
+      !isOverlayView(appViewForPath(remembered.route))
+
+    pendingSessionRef.current = remembered.sessionId
+    setStartupNavigationPending(Boolean(remembered.sessionId || restorableNonSessionRoute))
+
+    if (!remembered.sessionId) {
+      return
+    }
+
+    const profile = activeProfile.trim() || 'default'
+    const owner = getSessionOwnerHint(remembered.sessionId)
+    const connection = $connection.get()
+
+    const connectionId =
+      owner?.connectionId || connection?.connectionId || (connection?.mode === 'remote' ? '' : 'local')
+
+    const ownerProfile = owner?.targetProfile || owner?.profile || profile
+
+    // Remembered navigation is already connection-scoped. Still fail closed
+    // when a legacy/unregistered remote cannot name its connection: guessing
+    // local would let one gateway's cached transcript paint under another.
+    const cached =
+      connectionId && ownerProfile === profile
+        ? loadTranscriptTail(remembered.sessionId, { connectionId, profile })
+        : null
+
+    if (cached) {
+      prepaintedSessionRef.current = remembered.sessionId
+      $selectedStoredSessionId.set(remembered.sessionId)
+      setMessages(cached)
+    }
+  }, [activeProfile, locationPathname])
 
   // Wait until boot has adopted the primary profile, then restore that profile's
   // navigation exactly once. The same effect owns subsequent writes so the
@@ -101,13 +216,30 @@ export function useDesktopIntegrations({
       return
     }
 
+    // The remembered target remains presentation-only until the exact route
+    // has a live runtime. That keeps the cached transcript visible but the
+    // composer unavailable throughout ownership validation and runtime binding.
+    const pendingSession = pendingSessionRef.current
+
+    if (
+      pendingSession &&
+      activeSessionId &&
+      routeSessionId(locationPathname) === pendingSession &&
+      $selectedStoredSessionId.get() === pendingSession
+    ) {
+      pendingSessionRef.current = null
+      prepaintedSessionRef.current = null
+      setStartupNavigationPending(false)
+    }
+
     if (!restoredRef.current) {
       // Only cold-start navigation at the default route is replaceable; a deep
       // link or hidden-then-shown window keeps its explicit destination.
       if (locationPathname === NEW_CHAT_ROUTE) {
-        const route = getRememberedRoute(activeProfile)
-        const routeSession = route ? routeSessionId(route) : null
-        const last = getRememberedSessionId(activeProfile)
+        const remembered = rememberedStartupTarget(activeProfile)
+        const { route } = remembered
+        const routeSession = remembered.routeSessionId
+        const last = remembered.lastSessionId
 
         const restorableNonSessionRoute =
           !!route && route !== NEW_CHAT_ROUTE && !routeSession && !isOverlayView(appViewForPath(route))
@@ -124,11 +256,22 @@ export function useDesktopIntegrations({
 
         if (
           route &&
+          !remembered.conflict &&
           route !== NEW_CHAT_ROUTE &&
           !isOverlayView(appViewForPath(route)) &&
           (!routeSession || sessionBelongsToProfile(sessions, routeSession, activeProfile))
         ) {
           navigate(route, { replace: true })
+
+          return
+        }
+
+        if (last && sessionBelongsToProfile(sessions, last, activeProfile)) {
+          if (remembered.conflict) {
+            setRememberedRoute(sessionRoute(last), activeProfile)
+          }
+
+          navigate(sessionRoute(last), { replace: true })
 
           return
         }
@@ -139,16 +282,22 @@ export function useDesktopIntegrations({
           setRememberedRoute(null, activeProfile)
         }
 
-        if (last && sessionBelongsToProfile(sessions, last, activeProfile)) {
-          navigate(sessionRoute(last), { replace: true })
-
-          return
-        }
-
         if (last) {
           setRememberedSessionId(null, activeProfile)
         }
+
+        pendingSessionRef.current = null
+        clearProvisionalSessionPaint()
+        setStartupNavigationPending(false)
       } else {
+        const pendingSession = pendingSessionRef.current
+
+        if (!pendingSession || routeSessionId(locationPathname) !== pendingSession) {
+          pendingSessionRef.current = null
+          clearProvisionalSessionPaint()
+          setStartupNavigationPending(false)
+        }
+
         restoredRef.current = true
       }
     }
@@ -163,7 +312,16 @@ export function useDesktopIntegrations({
     } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname))) {
       setRememberedRoute(locationPathname, activeProfile)
     }
-  }, [activeProfile, locationPathname, navigate, profileReady, routedSessionId, sessions])
+  }, [
+    activeProfile,
+    activeSessionId,
+    clearProvisionalSessionPaint,
+    locationPathname,
+    navigate,
+    profileReady,
+    routedSessionId,
+    sessions
+  ])
 
   useEffect(() => {
     if (!profileReady || !resumeExhaustedSessionId) {

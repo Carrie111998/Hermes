@@ -30,6 +30,7 @@ interface HarnessProps {
   selectedStoredSessionId: null | string
   selectedStoredSessionIdRef: MutableRefObject<null | string>
   startFreshSessionDraft: (focus: boolean) => unknown
+  startupNavigationPending?: boolean
 }
 
 function RouteResumeHarness({
@@ -98,6 +99,33 @@ describe('useRouteResume', () => {
       />
     )
 
+    expect(resumeSession).not.toHaveBeenCalled()
+  })
+
+  it('does not erase a preboot snapshot while remembered navigation is pending', () => {
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+
+    render(
+      <RouteResumeHarness
+        activeSessionId={null}
+        activeSessionIdRef={{ current: null }}
+        creatingSessionRef={{ current: false }}
+        currentView="chat"
+        freshDraftReady={false}
+        gatewayState="open"
+        locationPathname="/"
+        resumeSession={resumeSession}
+        routedSessionId={null}
+        runtimeIdByStoredSessionIdRef={{ current: new Map() }}
+        selectedStoredSessionId="remembered-session"
+        selectedStoredSessionIdRef={{ current: 'remembered-session' }}
+        startFreshSessionDraft={startFreshSessionDraft}
+        startupNavigationPending
+      />
+    )
+
+    expect(startFreshSessionDraft).not.toHaveBeenCalled()
     expect(resumeSession).not.toHaveBeenCalled()
   })
 

@@ -42,6 +42,7 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $sessions,
+  $startupNavigationPending,
   getSessionOwnerHint,
   resolveComposerSessionKey,
   sessionMatchesStoredId,
@@ -278,9 +279,14 @@ function ChatRuntimeBoundary({
     ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
     : undefined
 
-  const tailProfile = ownerRoute
-    ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
-    : undefined
+  const tailConnectionId = ownerRoute?.connectionId
+  const tailOwnerProfile = ownerRoute?.targetProfile || ownerRoute?.profile
+
+  const tailProfile = useMemo(
+    () =>
+      tailConnectionId && tailOwnerProfile ? { connectionId: tailConnectionId, profile: tailOwnerProfile } : undefined,
+    [tailConnectionId, tailOwnerProfile]
+  )
 
   const tailState = storedId && transcriptTailStates ? transcriptTailState(storedId, tailProfile) : undefined
   const restBackfillAvailable = Boolean(tailState?.possiblyTruncated)
@@ -436,6 +442,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const selectedSessionId = useStore(view.$storedId)
   const sessions = useStore($sessions)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
+  const startupNavigationPending = useStore($startupNavigationPending)
 
   // Durable composer/queue scope (lineage root) so auto-compression tip rotation
   // does not wipe an in-progress draft or orphan /queue entries. For the
@@ -526,7 +533,8 @@ const ChatViewContent = memo(function ChatViewContent({
     messagesEmpty,
     resumeExhausted,
     routeSessionMismatch,
-    routedSessionView: isRoutedSessionView
+    routedSessionView: isRoutedSessionView,
+    startupNavigationPending: isPrimary && startupNavigationPending
   })
 
   const threadLoading = threadLoadingState(loadingSession, !messagesEmpty, busy, awaitingResponse, lastVisibleIsUser)
@@ -657,7 +665,7 @@ const ChatViewContent = memo(function ChatViewContent({
             clampToComposer={showChatBar}
             cwd={currentCwd}
             gateway={gateway}
-            intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
+            intro={!loadingSession && showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
             loading={threadLoading}
             onBranchInNewChat={onBranchInNewChat}
             onCancel={haltRun}

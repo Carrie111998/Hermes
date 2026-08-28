@@ -47,6 +47,16 @@ describe('routedSessionIsLoading', () => {
     routedSessionView: true
   }
 
+  it('claims the fresh route while remembered startup navigation is unresolved', () => {
+    expect(
+      routedSessionIsLoading({
+        ...base,
+        routedSessionView: false,
+        startupNavigationPending: true
+      })
+    ).toBe(true)
+  })
+
   it('keeps the composer gated until a routed session has a bound runtime', () => {
     expect(
       routedSessionIsLoading({
