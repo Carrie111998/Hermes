@@ -7001,6 +7001,40 @@ def matches_name_filter(tool_name: str, patterns: set[str]) -> bool:
     )
 
 
+def mcp_tool_filter_predicate(
+    config: dict, server_name: str
+) -> tuple[Callable[[str], bool], bool]:
+    """Return the runtime tool predicate and whether a filter is active.
+
+    The distinction between a missing ``include`` and an explicit empty one is
+    intentional: absent means all tools, while ``include: []`` is an active
+    whitelist that matches nothing. A non-empty include takes precedence over
+    exclude; without include, a non-empty exclude removes matching names.
+
+    The boolean lets reporting surfaces describe filtered discovery without
+    reimplementing (and potentially drifting from) runtime registration.
+    """
+    tools_filter = config.get("tools") or {}
+    include_raw = tools_filter.get("include")
+    include_set = _normalize_name_filter(
+        include_raw, f"mcp_servers.{server_name}.tools.include"
+    )
+    include_active = isinstance(include_raw, (str, list, tuple, set))
+    exclude_set = _normalize_name_filter(
+        tools_filter.get("exclude"),
+        f"mcp_servers.{server_name}.tools.exclude",
+    )
+
+    def _should_register(tool_name: str) -> bool:
+        if include_active:
+            return matches_name_filter(tool_name, include_set)
+        if exclude_set:
+            return not matches_name_filter(tool_name, exclude_set)
+        return True
+
+    return _should_register, include_active or bool(exclude_set)
+
+
 def _parse_boolish(value: Any, default: bool = True) -> bool:
     """Parse a bool-like config value with safe fallback."""
     if value is None:
@@ -7186,22 +7220,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     #   include: [] → register nothing (an explicit empty whitelist, as
     #   written by the install checklist's "uncheck everything" path)
     #   Neither set → register all tools (backward-compatible default)
-    tools_filter = config.get("tools") or {}
-    include_raw = tools_filter.get("include")
-    include_set = _normalize_name_filter(
-        include_raw, f"mcp_servers.{name}.tools.include"
-    )
-    include_active = isinstance(include_raw, (str, list, tuple, set))
-    exclude_set = _normalize_name_filter(
-        tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude"
-    )
-
-    def _should_register(tool_name: str) -> bool:
-        if include_active:
-            return matches_name_filter(tool_name, include_set)
-        if exclude_set:
-            return not matches_name_filter(tool_name, exclude_set)
-        return True
+    _should_register, _filter_active = mcp_tool_filter_predicate(config, name)
 
     check_fn = _make_check_fn(name)
     candidates: List[dict] = []
@@ -7450,24 +7469,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     toolset_name = f"mcp-{name}"
     fingerprint = config_fingerprint(config)
     tool_timeout = _resolve_tool_timeout(config)
-    tools_filter = config.get("tools") or {}
-    include_raw = tools_filter.get("include")
-    include_set = _normalize_name_filter(
-        include_raw, f"mcp_servers.{name}.tools.include"
-    )
-    # include: [] is an explicit empty whitelist (register nothing) — see the
-    # live discovery path above for the full filter rules.
-    include_active = isinstance(include_raw, (str, list, tuple, set))
-    exclude_set = _normalize_name_filter(
-        tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude"
-    )
-
-    def _should_register(tool_name: str) -> bool:
-        if include_active:
-            return matches_name_filter(tool_name, include_set)
-        if exclude_set:
-            return not matches_name_filter(tool_name, exclude_set)
-        return True
+    _should_register, _filter_active = mcp_tool_filter_predicate(config, name)
 
     check_fn = _make_check_fn(name)
     # Trust-tier metadata for the lazy path: the cached manifest carries
