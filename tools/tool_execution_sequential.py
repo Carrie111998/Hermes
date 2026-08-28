@@ -524,7 +524,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             finally:
                 agent._delegate_spinner = None
                 tool_duration = time.time() - tool_start_time
-                cute_msg = _get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=_delegate_result)
+                cute_msg = _get_cute_tool_message_impl(
+                    'delegate_task', function_args, tool_duration,
+                    result=sanitize_tool_result_for_sink(_delegate_result),
+                )
                 if spinner:
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
@@ -556,10 +559,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _ce_result = function_result
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
-                logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, sanitize_tool_result_for_sink(tool_error), exc_info=True)
+                logger.error(
+                    "context_engine.handle_tool_call raised for %s: %s",
+                    function_name,
+                    sanitize_tool_result_for_sink(tool_error),
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
-                cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
+                cute_msg = _get_cute_tool_message_impl(
+                    function_name, function_args, tool_duration,
+                    result=sanitize_tool_result_for_sink(_ce_result),
+                )
                 if spinner:
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
@@ -592,10 +602,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _mem_result = function_result
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
-                logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, sanitize_tool_result_for_sink(tool_error), exc_info=True)
+                logger.error(
+                    "memory_manager.handle_tool_call raised for %s: %s",
+                    function_name,
+                    sanitize_tool_result_for_sink(tool_error),
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
-                cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
+                cute_msg = _get_cute_tool_message_impl(
+                    function_name, function_args, tool_duration,
+                    result=sanitize_tool_result_for_sink(_mem_result),
+                )
                 if spinner:
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
@@ -683,10 +700,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, sanitize_tool_result_for_sink(tool_error), exc_info=True)
+                logger.error(
+                    "handle_function_call raised for %s: %s",
+                    function_name,
+                    sanitize_tool_result_for_sink(tool_error),
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
-                cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
+                cute_msg = _get_cute_tool_message_impl(
+                    function_name, function_args, tool_duration,
+                    result=sanitize_tool_result_for_sink(_spinner_result),
+                )
                 if spinner:
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
@@ -762,7 +786,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, sanitize_tool_result_for_sink(tool_error), exc_info=True)
+                logger.error(
+                    "handle_function_call raised for %s: %s",
+                    function_name,
+                    sanitize_tool_result_for_sink(tool_error),
+                )
             tool_duration = time.time() - tool_start_time
 
         _execution_timed_out = isinstance(
@@ -774,9 +802,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
             _result_len = len(function_result)
         else:
-            # Multimodal dict result (_multimodal=True) — not sliceable as string
-            result_preview = function_result
-            _result_len = len(str(function_result))
+            # Multimodal/custom results are also log sinks; never pass their
+            # raw object representation to the error logger.
+            result_preview = sanitize_tool_result_for_sink(
+                _multimodal_text_summary(function_result)
+            )
+            _result_len = len(result_preview)
 
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
@@ -923,9 +954,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
-                print(agent._wrap_verbose("Result: ", function_result))
+                print(agent._wrap_verbose(
+                    "Result: ", sanitize_tool_result_for_sink(function_result)
+                ))
             else:
-                _fr_str = function_result if isinstance(function_result, str) else str(function_result)
+                _fr_str = sanitize_tool_result_for_sink(function_result)
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 

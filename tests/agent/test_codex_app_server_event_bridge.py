@@ -399,3 +399,21 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+
+def test_codex_completion_callbacks_and_projection_redact_nested_result():
+    sentinel = "lowercasecredential1234567890abcde"
+    agent = _make_stub_agent()
+    bridge = make_codex_app_server_event_bridge(agent)
+    item = {
+        "type": "mcpToolCall",
+        "id": "mcp-secret-id",
+        "server": "demo",
+        "tool": "read",
+        "arguments": {},
+        "result": {"nested": {"value": sentinel}},
+    }
+    bridge(_item_started(item))
+    bridge(_item_completed(item))
+    completion = agent.tool_progress_callback.call_args_list[-1]
+    assert sentinel not in repr(completion)

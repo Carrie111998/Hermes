@@ -21,6 +21,7 @@ from tools.tool_result_storage import (
     cleanup_spillover_cache,
     enforce_turn_budget,
     generate_preview,
+    extract_persisted_path,
     get_spillover_dir,
     maybe_persist_tool_result,
 )
@@ -127,12 +128,15 @@ class TestResolveStorageDir:
 
 
 class TestSafeResultFilename:
-    def test_preserves_normal_tool_call_id(self):
-        assert _safe_result_filename("tc_456") == "tc_456.txt"
+    def test_uses_digest_only_for_normal_tool_call_id(self):
+        filename = _safe_result_filename("tc_456")
+        assert filename.startswith("tool_result_")
+        assert filename.endswith(".txt")
+        assert "tc_456" not in filename
 
     def test_replaces_path_and_shell_metacharacters(self):
         filename = _safe_result_filename("../outside/$(whoami);x")
-        assert filename.startswith("outside_whoami_x_")
+        assert filename.startswith("tool_result_")
         assert filename.endswith(".txt")
         assert "/" not in filename
         assert "$" not in filename
@@ -194,7 +198,8 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert "tc_456.txt" in result
+        assert _safe_result_filename("tc_456") in result
+        assert "tc_456" not in result
         assert len(result) < len(content)
 
     def test_persists_full_content_as_is(self):
@@ -262,7 +267,9 @@ class TestMaybePersistToolResult:
 
         assert PERSISTED_OUTPUT_TAG in result
         assert sentinel not in result
-        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "tc_redact.txt").read_text(encoding="utf-8")
+        stored_path = extract_persisted_path(result)
+        assert stored_path is not None
+        stored = open(stored_path, encoding="utf-8").read()
         assert sentinel not in stored
         assert "redacted" in stored
 
@@ -286,9 +293,9 @@ class TestMaybePersistToolResult:
         cmd = env.execute.call_args[0][0]
         target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
 
-        assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
-        assert "/tmp/hermes-results/../" not in result
-        assert target.startswith("/tmp/hermes-results/outside_whoami_x_")
+        assert "../outside/$(whoami);x" not in result
+        assert "/tmp/hermes-results/tool_result_" in result
+        assert "/tmp/hermes-results/" in target
         assert "/../" not in target
         assert "$(whoami)" not in target
         assert ";" not in target
@@ -401,7 +408,7 @@ class TestSpillover:
         )
         assert PERSISTED_OUTPUT_TAG in result
         assert "could not be saved" not in result
-        spill_file = get_spillover_dir() / "tc_mcp_1.txt"
+        spill_file = get_spillover_dir() / _safe_result_filename("tc_mcp_1")
         assert spill_file.exists()
         assert spill_file.read_text(encoding="utf-8") == content
         assert str(spill_file) in result
@@ -420,7 +427,7 @@ class TestSpillover:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert (get_spillover_dir() / "tc_local_1.txt").exists()
+        assert (get_spillover_dir() / _safe_result_filename("tc_local_1")).exists()
         env.execute.assert_not_called()
 
     def test_remote_env_probe_success_references_mounted_path(self):
@@ -439,7 +446,7 @@ class TestSpillover:
         )
         assert PERSISTED_OUTPUT_TAG in result
         # Canonical host copy always exists now.
-        assert (get_spillover_dir() / "tc_remote_1.txt").exists()
+        assert (get_spillover_dir() / _safe_result_filename("tc_remote_1")).exists()
         # Only the readability probe ran — no cat-into-sandbox call.
         assert env.execute.call_count == 1
         assert "test -r" in env.execute.call_args[0][0]
@@ -462,10 +469,12 @@ class TestSpillover:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert "/tmp/hermes-results/tc_remote_2.txt" in result
+        assert "/tmp/hermes-results/" in result
+        assert _safe_result_filename("tc_remote_2") in result
+        assert "tc_remote_2" not in result
         assert env.execute.call_count == 2
         # Host canonical copy exists regardless.
-        assert (get_spillover_dir() / "tc_remote_2.txt").exists()
+        assert (get_spillover_dir() / _safe_result_filename("tc_remote_2")).exists()
 
     def test_spillover_write_failure_falls_back_to_inline(self, monkeypatch):
         import tools.tool_result_storage as trs
@@ -524,7 +533,7 @@ class TestSpillover:
         )
 
         assert not old.exists()
-        assert (spill_dir / "tc_prune_1.txt").exists()
+        assert (spill_dir / _safe_result_filename("tc_prune_1")).exists()
 
 
 # ── recovery hint in the persisted preview ────────────────────────────

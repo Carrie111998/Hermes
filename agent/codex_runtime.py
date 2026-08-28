@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from tools.tool_result_sanitization import sanitize_tool_result_for_sink
 
 logger = logging.getLogger(__name__)
 
@@ -454,12 +455,12 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     same outcome string that ends up in the messages list."""
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
-        out = item.get("aggregatedOutput") or ""
+        out = sanitize_tool_result_for_sink(item.get("aggregatedOutput") or "")
         exit_code = item.get("exitCode")
         is_error = bool(exit_code is not None and exit_code != 0)
         if is_error:
             out = f"[exit {exit_code}]\n{out}"
-        return out, is_error
+        return out[:4000], is_error
     if item_type == "fileChange":
         status = item.get("status") or "unknown"
         n = len(item.get("changes") or [])
@@ -471,12 +472,14 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         error = item.get("error")
         if error:
             return (
-                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}",
+                sanitize_tool_result_for_sink(
+                    f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+                ),
                 True,
             )
         result = item.get("result")
         return (
-            json.dumps(result, ensure_ascii=False)[:4000]
+            sanitize_tool_result_for_sink(result)[:4000]
             if result is not None else "",
             False,
         )
@@ -484,7 +487,7 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
             return (
-                json.dumps(content_items, ensure_ascii=False)[:4000],
+                sanitize_tool_result_for_sink(content_items)[:4000],
                 not bool(item.get("success", True)),
             )
         success = item.get("success", True)

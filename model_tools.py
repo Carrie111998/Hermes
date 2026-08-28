@@ -1616,11 +1616,21 @@ def handle_function_call(
                     function_name,
                     result,
                 )
+                # The transform hook is an observer-capable sink.  Give it the
+                # same total safe projection as post_tool_call; the raw result
+                # remains local and is returned unchanged when no transform
+                # replaces it.
+                safe_result = sanitize_tool_result_for_sink(result)
+                safe_error_message = (
+                    sanitize_tool_result_for_sink(error_message)
+                    if error_message is not None
+                    else None
+                )
                 hook_results = invoke_hook(
                     "transform_tool_result",
                     tool_name=function_name,
                     args=function_args,
-                    result=result,
+                    result=safe_result,
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
@@ -1629,7 +1639,7 @@ def handle_function_call(
                     duration_ms=duration_ms,
                     status=status,
                     error_type=error_type,
-                    error_message=error_message,
+                    error_message=safe_error_message,
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
@@ -1641,9 +1651,16 @@ def handle_function_call(
         return result
 
     except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
+        try:
+            error_detail = str(e)
+        except Exception:
+            error_detail = f"<{type(e).__name__}>"
+        error_msg = f"Error executing {function_name}: {error_detail}"
         safe_error_msg = sanitize_tool_result_for_sink(error_msg)
-        logger.exception(safe_error_msg)
+        # Do not attach the original exception object: logging handlers format
+        # its traceback independently of the sanitized message and would
+        # reintroduce the raw exception text into the sink.
+        logger.error(safe_error_msg)
         result = tool_error(safe_error_msg)
         duration_ms = (
             int((time.monotonic() - _dispatch_start) * 1000)

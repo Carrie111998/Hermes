@@ -221,6 +221,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
+from tools.tool_result_sanitization import sanitize_tool_result_for_sink
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
@@ -3848,7 +3849,9 @@ class AIAgent:
         for path, info in failed.items():
             if shown >= 10:
                 break
-            preview = (info.get("error_preview") or "").strip()
+            preview = sanitize_tool_result_for_sink(
+                info.get("error_preview") or ""
+            ).strip()
             tool = info.get("tool") or "patch"
             if preview:
                 lines.append(f"  • `{path}` — [{tool}] {preview}")
