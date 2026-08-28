@@ -25098,8 +25098,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 send_metadata = _non_conversational_metadata(metadata, platform=platform)
                 if send_metadata is not None or transport.is_relay:
                     result = await self._send_lifecycle_message_with_retry(
-                    transport.adapter,
-
+                        transport.adapter,
                         str(home.chat_id),
                         message,
                         metadata=send_metadata,
