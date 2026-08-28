@@ -30,6 +30,17 @@ def _start_ui_server_source() -> str:
     return match.group("body")
 
 
+def _show_progress_window_source() -> str:
+    source = WINDOWS_PS1.read_text(encoding="utf-8").replace("\r\n", "\n")
+    match = re.search(
+        r"function Show-ProgressWindow \{(?P<body>.*?)\n\}\n\nfunction ",
+        source,
+        re.DOTALL,
+    )
+    assert match, "Expected a complete Show-ProgressWindow function in windows.ps1."
+    return match.group("body")
+
+
 def test_listener_accept_is_armed_before_start_ui_server_reports_ready() -> None:
     source = _start_ui_server_source()
 
@@ -47,4 +58,19 @@ def test_listener_accept_is_armed_before_start_ui_server_reports_ready() -> None
         "Signal readiness only after a pending accept has been registered and "
         "before waiting to complete that accept; BeginInvoke alone is not a "
         "readiness guarantee on a loaded Windows runner."
+    )
+
+
+def test_browser_launch_failure_uses_full_ui_server_teardown() -> None:
+    source = _show_progress_window_source()
+    primary = source[source.find("if ($server) {") : source.find("# fall through to WinForms")]
+
+    published = primary.find("$script:UiServer = $server")
+    launched = primary.find("$server.BrowserProc = Start-Process")
+    assert published >= 0 and published < launched, (
+        "Publish the server to Stop-UiServer before browser launch so a launch "
+        "exception can dispose its listener, runspace, PowerShell pipeline, and Ready event."
+    )
+    assert re.search(r"catch\s*\{\s*Stop-UiServer\s*$", primary, re.MULTILINE), (
+        "Browser-launch fallback must use Stop-UiServer rather than stopping only the listener."
     )

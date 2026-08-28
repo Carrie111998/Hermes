@@ -342,13 +342,16 @@ function Show-ProgressWindow {
                     "--disable-features=msImplicitSignin",
                     "--window-size=280,320"
                 )
+                # Publish before browser launch so its exception path can use
+                # the canonical teardown (listener, runspace, pipeline, Ready,
+                # and any profile directory) instead of leaking the server.
+                $script:UiServer = $server
                 $server.BrowserProc = Start-Process -FilePath $browser -ArgumentList $browserArgs -PassThru
                 $server.Profile = $browserProfile
-                $script:UiServer = $server
                 Write-HandoffLog "shim: default-browser app window on 127.0.0.1:$($server.Port)"
                 return
             } catch {
-                try { $server.Listener.Stop() } catch {}
+                Stop-UiServer
                 # fall through to WinForms
             }
         }

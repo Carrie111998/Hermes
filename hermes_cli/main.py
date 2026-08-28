@@ -10843,7 +10843,16 @@ def cmd_update(args):
 
     _update_lock = UpdateLock()
     if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
+        detail = describe_holder(_update_lock.holder)
+        if getattr(args, "commit", None) is not None:
+            # Lock contention prevents the exact target from reaching the
+            # implementation-level receipt boundary. Record the pinned refusal
+            # here so coordinators can distinguish a safe deferral from an
+            # unobserved host; normal unpinned contention remains unchanged.
+            record_pinned_preflight_refusal_receipt(
+                detail, stop_reason="update-lock-held"
+            )
+        print(detail)
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
