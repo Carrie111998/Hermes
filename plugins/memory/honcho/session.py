@@ -290,7 +290,18 @@ class HonchoSessionManager:
             host = getattr(self._config, "host", "") or ""
             if not host:
                 return False
-            token = oauth.force_refresh_token(self._bound_config_path(), host)
+            # Tell the refresher exactly which access token the server just
+            # rejected: if disk already moved off it, a sibling rotated the
+            # single-use refresh token and the fresh grant is adopted instead
+            # of re-exchanged (a replay can revoke the whole grant).
+            failed = None
+            try:
+                failed = getattr(getattr(self.honcho, "_http", None), "api_key", None)
+            except Exception:
+                failed = None
+            token = oauth.force_refresh_token(
+                self._bound_config_path(), host, failed_access_token=failed
+            )
             if not token:
                 return False
             if not oauth.apply_token_to_client(self.honcho, token):
