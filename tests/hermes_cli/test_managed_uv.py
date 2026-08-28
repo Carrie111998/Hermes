@@ -483,6 +483,7 @@ class TestUpdateManagedUv:
         stamp.touch()
 
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.shutil.which", return_value=None), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run, \
              patch(
                  "hermes_cli.managed_uv.repair_vulnerable_runtime",
@@ -511,6 +512,7 @@ class TestUpdateManagedUv:
         _os.utime(stamp, (old, old))
 
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.shutil.which", return_value=None), \
              patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
@@ -518,6 +520,30 @@ class TestUpdateManagedUv:
 
         assert mock_run.call_args_list[0][0][0] == [str(uv), "self", "update"]
         assert stamp.stat().st_mtime > old + 30, "successful self-update must refresh the stamp"
+
+
+    def test_repair_runs_with_user_uv_when_no_managed_exists(self, tmp_path, monkeypatch):
+        """Tier-1 regression: with only the USER's uv available (no managed
+        binary), the CVE-driven repair probe must still run — never gated
+        behind the managed binary's existence."""
+        from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
+
+        user_uv = "/usr/local/bin/uv"
+        monkeypatch.setattr("hermes_cli.managed_uv.shutil.which", lambda name: user_uv)
+        monkeypatch.setattr("hermes_cli.managed_uv._uv_runs", lambda path: True)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch(
+                 "hermes_cli.managed_uv.repair_vulnerable_runtime",
+                 return_value=RuntimeRepairResult("skipped"),
+             ) as mock_repair, \
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
+            result = update_managed_uv()
+
+        # No managed uv -> no self-update attempted, but the repair runs with
+        # the user's uv engine (read-only use; writes stay in Hermes' dirs).
+        assert result is None
+        assert mock_run.call_count == 0, "no managed uv -> nothing to self-update"
+        mock_repair.assert_called_once_with(user_uv)
 
 
 

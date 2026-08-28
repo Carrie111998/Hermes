@@ -546,14 +546,22 @@ def update_managed_uv(
     The network self-update is skipped when it succeeded within the last
     ``UV_SELF_UPDATE_INTERVAL_SECONDS`` (7 days) unless ``force=True``; the
     vulnerable-runtime repair probe below ALWAYS runs — CVE-driven runtime
-    repair must never be gated behind the freshness stamp.
+    repair must never be gated behind the freshness stamp or behind the
+    managed binary's existence: with tier-1 (the user's own uv on PATH) there
+    is often no managed uv at all, and the repair must still run.
     """
+    # Self-update target: managed-only.  The user's own uv is never
+    # self-updated (ownership red line).
     existing = resolve_uv()
-    if not existing:
-        # Not installed yet — ensure_uv() will handle that elsewhere.
-        return None
 
-    if force or not _uv_self_update_is_fresh():
+    # Repair probe engine: ANY usable uv (user's or managed).  The probe and
+    # any Python provisioning it triggers go through managed_python_env(), so
+    # every write lands in Hermes' own directories even when the engine is the
+    # user's uv; _refresh_managed_uv_catalog() likewise refuses to touch a
+    # foreign binary.  Read-only use of the user's engine — never modified.
+    engine = resolve_uv_engine()
+
+    if existing and (force or not _uv_self_update_is_fresh()):
         try:
             result = subprocess.run(
                 [existing, "self", "update"],
@@ -580,12 +588,17 @@ def update_managed_uv(
                 "uv self update failed (rc=%d): %s", result.returncode, result.stderr
             )
 
+    repair_uv = engine.path or existing
+    if not repair_uv:
+        # No uv at all yet — ensure_uv() will handle provisioning elsewhere.
+        return None
+
     # Keep this hook inside the long-standing API. During an update, main.py is
     # already imported from the old checkout, then ``git pull`` replaces this
     # module on disk before the updater imports it. Calling the repair here is
     # what makes the migration happen on that first update.
     try:
-        repair = repair_vulnerable_runtime(existing)
+        repair = repair_vulnerable_runtime(repair_uv)
         if repair_observer is not None:
             repair_observer(repair)
         if repair.status == "failed":
