@@ -93,6 +93,7 @@ import {
   $focusedStoredSessionId,
   $sessionStates,
   $sessionTiles,
+  dropTilesForProfile,
   focusWorkspaceOwnerSessionTile,
   sessionTileDelegate
 } from '@/store/session-states'
@@ -720,6 +721,15 @@ export const host = {
         : ambientRemoteConnectionId
           ? { connectionId: ambientRemoteConnectionId, profile: name }
           : undefined
+    )
+
+    // The profile is gone. Drop its persisted tiles now — a leftover tile
+    // restores on relaunch and re-creates the deleted profile (hermes-agent#94235).
+    dropTilesForProfile(
+      route ? route.profile : name,
+      route
+        ? { connectionId: route.connectionId, profile: route.profile, targetProfile: route.targetProfile }
+        : undefined
     )
 
     // The profile rail paints from the shared $profiles cache; without a
