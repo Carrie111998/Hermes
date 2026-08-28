@@ -1084,10 +1084,15 @@ def _cmd_routing_lane(args: argparse.Namespace) -> int:
 
     if lane is not None:
         configured, has_routing = _configured_routing_lanes()
-        if configured and lane not in configured:
+        if has_routing and lane not in configured:
+            # An empty or malformed ``routing.lanes`` means NO lane is valid.
+            # Accepting anything there silently presented an invented lane as a
+            # configured route.
+            listed = (", ".join(configured) if configured
+                      else "(none — routing.lanes is empty or malformed)")
             print(
                 f"kanban routing-lane: {lane!r} is not a configured lane. "
-                f"Configured lanes: {', '.join(configured)}",
+                f"Configured lanes: {listed}",
                 file=sys.stderr,
             )
             return 2

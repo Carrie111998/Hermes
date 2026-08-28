@@ -334,7 +334,9 @@ def bind_worker_session_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
-            stored = kb.record_run_session_id(conn, run_id, session_id)
+            stored = kb.record_run_session_id(
+                conn, run_id, session_id, task_id=tid,
+            )
         finally:
             conn.close()
     except Exception:

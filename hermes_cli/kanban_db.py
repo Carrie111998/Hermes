@@ -1493,6 +1493,25 @@ CREATE TABLE IF NOT EXISTS task_runs (
     session_id          TEXT
 );
 
+-- Terminal routing records staged INSIDE the transaction that ends a run, and
+-- projected to ``logs/routing.jsonl`` only after that transaction commits.
+--
+-- A JSONL append is an external side effect: it cannot roll back with SQLite.
+-- Writing it from inside ``_end_run`` meant a later failure in the same
+-- transaction rolled the run back to active while the log permanently claimed
+-- it had completed. Staging here makes the record share the run's fate.
+--
+-- ``run_id`` is UNIQUE so a retried terminal path stages once, and
+-- ``projected_at`` is the claim: a projector marks rows only after their lines
+-- are written, inside one BEGIN IMMEDIATE so concurrent projectors serialize.
+CREATE TABLE IF NOT EXISTS routing_outbox (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       INTEGER NOT NULL UNIQUE,
+    payload      TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    projected_at INTEGER
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -4479,7 +4498,7 @@ def _append_event(
     )
 
 
-def _emit_terminal_routing_record(
+def _stage_terminal_routing_record(
     conn: sqlite3.Connection, task_id: str, run_id: int, outcome: str,
 ) -> None:
     """Append the run-linked routing record when the task declared a lane.
@@ -4515,21 +4534,86 @@ def _emit_terminal_routing_record(
         from hermes_cli import routing_audit
 
         usage = routing_audit.usage_for_session(row["session_id"] or "")
-        routing_audit.record_routing_decision(
-            task_id=task_id,
-            project_id=row["project_id"],
-            lane=row["lane"],
-            run_ref=f"task_run:{run_id}",
-            session_id=row["session_id"],
-            profile=row["profile"],
-            outcome=outcome,
-            runtime_seconds=runtime,
-            cost_status="joined" if usage else "unavailable",
-            **(usage or {}),
+        payload = {
+            "task_id": task_id,
+            "project_id": row["project_id"],
+            "lane": row["lane"],
+            "run_ref": f"task_run:{run_id}",
+            "session_id": row["session_id"],
+            "profile": row["profile"],
+            "outcome": outcome,
+            "runtime_seconds": runtime,
+        }
+        if usage:
+            payload.update(usage)
+        else:
+            payload["cost_status"] = "unavailable"
+        # Staged in the CALLER's transaction, so it commits or rolls back with
+        # the run it describes. INSERT OR IGNORE on the UNIQUE run_id makes a
+        # retried terminal path stage exactly once.
+        conn.execute(
+            "INSERT OR IGNORE INTO routing_outbox (run_id, payload, created_at) "
+            "VALUES (?, ?, ?)",
+            (run_id, json.dumps(payload, ensure_ascii=False, default=str),
+             int(time.time())),
         )
     except Exception:
-        # Never raise out of a run's terminal path for an audit line.
+        # Never raise out of a run's terminal path for an audit record.
         pass
+
+
+def project_routing_outbox(
+    conn: sqlite3.Connection, *, limit: int = 50,
+) -> int:
+    """Write staged terminal routing records to the log. Returns how many.
+
+    Runs AFTER the staging transaction has committed, so a line can only
+    describe a run that really ended. The whole claim-and-write happens inside
+    one ``BEGIN IMMEDIATE``: concurrent projectors serialize, and a failed
+    write rolls the claim back so the record is retried rather than lost —
+    which is also how a record survives a temporary log outage and is projected
+    once the log returns.
+
+    Each line carries ``record_id`` (the outbox row) so the one residual
+    duplicate window — a crash after the lines are written but before the
+    transaction commits — is detectable downstream rather than silent.
+
+    Best-effort by contract: never raises, so draining the outbox can be
+    attached to ordinary board activity without becoming a new failure mode.
+    """
+    from hermes_cli import routing_audit
+
+    written = 0
+    try:
+        with write_txn(conn):
+            rows = conn.execute(
+                "SELECT id, payload FROM routing_outbox "
+                " WHERE projected_at IS NULL ORDER BY id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            if not rows:
+                return 0
+            now = int(time.time())
+            for row in rows:
+                try:
+                    fields = json.loads(row["payload"])
+                except (ValueError, TypeError):
+                    fields = {"payload_unreadable": True}
+                if not routing_audit.record_routing_decision(
+                    record_id=row["id"], **fields
+                ):
+                    # The log is unavailable. Abort the whole claim so every
+                    # row in this batch is retried later.
+                    raise RuntimeError("routing log unavailable")
+                written += 1
+            conn.execute(
+                "UPDATE routing_outbox SET projected_at = ? "
+                " WHERE id IN (%s)" % ",".join("?" * len(rows)),
+                [now, *[r["id"] for r in rows]],
+            )
+    except Exception:
+        return 0
+    return written
 
 
 def _end_run(
@@ -4590,7 +4674,7 @@ def _end_run(
     # stamped, so the run-linked routing record can be joined and written.
     # Emitted only for a task that declared a lane (§4.3), and never allowed
     # to fail the run it describes.
-    _emit_terminal_routing_record(conn, task_id, run_id, outcome)
+    _stage_terminal_routing_record(conn, task_id, run_id, outcome)
     return run_id
 
 
@@ -8523,18 +8607,37 @@ def set_routing_lane(
     except Exception:
         # Never raise out of the audit path — see routing_audit's docstring.
         pass
+    # Opportunistic drain: any terminal record staged by an earlier run (or
+    # left behind by a log outage or a restart) reaches the log here.
+    project_routing_outbox(conn)
     return True
 
 
 def record_run_session_id(
     conn: sqlite3.Connection, run_id: Optional[int], session_id: Optional[str],
+    *, task_id: Optional[str] = None,
 ) -> bool:
-    """Stamp the agent session that produced a run. False when not stored.
+    """Stamp the agent session that produced a run. **Set-once, verified.**
 
-    This is the join key, and only the key: with ``task_runs.profile`` it
-    resolves to that profile's ``state.db.session_model_usage``, where the
-    token and cost figures already are. Nothing here recomputes them, and no
-    part of the run's own lifecycle state changes.
+    This is the cost join key: with ``task_runs.profile`` it resolves to that
+    profile's ``state.db.session_model_usage``, where the token and cost
+    figures already are. Nothing here recomputes them, and no part of the run's
+    own lifecycle state changes.
+
+    Two properties the first version did not have, both reproduced by review:
+
+    * **The relationship is verified in the database**, not inferred from
+      environment variables. A caller's ``task_id`` (when given) must match
+      ``task_runs.task_id``, the task's ``current_run_id`` must still be this
+      run, and the run must not have ended. A stale, reclaimed, superseded,
+      ended, or *sibling* run is refused — previously a worker holding one
+      task's id and another task's run id could stamp the sibling.
+    * **Set-once.** NULL may become the authoritative session. An identical
+      retry is idempotent and returns True. A *different* non-NULL session is
+      refused without mutation, because silently re-pointing the key moves a
+      run's whole accounting onto another transcript. The ``session_id IS
+      NULL`` guard inside ``BEGIN IMMEDIATE`` makes that atomic across
+      processes, so two competing binders yield exactly one winner.
     """
     if run_id is None:
         return False
@@ -8542,10 +8645,31 @@ def record_run_session_id(
     if not text:
         return False
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT r.task_id AS run_task, r.session_id AS session_id, "
+            "       r.ended_at AS ended_at, t.current_run_id AS current_run_id "
+            "  FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            " WHERE r.id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if task_id is not None and row["run_task"] != task_id:
+            return False
+        if row["current_run_id"] != run_id:
+            return False
+        if row["ended_at"] is not None:
+            return False
+        existing = row["session_id"]
+        if existing:
+            # Idempotent retry, or a refused re-point. Either way: no mutation.
+            return str(existing) == text
         cur = conn.execute(
-            "UPDATE task_runs SET session_id = ? WHERE id = ?", (text, run_id),
+            "UPDATE task_runs SET session_id = ? "
+            " WHERE id = ? AND session_id IS NULL",
+            (text, run_id),
         )
-    return cur.rowcount == 1
+        return cur.rowcount == 1
 
 
 def plan_gate_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
