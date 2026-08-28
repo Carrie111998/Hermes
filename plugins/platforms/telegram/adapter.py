@@ -7187,6 +7187,18 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Collective Wisdom managed install/update callbacks ---
+        if data.startswith("wi:"):
+            await self._handle_wisdom_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -7551,6 +7563,173 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    async def _handle_wisdom_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Plan and explicitly confirm a safe managed Wisdom operation."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to manage skills.")
+            return
+
+        parts = data.split(":", 3)
+        if data == "wi:cancel":
+            await query.answer(text="Cancelled")
+            try:
+                await query.edit_message_text(
+                    text="Collective Wisdom action cancelled.", reply_markup=None
+                )
+            except Exception:
+                pass
+            return
+        if (
+            len(parts) != 4
+            or parts[1] not in {"plan", "confirm"}
+            or parts[2] not in {"install", "update"}
+        ):
+            await query.answer(text="Invalid Collective Wisdom action.")
+            return
+
+        phase, action, value = parts[1], parts[2], parts[3]
+        await query.answer(text="Verifying…" if phase == "plan" else "Applying…")
+
+        try:
+            from hermes_wisdom.service import WisdomService
+
+            def run_action():
+                service = WisdomService()
+                service.require_setup()
+                if phase == "plan":
+                    return (
+                        service.install_plan(value)
+                        if action == "install"
+                        else service.update_plan(value)
+                    )
+                if action == "install":
+                    if not value.startswith("wip_"):
+                        raise ValueError("invalid install receipt")
+                    return service.install_apply(value, accept_partial=False)
+                if not value.startswith("wup_"):
+                    raise ValueError("invalid update receipt")
+                return service.update_apply(
+                    value,
+                    accept_sensitive=False,
+                    accept_partial=False,
+                    preserve_modified=False,
+                )
+
+            result = await asyncio.to_thread(run_action)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Collective Wisdom Telegram action failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            try:
+                await query.edit_message_text(
+                    text=(
+                        "<b>Collective Wisdom action could not continue</b>\n"
+                        "Open Collective in Hermes to review the current state and try again."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        if phase == "confirm":
+            version = result.get("version") if isinstance(result, dict) else None
+            suffix = f" v{version}" if isinstance(version, int) else ""
+            verb = "installed" if action == "install" else "updated"
+            try:
+                await query.edit_message_text(
+                    text=f"✅ <b>Skill {verb}{suffix}</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        if not isinstance(result, dict) or not result.get("receipt"):
+            state = str(result.get("state") if isinstance(result, dict) else "current")
+            label = "already current" if state == "current" else "not ready"
+            try:
+                await query.edit_message_text(
+                    text=f"<b>Collective Wisdom skill is {label}</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        compatibility = result.get("compatibility")
+        compatibility = compatibility if isinstance(compatibility, dict) else {}
+        outcome = str(compatibility.get("outcome") or "")
+        sensitive = result.get("sensitive_expansion")
+        needs_full_review = (
+            outcome != "compatible"
+            or result.get("allowed") is False
+            or bool(result.get("modified"))
+            or bool(sensitive)
+        )
+        name = _html.escape(str(result.get("slug") or "skill"))
+        version = result.get("version")
+        version_label = f" v{version}" if isinstance(version, int) else ""
+        if needs_full_review:
+            try:
+                await query.edit_message_text(
+                    text=(
+                        f"⚠️ <b>{name}{version_label} needs a full review</b>\n"
+                        "Open Collective in Hermes to review compatibility, local changes, "
+                        "and sensitive requirements before continuing."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        receipt = str(result["receipt"])
+        verb = "Install" if action == "install" else "Update"
+        reply_markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    f"Confirm {verb.lower()}",
+                    callback_data=f"wi:confirm:{action}:{receipt}",
+                )
+            ],
+            [InlineKeyboardButton("Cancel", callback_data="wi:cancel")],
+        ])
+        try:
+            await query.edit_message_text(
+                text=(
+                    f"<b>{verb} {name}{version_label}?</b>\n"
+                    "Hermes verified the exact package and local compatibility. "
+                    "Nothing changes until you confirm."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            pass
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback

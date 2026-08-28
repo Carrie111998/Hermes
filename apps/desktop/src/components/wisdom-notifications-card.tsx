@@ -52,15 +52,18 @@ function notificationText(event: WisdomNotification, copy: WisdomTranslations): 
 export function WisdomNotificationsCard({
   className,
   events,
-  onMarkAllRead
+  onMarkAllRead,
+  onPlanAction
 }: {
   className?: string
   events: WisdomNotification[]
   onMarkAllRead: () => Promise<void>
+  onPlanAction?: (action: 'install' | 'update', event: WisdomNotification) => Promise<void> | void
 }) {
   const { t } = useI18n()
   const copy = t.skills.collective
   const [clearing, setClearing] = useState(false)
+  const [planning, setPlanning] = useState<null | string>(null)
 
   if (events.length === 0) {
     return null
@@ -105,11 +108,31 @@ export function WisdomNotificationsCard({
             <p className="min-w-0 text-[0.68rem] leading-4 text-(--ui-text-secondary)">
               {notificationText(event, copy)}
             </p>
-            {event.portal_url ? (
-              <Button onClick={() => openExternalLink(event.portal_url || '')} size="inline" variant="textStrong">
-                {copy.viewSkill}
-              </Button>
-            ) : null}
+            <div className="flex shrink-0 items-center gap-3">
+              {onPlanAction && (event.category === 'new_skill' || event.category === 'update_available') ? (
+                <Button
+                  disabled={planning === event.event_id}
+                  onClick={async () => {
+                    setPlanning(event.event_id)
+
+                    try {
+                      await onPlanAction(event.category === 'new_skill' ? 'install' : 'update', event)
+                    } finally {
+                      setPlanning(null)
+                    }
+                  }}
+                  size="inline"
+                  variant="textStrong"
+                >
+                  {event.category === 'new_skill' ? copy.install : copy.reviewUpdate}
+                </Button>
+              ) : null}
+              {event.portal_url ? (
+                <Button onClick={() => openExternalLink(event.portal_url || '')} size="inline" variant="text">
+                  {copy.viewSkill}
+                </Button>
+              ) : null}
+            </div>
           </li>
         ))}
       </ul>

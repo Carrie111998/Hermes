@@ -264,7 +264,7 @@ def send_message_tool(args, **kw):
 def send_telegram_notification_pane(
     *, message: str, buttons: list[dict[str, str]]
 ) -> dict:
-    """Send an internal notification to the Telegram home chat with URL actions.
+    """Send an internal notification to the Telegram home chat with trusted actions.
 
     This is intentionally not part of the model-facing ``send_message`` schema.
     Product notifications can offer trusted Portal deep links without giving an
@@ -284,11 +284,26 @@ def send_telegram_notification_pane(
             return _error("Telegram has no configured home channel")
 
         safe_buttons: list[dict[str, str]] = []
-        for button in buttons[:8]:
+        for button in buttons[:16]:
             label = str(button.get("label") or "").strip()[:64]
             url = str(button.get("url") or "").strip()
             if label and re.fullmatch(r"https?://[^\s]+", url):
                 safe_buttons.append({"label": label, "url": url})
+                continue
+            callback_data = str(button.get("callback_data") or "").strip()
+            if (
+                label
+                and len(callback_data.encode("utf-8")) <= 64
+                and re.fullmatch(
+                    r"wi:(?:plan:(?:install|update):[A-Za-z0-9_-]+|"
+                    r"confirm:(?:install|update):w(?:ip|up)_[a-f0-9]+|cancel)",
+                    callback_data,
+                )
+            ):
+                safe_buttons.append({
+                    "label": label,
+                    "callback_data": callback_data,
+                })
 
         from model_tools import _run_async
 
@@ -298,7 +313,7 @@ def send_telegram_notification_pane(
                 home.chat_id,
                 message,
                 disable_link_previews=True,
-                url_buttons=safe_buttons,
+                action_buttons=safe_buttons,
             )
         )
         return result if isinstance(result, dict) else {"success": bool(result)}
@@ -1397,6 +1412,7 @@ async def _send_telegram(
     disable_link_previews=False,
     force_document=False,
     url_buttons=None,
+    action_buttons=None,
 ):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1489,7 +1505,21 @@ async def _send_telegram(
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
         reply_markup = None
-        if url_buttons:
+        if action_buttons:
+            reply_markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        str(button["label"]),
+                        **(
+                            {"url": str(button["url"])}
+                            if button.get("url")
+                            else {"callback_data": str(button["callback_data"])}
+                        ),
+                    )
+                ]
+                for button in action_buttons
+            ])
+        elif url_buttons:
             reply_markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton(str(button["label"]), url=str(button["url"]))]
                 for button in url_buttons

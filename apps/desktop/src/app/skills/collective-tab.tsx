@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -76,6 +77,8 @@ async function waitForWisdomAction(name: string, profile: ProfileScope): Promise
 export function CollectiveTab({ profile, query }: { profile: ProfileScope; query: string }) {
   const { t } = useI18n()
   const copy = t.skills.collective
+  const location = useLocation()
+  const navigate = useNavigate()
   const scope = profileScopeKey(profile)
   const [selectedId, setSelectedId] = useState<null | string>(null)
 
@@ -441,32 +444,62 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
 
   const selectedUpdate = selectedId ? pendingUpdates.get(selectedId) : undefined
 
+  const planManagedActionForSkill = useCallback(
+    async (skillId: string, action: 'install' | 'uninstall' | 'update') => {
+      setSelectedId(skillId)
+      setBusy(skillId)
+
+      try {
+        const plan =
+          action === 'install'
+            ? await planWisdomInstall(skillId, profile, installUpdateMode || undefined)
+            : action === 'update'
+              ? await planWisdomUpdate(skillId, profile)
+              : { skill_id: skillId, state: 'confirm_uninstall' }
+
+        setActionPlan({ ...plan, action })
+        setActionPlanReference(action === 'install' ? skillId : null)
+        setAcceptSensitive(false)
+        setAcceptPartial(false)
+        setPreserveModified(false)
+      } catch (error) {
+        notifyError(error, `Wisdom ${action} planning failed`)
+      } finally {
+        setBusy(null)
+      }
+    },
+    [installUpdateMode, profile]
+  )
+
   const planManagedAction = async (action: 'install' | 'uninstall' | 'update') => {
-    if (!selectedId) {
+    if (selectedId) {
+      await planManagedActionForSkill(selectedId, action)
+    }
+  }
+
+  useEffect(() => {
+    if (!status.data?.configured) {
       return
     }
 
-    setBusy(selectedId)
+    const params = new URLSearchParams(location.search)
+    const action = params.get('wisdomAction')
+    const skillId = params.get('wisdomSkillId')
 
-    try {
-      const plan =
-        action === 'install'
-          ? await planWisdomInstall(selectedId, profile, installUpdateMode || undefined)
-          : action === 'update'
-            ? await planWisdomUpdate(selectedId, profile)
-            : { skill_id: selectedId, state: 'confirm_uninstall' }
-
-      setActionPlan({ ...plan, action })
-      setActionPlanReference(action === 'install' ? selectedId : null)
-      setAcceptSensitive(false)
-      setAcceptPartial(false)
-      setPreserveModified(false)
-    } catch (error) {
-      notifyError(error, `Wisdom ${action} planning failed`)
-    } finally {
-      setBusy(null)
+    if ((action !== 'install' && action !== 'update') || !skillId) {
+      return
     }
-  }
+
+    params.delete('wisdomAction')
+    params.delete('wisdomSkillId')
+    const search = params.toString()
+
+    navigate(
+      { hash: location.hash, pathname: location.pathname, search: search ? `?${search}` : '' },
+      { replace: true }
+    )
+    void planManagedActionForSkill(skillId, action)
+  }, [location.hash, location.pathname, location.search, navigate, planManagedActionForSkill, status.data?.configured])
 
   const planReferencedInstall = async () => {
     const reference = installReference.trim()
@@ -765,6 +798,7 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
               notifyError(error, 'Could not acknowledge Wisdom notifications')
             }
           }}
+          onPlanAction={(action, event) => planManagedActionForSkill(event.skill_id, action)}
         />
       </div>
       <MasterDetail resizeId="collective-capabilities-split" split="wide">

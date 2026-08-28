@@ -271,6 +271,77 @@ class TestTelegramApprovalCallback:
         assert (tmp_path / ".update_response").read_text() == "y"
 
     @pytest.mark.asyncio
+    async def test_wisdom_update_callback_plans_before_offering_confirmation(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: {"text": text, "callback_data": callback_data},
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+        query = AsyncMock()
+        query.data = "wi:plan:update:skill-3"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+        service = MagicMock()
+        service.update_plan.return_value = {
+            "receipt": "wup_deadbeef",
+            "skill_id": "skill-3",
+            "slug": "team-runbook",
+            "version": 3,
+            "compatibility": {"outcome": "compatible"},
+            "modified": False,
+            "sensitive_expansion": [],
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        service.require_setup.assert_called_once_with()
+        service.update_plan.assert_called_once_with("skill-3")
+        service.update_apply.assert_not_called()
+        edit_kwargs = query.edit_message_text.await_args.kwargs
+        assert "Update team-runbook v3?" in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"][0][0] == {
+            "callback_data": "wi:confirm:update:wup_deadbeef",
+            "text": "Confirm update",
+        }
+
+    @pytest.mark.asyncio
+    async def test_wisdom_update_confirmation_applies_exact_receipt(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:confirm:update:wup_deadbeef"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+        service = MagicMock()
+        service.update_apply.return_value = {"skill_id": "skill-3", "version": 3}
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        service.update_apply.assert_called_once_with(
+            "wup_deadbeef",
+            accept_sensitive=False,
+            accept_partial=False,
+            preserve_modified=False,
+        )
+        assert "Skill updated v3" in query.edit_message_text.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
     async def test_update_prompt_callback_rejects_unauthorized_user(self, tmp_path):
         """Update prompt buttons should honor TELEGRAM_ALLOWED_USERS."""
         adapter = _make_adapter()
@@ -329,4 +400,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

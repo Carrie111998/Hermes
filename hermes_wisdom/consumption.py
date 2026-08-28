@@ -1143,9 +1143,19 @@ class WisdomConsumption:
         for event in selected:
             heading, detail = self._telegram_notification_text(event)
             lines.extend(["", heading, detail])
+            version = f" v{event['version']}" if event.get("version") else ""
+            if event["category"] == "new_skill":
+                buttons.append({
+                    "label": f"Install {event['skill_name']}{version}",
+                    "callback_data": f"wi:plan:install:{event['skill_id']}",
+                })
+            elif event["category"] == "update_available":
+                buttons.append({
+                    "label": f"Update {event['skill_name']}{version}",
+                    "callback_data": f"wi:plan:update:{event['skill_id']}",
+                })
             portal_url = event.get("portal_url")
             if isinstance(portal_url, str) and portal_url:
-                version = f" v{event['version']}" if event.get("version") else ""
                 buttons.append({
                     "label": f"View {event['skill_name']}{version}",
                     "url": portal_url,

@@ -34,6 +34,7 @@ from tools.send_message_tool import (
     _send_telegram,
     _send_to_platform,
     send_message_tool,
+    send_telegram_notification_pane,
 )
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
@@ -244,12 +245,18 @@ def _install_telegram_mock(monkeypatch, bot):
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
 
     class InlineKeyboardButton:
-        def __init__(self, text, *, url):
+        def __init__(self, text, *, url=None, callback_data=None):
             self.text = text
             self.url = url
+            self.callback_data = callback_data
 
         def to_dict(self):
-            return {"text": self.text, "url": self.url}
+            data = {"text": self.text}
+            if self.url is not None:
+                data["url"] = self.url
+            if self.callback_data is not None:
+                data["callback_data"] = self.callback_data
+            return data
 
     class InlineKeyboardMarkup:
         def __init__(self, inline_keyboard):
@@ -301,6 +308,42 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_wisdom_notification_pane_allows_only_bounded_trusted_callbacks(self):
+        telegram_cfg = SimpleNamespace(enabled=True, token="tok", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.TELEGRAM: telegram_cfg},
+            get_home_channel=lambda _platform: SimpleNamespace(chat_id="123"),
+        )
+
+        with patch("tools.send_message_tool.prepare_send_message_platforms"), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_telegram", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = send_telegram_notification_pane(
+                message="Collective Wisdom",
+                buttons=[
+                    {
+                        "label": "Update team-runbook v3",
+                        "callback_data": "wi:plan:update:skill-3",
+                    },
+                    {"label": "Unsafe", "callback_data": "ea:always:1"},
+                ],
+            )
+
+        assert result == {"success": True}
+        send_mock.assert_awaited_once_with(
+            "tok",
+            "123",
+            "Collective Wisdom",
+            disable_link_previews=True,
+            action_buttons=[
+                {
+                    "label": "Update team-runbook v3",
+                    "callback_data": "wi:plan:update:skill-3",
+                }
+            ],
+        )
+
     def test_ntfy_topic_target_is_explicit(self):
         chat_id, thread_id, is_explicit = _parse_target_ref("ntfy", "alerts-channel")
 
@@ -840,6 +883,46 @@ class TestSendTelegramHtmlDetection:
                     {
                         "text": "Review release-checklist",
                         "url": "https://portal.example/orgs/team/wisdom/review/draft-4",
+                    }
+                ],
+            ]
+        }
+
+    def test_notification_callback_buttons_render_as_action_rows(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(
+            _send_telegram(
+                "tok",
+                "123",
+                "<b>Collective Wisdom</b>",
+                action_buttons=[
+                    {
+                        "label": "Update team-runbook v3",
+                        "callback_data": "wi:plan:update:skill-3",
+                    },
+                    {
+                        "label": "View team-runbook v3",
+                        "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
+                    },
+                ],
+            )
+        )
+
+        reply_markup = bot.send_message.await_args.kwargs["reply_markup"]
+        assert reply_markup.to_dict() == {
+            "inline_keyboard": [
+                [
+                    {
+                        "callback_data": "wi:plan:update:skill-3",
+                        "text": "Update team-runbook v3",
+                    }
+                ],
+                [
+                    {
+                        "text": "View team-runbook v3",
+                        "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
                     }
                 ],
             ]

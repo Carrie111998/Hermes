@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
@@ -18,6 +19,8 @@ const reviseWisdomDraft = vi.fn()
 const decideWisdomDraft = vi.fn()
 const planWisdomInstall = vi.fn()
 const applyWisdomInstall = vi.fn()
+const planWisdomUpdate = vi.fn()
+const applyWisdomUpdate = vi.fn()
 const checkWisdom = vi.fn()
 const setupWisdom = vi.fn()
 const getActionStatus = vi.fn()
@@ -37,6 +40,8 @@ vi.mock('@/hermes', async importOriginal => ({
   suggestWisdomSkill,
   planWisdomInstall,
   applyWisdomInstall,
+  planWisdomUpdate,
+  applyWisdomUpdate,
   checkWisdom,
   setupWisdom,
   getActionStatus
@@ -75,14 +80,16 @@ const systemSpecification = {
   known_limitations: []
 }
 
-async function renderTab() {
+async function renderTab(initialEntry = '/skills?tab=collective') {
   const { CollectiveTab } = await import('./collective-tab')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   return render(
-    <QueryClientProvider client={client}>
-      <CollectiveTab profile={scope} query="" />
-    </QueryClientProvider>
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <QueryClientProvider client={client}>
+        <CollectiveTab profile={scope} query="" />
+      </QueryClientProvider>
+    </MemoryRouter>
   )
 }
 
@@ -493,6 +500,31 @@ describe('CollectiveTab', () => {
     expect(preview.contains(confirm)).toBe(false)
     fireEvent.click(confirm)
     await waitFor(() => expect(applyWisdomInstall).toHaveBeenCalledWith('wip_auto', false, scope))
+  })
+
+  it('opens the verified update plan from a notification deep link', async () => {
+    mockInstallations()
+    getWisdomStatus.mockResolvedValue({ configured: true, verified_org_id: 'org-1' })
+    getWisdomCandidates.mockResolvedValue({ candidates: [] })
+    getWisdomDrafts.mockResolvedValue({ drafts: [] })
+    getWisdomDiscovery.mockResolvedValue({ next_cursor: null, skills: [] })
+    getWisdomSkill.mockResolvedValue({
+      skill: { id: 'skill-1', slug: 'managed-skill' },
+      versions: [{ version: 3 }]
+    })
+    getWisdomVersionContent.mockResolvedValue({ commit: 'sha256:commit', content_hash: 'sha256:content', files: [] })
+    planWisdomUpdate.mockResolvedValue({
+      receipt: 'wup_notification',
+      skill_id: 'skill-1',
+      version: 3,
+      compatibility: { outcome: 'compatible' }
+    })
+
+    await renderTab('/skills?tab=collective&wisdomAction=update&wisdomSkillId=skill-1')
+
+    await waitFor(() => expect(planWisdomUpdate).toHaveBeenCalledWith('skill-1', scope))
+    expect((await screen.findByRole('region', { name: 'Confirm update' })).textContent).toContain('wup_notification')
+    expect(applyWisdomUpdate).not.toHaveBeenCalled()
   })
 
   it('plans a pasted Portal install link before allowing an install', async () => {

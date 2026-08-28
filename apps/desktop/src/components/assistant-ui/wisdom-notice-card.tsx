@@ -56,6 +56,15 @@ export function WisdomNoticeCard({ profile }: { profile?: ProfileScope }) {
           notifyError(error, 'Could not acknowledge Wisdom notifications')
         }
       }}
+      onPlanAction={(action, event) => {
+        const params = new URLSearchParams({
+          tab: 'collective',
+          wisdomAction: action,
+          wisdomSkillId: event.skill_id
+        })
+
+        window.location.hash = `#/skills?${params.toString()}`
+      }}
     />
   )
 }
