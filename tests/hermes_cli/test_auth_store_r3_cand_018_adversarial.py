@@ -265,6 +265,38 @@ def test_windows_ancestor_swap_between_check_and_open_is_rejected(tmp_path):
         moved_parent.rename(original_parent)
 
 
+@pytest.mark.windows_only
+def test_windows_sidecar_race_does_not_publish_into_swapped_ancestor(tmp_path, monkeypatch):
+    """Sidecar publication must fail closed if its ancestor is swapped."""
+    original_parent = tmp_path / "auth-home"
+    original_parent.mkdir()
+    primary = original_parent / "auth.json"
+    primary.write_bytes(b"{broken")
+    attacker_parent = tmp_path / "attacker-home"
+    attacker_parent.mkdir()
+    moved_parent = tmp_path / "auth-home-original"
+    real_link = os.link
+    swapped = False
+
+    def swap_then_link(source, destination, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            original_parent.rename(moved_parent)
+            original_parent.symlink_to(attacker_parent, target_is_directory=True)
+            swapped = True
+        return real_link(source, destination, **kwargs)
+
+    monkeypatch.setattr(owner.os, "link", swap_then_link)
+    try:
+        assert owner._write_corrupt_sidecar(primary, b"credential-bearing-corruption") is None
+        assert not list(attacker_parent.glob("*.corrupt*"))
+    finally:
+        if original_parent.is_symlink():
+            original_parent.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(original_parent)
+
+
 def test_auth_recover_command_imports_valid_json(tmp_path, capsys):
     primary = tmp_path / "auth.json"
     _corrupt(primary)
@@ -276,3 +308,76 @@ def test_auth_recover_command_imports_valid_json(tmp_path, capsys):
     auth_recover_command(type("Args", (), {"target": str(primary), "source": str(replacement)})())
     assert json.loads(primary.read_text(encoding="utf-8"))["providers"] == {"cli": {"ok": True}}
     assert "Recovered auth store:" in capsys.readouterr().out
+
+
+def test_recovery_cas_rechecks_after_serialization_callback(tmp_path, monkeypatch):
+    """A target mutation after preflight must abort the recovery publication."""
+    primary = tmp_path / "auth.json"
+    original = _corrupt(primary)
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    real_publish = owner._atomic_publish_auth_store
+
+    def race_publish(tmp_path_arg, auth_file, **kwargs):
+        assert auth_file == primary
+        primary.write_bytes(b"{changed-in-publication-window")
+        return real_publish(tmp_path_arg, auth_file, **kwargs)
+
+    monkeypatch.setattr(owner, "_atomic_publish_auth_store", race_publish)
+    with pytest.raises(auth.AuthStoreRecoveryConflictError):
+        auth.recover_auth_store(
+            _replacement(),
+            primary,
+            expected_corrupt_sha256=hashlib.sha256(original).hexdigest(),
+            expected_corrupt_path=primary,
+        )
+    assert primary.read_bytes() == b"{changed-in-publication-window"
+
+
+@pytest.mark.windows_only
+def test_windows_publication_rejects_ancestor_swap_before_source_open(tmp_path, monkeypatch):
+    """A retained parent handle must reject a deterministic ancestor swap."""
+    original_parent = tmp_path / "auth-home"
+    original_parent.mkdir()
+    source = original_parent / "source"
+    source.write_bytes(b"source")
+    attacker_parent = tmp_path / "attacker-home"
+    attacker_parent.mkdir()
+    (attacker_parent / "source").write_bytes(b"attacker")
+    moved_parent = tmp_path / "auth-home-original"
+    parent_handle = owner._windows_open_no_reparse(
+        original_parent,
+        directory=True,
+        share_mode=7,
+    )
+    real_final_path = owner._windows_final_path
+    calls = 0
+
+    def swap_after_parent_validation(path, handle, win32file):
+        nonlocal calls
+        result = real_final_path(path, handle, win32file)
+        calls += 1
+        if calls == 1:
+            original_parent.rename(moved_parent)
+            original_parent.symlink_to(attacker_parent, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(owner, "_windows_final_path", swap_after_parent_validation)
+    try:
+        with pytest.raises(OSError, match="escaped"):
+            owner._windows_rename_relative(
+                source,
+                parent_handle,
+                "published",
+                replace_existing=True,
+            )
+        assert not (attacker_parent / "published").exists()
+    finally:
+        import win32file
+
+        win32file.CloseHandle(parent_handle)
+        if original_parent.is_symlink():
+            original_parent.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(original_parent)

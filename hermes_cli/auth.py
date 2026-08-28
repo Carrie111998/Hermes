@@ -1205,7 +1205,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     Writes always go to the profile (``write_credential_pool`` is unchanged).
     See issue #18594 follow-up.
     """
-    auth_store = _load_auth_store()
+    auth_store = _load_auth_store(allow_legacy_empty=True)
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
@@ -1329,7 +1329,7 @@ def write_credential_pool(
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
-        auth_store = _load_auth_store()
+        auth_store = _load_auth_store(allow_legacy_empty=True)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1378,7 +1378,7 @@ def suppress_credential_source(provider_id: str, source: str) -> None:
     canonical list form before appending the requested source.
     """
     with _auth_store_lock():
-        auth_store = _load_auth_store()
+        auth_store = _load_auth_store(allow_legacy_empty=True)
         suppressed = auth_store.get("suppressed_sources")
         if not isinstance(suppressed, dict):
             suppressed = {}
@@ -1415,7 +1415,7 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
     Returns True if a marker was cleared, False if no marker existed.
     """
     with _auth_store_lock():
-        auth_store = _load_auth_store()
+        auth_store = _load_auth_store(allow_legacy_empty=True)
         suppressed = auth_store.get("suppressed_sources")
         if not isinstance(suppressed, dict):
             return False
