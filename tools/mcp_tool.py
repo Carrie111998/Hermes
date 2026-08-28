@@ -5028,10 +5028,11 @@ def _handle_auth_error_and_retry(
                 parsed = json.loads(result)
                 if "error" not in parsed:
                     _reset_server_error(server_name)
-                    return result
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)
-                return result
+            # A returned payload is a completed retry. Surface rendered tool
+            # errors as-is; their JSON shape says nothing about reachability.
+            return result
         except Exception as retry_exc:
             logger.warning(
                 "MCP %s/%s retry after auth recovery failed: %s",
@@ -5222,10 +5223,11 @@ def _handle_session_expired_and_retry(
             parsed = json.loads(result)
             if "error" not in parsed:
                 _reset_server_error(server_name)
-                return result
         except (json.JSONDecodeError, TypeError):
             _reset_server_error(server_name)
-            return result
+        # A returned payload is a completed retry. Surface rendered tool
+        # errors as-is; their JSON shape says nothing about reachability.
+        return result
     except Exception as retry_exc:
         logger.warning(
             "MCP %s/%s retry after session reconnect failed: %s",
@@ -6075,6 +6077,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        rpc_round_trip_completed = False
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -6143,6 +6147,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
         async def _call():
+            nonlocal rpc_round_trip_completed
             _mark_server_call_started(server)
             async with server._rpc_lock, _track_inflight_rpc(
                 server, server_name, f"tools/call {tool_name}"
@@ -6168,9 +6173,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # Dead children but stale server.session, so the
                         # transport-down path above never fired — signal the
                         # server task to respawn and return a clean
-                        # reconnecting error. No explicit _bump_server_error:
-                        # the error return flows through the handler's JSON
-                        # parse, which already bumps once.
+                        # reconnecting error. This is a known transport
+                        # failure; leaving rpc_round_trip_completed false
+                        # charges the reachability breaker in _call_once.
                         if _signal_reconnect(server):
                             return tool_error(
                                 f"MCP server '{server_name}' stdio subprocess is "
@@ -6235,6 +6240,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             await asyncio.gather(
                                 rpc_task, watch_task, return_exceptions=True
                             )
+                    rpc_round_trip_completed = True
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -6368,20 +6374,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+            nonlocal rpc_round_trip_completed
+            rpc_round_trip_completed = False
+            result = _run_on_mcp_loop(_call, timeout=tool_timeout)
+            # Reachability follows transport facts, not the rendered JSON
+            # payload. A completed CallTool RPC proves the backend is live,
+            # including when the tool reports an application/input error.
+            if rpc_round_trip_completed:
+                _reset_server_error(server_name)
+            else:
+                # The only non-raising result without an RPC round trip is
+                # the known-dead stdio fast-fail above.
+                _bump_server_error(server_name)
+            return result
 
         try:
-            result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
-            return result
+            return _call_once()
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
