@@ -552,6 +552,10 @@ export function useGatewayBoot({
     async function seedDefaultCwd(shouldPublish: () => boolean = () => true) {
       await ensureDefaultWorkspaceCwd(shouldPublish)
 
+      await seedBackendDefaultCwd(shouldPublish)
+    }
+
+    async function seedBackendDefaultCwd(shouldPublish: () => boolean = () => true) {
       if (!shouldPublish()) {
         return
       }
@@ -651,18 +655,40 @@ export function useGatewayBoot({
 
         void refreshActiveProfile().catch(() => undefined)
 
-        await Promise.all([
-          seedDefaultCwd(ownsSwitch),
-          callbacksRef.current.refreshHermesConfig(false, ownsSwitch).catch(() => undefined),
-          callbacksRef.current.refreshSessions(ownsSwitch).catch(() => undefined)
-        ])
+        // The connected socket/profile is the usable interaction boundary.
+        // Workspace validation, settings, and indexed session rows hydrate
+        // behind it; none is allowed to keep the switch overlay up. Preserve a
+        // source/activation guard so a late result from switch A cannot publish
+        // into a newer switch B after this switch token is released.
+        const hydrationEpoch = gatewayActivationEpoch()
 
-        if (!ownsSwitch()) {
-          return
-        }
+        const ownsHydration = () =>
+          !cancelled &&
+          gatewayActivationEpoch() === hydrationEpoch &&
+          $connection.get()?.connectionId === conn.connectionId &&
+          $connection.get()?.profile === conn.profile
 
         completeDesktopBoot()
         bootCompleted = true
+
+        void Promise.allSettled([
+          seedDefaultCwd(ownsHydration),
+          callbacksRef.current.refreshHermesConfig(false, ownsHydration),
+          callbacksRef.current.refreshSessions(ownsHydration)
+        ]).then(results => {
+          for (const [index, result] of results.entries()) {
+            if (result.status === 'rejected') {
+              console.warn(
+                [
+                  'Failed to sync workspace cwd after switch',
+                  'Failed to load Hermes settings',
+                  'Failed to load sessions'
+                ][index],
+                result.reason
+              )
+            }
+          }
+        })
       } catch (err) {
         const mayPublishFailure =
           !cancelled && (switchToken === null ? !$gatewaySwitching.get() : isCurrentGatewaySwitch(switchToken))
@@ -994,18 +1020,14 @@ export function useGatewayBoot({
         publish(conn)
         setPrimaryGatewayConnection(conn)
 
-        // Seed the workspace BEFORE the gateway opens: every session-restore
-        // path is gated on gatewayState === 'open', so nothing can be active yet
-        // and ensureDefaultWorkspaceCwd's live-session guard passes. The
-        // post-connect seed could lose that race on a slow start (#71873). A
-        // resumed session's own cwd still supersedes this once its runtime
-        // arrives. Non-fatal: the remembered cwd is a fine fallback and the
-        // post-connect pass retries the sync.
-        try {
-          await ensureDefaultWorkspaceCwd()
-        } catch (err) {
+        // Workspace validation is cache hydration, not a connection
+        // prerequisite. Start it now so the common fast result wins the race,
+        // but never hold the WebSocket or shell behind filesystem/settings IPC.
+        // Its own live-session guard ensures a later result cannot overwrite a
+        // resumed session's authoritative cwd.
+        const cwdSeed = ensureDefaultWorkspaceCwd().catch(err => {
           console.warn('Failed to seed default workspace cwd pre-connect', err)
-        }
+        })
 
         // Mint a fresh WS URL right before connecting. For OAuth gateways the
         // ticket is single-use with a short TTL, so the ticket baked into
@@ -1039,30 +1061,44 @@ export function useGatewayBoot({
           progress: 97
         })
 
-        await Promise.all([
-          // The pre-connect seed already applied the configured default; this
-          // post-connect pass covers the remote backend default. Non-fatal: a
-          // failed sync must not abort boot (the remembered cwd remains).
-          seedDefaultCwd().catch(err => console.warn('Failed to sync default workspace cwd post-connect', err)),
-          callbacksRef.current.refreshHermesConfig(),
-          // Session-list population is never boot-fatal. The gateway WS is
-          // already open by this point — a failed sidebar fetch (transient
-          // blip, or an endpoint the fallback couldn't cover) must leave the
-          // app usable with an empty sidebar (the reconnect/turn refreshes
-          // retry it), not brick boot behind the "Hermes couldn't start"
-          // overlay. Matches the reconnect + softSwitch call sites.
-          callbacksRef.current.refreshSessions().catch(() => {
-            setSessionsLoading(false)
-          })
-        ])
-
-        if (cancelled) {
-          return
-        }
-
+        // The socket and profile are the interaction boundary. Settings, cwd,
+        // and sidebar rows are independent cache hydration: let their existing
+        // skeleton/stale states fill in without holding the whole app in boot.
         completeDesktopBoot()
         bootCompleted = true
         bootRetryAttempt = 0
+
+        const stillCurrent = () =>
+          !cancelled &&
+          !$gatewaySwitching.get() &&
+          $connection.get()?.connectionId === conn.connectionId &&
+          $connection.get()?.profile === conn.profile
+
+        void Promise.allSettled([
+          // The pre-connect seed already applied the configured default; this
+          // post-connect pass covers the remote backend default. Non-fatal: a
+          // failed sync must not abort boot (the remembered cwd remains).
+          cwdSeed.then(() => seedBackendDefaultCwd(stillCurrent)),
+          callbacksRef.current.refreshHermesConfig(),
+          callbacksRef.current.refreshSessions()
+        ]).then(results => {
+          if (results[2]?.status === 'rejected' && stillCurrent()) {
+            setSessionsLoading(false)
+          }
+
+          for (const [index, result] of results.entries()) {
+            if (result.status === 'rejected') {
+              console.warn(
+                [
+                  'Failed to sync default workspace cwd post-connect',
+                  'Failed to load Hermes settings',
+                  'Failed to load sessions'
+                ][index],
+                result.reason
+              )
+            }
+          }
+        })
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err)

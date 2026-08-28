@@ -746,7 +746,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(FakeWebSocket.instances).toHaveLength(socketCount)
   })
 
-  it('passes switch ownership through a session refresh held across a newer switch', async () => {
+  it('keeps a switched connection interactive while stale session hydration is still pending', async () => {
     const staleRefresh = deferred<void>()
     const publications: string[] = []
     let switchRefresh = 0
@@ -774,6 +774,9 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     act(() => connectionApplied?.())
     await vi.waitFor(() => expect(switchRefresh).toBe(1))
+
+    expect($gatewaySwitching.get()).toBe(false)
+    expect($desktopBoot.get().visible).toBe(false)
 
     act(() => connectionApplied?.())
     await vi.waitFor(() => expect(switchRefresh).toBe(2))
@@ -1415,20 +1418,20 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().visible).toBe(false)
   })
 
-  it('FIX: a failed session-list fetch during boot is non-fatal — the app still boots', async () => {
-    // The version-skew report: gateway WS connects fine, but refreshSessions()
-    // rejects (e.g. older backend 404s an endpoint the fallback didn't cover,
-    // or a transient read error). That must NOT reject boot() into
-    // failDesktopBoot's "Hermes couldn't start" overlay — the socket is open
-    // and the app is fully usable with an empty sidebar.
+  it('keeps the connected app usable when noncritical startup hydration fails', async () => {
     const refreshSessions = vi.fn(async () => {
       throw new Error('404: {"detail":"No such API endpoint: /api/profiles/sessions/sidebar"}')
     })
 
-    render(<Harness refreshSessions={refreshSessions} />)
+    const refreshHermesConfig = vi.fn(async () => {
+      throw new Error('settings read failed')
+    })
+
+    render(<Harness refreshHermesConfig={refreshHermesConfig} refreshSessions={refreshSessions} />)
     await flushAsync()
 
     expect(refreshSessions).toHaveBeenCalled()
+    expect(refreshHermesConfig).toHaveBeenCalled()
     expect($gatewayState.get()).toBe('open')
     // Boot completed: no error, overlay dismissed.
     expect($desktopBoot.get().error).toBeNull()
@@ -1436,32 +1439,42 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().phase).toBe('renderer.ready')
   })
 
-  it('seeds the configured default project dir pre-connect — no route-resume race (#71873)', async () => {
-    // The reporter's scenario: a configured default project dir must be applied
-    // at boot regardless of route-resume timing. The seed now runs BEFORE the
-    // gateway opens, so no session restore can race it (route-resume is gated
-    // on gatewayState === 'open').
+  it('makes the connected shell interactive before initial hydration finishes', async () => {
+    const sessions = deferred<void>()
+    const config = deferred<void>()
+    const refreshSessions = vi.fn(() => sessions.promise)
+    const refreshHermesConfig = vi.fn(() => config.promise)
+
+    render(<Harness refreshHermesConfig={refreshHermesConfig} refreshSessions={refreshSessions} />)
+    await flushAsync()
+
+    expect(refreshSessions).toHaveBeenCalledOnce()
+    expect(refreshHermesConfig).toHaveBeenCalledOnce()
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().phase).toBe('renderer.ready')
+    expect($desktopBoot.get().visible).toBe(false)
+
+    sessions.resolve()
+    config.resolve()
+    await flushAsync()
+  })
+
+  it('does not hold gateway connection behind configured workspace validation', async () => {
     const desktop = fakeDesktop() as {
       sanitizeWorkspaceCwd?: unknown
       settings?: unknown
     }
 
+    const configuredDir = deferred<{ defaultLabel: string; dir: string; resolvedCwd: string }>()
+
     desktop.settings = {
-      getDefaultProjectDir: vi.fn(async () => ({
-        defaultLabel: 'C:\\Users\\sonny',
-        dir: 'C:\\Hermes',
-        resolvedCwd: 'C:\\Hermes'
-      })),
+      getDefaultProjectDir: vi.fn(() => configuredDir.promise),
       pickDefaultProjectDir: vi.fn(async () => undefined),
       setDefaultProjectDir: vi.fn(async () => undefined)
     }
     desktop.sanitizeWorkspaceCwd = vi.fn(async (cwd: string) => ({ cwd }))
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
 
-    // Record the cwd at the exact moment the gateway opens its WebSocket: if
-    // the seed moved back post-connect, this would still be '' here and the
-    // end-state assertion would pass anyway (the seed would run later in the
-    // same flush). The construction-time snapshot is what proves ordering.
     let cwdAtConnect = ''
 
     class RecordingSocket extends FakeWebSocket {
@@ -1476,8 +1489,52 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     render(<Harness />)
     await flushAsync()
 
-    expect(cwdAtConnect).toBe('C:\\Hermes')
+    expect(cwdAtConnect).toBe('')
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().visible).toBe(false)
+
+    configuredDir.resolve({
+      defaultLabel: 'C:\\Users\\sonny',
+      dir: 'C:\\Hermes',
+      resolvedCwd: 'C:\\Hermes'
+    })
+    await flushAsync()
+
     expect($currentCwd.get()).toBe('C:\\Hermes')
+  })
+
+  it('does not let delayed workspace validation overwrite a resumed session cwd (#71873)', async () => {
+    const desktop = fakeDesktop() as {
+      sanitizeWorkspaceCwd?: unknown
+      settings?: unknown
+    }
+
+    const configuredDir = deferred<{ defaultLabel: string; dir: string; resolvedCwd: string }>()
+
+    desktop.settings = {
+      getDefaultProjectDir: vi.fn(() => configuredDir.promise),
+      pickDefaultProjectDir: vi.fn(async () => undefined),
+      setDefaultProjectDir: vi.fn(async () => undefined)
+    }
+    desktop.sanitizeWorkspaceCwd = vi.fn(async (cwd: string) => ({ cwd }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    setActiveSessionId('resumed-session')
+    $currentCwd.set('C:\\Session')
+
+    configuredDir.resolve({
+      defaultLabel: 'C:\\Users\\sonny',
+      dir: 'C:\\Hermes',
+      resolvedCwd: 'C:\\Hermes'
+    })
+    await flushAsync()
+
+    expect($activeSessionId.get()).toBe('resumed-session')
+    expect($currentCwd.get()).toBe('C:\\Session')
   })
 
   it('FIX: primary sleep/wake reconnect dials the window backend, not the active secondary profile', async () => {
