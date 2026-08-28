@@ -53,6 +53,7 @@ class Client:
         self.deactivated: list[tuple[str, str]] = []
         self.feed_pages: list[Feed] = []
         self.drafts = []
+        self.discovery = []
 
     def installations(self, _identity):
         return [
@@ -90,6 +91,10 @@ class Client:
 
     def list_drafts(self):
         return self.drafts
+
+    def list_skills(self, *, cursor=None):
+        assert cursor is None
+        return SimpleNamespace(skills=self.discovery, next_cursor=None)
 
     def deactivate_install(self, installation_id, skill_id):
         self.deactivated.append((installation_id, skill_id))
@@ -344,6 +349,12 @@ def test_returned_draft_invalidates_receipt_and_preserves_moderator_note(
     assert notice["payload"]["moderation_note"] == (
         "Remove the environment-specific hostname."
     )
+    notification = manager.notifications()["events"][0]
+    assert notification["category"] == "publication_decision"
+    assert notification["skill_name"] == "owner-skill"
+    assert notification["portal_url"].endswith(
+        "/orgs/org-1/wisdom/review/draft-1"
+    )
 
 
 def test_update_recovers_when_swap_won_before_journal_advance(
@@ -472,13 +483,135 @@ def test_feed_cursor_is_durable_deduplicated_and_telegram_uses_home_target(
 
     calls = []
     monkeypatch.setattr(
-        "tools.send_message_tool.send_message_tool",
-        lambda args: calls.append(args) or json.dumps({"success": True}),
+        "tools.send_message_tool.send_telegram_notification_pane",
+        lambda **kwargs: calls.append(kwargs) or {"success": True},
     )
     delivered = manager.dispatch_telegram()
     assert delivered == {"attempted": True, "delivered": 1}
-    assert calls[0]["target"] == "telegram"
-    assert ":-" not in calls[0]["target"]
+    assert "managed-skill" in calls[0]["message"]
+    assert "skill-1" not in calls[0]["message"]
+    assert calls[0]["buttons"] == [
+        {
+            "label": "View managed-skill v2",
+            "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
+        }
+    ]
+
+
+def test_notifications_resolve_org_skill_names_filter_noise_and_deep_link(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(_files(2))
+    client.discovery = [
+        SimpleNamespace(
+            id="remote-skill",
+            slug="team-runbook",
+            latest_version=3,
+            model_dump=lambda **_kwargs: {
+                "id": "remote-skill",
+                "slug": "team-runbook",
+                "latest_version": 3,
+            },
+        )
+    ]
+    manager, _target = _manager(monkeypatch, tmp_path, client=client)
+    manager.config = {
+        "portal_url": "http://127.0.0.1:3111",
+        "notifications": {"new_skills": "immediate"},
+    }
+    client.feed_pages = [
+        Feed.model_validate({
+            "events": [
+                {
+                    "event_id": "event-new",
+                    "kind": "new",
+                    "skill_id": "remote-skill",
+                    "version": 3,
+                    "takedown_generation": 0,
+                    "installation_id": None,
+                    "update_mode": None,
+                    "occurred_at": "2026-08-24T00:00:00+00:00",
+                },
+                {
+                    "event_id": "event-restored",
+                    "kind": "restored",
+                    "skill_id": "remote-skill",
+                    "version": 3,
+                    "takedown_generation": 0,
+                    "installation_id": None,
+                    "update_mode": None,
+                    "occurred_at": "2026-08-24T00:00:01+00:00",
+                },
+            ],
+            "next_cursor": "cursor-notifications",
+            "has_more": False,
+        })
+    ]
+
+    assert manager.poll_feed()["inserted"] == 2
+    notifications = manager.notifications()["events"]
+    assert notifications == [
+        {
+            "event_id": "event-new",
+            "source_event_ids": ["event-new"],
+            "category": "new_skill",
+            "kind": "new",
+            "skill_id": "remote-skill",
+            "skill_name": "team-runbook",
+            "version": 3,
+            "state": None,
+            "moderation_note": None,
+            "portal_url": "http://127.0.0.1:3111/orgs/org-1/wisdom/skills/remote-skill?version=3",
+            "occurred_at": "2026-08-24T00:00:00Z",
+        }
+    ]
+    assert [
+        item["event_id"] for item in manager.store.feed_events(unseen_only=True)
+    ] == ["event-new"]
+    manager.notifications(mark_seen=True)
+    assert manager.notifications()["events"] == []
+
+
+def test_install_notifications_are_limited_to_this_installation(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(_files(2))
+    manager, _target = _manager(monkeypatch, tmp_path, client=client)
+    local_identity = manager.store.installation_identity()
+    client.feed_pages = [
+        Feed.model_validate({
+            "events": [
+                {
+                    "event_id": "event-local-install",
+                    "kind": "installed",
+                    "skill_id": "skill-1",
+                    "version": 1,
+                    "takedown_generation": 0,
+                    "installation_id": local_identity,
+                    "update_mode": "MANUAL",
+                    "occurred_at": "2026-08-24T00:00:00+00:00",
+                },
+                {
+                    "event_id": "event-other-install",
+                    "kind": "installed",
+                    "skill_id": "skill-1",
+                    "version": 1,
+                    "takedown_generation": 0,
+                    "installation_id": "hwi_other-device",
+                    "update_mode": "MANUAL",
+                    "occurred_at": "2026-08-24T00:00:01+00:00",
+                },
+            ],
+            "next_cursor": "cursor-installs",
+            "has_more": False,
+        })
+    ]
+
+    manager.poll_feed()
+    events = manager.notifications()["events"]
+    assert len(events) == 1
+    assert events[0]["category"] == "installed"
+    assert events[0]["source_event_ids"] == ["event-local-install"]
 
 
 def test_off_cadence_suppresses_local_and_telegram_delivery(

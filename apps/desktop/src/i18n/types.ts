@@ -132,10 +132,13 @@ export interface WisdomTranslations {
   decisionDeclined: (skill: string) => string
   decisionChanged: (skill: string, state: string) => string
   installedNotice: (skill: string, version?: string) => string
+  updatedNotice: (skill: string, version?: string) => string
   updateNotice: (skill: string, version?: string) => string
   newSkillNotice: (skill: string) => string
+  unavailableNotice: (skill: string) => string
   archivedNotice: (skill: string) => string
   takedownNotice: (skill: string) => string
+  viewSkill: string
   markSeen: string
 }
 

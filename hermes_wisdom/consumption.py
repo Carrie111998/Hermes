@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
 import uuid
+from html import escape
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
+from urllib.parse import quote, urlencode
 
 from hermes_constants import get_skills_dir
 
@@ -34,6 +37,7 @@ from .store import WisdomStore
 
 
 UPDATE_MODES = {"MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"}
+logger = logging.getLogger(__name__)
 
 
 def _tree_hashes(root: Path) -> dict[str, str]:
@@ -94,9 +98,7 @@ def _safe_target(store: WisdomStore, installation: dict[str, Any]) -> Path:
     org_id = store.active_org_id()
     if not org_id or installation["org_id"] != org_id:
         raise PackagePolicyError("managed installation belongs to another organization")
-    managed_root = (
-        get_skills_dir() / "_wisdom" / org_directory_name(org_id)
-    ).resolve()
+    managed_root = (get_skills_dir() / "_wisdom" / org_directory_name(org_id)).resolve()
     target = Path(str(installation["target_path"])).resolve()
     try:
         target.relative_to(managed_root)
@@ -132,6 +134,204 @@ class WisdomConsumption:
         self.client = client
         self.scan = scan
         self.config = config
+
+    def _portal_url(
+        self,
+        *,
+        skill_id: str | None = None,
+        version: int | None = None,
+        draft_id: str | None = None,
+    ) -> str | None:
+        org_id = self.store.active_org_id()
+        if not org_id:
+            return None
+        org_slug = org_id.split(":", 1)[-1]
+        base = str(
+            self.config.get("portal_url") or "https://portal.nousresearch.com"
+        ).rstrip("/")
+        if draft_id:
+            return (
+                f"{base}/orgs/{quote(org_slug, safe='')}/wisdom/review/"
+                f"{quote(draft_id, safe='')}"
+            )
+        if not skill_id:
+            return None
+        url = (
+            f"{base}/orgs/{quote(org_slug, safe='')}/wisdom/skills/"
+            f"{quote(skill_id, safe='')}"
+        )
+        return f"{url}?{urlencode({'version': version})}" if version else url
+
+    def _notification_catalog(
+        self, events: list[dict[str, Any]]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        by_id: dict[str, dict[str, Any]] = {}
+        by_slug: dict[str, dict[str, Any]] = {}
+        for installation in self.store.installations():
+            item = dict(installation)
+            by_id[str(item["skill_id"])] = item
+            slug = item.get("slug")
+            if isinstance(slug, str) and slug:
+                by_slug[slug] = item
+
+        unresolved = {
+            str(event["skill_id"])
+            for event in events
+            if str(event["skill_id"]) not in by_id
+        }
+        if not unresolved:
+            return by_id, by_slug
+
+        cursor: str | None = None
+        try:
+            for _page in range(20):
+                response = self.client.list_skills(cursor=cursor)
+                for skill in response.skills:
+                    item = skill.model_dump(mode="json")
+                    by_id[skill.id] = item
+                    by_slug[skill.slug] = item
+                cursor = response.next_cursor
+                if not cursor or not (unresolved - by_id.keys()):
+                    break
+        except Exception:
+            # Notification rendering is an enhancement. A temporary discovery
+            # failure must not break update checks or expose opaque identifiers.
+            logger.debug("Wisdom notification enrichment failed", exc_info=True)
+        return by_id, by_slug
+
+    def _notification_projection(
+        self, events: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        by_id, by_slug = self._notification_catalog(events)
+        installed_ids = {
+            str(item["skill_id"])
+            for item in self.store.installations()
+            if str(item.get("state") or "active") == "active"
+        }
+        local_installation_id = self.store.existing_installation_identity()
+        installation_updates = {
+            (str(item["skill_id"]), item.get("version"))
+            for item in events
+            if str(item.get("kind")) == "installation_updated"
+            and local_installation_id
+            and str((item.get("payload") or {}).get("installation_id") or "")
+            == local_installation_id
+        }
+        grouped: dict[tuple[str, str, int | None, str], dict[str, Any]] = {}
+        ignored: list[str] = []
+
+        for event in events:
+            event_id = str(event["event_id"])
+            payload = event.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            kind = str(event.get("kind") or "")
+            skill_id = str(event.get("skill_id") or payload.get("skill_id") or "")
+            state = str(payload.get("state") or "")
+            version_value = event.get("version") or payload.get("version")
+            version = (
+                int(version_value)
+                if isinstance(version_value, int) and version_value > 0
+                else None
+            )
+
+            category: str | None = None
+            if kind == "owner_decision":
+                category = "publication_decision"
+            elif kind == "new":
+                category = "new_skill"
+            elif (
+                kind == "installed"
+                and local_installation_id
+                and str(payload.get("installation_id") or "") == local_installation_id
+            ):
+                category = "installed"
+            elif (
+                kind == "installation_updated"
+                and local_installation_id
+                and str(payload.get("installation_id") or "") == local_installation_id
+            ):
+                category = "updated"
+            elif kind == "updated" and skill_id in installed_ids:
+                category = (
+                    "updated"
+                    if (skill_id, version) in installation_updates
+                    else "update_available"
+                )
+            elif kind in {"archived", "taken_down"} and skill_id in installed_ids:
+                category = "unavailable"
+
+            if category is None:
+                ignored.append(event_id)
+                continue
+
+            slug = str(payload.get("slug") or "")
+            catalog_item = by_id.get(skill_id)
+            if not catalog_item and slug:
+                catalog_item = by_slug.get(slug)
+            if catalog_item:
+                authoritative_id = str(catalog_item.get("id") or skill_id)
+                slug = str(catalog_item.get("slug") or slug)
+                if version is None:
+                    latest = catalog_item.get("latest_version")
+                    version = latest if isinstance(latest, int) and latest > 0 else None
+                skill_id = authoritative_id
+            elif not slug:
+                ignored.append(event_id)
+                continue
+
+            draft_id = str(payload.get("draft_id") or "") or None
+            use_draft_link = category == "publication_decision" and (
+                state != "published" or catalog_item is None
+            )
+            portal_url = self._portal_url(
+                skill_id=skill_id,
+                version=version,
+                draft_id=draft_id if use_draft_link else None,
+            )
+            key = (category, skill_id, version, state)
+            existing = grouped.get(key)
+            if existing:
+                existing["source_event_ids"].append(event_id)
+                continue
+            grouped[key] = {
+                "event_id": event_id,
+                "source_event_ids": [event_id],
+                "category": category,
+                "kind": kind,
+                "skill_id": skill_id,
+                "skill_name": slug,
+                "version": version,
+                "state": state or None,
+                "moderation_note": payload.get("moderation_note"),
+                "portal_url": portal_url,
+                "occurred_at": event.get("created_at") or payload.get("occurred_at"),
+            }
+
+        return list(grouped.values()), ignored
+
+    @staticmethod
+    def _telegram_notification_text(event: dict[str, Any]) -> tuple[str, str]:
+        name = escape(str(event["skill_name"]))
+        version = f" · v{event['version']}" if event.get("version") else ""
+        category = str(event["category"])
+        state = str(event.get("state") or "")
+        if category == "publication_decision":
+            if state in {"published", "approved"}:
+                return "✅ <b>Your skill was published</b>", f"{name}{version}"
+            if state == "changes_requested":
+                return "✏️ <b>Your skill needs changes</b>", f"{name}{version}"
+            if state in {"declined", "rejected"}:
+                return "↩️ <b>Your skill was not published</b>", f"{name}{version}"
+            return "📣 <b>Your contribution changed</b>", f"{name}{version}"
+        if category == "new_skill":
+            return "🆕 <b>New skill from your team</b>", f"{name}{version}"
+        if category == "installed":
+            return "⬇️ <b>Installed on this device</b>", f"{name}{version}"
+        if category == "updated":
+            return "✅ <b>Updated on this device</b>", f"{name}{version}"
+        if category == "update_available":
+            return "⬆️ <b>Update available</b>", f"{name}{version}"
+        return "⚠️ <b>Installed skill is unavailable</b>", f"{name}{version}"
 
     def _remote_installations(self) -> dict[str, dict[str, Any]]:
         identity = self.store.installation_identity()
@@ -914,27 +1114,48 @@ class WisdomConsumption:
 
     def notifications(self, *, mark_seen: bool = False) -> dict[str, Any]:
         events = self.store.feed_events(unseen_only=True)
+        notifications, ignored = self._notification_projection(events)
+        self.store.mark_feed_local_seen(ignored)
         if mark_seen:
-            self.store.mark_feed_local_seen([str(item["event_id"]) for item in events])
-        return {"events": events}
+            source_ids = [
+                str(event_id)
+                for item in notifications
+                for event_id in item["source_event_ids"]
+            ]
+            self.store.mark_feed_local_seen(source_ids)
+        return {"events": notifications}
 
     def dispatch_telegram(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
         due = self.store.feed_events(telegram_due_at=now)
         if not due:
             return {"attempted": False, "delivered": 0}
-        lines = ["Hermes Collective Wisdom"]
-        for event in due[:50]:
-            version = f" v{event['version']}" if event.get("version") else ""
-            lines.append(f"- {event['kind']}: {event['skill_id']}{version}")
+        notifications, ignored = self._notification_projection(due)
+        selected = notifications[:8]
+        if not selected:
+            self.store.mark_feed_telegram_delivered(ignored)
+            return {"attempted": False, "delivered": 0}
+        lines = [
+            "<b>Collective Wisdom</b>",
+            f"{len(selected)} new {'update' if len(selected) == 1 else 'updates'}",
+        ]
+        buttons: list[dict[str, str]] = []
+        for event in selected:
+            heading, detail = self._telegram_notification_text(event)
+            lines.extend(["", heading, detail])
+            portal_url = event.get("portal_url")
+            if isinstance(portal_url, str) and portal_url:
+                version = f" v{event['version']}" if event.get("version") else ""
+                buttons.append({
+                    "label": f"View {event['skill_name']}{version}",
+                    "url": portal_url,
+                })
         try:
-            from tools.send_message_tool import send_message_tool
+            from tools.send_message_tool import send_telegram_notification_pane
 
-            raw = send_message_tool({
-                "action": "send",
-                "target": "telegram",
-                "message": "\n".join(lines),
-            })
+            raw = send_telegram_notification_pane(
+                message="\n".join(lines), buttons=buttons
+            )
             result = json.loads(raw) if isinstance(raw, str) else raw
         except Exception as exc:
             return {"attempted": True, "delivered": 0, "error": str(exc)}
@@ -946,6 +1167,9 @@ class WisdomConsumption:
                     result.get("error") if isinstance(result, dict) else result
                 ),
             }
-        ids = [str(item["event_id"]) for item in due[:50]]
+        ids = [
+            str(event_id) for item in selected for event_id in item["source_event_ids"]
+        ]
+        ids.extend(ignored)
         self.store.mark_feed_telegram_delivered(ids)
-        return {"attempted": True, "delivered": len(ids)}
+        return {"attempted": True, "delivered": len(selected)}

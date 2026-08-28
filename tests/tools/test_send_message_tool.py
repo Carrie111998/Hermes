@@ -242,10 +242,36 @@ def _make_config():
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
+
+    class InlineKeyboardButton:
+        def __init__(self, text, *, url):
+            self.text = text
+            self.url = url
+
+        def to_dict(self):
+            return {"text": self.text, "url": self.url}
+
+    class InlineKeyboardMarkup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
+        def to_dict(self):
+            return {
+                "inline_keyboard": [
+                    [button.to_dict() for button in row] for row in self.inline_keyboard
+                ]
+            }
+
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+    telegram_mod = SimpleNamespace(
+        Bot=lambda token: bot,
+        InlineKeyboardButton=InlineKeyboardButton,
+        InlineKeyboardMarkup=InlineKeyboardMarkup,
+        MessageEntity=_MessageEntity,
+        constants=constants_mod,
+    )
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
@@ -778,6 +804,46 @@ class TestSendTelegramHtmlDetection:
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["parse_mode"] == "HTML"
         assert kwargs["text"] == "<b>Hello</b> world"
+
+    def test_notification_url_buttons_render_as_action_rows(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(
+            _send_telegram(
+                "tok",
+                "123",
+                "<b>Collective Wisdom</b>",
+                url_buttons=[
+                    {
+                        "label": "View team-runbook v3",
+                        "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
+                    },
+                    {
+                        "label": "Review release-checklist",
+                        "url": "https://portal.example/orgs/team/wisdom/review/draft-4",
+                    },
+                ],
+            )
+        )
+
+        reply_markup = bot.send_message.await_args.kwargs["reply_markup"]
+        assert reply_markup.to_dict() == {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "View team-runbook v3",
+                        "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
+                    }
+                ],
+                [
+                    {
+                        "text": "Review release-checklist",
+                        "url": "https://portal.example/orgs/team/wisdom/review/draft-4",
+                    }
+                ],
+            ]
+        }
 
 
     def test_transient_bad_gateway_retries_text_send(self, monkeypatch):

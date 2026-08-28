@@ -1577,10 +1577,13 @@ export const zh: Translations = {
       decisionDeclined: skill => `${skill} 未获共享批准。`,
       decisionChanged: (skill, state) => `${skill} 的贡献状态已更改为${state}。`,
       installedNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} 已安装到此配置文件。`,
+      updatedNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} 已在此配置文件中更新。`,
       updateNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} 有可用更新。`,
       newSkillNotice: skill => `${skill} 已与你的集体共享。`,
+      unavailableNotice: skill => `${skill} 在此配置文件中已不可用。`,
       archivedNotice: skill => `${skill} 已不再可用于新安装。`,
       takedownNotice: skill => `${skill} 已从集体中移除。`,
+      viewSkill: '查看技能',
       markSeen: '全部标为已读'
     },
     tabCollective: '集体智慧',

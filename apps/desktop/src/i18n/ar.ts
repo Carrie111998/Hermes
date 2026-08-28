@@ -1106,10 +1106,13 @@ export const ar = defineLocale({
       decisionDeclined: skill => `لم تتم الموافقة على مشاركة ${skill}.`,
       decisionChanged: (skill, state) => `تغيّرت حالة مساهمة ${skill} إلى ${state}.`,
       installedNotice: (skill, version) => `تم تثبيت ${skill}${version ? ` ${version}` : ''} في هذا الملف الشخصي.`,
+      updatedNotice: (skill, version) => `تم تحديث ${skill}${version ? ` ${version}` : ''} في هذا الملف الشخصي.`,
       updateNotice: (skill, version) => `يتوفر تحديث لـ ${skill}${version ? ` ${version}` : ''}.`,
       newSkillNotice: skill => `تمت مشاركة ${skill} مع مجموعتك.`,
+      unavailableNotice: skill => `لم تعد ${skill} متاحة لهذا الملف الشخصي.`,
       archivedNotice: skill => `لم تعد ${skill} متاحة للتثبيتات الجديدة.`,
       takedownNotice: skill => `تمت إزالة ${skill} من المجموعة.`,
+      viewSkill: 'عرض المهارة',
       markSeen: 'تعليم الكل كمقروء'
     },
     tabCollective: 'المعرفة الجماعية',

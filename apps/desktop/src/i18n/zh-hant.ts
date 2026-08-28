@@ -1238,10 +1238,13 @@ export const zhHant = defineLocale({
       decisionDeclined: skill => `${skill} 未獲共享核准。`,
       decisionChanged: (skill, state) => `${skill} 的貢獻狀態已變更為${state}。`,
       installedNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} 已安裝到此設定檔。`,
+      updatedNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} 已在此設定檔中更新。`,
       updateNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} 有可用更新。`,
       newSkillNotice: skill => `${skill} 已與你的集體共享。`,
+      unavailableNotice: skill => `${skill} 在此設定檔中已無法使用。`,
       archivedNotice: skill => `${skill} 已不再可用於新安裝。`,
       takedownNotice: skill => `${skill} 已從集體中移除。`,
+      viewSkill: '查看技能',
       markSeen: '全部標示為已讀'
     },
     tabCollective: '集體智慧',

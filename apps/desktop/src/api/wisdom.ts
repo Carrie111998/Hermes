@@ -132,9 +132,26 @@ export interface WisdomManagedInstall {
   target_path: string
 }
 
+export type WisdomNotificationCategory =
+  'installed' | 'new_skill' | 'publication_decision' | 'unavailable' | 'update_available' | 'updated'
+
+export interface WisdomNotification {
+  category: WisdomNotificationCategory
+  event_id: string
+  kind: string
+  moderation_note?: string | null
+  occurred_at?: string | null
+  portal_url?: string | null
+  skill_id: string
+  skill_name: string
+  source_event_ids: string[]
+  state?: string | null
+  version?: number | null
+}
+
 export interface WisdomInstallations {
   installations: WisdomManagedInstall[]
-  notifications: Array<Record<string, unknown>>
+  notifications: WisdomNotification[]
 }
 
 export type WisdomInstallationCheckState =
@@ -255,9 +272,7 @@ export const applyWisdomUpdate = (
 export const uninstallWisdomSkill = (skillId: string, profile?: ProfileScope): Promise<Record<string, unknown>> =>
   request('/api/wisdom/uninstall', profile, { method: 'POST', body: { skill_id: skillId } })
 
-export const acknowledgeWisdomNotifications = (
-  profile?: ProfileScope
-): Promise<{ events: Array<Record<string, unknown>> }> =>
+export const acknowledgeWisdomNotifications = (profile?: ProfileScope): Promise<{ events: WisdomNotification[] }> =>
   request('/api/wisdom/notifications', profile, { method: 'POST', body: { mark_seen: true } })
 
 export const suggestWisdomSkill = (

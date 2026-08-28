@@ -261,6 +261,51 @@ def send_message_tool(args, **kw):
     return _handle_send(args)
 
 
+def send_telegram_notification_pane(
+    *, message: str, buttons: list[dict[str, str]]
+) -> dict:
+    """Send an internal notification to the Telegram home chat with URL actions.
+
+    This is intentionally not part of the model-facing ``send_message`` schema.
+    Product notifications can offer trusted Portal deep links without giving an
+    arbitrary tool caller a second, Telegram-specific message surface.
+    """
+    prepare_send_message_platforms()
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        config = load_gateway_config()
+        platform = Platform.TELEGRAM
+        pconfig = config.platforms.get(platform)
+        if not pconfig or not pconfig.enabled:
+            return _error("Telegram is not configured")
+        home = config.get_home_channel(platform)
+        if not home:
+            return _error("Telegram has no configured home channel")
+
+        safe_buttons: list[dict[str, str]] = []
+        for button in buttons[:8]:
+            label = str(button.get("label") or "").strip()[:64]
+            url = str(button.get("url") or "").strip()
+            if label and re.fullmatch(r"https?://[^\s]+", url):
+                safe_buttons.append({"label": label, "url": url})
+
+        from model_tools import _run_async
+
+        result = _run_async(
+            _send_telegram(
+                pconfig.token,
+                home.chat_id,
+                message,
+                disable_link_previews=True,
+                url_buttons=safe_buttons,
+            )
+        )
+        return result if isinstance(result, dict) else {"success": bool(result)}
+    except Exception as exc:
+        return _error(f"Telegram notification failed: {exc}")
+
+
 def _handle_list():
     """Return formatted list of available messaging targets."""
     try:
@@ -1343,7 +1388,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    url_buttons=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1352,7 +1406,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     instead, bypassing MarkdownV2 conversion.
     """
     try:
-        from telegram import Bot
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
         from telegram.constants import ParseMode
 
         # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
@@ -1434,6 +1488,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         text_kwargs = dict(thread_kwargs)
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
+        reply_markup = None
+        if url_buttons:
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(str(button["label"]), url=str(button["url"]))]
+                for button in url_buttons
+            ])
 
         last_msg = None
         warnings = []
@@ -1467,27 +1527,31 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
-            for chunk in text_chunks:
+            for index, chunk in enumerate(text_chunks):
+                chunk_kwargs = dict(text_kwargs)
+                if reply_markup is not None and index == len(text_chunks) - 1:
+                    chunk_kwargs["reply_markup"] = reply_markup
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode, **chunk_kwargs
                     )
                 except Exception as md_error:
                     # Thread not found — retry without message_thread_id so the
                     # message still delivers (matching the gateway adapter's
                     # fallback behaviour, issue #27012).
-                    if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
+                    if _is_telegram_thread_not_found(md_error) and chunk_kwargs.get("message_thread_id") is not None:
                         logger.warning(
                             "Thread %s not found in _send_telegram, retrying without message_thread_id",
-                            text_kwargs.get("message_thread_id"),
+                            chunk_kwargs.get("message_thread_id"),
                         )
                         text_kwargs.pop("message_thread_id", None)
+                        chunk_kwargs.pop("message_thread_id", None)
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode, **chunk_kwargs
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1506,7 +1570,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None, **chunk_kwargs
                         )
                     else:
                         raise

@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { WisdomNotificationsCard } from '@/components/wisdom-notifications-card'
 import {
   acknowledgeWisdomNotifications,
   applyWisdomInstall,
@@ -53,10 +54,6 @@ import { WisdomSystemSpecificationEditor } from './wisdom-manifest-editor'
 
 const TERMINAL_DRAFT_STATES = new Set(['published', 'declined', 'invalidated', 'rejected'])
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
-}
 
 async function waitForWisdomAction(name: string, profile: ProfileScope): Promise<void> {
   for (let attempt = 0; attempt < 1200; attempt += 1) {
@@ -296,63 +293,6 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
     }
 
     return candidate.qualification === 'manual_selection' ? copy.localOnly : copy.qualifiedLocally
-  }
-
-  const notificationText = (event: Record<string, unknown>): string => {
-    const payload = asRecord(event.payload)
-    const skillId = String(event.skill_id ?? payload.skill_id ?? '')
-
-    const skill =
-      String(payload.slug ?? '') ||
-      (discovery.data?.skills ?? []).find(item => item.id === skillId)?.slug ||
-      installations.data?.installations.find(item => item.skill_id === skillId)?.slug ||
-      copy.aSkill
-
-    const rawVersion = event.version ?? payload.version
-    const version = rawVersion ? `v${String(rawVersion)}` : undefined
-    const kind = String(event.kind ?? '')
-
-    if (kind === 'owner_decision') {
-      const state = String(payload.state ?? '')
-
-      if (state === 'published' || state === 'approved') {
-        return copy.decisionPublished(skill)
-      }
-
-      if (state === 'changes_requested') {
-        const note = typeof payload.moderation_note === 'string' ? payload.moderation_note.trim() : ''
-
-        return `${copy.decisionChanges(skill)}${note ? ` ${note}` : ''}`
-      }
-
-      if (state === 'declined' || state === 'rejected') {
-        return copy.decisionDeclined(skill)
-      }
-
-      return copy.decisionChanged(skill, copy.draftState(state))
-    }
-
-    if (kind === 'installed') {
-      return copy.installedNotice(skill, version)
-    }
-
-    if (kind === 'updated' || kind === 'update_available' || kind === 'required_update') {
-      return copy.updateNotice(skill, version)
-    }
-
-    if (kind === 'new' || kind === 'published') {
-      return copy.newSkillNotice(skill)
-    }
-
-    if (kind === 'archived') {
-      return copy.archivedNotice(skill)
-    }
-
-    if (kind === 'takedown') {
-      return copy.takedownNotice(skill)
-    }
-
-    return copy.decisionChanged(skill, kind.replaceAll('_', ' ') || 'updated')
   }
 
   const prepare = async (candidate: WisdomCandidate) => {
@@ -814,34 +754,18 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
             {busy === 'install-reference' ? copy.planningInstall : copy.reviewInstall}
           </Button>
         </form>
-        {installations.data.notifications.length > 0 && (
-          <div className="mt-2 flex items-start justify-between gap-3 border-t border-(--ui-stroke-tertiary) pt-2 text-[0.65rem]">
-            <div className="min-w-0">
-              <p className="font-medium">{copy.activityReady(installations.data.notifications.length)}</p>
-              <ul className="mt-1 space-y-1 text-muted-foreground">
-                {installations.data.notifications.slice(0, 4).map((event, index) => (
-                  <li className="truncate" key={String(event.event_id ?? index)}>
-                    {notificationText(event)}
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <Button
-              onClick={async () => {
-                try {
-                  await acknowledgeWisdomNotifications(profile)
-                  await installations.refetch()
-                } catch (error) {
-                  notifyError(error, 'Could not acknowledge Wisdom notifications')
-                }
-              }}
-              size="sm"
-              variant="outline"
-            >
-              {copy.markSeen}
-            </Button>
-          </div>
-        )}
+        <WisdomNotificationsCard
+          className="mt-2"
+          events={installations.data.notifications}
+          onMarkAllRead={async () => {
+            try {
+              await acknowledgeWisdomNotifications(profile)
+              await installations.refetch()
+            } catch (error) {
+              notifyError(error, 'Could not acknowledge Wisdom notifications')
+            }
+          }}
+        />
       </div>
       <MasterDetail resizeId="collective-capabilities-split" split="wide">
         <ListColumn

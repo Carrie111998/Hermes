@@ -1284,10 +1284,13 @@ export const ja = defineLocale({
       decisionChanged: (skill, state) => `${skill} の貢献ステータスが ${state} に変わりました。`,
       installedNotice: (skill, version) =>
         `${skill}${version ? ` ${version}` : ''} をこのプロファイルにインストールしました。`,
+      updatedNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} をこのプロファイルで更新しました。`,
       updateNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} の更新を利用できます。`,
       newSkillNotice: skill => `${skill} がコレクティブに共有されました。`,
+      unavailableNotice: skill => `${skill} はこのプロファイルで利用できなくなりました。`,
       archivedNotice: skill => `${skill} は新規インストールできなくなりました。`,
       takedownNotice: skill => `${skill} はコレクティブから削除されました。`,
+      viewSkill: 'スキルを表示',
       markSeen: 'すべて既読にする'
     },
     tabCollective: 'コレクティブ',
