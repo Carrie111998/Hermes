@@ -236,7 +236,7 @@ class TestMaybePersistToolResult:
         )
 
         assert path is not None
-        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "direct.txt").read_text()
+        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "direct.txt").read_text(encoding="utf-8")
         assert sentinel not in stored
         assert "redacted" in stored
 
@@ -262,7 +262,7 @@ class TestMaybePersistToolResult:
 
         assert PERSISTED_OUTPUT_TAG in result
         assert sentinel not in result
-        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "tc_redact.txt").read_text()
+        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "tc_redact.txt").read_text(encoding="utf-8")
         assert sentinel not in stored
         assert "redacted" in stored
 
@@ -489,8 +489,8 @@ class TestSpillover:
         spill_dir.mkdir(parents=True, exist_ok=True)
         old = spill_dir / "old.txt"
         new = spill_dir / "new.txt"
-        old.write_text("old")
-        new.write_text("new")
+        old.write_text("old", encoding="utf-8")
+        new.write_text("new", encoding="utf-8")
         stale = _time.time() - (48 * 3600)
         os.utime(old, (stale, stale))
 
@@ -511,7 +511,7 @@ class TestSpillover:
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
         old = spill_dir / "ancient.txt"
-        old.write_text("ancient")
+        old.write_text("ancient", encoding="utf-8")
         stale = _time.time() - (48 * 3600)
         os.utime(old, (stale, stale))
 
