@@ -277,3 +277,50 @@ class TestModelStateIncludesNamedProviders:
             )
         assert provider == "custom:local-127.0.0.1:11434"
         assert model == "qwen3:1.7b"
+
+    def test_canonicalizes_named_provider_inventory_slug(self):
+        """ACP must advertise one round-trippable id for a named endpoint."""
+        from hermes_cli.models import parse_model_input
+
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.4", provider="openai-codex", base_url=None
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+        model = "tflow/gpt-5.6-sol"
+        cfg = {
+            "providers": {
+                "9router": {
+                    "name": "9Router",
+                    "base_url": "https://router.example/v1",
+                    "default_model": model,
+                }
+            }
+        }
+        inventory = {
+            "providers": [
+                {
+                    "slug": "9router",
+                    "name": "9Router",
+                    "api_url": "https://router.example/v1",
+                    "models": [{"id": model}],
+                }
+            ]
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+            "hermes_cli.inventory.build_models_payload", return_value=inventory
+        ):
+            model_state = acp_agent._build_model_state(state)
+            canonical_id = f"custom:9router:{model}"
+            provider, parsed_model = parse_model_input(canonical_id, "custom")
+
+        assert isinstance(model_state, SessionModelState)
+        ids = [item.model_id for item in model_state.available_models]
+        assert ids.count(canonical_id) == 1
+        assert f"9router:{model}" not in ids
+
+        assert provider == "custom:9router"
+        assert parsed_model == model
