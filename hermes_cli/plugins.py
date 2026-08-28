@@ -2678,7 +2678,7 @@ class PluginContext:
         finds no built-in backend of that name.
 
         Names colliding with built-in backends (local, docker, singularity,
-        modal, daytona, vercel_sandbox, ssh) are rejected by the registry —
+        modal, daytona, e2b, vercel_sandbox, ssh) are rejected by the registry —
         plugins extend the backend set, they never shadow in-tree backends.
 
         Mirrors :meth:`register_browser_provider` — same registration shape,

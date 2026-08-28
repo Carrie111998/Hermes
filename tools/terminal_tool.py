@@ -3,7 +3,7 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and Vercel Sandbox environments. Supports local
+Singularity, Daytona, E2B, and Vercel Sandbox environments. Supports local
 execution, containerized backends, and cloud sandboxes, including managed
 Modal mode.
 
@@ -11,6 +11,7 @@ Environment Selection (via TERMINAL_ENV environment variable):
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
+- "e2b": Execute in E2B cloud sandboxes
 - "vercel_sandbox": Execute in Vercel Sandbox cloud sandboxes
 
 Features:
@@ -131,6 +132,7 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     float,
     "number",
 )
+_E2B_DEFAULT_CWD = "/home/user"
 _VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
 _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
 
@@ -195,6 +197,26 @@ def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
         "development only."
     )
     return False
+
+
+def _check_e2b_requirements(config: dict[str, Any]) -> bool:
+    """Validate E2B terminal backend requirements for the active profile."""
+    del config
+    if importlib.util.find_spec("e2b") is None:
+        logger.error(
+            "e2b is required for the E2B terminal backend: "
+            "pip install 'hermes-agent[e2b]'"
+        )
+        return False
+
+    from agent.secret_scope import get_secret
+
+    if not get_secret("E2B_API_KEY"):
+        logger.error(
+            "E2B_API_KEY is required for the E2B terminal backend in the active profile"
+        )
+        return False
+    return True
 
 
 # Cache for disk usage warning to avoid full rglob scan on every call.
@@ -1437,6 +1459,21 @@ def _current_session_profile() -> str:
     return get_session_env("HERMES_SESSION_PROFILE", "")
 
 
+def _e2b_persistent_filesystem_enabled() -> bool:
+    """True when E2B keeps one profile-scoped sandbox across sessions.
+
+    Reads the same ``container_persistent`` setting the E2B environment is
+    constructed with, so sandbox identity and sandbox lifecycle can't drift:
+    persistent mode reconnects one filesystem sandbox per profile, while
+    non-persistent mode is a statement that state must not survive the
+    session — sharing one ephemeral sandbox across sessions contradicts it
+    (shared shell state and files, plus either session's cleanup killing the
+    sandbox under the other).
+    """
+    _ensure_terminal_env_bridged()
+    return os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"}
+
+
 _ISOLATION_OVERRIDE_KEYS = frozenset({
     "docker_image", "modal_image", "singularity_image",
     "daytona_image", "env_type",
@@ -1487,9 +1524,34 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     alias registry (``register_container_alias``).
     """
     if task_id and _has_isolation_overrides(task_id):
-        return task_id
-    if task_id and _session_isolation_enabled():
-        return _resolve_container_alias(task_id)
+        container_key = task_id
+    elif task_id and _session_isolation_enabled():
+        container_key = _resolve_container_alias(task_id)
+    else:
+        container_key = "default"
+
+    _ensure_terminal_env_bridged()
+    if os.getenv("TERMINAL_ENV", "local") == "e2b":
+        from hermes_constants import hermes_home_key
+
+        profile_prefix = f"e2b:{hermes_home_key()}:"
+        if task_id and task_id.startswith(profile_prefix):
+            return task_id
+        # Persistent E2B intentionally shares ONE filesystem sandbox across
+        # gateway/WebUI sessions within a profile — the pointer store and the
+        # sync lifecycle reconnect it by profile-scoped key. Non-persistent
+        # E2B keeps the session isolation below: nominally ephemeral sandboxes
+        # must not share shell state across sessions, and one session's
+        # cleanup must not kill a sandbox another session is still using.
+        # Subagents inherit the parent's session key (and collapse to
+        # "default" outside sessions), so they share the parent's sandbox in
+        # both modes; isolation overrides stay authoritative either way.
+        if container_key == "default" and not _e2b_persistent_filesystem_enabled():
+            session_key = _current_session_key()
+            if session_key:
+                container_key = f"session:{session_key}"
+        return f"{profile_prefix}{container_key}"
+
     # Per-session isolation: when a session key is present (the WebUI streaming
     # layer sets it per-session, the gateway per-message via contextvars), scope
     # the container to it so switching profiles can't reuse a previous profile's
@@ -1502,7 +1564,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     # branches above: those paths already key containers per task_id, so they
     # stay authoritative where they apply and this only covers the cases that
     # would otherwise collapse to the shared "default" key (notably SSH).
-    session_key = _current_session_key()
+    session_key = _current_session_key() if container_key == "default" else None
     if session_key:
         # Persistent Docker is PROFILE-scoped by contract: one long-lived
         # container shared by every session of the profile. Key it by profile
@@ -1517,12 +1579,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
             # slot (and sandbox dir) regardless of profile name (#84671).
             shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
             if shared:
-                return f"shared:{shared}"
-            profile = _current_session_profile() or "default"
-            if profile == "default":
-                return "default"
-            return f"profile:{profile}"
-        return f"session:{session_key}"
+                container_key = f"shared:{shared}"
+            else:
+                profile = _current_session_profile() or "default"
+                container_key = "default" if profile == "default" else f"profile:{profile}"
+        else:
+            container_key = f"session:{session_key}"
     # CLI/no-session path: honour the shared-container opt-in here too, or a
     # CLI run of a keyed profile would land in "default" while its gateway
     # sessions land in "shared:<key>" — splitting the very container the
@@ -1530,8 +1592,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     if _docker_persistent_profile_scoped():
         shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
         if shared:
-            return f"shared:{shared}"
-    return "default"
+            container_key = f"shared:{shared}"
+
+    return container_key
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
@@ -1641,7 +1704,7 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "e2b", "vercel_sandbox"})
 
 
 def _plugin_env_flag(env_type: str, attr: str, default=False):
@@ -1803,6 +1866,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = "~"
     elif env_type == "vercel_sandbox":
         default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
+    elif env_type == "e2b":
+        default_cwd = _E2B_DEFAULT_CWD
     else:
         default_cwd = "/root"
 
@@ -1840,6 +1905,7 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "e2b_template": os.getenv("TERMINAL_E2B_TEMPLATE", "base").strip() or "base",
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
@@ -1859,8 +1925,8 @@ def _get_env_config() -> Dict[str, Any]:
             os.getenv("TERMINAL_PERSISTENT_SHELL", "true"),
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
-        # Container resource config (applies to docker, singularity, modal,
-        # daytona, and vercel_sandbox -- ignored for local/ssh)
+        # Container settings. E2B consumes persistence only; its template
+        # defines CPU, memory, and disk resources.
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
@@ -1929,7 +1995,9 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "container_memory": config.get("container_memory", 5120),
         "container_disk": config.get("container_disk", 51200),
         "container_persistent": config.get("container_persistent", True),
+        "lifetime_seconds": config.get("lifetime_seconds", 300),
         "modal_mode": config.get("modal_mode", "auto"),
+        "e2b_template": config.get("e2b_template", "base"),
         "vercel_runtime": config.get("vercel_runtime", ""),
         "docker_volumes": config.get("docker_volumes", []),
         "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
@@ -1955,7 +2023,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "vercel_sandbox", "ssh"
+            "daytona", "e2b", "vercel_sandbox", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
         cwd: Working directory
         timeout: Default command timeout
@@ -2119,6 +2187,20 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             task_id=task_id,
         )
 
+    elif env_type == "e2b":
+        from agent.secret_scope import get_secret
+        from tools.environments.e2b import E2BEnvironment as _E2BEnvironment
+
+        return _E2BEnvironment(
+            api_key=get_secret("E2B_API_KEY") or "",
+            template=cc.get("e2b_template") or "base",
+            cwd=cwd,
+            timeout=timeout,
+            lifetime_seconds=cc.get("lifetime_seconds", 300),
+            persistent_filesystem=persistent,
+            task_id=task_id,
+        )
+
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -2156,7 +2238,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', 'ssh'{extra}"
+            f"'singularity', 'modal', 'daytona', 'e2b', 'vercel_sandbox', 'ssh'{extra}"
         )
 
 
@@ -2427,13 +2509,26 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
-    env = None
+    envs: list[Any] = []
+    # Preserve the established exact-key cleanup behavior for existing
+    # backends. E2B is the one backend whose runtime key is intentionally
+    # profile-scoped, so callers holding the public task ID need resolution.
+    _ensure_terminal_env_bridged()
+    resolved_task_id = (
+        _resolve_container_task_id(task_id)
+        if os.getenv("TERMINAL_ENV", "local").strip().lower() == "e2b"
+        else task_id
+    )
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        for key in dict.fromkeys((resolved_task_id, task_id)):
+            env = _active_environments.pop(key, None)
+            _last_activity.pop(key, None)
+            if env is not None and all(existing is not env for existing in envs):
+                envs.append(env)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
+        _creation_locks.pop(resolved_task_id, None)
         _creation_locks.pop(task_id, None)
 
     # Invalidate stale file_ops cache entry
@@ -2443,32 +2538,33 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     except ImportError:
         pass
 
-    if env is None:
+    if not envs:
         return
 
-    try:
-        if hasattr(env, 'cleanup'):
-            # Pass force_remove only if the env's cleanup() accepts it
-            # (DockerEnvironment after issue #20561; other backends don't).
-            import inspect
-            sig = inspect.signature(env.cleanup)
-            if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
+    for env in envs:
+        try:
+            if hasattr(env, 'cleanup'):
+                # Pass force_remove only if the env's cleanup() accepts it
+                # (DockerEnvironment after issue #20561; other backends don't).
+                import inspect
+                sig = inspect.signature(env.cleanup)
+                if "force_remove" in sig.parameters:
+                    env.cleanup(force_remove=force_remove)
+                else:
+                    env.cleanup()
+            elif hasattr(env, 'stop'):
+                env.stop()
+            elif hasattr(env, 'terminate'):
+                env.terminate()
+
+            logger.info("Manually cleaned up environment for task: %s", task_id)
+
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                logger.info("Environment for task %s already cleaned up", task_id)
             else:
-                env.cleanup()
-        elif hasattr(env, 'stop'):
-            env.stop()
-        elif hasattr(env, 'terminate'):
-            env.terminate()
-
-        logger.info("Manually cleaned up environment for task: %s", task_id)
-
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
-        else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+                logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
 def _atexit_cleanup():
@@ -4026,6 +4122,9 @@ def check_terminal_requirements() -> bool:
         elif env_type == "vercel_sandbox":
             return _check_vercel_sandbox_requirements(config)
 
+        elif env_type == "e2b":
+            return _check_e2b_requirements(config)
+
         elif env_type == "daytona":
             from daytona import Daytona  # noqa: F401 — SDK presence check
             from agent.secret_scope import get_secret
@@ -4037,7 +4136,7 @@ def check_terminal_requirements() -> bool:
                 return bool(provider.check_requirements(config))
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, vercel_sandbox, ssh, or a plugin-registered backend.",
+                "modal, daytona, e2b, vercel_sandbox, ssh, or a plugin-registered backend.",
                 env_type,
             )
             return False
@@ -4080,7 +4179,7 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/vercel_sandbox/ssh)"
+        "(local/docker/singularity/modal/daytona/e2b/vercel_sandbox/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
