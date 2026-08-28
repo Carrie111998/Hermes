@@ -60,7 +60,7 @@ def _deterministic_path_layout(monkeypatch):
 def agent_bin() -> str:
     """Create ``$HERMES_HOME/agent-bin`` and return its path.
 
-    The autouse ``_isolate_hermes_home`` fixture already points HERMES_HOME at
+    The autouse ``_hermetic_environment`` fixture already points HERMES_HOME at
     a per-test tempdir, so this creates the real directory the helper looks for
     rather than mocking the lookup.
     """

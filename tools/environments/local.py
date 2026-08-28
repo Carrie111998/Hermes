@@ -1218,6 +1218,13 @@ def _prepend_agent_bin_dir(existing_path: str) -> str:
     No-op on Windows, where the native PATH is a deliberate passthrough in the
     sibling helpers.  First-occurrence wins, so a PATH that already lists the
     dir is returned unchanged.
+
+    Trust boundary: this slot intercepts every CLI the agent shells out to at
+    higher precedence than the user's own tools, so it must be
+    trusted-operator-owned — never writable by the agent process or by
+    untrusted users unless that interception is the point.  The opt-in (the
+    directory is absent by default) is what keeps a default install outside
+    the boundary.
     """
     if _IS_WINDOWS:
         return existing_path
