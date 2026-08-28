@@ -226,6 +226,18 @@ class TestDoctorToolAvailabilityOverrides:
         assert available == []
         assert unavailable == [kanban_entry]
 
+    def test_omits_intentionally_default_off_toolsets(self, monkeypatch):
+        monkeypatch.setattr(doctor, "_is_default_off_toolset", lambda item: item["name"] == "spotify")
+        spotify = {"name": "spotify", "missing_vars": ["SPOTIFY_CLIENT_ID"]}
+        required = {"name": "terminal", "missing_vars": ["SHELL"]}
+
+        available, unavailable = doctor._apply_doctor_tool_availability_overrides(
+            [], [spotify, required]
+        )
+
+        assert available == []
+        assert unavailable == [required]
+
 
 
 

@@ -288,6 +288,16 @@ def _is_kanban_worker_env_gate(item: dict) -> bool:
     return bool(tools) and all(str(tool).startswith("kanban_") for tool in tools)
 
 
+def _is_default_off_toolset(item: dict) -> bool:
+    """Return True for bundled integrations that are intentionally opt-in."""
+    try:
+        from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+
+        return item.get("name") in _DEFAULT_OFF_TOOLSETS
+    except Exception:
+        return False
+
+
 def _doctor_tool_availability_detail(toolset: str) -> str:
     """Optional explanatory suffix for toolsets whose doctor status needs context."""
     if toolset == "kanban" and not os.environ.get("HERMES_KANBAN_TASK"):
@@ -362,6 +372,8 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
         if name == "honcho" and _honcho_is_configured_for_doctor():
             if "honcho" not in updated_available:
                 updated_available.append("honcho")
+            continue
+        if _is_default_off_toolset(item):
             continue
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
