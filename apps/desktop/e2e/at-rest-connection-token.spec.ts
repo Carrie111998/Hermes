@@ -211,7 +211,7 @@ async function startFakeGateway(): Promise<FakeGateway> {
       accessHeaderValues.push(accessHeader)
     }
 
-    socket.destroy()
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
   })
 
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -498,7 +498,7 @@ async function saveRegistrySecrets(
   page: Page,
   remoteUrl: string,
   token: string,
-  header: string
+  header: unknown
 ): Promise<RegistrySaveOutcome> {
   return page.evaluate(
     async ([url, tokenValue, headerValue]) => {
@@ -832,6 +832,85 @@ test.describe('remote gateway session token at rest', () => {
       scanTreeForSecret(sandbox.hermesHome, needles),
       'malformed policy leaked a token or header into HERMES_HOME'
     ).toEqual([])
+  })
+
+  test('duplicate policy members cannot downgrade composed token and header storage', async () => {
+    const fake = gateway!
+    sandbox = createSandbox('at-rest-duplicate-policy')
+
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, 'secure-token-storage.json'),
+      '{"on":true,"on":false,"migrated":false,"migrated":true}',
+      'utf8'
+    )
+
+    const first = await launchAgainst(sandbox)
+    app = first.app
+
+    const capability = await readSafeStorageCapability(first.app)
+    const userDataDir = await resolveUserDataDir(first.app)
+    const registryFile = path.join(userDataDir, 'connections.json')
+    const saved = await saveRegistrySecrets(first.page, fake.url, SENTINEL_TOKEN, SENTINEL_HEADER)
+
+    if (capability.available) {
+      expect(saved.error, 'duplicate policy members must resolve to secure storage').toBeNull()
+      expect(saved.connectionId).not.toBeNull()
+      const registry = JSON.parse(readIfExists(registryFile).toString('utf8'))
+      const composed = registry.connections.find((entry: { label?: string }) => entry.label === 'E2E at-rest composed')
+      expect(composed?.token?.encoding).toBe('safeStorage')
+      expect(composed?.headers?.['X-E2E-Access-Secret']?.encoding).toBe('safeStorage')
+      expectOwnerOnlyMode(registryFile, 'the duplicate-policy connections.json must be owner-only')
+
+      const beforeToken = fake.sessionTokens.length
+      const beforeHeader = fake.accessHeaderValues.length
+      await exerciseRegistryConnection(first.page, saved.connectionId!)
+      expect(fake.sessionTokens.slice(beforeToken), 'duplicate policy must preserve the stored token').toContain(
+        SENTINEL_TOKEN
+      )
+      expect(fake.accessHeaderValues.slice(beforeHeader), 'duplicate policy must preserve the stored header').toContain(
+        SENTINEL_HEADER
+      )
+    } else {
+      expect(saved.error, 'duplicate policy members must refuse without secure storage').not.toBeNull()
+    }
+
+    const needles = secretNeedles(SENTINEL_TOKEN, SENTINEL_HEADER)
+    expect(scanTreeForSecret(userDataDir, needles), 'duplicate policy leaked a token or header').toEqual([])
+    expect(scanTreeForSecret(sandbox.hermesHome, needles), 'duplicate policy leaked into HERMES_HOME').toEqual([])
+  })
+
+  test('renderer-supplied plaintext header envelopes cannot bypass secure persistence', async () => {
+    const fake = gateway!
+    sandbox = createSandbox('at-rest-header-envelope')
+
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, 'secure-token-storage.json'),
+      JSON.stringify({ on: true, migrated: true }),
+      'utf8'
+    )
+
+    const first = await launchAgainst(sandbox)
+    app = first.app
+
+    const userDataDir = await resolveUserDataDir(first.app)
+    const registryFile = path.join(userDataDir, 'connections.json')
+    const saved = await saveRegistrySecrets(first.page, fake.url, SENTINEL_TOKEN, {
+      encoding: 'plain',
+      value: SENTINEL_HEADER
+    })
+
+    expect(saved.error, 'a renderer-supplied header envelope must be rejected').not.toBeNull()
+    expect(saved.connectionId).toBeNull()
+    const needles = secretNeedles(SENTINEL_TOKEN, SENTINEL_HEADER)
+    expect(scanTreeForSecret(userDataDir, needles)).toEqual([])
+    expect(scanTreeForSecret(sandbox.hermesHome, needles)).toEqual([])
+
+    if (fs.existsSync(registryFile)) {
+      const registry = JSON.parse(readIfExists(registryFile).toString('utf8'))
+      expect(registry.connections.some((entry: { label?: string }) => entry.label === 'E2E at-rest composed')).toBe(
+        false
+      )
+    }
   })
 
   /**

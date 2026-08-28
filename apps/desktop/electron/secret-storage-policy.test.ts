@@ -68,6 +68,16 @@ test('malformed policy objects default to encryption ON instead of plaintext', (
   }
 })
 
+test('duplicate policy members default to encryption ON instead of last-key-wins plaintext', () => {
+  for (const bad of [
+    '{"on":true,"on":false,"migrated":true}',
+    '{"on":false,"migrated":false,"migrated":true}',
+    '{"nested":{"on":true,"on":false},"on":false,"migrated":true}'
+  ]) {
+    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: true, migrated: false })
+  }
+})
+
 test('round trip preserves both fields', () => {
   const io = fakeIo()
 

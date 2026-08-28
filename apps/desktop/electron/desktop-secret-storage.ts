@@ -91,7 +91,8 @@ export function createDesktopSecretStorage({
    *   - non-empty string  → new plaintext value, encrypted like a token
    *   - null              → keep the currently stored envelope for that name
    *                         (the editor shows a set-but-hidden secret)
-   *   - envelope object   → stored verbatim (hand-edited import path)
+   *   - envelope object   → rejected; renderer-controlled envelopes are not
+   *                         trusted storage and must not bypass encryption
    * Name filtering (forbidden/managed headers) happens in
    * normalizeRemoteHeaders at the registry/config layer.
    */
@@ -129,7 +130,7 @@ export function createDesktopSecretStorage({
       }
 
       if (value && typeof value === 'object') {
-        out[key] = value
+        throw new Error('Remote header envelopes must be supplied as plaintext values or omitted.')
       }
     }
 
