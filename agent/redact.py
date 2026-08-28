@@ -208,7 +208,7 @@ _CFG_DOTTED_RE = re.compile(
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(^[ \t]*(?:\d+\|)?[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -219,12 +219,13 @@ _CFG_ANCHORED_RE = re.compile(
 # value) and ``error: token expired`` are left alone. Bare ``auth`` is excluded
 # from the key set so ``Authorization:`` / ``author:`` don't match (the former
 # is masked by _AUTH_HEADER_RE); ``auth_token``/``auth-token`` still match via
-# the ``token`` keyword. Quoted values defer to _JSON_FIELD_RE via the lookahead.
+# the ``token`` keyword. Both quoted and unquoted scalar values are supported.
 _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
 # NOTE(perf): possessive quantifiers wherever the successor is disjoint; the
 # leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
 _YAML_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
+    rf"(^[ \t]*+(?:\d+\|)?[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)"
+    rf"(:[ \t]*+)(['\"]?)([^\s&]+?)\3(?=[\s&]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -315,11 +316,12 @@ def _key_has_secret_keyword(key: str) -> bool:
             return True
     return False
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+# JSON field pattern. Match a bounded key and validate secret-bearing word
+# boundaries in the callback so provider names such as ``exaApiKey`` and
+# ``braveSearchApiKey`` are covered without treating words like ``monkey`` as
+# credentials.
 _JSON_FIELD_RE = re.compile(
-    rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
-    re.IGNORECASE,
+    r'("([A-Za-z0-9_.-]{1,128})")\s*:\s*"([^"]+)"',
 )
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
@@ -771,12 +773,86 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+def _mask_file_value(token: str) -> str:
+    """Mask file values without collapsing an existing non-reusable sentinel."""
+    if token == "«redacted-secret»" or (
+        token.startswith("«redacted:") and token.endswith("…»")
+    ):
+        return token
+    return _mask_token_nonreusable(token)
+
+
+_CONFIG_FILE_EXTENSIONS = frozenset({
+    ".cfg", ".conf", ".env", ".ini", ".json", ".properties", ".toml",
+    ".yaml", ".yml",
+})
+_SOURCE_OR_DOC_EXTENSIONS = frozenset({
+    ".adoc", ".bash", ".c", ".cc", ".cpp", ".cs", ".fish", ".go", ".h",
+    ".hpp", ".java", ".js", ".jsx", ".kt", ".kts", ".lua", ".md", ".php",
+    ".ps1", ".py", ".pyi", ".r", ".rb", ".rs", ".rst", ".scala", ".sh",
+    ".sql", ".svelte", ".swift", ".ts", ".tsx", ".vue", ".zsh",
+})
+_CONFIG_BASENAME_WORDS = frozenset({"config", "configuration", "settings"})
+
+
+def is_config_like_path(path: object) -> bool:
+    """Return whether ``path`` names a configuration/settings data file."""
+    if not path:
+        return False
+    basename = str(path).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if basename == ".env" or basename.startswith(".env."):
+        return True
+    extension = os.path.splitext(basename)[1]
+    if extension in _CONFIG_FILE_EXTENSIONS:
+        return True
+    if extension in _SOURCE_OR_DOC_EXTENSIONS:
+        return False
+    words = re.split(r"[^a-z0-9]+", basename)
+    return any(word in _CONFIG_BASENAME_WORDS for word in words)
+
+
+def redact_patch_text(
+    text: str,
+    file_paths: tuple | list = (),
+    *,
+    force: bool = False,
+) -> str:
+    """Redact a unified diff using each section's target-file policy."""
+    if not text:
+        return text
+    paths = [str(path) for path in (file_paths or ()) if path]
+    current_path = paths[0] if len(paths) == 1 else None
+    redacted_lines = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith(("--- ", "+++ ")):
+            candidate = line[4:].split("\t", 1)[0].strip()
+            if candidate != "/dev/null":
+                if candidate.startswith(("a/", "b/")):
+                    candidate = candidate[2:]
+                current_path = candidate
+            redacted_lines.append(line)
+            continue
+
+        if line[:1] in {"+", "-", " "}:
+            prefix, payload = line[:1], line[1:]
+            redacted_lines.append(prefix + redact_sensitive_text(
+                payload,
+                force=force,
+                file_read=True,
+                file_path=current_path,
+            ))
+        else:
+            redacted_lines.append(line)
+    return "".join(redacted_lines)
+
+
 def redact_sensitive_text(
     text: str,
     *,
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
+    file_path: object = None,
     redact_url_credentials: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
@@ -804,8 +880,9 @@ def redact_sensitive_text(
     an agent reading it from config.yaml and writing it back silently corrupted
     the stored credential into a dead 13-char value → 401 (issue #35519). The
     sentinel is syntactically invalid as a token, so it can't be mistaken for a
-    usable key or written back as one. Implies code_file=True (config/data
-    files shouldn't trigger the source-code ENV/JSON false-positive paths).
+    usable key or written back as one. Pass ``file_path`` when available so
+    configuration/settings data files can use generic key-name redaction while
+    source files retain the conservative ``code_file`` behavior.
 
     Performance: each regex pattern is gated behind a cheap substring
     pre-check (e.g. ``"=" in text`` for ENV assignments, ``"://" in text``
@@ -825,10 +902,13 @@ def redact_sensitive_text(
     if not (force or _REDACT_ENABLED):
         return text
 
-    # file_read content shouldn't hit the source-code ENV/JSON false-positive
-    # paths either (it's config/data, not log lines).
+    # File content defaults to the conservative source-code path. Configuration
+    # files are the exception: opaque values under secret-bearing keys are more
+    # likely credentials than examples, so enable the ENV/JSON/YAML passes.
     if file_read:
-        code_file = True
+        code_file = not is_config_like_path(file_path)
+
+    value_mask = _mask_file_value if file_read else _mask_token
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -859,7 +939,7 @@ def redact_sensitive_text(
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                return f"{name}={quote}{value_mask(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
@@ -888,21 +968,24 @@ def redact_sensitive_text(
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
             def _redact_json(m):
-                key, value = m.group(1), m.group(2)
+                key, key_name, value = m.group(1), m.group(2), m.group(3)
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                if key_name.casefold() != "bearer" and not _key_has_secret_keyword(key_name):
+                    return m.group(0)
+                return f'{key}: "{value_mask(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
-        # Unquoted YAML / colon config: password: ***  (after JSON so quoted
-        # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
-        # quotes). Skip URLs — web-URL query params pass through by design.
+        # YAML / colon config: password: *** (quoted or unquoted scalar).
+        # Skip URLs — web-URL query params pass through by design.
         if ":" in text and "://" not in text:
             def _redact_yaml(m):
-                key, sep, value = m.group(1), m.group(2), m.group(3)
+                key, sep, quote, value = (
+                    m.group(1), m.group(2), m.group(3), m.group(4)
+                )
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): api_key: os.getenv('X') is a code snippet,
                 # not a leaked secret value.
@@ -913,7 +996,7 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                return f"{key}{sep}{quote}{value_mask(value)}{quote}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
