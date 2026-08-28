@@ -6764,6 +6764,7 @@ def resolve_pre_tool_block(
     )
     return _resolve_block_from_details(
         details, tool_name,
+        original_args=args,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
     )
 
@@ -6772,6 +6773,7 @@ def _resolve_block_from_details(
     details: "_PreToolCallDirective",
     tool_name: str,
     *,
+    original_args: Optional[Dict[str, Any]] = None,
     turn_id: str = "",
     tool_call_id: str = "",
     session_id: str = "",
@@ -6785,8 +6787,33 @@ def _resolve_block_from_details(
     denies, or times out is fail-closed to a block; anything else
     proceeds.
     """
+    block_message, approval_receipt = _resolve_block_and_receipt_from_details(
+        details,
+        tool_name,
+        original_args=original_args,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+    )
+    if approval_receipt is not None:
+        return (
+            f"BLOCKED: smart approval receipt cannot be propagated for {tool_name}"
+        )
+    return block_message
+
+
+def _resolve_block_and_receipt_from_details(
+    details: "_PreToolCallDirective",
+    tool_name: str,
+    *,
+    original_args: Optional[Dict[str, Any]] = None,
+    turn_id: str = "",
+    tool_call_id: str = "",
+    session_id: str = "",
+) -> tuple[Optional[str], Any]:
+    """Resolve one directive and return its consume-once smart receipt."""
     if details.action == "block":
-        return details.message
+        return details.message, None
     if details.action == "approve":
         try:
             from tools.approval import (
@@ -6809,6 +6836,11 @@ def _resolve_block_from_details(
                     tool_name,
                     details.message or "",
                     rule_key=details.rule_key or tool_name,
+                    action_args=(
+                        details.modified_args
+                        if details.modified_args is not None
+                        else original_args
+                    ),
                 )
             finally:
                 if approval_tokens is not None:
@@ -6819,13 +6851,23 @@ def _resolve_block_from_details(
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
             # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
+            return f"BLOCKED: plugin approval gate failed for {tool_name}", None
         if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
+            return (
+                str(
+                    result.get("message")
+                    or f"BLOCKED: plugin approval required for {tool_name}"
+                ),
+                None,
             )
-    return None
+        receipt = result.get("_approval_receipt")
+        if result.get("smart_approved") and receipt is None:
+            return (
+                f"BLOCKED: smart approval receipt missing for {tool_name}",
+                None,
+            )
+        return None, receipt
+    return None, None
 
 
 def _dispatch_pre_tool_call_hooks(
@@ -6837,14 +6879,17 @@ def _dispatch_pre_tool_call_hooks(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    include_approval_receipt: bool = False,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]] | tuple[
+    Optional[str], Optional[Dict[str, Any]], Any
+]:
     """Invoke ``pre_tool_call`` hooks once and process all response types.
 
     Returns a ``(block_message, modified_args)`` tuple:
     - ``block_message`` — the first block/approve directive's resolved message
       (or ``None`` when the call may proceed).  Shares the exact fail-closed
       approval-gate logic of :func:`resolve_pre_tool_block` via
-      :func:`_resolve_block_from_details`, including the observability
+      :func:`_resolve_block_and_receipt_from_details`, including the observability
       context set around the human-approval gate.
     - ``modified_args`` — merged args from ``modify`` directives
       (or ``None`` when no hook requested modification).
@@ -6861,10 +6906,18 @@ def _dispatch_pre_tool_call_hooks(
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
-    block_msg = _resolve_block_from_details(
+    block_msg, approval_receipt = _resolve_block_and_receipt_from_details(
         details, tool_name,
+        original_args=args,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
     )
+    if include_approval_receipt:
+        return (block_msg, details.modified_args, approval_receipt)
+    if approval_receipt is not None:
+        return (
+            f"BLOCKED: smart approval receipt cannot be propagated for {tool_name}",
+            details.modified_args,
+        )
     return (block_msg, details.modified_args)
 
 

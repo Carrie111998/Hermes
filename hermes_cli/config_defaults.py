@@ -2507,9 +2507,11 @@ DEFAULT_CONFIG = {
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
-    # cron_mode — what to do when a cron job hits a dangerous command:
-    #   deny    — block the command and let the agent find another way (default, safe)
-    #   approve — auto-approve all dangerous commands in cron jobs
+    # cron_mode — what to do when a cron job hits a flagged approval action:
+    #   deny    — block the action and let the agent find another way (default, safe)
+    #   smart   — allow only when the auxiliary guardian returns APPROVE;
+    #             DENY, ESCALATE, or review failure blocks without a human prompt
+    #   approve — bypass review for flagged actions in cron jobs
     #
     # single_query_mode — what to do when a single-query (-q) session hits a
     # dangerous command. -q runs export HERMES_INTERACTIVE=1 (for interactive
@@ -2518,7 +2520,7 @@ DEFAULT_CONFIG = {
     # agent is forced to work around the block (often via execute_code). This
     # setting makes that intent explicit:
     #   deny    — block the command and let the agent find another way (default,
-    #             safe; mirrors cron_mode deny)
+    #             safe)
     #   approve — auto-approve all dangerous commands in single-query mode
     #
     # unattended_mode — what to do when a session on an unattended

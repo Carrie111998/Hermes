@@ -258,18 +258,18 @@ def test_guard_gateway_missing_notify_is_pending(gw_session):
 def test_guard_smart_mode(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
 
-    monkeypatch.setattr(A, "_smart_approve", lambda c, d: "approve")
+    monkeypatch.setattr(A, "_smart_approve", lambda c, d, **_: "approve")
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is True and res.get("smart_approved") is True
 
     # Smart DENY on an interactive surface now asks the owner. With no bound
     # notifier it remains pending rather than being hard-denied.
-    monkeypatch.setattr(A, "_smart_approve", lambda c, d: "deny")
+    monkeypatch.setattr(A, "_smart_approve", lambda c, d, **_: "deny")
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False and res["status"] == "pending_approval"
 
     # escalate → falls through to manual gateway approval
-    monkeypatch.setattr(A, "_smart_approve", lambda c, d: "escalate")
+    monkeypatch.setattr(A, "_smart_approve", lambda c, d, **_: "escalate")
     _register_resolver(gw_session, "once")
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is True
@@ -281,7 +281,9 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
         A._permanent_approved.discard("owner-override-test-danger")
         A._session_approved.get(gw_session, set()).discard("owner-override-test-danger")
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
+    monkeypatch.setattr(
+        A, "_smart_approve", lambda _command, _description, **_: "deny"
+    )
     monkeypatch.setattr(
         A,
         "detect_dangerous_command",
@@ -314,7 +316,9 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
         A._permanent_approved.discard("execute_code")
         A._session_approved.get(gw_session, set()).discard("execute_code")
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
+    monkeypatch.setattr(
+        A, "_smart_approve", lambda _command, _description, **_: "deny"
+    )
 
     shown = _register_capturing_resolver(gw_session, "session")
     result = A.check_execute_code_guard("print('first')", "local")
@@ -337,7 +341,9 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     with A._lock:
         A._session_approved.get(gw_session, set()).discard(key)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "escalate")
+    monkeypatch.setattr(
+        A, "_smart_approve", lambda _command, _description, **_: "escalate"
+    )
     monkeypatch.setattr(
         A, "detect_dangerous_command",
         lambda command: (True, key, f"risk:{command}"),
@@ -359,7 +365,9 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
 
 def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
+    monkeypatch.setattr(
+        A, "_smart_approve", lambda _command, _description, **_: "deny"
+    )
     monkeypatch.setattr(
         A, "detect_dangerous_command",
         lambda command: (True, "pending-smart-deny", f"risk:{command}"),
@@ -383,7 +391,9 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
 
 def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
+    monkeypatch.setattr(
+        A, "_smart_approve", lambda _command, _description, **_: "deny"
+    )
 
     result = A.check_execute_code_guard("print('pending')", "local")
 

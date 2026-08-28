@@ -33,7 +33,7 @@ The approval system supports three modes, configured via `approvals.mode` in `~/
 approvals:
   mode: smart                     # smart | manual | off
   timeout: 300                    # seconds to wait for user response (default: 300)
-  cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
+  cron_mode: deny                 # deny | smart | approve — headless policy for flagged cron actions
   single_query_mode: deny         # deny | approve — what single-query (-q) sessions do on a dangerous command
   unattended_mode: deny           # deny | approve — what webhook/API sessions do on a dangerous command
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
@@ -46,9 +46,9 @@ The full set of keys:
 |---|---|---|
 | `mode` | `smart` | Approval policy for dangerous shell commands — see the table below. |
 | `timeout` | `300` | Seconds Hermes waits for an approval reply before timing out. |
-| `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
-| `single_query_mode` | `deny` | How one-shot [`hermes chat -q`](./cli.md) sessions behave when they trigger a dangerous-command prompt. A `-q` session runs a single turn and exits with no user waiting to answer prompts; `deny` blocks the command (the agent must find another path), `approve` auto-approves everything in single-query context. Mirrors `cron_mode`. |
-| `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. Mirrors `cron_mode`. |
+| `cron_mode` | `deny` | How [cron jobs](./features/cron.md) handle flagged actions without a human present. `deny` blocks them. `smart` asks the auxiliary guardian and permits that operation only when it returns `APPROVE`; `DENY`, `ESCALATE`, malformed responses, errors, timeouts, or an unavailable reviewer block immediately without a human prompt. `approve` permits flagged cron actions unconditionally and is higher risk. Unflagged safe terminal commands continue without a guardian call. |
+| `single_query_mode` | `deny` | How one-shot [`hermes chat -q`](./cli.md) sessions behave when they trigger a dangerous-command prompt. This setting supports only `deny` and `approve`: `deny` blocks the command (the agent must find another path), while `approve` auto-approves everything in single-query context. It does not support `smart`. |
+| `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. The TUI also honors this setting for its `/clear`, `/new`, and `/reset` modal; `HERMES_TUI_NO_CONFIRM=1` force-skips that modal regardless of the configured value. |
 
@@ -61,6 +61,26 @@ The full set of keys:
 :::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::
+
+`approvals.cron_mode` is an independent headless policy. In `smart` mode,
+only flagged terminal or Tirith actions, complete `execute_code` scripts, and
+plugin approval escalations use the guardian decision described above. Cron
+never creates a pending human approval: only `APPROVE` proceeds, while `DENY`,
+uncertainty, malformed output, and reviewer errors fail closed. By contrast,
+`cron_mode: approve` bypasses review and should be used only for cron profiles
+whose flagged actions are intentionally trusted. The default is `deny`.
+Each approved `execute_code` program runs in a fresh local or remote process,
+so persistent kernel state from an earlier call cannot add behavior that the
+guardian did not review.
+
+For a plugin `pre_tool_call` approval escalation, the guardian reviews one
+deterministic JSON envelope containing the tool name, the plugin reason, and
+the complete effective arguments that would execute, including earlier
+`modify` directives. Secrets are redacted before the auxiliary request. This
+envelope is limited to 16 KiB; missing, unsupported, unserializable, or larger
+argument payloads block without a guardian call, human prompt, cached approval,
+or pending approval. The payload is never truncated because a removed suffix
+could hide a consequential operation.
 
 ### YOLO Mode
 

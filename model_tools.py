@@ -1429,11 +1429,12 @@ def handle_function_call(
         # (for `modify` directives). Observer plugins see
         # the hook on that same pass. When skip=True, the caller already
         # fired it — do nothing here.
+        approval_receipt = None
         if not skip_pre_tool_call_hook:
             block_message: Optional[str] = None
             try:
                 from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-                block_message, modified_args = _dispatch_pre_tool_call_hooks(
+                hook_result = _dispatch_pre_tool_call_hooks(
                     function_name,
                     function_args,
                     task_id=task_id or "",
@@ -1442,7 +1443,12 @@ def handle_function_call(
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
                     middleware_trace=list(_tool_middleware_trace),
+                    include_approval_receipt=True,
                 )
+                if len(hook_result) == 3:
+                    block_message, modified_args, approval_receipt = hook_result
+                else:
+                    block_message, modified_args = hook_result
                 if modified_args is not None:
                     function_args = modified_args
             except Exception as _hook_err:
@@ -1538,11 +1544,31 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            def _receipt_block(next_args: Dict[str, Any]) -> Optional[str]:
+                if approval_receipt is None:
+                    return None
+                from tools.approval import consume_plugin_smart_approval_receipt
+
+                receipt_error = consume_plugin_smart_approval_receipt(
+                    approval_receipt,
+                    function_name,
+                    next_args,
+                )
+                if receipt_error is None:
+                    return None
+                return (
+                    "BLOCKED: Plugin tool arguments changed after smart approval "
+                    f"or the approval receipt was invalid: {receipt_error}"
+                )
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    receipt_block = _receipt_block(next_args)
+                    if receipt_block is not None:
+                        return tool_error(receipt_block)
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1551,6 +1577,9 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    receipt_block = _receipt_block(next_args)
+                    if receipt_block is not None:
+                        return tool_error(receipt_block)
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,

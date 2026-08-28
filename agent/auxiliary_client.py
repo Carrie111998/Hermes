@@ -10072,6 +10072,16 @@ def _call_llm_impl(
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
+            # Approval review is a fail-closed execution gate. A timeout has
+            # consumed its full review budget, so a later attempt cannot turn
+            # that timed-out review into permission to execute.
+            if task == "approval" and _is_timeout_error(transient_err):
+                logger.info(
+                    "Auxiliary approval: first timeout; skipping retries and "
+                    "fallbacks: %s",
+                    transient_err,
+                )
+                raise
             # Compression is on the critical preflight path: a user cannot
             # continue or resume an oversized session until it compacts. A
             # same-provider retry on a timeout means another full ``timeout``-
@@ -10123,6 +10133,8 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if task == "approval" and _is_timeout_error(first_err):
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
