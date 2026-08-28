@@ -25,6 +25,47 @@ class TestNvidiaProfile:
         assert "nvidia.com" in p.base_url
 
 
+    def test_prepare_messages_strips_tool_result_names(self):
+        p = get_provider_profile("nvidia")
+        msgs = [
+            {"role": "user", "content": "run a command"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "terminal",
+                "tool_name": "terminal",
+                "tool_call_id": "call_1",
+                "content": "ok",
+            },
+        ]
+
+        result = p.prepare_messages(msgs)
+
+        assert "name" not in result[2]
+        assert "tool_name" not in result[2]
+        assert result[2] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok",
+        }
+        assert msgs[2]["name"] == "terminal"
+        assert msgs[2]["tool_name"] == "terminal"
+
+    def test_prepare_messages_passthrough_without_tool_result_names(self):
+        p = get_provider_profile("nvidia")
+        msgs = [{"role": "tool", "tool_call_id": "call_1", "content": "ok"}]
+        assert p.prepare_messages(msgs) is msgs
+
 
 class TestKimiProfile:
     def test_temperature_omit(self):
@@ -51,6 +92,14 @@ class TestOpenRouterProfile:
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
         assert body["provider"] == {"allow": ["anthropic"]}
+
+    def test_sticky_session_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job keep the same sticky routing key."""
+        p = get_provider_profile("openrouter")
+        first = p.build_extra_body(session_id="cron_job42_20260801_090000")
+        second = p.build_extra_body(session_id="cron_job42_20260802_090000")
+        assert first["session_id"] == "cron_job42"
+        assert first["session_id"] == second["session_id"]
 
 
 
@@ -85,6 +134,22 @@ class TestOpenRouterProfile:
             session_id="sess-abc123",
         )
         assert tl["extra_headers"]["x-grok-conv-id"] == "sess-abc123"
+
+    def test_grok_conv_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job must pin to the same xAI backend,
+        same as the body.session_id sticky key (#78941)."""
+        p = get_provider_profile("openrouter")
+        _, first = p.build_api_kwargs_extras(
+            model="x-ai/grok-4", session_id="cron_job42_20260801_090000",
+        )
+        _, second = p.build_api_kwargs_extras(
+            model="x-ai/grok-4", session_id="cron_job42_20260802_090000",
+        )
+        assert first["extra_headers"]["x-grok-conv-id"] == "cron_job42"
+        assert (
+            first["extra_headers"]["x-grok-conv-id"]
+            == second["extra_headers"]["x-grok-conv-id"]
+        )
 
 
 
@@ -132,6 +197,14 @@ class TestNousProfile:
         p = get_provider_profile("nous")
         body = p.build_extra_body()
         assert body["tags"] == nous_portal_tags()
+
+    def test_sticky_session_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job keep the same sticky routing key."""
+        p = get_provider_profile("nous")
+        first = p.build_extra_body(session_id="cron_job42_20260801_090000")
+        second = p.build_extra_body(session_id="cron_job42_20260802_090000")
+        assert first["session_id"] == "cron_job42"
+        assert first["session_id"] == second["session_id"]
 
 
 

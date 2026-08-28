@@ -109,7 +109,9 @@ def connected_adapter(monkeypatch):
         "gateway.status.acquire_scoped_lock",
         lambda scope, identity, metadata=None: (True, None),
     )
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock", lambda scope, identity: None
+    )
 
     intents = SimpleNamespace(
         message_content=False,
@@ -122,7 +124,9 @@ def connected_adapter(monkeypatch):
 
     created: dict = {"health_samples": 0}
 
-    def fake_bot_factory(*, command_prefix, intents, proxy=None, allowed_mentions=None, **_):
+    def fake_bot_factory(
+        *, command_prefix, intents, proxy=None, allowed_mentions=None, **_
+    ):
         created["bot"] = _LiveBot(intents=intents, allowed_mentions=allowed_mentions)
         return created["bot"]
 
@@ -209,7 +213,9 @@ async def test_on_resumed_marks_platform_connected(connected_adapter, status_wri
 
 
 @pytest.mark.asyncio
-async def test_on_disconnect_marks_platform_disconnected(connected_adapter, status_writes):
+async def test_on_disconnect_marks_platform_disconnected(
+    connected_adapter, status_writes
+):
     """A gateway socket drop must publish a ``disconnected`` runtime status."""
     adapter, created = connected_adapter
 
@@ -227,6 +233,27 @@ async def test_on_disconnect_marks_platform_disconnected(connected_adapter, stat
     assert "disconnected" in _platform_states(status_writes), (
         f"on_disconnect must mark the platform disconnected; saw writes={status_writes}"
     )
+
+
+@pytest.mark.asyncio
+async def test_transport_refresh_keeps_plugin_runtime_status_key(
+    connected_adapter, status_writes
+):
+    """Multiplexed plugin adapters must keep their namespaced status owner."""
+    adapter, created = connected_adapter
+    adapter._runtime_status_platform_key = "reviewer:discord"
+
+    assert await adapter.connect() is True
+    bot = created["bot"]
+
+    status_writes.clear()
+    await bot._events["on_disconnect"]()
+
+    assert any(
+        write.get("platform") == "reviewer:discord"
+        and write.get("platform_state") == "disconnected"
+        for write in status_writes
+    ), status_writes
 
 
 @pytest.mark.asyncio
@@ -249,7 +276,9 @@ async def test_on_disconnect_keeps_the_liveness_watchdog_alive(
     bot = created["bot"]
 
     assert adapter._liveness_task is not None, "connect() must start the watchdog"
-    assert await _watchdog_is_sampling(created), "watchdog is not sampling before the drop"
+    assert await _watchdog_is_sampling(created), (
+        "watchdog is not sampling before the drop"
+    )
 
     await bot._events["on_disconnect"]()
 
