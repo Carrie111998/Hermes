@@ -1086,9 +1086,17 @@ def find_windows_gateway_services(
             if service_status == "stopped":
                 continue
             if service_status != "running":
-                raise RuntimeError(
-                    f"SCM service {service_name} has indeterminate status: {service_status}"
+                # Non-running, non-stopped statuses (paused, pause_pending,
+                # continue_pending, start_pending, stop_pending) are not active
+                # SCM hosts for a gateway — skip them instead of aborting the
+                # entire enumeration.  A single paused third-party service
+                # (e.g. Siemens SmartServer) must not block updates. (#96860)
+                logger.debug(
+                    "Skipping SCM service %s with non-running status: %s",
+                    service_name,
+                    service_status,
                 )
+                continue
             if service_pid <= 0:
                 raise RuntimeError(
                     f"Running SCM service {service_name} has no valid process ID"

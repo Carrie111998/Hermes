@@ -1126,6 +1126,27 @@ def test_find_windows_gateway_services_fails_closed_on_service_access_error(
         )
 
 
+def test_find_windows_gateway_services_skips_paused_service(monkeypatch):
+    """A paused third-party service must not abort the SCM enumeration (#96860)."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
+
+    class PausedService:
+        def as_dict(self):
+            return {"name": "cortsmartserver", "pid": 0, "status": "paused"}
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [PausedService()],
+    )
+
+    # Must not raise — paused services are skipped, not fatal.
+    result = gateway.find_windows_gateway_services(
+        psutil_module=fake_psutil,
+        profile_processes=[profile],
+    )
+    assert result == []
+
+
 def test_find_windows_gateway_services_fails_closed_when_scm_scan_is_indeterminate(
     monkeypatch,
 ):
