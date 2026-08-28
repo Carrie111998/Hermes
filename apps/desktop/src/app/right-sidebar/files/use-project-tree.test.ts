@@ -29,11 +29,16 @@ function ok(entries: { name: string; path: string; isDirectory: boolean }[]): He
 }
 
 describe('useProjectTree', () => {
-  it('starts empty when cwd is blank and skips IPC', async () => {
+  it('starts empty when cwd is blank and skips IPC across external resets', async () => {
     const { result } = renderHook(() => useProjectTree(''))
 
     await waitFor(() => expect(result.current.rootLoading).toBe(false))
 
+    act(() => {
+      resetProjectTreeState()
+    })
+
+    await waitFor(() => expect(result.current.rootLoading).toBe(false))
     expect(result.current.data).toEqual([])
     expect(result.current.rootError).toBeNull()
     expect(readDir).not.toHaveBeenCalled()
@@ -116,6 +121,35 @@ describe('useProjectTree', () => {
 
     expect(result.current.rootError).toBeNull()
     expect(result.current.data.map(node => node.name)).toEqual(['IDEA.md'])
+  })
+
+  it('reloads when project state resets after the mounted root read starts', async () => {
+    let resolveSupersededRead: ((result: HermesReadDirResult) => void) | undefined
+    readDir.mockImplementationOnce(
+      () =>
+        new Promise<HermesReadDirResult>(resolve => {
+          resolveSupersededRead = resolve
+        })
+    )
+    readDir.mockResolvedValueOnce(ok([{ name: 'recovered', path: '/p/recovered', isDirectory: true }]))
+
+    const { result } = renderHook(() => useProjectTree('/p'))
+
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      resetProjectTreeState()
+    })
+
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(result.current.data.map(node => node.name)).toEqual(['recovered']))
+
+    await act(async () => {
+      resolveSupersededRead?.(ok([{ name: 'stale', path: '/p/stale', isDirectory: false }]))
+    })
+
+    expect(result.current.data.map(node => node.name)).toEqual(['recovered'])
+    expect(result.current.rootLoading).toBe(false)
   })
 
   it('lazy-loads children on loadChildren and replaces the placeholder', async () => {
