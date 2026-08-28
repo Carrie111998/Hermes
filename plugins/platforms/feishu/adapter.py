@@ -2233,34 +2233,6 @@ class FeishuAdapter(BasePlatformAdapter):
         }
         return json.dumps(card, ensure_ascii=False)
 
-    def _get_sdk_executor(self):
-        """Return the adapter-owned thread pool for blocking SDK calls.
-
-        Using a dedicated executor avoids depending on the event loop's
-        default executor, which may have different sizing and back-pressure
-        characteristics.  Mirrors the pattern on Hermes main branch.
-        """
-        lock = getattr(self, "_sdk_executor_lock", None)
-        if lock is None:
-            self._sdk_executor_lock = threading.Lock()
-            lock = self._sdk_executor_lock
-        with lock:
-            if getattr(self, "_sdk_executor_closing", False):
-                raise RuntimeError("Feishu SDK executor is shutting down")
-            executor = getattr(self, "_sdk_executor", None)
-            if executor is None:
-                from concurrent.futures import ThreadPoolExecutor
-                executor = ThreadPoolExecutor(
-                    max_workers=4, thread_name_prefix="feishu-sdk",
-                )
-                self._sdk_executor = executor
-            return executor
-
-    async def _run_blocking(self, func, *args):
-        """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
-
     async def _cardkit_api_call(
         self,
         operation: str,
