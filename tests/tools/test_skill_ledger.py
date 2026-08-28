@@ -365,3 +365,147 @@ def test_user_actor_override(ledger_env):
         skill_ledger.reset_ledger_actor(tok)
     entry = skill_ledger.get_entry(entry_id)
     assert entry["actor"] == "user"
+
+
+def _write_skills_tarball(home: Path, files: dict, stamp: str = "2026-08-01T00-00-00Z"):
+    """Write a curator-shaped skills.tar.gz under *home*."""
+    import io
+    import tarfile
+
+    snap = home / "skills" / ".curator_backups" / stamp
+    snap.mkdir(parents=True, exist_ok=True)
+    tar_path = snap / "skills.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for rel, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            info = tarfile.TarInfo(name=rel)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return tar_path
+
+
+def test_delete_after_rehome_ledgers_full_package_from_backup(ledger_env):
+    """Consolidation re-homes references/ then deletes. The delete entry
+    must still capture the support file from the pre-run snapshot (#96962)."""
+    from tools import skill_ledger
+    from tools.skill_manager_tool import skill_manage
+
+    assert _create()["success"] is True
+    extra = ledger_env["skills"] / "my-skill" / "references" / "extra.md"
+    wrote = json.loads(
+        skill_manage(
+            action="write_file",
+            name="my-skill",
+            file_path="references/extra.md",
+            file_content="roadmap body",
+        )
+    )
+    assert wrote["success"] is True
+    skill_md = ledger_env["skills"] / "my-skill" / "SKILL.md"
+    _write_skills_tarball(
+        ledger_env["home"],
+        {
+            "my-skill/SKILL.md": skill_md.read_text(encoding="utf-8"),
+            "my-skill/references/extra.md": "roadmap body",
+        },
+    )
+    extra.unlink()
+    extra.parent.rmdir()
+
+    deleted = json.loads(skill_manage(action="delete", name="my-skill"))
+    assert deleted["success"] is True
+
+    delete_entry = [
+        r for r in skill_ledger.list_entries(skill="my-skill") if r["action"] == "delete"
+    ][0]
+    before_paths = {Path(i["path"]).name for i in delete_entry["before"]}
+    assert "SKILL.md" in before_paths
+    assert "extra.md" in before_paths, (
+        "delete ledger captured only SKILL.md after support files were "
+        "re-homed — rollback would restore a hollow skill (#96962)"
+    )
+
+    ok, msg = skill_ledger.rollback_entry(delete_entry["id"])
+    assert ok is True, msg
+    assert extra.is_file()
+    assert extra.read_text(encoding="utf-8") == "roadmap body"
+    assert skill_md.is_file()
+
+
+def test_rollback_incomplete_delete_restores_support_files_from_backup(ledger_env):
+    """Historical delete entries that recorded files:1 still restore the
+    package by filling from the newest curator snapshot at rollback time."""
+    from tools import skill_ledger
+
+    skill_dir = ledger_env["skills"] / "my-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    _write_skills_tarball(
+        ledger_env["home"],
+        {
+            "my-skill/SKILL.md": VALID_SKILL_CONTENT,
+            "my-skill/references/pi-lesson-roadmap.md": "week 1",
+        },
+    )
+    skill_md.unlink()
+    skill_dir.rmdir()
+
+    entry_id = skill_ledger.append_entry(
+        "delete",
+        "my-skill",
+        before=[{"path": str(skill_md), "sha256": skill_ledger._store_blob(
+            VALID_SKILL_CONTENT.encode("utf-8")
+        )}],
+        after=[],
+    )
+    assert entry_id is not None
+    ok, msg = skill_ledger.rollback_entry(entry_id)
+    assert ok is True, msg
+    roadmap = skill_dir / "references" / "pi-lesson-roadmap.md"
+    assert skill_md.is_file()
+    assert roadmap.is_file()
+    assert roadmap.read_text(encoding="utf-8") == "week 1"
+
+
+def test_backup_fill_does_not_clobber_disk_hash(ledger_env):
+    from tools import skill_ledger
+
+    skill_dir = ledger_env["skills"] / "my-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    live = VALID_SKILL_CONTENT.replace("Original body.", "Live body.")
+    skill_md.write_text(live, encoding="utf-8")
+    _write_skills_tarball(
+        ledger_env["home"],
+        {
+            "my-skill/SKILL.md": VALID_SKILL_CONTENT,
+            "my-skill/references/extra.md": "from tar",
+        },
+    )
+    captured = skill_ledger.snapshot_paths(skill_dir, complete_package=True)
+    by_name = {Path(i["path"]).name: i["sha256"] for i in captured}
+    live_hash = skill_ledger._store_blob(live.encode("utf-8"))
+    tar_hash = skill_ledger._store_blob(VALID_SKILL_CONTENT.encode("utf-8"))
+    assert by_name["SKILL.md"] == live_hash
+    assert by_name["SKILL.md"] != tar_hash
+    assert by_name["extra.md"] == skill_ledger._store_blob(b"from tar")
+
+
+def test_backup_fill_ignores_tar_slip(ledger_env):
+    from tools import skill_ledger
+
+    skill_dir = ledger_env["skills"] / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    _write_skills_tarball(
+        ledger_env["home"],
+        {
+            "my-skill/SKILL.md": VALID_SKILL_CONTENT,
+            "../evil.md": "nope",
+            "my-skill/../outside.md": "nope",
+        },
+    )
+    captured = skill_ledger.snapshot_paths(skill_dir, complete_package=True)
+    paths = [i["path"] for i in captured]
+    assert not any(p.endswith("evil.md") or p.endswith("outside.md") for p in paths)
