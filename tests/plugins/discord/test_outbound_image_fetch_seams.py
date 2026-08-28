@@ -42,7 +42,7 @@ async def test_adapter_redirect_wrapper_uses_adapter_url_safety_patch(monkeypatc
         async def __aexit__(self, *_args: Any) -> bool:
             return False
 
-        async def aiter_bytes(self):
+        async def aiter_bytes(self, *, chunk_size=None):
             yield b"\x89PNG\r\n\x1a\n"
 
     class Client:

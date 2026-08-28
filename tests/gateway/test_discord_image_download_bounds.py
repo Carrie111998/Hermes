@@ -21,6 +21,9 @@ from plugins.platforms.discord.adapter import (
     _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
     DiscordAdapter,
 )
+from plugins.platforms.discord.outbound_image_fetch import (
+    _DISCORD_IMAGE_DECODED_READ_CHUNK_MAX_BYTES,
+)
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from tools.url_safety import (
@@ -83,7 +86,9 @@ class _FakeResponse:
     async def __aexit__(self, *_args: object) -> bool:
         return False
 
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+    async def aiter_bytes(
+        self, *, chunk_size: int | None = None
+    ) -> AsyncIterator[bytes]:
         async for chunk in self.content.iter_chunked(64 * 1024):
             yield chunk
 
@@ -101,6 +106,24 @@ class _FakeResponse:
             raise self._close_error
 
 
+class _ChunkSizeAwareResponse:
+    """Response fake that records the decoded iterator chunk-size request."""
+
+    def __init__(self, chunks: tuple[bytes, ...]):
+        self.headers: dict[str, str] = {}
+        self._chunks = chunks
+        self.requested_chunk_size: int | None = None
+        self.close_called = 0
+
+    async def aiter_bytes(self, *, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        self.requested_chunk_size = chunk_size
+        for chunk in self._chunks:
+            yield chunk
+
+    def close(self) -> None:
+        self.close_called += 1
+
+
 class _ReleaseOnlyResponse:
     """Response variant exposing release() but no close()."""
 
@@ -109,7 +132,9 @@ class _ReleaseOnlyResponse:
         self.content = _FakeResponseContent(chunks)
         self.release_called = 0
 
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+    async def aiter_bytes(
+        self, *, chunk_size: int | None = None
+    ) -> AsyncIterator[bytes]:
         async for chunk in self.content.iter_chunked(64 * 1024):
             yield chunk
 
@@ -167,7 +192,9 @@ class _ImageBodyResponse:
     async def __aexit__(self, *_args: object) -> bool:
         return False
 
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+    async def aiter_bytes(
+        self, *, chunk_size: int | None = None
+    ) -> AsyncIterator[bytes]:
         yield self.body
 
 
@@ -396,6 +423,26 @@ def test_image_client_passes_explicit_proxy_to_ssrf_safe_client(monkeypatch):
 
 
 class TestReadResponseBytesBounded:
+    def test_requests_bounded_chunk_size_and_closes_on_overflow(self):
+        response_limit = 4
+        response = _ChunkSizeAwareResponse((b"abc", b"de"))
+        result = None
+
+        with pytest.raises(ValueError, match="exceeded 4 bytes"):
+            result = asyncio.run(
+                _read_response_bytes_bounded(response, response_limit)
+            )
+
+        assert response.requested_chunk_size is not None
+        assert response.requested_chunk_size > 0
+        assert (
+            response.requested_chunk_size
+            <= _DISCORD_IMAGE_DECODED_READ_CHUNK_MAX_BYTES
+        )
+        assert response.requested_chunk_size <= response_limit
+        assert response.close_called == 1
+        assert result is None
+
     def test_reads_all_chunks_within_limit(self):
         resp = _FakeResponse((b"xx", b"yyy"))
 

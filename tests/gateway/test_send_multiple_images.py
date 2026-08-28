@@ -179,7 +179,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 if False:
                     yield b""
                 raise AssertionError("redirect responses must not be read")
@@ -194,7 +194,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 yield b"\x89PNG\r\n\x1a\n"
 
         class FakeClient:
@@ -250,7 +250,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 if False:
                     yield b""
                 raise AssertionError("redirect responses must not be read")
@@ -318,7 +318,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 yield body
 
         class FakeClient:
@@ -371,7 +371,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 yield b'{"error":"not an image"}'
 
         class FakeClient:
@@ -430,7 +430,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 self.consumed_chunks += 1
                 yield body
 
@@ -514,7 +514,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 self.consumed_chunks += 1
                 yield self.body
 
@@ -596,7 +596,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 self.consumed_chunks += 1
                 yield self.body
 
@@ -682,7 +682,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 self.consumed_chunks += 1
                 yield body
 
@@ -760,7 +760,7 @@ class TestDiscordMultiImage:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def aiter_bytes(self):
+            async def aiter_bytes(self, *, chunk_size=None):
                 self.body_read_calls += 1
                 self.bytes_yielded += len(body)
                 yield body

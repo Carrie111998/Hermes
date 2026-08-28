@@ -12,6 +12,7 @@ from tools.url_safety import async_is_safe_url, create_ssrf_safe_async_client
 
 _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # generous limit for images/animations
 _DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
+_DISCORD_IMAGE_DECODED_READ_CHUNK_MAX_BYTES = 64 * 1024
 _DISCORD_IMAGE_DOWNLOAD_BUDGET_CONTEXT = ContextVar(
     "discord_image_download_budget",
     default=None,
@@ -106,7 +107,15 @@ async def _read_response_bytes_bounded(
 
     chunks = []
     total_bytes = 0
-    async for chunk in resp.aiter_bytes():
+    decoded_read_chunk_size = min(
+        _DISCORD_IMAGE_DECODED_READ_CHUNK_MAX_BYTES,
+        limit_bytes,
+    )
+    if download_budget is not None:
+        remaining_budget = download_budget.limit_bytes - download_budget.bytes_read
+        decoded_read_chunk_size = min(decoded_read_chunk_size, remaining_budget)
+
+    async for chunk in resp.aiter_bytes(chunk_size=decoded_read_chunk_size):
         if download_budget is not None:
             try:
                 download_budget.account(len(chunk))
@@ -166,6 +175,8 @@ async def _read_url_image_with_redirect_guard(
             headers = {str(key).lower(): value for key, value in dict(raw_headers).items()}
             status = int(getattr(resp, "status_code", getattr(resp, "status", 0)))
             if status in redirect_statuses:
+                # Redirect bodies are intentionally not drained; the stream context closes them,
+                # and the budget counts only bytes actually read.
                 location = headers.get("location")
                 if not location:
                     return status, b"", headers
