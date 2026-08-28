@@ -193,7 +193,7 @@ describe('submissionCore.submitPrompt — session-busy re-queue is origin-scoped
 
     // The prompt goes back to A's bucket. Before the fix this went through the
     // active bucket, so A's prompt was queued into B and then sent into B.
-    expect(enqueueToSession).toHaveBeenCalledWith('sess-a', 'follow-up for A')
+    expect(enqueueToSession).toHaveBeenCalledWith('sess-a', 'follow-up for A', { display: 'follow-up for A' })
 
     // ...and A's side effects must not be applied to B.
     expect(getUiState().sid).toBe('sess-b')
@@ -213,10 +213,40 @@ describe('submissionCore.submitPrompt — session-busy re-queue is origin-scoped
     rejectSubmit(new Error('session busy'))
     await flush()
 
-    expect(enqueueToSession).toHaveBeenCalledWith('sess-a', 'follow-up for A')
+    expect(enqueueToSession).toHaveBeenCalledWith('sess-a', 'follow-up for A', { display: 'follow-up for A' })
     expect(getUiState().busy).toBe(true)
     expect(getUiState().status).toBe('queued for next turn')
     expect(sys).toHaveBeenCalledWith('queued: "follow-up for A"')
+  })
+
+  it('re-queues expanded text with its display override into the origin session', async () => {
+    const { gw, rejectSubmit } = makeDeferredSubmitGateway()
+    const appendMessage = vi.fn()
+    const enqueueToSession = vi.fn()
+    const expandedText = 'expanded skill instructions for the model'
+    const displayText = '/review the current change'
+
+    submitPrompt(
+      'review current change',
+      makeDeps(gw, {
+        appendMessage,
+        enqueueToSession,
+        expand: () => expandedText
+      }),
+      true,
+      displayText
+    )
+    await flush()
+
+    patchUiState({ busy: false, sid: 'sess-b', status: 'ready' })
+
+    rejectSubmit(new Error('session busy'))
+    await flush()
+
+    expect(appendMessage).toHaveBeenCalledWith({ role: 'user', text: displayText })
+    expect(enqueueToSession).toHaveBeenCalledWith('sess-a', expandedText, { display: displayText })
+    expect(getUiState().sid).toBe('sess-b')
+    expect(getUiState().busy).toBe(false)
   })
 })
 

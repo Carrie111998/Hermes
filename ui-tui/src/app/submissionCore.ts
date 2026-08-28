@@ -14,7 +14,7 @@ export interface SubmitPromptDeps {
   // Keyed by origin session: the requeue below fires from a `.catch` nested
   // inside the `input.detect_drop` round-trip, so it can resolve two RPCs after
   // the user switched sessions.
-  enqueueToSession: (sessionId: string, text: string) => void
+  enqueueToSession: (sessionId: string, text: string, opts?: { display?: string }) => void
   expand: (text: string) => string
   gw: GatewayClient
   setLastUserMsg: (value: string) => void
@@ -98,7 +98,7 @@ export function submitPrompt(
         // the re-queue path as a safety net for any future/legacy gateway that
         // still errors, so a message is never silently dropped.
         if (isSessionBusyError(e)) {
-          deps.enqueueToSession(liveSid, submitText)
+          deps.enqueueToSession(liveSid, submitText, { display: displayOverride || displayText })
 
           // Both side effects below describe the ORIGIN session: the busy latch
           // covers its in-flight turn, and the notice reports what landed in its
