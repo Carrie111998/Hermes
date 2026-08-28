@@ -708,3 +708,61 @@ class TestKeylessFailover:
         assert out[1]["error"] == "HTTP 404"
         assert out[2]["error"] == "HTTP 403 blocked"
         assert out[2]["metadata"]["served_by"] == "parallel"
+
+    def test_extract_tracks_duplicate_url_occurrences_independently(self, monkeypatch):
+        self._pin(monkeypatch, "exa")
+        url = "https://duplicate"
+        primary = [
+            {"url": url, "title": "first", "content": "primary-success"},
+            {"url": url, "title": "", "content": "", "error": "HTTP 429"},
+        ]
+        rescue_calls = []
+
+        def rescue(requested):
+            rescue_calls.append(list(requested))
+            return [{"url": url, "title": "second", "content": "rescued-success"}]
+
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", rescue)
+
+        out = keyless_mcp.extract_with_failover("exa", [url, url])
+
+        assert rescue_calls == [[url]]
+        assert [row["content"] for row in out] == [
+            "primary-success",
+            "rescued-success",
+        ]
+        assert out[0] is not out[1]
+        assert out[1]["metadata"] == {
+            "sourceURL": url,
+            "served_by": "parallel",
+        }
+
+    def test_extract_normalizes_malformed_rescue_metadata(self, monkeypatch):
+        self._pin(monkeypatch, "exa")
+        url = "https://malformed-metadata"
+        primary = [{"url": url, "title": "", "content": "", "error": "HTTP 429"}]
+        rescued = [
+            {
+                "url": url,
+                "title": "rescued",
+                "content": "ok",
+                "metadata": "broken",
+            }
+        ]
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "parallel", lambda requested: rescued
+        )
+
+        out = keyless_mcp.extract_with_failover("exa", [url])
+
+        assert out[0]["content"] == "ok"
+        assert out[0]["metadata"] == {
+            "sourceURL": url,
+            "served_by": "parallel",
+        }

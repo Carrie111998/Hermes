@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -860,20 +861,30 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
     if not urls:
         return []
 
-    pending = list(urls)
-    merged: Dict[str, Dict[str, Any]] = {}
+    pending = list(range(len(urls)))
+    merged: List[Optional[Dict[str, Any]]] = []
+    for _ in urls:
+        merged.append(None)
     for i, vendor in enumerate(order):
         if not pending:
             break
-        results = _KEYLESS_EXTRACTORS[vendor](list(pending))
-        by_url = {
-            str(row.get("url") or ""): row
-            for row in results
-            if isinstance(row, dict) and row.get("url") in pending
-        }
-        retry: List[str] = []
-        for url in pending:
-            row = by_url.get(url)
+        requested_urls = [urls[index] for index in pending]
+        results = _KEYLESS_EXTRACTORS[vendor](requested_urls)
+        rows_by_url: Dict[str, List[Dict[str, Any]]] = {}
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            result_url = str(row.get("url") or "")
+            if result_url in requested_urls:
+                rows_by_url.setdefault(result_url, []).append(row)
+        row_offsets: Dict[str, int] = {}
+        retry: List[int] = []
+        for input_index in pending:
+            url = urls[input_index]
+            offset = row_offsets.get(url, 0)
+            candidates = rows_by_url.get(url, [])
+            row = candidates[offset] if offset < len(candidates) else None
+            row_offsets[url] = offset + 1
             if row is None:
                 row = {
                     "url": url,
@@ -883,14 +894,17 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
                 }
             elif vendor != name:
                 row = dict(row)
-                metadata = dict(row.get("metadata") or {})
+                raw_metadata = row.get("metadata")
+                metadata = (
+                    dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+                )
                 metadata.setdefault("sourceURL", url)
                 metadata["served_by"] = vendor
                 row["metadata"] = metadata
-            merged[url] = row
+            merged[input_index] = row
             error = str(row.get("error") or "")
             if error and _is_rate_limitish(error) and i + 1 < len(order):
-                retry.append(url)
+                retry.append(input_index)
 
         nxt = order[i + 1] if retry and i + 1 < len(order) else None
         if nxt:
@@ -903,4 +917,14 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
             )
         pending = retry
 
-    return [merged[url] for url in urls]
+    return [
+        row
+        if row is not None
+        else {
+            "url": urls[index],
+            "title": "",
+            "content": "",
+            "error": "Keyless extract returned no result",
+        }
+        for index, row in enumerate(merged)
+    ]
