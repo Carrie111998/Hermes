@@ -51,6 +51,31 @@ logger = logging.getLogger("gateway.streaming_tts_consumer")
 _ABORT = object()
 _DONE = object()
 
+# Default first-sentence threshold for the chunker, in characters. Tuned for
+# English, where a meaningful clause rarely fits in fewer than 20. For CJK
+# text 20 characters is one-to-two full clauses, so short openers ("嗯，好的。")
+# always buffer and ride with the second sentence, delaying the first audible
+# audio by about one LLM sentence — the most latency-sensitive moment of a
+# voice interaction (#96927).
+_DEFAULT_STREAMING_MIN_LEN = 20
+
+
+def _streaming_min_len(tts_config: Dict[str, Any]) -> int:
+    """Read ``tts.streaming.min_len`` (first-sentence threshold, chars).
+
+    Invalid values fall back to the default rather than failing the voice
+    path; the floor is 1 so a misconfigured 0 cannot disable chunking
+    entirely (every boundary would emit, including single-char fragments).
+    """
+    streaming_cfg = tts_config.get("streaming")
+    if not isinstance(streaming_cfg, dict):
+        return _DEFAULT_STREAMING_MIN_LEN
+    try:
+        value = int(streaming_cfg.get("min_len", _DEFAULT_STREAMING_MIN_LEN))
+    except (TypeError, ValueError):
+        return _DEFAULT_STREAMING_MIN_LEN
+    return max(1, value)
+
 
 class StreamingTTSConsumer:
     """Consumes LLM text deltas and produces streaming PCM audio for an adapter."""
@@ -76,7 +101,7 @@ class StreamingTTSConsumer:
         # Resolve the streaming provider once. If unavailable, the consumer is
         # inactive and the gateway falls back to whole-file TTS.
         self._streamer = resolve_streaming_provider(tts_config)
-        self._chunker = SentenceChunker()
+        self._chunker = SentenceChunker(min_len=_streaming_min_len(tts_config))
 
         if self._streamer is not None:
             self._audio_format = AudioFormat(
