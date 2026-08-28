@@ -458,6 +458,57 @@ class TestMcpTest:
 
 
 # ---------------------------------------------------------------------------
+# Tests: cmd_mcp_configure
+# ---------------------------------------------------------------------------
+
+class TestMcpConfigure:
+    @pytest.mark.parametrize(
+        ("tools_filter", "expected_pre_selected", "expected_status"),
+        [
+            (None, {0, 1}, "Currently 2/2 tools enabled"),
+            ({"include": []}, set(), "Currently 0/2 tools enabled"),
+            ({"include": ["write"]}, {1}, "Currently 1/2 tools enabled"),
+        ],
+        ids=["absent-include", "empty-include", "nonempty-include"],
+    )
+    def test_configure_preselection_matches_active_include_filter(
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
+        tools_filter,
+        expected_pre_selected,
+        expected_status,
+    ):
+        server = {"url": "https://example.com/mcp"}
+        if tools_filter is not None:
+            server["tools"] = tools_filter
+        _seed_config(tmp_path, {"test-server": server})
+        _set_interactive_stdin(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config: [("read", "Read"), ("write", "Write")],
+        )
+
+        captured = {}
+
+        def capture_checklist(title, labels, pre_selected, **kwargs):
+            captured["pre_selected"] = pre_selected
+            return pre_selected
+
+        monkeypatch.setattr(
+            "hermes_cli.curses_ui.curses_checklist", capture_checklist
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args())
+
+        assert captured["pre_selected"] == expected_pre_selected
+        assert expected_status in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # Tests: env var interpolation
 # ---------------------------------------------------------------------------
 

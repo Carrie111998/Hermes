@@ -5901,8 +5901,8 @@ def _configure_mcp_tools_interactive(config: dict):
     """Probe MCP servers for available tools and let user toggle them on/off.
 
     Connects to each configured MCP server, discovers tools, then shows
-    a per-server curses checklist.  Writes changes back as ``tools.exclude``
-    entries in config.yaml.
+    a per-server curses checklist. Writes changes back using the server's
+    active ``tools.include`` or ``tools.exclude`` filter mode.
     """
     from hermes_cli.curses_ui import curses_checklist
 
@@ -5955,8 +5955,8 @@ def _configure_mcp_tools_interactive(config: dict):
 
         srv_cfg = mcp_servers.get(server_name, {})
         tools_cfg = srv_cfg.get("tools") or {}
-        include_list = tools_cfg.get("include") or []
-        exclude_list = tools_cfg.get("exclude") or []
+        include_list = tools_cfg.get("include")
+        exclude_list = tools_cfg.get("exclude")
 
         # Build checklist labels
         labels = []
@@ -5980,10 +5980,15 @@ def _configure_mcp_tools_interactive(config: dict):
 
         pre_selected: Set[int] = set()
         tool_names = [t[0] for t in tools]
-        include_set = {str(p) for p in include_list} if include_list else None
-        exclude_set = {str(p) for p in exclude_list} if exclude_list else None
+        include_mode = isinstance(include_list, list)
+        include_set = {str(p) for p in include_list} if include_mode else set()
+        exclude_set = (
+            {str(p) for p in exclude_list}
+            if isinstance(exclude_list, list)
+            else set()
+        )
         for i, tool_name in enumerate(tool_names):
-            if include_set:
+            if include_mode:
                 # Include mode: only included tools are selected
                 if _match_filter(tool_name, include_set):
                     pre_selected.add(i)
@@ -6010,7 +6015,7 @@ def _configure_mcp_tools_interactive(config: dict):
         srv_cfg = mcp_servers.setdefault(server_name, {})
         tools_cfg = srv_cfg.setdefault("tools", {})
 
-        exclude_mode = bool(exclude_set) and not include_set
+        exclude_mode = bool(exclude_set) and not include_mode
 
         if len(chosen) == len(tools) and not exclude_mode:
             # All tools enabled — clear filters (cleanest config shape; the
