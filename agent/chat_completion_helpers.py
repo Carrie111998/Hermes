@@ -1822,8 +1822,83 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+_CLAUDE_OAUTH_SCRUB = (
+    ("session_search", "sess_search"),
+    ("skill_manage", "sk_manage"),
+    ("skill_view", "sk_view"),
+)
+
+
+def _moa_preset_targets_claude(agent) -> bool:
+    """Return whether a MoA preset routes any acting slot to Claude."""
+    try:
+        base_url = str(getattr(agent, "base_url", "") or "").lower()
+        if not base_url.startswith("moa://"):
+            return False
+        from hermes_cli.config import load_config
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        preset = resolve_moa_preset(
+            load_config().get("moa") or {},
+            str(getattr(agent, "model", "") or "default"),
+        )
+        slots = list(preset.get("reference_models") or [])
+        if isinstance(preset.get("aggregator"), dict):
+            slots.append(preset["aggregator"])
+        return any(
+            "claude" in str(slot.get("model", "")).lower()
+            for slot in slots
+            if isinstance(slot, dict)
+        )
+    except Exception:
+        return True
+
+
+def _scrub_claude_oauth_triggers(agent, api_messages):
+    try:
+        model = str(getattr(agent, "model", "") or "").lower()
+    except Exception:
+        return api_messages
+    if not isinstance(api_messages, list):
+        return api_messages
+    if "claude" not in model and not _moa_preset_targets_claude(agent):
+        return api_messages
+
+    def scrub_string(text: str) -> str:
+        for original, replacement in _CLAUDE_OAUTH_SCRUB:
+            text = text.replace(original, replacement)
+        return text
+
+    changed = False
+    output = []
+    for message in api_messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                scrubbed = scrub_string(content)
+                if scrubbed != content:
+                    message = {**message, "content": scrubbed}
+                    changed = True
+            elif isinstance(content, list):
+                blocks = []
+                message_changed = False
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        scrubbed = scrub_string(block["text"])
+                        if scrubbed != block["text"]:
+                            block = {**block, "text": scrubbed}
+                            message_changed = True
+                    blocks.append(block)
+                if message_changed:
+                    message = {**message, "content": blocks}
+                    changed = True
+        output.append(message)
+    return output if changed else api_messages
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    api_messages = _scrub_claude_oauth_triggers(agent, api_messages)
     if tools_for_api is None:
         tools_for_api = agent.tools
 
