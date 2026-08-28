@@ -386,7 +386,8 @@ def _try_relay_delivery(
     try:
         from tools.bot_relay import (
             EnvelopeRefusedError,
-            enqueue_envelope,
+            prepare_envelope,
+            publish_envelope,
             read_remote_roster,
             resolve_remote_target,
             waiter_command,
@@ -409,7 +410,7 @@ def _try_relay_delivery(
                 f"disambiguate with one of: {forms}."
             )
         try:
-            envelope = enqueue_envelope(
+            envelope = prepare_envelope(
                 root,
                 target=match,
                 message=f"Message from 🤖 {sender_handle} (@{sender_handle}): {body}",
@@ -422,9 +423,24 @@ def _try_relay_delivery(
             # resolution error ('runtime_offline' per the #93091 reason enum).
             return json.dumps({"error": str(exc), "reason": exc.reason})
         label = f"@{match['handle']} on {match['connection_label'] or match['connection_id']}"
-        return _spawn_delivery(
-            waiter_command(root, envelope), label, task_id=task_id, agent=agent
+        result = _spawn_delivery(
+            waiter_command(root, envelope),
+            label,
+            task_id=task_id,
+            agent=agent,
         )
+        try:
+            started = json.loads(result).get("status") == "sent"
+        except (TypeError, ValueError):
+            started = False
+        if not started:
+            return result
+        try:
+            publish_envelope(root, envelope)
+        except Exception as exc:
+            logger.error("relay envelope publish failed: %s", exc, exc_info=True)
+            return _err(f"Delivery to {label} could not be queued: {exc}")
+        return result
     except Exception:
         logger.debug("relay delivery attempt failed", exc_info=True)
         return None

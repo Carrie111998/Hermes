@@ -305,7 +305,7 @@ def _target_liveness(root: Path | str, target: dict) -> Optional[bool]:
         return None
 
 
-def enqueue_envelope(
+def prepare_envelope(
     root: Path | str,
     *,
     target: dict,
@@ -313,11 +313,11 @@ def enqueue_envelope(
     sender_profile: str,
     sender_handle: str,
 ) -> dict:
-    """Queue a cross-connection DM for the Desktop relay. Returns envelope.
+    """Build a cross-connection DM without making it drainable.
 
     Raises ``EnvelopeRefusedError`` (reason ``'runtime_offline'``) instead of
-    writing the outbox file when the target is definitively offline per
-    ``_target_liveness``. Unknown liveness enqueues as before (fail-open).
+    preparing an envelope when the target is definitively offline per
+    ``_target_liveness``. Unknown liveness proceeds as before (fail-open).
     """
     if _target_liveness(root, target) is False:
         label = (
@@ -330,8 +330,7 @@ def enqueue_envelope(
             f"{label} is offline right now — the message was NOT queued. "
             "Try again once that machine reconnects to the Desktop.",
         )
-    base = _ensure_dirs(root)
-    envelope = {
+    return {
         "id": uuid.uuid4().hex,
         "created_at": int(time.time()),
         "from_profile": sender_profile,
@@ -341,11 +340,45 @@ def enqueue_envelope(
         "target_handle": target["handle"],
         "message": message,
     }
+
+
+def publish_envelope(root: Path | str, envelope: dict) -> None:
+    """Atomically expose a prepared envelope to the Desktop drain loop."""
+    envelope_id = str(envelope.get("id") or "") if isinstance(envelope, dict) else ""
+    if not re.fullmatch(r"[0-9a-f]{32}", envelope_id):
+        raise ValueError(f"invalid envelope id: {envelope_id!r}")
+    base = _ensure_dirs(root)
     path = base / OUTBOX_DIR / f"{envelope['id']}.json"
     fd, tmp = tempfile.mkstemp(dir=str(base / OUTBOX_DIR), prefix=".env-", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(envelope, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(envelope, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def enqueue_envelope(
+    root: Path | str,
+    *,
+    target: dict,
+    message: str,
+    sender_profile: str,
+    sender_handle: str,
+) -> dict:
+    """Prepare and immediately queue a cross-connection DM."""
+    envelope = prepare_envelope(
+        root,
+        target=target,
+        message=message,
+        sender_profile=sender_profile,
+        sender_handle=sender_handle,
+    )
+    publish_envelope(root, envelope)
     return envelope
 
 
@@ -487,49 +520,46 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
 
     Spawned with ``terminal_tool(background=True, notify_on_complete=True)``
     so its stdout — the teammate's reply — arrives as the same completion
-    notification local DMs use. Stdlib-only; runs under the sender gateway's
-    interpreter.
+    notification local DMs use. The first-party script entrypoint avoids the
+    generic approval gate for model-authored ``python -c`` commands.
     """
     reply_path = str(relay_root(root) / REPLIES_DIR / f"{envelope['id']}.json")
     label = (
         f"@{envelope.get('target_handle', '')} "
         f"on {envelope.get('target_connection', '')}"
     )
-    # Encode label with !r so roster fields cannot break out of the generated
-    # python -c source (quotes, parens, or extra statements in connection_id).
-    # The raw-string prefix keeps Windows paths viable: repr escapes each
-    # backslash ("C:\\Users\\..."), but the Windows execution layer the
-    # waiter runs under folds "\\" back to "\", which turns "\U" into an
-    # invalid unicode escape and SyntaxErrors the whole script (#93590).
-    # With the r prefix the folded single backslash parses as a literal.
-    # POSIX paths contain no backslashes, so the prefix is a no-op there,
-    # and \' inside a raw literal still cannot terminate the string, so
-    # the injection defense above is unchanged.
-    code = (
-        "import json,os,sys,time\n"
-        f"p = r{reply_path!r}\n"
-        f"label = r{label!r}\n"
-        f"deadline = time.time() + {REPLY_WAIT_SECONDS}\n"
-        "while time.time() < deadline:\n"
-        "    if os.path.exists(p):\n"
-        "        d = json.load(open(p, encoding='utf-8'))\n"
-        "        if d.get('error'):\n"
-        # The typed reason code (#93091) rides ahead of the free text so the
-        # sending agent can branch on it (auth vs rate limit vs offline)
-        # without parsing provider prose.
-        "            code = str(d.get('reason') or '').strip()\n"
-        "            tag = ' [reason: ' + code + ']' if code else ''\n"
-        "            print('Delivery to ' + label + ' failed' + tag + ': ' + d['error'])\n"
-        "            sys.exit(1)\n"
-        "        print('Reply from ' + label + ':')\n"
-        "        print(d.get('reply') or '(empty reply)')\n"
-        "        sys.exit(0)\n"
-        "    time.sleep(2)\n"
-        f"print('No reply from ' + label + ' within {REPLY_WAIT_SECONDS}s. The message may "
-        "still be delivered when the Desktop reconnects; do not resend blindly.')\n"
-        "sys.exit(1)\n"
+    return shlex.join(
+        [
+            sys.executable or "python3",
+            str(Path(__file__).resolve()),
+            "--wait-for-reply",
+            reply_path,
+            label,
+        ]
     )
-    return f"{shlex.quote(sys.executable or 'python3')} -c {shlex.quote(code)}"
+
+
+def _wait_for_reply(reply_path: str, label: str) -> int:
+    """Waiter entrypoint used by :func:`waiter_command`."""
+    deadline = time.time() + REPLY_WAIT_SECONDS
+    while time.time() < deadline:
+        if os.path.exists(reply_path):
+            with open(reply_path, encoding="utf-8") as stream:
+                data = json.load(stream)
+            if data.get("error"):
+                code = str(data.get("reason") or "").strip()
+                tag = f" [reason: {code}]" if code else ""
+                print(f"Delivery to {label} failed{tag}: {data['error']}")
+                return 1
+            print(f"Reply from {label}:")
+            print(data.get("reply") or "(empty reply)")
+            return 0
+        time.sleep(2)
+    print(
+        f"No reply from {label} within {REPLY_WAIT_SECONDS}s. The message may still be "
+        "delivered when the Desktop reconnects; do not resend blindly."
+    )
+    return 1
 
 
 # ── delivery command (used by the deliver RPC on the TARGET gateway) ────────
@@ -674,3 +704,13 @@ def acquire_turn_lock(
                 pass
     finally:
         os.close(fd)
+
+
+def _main(args: list[str]) -> int:
+    if len(args) != 3 or args[0] != "--wait-for-reply":
+        return 2
+    return _wait_for_reply(args[1], args[2])
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised as a background process
+    raise SystemExit(_main(sys.argv[1:]))

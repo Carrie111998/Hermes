@@ -14,6 +14,8 @@ relay adds to message_agent:
 
 import json
 import re
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -121,6 +123,17 @@ def test_enqueue_claim_is_atomic_and_single_shot(root):
     assert bot_relay.claim_pending_envelopes(root) == []
 
 
+def test_prepared_envelope_is_invisible_until_published(root):
+    target = bot_relay.resolve_remote_target("researcher", _rows())
+    env = bot_relay.prepare_envelope(
+        root, target=target, message="hi", sender_profile="work", sender_handle="work"
+    )
+
+    assert bot_relay.claim_pending_envelopes(root) == []
+    bot_relay.publish_envelope(root, env)
+    assert [item["id"] for item in bot_relay.claim_pending_envelopes(root)] == [env["id"]]
+
+
 def test_write_reply_validates_envelope_id(root):
     with pytest.raises(ValueError):
         bot_relay.write_reply(root, "../../etc/passwd", reply="x")
@@ -147,8 +160,25 @@ def test_write_reply_reason_passthrough_and_classification(root):
 def test_waiter_command_quotes_and_targets_reply_file(root):
     env = {"id": "b" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
     cmd = bot_relay.waiter_command(root, env)
-    assert ("b" * 32) in cmd and "-c" in cmd
-    assert "rm -rf" not in cmd  # sanity: single quoted -c payload
+    parts = shlex.split(cmd)
+    assert parts[:2] == [sys.executable, str(Path(bot_relay.__file__).resolve())]
+    assert parts[2] == "--wait-for-reply"
+    assert parts[3].endswith(f"{env['id']}.json")
+    assert parts[4] == "@researcher on ssh-vps"
+    assert "-c" not in parts
+
+
+def test_waiter_command_is_safe_in_default_single_query_mode(root, monkeypatch):
+    from unittest.mock import patch as mock_patch
+
+    from tools.approval import check_dangerous_command
+
+    env = {"id": "b" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    with mock_patch("tools.approval._get_single_query_approval_mode", return_value="deny"):
+        result = check_dangerous_command(bot_relay.waiter_command(root, env), "local")
+
+    assert result["approved"] is True
 
 
 def test_roster_rejects_connection_id_outside_handle_charset(root):
@@ -168,9 +198,6 @@ def test_roster_rejects_connection_id_outside_handle_charset(root):
 
 
 def test_waiter_command_repr_encodes_hostile_connection_id(root):
-    import ast
-    import shlex
-
     inj = "x'); open(r'/tmp/pwned','w').write('pwned'); print('x"
     env = {
         "id": "c" * 32,
@@ -179,26 +206,9 @@ def test_waiter_command_repr_encodes_hostile_connection_id(root):
     }
     cmd = bot_relay.waiter_command(root, env)
     parts = shlex.split(cmd)
-    code = parts[parts.index("-c") + 1]
-    compile(code, "<waiter>", "exec")
-    tree = ast.parse(code)
-    opens = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == "open"
-    ]
-    # Only json.load(open(p, ...)) is a real open(); the payload must stay data.
-    assert len(opens) == 1
-
-    # A quote in the id used to SyntaxError the waiter. It must compile.
-    quoted = bot_relay.waiter_command(
-        root,
-        {"id": "a" * 32, "target_handle": "h", "target_connection": "foo'bar"},
-    )
-    qcode = shlex.split(quoted)[shlex.split(quoted).index("-c") + 1]
-    compile(qcode, "<waiter-quote>", "exec")
+    assert parts[2] == "--wait-for-reply"
+    assert parts[4] == f"@researcher on {inj}"
+    assert "-c" not in parts
 
 
 # ── message_agent integration: relay route + legacy-SOUL gate fix ───────────
@@ -288,6 +298,7 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     def _fake_spawn(command, label, *, task_id, agent):
         spawned["command"] = command
         spawned["label"] = label
+        assert bot_relay.claim_pending_envelopes(home) == []
         return json.dumps({"status": "sent", "to": label})
 
     monkeypatch.setattr("tools.bot_mode_dm._spawn_delivery", _fake_spawn)
@@ -303,6 +314,25 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     assert pending[0]["message"].startswith("Message from 🤖 hermes (@hermes): ping")
     # waiter watches this envelope's reply file
     assert pending[0]["id"] in spawned["command"]
+
+
+def test_relay_waiter_start_failure_leaves_no_deliverable_envelope(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path)
+    bot_relay.write_remote_roster(home, [
+        {"profile": "default", "handle": "hermes", "connection_id": "cloud-1"},
+    ])
+
+    import tools.terminal_tool as terminal_tool_module
+
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "terminal_tool",
+        lambda *args, **kwargs: json.dumps({"error": "BLOCKED by approval policy"}),
+    )
+    out = json.loads(message_agent_tool(target="hermes", message="ping", agent=_FakeAgent(home)))
+
+    assert "failed to start" in out["error"]
+    assert bot_relay.claim_pending_envelopes(home) == []
 
 
 def test_relay_route_ambiguous_target_errors_with_forms(tmp_path, monkeypatch):
