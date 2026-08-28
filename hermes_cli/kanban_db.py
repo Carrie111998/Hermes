@@ -10498,8 +10498,16 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 
 def count_running_model_overrides_other_boards(
     board: Optional[str] = None,
+    *,
+    model_key_resolver: Optional[Callable[[Any], Optional[tuple[str, str]]]] = None,
 ) -> dict[tuple[str, str], int]:
-    """Count explicit running provider/model pairs on every other board."""
+    """Count running provider/model pairs on every other board.
+
+    ``model_key_resolver`` lets the dispatcher account for an effective route
+    that is selected from a profile at spawn time (not persisted as a task
+    override).  The default retains the historical explicit-override-only
+    behavior for callers that do not opt in.
+    """
     try:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
     except Exception:
@@ -10521,15 +10529,18 @@ def count_running_model_overrides_other_boards(
             other = connect(board=slug)
             try:
                 rows = other.execute(
-                    "SELECT provider_override, model_override, COUNT(*) AS n "
-                    "FROM tasks WHERE status = 'running' "
-                    "AND provider_override IS NOT NULL AND provider_override != '' "
-                    "AND model_override IS NOT NULL AND model_override != '' "
-                    "GROUP BY provider_override, model_override"
+                    "SELECT assignee, provider_override, model_override "
+                    "FROM tasks WHERE status = 'running'"
                 ).fetchall()
                 for row in rows:
-                    key = (row["provider_override"], row["model_override"])
-                    counts[key] = counts.get(key, 0) + int(row["n"])
+                    if model_key_resolver is not None:
+                        key = model_key_resolver(row)
+                    else:
+                        provider = (row["provider_override"] or "").strip()
+                        model = (row["model_override"] or "").strip()
+                        key = (provider, model) if provider and model else None
+                    if key is not None:
+                        counts[key] = counts.get(key, 0) + 1
             finally:
                 other.close()
         except Exception:
@@ -10918,23 +10929,71 @@ def _dispatch_once_locked(
     ) else None
     _per_model_running: dict[tuple[str, str], int] = {}
     if _per_model_cap is not None:
+        # Local-first selection happens at spawn time, so a task normally has
+        # no persisted override even though several profiles may resolve to the
+        # same single-concurrency Ollama model.  Counting only explicit fields
+        # made the advertised per-model cap ineffective for those workers and
+        # allowed them to starve one another until the board timeout.
+        local_first_enabled = _kanban_local_first_enabled()
+        effective_route_cache: dict[str, Optional[tuple[str, str]]] = {}
+
+        def _route_value(row: Any, field: str) -> Any:
+            """Read a route field from either a SQLite row or a claimed Task."""
+            try:
+                return row[field]
+            except (KeyError, TypeError, IndexError):
+                return getattr(row, field, None)
+
+        def _model_key_for_row(row: Any) -> Optional[tuple[str, str]]:
+            provider = (_route_value(row, "provider_override") or "").strip()
+            model = (_route_value(row, "model_override") or "").strip()
+            if provider and model:
+                return provider, model
+            if not local_first_enabled:
+                return None
+            assignee = str(_route_value(row, "assignee") or "").strip()
+            if not assignee:
+                return None
+            if assignee not in effective_route_cache:
+                route: Optional[tuple[str, str]] = None
+                try:
+                    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+                    import yaml
+
+                    profile_path = Path(resolve_profile_env(normalize_profile_name(assignee))) / "config.yaml"
+                    loaded = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+                    route = _resolve_local_first_route(loaded)
+                except Exception:
+                    # A profile parse problem is handled by the existing spawn
+                    # failure path.  Do not invent a route or block unrelated
+                    # explicitly-routed work here.
+                    route = None
+                effective_route_cache[assignee] = route
+            return effective_route_cache[assignee]
+
         for mrow in conn.execute(
-            "SELECT provider_override, model_override, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' "
-            "AND provider_override IS NOT NULL AND provider_override != '' "
-            "AND model_override IS NOT NULL AND model_override != '' "
-            "GROUP BY provider_override, model_override"
+            "SELECT assignee, provider_override, model_override FROM tasks "
+            "WHERE status = 'running'"
         ):
-            _per_model_running[(mrow["provider_override"], mrow["model_override"])] = int(
-                mrow["n"]
-            )
-        for key, count in count_running_model_overrides_other_boards(board).items():
+            key = _model_key_for_row(mrow)
+            if key is not None:
+                _per_model_running[key] = _per_model_running.get(key, 0) + 1
+        for key, count in count_running_model_overrides_other_boards(
+            board, model_key_resolver=_model_key_for_row
+        ).items():
             _per_model_running[key] = _per_model_running.get(key, 0) + count
 
-    def _explicit_model_key(row) -> Optional[tuple[str, str]]:
-        provider = (row["provider_override"] or "").strip()
-        model = (row["model_override"] or "").strip()
-        return (provider, model) if provider and model else None
+    else:
+        def _model_key_for_row(row: Any) -> Optional[tuple[str, str]]:
+            try:
+                provider_value = row["provider_override"]
+                model_value = row["model_override"]
+            except (KeyError, TypeError, IndexError):
+                provider_value = getattr(row, "provider_override", None)
+                model_value = getattr(row, "model_override", None)
+            provider = (provider_value or "").strip()
+            model = (model_value or "").strip()
+            return (provider, model) if provider and model else None
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -11079,7 +11138,7 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
-        model_key = _explicit_model_key(row)
+        model_key = _model_key_for_row(row)
         if (
             _per_model_cap is not None
             and model_key is not None
@@ -11188,11 +11247,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
-            claimed_model_key = (
-                (claimed.provider_override or "").strip(),
-                (claimed.model_override or "").strip(),
-            )
-            if _per_model_cap is not None and all(claimed_model_key):
+            claimed_model_key = _model_key_for_row(claimed)
+            if _per_model_cap is not None and claimed_model_key is not None:
                 _per_model_running[claimed_model_key] = (
                     _per_model_running.get(claimed_model_key, 0) + 1
                 )
@@ -11245,7 +11301,7 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
-        model_key = _explicit_model_key(row)
+        model_key = _model_key_for_row(row)
         if (
             _per_model_cap is not None
             and model_key is not None
@@ -11332,11 +11388,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
-            claimed_model_key = (
-                (claimed.provider_override or "").strip(),
-                (claimed.model_override or "").strip(),
-            )
-            if _per_model_cap is not None and all(claimed_model_key):
+            claimed_model_key = _model_key_for_row(claimed)
+            if _per_model_cap is not None and claimed_model_key is not None:
                 _per_model_running[claimed_model_key] = (
                     _per_model_running.get(claimed_model_key, 0) + 1
                 )
