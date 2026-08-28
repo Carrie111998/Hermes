@@ -11445,39 +11445,27 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
     from utils import atomic_json_write
 
     atomic_json_write(oauth_file, payload, indent=2, mode=0o600)
-    # Best-effort credential-pool insert. Failure here doesn't invalidate
-    # the file write — pool registration only matters for the rotation
-    # strategy, not for runtime credential resolution.
+    # Register the credential in the pool by seeding it from the file we just
+    # wrote — do NOT add a second, separate ``manual:dashboard_pkce`` row.
+    #
+    # ``load_pool("anthropic")`` already seeds a ``hermes_pkce`` entry from
+    # ~/.hermes/.anthropic_oauth.json (see ``_seed_*`` in credential_pool).
+    # A separate explicit insert produced a *second* pool row carrying the
+    # SAME refresh token. Anthropic OAuth refresh tokens are single-use: the
+    # first row to refresh rotates the pair, and the stale twin's next refresh
+    # 401s ("refresh_token_reused") and revokes the login. Seeding the single
+    # ``hermes_pkce`` row here mirrors what ``hermes auth add anthropic
+    # --type oauth`` does, keeping exactly one source of truth.
+    #
+    # Best-effort: a failure here doesn't invalidate the file write — pool
+    # registration only affects the rotation strategy, not runtime credential
+    # resolution (the file itself is read directly on load).
     try:
-        from agent.credential_pool import (
-            PooledCredential,
-            load_pool,
-            AUTH_TYPE_OAUTH,
-            SOURCE_MANUAL,
-        )
-        import uuid
-        pool = load_pool("anthropic")
-        # Avoid duplicate entries: delete any prior dashboard-issued OAuth entry
-        existing = [e for e in pool.entries() if getattr(e, "source", "").startswith(f"{SOURCE_MANUAL}:dashboard_pkce")]
-        for e in existing:
-            try:
-                pool.remove_entry(getattr(e, "id", ""))
-            except Exception:
-                pass
-        entry = PooledCredential(
-            provider="anthropic",
-            id=uuid.uuid4().hex[:6],
-            label="dashboard PKCE",
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source=f"{SOURCE_MANUAL}:dashboard_pkce",
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_at_ms=expires_at_ms,
-        )
-        pool.add_entry(entry)
+        from agent.credential_pool import load_pool
+
+        load_pool("anthropic")
     except Exception as e:
-        _log.warning("anthropic pool add (dashboard) failed: %s", e)
+        _log.warning("anthropic pool seed (dashboard) failed: %s", e)
 
 
 def _start_anthropic_pkce(profile: Optional[str] = None) -> Dict[str, Any]:
