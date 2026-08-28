@@ -1524,7 +1524,9 @@ _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # snapshot — the manifest validates SKILL.md mtime/size, and those files did
 # not change, only our code did. Any edit to the truncation rule needs a bump
 # here or it silently ships to nobody.
-_SKILLS_SNAPSHOT_VERSION = 4
+# 5: entries carry `environments`, so the snapshot path can re-apply the
+# gate the cold path applies at parse time.
+_SKILLS_SNAPSHOT_VERSION = 5
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1732,6 +1734,12 @@ def _build_snapshot_entry(
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
         "tags": _skill_tags(frontmatter),
+        # Carried so the snapshot path can re-apply the environment gate.
+        # `_parse_skill_file` applies it on the COLD path only, so an entry
+        # written while kanban was active outlived the environment that
+        # justified it — the index gained a line on snapshot-backed builds
+        # and lost it on cold ones, rewriting the cached system prefix.
+        "environments": frontmatter.get("environments") or [],
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1940,6 +1948,13 @@ def _build_skills_system_prompt_inner(
             frontmatter_name = entry.get("frontmatter_name") or skill_name
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
+                continue
+            # The environment gate is evaluated at PARSE time on the cold path,
+            # so without re-applying it here an entry written while kanban was
+            # active outlives the environment that justified it. The index then
+            # gains a line on snapshot-backed builds and loses it on cold ones,
+            # which rewrites the cached system prefix instead of hitting it.
+            if not skill_matches_environment({"environments": entry.get("environments")}):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue

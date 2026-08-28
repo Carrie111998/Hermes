@@ -7,6 +7,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import patch
 
 from agent.skill_utils import (
     SKILL_PROMPT_DESC_LIMIT as _DESC_LIMIT,
@@ -1221,3 +1222,44 @@ def test_a_snapshot_from_an_older_build_cannot_serve_stale_truncations(
     _SKILLS_PROMPT_CACHE.clear()
 
     assert "Use when bu..." not in build_skills_system_prompt()
+
+
+def test_the_snapshot_path_reapplies_the_environment_gate(monkeypatch, tmp_path):
+    """A skill gated on an environment must not outlive it in the snapshot.
+
+    `skill_matches_environment` runs at PARSE time, so it only ever ran on the
+    cold path. An entry written while the environment was active kept being
+    served from disk after it went away: the index gained a line on
+    snapshot-backed builds and lost it on cold ones, so the two disagreed and
+    the cached system prefix was rewritten instead of hit.
+    """
+    from agent.prompt_builder import (
+        _SKILLS_PROMPT_CACHE,
+        build_skills_system_prompt,
+        clear_skills_system_prompt_cache,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    d = tmp_path / "skills" / "devops" / "gated"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: gated\ndescription: Only when the environment is live.\n"
+        "environments:\n  - kanban\n---\n"
+    )
+
+    with patch("agent.skill_utils._detect_environment", return_value=True):
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        assert "gated" in build_skills_system_prompt()
+
+    # Environment goes away; the snapshot written above still holds the entry.
+    with patch("agent.skill_utils._detect_environment", return_value=False):
+        _SKILLS_PROMPT_CACHE.clear()
+        from_snapshot = build_skills_system_prompt()
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        from_cold = build_skills_system_prompt()
+
+    assert "gated" not in from_snapshot
+    # The real cost of the old behaviour: the two paths must agree byte for
+    # byte or every session pays a prompt-cache rewrite.
+    assert from_snapshot == from_cold
