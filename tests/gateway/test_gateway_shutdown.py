@@ -113,6 +113,7 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 @pytest.mark.asyncio
 async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect():
     runner, adapter = make_restart_runner()
+    attach_real_stop(runner)
     runner._completion_notification_batch_window = 3600
     event = {
         "session_id": "shutdown-batch",
@@ -156,6 +157,7 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect()
 @pytest.mark.asyncio
 async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
     runner, adapter = make_restart_runner()
+    attach_real_stop(runner)
     adapter.disconnect = AsyncMock()
     runner._restart_requested = True
     runner._restart_via_service = True
