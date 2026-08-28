@@ -19,11 +19,14 @@ class TestSkillManageSchemaDiet(unittest.TestCase):
         return SKILL_MANAGE_SCHEMA["parameters"]["properties"]["operations"]["items"]["properties"]
 
     def test_single_call_shape(self):
-        """Maintainer-directed: operations[] IS the interface — a single
-        edit is a list of one. Flat fields are handler-only compat."""
+        """Maintainer-directed: operations[] IS the interface — each op
+        names its skill; a single edit is a list of one. Flat fields are
+        handler-only compat."""
         props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
-        self.assertEqual(sorted(props), ["name", "operations"])
-        self.assertEqual(SKILL_MANAGE_SCHEMA["parameters"]["required"], ["name", "operations"])
+        self.assertEqual(sorted(props), ["operations"])
+        self.assertEqual(SKILL_MANAGE_SCHEMA["parameters"]["required"], ["operations"])
+        items = SKILL_MANAGE_SCHEMA["parameters"]["properties"]["operations"]["items"]
+        self.assertEqual(items["required"], ["name", "action"])
         self.assertIn("delete", self._op_props()["action"]["enum"])
 
     def test_patch_args_defer_to_patch_tool(self):
@@ -53,7 +56,7 @@ class TestSkillManageSchemaDiet(unittest.TestCase):
         self.assertIn("skill_view()", desc)
         self.assertNotIn("numbered steps", desc)
         # Stale action vocabulary must not return.
-        self.assertNotIn("edit", SKILL_MANAGE_SCHEMA["parameters"]["properties"]["name"]["description"])
+        self.assertNotIn("edit", self._op_props()["name"]["description"])
 
     def test_content_keeps_pre_irreversibility_warning(self):
         """The REPLACES-whole-file warning is pre-irreversibility guidance:

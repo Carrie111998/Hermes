@@ -36,7 +36,11 @@ class TestSkillManageBatch(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
 
     def _call(self, name, ops):
-        return json.loads(self.smt.skill_manage(action="", name=name, operations=ops))
+        # Inject the per-op name (tests were written per-skill; the
+        # interface is name-per-op, maintainer-directed).
+        for op in ops:
+            op.setdefault("name", name)
+        return json.loads(self.smt.skill_manage(action="", name="", operations=ops))
 
     def test_create_plus_files_atomic(self):
         r = self._call("probe", [
@@ -130,6 +134,25 @@ class TestSkillManageBatch(unittest.TestCase):
             {"action": "patch", "old_string": "H.", "new_string": "I."},
         ])
         self.assertTrue(r["success"], r)
+
+    def test_cross_skill_batch_and_rollback(self):
+        """Ops may target DIFFERENT skills; a late failure rolls back
+        every touched skill, including removing a batch-created one."""
+        self._call("alpha", [{"action": "create", "content": SK.format(n="alpha")}])
+        r = json.loads(self.smt.skill_manage(action="", name="", operations=[
+            {"name": "alpha", "action": "patch",
+             "old_string": "Step 1.", "new_string": "Step A."},
+            {"name": "beta", "action": "create", "content": SK.format(n="beta")},
+            {"name": "beta", "action": "write_file",
+             "file_path": "bad/nope.md", "file_content": "x"},
+        ]))
+        self.assertFalse(r["success"])
+        self.assertEqual(r["failed_index"], 2)
+        # alpha's patch undone; beta (batch-created) removed entirely.
+        content = open(os.path.join(self.home, "skills", "alpha", "SKILL.md")).read()
+        self.assertIn("Step 1.", content)
+        self.assertNotIn("Step A.", content)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "beta")))
 
     def test_single_op_path_unchanged(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])

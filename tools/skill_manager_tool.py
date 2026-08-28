@@ -1529,24 +1529,27 @@ _BATCH_MAX_OPS = 20
 
 
 def _skill_manage_batch(
-    name: str,
     operations,
+    default_name: str = None,
     task_id: str = None,
     session_id: str = None,
 ) -> str:
-    """Apply a sequence of operations to ONE skill atomically.
+    """Apply a sequence of operations atomically (memory-tool pattern).
 
-    The memory-tool pattern (#95681 arc): create + N supporting files, or
-    a SKILL.md fix plus the script it references, land in one call — all
-    or nothing. On any op failure the skill directory is restored to its
-    pre-batch state (including full removal when the batch created it).
+    Each op carries its own ``name`` (skill) and ``action``; a single edit
+    is a list of one. Every skill the batch touches is snapshotted before
+    any op runs; any failure rolls ALL touched skills back to their
+    pre-batch state (skills the batch created are removed).
 
-    Scope rules:
-    - all ops target the top-level ``name`` (one skill per batch);
-    - ``delete`` only as the SOLE op (its recoverable-archive path doesn't
-      compose with rollback) — routed straight to the single-op handler,
-      preserving absorbed_into/archive semantics;
-    - ``create`` only as the FIRST op.
+    Rules:
+    - ``delete`` only as the SOLE op of the call (its recoverable-archive
+      path doesn't compose with rollback) — routed to the single-op
+      handler, preserving absorbed_into/archive semantics;
+    - ``create`` for a skill must precede that skill's other ops;
+    - same-file clobber guard (below) rejects silently-lost work.
+
+    ``default_name``: legacy top-level ``name`` fallback for ops that omit
+    their own (staged-replay / back-compat path).
     """
     import shutil
     import tempfile
@@ -1566,13 +1569,17 @@ def _skill_manage_batch(
                 success=False,
             )
         op = operations[0]
+        nm = op.get("name") or default_name
+        if not nm:
+            return tool_error("operations[0] (delete) needs a 'name'.", success=False)
         return skill_manage(
             action="delete",
-            name=name,
+            name=nm,
             absorbed_into=op.get("absorbed_into"),
             task_id=task_id,
             session_id=session_id,
         )
+    names = []
     for i, op in enumerate(operations):
         if not isinstance(op, dict) or not op.get("action"):
             return tool_error(f"operations[{i}] needs an 'action'.", success=False)
@@ -1584,9 +1591,17 @@ def _skill_manage_batch(
                 "delete must be sole.",
                 success=False,
             )
-        if act == "create" and i != 0:
-            return tool_error("create must be the first op in a batch.", success=False)
-        preflight = _background_review_preflight(act, name)
+        nm = op.get("name") or default_name
+        if not nm:
+            return tool_error(f"operations[{i}] needs a 'name' (the skill it targets).", success=False)
+        names.append(nm)
+        if act == "create" and nm in names[:-1]:
+            return tool_error(
+                f"operations[{i}]: create for '{nm}' must precede that "
+                "skill's other ops.",
+                success=False,
+            )
+        preflight = _background_review_preflight(act, nm)
         if preflight is not None:
             return json.dumps(preflight, ensure_ascii=False)
 
@@ -1594,30 +1609,31 @@ def _skill_manage_batch(
     # these SILENTLY succeed while discarding earlier ops' work — always a
     # confused plan, never intentional. Patch CHAINS on one file (each op
     # building on the previous text) stay legal. ---
-    seen_writes: set = set()
-    touched_skill_md = False
+    seen_writes = set()
+    touched_skill_md = set()
     for i, op in enumerate(operations):
         act = op["action"]
+        nm = names[i]
         if act in ("write_file", "remove_file"):
-            key = (op.get("file_path") or "").strip()
+            key = (nm, (op.get("file_path") or "").strip())
             if key in seen_writes:
                 return tool_error(
-                    f"operations[{i}]: '{key}' already written/removed "
-                    "earlier in this batch — the later op would silently "
-                    "clobber it. One write per file per batch.",
+                    f"operations[{i}]: '{key[1]}' on skill '{nm}' already "
+                    "written/removed earlier in this batch — the later op "
+                    "would silently clobber it. One write per file per batch.",
                     success=False,
                 )
             seen_writes.add(key)
         if act in ("create", "patch") and not op.get("file_path"):
-            if act == "patch" and op.get("content") and touched_skill_md:
+            if act == "patch" and op.get("content") and nm in touched_skill_md:
                 return tool_error(
-                    f"operations[{i}]: full SKILL.md rewrite (content) after "
-                    "an earlier op already modified SKILL.md — the rewrite "
-                    "would silently discard that edit. Put the rewrite "
-                    "first, or fold the change into it.",
+                    f"operations[{i}]: full SKILL.md rewrite (content) for "
+                    f"'{nm}' after an earlier op already modified its "
+                    "SKILL.md — the rewrite would silently discard that "
+                    "edit. Put the rewrite first, or fold the change in.",
                     success=False,
                 )
-            touched_skill_md = True
+            touched_skill_md.add(nm)
 
     # --- approval gate: stage the WHOLE batch as one pending write ---
     if not _skill_gate_bypass.get():
@@ -1630,9 +1646,10 @@ def _skill_manage_batch(
             if decision.blocked:
                 return tool_error(decision.message, success=False)
             if not decision.allow:
-                payload = {"action": "batch", "name": name, "operations": operations}
+                payload = {"action": "batch", "operations": operations}
                 acts = ", ".join(op["action"] for op in operations)
-                gist = f"batch({len(operations)} ops: {acts}) on skill '{name}'"
+                skills = ", ".join(sorted(set(names)))
+                gist = f"batch({len(operations)} ops: {acts}) on {skills}"
                 record = wa.stage_write(
                     wa.SKILLS, payload, summary=gist, origin=wa.current_origin()
                 )
@@ -1642,32 +1659,38 @@ def _skill_manage_batch(
                     ensure_ascii=False,
                 )
 
-    # --- snapshot for rollback ---
-    pre = _find_skill(name)
-    pre_dir = Path(pre["path"]) if pre else None
-    snapshot = None
-    if pre_dir is not None and pre_dir.is_dir():
-        snapshot = Path(tempfile.mkdtemp(prefix="skill_batch_")) / pre_dir.name
-        try:
-            shutil.copytree(pre_dir, snapshot)
-        except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
-            return tool_error(f"Could not snapshot skill for atomic batch: {exc}", success=False)
+    # --- snapshot every touched skill for rollback ---
+    snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
+    snapshots = {}  # skill name -> (pre_dir or None, snapshot_dir or None)
+    for nm in dict.fromkeys(names):  # ordered unique
+        pre = _find_skill(nm)
+        pre_dir = Path(pre["path"]) if pre else None
+        snap = None
+        if pre_dir is not None and pre_dir.is_dir():
+            snap = snap_root / nm
+            try:
+                shutil.copytree(pre_dir, snap)
+            except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
+                shutil.rmtree(snap_root, ignore_errors=True)
+                return tool_error(f"Could not snapshot '{nm}' for atomic batch: {exc}", success=False)
+        snapshots[nm] = (pre_dir, snap)
 
     def _rollback() -> str:
-        try:
-            post = _find_skill(name)
-            post_dir = Path(post["path"]) if post else None
-            if snapshot is not None:
-                if post_dir is not None and post_dir.is_dir():
+        notes = []
+        for nm, (pre_dir, snap) in snapshots.items():
+            try:
+                post = _find_skill(nm)
+                post_dir = Path(post["path"]) if post else None
+                if snap is not None:
+                    if post_dir is not None and post_dir.is_dir():
+                        shutil.rmtree(post_dir)
+                    shutil.copytree(snap, pre_dir)
+                elif post_dir is not None and post_dir.is_dir():
+                    # Batch created this skill: remove the partial result.
                     shutil.rmtree(post_dir)
-                shutil.copytree(snapshot, pre_dir)
-                return "rolled back to pre-batch state"
-            # Batch created the skill: remove what the partial batch made.
-            if post_dir is not None and post_dir.is_dir():
-                shutil.rmtree(post_dir)
-            return "partially-created skill removed"
-        except Exception as exc:  # noqa: BLE001
-            return f"ROLLBACK FAILED ({exc}) — inspect the skill manually"
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})")
+        return "; ".join(notes) if notes else "all touched skills rolled back"
 
     # --- execute ops through the normal single-op path (gate bypassed:
     #     the batch already cleared/staged it above; ledger + telemetry
@@ -1678,7 +1701,7 @@ def _skill_manage_batch(
         for i, op in enumerate(operations):
             raw = skill_manage(
                 action=op["action"],
-                name=name,
+                name=names[i],
                 content=op.get("content"),
                 category=op.get("category"),
                 file_path=op.get("file_path"),
@@ -1698,26 +1721,22 @@ def _skill_manage_batch(
                 return json.dumps(
                     {"success": False,
                      "error": (
-                         f"operations[{i}] ({op['action']}) failed: "
+                         f"operations[{i}] ({op['action']} on '{names[i]}') failed: "
                          f"{parsed.get('error', 'unknown error')} — batch aborted, {note}."
                      ),
                      "failed_index": i,
                      "completed_before_failure": i},
                     ensure_ascii=False,
                 )
-            results.append({"action": op["action"],
+            results.append({"name": names[i], "action": op["action"],
                             "file_path": op.get("file_path"),
                             "success": True})
     finally:
         _skill_gate_bypass.reset(token)
-        if snapshot is not None:
-            try:
-                shutil.rmtree(snapshot.parent)
-            except Exception:  # noqa: BLE001
-                pass
+        shutil.rmtree(snap_root, ignore_errors=True)
 
     return json.dumps(
-        {"success": True, "skill": name, "operations_applied": len(results),
+        {"success": True, "operations_applied": len(results),
          "results": results},
         ensure_ascii=False,
     )
@@ -1799,7 +1818,8 @@ def skill_manage(
     """
     if operations is not None:
         return _skill_manage_batch(
-            name, operations, task_id=task_id, session_id=session_id
+            operations, default_name=name or None,
+            task_id=task_id, session_id=session_id,
         )
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
@@ -1969,43 +1989,42 @@ def skill_manage(
 
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
-    # ONE call shape (memory-tool pattern, maintainer-directed): every call
-    # is an operations array on one skill — a single edit is a list of one.
-    # The legacy flat fields (action/content/old_string/...) are still
-    # ACCEPTED by the handler for old transcripts and staged-write replay,
-    # but no longer advertised. absorbed_into: see NOTE below.
+    # ONE call shape (memory-tool pattern, maintainer-directed): the call
+    # IS an operations array — each op names its skill and action; a
+    # single edit is a list of one. The legacy flat shape (top-level
+    # action/name/content/...) is still ACCEPTED by the handler for old
+    # transcripts and staged-write replay, but no longer advertised.
     "description": (
         "Create, update, or delete skills — your procedural memory for "
-        "recurring task types. Every call applies an operations array to "
-        "ONE skill, atomically (a single edit is a list of one; a failure "
-        "rolls the skill back). Ops: create (full SKILL.md; lands in "
-        f"{display_hermes_home()}/skills/), patch (targeted "
-        "old_string/new_string fix — preferred; content alone REPLACES the "
-        "whole file, read it via skill_view() first), write_file/"
-        "remove_file (supporting files), delete (sole op only). Existing "
-        "skills are modified wherever they live. Keep the description's "
-        "first 57 chars a self-contained trigger: 'Use when <trigger>. "
-        "<one-line behavior>.' — skill_view() shows format conventions."
+        "recurring task types. The call is an operations array (a single "
+        "edit is a list of one); it applies atomically — any failure rolls "
+        "every touched skill back. Ops: create (full SKILL.md; lands in "
+        f"{display_hermes_home()}/skills/; must precede that skill's other "
+        "ops), patch (targeted old_string/new_string fix — preferred; "
+        "content alone REPLACES the whole file, read it via skill_view() "
+        "first), write_file/remove_file (supporting files), delete (sole "
+        "op only). Existing skills are modified wherever they live. Keep "
+        "the description's first 57 chars a self-contained trigger: 'Use "
+        "when <trigger>. <one-line behavior>.' — skill_view() shows "
+        "format conventions."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "name": {
-                "type": "string",
-                "description": (
-                    "Skill name (lowercase, hyphens/underscores, max 64 "
-                    "chars); an existing skill's name unless creating."
-                )
-            },
             "operations": {
                 "type": "array",
-                "description": (
-                    "Ordered ops for this skill. create first-only; "
-                    "delete alone-only."
-                ),
+                "description": "Ordered ops; each names its target skill.",
                 "items": {
                     "type": "object",
                     "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Skill name (lowercase, hyphens/underscores, "
+                                "max 64 chars); an existing skill's name "
+                                "unless creating."
+                            )
+                        },
                         "action": {
                             "type": "string",
                             "enum": ["create", "patch", "delete", "write_file", "remove_file"]
@@ -2052,17 +2071,18 @@ SKILL_MANAGE_SCHEMA = {
                             "description": "Content for write_file."
                         }
                     },
-                    "required": ["action"]
+                    "required": ["name", "action"]
                 }
             },
             # NOTE: the handler also accepts the legacy flat single-op shape
-            # (action/content/old_string/new_string/replace_all/category/
-            # file_path/file_content) — old transcripts and staged-write
-            # replay depend on it — plus `absorbed_into` on delete ops
-            # (curator-only vocabulary; the curator's prompt documents it and
-            # the delete guard's error re-teaches it). None are advertised.
+            # (top-level action/name/content/old_string/new_string/
+            # replace_all/category/file_path/file_content) — old transcripts
+            # and staged-write replay depend on it — plus `absorbed_into` on
+            # delete ops (curator-only vocabulary; the curator's prompt
+            # documents it and the delete guard's error re-teaches it).
+            # None are advertised.
         },
-        "required": ["name", "operations"],
+        "required": ["operations"],
     },
 }
 
