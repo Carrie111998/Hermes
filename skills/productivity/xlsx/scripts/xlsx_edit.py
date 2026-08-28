@@ -86,6 +86,11 @@ def parse_idx(arg):
     return int(arg), 1
 
 
+# NOTE: ranges_intersect / check_table_header are duplicated in
+# scripts/xlsx_create.py (which applies the drop_overlapping_autofilter
+# guard inline at its autofilter spec) -- these skill scripts run
+# standalone (no shared import), so any change to these helpers must be
+# mirrored there.
 def ranges_intersect(a, b):
     a_min_col, a_min_row, a_max_col, a_max_row = range_boundaries(a)
     b_min_col, b_min_row, b_max_col, b_max_row = range_boundaries(b)
