@@ -1,6 +1,6 @@
 """Guard: Hermes-owned subprocesses must not resolve managed runtimes by bare PATH.
 
-Hermes installs runtimes for itself — ``uv`` at ``$HERMES_HOME/bin/uv``, Node at
+Hermes installs runtimes for itself — ``uv`` at ``$HERMES_HOME/uv/uv``, Node at
 ``$HERMES_HOME/node``. Neither directory is on the ambient PATH of an arbitrary
 process, so ``shutil.which("uv")`` / ``shutil.which("node")`` in Hermes's own
 code has two failure modes:
@@ -70,6 +70,12 @@ _ALLOWED: dict[tuple[str, str], str] = {
     ("hermes_cli/update_cmd.py", "npm"): (
         "WSL diagnostic: deliberately inspects what PATH resolves so it can "
         "warn that the only reachable npm is the Windows one."
+    ),
+    ("hermes_cli/managed_uv.py", "uv"): (
+        "Tier-1 probe of resolve_uv_engine(): PATH here deliberately means "
+        "the USER's own uv (preferred when present, never modified). The "
+        "managed uv is resolved separately by absolute path via resolve_uv(), "
+        "never via this call."
     ),
     ("tools/lazy_deps.py", "uv"): (
         "Fallback after resolve_uv(), plus the except-branch for the "
@@ -227,4 +233,4 @@ def test_managed_uv_helpers_exist():
 
     assert callable(resolve_uv)
     assert callable(ensure_uv)
-    assert managed_uv_path().parent.name == "bin"
+    assert managed_uv_path().parent.name == "uv"

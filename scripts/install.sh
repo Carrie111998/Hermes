@@ -559,11 +559,26 @@ install_uv() {
         return 0
     fi
 
-    # Hermes owns its own uv at $HERMES_HOME/bin/uv.  Always install there —
-    # no PATH probing, no conda guards, no multi-location resolution chains.
-    # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-    # place, so install.sh and `hermes update` stay in sync.
-    local _managed_uv="$HERMES_HOME/bin/uv"
+    # Tier-1: a usable user uv on PATH wins — install nothing, touch nothing.
+    # A PATH hit that resolves to Hermes' own managed/legacy binary is not
+    # "user"; that is the managed engine (migrated/used below).
+    if command -v uv >/dev/null 2>&1; then
+        local _on_path_uv
+        _on_path_uv="$(command -v uv)"
+        local _managed_path="$HERMES_HOME/uv/uv" _legacy_path="$HERMES_HOME/bin/uv"
+        if [ "$_on_path_uv" != "$_managed_path" ] && [ "$_on_path_uv" != "$_legacy_path" ] \
+                && "$_on_path_uv" --version >/dev/null 2>&1; then
+            UV_CMD="$_on_path_uv"
+            UV_VERSION=$($UV_CMD --version 2>/dev/null)
+            log_success "Using uv from PATH ($UV_CMD)"
+            return 0
+        fi
+    fi
+
+    # Managed binary lives in a private directory that is never registered on
+    # PATH.  The runtime update path (hermes_cli/managed_uv.py) looks in the
+    # same place, so install.sh and `hermes update` stay in sync.
+    local _managed_uv="$HERMES_HOME/uv/uv"
 
     if [ -x "$_managed_uv" ]; then
         UV_CMD="$_managed_uv"
@@ -572,8 +587,21 @@ install_uv() {
         return 0
     fi
 
-    log_info "Installing managed uv into $HERMES_HOME/bin ..."
-    mkdir -p "$HERMES_HOME/bin"
+    # Upgrade path: migrate a pre-isolation $HERMES_HOME/bin/uv (bin is a
+    # persisted PATH entry on Windows, so that layout shadowed the user's uv)
+    # into the private directory.  Best-effort; a locked file retries next run.
+    if [ -x "$HERMES_HOME/bin/uv" ] && [ ! -e "$_managed_uv" ]; then
+        mkdir -p "$HERMES_HOME/uv"
+        if mv "$HERMES_HOME/bin/uv" "$_managed_uv" 2>/dev/null; then
+            UV_CMD="$_managed_uv"
+            UV_VERSION=$($UV_CMD --version 2>/dev/null)
+            log_success "Managed uv migrated from $HERMES_HOME/bin ($UV_VERSION)"
+            return 0
+        fi
+    fi
+
+    log_info "Installing managed uv into $HERMES_HOME/uv ..."
+    mkdir -p "$HERMES_HOME/uv"
 
     # Two-stage: download the installer, then run it.  Piping
     # `curl | sh` masks curl failures (sh exits 0 on empty stdin)
@@ -591,7 +619,7 @@ install_uv() {
     fi
     # UV_UNMANAGED_INSTALL tells the astral installer to place the binary
     # directly into $HERMES_HOME/bin instead of ~/.local/bin.
-    if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
+    if UV_UNMANAGED_INSTALL="$HERMES_HOME/uv" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
             UV_CMD="$_managed_uv"

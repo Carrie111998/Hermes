@@ -741,12 +741,69 @@ function Get-PowerShellHostExe {
     return "powershell"
 }
 
+function Get-ManagedUvPath {
+    # Private location, never on PATH.  Mirrors managed_uv_path() in
+    # hermes_cli/managed_uv.py -- keep the two in sync.
+    return Join-Path $HermesHome "uv\uv.exe"
+}
+
+function Test-UserUvUsable {
+    # Tier-1: the user's OWN uv on PATH (one that actually runs `uv --version`)
+    # is preferred and used read-only -- never installed over, never updated.
+    # A PATH hit that resolves to Hermes' own managed or legacy binary is NOT
+    # "user" (an upgrade can find the old bin\uv.exe this way); that is the
+    # managed engine and is handled by the migration below.
+    $cmd = Get-Command uv -ErrorAction SilentlyContinue
+    if (-not $cmd -or -not $cmd.Source -or -not (Test-Path $cmd.Source)) {
+        return $null
+    }
+    $managed = Get-ManagedUvPath
+    $legacy = Join-Path $HermesHome "bin\uv.exe"
+    if ($cmd.Source -eq $legacy -or $cmd.Source -eq $managed) {
+        return $null
+    }
+    try {
+        $null = & $cmd.Source --version
+        return $cmd.Source
+    } catch {
+        return $null
+    }
+}
+
+function Move-LegacyManagedUv {
+    # One-time migration from the pre-isolation layout.  Installers before the
+    # uv isolation change placed the managed binary at $HermesHome\bin\uv.exe;
+    # bin is a persisted User PATH entry, so that layout silently shadowed the
+    # user's own uv in every new shell.  Move it into the private directory
+    # (never on PATH).  Best-effort: a locked legacy binary stays put and the
+    # next run retries.  Never deletes anything.
+    $legacy = Join-Path $HermesHome "bin\uv.exe"
+    $target = Get-ManagedUvPath
+    if (-not (Test-Path $legacy) -or (Test-Path $target)) { return $false }
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
+        Move-Item -LiteralPath $legacy -Destination $target -Force
+        return $true
+    } catch {
+        Write-Warn "Could not migrate legacy managed uv from $legacy : $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Install-Uv {
-    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
-    # no PATH probing, no conda guards, no multi-location resolution chains.
-    # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-    # place, so install.ps1 and `hermes update` stay in sync.
-    $managedUv = Join-Path $HermesHome "bin\uv.exe"
+    # Tier-1: a usable user uv on PATH wins -- install nothing, touch nothing.
+    # The managed binary is only provisioned when the user has no working uv.
+    $userUv = Test-UserUvUsable
+    if ($userUv) {
+        $script:UvCmd = $userUv
+        Write-Success "Using uv from PATH ($userUv)"
+        return $true
+    }
+
+    # Managed binary lives in a private directory that is never registered on
+    # PATH.  The runtime update path (hermes_cli/managed_uv.py) looks in the
+    # same place, so install.ps1 and `hermes update` stay in sync.
+    $managedUv = Get-ManagedUvPath
 
     if (Test-Path $managedUv) {
         $script:UvCmd = $managedUv
@@ -755,15 +812,23 @@ function Install-Uv {
         return $true
     }
 
-    Write-Info "Installing managed uv into $HermesHome\bin ..."
-    New-Item -ItemType Directory -Path (Join-Path $HermesHome "bin") -Force | Out-Null
+    # Upgrade path: migrate a pre-isolation bin\uv.exe into the private dir.
+    if (Move-LegacyManagedUv) {
+        $script:UvCmd = $managedUv
+        $version = & $managedUv --version
+        Write-Success "Managed uv migrated from $HermesHome\bin ($version)"
+        return $true
+    }
+
+    Write-Info "Installing managed uv into $(Split-Path $managedUv -Parent) ..."
+    New-Item -ItemType Directory -Path (Split-Path $managedUv -Parent) -Force | Out-Null
 
     # UV_INSTALL_DIR tells the astral installer to place the binary
-    # directly into $HermesHome\bin instead of ~/.local/bin.
+    # directly into the private managed dir instead of ~/.local/bin.
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $env:UV_INSTALL_DIR = Join-Path $HermesHome "bin"
+        $env:UV_INSTALL_DIR = Split-Path $managedUv -Parent
         # Spawn via the resolved host exe (see Get-PowerShellHostExe) rather
         # than a bare `powershell`, which isn't guaranteed to be on PATH under
         # PowerShell 7 / pwsh-only setups.
@@ -801,7 +866,7 @@ function Install-Uv {
         # on PATH, or at ~/.local/bin (the astral default location when
         # UV_INSTALL_DIR was ignored by an older installer) -- copy it into
         # the managed location so the managed-first invariant holds
-        # (hermes_cli/managed_uv.py looks only at $HermesHome\bin\uv.exe).
+        # (hermes_cli/managed_uv.py looks only at the private managed dir).
         if (-not (Test-Path $managedUv)) {
             $existingUv = $null
             $uvOnPath = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue |
@@ -1139,10 +1204,24 @@ function Resolve-UvCmd {
         # Stale; fall through to re-discover.
     }
 
-    # Check the managed location first -- this is where Install-Uv puts it.
-    $managedUv = Join-Path $HermesHome "bin\uv.exe"
+    # Tier-1: the user's own uv on PATH wins (read-only use).  Re-checked
+    # here because cross-process stages may not have seen Install-Uv's choice.
+    $userUv = Test-UserUvUsable
+    if ($userUv) {
+        $script:UvCmd = $userUv
+        return
+    }
+
+    # Check the managed location first -- private dir, never on PATH.
+    $managedUv = Get-ManagedUvPath
     if (Test-Path $managedUv) {
         $script:UvCmd = $managedUv
+        return
+    }
+
+    # Upgrade path: migrate a pre-isolation bin\uv.exe into the private dir.
+    if (Move-LegacyManagedUv) {
+        $script:UvCmd = Get-ManagedUvPath
         return
     }
 

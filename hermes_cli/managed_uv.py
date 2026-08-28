@@ -1,11 +1,21 @@
 """Hermes-managed uv and Python runtime repair.
 
-Hermes owns its own uv binary at ``$HERMES_HOME/bin/uv`` (or ``uv.exe`` on
-Windows).  Every code path that needs uv resolves it from that single location.
-If the binary is missing, ``ensure_uv()`` bootstraps it via the official
-standalone installer with ``UV_UNMANAGED_INSTALL`` / ``UV_INSTALL_DIR`` pointed
-at ``$HERMES_HOME/bin`` so the installer writes directly there — no PATH
-probing, no conda guards, no multi-location resolution chains.
+Hermes keeps its own uv binary at ``$HERMES_HOME/uv/uv`` (or ``uv.exe`` on
+Windows) as a private fallback, but **prefers the user's own uv when one is
+present and usable** — tier-1 of the same contract the managed-Node installer
+uses. Resolution order (see :func:`resolve_uv_engine`):
+
+1. A usable ``uv`` on PATH (runs ``uv --version``) → use it, never modify it;
+2. Otherwise the managed binary at ``$HERMES_HOME/uv/uv`` → use it, and only
+   this one may be self-updated (``resolve_uv`` is managed-only, so
+   ``update_managed_uv`` can never touch a toolchain Hermes does not own);
+3. Otherwise provision the managed binary into ``$HERMES_HOME/uv`` — a
+   private directory that is never registered on PATH, so shells always
+   resolve the user's own uv (or none), never Hermes' copy.
+
+Legacy installs that placed the managed uv at ``$HERMES_HOME/bin/uv`` (the
+pre-isolation layout — bin is a persisted User PATH entry on Windows) are
+migrated to the private location on first use.
 
 The Python backing the install is different: it is shared by every Hermes
 profile because the checkout's ``venv`` is shared.  Runtime repair therefore
@@ -52,11 +62,28 @@ _MACOS_MANAGED_PYTHON_IDENTIFIER = "com.nousresearch.hermes.managed-python"
 
 
 def managed_uv_path() -> Path:
-    """Return the path where Hermes keeps *its* uv binary.
+    """Return the path where Hermes keeps *its own* uv binary.
 
-    ``$HERMES_HOME/bin/uv`` on POSIX, ``$HERMES_HOME\\bin\\uv.exe`` on
-    Windows.  The directory may not exist yet — callers should use
+    ``$HERMES_HOME/uv/uv`` on POSIX, ``$HERMES_HOME\\uv\\uv.exe`` on
+    Windows.  This is a **private** location: it is never registered on PATH,
+    so interactive shells always resolve the user's own uv (or none) rather
+    than Hermes' copy.  The directory may not exist yet — callers should use
     ``ensure_uv()`` to bootstrap it.
+    """
+    home = get_hermes_home()
+    if platform.system() == "Windows":
+        return home / "uv" / "uv.exe"
+    return home / "uv" / "uv"
+
+
+def legacy_managed_uv_path() -> Path:
+    """Return the pre-isolation managed-uv location, if it is still around.
+
+    Installers before the uv isolation change placed the managed binary at
+    ``$HERMES_HOME/bin/uv(.exe)`` — ``bin`` is a persisted User PATH entry on
+    Windows, so that layout silently shadowed the user's own uv in every new
+    shell.  Callers migrate a legacy binary to :func:`managed_uv_path` once;
+    this accessor exists so the migration can recognize the old shape.
     """
     home = get_hermes_home()
     if platform.system() == "Windows":
@@ -67,12 +94,108 @@ def managed_uv_path() -> Path:
 def resolve_uv() -> Optional[str]:
     """Return the managed uv path if it exists, else ``None``.
 
-    No side effects — pure lookup.
+    No side effects — pure lookup.  **Managed-only**: this never resolves the
+    user's own uv on PATH, which is exactly what keeps
+    :func:`update_managed_uv` from ever modifying a toolchain Hermes does not
+    own.
     """
     p = managed_uv_path()
     if p.is_file() and os.access(p, os.X_OK):
         return str(p)
     return None
+
+
+def _uv_runs(path: str) -> bool:
+    """Smoke-test a uv binary: ``uv --version`` must succeed.
+
+    Hermes never modifies a toolchain it does not own — but it also never
+    *depends* on one: a uv that is on PATH yet cannot even report its version
+    (broken install, wrong arch, quarantined binary) is not "suitable" and
+    falls through to the managed fallback.
+    """
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+@dataclass
+class UvEngine:
+    """The uv binary Hermes should use, plus the ownership rules for it.
+
+    ``engine`` is ``"user"`` (the user's own uv on PATH — read-only use, never
+    self-updated, never moved), ``"managed"`` (Hermes' private binary — may be
+    self-updated), or ``"none"`` (nothing usable yet — bootstrap required).
+    ``path`` is the resolved binary or ``None``; ``can_self_update`` encodes the
+    ownership rule so callers never need to re-derive it.
+    """
+
+    engine: str
+    path: Optional[str]
+    can_self_update: bool = False
+
+
+def resolve_uv_engine() -> UvEngine:
+    """Resolve which uv Hermes should use, tier-1 first.
+
+    Order:
+
+    1. **User's uv** — a ``uv`` on PATH that passes the ``--version`` smoke
+       test.  Preferred whenever present (the user's machine, the user's
+       choice), but never modified.  A PATH hit that resolves to Hermes' own
+       managed or legacy binary is *not* "user" — it is the managed engine
+       (and the legacy case is migrated on next bootstrap).
+    2. **Managed uv** — the private binary at :func:`managed_uv_path`.
+    3. **None** — nothing usable; callers bootstrap the managed binary.
+
+    No side effects — migration/install live in the callers.
+    """
+    managed = managed_uv_path()
+    legacy = legacy_managed_uv_path()
+    try:
+        on_path = shutil.which("uv")
+    except Exception:
+        on_path = None
+    if on_path:
+        resolved = Path(on_path)
+        # Windows paths are case-insensitive: normcase lowercases there and is
+        # a no-op on POSIX, so a PATH hit that IS our own binary (possibly
+        # spelled differently) is never mistaken for the user's.
+        is_managed = (
+            os.path.normcase(str(resolved)) == os.path.normcase(str(managed))
+            or os.path.normcase(str(resolved)) == os.path.normcase(str(legacy))
+        )
+        if not is_managed and _uv_runs(on_path):
+            return UvEngine("user", on_path, can_self_update=False)
+    if managed.is_file() and os.access(managed, os.X_OK):
+        return UvEngine("managed", str(managed), can_self_update=True)
+    return UvEngine("none", None, can_self_update=False)
+
+
+def _migrate_legacy_managed_uv() -> bool:
+    """Move a pre-isolation ``bin/uv(.exe)`` to the private location, once.
+
+    Best-effort: a locked or busy legacy binary simply stays put (a concurrent
+    process may hold it); the resolver keeps finding it via PATH and the next
+    bootstrap retries.  Never deletes anything.
+    """
+    legacy = legacy_managed_uv_path()
+    target = managed_uv_path()
+    if target.is_file() or not legacy.is_file():
+        return False
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(legacy), str(target))
+        return True
+    except OSError:
+        return False
 
 
 def managed_python_install_dir(project_root: Path | None = None) -> Path:
@@ -271,11 +394,24 @@ def _ensure_uv_path(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
 ) -> Optional[str]:
-    """Resolve the managed uv path, installing it if necessary (plain ``str``/``None``)."""
-    existing = resolve_uv()
-    if existing:
-        return existing
+    """Resolve the uv Hermes should use, tier-1 first (plain ``str``/``None``).
 
+    Order: the user's own uv on PATH (read-only use — never modified), then
+    the managed private binary, then bootstrap the managed binary into the
+    private location (migrating a legacy ``bin/uv`` first if present).
+    """
+    engine = resolve_uv_engine()
+    if engine.path:
+        return engine.path
+
+    # Nothing usable yet — provision the managed binary.  A legacy
+    # pre-isolation binary at $HERMES_HOME/bin/uv (Windows: bin is on the
+    # persisted User PATH) is moved to the private location first, and a
+    # successful move means the managed uv already exists — no reinstall.
+    _migrate_legacy_managed_uv()
+    migrated = resolve_uv()
+    if migrated:
+        return migrated
     target = managed_uv_path()
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -319,7 +455,13 @@ def ensure_uv(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
 ):
-    """Return the managed uv path, installing it first if necessary.
+    """Return the uv Hermes should use, tier-1 first (install as fallback).
+
+    Resolution order: the user's own uv on PATH (read-only use, never
+    modified — see :func:`resolve_uv_engine`), then the managed private
+    binary, then bootstrap the managed binary.  The managed binary lives at
+    ``$HERMES_HOME/uv`` — a private directory never registered on PATH — so
+    Hermes' own copy can never shadow the user's uv in their shells.
 
     On **POSIX** the result is a :class:`_UvResult` (a ``str`` subclass) that is
     both usable directly as the path *and* unpackable as
@@ -394,9 +536,12 @@ def update_managed_uv(
     """Run ``uv self update`` on the managed uv binary.
 
     Call this during ``hermes update`` so the managed copy stays current.
-    Returns the managed path when uv is available and ``None`` otherwise.
-    A self-update failure is non-fatal because the old version still works.
-    ``repair_observer``, when provided, receives the runtime repair result.
+    **This never touches the user's own uv**: resolution goes through
+    ``resolve_uv()``, which is managed-only, so a toolchain Hermes does not
+    own is never self-updated (ownership red line).  Returns the managed path
+    when uv is available and ``None`` otherwise.  A self-update failure is
+    non-fatal because the old version still works.  ``repair_observer``, when
+    provided, receives the runtime repair result.
 
     The network self-update is skipped when it succeeded within the last
     ``UV_SELF_UPDATE_INTERVAL_SECONDS`` (7 days) unless ``force=True``; the
