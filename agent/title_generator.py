@@ -694,6 +694,29 @@ def retitle_session(
         if title is None:
             return None
 
+        # ``set_auto_title`` refuses equal-rank writes (llm -> llm returns 0)
+        # to stop the first-turn titler renaming a session on every subsequent
+        # turn — see hermes_state._set_session_title docstring. Retitle is an
+        # EXPLICIT rewrite intent, not that accidental case, so demote the row
+        # to ``derived`` first, then land the new llm title on top. Both writes
+        # are single-row updates; the intermediate ``derived`` state is invisible
+        # and — even if the second write raced a manual /title — the CAS in
+        # set_session_title would still reject the demotion cleanly.
+        try:
+            source_fn = getattr(session_db, "get_session_title_source", None)
+            demote_fn = getattr(session_db, "set_session_title_source", None)
+            if (
+                callable(source_fn)
+                and callable(demote_fn)
+                and source_fn(session_id) == "llm"
+            ):
+                demote_fn(session_id, "derived")
+        except Exception:
+            logger.debug(
+                "Retitle pre-write demotion failed for %s (proceeding)",
+                session_id, exc_info=True,
+            )
+
         persisted = _persist_session_title(
             session_db, session_id, title, source="llm"
         )
