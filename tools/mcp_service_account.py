@@ -39,6 +39,15 @@ to disk. If the server returns a ``refresh_token``, it is cached and used
 on subsequent renewals, falling back to a fresh service-account exchange
 if the refresh fails.
 
+httpx compatibility
+-------------------
+``ServiceAccountAuth`` inherits from the ``Auth`` class exported by
+whichever httpx distribution the installed MCP SDK uses (plain ``httpx``
+for mcp < 2.0, ``httpx2`` for mcp >= 2.0).  The base class is resolved
+once at module import time via :func:`_resolve_auth_base` and stored in
+``_SA_AUTH_BASE``.  This makes the provider a valid ``isinstance(...,
+httpx.Auth)`` object and therefore acceptable to ``AsyncClient(auth=...)``.
+
 Security
 --------
 - TLS verification is always on; no way to disable it from config.
@@ -59,8 +68,9 @@ import re
 import secrets
 import stat
 import time
+import threading as _threading
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +79,40 @@ _PROACTIVE_RENEW_BUFFER_SECONDS = 60
 
 # ── Env-var name validation — same rule as shell identifier.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+# ---------------------------------------------------------------------------
+# httpx Auth base — resolved from the SDK's own httpx distribution
+# ---------------------------------------------------------------------------
+
+def _resolve_auth_base() -> type:
+    """Return the ``Auth`` base class from the MCP SDK's httpx distribution.
+
+    mcp >= 2.0 ships its transports against ``httpx2`` rather than the
+    upstream ``httpx``.  ``AsyncClient(auth=...)`` uses ``isinstance(auth,
+    Auth)`` from *its own* httpx module, so the provider must inherit from
+    the same class.  We mirror what :func:`tools.mcp_tool.sdk_httpx` does
+    (read the transport module's ``httpx2`` or ``httpx`` attribute) without
+    importing all of ``mcp_tool`` to avoid a heavy circular-import at
+    module load time.
+    """
+    try:
+        from mcp.client import streamable_http as _transport
+        _mod = getattr(_transport, "httpx2", None) or getattr(_transport, "httpx", None)
+        if _mod is not None and hasattr(_mod, "Auth"):
+            return _mod.Auth
+    except ImportError:
+        pass
+    # Fallback: httpx2 then httpx
+    try:
+        import httpx2 as _h
+        return _h.Auth
+    except ImportError:
+        import httpx as _h  # type: ignore[no-redef]
+        return _h.Auth
+
+
+_SA_AUTH_BASE: type = _resolve_auth_base()
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +195,6 @@ def _resolve_client_secret(cfg: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Token cache (disk)
 # ---------------------------------------------------------------------------
-
-# Lazy import helpers shared with mcp_oauth.py — imported inside functions to
-# avoid a circular-import at module load time.
 
 def _get_sa_token_path(server_name: str, hermes_home: Optional[str | Path] = None) -> Path:
     """Return the path to the service-account token cache file.
@@ -334,10 +375,6 @@ def _parse_token_response(
 # ---------------------------------------------------------------------------
 
 # Keyed by (hermes_home_str, server_name) → asyncio.Lock.
-# Using a plain dict with a module-level lock for thread-safe creation.
-
-import threading as _threading
-
 _refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
 _refresh_locks_mu = _threading.Lock()
 
@@ -359,18 +396,17 @@ def _clear_refresh_locks_for_tests() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ServiceAccountAuth — httpx.Auth subclass
+# ServiceAccountAuth — inherits from the SDK's httpx.Auth
 # ---------------------------------------------------------------------------
 
 
-class ServiceAccountAuth:
-    """httpx.Auth-compatible provider for service-account M2M token exchange.
+class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
+    """httpx.Auth subclass for service-account M2M token exchange.
 
-    Usage::
-
-        auth = build_service_account_auth("toolhive", cfg)
-        async with httpx.AsyncClient(auth=auth) as client:
-            resp = await client.get("https://mcp.example/mcp")
+    Inherits from the ``Auth`` class of whichever httpx distribution the
+    installed MCP SDK uses (``httpx`` for mcp < 2.0, ``httpx2`` for mcp
+    >= 2.0).  This satisfies ``AsyncClient(auth=...)``'s ``isinstance``
+    check on both SDK generations.
 
     The provider:
     - Caches tokens to disk at ``$HERMES_HOME/mcp-tokens/<server>-sa.json``.
@@ -380,6 +416,14 @@ class ServiceAccountAuth:
     - Never logs passwords, tokens, or Authorization header values.
     """
 
+    # Tell httpx we need to read both request and response bodies so the
+    # base-class sync stub in auth_flow() is never called (we fully override
+    # async_auth_flow).  Setting these to False is safe because our
+    # async_auth_flow is a complete async generator that never delegates to
+    # the sync auth_flow() path.
+    requires_request_body = False
+    requires_response_body = False
+
     def __init__(
         self,
         server_name: str,
@@ -387,6 +431,8 @@ class ServiceAccountAuth:
         *,
         hermes_home: Optional[str | Path] = None,
     ):
+        # httpx.Auth.__init__ takes no arguments, but call it for compat.
+        super().__init__()
         self._server_name = server_name
         self._cfg = dict(sa_config)
         from hermes_constants import get_hermes_home
@@ -525,20 +571,45 @@ class ServiceAccountAuth:
 
     # -- httpx.Auth protocol -------------------------------------------------
 
-    async def async_auth_flow(
-        self, request: Any
-    ) -> AsyncGenerator[Any, Any]:
-        """httpx async auth flow: inject token, handle one 401 retry."""
-        # Lazily import httpx from whatever flavour the MCP SDK uses.
-        try:
-            from tools.mcp_tool import sdk_httpx
-            _httpx = sdk_httpx()
-        except Exception:
-            import httpx as _httpx
+    def auth_flow(self, request: Any):  # type: ignore[override]
+        # httpx.Auth requires a sync auth_flow stub; the async path below
+        # is used exclusively in our async MCP context.  This stub is never
+        # called because async_auth_flow is overridden and httpx prefers it.
+        raise NotImplementedError(  # pragma: no cover
+            "ServiceAccountAuth requires an async context; "
+            "use an AsyncClient, not a sync Client"
+        )
 
-        # Build a minimal internal client to make token requests.
-        # We share TLS settings but not auth (never nest auth providers).
-        async with _httpx.AsyncClient(follow_redirects=True) as token_client:
+    async def async_auth_flow(self, request: Any):  # type: ignore[override]
+        """Inject Bearer token, handle one 401 retry.
+
+        httpx drives this generator:
+          1. ``__anext__()``       → we yield the request with Authorization header
+          2. ``asend(response)``  → we inspect the response
+             - 2xx/other: generator returns → httpx uses that response
+             - 401:  invalidate cache, fetch fresh token, yield retry request
+             - ``asend(response2)`` → generator returns
+        """
+        # Build a small dedicated client for token-endpoint requests.  It is
+        # created fresh each auth-flow invocation so it lives only as long as
+        # a single MCP request (including one possible 401 retry).  We resolve
+        # the correct httpx module here (same logic as _resolve_auth_base) to
+        # handle both mcp 1.x (httpx) and mcp 2.x (httpx2) at runtime.
+        try:
+            from mcp.client import streamable_http as _transport
+            _httpx_mod = (
+                getattr(_transport, "httpx2", None)
+                or getattr(_transport, "httpx", None)
+            )
+        except ImportError:
+            _httpx_mod = None
+        if _httpx_mod is None:
+            try:
+                import httpx2 as _httpx_mod  # type: ignore[no-redef]
+            except ImportError:
+                import httpx as _httpx_mod  # type: ignore[no-redef]
+
+        async with _httpx_mod.AsyncClient(follow_redirects=True) as token_client:
             token = await self._acquire_token(token_client)
 
             # Inject Authorization header without logging the value.
@@ -560,17 +631,9 @@ class ServiceAccountAuth:
             request.headers["Authorization"] = f"Bearer {token.access_token}"
             yield request
 
-    # -- Make this class act as an httpx.Auth without inheriting it ----------
-    # httpx recognises objects with ``async_auth_flow`` as async auth providers
-    # without requiring subclassing.  This keeps us decoupled from whichever
-    # httpx version the MCP SDK vendors (httpx vs httpx2).
-
-    def auth_flow(self, request: Any) -> Any:  # pragma: no cover
-        raise NotImplementedError("Use async_auth_flow")
-
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 
 
