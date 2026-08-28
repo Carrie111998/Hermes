@@ -217,6 +217,25 @@ _CFG_ANCHORED_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# TOML assignments permit whitespace around ``=`` and bare, basic-string, or
+# literal-string key segments. Keep this line-anchored and use possessive
+# quantifiers so malformed/very long quoted keys cannot trigger expensive
+# backtracking. This parser is only applied to file-tool output from .toml
+# paths; source-code examples retain the conservative code-file behavior.
+_TOML_KEY_SEGMENT = r'(?:[A-Za-z0-9_-]++|"(?:\\[^\r\n]|[^"\\\r\n])*+"|\'[^\'\r\n]*+\')'
+_TOML_SECRET_ASSIGN_RE = re.compile(
+    rf"(?P<toml_prefix>^[ \t]*(?:\d+\|)?[ \t]*)"
+    rf"(?P<toml_key>{_TOML_KEY_SEGMENT}"
+    rf"(?:[ \t]*+\.[ \t]*+{_TOML_KEY_SEGMENT})*+)"
+    rf"(?P<toml_sep>[ \t]*+=[ \t]*+)"
+    rf"(?:"
+    rf'(?P<toml_dquote>")(?P<toml_dvalue>(?:\\[^\r\n]|[^"\\\r\n])*+)"'
+    rf"|(?P<toml_squote>')(?P<toml_svalue>[^'\r\n]*+)'"
+    rf"|(?P<toml_bvalue>[^ \t\r\n#]++)"
+    rf")",
+    re.MULTILINE,
+)
+
 # Unquoted YAML / colon config (e.g. ``password: secret``,
 # ``spring.datasource.password: hunter2``). The secret keyword must be part of
 # the KEY (anchored to the start of the line/indent), and the value is a single
@@ -916,6 +935,41 @@ def redact_sensitive_text(
         code_file = not is_config_like_path(file_path)
 
     value_mask = _mask_file_value if file_read else _mask_token
+
+    # TOML's assignment grammar allows whitespace around ``=`` and quoted key
+    # segments, neither of which the generic dotted/bare config regexes fully
+    # cover. Restrict this richer parser to actual .toml file-tool surfaces so
+    # quoted assignment examples in source code remain editable.
+    if (
+        file_read
+        and os.path.splitext(str(file_path or ""))[1].casefold() == ".toml"
+        and "=" in text
+        and _CFG_SECRET_WORD_RE.search(text)
+    ):
+
+        def _redact_toml_assignment(m):
+            key = m.group("toml_key")
+            if not _key_has_secret_keyword(key):
+                return m.group(0)
+
+            if m.group("toml_dvalue") is not None:
+                quote = m.group("toml_dquote")
+                value = m.group("toml_dvalue")
+            elif m.group("toml_svalue") is not None:
+                quote = m.group("toml_squote")
+                value = m.group("toml_svalue")
+            else:
+                quote = ""
+                value = m.group("toml_bvalue")
+
+            if _ENV_LOOKUP_VALUE_RE.match(value):
+                return m.group(0)
+            return (
+                f"{m.group('toml_prefix')}{key}{m.group('toml_sep')}"
+                f"{quote}{value_mask(value)}{quote}"
+            )
+
+        text = _TOML_SECRET_ASSIGN_RE.sub(_redact_toml_assignment, text)
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
