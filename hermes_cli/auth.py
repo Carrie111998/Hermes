@@ -1696,16 +1696,12 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 def _suppressed_sources_for_provider(
     auth_store: Dict[str, Any], provider_id: str
 ) -> set[str]:
-    """Return profile-local credential source suppressions without mutating them."""
-    suppressed = auth_store.get("suppressed_sources")
-    if not isinstance(suppressed, dict):
-        return set()
-    raw_sources = suppressed.get(provider_id)
-    if isinstance(raw_sources, list):
-        return {str(source) for source in raw_sources if source}
-    if isinstance(raw_sources, dict):
-        return {str(source) for source in raw_sources if source}
-    return set()
+    """Return the union of profile and root suppressions for global fallback."""
+    local_sources = set(_suppressed_sources_for(auth_store, provider_id))
+    global_sources = set(
+        _suppressed_sources_for(_load_global_auth_store(), provider_id)
+    )
+    return local_sources | global_sources
 
 
 def _filter_suppressed_global_entries(
