@@ -51,6 +51,8 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_VIDEO_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    apply_terminal_outbound_payload_policy,
+    apply_terminal_outbound_text_policy,
     is_host_excluded_by_no_proxy,
     resolve_proxy_url,
     safe_url_for_log,
@@ -3668,6 +3670,17 @@ class SlackAdapter(BasePlatformAdapter):
                     _status = f"still working… ({_human})"
                 else:
                     _status = "is thinking..."
+            # This status is recipient-visible text, not a textless typing
+            # signal. Apply the loader-owned terminal policy to the exact final
+            # phrase immediately before Slack API I/O. stop_typing's empty clear
+            # remains untouched.
+            _status = apply_terminal_outbound_text_policy(
+                platform="slack",
+                chat_id=str(chat_id),
+                content=str(_status),
+                metadata=metadata,
+                operation="send_typing",
+            )
             await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
@@ -5309,6 +5322,20 @@ class SlackAdapter(BasePlatformAdapter):
             kwargs["title"] = title
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
+
+        gated, changed = apply_terminal_outbound_payload_policy(
+            platform="slack", chat_id=channel_id, payload=kwargs,
+            metadata={"thread_id": thread_ts} if thread_ts else None,
+            operation="assistant_threads_setSuggestedPrompts",
+        )
+        if changed:
+            kwargs = {
+                "channel_id": channel_id,
+                "title": "Delivery blocked",
+                "prompts": [{"title": "Delivery blocked", "message": gated}],
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
 
         try:
             await self._get_client(channel_id, team_id=team_id).assistant_threads_setSuggestedPrompts(
@@ -7597,6 +7624,14 @@ class SlackAdapter(BasePlatformAdapter):
         ]
 
         try:
+            gated, changed = apply_terminal_outbound_payload_policy(
+                platform="slack", chat_id=channel_id,
+                payload={"text": decision_text, "blocks": updated_blocks},
+                metadata={"thread_id": message.get("thread_ts") or msg_ts},
+                operation="interaction_chat_update",
+            )
+            if changed:
+                decision_text, updated_blocks = gated, []
             await self._get_client(channel_id, team_id=team_id or None).chat_update(
                 channel=channel_id,
                 ts=msg_ts,
@@ -7622,6 +7657,13 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts = message.get("thread_ts") or msg_ts
                 if thread_ts:
                     post_kwargs["thread_ts"] = thread_ts
+                gated, changed = apply_terminal_outbound_payload_policy(
+                    platform="slack", chat_id=channel_id, payload=post_kwargs,
+                    metadata={"thread_id": thread_ts} if thread_ts else None,
+                    operation="interaction_follow_up",
+                )
+                if changed:
+                    post_kwargs["text"] = gated
                 await self._get_client(
                     channel_id, team_id=team_id or None
                 ).chat_postMessage(**post_kwargs)
@@ -7776,6 +7818,14 @@ class SlackAdapter(BasePlatformAdapter):
         ]
 
         try:
+            gated, changed = apply_terminal_outbound_payload_policy(
+                platform="slack", chat_id=channel_id,
+                payload={"text": decision_text, "blocks": updated_blocks},
+                metadata={"thread_id": message.get("thread_ts") or msg_ts},
+                operation="approval_chat_update",
+            )
+            if changed:
+                decision_text, updated_blocks = gated, []
             await self._get_client(channel_id, team_id=team_id or None).chat_update(
                 channel=channel_id,
                 ts=msg_ts,
@@ -7806,6 +7856,14 @@ class SlackAdapter(BasePlatformAdapter):
             },
         ]
         try:
+            gated, changed = apply_terminal_outbound_payload_policy(
+                platform="slack", chat_id=channel_id,
+                payload={"text": decision_text, "blocks": updated_blocks},
+                metadata={"thread_id": msg_ts},
+                operation="clarify_chat_update",
+            )
+            if changed:
+                decision_text, updated_blocks = gated, []
             await self._get_client(channel_id).chat_update(
                 channel=channel_id,
                 ts=msg_ts,

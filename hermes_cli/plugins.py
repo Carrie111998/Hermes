@@ -233,6 +233,14 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway outbound policy hook. Fired at the platform-adapter boundary for
+    # both sends and edits, immediately before user-visible I/O. Callbacks may
+    # allow, rewrite, or block the message. This hook is fail-closed on timeout
+    # and callback error because it is an enforcement boundary, not telemetry.
+    # Kwargs: platform, chat_id, content, metadata, operation.
+    "pre_gateway_send",
+    # Terminal enforcement policy over the fully transformed payload.
+    "final_gateway_send_policy",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -440,7 +448,11 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
 # Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
+    "pre_tool_call",
+    "pre_gateway_send",
+    "final_gateway_send_policy",
+}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
@@ -453,6 +465,13 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running"
 )
+
+
+def _outbound_gate_required_at_startup(config: Mapping[str, Any] | None = None) -> bool:
+    """Whether protected targets make the bundled security gate mandatory."""
+    from hermes_cli.outbound_policy import outbound_policy_settings
+
+    return bool(outbound_policy_settings(config).get("protected_targets"))
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
@@ -3390,6 +3409,10 @@ class PluginContext:
         Unknown hook names produce a warning but are still stored so
         forward-compatible plugins don't break.
         """
+        if hook_name == "final_gateway_send_policy":
+            raise PermissionError(
+                "final_gateway_send_policy is loader-owned; use the bundled policy capability"
+            )
         if hook_name not in VALID_HOOKS:
             logger.warning(
                 "Plugin '%s' registered unknown hook '%s' "
@@ -3408,6 +3431,10 @@ class PluginContext:
         )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
+
+    def register_final_gateway_send_policy(self, callback: Callable) -> None:
+        """Register the loader-owned bundled terminal outbound policy."""
+        self._manager._register_final_gateway_send_policy(self.manifest, callback)
 
     def register_system_prompt_section(
         self,
@@ -3723,11 +3750,17 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     )
 
 
-def _pre_tool_call_timeout_block() -> Dict[str, str]:
-    """Fail-closed directive when a policy callback times out or is still running."""
+def _policy_hook_block(hook_name: str, *, error: bool = False) -> Dict[str, str]:
+    """Fail-closed directive when a policy callback does not produce a decision."""
+    if hook_name == "pre_tool_call":
+        return {
+            "action": "block",
+            "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        }
+    failure = "raised an error" if error else "timed out or is still running"
     return {
         "action": "block",
-        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        "reason": f"{hook_name} policy callback {failure}",
     }
 
 
@@ -3747,6 +3780,8 @@ class PluginManager:
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._final_gateway_send_policy: Optional[Callable] = None
+        self._final_gateway_send_policy_owner: Optional[PluginManifest] = None
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -4355,6 +4390,7 @@ class PluginManager:
         # winner. Keys are path-derived (``image_gen/openai``,
         # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
         # don't collide even when both manifests say ``name: openai``.
+        outbound_gate_required = _outbound_gate_required_at_startup()
         disabled = _get_disabled_plugins()
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         stale_relay_keys = legacy_relay_plugin_keys(enabled)
@@ -4366,14 +4402,27 @@ class PluginManager:
                 RELAY_PLUGINS_CONFIG_ENV,
             )
         winners: Dict[str, PluginManifest] = {}
+        bundled_gate_exists = any(
+            manifest.name == "outbound-message-gate" and manifest.source == "bundled"
+            for manifest in manifests
+        )
         for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
+            lookup_key = manifest.key or manifest.name
+            if (
+                bundled_gate_exists
+                and manifest.name == "outbound-message-gate"
+                and manifest.source != "bundled"
+            ):
+                logger.warning("Ignoring non-bundled outbound-message-gate manifest")
+                continue
+            winners[lookup_key] = manifest
         # Standalone/user plugins that pass the gates below are collected
         # here and loaded AFTER the sweep in dependency-respecting order
         # (requires_plugins topological sort, #64165).
         to_load: Dict[str, PluginManifest] = {}
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+            is_outbound_gate = manifest.name == "outbound-message-gate"
 
             # Relay lifecycle ownership now lives in the Hermes core. Loading
             # an old user or entry-point copy would let plugin.initialize()
@@ -4395,9 +4444,13 @@ class PluginManager:
                 )
                 continue
 
-            # Explicit disable always wins (matches on key or on legacy
-            # bare name for back-compat with existing user configs).
+            # Explicit disable always wins, except that a configured protected
+            # target makes disabling the bundled security boundary invalid.
             if lookup_key in disabled or manifest.name in disabled:
+                if is_outbound_gate and outbound_gate_required:
+                    raise RuntimeError(
+                        "outbound-message-gate is mandatory while protected_targets are configured"
+                    )
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
@@ -4464,7 +4517,7 @@ class PluginManager:
             is_enabled = (
                 enabled is not None
                 and (lookup_key in enabled or manifest.name in enabled)
-            )
+            ) or (is_outbound_gate and outbound_gate_required)
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = (
@@ -4487,6 +4540,19 @@ class PluginManager:
             self._warn_python_dependencies(manifest)
             self._validate_plugin_config_schema(manifest)
             self._load_plugin(manifest)
+
+        if outbound_gate_required:
+            owner = self._final_gateway_send_policy_owner
+            if (
+                self._final_gateway_send_policy is None
+                or owner is None
+                or owner.source != "bundled"
+                or owner.name != "outbound-message-gate"
+                or (owner.key or owner.name) != "outbound-message-gate"
+            ):
+                raise RuntimeError(
+                    "gateway readiness refused: exact outbound-message-gate policy callback is not loaded"
+                )
 
         if manifests:
             logger.info(
@@ -5561,6 +5627,46 @@ class PluginManager:
         }
         return callback(**accepted_payload)
 
+    def _register_final_gateway_send_policy(
+        self, manifest: PluginManifest, callback: Callable
+    ) -> None:
+        """Retain loader-authenticated ownership of the one terminal policy."""
+        if (
+            manifest.source != "bundled"
+            or manifest.name != "outbound-message-gate"
+            or (manifest.key or manifest.name) != "outbound-message-gate"
+        ):
+            raise PermissionError(
+                "final gateway send policy requires bundled outbound-message-gate ownership"
+            )
+        if self._final_gateway_send_policy is not None:
+            raise RuntimeError("final gateway send policy is already registered")
+        if not callable(callback):
+            raise TypeError("final gateway send policy must be callable")
+        self._final_gateway_send_policy = callback
+        self._final_gateway_send_policy_owner = manifest
+        self._hooks.setdefault("final_gateway_send_policy", []).append(callback)
+
+    def invoke_final_gateway_send_policy(self, **kwargs: Any) -> Dict[str, Any]:
+        """Invoke only the loader-owned terminal policy and sanitize its result."""
+        callback = self._final_gateway_send_policy
+        owner = self._final_gateway_send_policy_owner
+        if callback is None or owner is None:
+            raise RuntimeError("bundled outbound-message-gate policy is not registered")
+        results = self.invoke_hook("final_gateway_send_policy", **kwargs)
+        if len(results) != 1:
+            raise RuntimeError("final gateway send policy identity is ambiguous")
+        result = results[0]
+        if not isinstance(result, dict):
+            raise RuntimeError("final gateway send policy returned an invalid decision")
+        allowed = {key: result[key] for key in ("action", "content", "reason") if key in result}
+        action = str(allowed.get("action") or "").lower()
+        if action not in {"allow", "rewrite", "block"}:
+            raise RuntimeError("final gateway send policy returned an invalid action")
+        if action == "rewrite" and not isinstance(allowed.get("content"), str):
+            raise RuntimeError("final gateway send policy rewrite omitted content")
+        return allowed
+
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
@@ -5629,7 +5735,7 @@ class PluginManager:
                                 callback_name,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(_policy_hook_block(hook_name))
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -5680,7 +5786,7 @@ class PluginManager:
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(_policy_hook_block(hook_name))
                         continue
                     if "exc" in failure:
                         raise failure["exc"]
@@ -5696,6 +5802,8 @@ class PluginManager:
                     callback_name,
                     exc,
                 )
+                if fail_closed:
+                    results.append(_policy_hook_block(hook_name, error=True))
         return results
 
     def _subscribe_event(
@@ -6457,6 +6565,11 @@ def _delivery_manager() -> PluginManager:
         _join_background_discovery()
         manager.discover_and_load()
     return manager
+
+
+def invoke_final_gateway_send_policy(**kwargs: Any) -> Dict[str, Any]:
+    """Invoke the loader-authenticated bundled terminal outbound policy."""
+    return _delivery_manager().invoke_final_gateway_send_policy(**kwargs)
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:

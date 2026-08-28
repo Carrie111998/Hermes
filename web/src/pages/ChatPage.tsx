@@ -205,6 +205,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setHasActivated((prev) => latchChatActivation(prev, isActive));
   }, [isActive]);
   const [searchParams, setSearchParams] = useSearchParams();
+  // A guided token is an opaque, single-consumption launch admission. Keep it
+  // in a ref so removing it from the visible URL after a successful socket
+  // open does not rebuild the persistent PTY. It is never retried: a failed
+  // first attach must return to Agent OS for a newly approved launch.
+  const guidedLaunchRef = useRef<string | null>(searchParams.get("guided"));
+  // Preserve the admitted profile for ordinary keep-alive reconnects after the
+  // opaque token is removed, so the server derives the identical PTY registry
+  // key and cannot spawn a detached duplicate session.
+  const guidedProfileRef = useRef<string | null>(
+    searchParams.get("guided") ? searchParams.get("profile") : null,
+  );
   // Lazy-init: the missing-token check happens at construction so the effect
   // body doesn't have to setState (React 19's set-state-in-effect rule).
   // In gated (OAuth) mode the server intentionally omits the session token —
@@ -1112,6 +1123,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     }
     const forceFresh = forceFreshPtyRef.current;
     forceFreshPtyRef.current = false;
+    const guidedToken = guidedLaunchRef.current;
+    const guidedAttempt = Boolean(guidedToken);
     // A connect attempt is now in flight — set synchronously (before the async
     // socket-open IIFE below awaits its ticket URL) so a page-resume event in
     // that gap doesn't fire a redundant reconnect (wsRef isn't assigned yet).
@@ -1138,6 +1151,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // `code` is null when the attempt died before any socket existed — the
     // banner then omits the "(code N)" suffix rather than inventing one.
     const scheduleReconnect = (code: number | null) => {
+      if (
+        guidedAttempt &&
+        guidedToken &&
+        guidedLaunchRef.current === guidedToken
+      ) {
+        // A guided token may already have been consumed server-side even when
+        // the browser never observed OPEN. Retrying it would either replay or
+        // risk a duplicate attach, so fail closed and require a new launch.
+        guidedLaunchRef.current = null;
+        connectInFlightRef.current = false;
+        setLastCloseCode(code);
+        setPtyState("closed");
+        setBanner(
+          "Guided launch did not attach. Return to Agent OS and start guided assistance again.",
+        );
+        return;
+      }
       if (reconnectTimerRef.current) {
         return;
       }
@@ -1171,7 +1201,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
-      if (scopedProfile) params.profile = scopedProfile;
+      if (guidedProfileRef.current || scopedProfile) {
+        params.profile = guidedProfileRef.current || scopedProfile;
+      }
+      if (guidedToken) {
+        // The server atomically compares every selector to the opaque claim.
+        // Missing values are intentionally forwarded as empty strings so the
+        // server burns malformed launches instead of silently downgrading them
+        // to ordinary chat.
+        params.guided = guidedToken;
+        params.profile = searchParams.get("profile") ?? "";
+        params.conversation = searchParams.get("conversation") ?? "";
+        params.resume = searchParams.get("resume") ?? "";
+        params.board = searchParams.get("board") ?? "";
+        params.task = searchParams.get("task") ?? "";
+        params.lease = searchParams.get("lease") ?? "";
+        params.brief_sha256 = searchParams.get("brief_sha256") ?? "";
+      }
 
       ticketTimer = setTimeout(() => {
         ticketTimer = null;
@@ -1235,6 +1281,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // the bottom so the latest output is in view; released once the user
       // scrolls up (#59591).
       if (resumeParam) stickToBottomRef.current = true;
+      if (guidedToken && guidedLaunchRef.current === guidedToken) {
+        // The server has admitted this socket and consumed the launch. Clear
+        // the browser copy before any later keep-alive reconnect; the ordinary
+        // resume + attach identity then reconnects without another seed turn.
+        guidedLaunchRef.current = null;
+        const next = new URLSearchParams(searchParams);
+        next.delete("guided");
+        setSearchParams(next, { replace: true });
+      }
       // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
       // skill" panel) is typed into the composer as a /learn command once the
       // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
@@ -1385,6 +1440,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           ev.reason
             ? `Refused: ${ev.reason}.`
             : "Refused: your client isn't permitted (server bound to localhost only).",
+        );
+        return;
+      }
+      if (ev.code === 4411) {
+        setPtyState("closed");
+        setBanner(
+          "Guided launch was rejected or already used. Return to Agent OS and start guided assistance again.",
         );
         return;
       }

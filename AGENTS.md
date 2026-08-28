@@ -4,6 +4,10 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Paul-facing outbound assurance
+
+Paul-facing outbound messages are subject to a fail-closed gateway policy. Every included URL must pass an immediate live fetch before delivery. Success language must carry a named same-turn receipt with the passing output from a ratchet or journey check against the live build; otherwise the gateway marks the claim `UNVERIFIED` and identifies the missing proof. LinkedIn completion claims remain blocked until the authorized test-post journey produces and fetches the public URL. This paragraph explains the policy; gateway code, structured receipts, and ratchet tests enforce it.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a

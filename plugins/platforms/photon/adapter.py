@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    apply_terminal_outbound_payload_policy,
 )
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 
@@ -2793,6 +2794,16 @@ async def _standalone_send(
     media_files: Optional[list] = None,
     force_document: bool = False,  # noqa: ARG001 — iMessage auto-detects file kind
 ) -> Dict[str, Any]:
+    gated_envelope, changed = apply_terminal_outbound_payload_policy(
+        platform="photon",
+        chat_id=str(chat_id),
+        payload={"content": message, "media": media_files or []},
+        metadata={"thread_id": thread_id} if thread_id else None,
+        operation="photon_standalone_sender",
+    )
+    if changed:
+        message = gated_envelope
+        media_files = []
     if not HTTPX_AVAILABLE:
         return {"error": "httpx not installed"}
     port = _coerce_port(

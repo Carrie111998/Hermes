@@ -489,16 +489,10 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         # our own v2 layout.
         _migrate_legacy_store(base)
 
-    if (store / "HEAD").exists():
-        return None
-
-    store.mkdir(parents=True, exist_ok=True)
-    (store / _INDEXES_DIRNAME).mkdir(exist_ok=True)
-    (store / _PROJECTS_DIRNAME).mkdir(exist_ok=True)
-
-    # ``git init --bare`` rejects GIT_WORK_TREE, so we can't use _run_git
-    # here (which always sets GIT_DIR + GIT_WORK_TREE).  Use a raw
-    # subprocess with just the config-isolation env vars.
+    # ``git init --bare`` and the validity probe reject or must not inherit
+    # working-tree state, so we can't use _run_git here (it always sets
+    # GIT_DIR + GIT_WORK_TREE).  Use raw subprocesses with the same config
+    # isolation instead.
     from tools.environments.local import build_subprocess_env
     init_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     init_env["GIT_CONFIG_GLOBAL"] = os.devnull
@@ -508,6 +502,26 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
     for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
               "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         init_env.pop(k, None)
+
+    if store.exists():
+        try:
+            validity = subprocess.run(
+                ["git", "--git-dir", str(store), "rev-parse", "--git-dir"],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                env=init_env, timeout=_GIT_TIMEOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+            )
+            if validity.returncode == 0:
+                return None
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            # Let the normal init path below return the actionable error.
+            pass
+
+    store.mkdir(parents=True, exist_ok=True)
+    (store / _INDEXES_DIRNAME).mkdir(exist_ok=True)
+    (store / _PROJECTS_DIRNAME).mkdir(exist_ok=True)
+
     try:
         result = subprocess.run(
             ["git", "init", "--bare", str(store)],

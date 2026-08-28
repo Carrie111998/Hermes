@@ -133,6 +133,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    apply_terminal_outbound_text_policy,
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
@@ -4552,6 +4553,12 @@ class MatrixAdapter(BasePlatformAdapter):
         if not self._client or not text:
             return SendResult(success=False, error="No client or empty text")
 
+        text = apply_terminal_outbound_text_policy(
+            platform="matrix",
+            chat_id=str(chat_id),
+            content=str(text),
+            operation="matrix_simple_message",
+        )
         msg_content = self._build_text_message_content(text, msgtype=msgtype)
 
         try:

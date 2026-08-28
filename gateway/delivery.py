@@ -568,7 +568,16 @@ class DeliveryRouter:
                 and not has_explicit_direct_topic
             )
             if is_named_telegram_private_topic:
-                named_telegram_private_topic_name = target_thread_id
+                from gateway.platforms.base import apply_terminal_outbound_text_policy
+
+                named_telegram_private_topic_name = apply_terminal_outbound_text_policy(
+                    platform="telegram",
+                    chat_id=target.chat_id,
+                    content=target_thread_id,
+                    metadata=send_metadata or None,
+                    operation="telegram_create_forum_topic",
+                )
+                target_thread_id = named_telegram_private_topic_name
                 ensure_dm_topic = getattr(adapter, "ensure_dm_topic", None)
                 if ensure_dm_topic is None:
                     raise RuntimeError(

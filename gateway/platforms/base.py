@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import functools
 import inspect
 import ipaddress
 import logging
@@ -20,12 +21,18 @@ import threading
 import time
 import uuid
 import weakref
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
+from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+_SAFE_OUTBOUND_POLICY_NOTICE = (
+    "DELIVERY BLOCKED\n\n"
+    "The original message was withheld because outbound safety verification failed."
+)
 
 
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
@@ -80,6 +87,170 @@ def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
     return str(value or "").lower()
+
+
+def bind_outbound_receipt_context(
+    *metadata_mappings: Optional[Dict[str, Any]],
+    session_id: str,
+    turn_id: str,
+) -> None:
+    """Bind a gateway turn identity into every mutable delivery metadata map."""
+    for metadata in metadata_mappings:
+        if metadata is None:
+            continue
+        metadata["_hermes_session_id"] = str(session_id or "")
+        metadata["_hermes_turn_id"] = str(turn_id or "")
+
+
+def _outbound_gate_required_for_target(platform: str, chat_id: str) -> bool:
+    """Read the canonical profile-scoped required-target policy fail closed."""
+    from hermes_cli.outbound_policy import (
+        normalize_outbound_target,
+        outbound_policy_required,
+        outbound_policy_settings,
+    )
+
+    if str(chat_id or "").strip():
+        return outbound_policy_required(platform, chat_id)
+
+    # Capability follow-ups can lack a concrete chat id. If that logical
+    # platform has any protected recipient, treat the unresolved destination as
+    # protected rather than allowing a content-bearing frame to bypass policy.
+    platform_prefix = f"{normalize_outbound_target(platform, '_').split(':', 1)[0]}:"
+    return any(
+        str(target).startswith(platform_prefix)
+        for target in outbound_policy_settings().get("protected_targets", [])
+    )
+
+
+_NON_VISIBLE_OUTBOUND_FIELDS = frozenset({
+    "op", "operation", "platform", "logical_platform", "target", "chat_id", "channel_id",
+    "user_id", "team_id", "scope_id", "tenant_id", "session_key", "reply_to",
+    "thread_id", "thread_ts", "message_id", "card_id", "prompt_id", "action_id", "id",
+    "draft_id", "kind", "media_kind", "prompt_kind", "style", "status_code",
+    "token", "secret", "credential", "credentials", "authorization", "metadata",
+})
+
+
+def _outbound_field_is_non_visible(key: Any) -> bool:
+    name = str(key or "").strip().lower()
+    return (
+        name in _NON_VISIBLE_OUTBOUND_FIELDS
+        or name.endswith("_id")
+        or name.endswith("_token")
+        or name.endswith("_secret")
+        or name.endswith("_credential")
+    )
+
+
+def extract_user_visible_strings(value: Any, *, _field: Any = None) -> list[str]:
+    """Flatten only recipient-visible strings from a native/Relay payload.
+
+    Routing, identity, lifecycle, and credential fields are deliberately not
+    interpreted as content even when an opaque value happens to look like a URL
+    or completion claim. Unknown structured fields default to visible: adding a
+    new card/block text key must not silently create an egress bypass.
+    """
+    if _field is not None and _outbound_field_is_non_visible(_field):
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, dict):
+        found: list[str] = []
+        for key, item in value.items():
+            found.extend(extract_user_visible_strings(item, _field=key))
+        return found
+    if isinstance(value, (list, tuple)):
+        found = []
+        for item in value:
+            found.extend(extract_user_visible_strings(item))
+        return found
+    return []
+
+
+def replace_user_visible_strings(
+    value: Any, replacement: str, *, _field: Any = None,
+) -> Any:
+    """Clone a payload, replacing visible strings while preserving routing."""
+    if _field is not None and _outbound_field_is_non_visible(_field):
+        return value
+    if isinstance(value, str):
+        return replacement
+    if isinstance(value, dict):
+        return {
+            key: replace_user_visible_strings(item, replacement, _field=key)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [replace_user_visible_strings(item, replacement) for item in value]
+    if isinstance(value, tuple):
+        return tuple(replace_user_visible_strings(item, replacement) for item in value)
+    return value
+
+
+# Canonical stdlib-only implementation is importable by isolated preflight
+# scripts without importing the gateway package and its optional dependencies.
+from outbound_transport_inventory import (  # noqa: E402
+    scan_terminal_transport_inventory as scan_terminal_transport_inventory,
+)
+
+
+def apply_terminal_outbound_text_policy(
+    *, platform: str, chat_id: str, content: str,
+    metadata: Any = None, operation: str,
+) -> str:
+    """Apply ordinary transforms then the loader-owned terminal text policy."""
+    text = str(content or "")
+    if not text:
+        return text
+    try:
+        required = _outbound_gate_required_for_target(platform, chat_id)
+    except Exception:
+        required = True
+    try:
+        from hermes_cli.lifecycle import invoke_final_gateway_send_policy, invoke_hook
+
+        for decision in invoke_hook(
+            "pre_gateway_send", platform=platform, chat_id=chat_id,
+            content=text, metadata=metadata, operation=operation,
+        ):
+            if not isinstance(decision, dict):
+                raise RuntimeError("invalid pre-gateway decision")
+            action = str(decision.get("action") or "").lower()
+            if action == "rewrite" and isinstance(decision.get("content"), str):
+                text = decision["content"]
+            elif action == "block":
+                return _SAFE_OUTBOUND_POLICY_NOTICE
+            elif action not in {"", "allow"}:
+                raise RuntimeError("invalid pre-gateway action")
+        final = invoke_final_gateway_send_policy(
+            platform=platform, chat_id=chat_id, content=text,
+            metadata=metadata, operation=operation,
+        )
+        action = str(final.get("action") or "").lower()
+        if action == "allow":
+            return text
+        if action == "rewrite" and isinstance(final.get("content"), str):
+            return final["content"]
+        if action == "block":
+            return _SAFE_OUTBOUND_POLICY_NOTICE
+        raise RuntimeError("invalid final policy decision")
+    except Exception:
+        return _SAFE_OUTBOUND_POLICY_NOTICE if required else text
+
+
+def apply_terminal_outbound_payload_policy(
+    *, platform: str, chat_id: str, payload: Any,
+    metadata: Any = None, operation: str,
+) -> tuple[str, bool]:
+    """Evaluate every visible nested field and report whether it was rewritten."""
+    visible = extract_user_visible_strings(payload)
+    original = "\n".join(item for item in visible if item)
+    gated = apply_terminal_outbound_text_policy(
+        platform=platform, chat_id=str(chat_id), content=original,
+        metadata=metadata, operation=operation,
+    )
+    return gated, gated != original
 
 
 def _float_env(name: str, default: float) -> float:
@@ -2967,16 +3138,177 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
-class BasePlatformAdapter(ABC):
+_PRIVATE_OUTBOUND_METHODS = frozenset({"_post_interactive", "_send_media"})
+_INSTANCE_ASYNC_CALLBACK_SLOTS = frozenset({
+    "_fatal_error_handler", "_message_handler", "_platform_event_handler",
+    "_reaction_handler", "_topic_recovery_fn",
+})
+
+
+def _should_wrap_outbound_method(name: str) -> bool:
+    """Wrap public adapter APIs plus the two legacy private transport APIs.
+
+    Arbitrary private async methods are predominantly inbound/control handlers;
+    treating their string arguments as egress mutates user input before routing.
+    Private direct publishers outside this legacy pair must call the explicit
+    terminal text/payload policy immediately before transport and are covered by
+    the static inventory ratchet.
+    """
+    return not str(name).startswith("_") or str(name) in _PRIVATE_OUTBOUND_METHODS
+
+
+class _TerminalOutboundBoundaryMeta(ABCMeta):
+    """Mechanically wrap every async adapter method, including later patches.
+
+    The wrapper itself decides from the bound call envelope whether recipient-
+    visible content exists.  Thus startup, inbound, configuration, read receipt,
+    and other non-content methods remain byte-for-byte calls to their original
+    implementation, while an unknown publisher cannot bypass policy merely by
+    choosing a new method name.
+    """
+
+    def __new__(mcls, name, bases, namespace, **kwargs):
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        wrapper = getattr(cls, "_wrap_outbound_method", None)
+        if wrapper is not None:
+            for method_name, implementation in namespace.items():
+                if (
+                    _should_wrap_outbound_method(method_name)
+                    and inspect.iscoroutinefunction(implementation)
+                    and not getattr(implementation, "_hermes_outbound_gate_wrapped", False)
+                ):
+                    type.__setattr__(
+                        cls, method_name, wrapper(method_name, implementation)
+                    )
+        return cls
+
+    def __setattr__(cls, name, value):
+        wrapper = getattr(cls, "_wrap_outbound_method", None)
+        if (
+            wrapper is not None
+            and _should_wrap_outbound_method(name)
+            and inspect.iscoroutinefunction(value)
+            and not getattr(value, "_hermes_outbound_gate_wrapped", False)
+        ):
+            value = wrapper(name, value, force_unknown_boundary=True)
+        super().__setattr__(name, value)
+
+
+class BasePlatformAdapter(ABC, metaclass=_TerminalOutboundBoundaryMeta):
     """
     Base class for platform adapters.
-    
+
     Subclasses implement platform-specific logic for:
     - Connecting and authenticating
     - Receiving messages
     - Sending messages/responses
     - Handling media
     """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Seal instance-level async publishers behind the terminal boundary.
+
+        Python functions stored on an instance are not descriptors, so an instance
+        monkey patch would otherwise bypass both class creation and metaclass
+        assignment wrapping. Public async callables and private callables whose
+        signature can carry recipient-visible content are rebound through the same
+        fail-closed wrapper. Private non-content helpers and ordinary mutable state
+        retain normal instance semantics.
+        """
+        async_callable = inspect.iscoroutinefunction(value) or (
+            callable(value)
+            and inspect.iscoroutinefunction(getattr(value, "__call__", None))
+        )
+        already_wrapped = getattr(value, "_hermes_outbound_gate_wrapped", False)
+        if callable(value) and not async_callable and not already_wrapped:
+            publisher_tokens = {
+                token for token in str(name).lower().replace("-", "_").split("_")
+                if token
+            }
+            try:
+                sync_parameter_names = {
+                    parameter.name.lower()
+                    for parameter in inspect.signature(value).parameters.values()
+                }
+            except (TypeError, ValueError):
+                sync_parameter_names = set()
+            sync_transport_shape = bool(
+                sync_parameter_names
+                & {"chat_id", "channel_id", "parent_chat_id", "user_id", "to_account"}
+                and sync_parameter_names
+                & {
+                    "content", "text", "message", "name", "title", "caption",
+                    "payload", "body", "card", "blocks", "options",
+                    "thread_name", "starter_message", "seed_content", "status",
+                }
+            )
+            if sync_transport_shape or publisher_tokens & {
+                "deliver", "edit", "post", "publish", "send", "transmit", "update",
+            }:
+                raise TypeError(
+                    f"synchronous adapter publisher assignment {name!r} is forbidden"
+                )
+        if async_callable and not already_wrapped:
+            try:
+                assigned_signature = inspect.signature(value)
+                parameter_names = {
+                    parameter.name.lower()
+                    for parameter in assigned_signature.parameters.values()
+                }
+            except (TypeError, ValueError):
+                assigned_signature = None
+                parameter_names = set()
+            carries_visible_content = bool(
+                parameter_names
+                & {
+                    "content", "text", "message", "name", "title", "caption",
+                    "payload", "body", "card", "blocks", "options",
+                    "thread_name", "starter_message", "seed_content", "status",
+                }
+            )
+            carries_target = bool(
+                parameter_names
+                & {"chat_id", "channel_id", "parent_chat_id", "user_id", "to_account"}
+            )
+            private_publisher_name = bool(
+                str(name).startswith("_")
+                and {token for token in str(name).lower().split("_") if token}
+                & {"deliver", "edit", "post", "publish", "send", "transmit", "update"}
+            )
+            if str(name) in _INSTANCE_ASYNC_CALLBACK_SLOTS:
+                object.__setattr__(self, name, value)
+                return
+            if str(name).startswith("_") and (
+                (carries_target and not carries_visible_content)
+                or (private_publisher_name and not carries_visible_content)
+            ):
+                raise TypeError(
+                    f"private async adapter assignment {name!r} has an uncertain "
+                    "publisher envelope"
+                )
+            if not str(name).startswith("_") or carries_visible_content:
+                if assigned_signature is None:
+                    raise TypeError(
+                        f"cannot safely seal async adapter assignment {name!r}: "
+                        "signature unavailable"
+                    )
+
+                assigned_callable: Any = value
+
+                async def _instance_implementation(_self, *args, **kwargs):
+                    return await assigned_callable(*args, **kwargs)
+
+                self_parameter = inspect.Parameter(
+                    "_self", inspect.Parameter.POSITIONAL_OR_KEYWORD
+                )
+                _instance_implementation.__signature__ = assigned_signature.replace(  # type: ignore[attr-defined]
+                    parameters=(self_parameter, *assigned_signature.parameters.values())
+                )
+                wrapped = type(self)._wrap_outbound_method(
+                    name, _instance_implementation, force_unknown_boundary=True
+                )
+                value = wrapped.__get__(self, type(self))
+        object.__setattr__(self, name, value)
 
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
@@ -3077,6 +3409,156 @@ class BasePlatformAdapter(ABC):
     # "interactive_resume", True)`` — no per-platform branching at the call
     # site.
     interactive_resume: bool = True
+
+    @staticmethod
+    def _wrap_outbound_method(
+        method_name: str, implementation, *, force_unknown_boundary: bool = False,
+    ):
+        signature = inspect.signature(implementation)
+
+        async def _constant_notice(self, chat_id: str, metadata: Any) -> Any:
+            wrapped_send = getattr(type(self), "send")
+            original_send = getattr(wrapped_send, "_hermes_outbound_original", None)
+            if original_send is None:
+                return SendResult(success=False, error="outbound policy blocked delivery")
+            send_signature = inspect.signature(original_send)
+            notice_bound = send_signature.bind_partial(
+                self, chat_id, _SAFE_OUTBOUND_POLICY_NOTICE
+            )
+            if "metadata" in send_signature.parameters:
+                notice_bound.arguments["metadata"] = metadata
+            result = await original_send(*notice_bound.args, **notice_bound.kwargs)
+            if method_name == "send_stream_frame":
+                return bool(getattr(result, "success", False))
+            return result
+
+        async def _wrapped(self, *args, **kwargs) -> SendResult:
+            # Bind exactly as the implementation would.  Besides preserving
+            # positional compatibility, this gives the gate one canonical map
+            # to inspect and mutate without injecting duplicate keyword values.
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            chat_id = str(
+                bound.arguments.get("chat_id")
+                or bound.arguments.get("parent_chat_id")
+                or bound.arguments.get("user_id")
+                or bound.arguments.get("to_account")
+                or bound.arguments.get("channel_id")
+                or ""
+            )
+            metadata = bound.arguments.get("metadata")
+            excluded = {
+                "self", "chat_id", "user_id", "to_account", "logical_platform",
+                "reply_to", "metadata",
+            }
+            visible: list[str] = []
+            for name, value in bound.arguments.items():
+                if name not in excluded:
+                    visible.extend(extract_user_visible_strings(value, _field=name))
+            original_content = "\n".join(item for item in visible if item)
+            if not original_content or (not chat_id and not force_unknown_boundary):
+                # Seed/finalize/typing frames with no recipient-visible text do
+                # not need content policy and must preserve native lifecycle.
+                return await implementation(*bound.args, **bound.kwargs)
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+
+                logical_platform = bound.arguments.get("logical_platform")
+                if logical_platform is None and isinstance(metadata, dict):
+                    logical_platform = metadata.get("_relay_logical_platform")
+                if logical_platform is None:
+                    logical_platform = getattr(self, "_platform_by_chat", {}).get(chat_id)
+                platform_name = _platform_name(
+                    logical_platform
+                    or getattr(self, "platform", "")
+                    or getattr(self, "name", "")
+                    or "unknown"
+                )
+                required = _outbound_gate_required_for_target(platform_name, chat_id)
+                transform_decisions = invoke_hook(
+                    "pre_gateway_send",
+                    platform=platform_name,
+                    chat_id=chat_id,
+                    content=original_content,
+                    metadata=metadata,
+                    operation=method_name,
+                )
+            except Exception as exc:
+                return await _constant_notice(self, chat_id, metadata)
+
+            gated_content = original_content
+            for decision in transform_decisions:
+                if not isinstance(decision, dict):
+                    return SendResult(
+                        success=False,
+                        error="pre_gateway_send policy returned an invalid decision",
+                    )
+                action = str(decision.get("action") or "").lower()
+                if action == "block":
+                    return await _constant_notice(self, chat_id, metadata)
+                if action == "rewrite":
+                    if not isinstance(decision.get("content"), str):
+                        return SendResult(
+                            success=False,
+                            error="pre_gateway_send rewrite omitted content",
+                        )
+                    gated_content = decision["content"]
+                elif action not in {"", "allow"}:
+                    return SendResult(
+                        success=False,
+                        error=f"pre_gateway_send policy returned unsupported action: {action}",
+                    )
+
+            try:
+                from hermes_cli.lifecycle import invoke_final_gateway_send_policy
+
+                decision = invoke_final_gateway_send_policy(
+                    platform=platform_name,
+                    chat_id=chat_id,
+                    content=gated_content,
+                    metadata=metadata,
+                    operation=method_name,
+                )
+            except Exception:
+                if required:
+                    return await _constant_notice(self, chat_id, metadata)
+                decision = {"action": "allow"}
+            action = str(decision.get("action") or "").lower()
+            if action == "block":
+                return await _constant_notice(self, chat_id, metadata)
+            if action == "rewrite":
+                rewritten = decision.get("content")
+                if not isinstance(rewritten, str):
+                    return await _constant_notice(self, chat_id, metadata)
+                gated_content = rewritten
+            elif action != "allow":
+                return await _constant_notice(self, chat_id, metadata)
+
+            if gated_content != original_content:
+                visible_fields = [
+                    name for name, value in bound.arguments.items()
+                    if name not in excluded
+                    and extract_user_visible_strings(value, _field=name)
+                ]
+                if all(isinstance(bound.arguments[name], str) for name in visible_fields):
+                    # A terminal rewrite is intentionally indivisible.  When a
+                    # native operation has several textual fields (thread name
+                    # plus starter message), replace every field with the same
+                    # policy-produced safe envelope; never retain a sibling raw
+                    # field after evaluating their joined visible content.
+                    for name in visible_fields:
+                        bound.arguments[name] = gated_content
+                else:
+                # Structured/card/media/interactive payloads cannot be safely
+                # partially rewritten. Suppress them and use the adapter's raw
+                # text send implementation for one host-generated constant.
+                    return await _constant_notice(self, chat_id, metadata)
+            return await implementation(*bound.args, **bound.kwargs)
+
+        functools.update_wrapper(_wrapped, implementation)
+        setattr(_wrapped, "_hermes_outbound_gate_wrapped", True)
+        setattr(_wrapped, "_hermes_outbound_original", implementation)
+        return _wrapped
 
     # Back-reference to the running ``GatewayRunner``, injected by
     # ``gateway/run.py`` after the adapter is created. Adapters consume it via

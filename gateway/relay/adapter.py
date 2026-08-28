@@ -26,7 +26,14 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    SendResult,
+    _SAFE_OUTBOUND_POLICY_NOTICE,
+    apply_terminal_outbound_text_policy,
+    extract_user_visible_strings,
+)
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
@@ -552,7 +559,7 @@ class RelayAdapter(BasePlatformAdapter):
             self._open_draft_by_chat[chat_key] = draft_id
             self._evict_oldest(self._open_draft_by_chat)
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 {
                     "op": "draft",
                     "chat_id": chat_id,
@@ -639,12 +646,11 @@ class RelayAdapter(BasePlatformAdapter):
             ),
         }
         _seal_platform = self._platform_by_chat.get(str(chat_id))
-        _transport = self._transport  # narrowed by the None-guard above
 
         async def _attempt() -> Optional[Dict[str, Any]]:
             """One seal attempt; None means ambiguous (exception or lost ack)."""
             try:
-                r = await _transport.send_outbound(
+                r = await self._send_outbound_frame(
                     seal_frame, platform=_seal_platform
                 )
             except asyncio.CancelledError:
@@ -749,7 +755,7 @@ class RelayAdapter(BasePlatformAdapter):
             # anchor on the triggering message when the runner gave us one.
             merged_meta["thread_ts"] = str(reply_to)
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 {
                     "op": "task_card",
                     "chat_id": chat_id,
@@ -795,7 +801,7 @@ class RelayAdapter(BasePlatformAdapter):
         # hits the open stream.
         card_id = self._card_key(reply_to, metadata)
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 {
                     "op": "task_card_stop",
                     "chat_id": chat_id,
@@ -1791,7 +1797,7 @@ class RelayAdapter(BasePlatformAdapter):
         _sfp_unfurl = self._slack_unfurl_hints(str(platform_value))
         if _sfp_unfurl:
             _sfp_metadata.update(_sfp_unfurl)
-        result = await self._transport.send_outbound(
+        result = await self._send_outbound_frame(
             {
                 "op": "send",
                 "chat_id": chat_id,
@@ -1980,7 +1986,7 @@ class RelayAdapter(BasePlatformAdapter):
         )
         if _unfurl:
             send_metadata.update(_unfurl)
-        result = await self._transport.send_outbound(
+        result = await self._send_outbound_frame(
             {
                 "op": "send",
                 "chat_id": chat_id,
@@ -2220,7 +2226,7 @@ class RelayAdapter(BasePlatformAdapter):
         """Edit a relayed message through the connector-owned platform API."""
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        result = await self._transport.send_outbound(
+        result = await self._send_outbound_frame(
             {
                 "op": "edit",
                 "chat_id": chat_id,
@@ -2241,6 +2247,54 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id") or message_id,
             error=result.get("error"),
         )
+
+    def _gate_outbound_frame(
+        self, action: Dict[str, Any], *, platform: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return the policy-checked immutable copy of one final Relay frame."""
+        visible = extract_user_visible_strings(action)
+        # Textless typing/clear events and routing-only frames remain byte-for-byte
+        # compatible. Every other recipient-visible field shares one envelope.
+        if not visible:
+            return action
+        metadata = action.get("metadata")
+        metadata_map = metadata if isinstance(metadata, dict) else {}
+        chat_id = str(action.get("chat_id") or metadata_map.get("chat_id") or "")
+        logical_platform = str(platform or self._platform_by_chat.get(chat_id) or "relay").lower()
+        envelope = "\n".join(visible)
+        gated_content = apply_terminal_outbound_text_policy(
+            platform=logical_platform,
+            chat_id=chat_id,
+            content=envelope,
+            metadata=metadata,
+            operation=str(action.get("op") or "relay"),
+        )
+        if gated_content == envelope:
+            return dict(action)
+        final_frame = dict(action)
+        if visible == [action.get("content")] and isinstance(action.get("content"), str):
+            final_frame["content"] = gated_content
+            return final_frame
+        # A rewrite of a structured payload must not leave any sibling visible
+        # field behind. Collapse it to one plain-text block frame while retaining
+        # only transport routing metadata.
+        return {
+            "op": "send",
+            "chat_id": chat_id,
+            "content": gated_content,
+            "reply_to": action.get("reply_to"),
+            "metadata": metadata_map,
+        }
+
+    async def _send_outbound_frame(
+        self, action: Dict[str, Any], *, platform: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Apply policy to the final Relay frame immediately before transport I/O."""
+        transport = self._transport
+        if transport is None:
+            return {"success": False, "error": "no transport"}
+        final_frame = self._gate_outbound_frame(action, platform=platform)
+        return await transport.send_outbound(final_frame, platform=platform)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Egress a typing indicator through the connector.
@@ -2302,7 +2356,7 @@ class RelayAdapter(BasePlatformAdapter):
         if phrase:
             frame["content"] = str(phrase)
         try:
-            await self._transport.send_outbound(
+            await self._send_outbound_frame(
                 frame,
                 platform=self._platform_by_chat.get(str(chat_id)),
             )
@@ -2337,7 +2391,7 @@ class RelayAdapter(BasePlatformAdapter):
         # timeout. Shared helper with send_typing so the two guards cannot drift.
         md = self._with_status_thread_anchor(chat_id, metadata)
         try:
-            await self._transport.send_outbound(
+            await self._send_outbound_frame(
                 {
                     "op": "typing",
                     "chat_id": chat_id,
@@ -2387,7 +2441,7 @@ class RelayAdapter(BasePlatformAdapter):
             prefix = kind.split(".", 1)[0]
             if self._platform_is_fronted(prefix):
                 follow_up_platform = prefix
-        result = await self._transport.send_follow_up(
+        action = self._gate_outbound_frame(
             {
                 "op": "follow_up",
                 "session_key": session_key,
@@ -2395,6 +2449,10 @@ class RelayAdapter(BasePlatformAdapter):
                 "content": content,
                 "metadata": metadata or {},
             },
+            platform=follow_up_platform,
+        )
+        result = await self._transport.send_follow_up(
+            action,
             platform=follow_up_platform,
         )
         return SendResult(
@@ -2494,7 +2552,7 @@ class RelayAdapter(BasePlatformAdapter):
         if filename:
             action["filename"] = filename
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 action,
                 platform=self._platform_by_chat.get(str(chat_id)),
             )
@@ -2782,7 +2840,7 @@ class RelayAdapter(BasePlatformAdapter):
         if timeout_s is not None:
             action["timeout_s"] = int(timeout_s)
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 action,
                 platform=self._platform_by_chat.get(str(chat_id)),
             )
@@ -3204,7 +3262,7 @@ class RelayAdapter(BasePlatformAdapter):
         if not chat_id or not message_id:
             return False
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 {
                     "op": "react",
                     "chat_id": chat_id,
@@ -3265,7 +3323,7 @@ class RelayAdapter(BasePlatformAdapter):
             return None
         thread_name = (str(name or "").strip() or "handoff")[:100]
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 {
                     "op": "thread_create",
                     "chat_id": str(parent_chat_id),
@@ -3331,7 +3389,7 @@ class RelayAdapter(BasePlatformAdapter):
         elif only_if_current_name is not None:
             action["only_if_current_name"] = str(only_if_current_name)
         try:
-            result = await self._transport.send_outbound(
+            result = await self._send_outbound_frame(
                 action,
                 platform=self._platform_by_chat.get(chat_id)
                 or self._platform_by_chat.get(str(thread_id)),

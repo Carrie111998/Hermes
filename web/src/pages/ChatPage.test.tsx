@@ -80,7 +80,14 @@ class FakeTerminal {
 
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
-  buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  buildWsUrl: vi.fn(
+    async (...args: [string, Record<string, string>?]) => {
+      void args;
+      return "ws://localhost/api/pty?channel=chat-1";
+    },
+  ),
+  getSessionDetail: vi.fn(async () => ({ title: "Guided task" })),
+  getSessionLatestDescendant: vi.fn(async () => ({ session_id: null })),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
@@ -320,6 +327,106 @@ describe("ChatPage", () => {
       "resize",
       "scroll",
     ]);
+  });
+});
+
+describe("ChatPage guided one-shot launch", () => {
+  const guidedUrl =
+    "/chat?guided=opaque-once&profile=default&conversation=Bot%20Chat" +
+    "&resume=session-1&board=mission-control&task=t_afd09696" +
+    "&lease=lease-123&brief_sha256=abc123";
+
+  it("passes every immutable guided selector to the first PTY connection", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={[guidedUrl]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() => expect(apiMocks.buildWsUrl).toHaveBeenCalled());
+    expect(apiMocks.buildWsUrl).toHaveBeenCalledWith("/api/pty", {
+      attach: expect.any(String),
+      board: "mission-control",
+      brief_sha256: "abc123",
+      channel: expect.any(String),
+      conversation: "Bot Chat",
+      guided: "opaque-once",
+      lease: "lease-123",
+      profile: "default",
+      resume: "session-1",
+      task: "t_afd09696",
+    });
+  });
+
+  it("never auto-starts from a generic chat URL", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat?profile=default"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() => expect(apiMocks.buildWsUrl).toHaveBeenCalled());
+    const params = apiMocks.buildWsUrl.mock.calls[0][1];
+    expect(params).not.toHaveProperty("guided");
+    expect(params).not.toHaveProperty("task");
+    expect(params).not.toHaveProperty("brief_sha256");
+  });
+
+  it("does not auto-retry a guided connection failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const { default: ChatPage } = await import("./ChatPage");
+      await render(
+        <MemoryRouter initialEntries={[guidedUrl]}>
+          <ChatPage isActive />
+        </MemoryRouter>,
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(FakeWebSocket.instances).toHaveLength(1);
+
+      await act(async () => {
+        FakeWebSocket.instances[0].onclose?.({
+          code: 1006,
+          reason: "network lost before attach",
+          wasClean: false,
+        });
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+      expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reattaches after OPEN without replaying the guided token", async () => {
+    vi.useFakeTimers();
+    try {
+      const { default: ChatPage } = await import("./ChatPage");
+      await render(
+        <MemoryRouter initialEntries={[guidedUrl]}>
+          <ChatPage isActive />
+        </MemoryRouter>,
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      const first = FakeWebSocket.instances[0];
+      await act(async () => first.onopen?.());
+      await act(async () => {
+        first.onclose?.({ code: 1006, reason: "radio handoff", wasClean: false });
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+
+      expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(2);
+      const reconnectParams = apiMocks.buildWsUrl.mock.calls[1][1];
+      expect(reconnectParams).not.toHaveProperty("guided");
+      expect(reconnectParams).not.toHaveProperty("task");
+      expect(reconnectParams).toMatchObject({ profile: "default", resume: "session-1" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
