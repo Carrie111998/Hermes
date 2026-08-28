@@ -9096,6 +9096,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   const rowTooltip = [displayName(bot, meta), `@${handle}`, gatewayLabel, sourceStatus.label]
     .filter(Boolean)
     .join(' · ')
+  const warmedForPointerVisit = useRef(false)
 
   const warm = () => {
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
@@ -9120,13 +9121,32 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
     }
   }
 
+  // `pointerenter` can fire without physical pointer movement when live bot
+  // rows reorder underneath a stationary cursor. Warming on that event alone
+  // cascades through the roster: each backend emits activity, the next row
+  // moves under the cursor, and Desktop wakes every profile. Require one real
+  // pointer move per visit so layout churn cannot start the cascade.
+  const armWarm = () => {
+    warmedForPointerVisit.current = false
+  }
+  const warmOnPointerMove = () => {
+    if (warmedForPointerVisit.current) {
+      return
+    }
+
+    warmedForPointerVisit.current = true
+    warm()
+  }
+
   // Rows and Active Now share the exact-owner open path; only that path may
   // activate a source and resolve the canonical Bot Chat.
   const open = () => void openRosterBot(bot)
 
   const row = jsxs('button', {
     type: 'button',
-    onPointerEnter: warm,
+    onPointerEnter: armWarm,
+    onPointerLeave: armWarm,
+    onPointerMove: warmOnPointerMove,
     onClick: open,
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',

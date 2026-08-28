@@ -107,6 +107,7 @@ function renderBotRow(input = 'alpha') {
     ACTIVE_WINDOW_S: 90,
     A2A_PREFIX_RE: /^$/,
     useEffect: () => undefined,
+    useRef: initial => ({ current: initial }),
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
       state: { gateway: atom('open'), profile: atom('default') },
@@ -169,12 +170,17 @@ test('regression: source transitions keep BotRow hook order stable', () => {
   assert.doesNotMatch(botRowSource, /remoteSource && Boolean\(useValue/)
 })
 
-test('behavior: pointer entry prewarms only the hovered bot', () => {
+test('regression: layout-only pointer entry does not prewarm a bot until the pointer moves', () => {
   const { row, warmed } = renderBotRow('alpha')
 
   assert.deepEqual(warmed, [])
   assert.equal(typeof row.props.onPointerEnter, 'function')
   row.props.onPointerEnter()
+  assert.deepEqual(warmed, [])
+
+  assert.equal(typeof row.props.onPointerMove, 'function')
+  row.props.onPointerMove()
+  row.props.onPointerMove()
   assert.deepEqual(warmed, ['alpha'])
 })
 
@@ -212,6 +218,7 @@ test('behavior: a remote Connections row opens through its captured route withou
   })
 
   row.props.onPointerEnter()
+  row.props.onPointerMove()
   assert.deepEqual(warmed, [['work', 'research']])
 
   await row.props.onClick()
@@ -297,6 +304,7 @@ test('behavior: remote default never opens the same-name local chat', async () =
     ACTIVE_WINDOW_S: 90,
     A2A_PREFIX_RE: /^$/,
     useEffect: () => undefined,
+    useRef: initial => ({ current: initial }),
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
       state: { gateway: atom('open'), profile: atom('default') },
