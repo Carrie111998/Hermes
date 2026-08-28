@@ -38,6 +38,7 @@ seam remembers and surfaces as 503 only if NO provider accepts the token.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import threading
 from typing import Awaitable, Callable, Optional, Tuple
@@ -151,7 +152,8 @@ async def token_auth_middleware(
     :func:`register_token_route`. For a registered path, token auth is the
     only accepted scheme:
 
-      * valid token  → attach principal + ``token_authenticated`` flag, pass through.
+      * exact process-internal bearer → attach the server principal and pass through;
+      * valid provider token → attach principal + ``token_authenticated`` flag, pass through.
       * unreachable  → 503 (provider backing store down; not "bad credentials").
       * otherwise    → 401 unauthenticated.
 
@@ -163,7 +165,22 @@ async def token_auth_middleware(
     if not is_token_route(path):
         return await call_next(request)
 
-    principal, unreachable = authenticate_token(request)
+    token = extract_bearer_token(request)
+    internal_token = getattr(request.app.state, "internal_api_token", None)
+    if (
+        token
+        and isinstance(internal_token, str)
+        and internal_token
+        and hmac.compare_digest(token.encode(), internal_token.encode())
+    ):
+        principal = TokenPrincipal(
+            principal="dashboard-internal",
+            provider="dashboard-internal",
+            scopes=("dashboard-internal",),
+        )
+        unreachable = None
+    else:
+        principal, unreachable = authenticate_token(request)
     if principal is not None:
         request.state.token_principal = principal
         request.state.token_authenticated = True
