@@ -391,6 +391,10 @@ def get_active_search_provider() -> Optional[WebSearchProvider]:
     fallback) from config.yaml; falls back per the module docstring.
     """
     explicit = _read_config_key("web", "search_backend") or _read_config_key("web", "backend")
+    if explicit:
+        from hermes_cli.config import normalize_web_backend_provider_id
+
+        explicit = normalize_web_backend_provider_id(explicit)
     return _resolve(explicit, capability="search")
 
 
@@ -401,6 +405,10 @@ def get_active_extract_provider() -> Optional[WebSearchProvider]:
     fallback) from config.yaml; falls back per the module docstring.
     """
     explicit = _read_config_key("web", "extract_backend") or _read_config_key("web", "backend")
+    if explicit:
+        from hermes_cli.config import normalize_web_backend_provider_id
+
+        explicit = normalize_web_backend_provider_id(explicit)
     return _resolve(explicit, capability="extract")
 
 

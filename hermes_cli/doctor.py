@@ -309,8 +309,10 @@ def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
         from agent.web_search_registry import (
             get_active_extract_provider,
             get_active_search_provider,
+            get_provider as get_web_provider,
         )
         from hermes_cli.config import (
+            effective_web_backend_selection,
             load_config,
             validate_web_backend_config_value,
         )
@@ -331,17 +333,22 @@ def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
         ("search", "web search", get_active_search_provider),
         ("extract", "web extract", get_active_extract_provider),
     ):
-        key = f"web.{capability}_backend"
-        explicit = (
-            web_config.get(f"{capability}_backend") or web_config.get("backend")
-        )
-        if explicit:
-            issue = validate_web_backend_config_value(key, explicit)
+        selection = effective_web_backend_selection(web_config, capability)
+        if selection is not None:
+            issue = validate_web_backend_config_value(
+                selection.source_key,
+                selection.configured_value,
+                required_capabilities=(capability,),
+            )
             if issue is not None:
                 rows.append(("warn", label, f"({issue.message})"))
                 continue
         try:
-            provider = getter()
+            provider = (
+                get_web_provider(selection.provider_id)
+                if selection is not None
+                else getter()
+            )
         except Exception:
             provider = None
         if provider is None:
