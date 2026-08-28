@@ -3257,6 +3257,9 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
+        # End option parsing before the user pattern so values such as
+        # ``--state`` are searched as data instead of interpreted as rg flags.
+        cmd_parts.append("--")
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
@@ -3413,6 +3416,9 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")
         
+        # End option parsing before the user pattern so leading-hyphen values
+        # remain search data for the grep fallback as well.
+        cmd_parts.append("--")
         # Add pattern and path. grep applies --exclude-dir to the command-line
         # search root too, so passing the default relative root ``.`` causes
         # ``.*`` to exclude the entire search. Anchor relative paths at the

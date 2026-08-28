@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 
 from tools.environments.base import (
@@ -53,7 +54,8 @@ class SSHEnvironment(BaseEnvironment):
     """
 
     def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+                 timeout: int = 60, port: int = 22, key_path: str = "",
+                 file_sync: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
@@ -78,15 +80,17 @@ class SSHEnvironment(BaseEnvironment):
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
 
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload,
-            delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload,
-            bulk_download_fn=self._ssh_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
+        self._sync_manager = None
+        if file_sync:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
 
         self.init_session()
 
@@ -394,7 +398,8 @@ class SSHEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to remote via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        if self._sync_manager is not None:
+            self._sync_manager.sync()
 
     # ------------------------------------------------------------------
     # Execution
@@ -404,13 +409,62 @@ class SSHEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn an SSH process that runs bash on the remote host."""
+        run_dir = f"{self._remote_home}/.hermes/run"
+        pid_file = f"{run_dir}/{uuid.uuid4().hex}.pid"
+        quoted_command = shlex.quote(cmd_string)
+        quoted_run_dir = shlex.quote(run_dir)
+        quoted_pid_file = shlex.quote(pid_file)
+        remote = (
+            f"mkdir -p {quoted_run_dir} || exit 125; "
+            "if command -v setsid >/dev/null 2>&1; then "
+            f"setsid /bin/bash -c {quoted_command} & child=$!; "
+            "elif command -v python3 >/dev/null 2>&1; then "
+            "python3 -c 'import os,sys; os.setsid(); "
+            "os.execv(\"/bin/bash\", [\"bash\", \"-c\", sys.argv[1]])' "
+            f"{quoted_command} & child=$!; "
+            "else echo 'remote process-group support unavailable' >&2; exit 126; fi; "
+            f"printf '%s\\n' \"$child\" > {quoted_pid_file}; "
+            "wait \"$child\"; rc=$?; "
+            f"rm -f {quoted_pid_file}; exit \"$rc\""
+        )
         cmd = self._build_ssh_command()
         if login:
-            cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
+            cmd.extend(["bash", "-l", "-c", shlex.quote(remote)])
         else:
-            cmd.extend(["bash", "-c", shlex.quote(cmd_string)])
+            cmd.extend(["bash", "-c", shlex.quote(remote)])
 
-        return _popen_bash(cmd, stdin_data)
+        process = _popen_bash(cmd, stdin_data)
+        process._hermes_remote_pid_file = pid_file
+        return process
+
+    def _kill_process(self, proc):
+        """Stop the tracked remote process group before closing local SSH."""
+        pid_file = getattr(proc, "_hermes_remote_pid_file", None)
+        if pid_file:
+            quoted_pid_file = shlex.quote(pid_file)
+            cleanup = (
+                f"pid_file={quoted_pid_file}; "
+                "if [ -f \"$pid_file\" ]; then pid=$(cat \"$pid_file\"); "
+                "case \"$pid\" in ''|*[!0-9]*) exit 125;; esac; "
+                "kill -TERM -- \"-$pid\" 2>/dev/null || true; sleep 1; "
+                "kill -KILL -- \"-$pid\" 2>/dev/null || true; "
+                "rm -f \"$pid_file\"; fi"
+            )
+            command = self._build_ssh_command()
+            command.extend(["bash", "-c", shlex.quote(cleanup)])
+            try:
+                subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError):
+                logger.warning("SSH: remote process cleanup could not be confirmed")
+        super()._kill_process(proc)
 
     def cleanup(self):
         if self._sync_manager:

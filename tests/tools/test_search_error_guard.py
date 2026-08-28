@@ -88,6 +88,14 @@ class TestSearchErrorGuard:
         assert "Search failed" in res.error
         assert not res.matches
 
+    def test_pattern_beginning_with_hyphen_is_data_not_an_option(self, method, match_tree):
+        (match_tree / "flags.txt").write_text("--state open\n")
+
+        res = _search(_ops(match_tree), method, "--state", match_tree)
+
+        assert res.error is None
+        assert any(match.content == "--state open" for match in res.matches)
+
 
     def test_count_mode_with_partial_error(self, method, partial_error_tree):
         res = _search(_ops(partial_error_tree), method, "needle",
