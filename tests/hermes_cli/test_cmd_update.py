@@ -1158,6 +1158,29 @@ class TestCmdUpdateExactCommitFlag:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_post_fetch_git_oserror_records_failed_pinned_preflight_receipt(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        """Git execution failures after fetch remain pinned-preflight failures."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        def failed_branch_probe(cmd, **kwargs):
+            if "rev-parse --abbrev-ref HEAD" in " ".join(str(part) for part in cmd):
+                raise OSError("git executable became unavailable after fetch")
+            return self._git_side_effect()(cmd, **kwargs)
+
+        mock_run.side_effect = failed_branch_probe
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "Could not execute git for pinned --commit validation" in capsys.readouterr().out
+        self._assert_failed_pinned_preflight_receipt("Could not execute git")
+        commands = self._commands(mock_run)
+        assert not any("merge --ff-only" in command for command in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_zip_eligible_git_failure_never_falls_back_when_pinned(
         self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
     ):

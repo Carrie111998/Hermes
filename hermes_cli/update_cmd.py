@@ -173,35 +173,40 @@ def _preflight_exact_commit_update(
             f"Could not fetch origin/{branch} for pinned --commit validation."
         )
 
-    current_branch_result = subprocess.run(
-        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if current_branch_result.returncode != 0:
-        raise ExactCommitTargetError("Could not determine the current checkout branch.")
-    current_branch = current_branch_result.stdout.strip()
-
-    update_target = _resolve_exact_commit_target(
-        git_cmd, project_root, branch, requested_commit
-    )
-    if current_branch != branch:
-        raise ExactCommitTargetError(
-            f"--commit requires the checkout to already be on '{branch}' "
-            f"(current: '{current_branch}'). No branch switch was performed."
+    try:
+        current_branch_result = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
+        if current_branch_result.returncode != 0:
+            raise ExactCommitTargetError("Could not determine the current checkout branch.")
+        current_branch = current_branch_result.stdout.strip()
 
-    forward_only = subprocess.run(
-        git_cmd + ["merge-base", "--is-ancestor", "HEAD", update_target],
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+        update_target = _resolve_exact_commit_target(
+            git_cmd, project_root, branch, requested_commit
+        )
+        if current_branch != branch:
+            raise ExactCommitTargetError(
+                f"--commit requires the checkout to already be on '{branch}' "
+                f"(current: '{current_branch}'). No branch switch was performed."
+            )
+
+        forward_only = subprocess.run(
+            git_cmd + ["merge-base", "--is-ancestor", "HEAD", update_target],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise ExactCommitTargetError(
+            f"Could not execute git for pinned --commit validation: {exc}"
+        ) from exc
     if forward_only.returncode != 0:
         raise ExactCommitTargetError(
             f"--commit {requested_commit} is not a fast-forward from HEAD. "
