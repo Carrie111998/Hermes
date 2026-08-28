@@ -4389,6 +4389,65 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def dispatch_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        binding: Optional[Any] = None,
+        require_binding: bool = False,
+    ) -> SendResult:
+        """Dispatch clarify without breaking pre-binding adapter overrides.
+
+        ``send_clarify`` is an established adapter hook. Third-party adapters
+        may still implement its pre-binding signature, so the compatibility
+        lane deliberately omits the new keyword. A surface that renders bound
+        callbacks (currently Telegram) opts into ``require_binding``; that lane
+        verifies both the immutable value and the handler capability before
+        invoking the adapter, and otherwise fails closed without posting an
+        unbound prompt.
+
+        Signature inspection happens before dispatch. We never catch and retry
+        ``TypeError`` from the adapter itself, because doing so would hide real
+        implementation bugs and could duplicate a prompt after a partial send.
+        """
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "question": question,
+            "choices": choices,
+            "clarify_id": clarify_id,
+            "session_key": session_key,
+            "metadata": metadata,
+        }
+        if require_binding:
+            from tools.clarify_gateway import ClarifyBinding
+
+            if not isinstance(binding, ClarifyBinding):
+                return SendResult(
+                    success=False,
+                    error="Missing immutable clarify binding",
+                )
+            try:
+                parameters = inspect.signature(self.send_clarify).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            accepts_binding = any(
+                parameter.name == "binding"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if not accepts_binding:
+                return SendResult(
+                    success=False,
+                    error="Adapter does not support immutable clarify binding",
+                )
+            kwargs["binding"] = binding
+        return await self.send_clarify(**kwargs)
+
     async def send_clarify(
         self,
         chat_id: str,

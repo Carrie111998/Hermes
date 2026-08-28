@@ -3583,6 +3583,13 @@ class SessionStore:
         repairs the persisted gateway key→session mapping. Returning ``None``
         means the route moved after the caller's snapshot (for example /new),
         so the caller must fail closed instead of overwriting the newer route.
+
+        The compare, boundary cleanup, route mutation, and routing snapshot all
+        execute under ``SessionStore._lock``. Cleanup may acquire
+        ``clarify_gateway._lock``; bound callbacks enter through
+        :meth:`run_if_session_current`, so the process-wide total order remains
+        ``SessionStore._lock -> clarify_gateway._lock`` and no callback can
+        consume the old binding after this method publishes the new route.
         """
         if not session_key or not expected_session_id or not target_session_id:
             return None

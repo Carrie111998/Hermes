@@ -96,13 +96,14 @@ class TestTelegramSendClarify:
         adapter._bot.send_message = AsyncMock(return_value=mock_msg)
 
         entry = _register_bound("cid1", choices=["alpha", "beta", "gamma"])
-        result = await adapter.send_clarify(
+        result = await adapter.dispatch_clarify(
             chat_id="12345",
             question="Which option?",
             choices=["alpha", "beta", "gamma"],
             clarify_id="cid1",
             session_key="sk1",
             binding=entry.binding,
+            require_binding=True,
         )
 
         assert result.success is True

@@ -9,7 +9,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
 
 
 def _make_source() -> SessionSource:
@@ -58,6 +58,110 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store._save = MagicMock()
     runner._session_db = None
     return runner
+
+
+@pytest.mark.asyncio
+async def test_compress_rotation_invalidates_clarify_before_topic_rebind(
+    tmp_path,
+):
+    """The real /compress path must publish rotation through SessionStore CAS."""
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    store = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(),
+        session_boundary_cleanup_fn=cm.clear_session,
+    )
+    store._db = None
+    session_entry = store.get_or_create_session(_make_source())
+    original_session_id = session_entry.session_id
+    target_session_id = "manual-compression-child"
+    store.load_transcript = MagicMock(return_value=history)
+    store.rewrite_transcript = MagicMock(return_value=True)
+    store.update_session = MagicMock()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.session_store = store
+    runner._session_db = None
+
+    pending = cm.register(
+        "manual-compress-pending",
+        session_entry.session_key,
+        "Pick",
+        ["A"],
+        origin=cm.ClarifyOrigin("u1", "c1"),
+        session_id=original_session_id,
+        active_session_transaction=lambda action: store.run_if_session_current(
+            session_entry.session_key,
+            original_session_id,
+            action,
+        ),
+    )
+    observations = []
+
+    def _topic_rebind(_source, advanced_entry, *, reason):
+        observations.append(
+            (
+                reason,
+                advanced_entry.session_id,
+                cm.resolve_bound_choice(
+                    pending.clarify_id,
+                    0,
+                    binding=pending.binding,
+                    observed_origin=pending.binding.origin,
+                ),
+            )
+        )
+
+    runner._sync_telegram_topic_binding = _topic_rebind
+
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.session_id = target_session_id
+    agent_instance._last_compaction_in_place = False
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    def _estimate(messages, **_kwargs):
+        return 100 if messages == history else 60
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            side_effect=_estimate,
+        ),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    assert store.peek_session_id(session_entry.session_key) == target_session_id
+    assert observations == [
+        ("compress-command", target_session_id, False)
+    ]
+    assert pending.event.is_set()
+    assert pending.response == ""
 
 
 @pytest.mark.asyncio

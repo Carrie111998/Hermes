@@ -48,7 +48,7 @@ def _ensure_slack_mock():
 _ensure_slack_mock()
 
 from plugins.platforms.slack.adapter import SlackAdapter
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 def _make_adapter():
@@ -272,3 +272,51 @@ class TestBaseAdapterClarifyFallbackUnchanged:
         assert "Pick a fruit" in text
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
+
+    @pytest.mark.asyncio
+    async def test_dispatch_does_not_swallow_adapter_typeerror(self):
+        """A handler bug is propagated once, never mistaken for signature drift."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        class _BuggyLegacyOverride(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(enabled=True, token="test"),
+                    Platform.SLACK,
+                )
+                self.calls = 0
+
+            async def connect(self, *, is_reconnect: bool = False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def send(self, chat_id, content, **kwargs):
+                raise AssertionError("not used")
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            async def send_clarify(
+                self,
+                chat_id,
+                question,
+                choices,
+                clarify_id,
+                session_key,
+                metadata=None,
+            ):
+                self.calls += 1
+                raise TypeError("adapter implementation bug")
+
+        adapter = _BuggyLegacyOverride()
+        with pytest.raises(TypeError, match="implementation bug"):
+            await adapter.dispatch_clarify(
+                chat_id="C1",
+                question="Pick",
+                choices=["A"],
+                clarify_id="cid",
+                session_key="sk",
+            )
+        assert adapter.calls == 1

@@ -7890,7 +7890,7 @@ class SlackAdapter(BasePlatformAdapter):
         # timeout / session reset.
         resolved_text: Optional[str] = None
         try:
-            entry = _clarify_mod._entries.get(clarify_id)  # type: ignore[attr-defined]
+            entry = _clarify_mod.get_entry(clarify_id)
             if entry and entry.choices and 0 <= idx < len(entry.choices):
                 resolved_text = str(entry.choices[idx])
         except Exception:

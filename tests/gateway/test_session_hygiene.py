@@ -215,6 +215,154 @@ class TestTokenEstimation:
 
 
 @pytest.mark.asyncio
+async def test_hygiene_rotation_invalidates_clarify_before_lease_rebind(
+    monkeypatch,
+    tmp_path,
+):
+    """The live hygiene path publishes its child through the locked CAS funnel."""
+    from tools import clarify_gateway as cm
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    target_session_id = "hygiene-compression-child"
+
+    class RotatingCompressAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, _messages, *_args, **_kwargs):
+            self.session_id = target_session_id
+            return (
+                [
+                    {"role": "user", "content": "retained"},
+                    {"role": "assistant", "content": "short summary"},
+                ],
+                None,
+            )
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RotatingCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+        user_id="12345",
+    )
+    event = MessageEvent(text="hello", source=source, message_id="1")
+    runner = gateway_run.GatewayRunner(
+        GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    token="fake-token",
+                )
+            }
+        )
+    )
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._session_db = None
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source_arg: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    session_entry = runner.session_store.get_or_create_session(source)
+    original_session_id = session_entry.session_id
+    runner.session_store.load_transcript = MagicMock(
+        return_value=_make_history(6, content_size=400)
+    )
+    runner.session_store.rewrite_transcript = MagicMock(return_value=True)
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    runner._sync_telegram_topic_binding = MagicMock()
+
+    pending = cm.register(
+        "hygiene-pending",
+        session_entry.session_key,
+        "Pick",
+        ["A"],
+        origin=cm.ClarifyOrigin("12345", "-1001", "17585"),
+        session_id=original_session_id,
+        active_session_transaction=lambda action: runner.session_store.run_if_session_current(
+            session_entry.session_key,
+            original_session_id,
+            action,
+        ),
+    )
+    observations = []
+
+    def _observe_rebind(_key, _generation, new_session_id):
+        observations.append(
+            (
+                new_session_id,
+                runner.session_store.peek_session_id(session_entry.session_key),
+                cm.resolve_bound_choice(
+                    pending.clarify_id,
+                    0,
+                    binding=pending.binding,
+                    observed_origin=pending.binding.origin,
+                ),
+            )
+        )
+
+    runner._rebind_turn_lease = _observe_rebind
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
+    )
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert observations == [
+        (target_session_id, target_session_id, False)
+    ]
+    assert runner.session_store.peek_session_id(session_entry.session_key) == (
+        target_session_id
+    )
+    assert pending.event.is_set()
+    assert pending.response == ""
+
+
+@pytest.mark.asyncio
 async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
     """Regression for #21301: the hygiene agent is built without a session_db,
     so _compress_context cannot rotate. When it neither rotates NOR compacts

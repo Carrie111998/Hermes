@@ -6208,7 +6208,7 @@ class TurnRunner:
                 )
 
             fut = safe_schedule_threadsafe(
-                ctx._status_adapter.send_clarify(
+                ctx._status_adapter.dispatch_clarify(
                     chat_id=ctx._status_chat_id,
                     question=question,
                     choices=list(choices) if choices else None,
@@ -6216,6 +6216,7 @@ class TurnRunner:
                     session_key=ctx.session_key or "",
                     metadata=ctx._status_thread_metadata,
                     binding=_clarify_entry.binding,
+                    require_binding=ctx.source.platform == Platform.TELEGRAM,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -20826,20 +20827,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
-                                            session_entry.session_id = _hyg_new_sid
-                                            # The held turn lease follows the
-                                            # rotation so an alias key resolving
-                                            # the fresh child still serializes
-                                            # against this turn (#64934).
-                                            self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
+                                            _hyg_prior_sid = session_entry.session_id
+                                            _hyg_advanced_entry = (
+                                                await self.async_session_store.advance_compression_session(
+                                                    session_entry.session_key,
+                                                    _hyg_prior_sid,
+                                                    _hyg_new_sid,
+                                                )
                                             )
-                                            await self.async_session_store._save()
-                                            await asyncio.to_thread(
-                                                self._sync_telegram_topic_binding,
-                                                source, session_entry,
-                                                reason="hygiene-compression",
-                                            )
+                                            if _hyg_advanced_entry is None:
+                                                logger.info(
+                                                    "Session hygiene: route %s moved "
+                                                    "away from %s before compression "
+                                                    "finished; leaving the newer route "
+                                                    "unchanged",
+                                                    session_entry.session_key,
+                                                    _hyg_prior_sid,
+                                                )
+                                                _hyg_rotated = False
+                                                _hyg_in_place = False
+                                            else:
+                                                session_entry = _hyg_advanced_entry
+                                                # The held turn lease follows the
+                                                # rotation so an alias key resolving
+                                                # the fresh child still serializes
+                                                # against this turn (#64934).
+                                                self._rebind_turn_lease(
+                                                    _quick_key,
+                                                    run_generation,
+                                                    _hyg_new_sid,
+                                                )
+                                                await asyncio.to_thread(
+                                                    self._sync_telegram_topic_binding,
+                                                    source, session_entry,
+                                                    reason="hygiene-compression",
+                                                )
 
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
@@ -21339,12 +21361,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _sanitize_gateway_final_response(source.platform, response)
 
             # Ordering contract: the agent thread already updated the contextvar
-            # in conversation_compression.py; propagate to SessionEntry + _save().
-            # If the agent's session_id changed during compression, update
-            # session_entry so transcript writes below go to the right session.
+            # in conversation_compression.py. CAS-advance the SessionStore route;
+            # its locked funnel persists the mapping and invalidates callbacks
+            # before transcript writes below target the rotated session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
-                if session_entry.session_id == _run_start_session_id:
-                    session_entry.session_id = agent_result["session_id"]
+                advanced_entry = (
+                    await self.async_session_store.advance_compression_session(
+                        session_key,
+                        _run_start_session_id,
+                        agent_result["session_id"],
+                    )
+                )
+                if advanced_entry is not None:
+                    session_entry = advanced_entry
                     # The held turn lease follows the rotation: the transcript
                     # persistence below writes to the NEW id, so the
                     # serialization boundary must move with it or an alias
@@ -21352,7 +21381,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._rebind_turn_lease(
                         _quick_key, run_generation, session_entry.session_id
                     )
-                    await self.async_session_store._save()
                     await self.async_session_store._record_gateway_session_peer(
                         session_entry.session_id,
                         session_key,

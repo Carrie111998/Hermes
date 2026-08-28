@@ -4561,6 +4561,7 @@ class GatewaySlashCommandsMixin:
                 # original messages and replace them with only the compressed
                 # summary (permanent data loss #44794, #39704).
                 if rotated:
+                    prior_session_id = session_entry.session_id
                     if not await self.async_session_store.rewrite_transcript(
                         new_session_id, compressed
                     ):
@@ -4568,8 +4569,18 @@ class GatewaySlashCommandsMixin:
                             f"failed to persist compressed transcript for "
                             f"session {new_session_id}"
                         )
-                    session_entry.session_id = new_session_id
-                    await self.async_session_store._save()
+                    advanced_entry = (
+                        await self.async_session_store.advance_compression_session(
+                            session_entry.session_key,
+                            prior_session_id,
+                            new_session_id,
+                        )
+                    )
+                    if advanced_entry is None:
+                        raise RuntimeError(
+                            "session route changed while compression was running"
+                        )
+                    session_entry = advanced_entry
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",

@@ -246,13 +246,18 @@ class TestClarifyLogPrivacy:
         }
         action = {"action_id": "hermes_clarify_choice_1", "value": "cid-priv|1"}
 
-        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
-            with patch.object(
+        with (
+            caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER),
+            patch.object(
                 adapter,
                 "_is_interactive_user_authorized",
                 return_value=True,
-            ):
-                await adapter._handle_clarify_action(AsyncMock(), body, action)
+            ),
+            patch.object(cm, "get_entry", wraps=cm.get_entry) as get_entry,
+        ):
+            await adapter._handle_clarify_action(AsyncMock(), body, action)
+
+        get_entry.assert_called_once_with("cid-priv")
 
         info_and_above = [
             r.getMessage() for r in caplog.records if r.levelno >= logging.INFO
