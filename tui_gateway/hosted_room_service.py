@@ -13,6 +13,10 @@ from typing import Any
 
 from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
+from gateway.hosted_room_attachments import (
+    AttachmentData,
+    HostedRoomAttachmentStore,
+)
 from gateway import hosted_rooms
 from tui_gateway.hosted_room_driver import HostedRoomBinding, HostedRoomRuntime
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
@@ -25,6 +29,7 @@ class HostedRoomService:
         self.server = server
         self.db_path = Path(db_path or hosted_rooms.default_db_path())
         self._policy_lock = threading.RLock()
+        self.attachments = HostedRoomAttachmentStore(self.db_path)
         self.rpc = HostedRoomServerRPC(server)
         self.runtime = HostedRoomRuntime(
             db_path=self.db_path,
@@ -33,6 +38,7 @@ class HostedRoomService:
             turn_lock=self._turn_lock,
             prepare_room=self.prepare_room,
             publish_terminal=self.publish_terminal,
+            attachment_loader=self._load_task_attachments,
         )
 
     @property
@@ -64,6 +70,7 @@ class HostedRoomService:
             yield
 
     def start(self) -> None:
+        self.attachments.prune()
         self.runtime.start()
 
     def stop(self, *, timeout: float = 5.0) -> bool:
@@ -98,6 +105,48 @@ class HostedRoomService:
                 self.db_path,
                 **event.append_kwargs(room_id),
             )
+
+    def _load_task_attachments(
+        self,
+        binding: HostedRoomBinding,
+        task: Mapping[str, Any],
+    ) -> Iterator[tuple[Mapping[str, Any], bytes]]:
+        """Resolve task manifests to verified bytes for one frozen room member."""
+
+        manifests = task.get("payload", {}).get("attachments") or []
+        if not manifests:
+            return
+        room = hosted_rooms.room_state(self.db_path, room_id=binding.room_id)
+        profile = str(task.get("payload", {}).get("target_profile") or "")
+        member = next(
+            (
+                candidate
+                for candidate in room["members"]
+                if str(candidate.get("profile") or "") == profile
+            ),
+            None,
+        )
+        if member is None:
+            raise RuntimeError("hosted attachment target is not in the frozen roster")
+        member_id = str(member.get("member_id") or "")
+        for manifest in manifests:
+            stored = self.attachments.read(
+                room_id=binding.room_id,
+                attachment_id=manifest.get("attachment_id"),
+                recipient_member_id=member_id,
+            )
+            safe = {
+                "attachment_id": stored.attachment["attachment_id"],
+                "kind": stored.attachment["kind"],
+                "name": stored.attachment["name"],
+                "size": stored.attachment["size"],
+                "mime": stored.attachment["mime"],
+            }
+            if safe != dict(manifest):
+                raise RuntimeError(
+                    "hosted attachment metadata changed after task admission"
+                )
+            yield safe, stored.data
 
     def _publish_terminal_tasks(
         self,
@@ -231,6 +280,45 @@ class HostedRoomService:
         self.runtime.wakeup()
         return room
 
+    def put_attachment(
+        self,
+        *,
+        room_id: str,
+        upload_id: str,
+        kind: str,
+        name: str,
+        mime: str,
+        data: bytes,
+    ) -> dict[str, Any]:
+        """Store one bounded upload for a live room without exposing its path."""
+
+        hosted_rooms.room_state(self.db_path, room_id=room_id)
+        return self.attachments.put(
+            room_id=room_id,
+            upload_id=upload_id,
+            kind=kind,
+            name=name,
+            mime=mime,
+            data=data,
+        )
+
+    def read_attachment(
+        self,
+        *,
+        room_id: str,
+        attachment_id: str,
+        recipient_member_id: str,
+        event_id: str | None = None,
+    ) -> AttachmentData:
+        """Return verified bytes only when send-time recipient ownership permits it."""
+
+        return self.attachments.read(
+            room_id=room_id,
+            attachment_id=attachment_id,
+            recipient_member_id=recipient_member_id,
+            event_id=event_id,
+        )
+
     def send(
         self,
         *,
@@ -239,7 +327,25 @@ class HostedRoomService:
         payload: Any,
         actor: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        normalized = discussion.validate_user_payload(payload)
+        room = hosted_rooms.room_state(self.db_path, room_id=room_id)
+        member_ids = tuple(
+            str(member.get("member_id") or member.get("profile") or "")
+            for member in room["members"]
+        )
+        if isinstance(payload, Mapping) and "thread_id" not in payload:
+            payload = {**payload, "thread_id": event_id}
+        normalized = discussion.validate_user_payload(
+            payload,
+            member_ids=member_ids,
+        )
+        if normalized.get("attachments"):
+            normalized["attachments"] = self.attachments.commit_message(
+                room_id=room_id,
+                event_id=event_id,
+                manifest=normalized["attachments"],
+                recipient_member_ids=(*member_ids, "viewer"),
+                hold_until_event=True,
+            )
         event = hosted_rooms.append_event(
             self.db_path,
             room_id=room_id,
@@ -248,6 +354,8 @@ class HostedRoomService:
             actor=actor or {"kind": "user", "id": "desktop"},
             payload=normalized,
         )
+        if normalized.get("attachments"):
+            self.attachments.retain_event(room_id=room_id, event_id=event_id)
         binding = next(
             (candidate for candidate in self.bindings() if candidate.room_id == room_id),
             None,

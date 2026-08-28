@@ -58,9 +58,13 @@ class FakeSessionRPC:
         *,
         auto_complete: bool = True,
         required_lock: RecordingTurnLocks | None = None,
+        fail_stage: bool = False,
+        fail_stage_at: int | None = None,
     ) -> None:
         self.auto_complete = auto_complete
         self.required_lock = required_lock
+        self.fail_stage = fail_stage
+        self.fail_stage_at = fail_stage_at
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self.states: dict[str, dict[str, Any]] = {}
@@ -69,6 +73,9 @@ class FakeSessionRPC:
         self.on_info = None
         self.history_failures = 0
         self._next_id = 1
+        self._stage_count = 0
+        self._pending_attachments: dict[str, list[str]] = {}
+        self._attachment_snapshots: dict[tuple[str, int], list[str]] = {}
         self._lock = threading.Lock()
 
     def _assert_lock(self, profile: str) -> None:
@@ -180,6 +187,9 @@ class FakeSessionRPC:
             "task": task,
             "execution_generation": execution_generation,
             "on_terminal": on_terminal,
+            "staged_attachment_ids": list(
+                self._pending_attachments.get(session_id, [])
+            ),
         }
         self.calls.append(("submit", params))
         with self._lock:
@@ -191,6 +201,102 @@ class FakeSessionRPC:
         if self.auto_complete:
             self.complete(task.task_id)
         return {"accepted": True}
+
+    def stage_attachment(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        attachment,
+        data: bytes,
+        execution_generation: int,
+    ):
+        self._assert_lock(profile)
+        params = {
+            "profile": profile,
+            "session_id": session_id,
+            "source": source,
+            "attachment": dict(attachment),
+            "data": data,
+            "execution_generation": execution_generation,
+        }
+        self.calls.append(("stage_attachment", params))
+        self._stage_count += 1
+        if self.fail_stage or self._stage_count == self.fail_stage_at:
+            raise RuntimeError("attachment staging failed")
+        self._pending_attachments.setdefault(session_id, []).append(
+            str(attachment.get("attachment_id") or "")
+        )
+        return {
+            "attached": True,
+            **(
+                {"ref_text": f"@file:attachments/{attachment['name']}"}
+                if attachment.get("kind") == "file"
+                else {}
+            ),
+        }
+
+    def begin_attachment_staging(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        execution_generation: int,
+    ) -> None:
+        self._assert_lock(profile)
+        params = {
+            "profile": profile,
+            "session_id": session_id,
+            "source": source,
+            "execution_generation": execution_generation,
+        }
+        self.calls.append(("begin_attachment_staging", params))
+        self._attachment_snapshots.setdefault(
+            (session_id, execution_generation),
+            list(self._pending_attachments.get(session_id, [])),
+        )
+
+    def commit_attachment_staging(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        execution_generation: int,
+    ) -> None:
+        self._assert_lock(profile)
+        params = {
+            "profile": profile,
+            "session_id": session_id,
+            "source": source,
+            "execution_generation": execution_generation,
+        }
+        self.calls.append(("commit_attachment_staging", params))
+        self._attachment_snapshots.pop((session_id, execution_generation), None)
+
+    def rollback_attachment_staging(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        execution_generation: int,
+    ) -> None:
+        self._assert_lock(profile)
+        params = {
+            "profile": profile,
+            "session_id": session_id,
+            "source": source,
+            "execution_generation": execution_generation,
+        }
+        self.calls.append(("rollback_attachment_staging", params))
+        snapshot = self._attachment_snapshots.pop(
+            (session_id, execution_generation), None
+        )
+        if snapshot is not None:
+            self._pending_attachments[session_id] = snapshot
 
     def history(self, *, profile: str, session_id: str, source: str):
         self._assert_lock(profile)
@@ -283,15 +389,19 @@ def _admit(
     identity: state.TaskIdentity,
     *,
     prompt: str = "Inspect the release candidate.",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> None:
+    payload = {
+        "target_profile": PROFILE,
+        "prompt": prompt,
+        "source_event_seq": 1,
+    }
+    if attachments:
+        payload["attachments"] = attachments
     state.admit_task(
         db,
         identity,
-        payload={
-            "target_profile": PROFILE,
-            "prompt": prompt,
-            "source_event_seq": 1,
-        },
+        payload=payload,
         clock=time.time,
     )
 
@@ -1014,3 +1124,176 @@ def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):
     assert time.monotonic() - started < 0.5
     assert state.get_task(db, identity)["status"] == "running"
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
+
+
+def test_attachments_stage_before_submit_and_file_ref_is_runtime_only(db: Path):
+    identity = _identity()
+    manifests = [
+        {
+            "attachment_id": "att_11111111111111111111111111111111",
+            "kind": "image",
+            "name": "diagram.png",
+            "size": 12,
+            "mime": "image/png",
+        },
+        {
+            "attachment_id": "att_22222222222222222222222222222222",
+            "kind": "file",
+            "name": "notes.txt",
+            "size": 5,
+            "mime": "text/plain",
+        },
+    ]
+    _admit(db, identity, attachments=manifests)
+    rpc = FakeSessionRPC()
+    runtime = _runtime(
+        db,
+        rpc,
+        attachment_loader=lambda _binding, _task: (
+            (manifests[0], b"image-bytes"),
+            (manifests[1], b"notes"),
+        ),
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert runtime.stop(timeout=1.0)
+
+    methods = [method for method, _params in rpc.calls]
+    assert methods.index("stage_attachment") < methods.index("submit")
+    assert methods.count("stage_attachment") == 2
+    submit = next(params for method, params in rpc.calls if method == "submit")
+    assert "@file:attachments/notes.txt" in submit["prompt"]
+    durable = state.get_task(db, identity)
+    assert "@file:" not in durable["payload"]["prompt"]
+    assert "image-bytes" not in repr(durable)
+
+
+def test_attachment_stage_failure_marks_turn_failed_without_text_only_submit(db: Path):
+    identity = _identity()
+    manifest = {
+        "attachment_id": "att_11111111111111111111111111111111",
+        "kind": "image",
+        "name": "diagram.png",
+        "size": 12,
+        "mime": "image/png",
+    }
+    _admit(db, identity, attachments=[manifest])
+    rpc = FakeSessionRPC(fail_stage=True)
+    runtime = _runtime(
+        db,
+        rpc,
+        attachment_loader=lambda _binding, _task: ((manifest, b"image-bytes"),),
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
+    assert runtime.stop(timeout=1.0)
+
+    assert any(method == "stage_attachment" for method, _params in rpc.calls)
+    assert not any(method == "submit" for method, _params in rpc.calls)
+    assert "attachment staging failed" in state.get_task(db, identity)["result"]["error"]
+
+
+def test_second_attachment_failure_rolls_back_before_later_text_only_turn(db: Path):
+    first = {
+        "attachment_id": "att_11111111111111111111111111111111",
+        "kind": "image",
+        "name": "diagram.png",
+        "size": 12,
+        "mime": "image/png",
+    }
+    second = {
+        "attachment_id": "att_22222222222222222222222222222222",
+        "kind": "pdf",
+        "name": "brief.pdf",
+        "size": 12,
+        "mime": "application/pdf",
+    }
+    failed_identity = _identity("task-with-files")
+    _admit(db, failed_identity, attachments=[first, second])
+    rpc = FakeSessionRPC(fail_stage_at=2)
+    runtime = _runtime(
+        db,
+        rpc,
+        attachment_loader=lambda _binding, _task: (
+            (first, b"image-bytes"),
+            (second, b"pdf-bytes"),
+        ),
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, failed_identity)["status"] == "failed")
+
+    session_id = next(iter(rpc.states))
+    assert rpc._pending_attachments[session_id] == []
+    assert any(method == "rollback_attachment_staging" for method, _ in rpc.calls)
+
+    text_identity = _identity("task-text-only")
+    _admit(db, text_identity, prompt="Continue without any attachment.")
+    runtime.wakeup()
+    _wait_for(lambda: state.get_task(db, text_identity)["status"] == "settled")
+    assert runtime.stop(timeout=1.0)
+
+    text_submit = next(
+        params
+        for method, params in rpc.calls
+        if method == "submit" and params["task"] == text_identity
+    )
+    assert text_submit["staged_attachment_ids"] == []
+
+
+def test_attachment_task_never_uses_peer_transport_binary_path(db: Path):
+    identity = _identity()
+    manifest = {
+        "attachment_id": "att_11111111111111111111111111111111",
+        "kind": "image",
+        "name": "diagram.png",
+        "size": 12,
+        "mime": "image/png",
+    }
+    _admit(db, identity, attachments=[manifest])
+    peer = FakeSessionRPC()
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING],
+        transport_resolver=lambda _binding, _task: peer,
+        turn_lock=RecordingTurnLocks(),
+        attachment_loader=lambda _binding, _task: ((manifest, b"image-bytes"),),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
+    assert runtime.stop(timeout=1.0)
+
+    assert not any(method == "stage_attachment" for method, _params in peer.calls)
+    assert not any(method == "submit" for method, _params in peer.calls)
+
+
+def test_task_can_stage_a_bounded_aggregate_from_multiple_messages(db: Path):
+    identity = _identity()
+    manifests = [
+        {
+            "attachment_id": f"att_{index:032x}",
+            "kind": "file",
+            "name": f"notes-{index}.txt",
+            "size": 1,
+            "mime": "text/plain",
+        }
+        for index in range(9)
+    ]
+    _admit(db, identity, attachments=manifests)
+    rpc = FakeSessionRPC()
+
+    def load_one_at_a_time(_binding, _task):
+        for manifest in manifests:
+            yield manifest, b"x"
+
+    runtime = _runtime(db, rpc, attachment_loader=load_one_at_a_time)
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert runtime.stop(timeout=1.0)
+
+    assert sum(method == "stage_attachment" for method, _params in rpc.calls) == 9
