@@ -839,7 +839,7 @@ def _chown_to_hermes_uid(path) -> None:
 
 
 def _secure_dir(path):
-    """Set directory to owner-only access (0700 by default). No-op on Windows.
+    """Set directory to owner-only access (0700 or a protected Windows DACL).
 
     Skipped in managed mode — the NixOS module sets group-readable
     permissions (0750) so interactive users in the hermes group can
@@ -857,6 +857,14 @@ def _secure_dir(path):
     subsequent uid-mapped workers).
     """
     if is_managed():
+        return
+    if os.name == "nt":
+        try:
+            from hermes_cli.windows_permissions import restrict_path_to_current_user
+
+            restrict_path_to_current_user(path)
+        except Exception:
+            logger.warning("Failed to restrict Windows ACL on directory %s", path)
         return
     try:
         mode_str = os.environ.get("HERMES_HOME_MODE", "").strip()
@@ -896,7 +904,7 @@ def _is_container() -> bool:
 
 
 def _secure_file(path):
-    """Set file to owner-only read/write (0600). No-op on Windows.
+    """Set file to owner-only read/write (0600 or a protected Windows DACL).
 
     Skipped in managed mode — the NixOS activation script sets
     group-readable permissions (0640) on config files.
@@ -905,6 +913,16 @@ def _secure_file(path):
     permissions.  Set HERMES_SKIP_CHMOD=1 to force-skip on other systems.
     """
     if is_managed() or _is_container():
+        return
+    if os.name == "nt":
+        if not os.path.exists(str(path)):
+            return
+        try:
+            from hermes_cli.windows_permissions import restrict_path_to_current_user
+
+            restrict_path_to_current_user(path)
+        except Exception:
+            logger.warning("Failed to restrict Windows ACL on file %s", path)
         return
     try:
         if os.path.exists(str(path)):
