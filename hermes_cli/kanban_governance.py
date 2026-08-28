@@ -127,6 +127,55 @@ def validate_block_transition(
     )
 
 
+def classify_blocker(
+    *,
+    reason: str,
+    task_title: str = "",
+    task_body: str = "",
+    attachments_checked: bool = False,
+    parents_checked: bool = False,
+    manuals_checked: bool = False,
+    sessions_checked: bool = False,
+    has_existing_artifact: bool = False,
+) -> str:
+    """Return one of BLOCKER_CLASSES from board-native evidence.
+
+    Check-order flags are accepted so callers can record the context ladder
+    they actually walked. They do not, by themselves, force a class.
+    """
+    del attachments_checked, parents_checked, manuals_checked, sessions_checked
+    text = f"{task_title}\n{task_body}\n{reason}".lower()
+    if "christopher" in text:
+        return "human_decision"
+    if has_existing_artifact or "parent" in text or "attachment" in text:
+        return "dependency_wait"
+    if "review" in text and "again" in text:
+        return "review_fix"
+    if "hook" in text or "dispatcher" in text or "routing" in text:
+        return "infra_default"
+    return "lane_work"
+
+
+def build_exception_packet(
+    task_id: str,
+    board: str,
+    blocker_class: str,
+    reason: str,
+    checks: list[str],
+    decision_prompt: str,
+) -> str:
+    """Decision-shaped exception packet. Not a research replay."""
+    checks_md = "\n".join(f"- {item}" for item in checks)
+    return (
+        f"# Kanban exception for {task_id}\n\n"
+        f"Board: {board}\n"
+        f"Blocker class: {blocker_class}\n"
+        f"Reason: {reason}\n\n"
+        f"Checks already performed:\n{checks_md}\n\n"
+        f"Decision needed: {decision_prompt}\n"
+    )
+
+
 @dataclass(frozen=True)
 class GovernanceReviewValidation:
     """Result of validating a review-entry transition against governance rules."""

@@ -6561,6 +6561,8 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    "blocker_class": blocker_class,
+                    "decision_class": decision_class,
                 },
                 run_id=run_id,
             )
@@ -6623,6 +6625,8 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    "blocker_class": blocker_class,
+                    "decision_class": decision_class,
                 },
                 run_id=run_id,
             )
@@ -6684,6 +6688,8 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
+                    "blocker_class": blocker_class,
+                    "decision_class": decision_class,
                 },
                 run_id=run_id,
             )
