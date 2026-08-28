@@ -202,7 +202,19 @@ class RepairController:
                     continue
                 mode = "report" if configured.report_only else "repair"
                 trigger_id = f"{mode}:{'+'.join(triggers)}"
-                target_base_sha = base_head if base_refresh_required else None
+                target_base_sha = (
+                    base_head
+                    if (
+                        base_head is not None
+                        and merge_policy is not None
+                        and pull.base_branch == merge_policy.base_branch
+                        and (
+                            base_refresh_required
+                            or "merge_conflict" in triggers
+                        )
+                    )
+                    else None
+                )
                 if target_base_sha is not None:
                     trigger_id = f"{trigger_id}:target-base:{target_base_sha}"
                 receipt = FeedbackReceipt(

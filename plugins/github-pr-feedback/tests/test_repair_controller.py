@@ -412,6 +412,35 @@ def test_repair_controller_routes_a_stale_pr_base_into_the_refresh_lane(
     ledger.close()
 
 
+def test_merge_conflict_targets_the_current_base_snapshot(tmp_path: Path) -> None:
+    configured = policy(tmp_path, merge_maintainer=True)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    kanban = Kanban()
+
+    class CurrentBaseConflictGitHub(BehindBaseGitHub):
+        def get_merge_state(self, repository: str, number: int):
+            return replace(
+                merge_state(mergeable=False, status="DIRTY"), base_branch="stable"
+            )
+
+    result = RepairController(
+        configured,
+        ledger,
+        CurrentBaseConflictGitHub(),
+        kanban,
+        LocalGit(),
+    ).scan()
+
+    assert result.created == 1
+    task = kanban.tasks[0]
+    assert "merge_conflict" in task.evidence["triggers"]
+    assert task.evidence["target_base_sha"] == "c" * 40
+    assert f"git cat-file -e {'c' * 40}^{{commit}}" in task.instructions
+    assert f"git merge --no-ff --no-edit {'c' * 40}" in task.instructions
+    assert "b" * 40 not in task.instructions
+    ledger.close()
+
+
 def test_conflict_free_base_refresh_uses_deterministic_path_and_dispatches_ci(
     tmp_path: Path,
 ) -> None:
