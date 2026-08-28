@@ -3079,6 +3079,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # recognize stubs after reasoning fields are stripped.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
+        # [hermes-local] The summary path hand-builds messages and calls
+        # chat.completions.create() directly, bypassing build_api_kwargs — so
+        # the Claude-OAuth system-prompt scrub never ran here, causing the
+        # max-iteration summary to 400 "out of extra usage" on the Claude Code
+        # subscription (2026-08-01 incident: 39 false 400s in one session).
+        # Apply it now. See _scrub_claude_oauth_triggers.
+        api_messages = _scrub_claude_oauth_triggers(agent, api_messages)
+
         # Strip all remaining underscore-prefixed scaffolding keys before the
         # wire. The summary path calls chat.completions.create() directly,
         # bypassing the transport's universal underscore-key sweeper.
