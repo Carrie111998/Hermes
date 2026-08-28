@@ -13,6 +13,9 @@ from agent.prompt_builder import (
     _truncate_content,
     _parse_skill_file,
     _skill_should_show,
+    _index_description,
+    _skill_tags,
+    _MAX_INDEX_TAGS,
     _find_hermes_md,
     _find_git_root,
     _strip_yaml_frontmatter,
@@ -1010,3 +1013,88 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 
 
+
+
+class TestIndexTriggerTags:
+    """`metadata.hermes.tags` reaching the index line.
+
+    The line is the only thing the model sees before deciding to load a skill,
+    and descriptions here are one short sentence (median 56 chars). Every
+    SKILL.md already carries the user's vocabulary in tags; before this it
+    never reached the prompt.
+    """
+
+    def test_appends_only_tags_the_description_does_not_already_say(self):
+        line = _index_description(
+            "Find My devices and people.",
+            ["find my", "AirTag", "devices", "location"],
+        )
+
+        assert "AirTag" in line and "location" in line
+        # "devices" and "find my" are already in the sentence — repeating them
+        # buys no recall and costs tokens on every session.
+        assert "devices]" not in line and "find my" not in line
+
+    def test_caps_the_tag_list(self):
+        line = _index_description("Do things.", [f"tag{n}" for n in range(10)])
+
+        assert line.count(",") == _MAX_INDEX_TAGS - 1
+        assert "tag3" not in line
+
+    def test_a_tag_that_adds_no_new_word_is_dropped_but_partial_overlap_is_kept(self):
+        """The unit is the WORD, not the tag string.
+
+        A tag survives when it introduces at least one term the line does not
+        already carry. Dropping it on any overlap would throw away real
+        vocabulary: "word press" still contributes "press".
+        """
+        line = _index_description("Blogging.", ["cms", "CMS", "word press"])
+
+        # "CMS" repeats "cms" exactly — nothing new, so it goes entirely.
+        assert "CMS" not in line
+        assert line.count("cms") == 1
+        # "word press" overlaps nothing yet and stays whole.
+        assert "word press" in line
+        # And overlap alone does not disqualify: "plugin" is still new.
+        assert "cms plugin" in _index_description("Blogging.", ["cms", "cms plugin"])
+
+    def test_untagged_and_malformed_frontmatter_leave_the_line_alone(self):
+        assert _index_description("Plain.", None) == "Plain."
+        assert _index_description("Plain.", []) == "Plain."
+        assert _index_description("Plain.", ["", "   "]) == "Plain."
+        # A single string instead of a list, and a non-list — neither may raise.
+        assert _skill_tags({"metadata": {"hermes": {"tags": "solo"}}}) == ["solo"]
+        assert _skill_tags({"metadata": {"hermes": {"tags": {"a": 1}}}}) == []
+        assert _skill_tags({"metadata": None}) == []
+        assert _skill_tags({}) == []
+
+    def test_tags_reach_the_rendered_index(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "tools" / "finder"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: finder\ndescription: Locate hardware.\n"
+            "metadata:\n  hermes:\n    tags: [AirTag, hardware, GPS]\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "AirTag" in result and "GPS" in result
+        assert "hardware," not in result  # already in the description
+
+    def test_a_demoted_category_stays_names_only(self, monkeypatch, tmp_path):
+        """Demotion exists to reclaim tokens; tags must not sneak back in."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "social-media" / "poster"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: poster\ndescription: Post things.\n"
+            "metadata:\n  hermes:\n    tags: [instagram, reels]\n---\n"
+        )
+
+        compact = build_skills_system_prompt(
+            compact_categories=frozenset({"social-media"})
+        )
+
+        assert "poster" in compact
+        assert "instagram" not in compact and "Post things" not in compact

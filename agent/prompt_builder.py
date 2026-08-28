@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import contextvars
@@ -1511,7 +1512,9 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# 3: index entries carry `tags`, so v2 snapshots (which have none) must be
+# discarded rather than silently rendering tagless lines forever.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1611,6 +1614,67 @@ def _write_skills_snapshot(
         logger.debug("Could not write skills prompt snapshot: %s", e)
 
 
+# How many novel tags one index line may carry. The index ships in the cached
+# system prefix, so the cost is a one-time cache write — but it is still real,
+# and tags past the third are consistently the generic ones ("automation",
+# "productivity") that match everything and therefore discriminate nothing.
+# Measured on a 112-skill install: cap 2 = +544 tok, cap 3 = +751, cap 6 =
+# +1073 against a 2,670-token index.
+_MAX_INDEX_TAGS = 3
+
+_TAG_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _skill_tags(frontmatter: dict) -> list:
+    """The skill's ``metadata.hermes.tags``, normalised to clean strings."""
+    try:
+        tags = ((frontmatter.get("metadata") or {}).get("hermes") or {}).get("tags")
+    except AttributeError:
+        return []
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple)):
+        return []
+    return [str(tag).strip() for tag in tags if str(tag).strip()]
+
+
+def _index_description(description: str, tags) -> str:
+    """One index line's text: the description plus the tags it does NOT say.
+
+    The index line is the only thing the model sees before deciding whether to
+    load a skill, so the line IS the trigger. Descriptions here are one short
+    sentence (measured: median 56 characters, none over 62), which leaves no
+    room for the user's own vocabulary — someone asks about "AirTag" or
+    "todo" and the line says "Find My devices" or "reminders".
+
+    Every SKILL.md already carries that vocabulary in ``metadata.hermes.tags``
+    and it has never reached the prompt. Tags whose words the description
+    already contains are dropped — repeating them buys nothing and costs
+    tokens on every session — so only genuinely new terms are appended.
+    """
+    if not tags:
+        return description
+
+    said = set(_TAG_WORD_RE.findall(description.lower()))
+    novel = []
+    for tag in tags:
+        words = set(_TAG_WORD_RE.findall(tag.lower()))
+        if words and not words <= said:
+            novel.append(tag)
+            # The unit is the WORD, not the tag string: a later tag survives
+            # only if it still introduces something new after this one's words
+            # are absorbed, so ["cms", "CMS"] yields one term while
+            # ["cms", "cms plugin"] yields two — the second carries "plugin".
+            said |= words
+        if len(novel) >= _MAX_INDEX_TAGS:
+            break
+
+    if not novel:
+        return description
+
+    return f"{description} [{', '.join(novel)}]" if description else f"[{', '.join(novel)}]"
+
+
 def _build_snapshot_entry(
     skill_file: Path,
     skills_dir: Path,
@@ -1647,6 +1711,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "tags": _skill_tags(frontmatter),
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1919,7 +1984,10 @@ def _build_skills_system_prompt_inner(
                         continue
                     project_names.add(fm_name)
                     skills_by_category.setdefault(entry["category"], []).append(
-                        (fm_name, f"[project] {entry['description']}".strip())
+                        (
+                            fm_name,
+                            f"[project] {_index_description(entry['description'], entry.get('tags'))}".strip(),
+                        )
                     )
                 except Exception as e:
                     logger.debug("Error reading project skill %s: %s", skill_file, e)
@@ -1949,7 +2017,7 @@ def _build_skills_system_prompt_inner(
         name_owners.setdefault(fm, set()).add(kind)
     for entry in visible_entries:
         fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
-        desc = entry.get("description", "")
+        desc = _index_description(entry.get("description", ""), entry.get("tags"))
         org_id = entry.get("org_id")
         collided = len(name_owners.get(fm, set())) > 1
         if org_id:
@@ -2018,7 +2086,7 @@ def _build_skills_system_prompt_inner(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, _index_description(entry["description"], entry.get("tags")))
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
