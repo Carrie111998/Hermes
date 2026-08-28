@@ -18,6 +18,8 @@ def _make_agent(**overrides):
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
+        _memory_enabled=True,
+        _user_profile_enabled=True,
         _memory_manager=None,
         model="",
         provider="",
@@ -91,6 +93,21 @@ def _init_code_repo(path):
 
     subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
     (path / "main.py").write_text("print('hi')\n")
+
+
+class TestGlobalPolicyPrompt:
+    def test_global_policy_block_is_injected(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        class Store:
+            def format_for_system_prompt(self, target):
+                if target == "global_policy":
+                    return "GLOBAL POLICY (shared across all Hermes profiles)\nShared rule"
+                return None
+
+        parts = _prompt_parts(_make_agent(_memory_store=Store()))
+        assert "GLOBAL POLICY (shared across all Hermes profiles)" in parts["volatile"]
+        assert "Shared rule" in parts["volatile"]
 
 
 class TestCodingContextBlock:
