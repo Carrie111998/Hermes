@@ -37,9 +37,14 @@ auth:
 # Network behaviour, stated exactly. "Makes no network calls" is the usual
 # phrasing and it is simply false here, so it is not used.
 #
-# NEVER transmitted: your source, file paths, queries, results, or any
-# identifier. No telemetry, no remote logging, no update check. Nothing about
-# the indexed repository leaves the machine at any point, in any tool above.
+# NEVER transmitted BY THIS SERVER: your source, file paths, queries, results,
+# or any identifier. No telemetry, no remote logging, no update check. None of
+# the tools above open a connection to send them anywhere.
+#
+# Scoped deliberately to the server. Hermes still sends whatever context it
+# selects on to its own model, exactly as with any MCP server, and no property
+# of this one changes that. Saying "nothing leaves the machine" would claim
+# credit for a boundary this server does not control.
 #
 # Transmitted ONCE, and only this: on the first embed with no cached model
 # (normally the first `neuralmind_build`), NeuralMind's own embedder --
