@@ -334,6 +334,16 @@ def _is_interactive() -> bool:
         return False
 
 
+def _prompt_toolkit_owns_stdin() -> bool:
+    """Return True while an active prompt_toolkit app owns terminal input."""
+    try:
+        from prompt_toolkit.application.current import get_app_or_none
+
+        return get_app_or_none() is not None
+    except Exception:
+        return False
+
+
 def _raise_if_non_interactive(lead: str) -> None:
     """Raise ``OAuthNonInteractiveError`` unless an interactive session exists.
 
@@ -1019,7 +1029,8 @@ def _make_callback_waiter(
         # result dict. The HTTP listener and this thread race for the result;
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
-        if _is_interactive():
+        interactive = _is_interactive()
+        if interactive and not _prompt_toolkit_owns_stdin():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
                 "portion) and press Enter. Type ``skip`` + Enter to continue "
@@ -1031,6 +1042,14 @@ def _make_callback_waiter(
                 target=_paste_callback_reader, args=(result,), daemon=True
             )
             paste_thread.start()
+        elif interactive:
+            print(
+                "\n  OAuth redirect paste is unavailable while the Hermes prompt "
+                "owns terminal input. Complete the browser redirect, or run "
+                "`hermes mcp login <server>` in a separate terminal.",
+                file=sys.stderr,
+                flush=True,
+            )
 
         poll_interval = 0.5
         elapsed = 0.0
