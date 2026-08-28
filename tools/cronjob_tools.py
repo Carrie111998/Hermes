@@ -1462,6 +1462,8 @@ def cronjob(
     job_id: Optional[str] = None,
     prompt: Optional[str] = None,
     schedule: Optional[str] = None,
+    fire_at: Optional[str] = None,
+    fireAt: Optional[str] = None,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
@@ -1491,8 +1493,15 @@ def cronjob(
     try:
         normalized = (action or "").strip().lower()
 
+        fire_at_input = (fire_at or fireAt or "").strip() or None
+        if fire_at and fireAt and fire_at.strip() != fireAt.strip():
+            return tool_error("For one-shot jobs, use either fire_at or fireAt — not both.", success=False)
+        if schedule and fire_at_input and schedule.strip() != fire_at_input:
+            return tool_error("For one-shot jobs, use either schedule or fireAt — not both.", success=False)
+
         if normalized == "create":
-            if not schedule:
+            schedule_input = (schedule or fire_at_input or "").strip() or None
+            if not schedule_input:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
@@ -1573,7 +1582,7 @@ def cronjob(
             try:
                 job = create_job_with_scheduler_registration(
                     prompt=prompt or "",
-                    schedule=schedule,
+                    schedule=schedule_input,
                     name=name,
                     repeat=repeat,
                     deliver=_resolve_cron_context_deliver(
@@ -1922,10 +1931,11 @@ def cronjob(
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
-            if schedule is not None:
-                parsed_schedule = parse_schedule(schedule)
+            schedule_input = (schedule or fire_at_input or "").strip() or None
+            if schedule_input is not None:
+                parsed_schedule = parse_schedule(schedule_input)
                 updates["schedule"] = parsed_schedule
-                updates["schedule_display"] = parsed_schedule.get("display", schedule)
+                updates["schedule_display"] = parsed_schedule.get("display", schedule_input)
                 if job.get("state") != "paused":
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
@@ -1958,7 +1968,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' or 'fireAt' field and 'prompt' are REQUIRED for one-shot jobs."
             },
             "job_id": {
                 "type": "string",
@@ -1970,7 +1980,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for create. '30m' (every 30 minutes), 'every 2h', cron syntax '0 9 * * *' (daily 9am), or an ISO timestamp for one-shot ('2026-06-01T09:00:00')."
+                "description": "REQUIRED for create unless fireAt is supplied. '30m' (every 30 minutes), 'every 2h', cron syntax '0 9 * * *' (daily 9am), or an ISO timestamp for one-shot ('2026-06-01T00:00')."
+            },
+            "fireAt": {
+                "type": "string",
+                "description": "Alias for schedule when creating or updating a one-shot job. Use an ISO-8601 timestamp. One-shot times more than the grace window in the past are rejected; near-miss timestamps within the grace window are allowed to catch the next tick."
             },
             "name": {
                 "type": "string",
@@ -2071,6 +2085,7 @@ def _cronjob_handler(args, **kw):
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
         schedule=args.get("schedule"),
+        fire_at=args.get("fireAt"),
         name=args.get("name"),
         repeat=args.get("repeat"),
         deliver=args.get("deliver"),
