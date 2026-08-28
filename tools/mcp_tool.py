@@ -3020,6 +3020,27 @@ class MCPServerTask:
                 return
             await asyncio.sleep(0.25)
 
+    def _keepalive_failure_should_reconnect(self) -> bool:
+        """Whether a keepalive failure warrants tearing down the session.
+
+        A keepalive failure means the MCP session went stale — but for a STDIO
+        transport, a ping timeout on a healthy subprocess (one that answers
+        tools but treats the optional ``ping`` as a no-op that never replies)
+        is "alive but unresponsive", not "process died". Respawn in that case
+        would loop forever against the same healthy process (#97245). So:
+        reconnect only when the transport is HTTP/remote (no stdio child to
+        probe) or when a tracked stdio child has actually exited. A live stdio
+        child means the server is still up — keep the session.
+        """
+        if self._is_http():
+            return True
+        if not getattr(self, "_stdio_child_pids", None):
+            # Unknown / no tracked child — default to the historical behavior
+            # (a keepalive failure still means reconnect).
+            return True
+        # A tracked child is present and alive → keep the session, don't loop.
+        return self._stdio_children_dead()
+
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
 
@@ -3105,16 +3126,24 @@ class MCPServerTask:
                         await _probe_under_lock()
                     except Exception as exc:
                         root = _unwrap_exception_group(exc)
+                        if self._keepalive_failure_should_reconnect():
+                            logger.warning(
+                                "MCP server '%s' keepalive failed, triggering "
+                                "reconnect (state: connected → degraded): %s: %s",
+                                self.name, type(root).__name__, root,
+                            )
+                            self.mark_suspect(
+                                f"keepalive failed: {type(root).__name__}: {root}"
+                            )
+                            self._reconnect_event.set()
+                            break
                         logger.warning(
-                            "MCP server '%s' keepalive failed, triggering "
-                            "reconnect (state: connected → degraded): %s: %s",
+                            "MCP server '%s' keepalive failed but its stdio "
+                            "subprocess is still alive — treating as a ping "
+                            "non-response, not a dead server; keeping the "
+                            "session instead of respawning (#97245): %s: %s",
                             self.name, type(root).__name__, root,
                         )
-                        self.mark_suspect(
-                            f"keepalive failed: {type(root).__name__}: {root}"
-                        )
-                        self._reconnect_event.set()
-                        break
                     # Keepalive succeeded — the session survived a full
                     # keepalive interval, which is real proof of health.
                     # Clear the rapid-drop budget (#62212).

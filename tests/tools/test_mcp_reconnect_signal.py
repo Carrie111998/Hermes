@@ -7,6 +7,7 @@ reconnect with fresh credentials. This file exercises the signal plumbing
 in isolation from the full stdio/http transport machinery.
 """
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -31,3 +32,36 @@ async def test_wait_for_lifecycle_event_shutdown_wins_when_both_set():
     task._reconnect_event.set()
     reason = await task._wait_for_lifecycle_event()
     assert reason == "shutdown"
+
+
+@pytest.mark.asyncio
+async def test_keepalive_failure_with_live_stdio_child_keeps_session(monkeypatch):
+    """A keepalive failure on a healthy stdio subprocess (ping non-response)
+    must NOT trigger a reconnect/respawn loop. Only when the stdio child has
+    actually exited should a keepalive failure tear the session down.
+    Regression for #97245."""
+    from tools.mcp_tool import MCPServerTask
+
+    def task_with(pids):
+        t = MCPServerTask("srv")
+        t._stdio_child_pids = set(pids)
+        t._is_http = lambda: False
+        return t
+
+    with patch("psutil.pid_exists") as pexists:
+        # Live child pid → _stdio_children_dead() False → keep session.
+        pexists.side_effect = [True]
+        assert task_with({111})._keepalive_failure_should_reconnect() is False
+
+        # Child exited → _stdio_children_dead() True → reconnect.
+        pexists.side_effect = [False]
+        assert task_with({111})._keepalive_failure_should_reconnect() is True
+
+    # HTTP/remote transport → always reconnect (no stdio child to probe).
+    http = MCPServerTask("srv")
+    http._stdio_child_pids = {111}
+    http._is_http = lambda: True
+    assert http._keepalive_failure_should_reconnect() is True
+
+    # No tracked child (unknown) → historical behavior, reconnect.
+    assert task_with(set())._keepalive_failure_should_reconnect() is True
