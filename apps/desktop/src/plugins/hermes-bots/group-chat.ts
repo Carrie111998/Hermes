@@ -1205,6 +1205,11 @@ export function setGroupChatSyncDisposed(disposed: boolean) {
 // values the old plugin.js shipped so neither rebase inherits a behavior
 // change on top of a rewrite; deciding the shape of the override belongs to
 // those PRs, not to a design-system pass.
+//
+// Model-aware cap: see group-chat-config.ts for getGroupChatConfig(),
+// isFreeModel(), getEffectiveRoundCap(). The effective cap is resolved in
+// group-rounds.ts runGroupChatRounds() and falls back to this constant for
+// paid models.
 export const GROUP_CHAT_MAX_ROUNDS = 3
 
 // #94478 review: continuation rounds are bounded independently of the message cap so a pathological mention chain can't consume the room's whole budget on handoffs.

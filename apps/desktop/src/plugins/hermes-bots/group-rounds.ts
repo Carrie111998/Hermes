@@ -21,6 +21,12 @@ import {
   updateGroupChat
 } from './group-chat'
 import type { GroupChatRoom, GroupHoldStamp } from './group-chat'
+import {
+  estimateTokens,
+  getEffectiveRoundCap,
+  getGroupChatConfig,
+  getCurrentModelName
+} from './group-chat-config'
 import { durableGroupChatMembers, groupMemberKey } from './group-membership'
 import { harvestStrandedGroupReply, isGroupPassText, runGroupChatMemberTurn } from './group-turns'
 import { requestForBot } from './routing'
@@ -502,8 +508,19 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
   // cap forced the exit — the activity feed must tell those apart.
   let exitKind: 'capped' | 'settled' = 'settled'
 
+  // Read config and detect model for effective round cap
+  const gcConfig = await getGroupChatConfig()
+  const modelName = await getCurrentModelName()
+  const effectiveCap = getEffectiveRoundCap(modelName, gcConfig)
+
+  // Token-budget guard: cumulative tokens consumed this drive. When the room log's
+  // cumulative token estimate exceeds gcConfig.token_budget, the drive exits as 'capped'
+  // independent of round count. This is the real safety net for pathological cascades.
+  let driveTokens = 0
+  const tokenBudget = Number(gcConfig.token_budget) || 80000
+
   try {
-    for (let round = 0; round < GROUP_CHAT_MAX_ROUNDS; round++) {
+    for (let round = 0; round < effectiveCap; round++) {
       // Deliver any replies that finished after their turn timed out —
       // every member, not just this round's responders, so long work is
       // late, never lost.
@@ -519,6 +536,18 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
         }
 
         await harvestStrandedGroupReply(group, member)
+      }
+
+      // Token-budget check at the top of each round: if the room log for this thread
+      // has consumed our budget, stop driving turns.
+      const roomLogAtRoundStart = (($groupChats.get()[group] || {}).log || []).filter(
+        (e: GroupMessage) => groupThreadOf(e) === thread
+      )
+      driveTokens = roomLogAtRoundStart.reduce((sum, e) => sum + estimateTokens(e.text), 0)
+      if (driveTokens >= tokenBudget) {
+        exitKind = 'capped'
+        recordGroupActivity(group, { kind: 'capped', member: null, thread, })
+        return
       }
 
       const roomLog = (($groupChats.get()[group] || {}).log || []).filter(
@@ -883,7 +912,7 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
       }
     }
 
-    // All GROUP_CHAT_MAX_ROUNDS rounds ran with someone still speaking —
+    // All rounds ran with someone still speaking —
     // the round cap ended the drive, not consensus. (#94478)
     exitKind = 'capped'
   } finally {
