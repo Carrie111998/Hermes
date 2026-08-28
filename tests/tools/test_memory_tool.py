@@ -119,6 +119,14 @@ class TestMemoryStoreAdd:
         assert result["success"] is True
         assert result["target"] == "user"
 
+    def test_soft_cap_capacity_warning_emitted(self, store):
+        # Fill store to >=85%
+        store.add("memory", "A" * 430)
+        res = store.add("memory", "B" * 10)
+        assert res["success"] is True
+        assert "capacity_warning" in res
+        assert "near capacity" in res["capacity_warning"]
+
 
     def test_overflow_returns_consolidation_context(self, store):
         store.add("memory", "x" * 490)

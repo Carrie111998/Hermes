@@ -749,6 +749,17 @@ class MemoryStore:
         }
         if message:
             resp["message"] = message
+        if pct >= 85:
+            warning_msg = (
+                f"Warning: {target} store is near capacity ({pct}% — {current:,}/{limit:,} chars). "
+                "Consider consolidating or removing older entries on next update."
+            )
+            resp["capacity_warning"] = warning_msg
+            if "message" in resp:
+                resp["message"] += f" ({warning_msg})"
+            else:
+                resp["message"] = warning_msg
+
         resp["note"] = "Write saved. This update is complete — do not repeat it."
         return resp
 
