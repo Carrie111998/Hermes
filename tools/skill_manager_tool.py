@@ -1607,33 +1607,40 @@ def _skill_manage_batch(
 
     # --- intra-batch conflict guard: sequential last-wins semantics make
     # these SILENTLY succeed while discarding earlier ops' work — always a
-    # confused plan, never intentional. Patch CHAINS on one file (each op
-    # building on the previous text) stay legal. ---
-    seen_writes = set()
-    touched_skill_md = set()
+    # confused plan, never intentional. Rule: a DESTRUCTIVE op (write_file,
+    # remove_file, full SKILL.md rewrite) on a file some earlier op in the
+    # batch already touched is rejected; ADDITIVE patches are always legal,
+    # so patch CHAINS (each op building on the previous text) and
+    # write-then-patch both stay allowed. Paths are normalized so spelling
+    # variants ('./references/x.md', 'references//x.md') can't slip past. ---
+    import posixpath
+
+    def _norm_target(op) -> str:
+        fp = (op.get("file_path") or "").strip()
+        if not fp:
+            return "SKILL.md"
+        return posixpath.normpath(fp.lstrip("/"))
+
+    touched_files = set()  # (skill, normalized path) touched by ANY earlier op
     for i, op in enumerate(operations):
         act = op["action"]
         nm = names[i]
-        if act in ("write_file", "remove_file"):
-            key = (nm, (op.get("file_path") or "").strip())
-            if key in seen_writes:
-                return tool_error(
-                    f"operations[{i}]: '{key[1]}' on skill '{nm}' already "
-                    "written/removed earlier in this batch — the later op "
-                    "would silently clobber it. One write per file per batch.",
-                    success=False,
-                )
-            seen_writes.add(key)
-        if act in ("create", "patch") and not op.get("file_path"):
-            if act == "patch" and op.get("content") and nm in touched_skill_md:
-                return tool_error(
-                    f"operations[{i}]: full SKILL.md rewrite (content) for "
-                    f"'{nm}' after an earlier op already modified its "
-                    "SKILL.md — the rewrite would silently discard that "
-                    "edit. Put the rewrite first, or fold the change in.",
-                    success=False,
-                )
-            touched_skill_md.add(nm)
+        # create and full-rewrite patch (content) always hit SKILL.md —
+        # _edit_skill ignores file_path on the rewrite shape.
+        full_rewrite = act == "patch" and bool(op.get("content"))
+        target = "SKILL.md" if (act == "create" or full_rewrite) else _norm_target(op)
+        key = (nm, target)
+        destructive = act in ("create", "write_file", "remove_file") or full_rewrite
+        if destructive and key in touched_files:
+            return tool_error(
+                f"operations[{i}]: {act} on '{target}' of skill '{nm}' — an "
+                "earlier op in this batch already touched that file, and this "
+                "op would silently discard its work. One destructive op "
+                "(write_file/remove_file/full rewrite) per file per batch; "
+                "put it first, or fold the change in. Patch chains are fine.",
+                success=False,
+            )
+        touched_files.add(key)
 
     # --- approval gate: stage the WHOLE batch as one pending write ---
     if not _skill_gate_bypass.get():

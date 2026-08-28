@@ -106,16 +106,38 @@ class TestSkillManageBatch(unittest.TestCase):
         a confused plan under last-wins sequencing — rejected BEFORE any
         side effect. Patch chains and rewrite-first stay legal."""
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
-        # double write, write+remove: rejected
+        # destructive op on an already-touched file: rejected — double
+        # write, write+remove, patch-then-write, patch-then-remove, and a
+        # path-spelling variant of the same file.
+        self._call("probe", [{"action": "write_file",
+                              "file_path": "references/c.md", "file_content": "seed"}])
         for ops in (
             [{"action": "write_file", "file_path": "references/a.md", "file_content": "1"},
              {"action": "write_file", "file_path": "references/a.md", "file_content": "2"}],
             [{"action": "write_file", "file_path": "references/b.md", "file_content": "x"},
              {"action": "remove_file", "file_path": "references/b.md"}],
+            [{"action": "patch", "file_path": "references/c.md",
+              "old_string": "seed", "new_string": "edited"},
+             {"action": "write_file", "file_path": "references/c.md", "file_content": "CLOB"}],
+            [{"action": "patch", "file_path": "references/c.md",
+              "old_string": "seed", "new_string": "edited"},
+             {"action": "remove_file", "file_path": "references/c.md"}],
+            [{"action": "write_file", "file_path": "references/d.md", "file_content": "1"},
+             {"action": "write_file", "file_path": "./references//d.md", "file_content": "2"}],
         ):
             r = self._call("probe", ops)
             self.assertFalse(r["success"], ops)
-            self.assertIn("clobber", r["error"])
+            self.assertIn("discard", r["error"])
+        # ...and rejected pre-effect: c.md still holds its seed text.
+        c_md = os.path.join(self.home, "skills", "probe", "references", "c.md")
+        self.assertEqual(open(c_md).read(), "seed")
+        # write-then-patch on one supporting file stays legal (additive).
+        r = self._call("probe", [
+            {"action": "write_file", "file_path": "references/e.md", "file_content": "base"},
+            {"action": "patch", "file_path": "references/e.md",
+             "old_string": "base", "new_string": "base+"},
+        ])
+        self.assertTrue(r["success"], r)
         # patch then full rewrite: rejected; rewrite-first: allowed
         r = self._call("probe", [
             {"action": "patch", "old_string": "Step 1.", "new_string": "P."},
