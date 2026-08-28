@@ -2819,6 +2819,10 @@ DEFAULT_CONFIG = {
         # keeps the handoff disabled rather than creating reviewerless review
         # cards that route back to the implementer and wait for a human verdict.
         "reviewer_profile": "",
+        # A worker that exits without a durable Kanban action normally retries
+        # its original assignee through the protocol-violation path.  Opt in
+        # only when plain worker prose is intentionally valuable review input.
+        "auto_review_on_stop": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
