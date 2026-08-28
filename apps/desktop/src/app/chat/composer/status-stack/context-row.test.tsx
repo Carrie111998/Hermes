@@ -122,3 +122,35 @@ describe('ContextStatusRow', () => {
     expect(screen.queryByText('Compact')).toBeNull()
   })
 })
+
+describe('ContextStatusRow compaction recovery', () => {
+  it('shows progress while the submit is in flight and releases when it settles', async () => {
+    let settle: () => void = () => undefined
+    const onCompact = vi.fn(() => new Promise<void>(resolve => (settle = resolve)))
+
+    render(<ContextStatusRow busy={false} gateway={gatewayFor(breakdown)} onCompact={onCompact} sessionId="s1" />)
+
+    fireEvent.click(await screen.findByText('Compact'))
+    expect(await screen.findByText('Compacting…')).not.toBeNull()
+
+    settle()
+
+    expect(await screen.findByText('Compact')).not.toBeNull()
+  })
+
+  it('recovers when the compaction request fails — a timed-out RPC must not wedge the pill', async () => {
+    // The gateway's `status: compacting` event clears on the NEXT stream event.
+    // If the socket drops, or the RPC times out while the server keeps going,
+    // that event may never arrive; the pill has to let go on its own.
+    const onCompact = vi.fn().mockRejectedValue(new Error('request timed out after 120s'))
+
+    render(<ContextStatusRow busy={false} gateway={gatewayFor(breakdown)} onCompact={onCompact} sessionId="s1" />)
+
+    fireEvent.click(await screen.findByText('Compact'))
+
+    const pill = await screen.findByText('Compact')
+
+    expect(pill).not.toBeNull()
+    expect(screen.queryByText('Compacting…')).toBeNull()
+  })
+})

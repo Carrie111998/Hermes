@@ -38,8 +38,9 @@ interface ContextStatusRowProps {
   busy: boolean
   gateway?: HermesGateway | null
   /** Runs `/compress` through the composer's own submit path, so it queues,
-   *  clears, and reports exactly like typing it. */
-  onCompact?: () => void
+   *  clears, and reports exactly like typing it. Awaited, so the pill can
+   *  release itself on whatever the submit settles as. */
+  onCompact?: () => Promise<unknown> | void
   sessionId: null | string
 }
 
@@ -66,7 +67,33 @@ export const ContextStatusRow = memo(function ContextStatusRow({
   const { t } = useI18n()
   const copy = t.statusStack.context
   const [open, setOpen] = useState(false)
-  const compacting = useStore(useMemo(() => sessionCompacting(sessionId), [sessionId]))
+  const [submitting, setSubmitting] = useState(false)
+
+  // Two sources, deliberately. The store flag is the real one — the gateway's
+  // `status: compacting` event sets it and the next stream event clears it —
+  // but it depends on an event arriving, and a socket drop mid-compaction
+  // would leave this pill disabled with no way back. The local flag is owned
+  // by the click and released in `finally`, so the pill always recovers.
+  const streamCompacting = useStore(useMemo(() => sessionCompacting(sessionId), [sessionId]))
+  const compacting = streamCompacting || submitting
+
+  const runCompact = useCallback(async () => {
+    if (!onCompact) {
+      return
+    }
+
+    setSubmitting(true)
+
+    try {
+      await onCompact()
+    } catch {
+      // Swallowed on purpose: the slash path already renders the failure into
+      // the transcript. Rethrowing here would only surface as an unhandled
+      // rejection in the renderer.
+    } finally {
+      setSubmitting(false)
+    }
+  }, [onCompact])
 
   const requestGateway = useCallback(
     <T,>(method: string, params?: Record<string, unknown>): Promise<T> =>
@@ -130,7 +157,7 @@ export const ContextStatusRow = memo(function ContextStatusRow({
             className={cn(composerFloatingPill, 'disabled:cursor-default disabled:opacity-45')}
             data-slot="context-compact-pill"
             disabled={busy || compacting}
-            onClick={onCompact}
+            onClick={() => void runCompact()}
             type="button"
           >
             {compacting ? (
