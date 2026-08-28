@@ -19,9 +19,9 @@ test('hosted rooms never advertise a file drop target they will reject', () => {
 })
 
 test('same-gateway hosted rooms keep file staging while distributed rooms fail early', () => {
-  assert.match(pluginSource, /async function stageSameGatewayHostedAttachments/)
+  assert.match(pluginSource, /async function stageHostedAttachments/)
   assert.match(pluginSource, /room\?\.continuityMode === 'distributed'/)
-  assert.match(pluginSource, /await stageSameGatewayHostedAttachments\(group, members, sent\.id, attachments\)/)
+  assert.match(pluginSource, /await stageHostedAttachments\(\{ connectionId \}, room\.roomId, sent\.id, attachments\)/)
   assert.match(pluginSource, /Files are not available across gateways yet\. The draft was kept\./)
 })
 

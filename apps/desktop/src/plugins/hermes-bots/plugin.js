@@ -573,6 +573,10 @@ const HOSTED_ROOM_UNSUPPORTED_REPROBE_MS = 30000
 const $hostedRoomCapabilities = atom({})
 const $hostedRoomOutbox = atom({ version: 1, commands: [] })
 const $hostedRoomCleanup = atom({ version: 1, operations: [] })
+const groupTransientAttachments = new Map()
+const groupAttachmentDataCache = new Map()
+let groupAttachmentDataCacheChars = 0
+const GROUP_ATTACHMENT_CACHE_CHARS = 50_000_000
 let hostedRoomSyncTimer = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = false
@@ -747,7 +751,26 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
       },
       text: String(entry?.text || '').slice(0, GROUP_CHAT_SYNC_TEXT_CHARS),
       at: Number(entry?.at || 0),
-      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {})
+      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {}),
+      ...(Array.isArray(entry?.images)
+        ? {
+            images: entry.images
+              .filter(attachment =>
+                /^att_[0-9a-f]{32}$/.test(String(attachment?.attachment_id || ''))
+              )
+              .slice(0, 8)
+              .map(attachment => ({
+                attachment_id: String(attachment.attachment_id),
+                kind: ['image', 'pdf', 'file'].includes(attachment.kind) ? attachment.kind : 'file',
+                name: String(attachment.name || 'attachment').slice(0, 255),
+                size: Math.max(0, Number(attachment.size || 0)),
+                mime: String(attachment.mime || 'application/octet-stream').slice(0, 127),
+                ...(attachment.connectionId
+                  ? { connectionId: String(attachment.connectionId).slice(0, 128) }
+                  : {})
+              }))
+          }
+        : {})
     }))
     const compact = {
       name: String(name).slice(0, 64),
@@ -1920,6 +1943,17 @@ async function refreshHostedRooms() {
         })
         if (hostedRoomSyncDisposed) return
         const replayState = replay.state
+        const replayMessages = (replayState.messages || []).map(message => ({
+          ...message,
+          ...(Array.isArray(message.images) && message.images.length
+            ? {
+                images: message.images.map(attachment => ({
+                  ...attachment,
+                  connectionId
+                }))
+              }
+            : {})
+        }))
         const driverStatus = serverState?.driver_status || {}
         const friendly = client.deriveFriendlyHostedRoomStatus(replayState)
         const hostedStatus = hostedRoomDriverDisplayStatus(
@@ -1943,7 +1977,7 @@ async function refreshHostedRooms() {
               [...sources.values()],
               capabilities
             ),
-            log: mergeGroupChatSyncEntries(room.log || [], replayState.messages || []).map(
+            log: mergeGroupChatSyncEntries(room.log || [], replayMessages).map(
               entry => (groupChatSyncSequence(entry) !== null ? { ...entry, pending: false } : entry)
             ),
             hostedConnectionId: connectionId,
@@ -2153,65 +2187,182 @@ async function enqueueHostedRoomCommand(command) {
   )
 }
 
-function hostedAttachmentRef(eventId, index, memberId) {
-  const seed = `${eventId}-${index}-${memberId}`
-    .replace(/[^A-Za-z0-9._:-]/g, '-')
-    .slice(0, 220)
-  return `staged:${seed || `attachment-${index}`}`
-}
-
-function hostedAttachmentMime(attachment) {
-  if (attachment?.mime) return String(attachment.mime)
+function attachmentMime(attachment) {
   const match = /^data:([^;,]+)/i.exec(String(attachment?.data || ''))
-  return match?.[1] || (
-    attachment?.kind === 'pdf'
-      ? 'application/pdf'
-      : attachment?.kind === 'image'
-        ? 'image/png'
-        : 'application/octet-stream'
-  )
+  return match?.[1] || String(attachment?.mime || '') || (attachment?.kind === 'pdf' ? 'application/pdf' : attachment?.kind === 'image' ? 'image/png' : 'application/octet-stream')
 }
 
-async function stageSameGatewayHostedAttachments(group, members, eventId, attachments) {
-  const picked = (Array.isArray(attachments) ? attachments : []).slice(0, 8)
-  if (!picked.length) return []
-  const manifests = picked.map(attachment => ({
-    kind: attachment.kind,
-    name: attachment.name || 'attachment',
-    size: Math.max(0, Number(attachment.size || 0)),
-    mime: hostedAttachmentMime(attachment),
-    refs: {}
-  }))
+function cacheGroupAttachmentData(key, dataUrl) {
+  const data = String(dataUrl || '')
+  if (!key || !data || data.length > GROUP_ATTACHMENT_CACHE_CHARS) return
+  const prior = groupAttachmentDataCache.get(key)
+  if (prior) groupAttachmentDataCacheChars -= prior.length
+  groupAttachmentDataCache.delete(key)
+  groupAttachmentDataCache.set(key, data)
+  groupAttachmentDataCacheChars += data.length
+  while (groupAttachmentDataCacheChars > GROUP_ATTACHMENT_CACHE_CHARS && groupAttachmentDataCache.size > 1) {
+    const oldest = groupAttachmentDataCache.keys().next().value
+    const removed = groupAttachmentDataCache.get(oldest) || ''
+    groupAttachmentDataCache.delete(oldest)
+    groupAttachmentDataCacheChars -= removed.length
+  }
+}
 
-  for (const member of members) {
-    const { runtime } = await ensureGroupChatSession(group, member)
-    if (!runtime) {
-      throw new Error(`${displayName(member, botRosterMeta(member, $botMeta.get()))} is unavailable.`)
+async function loadGroupAttachmentData(room, entry, attachment) {
+  if (attachment?.data) return String(attachment.data)
+  const attachmentId = String(attachment?.attachment_id || '')
+  const connectionId = String(attachment?.connectionId || room?.hostedConnectionId || '')
+  const roomId = String(room?.roomId || '')
+  const eventId = String(entry?.id || entry?.eventId || '')
+  if (!/^att_[0-9a-f]{32}$/.test(attachmentId) || !roomId || !eventId) {
+    throw new Error('This attachment is not available from its source.')
+  }
+  const cacheKey = `${connectionId}:${roomId}:${eventId}:${attachmentId}`
+  const cached = groupAttachmentDataCache.get(cacheKey)
+  if (cached) return cached
+  const result = await groupChatSyncRequest(
+    { connectionId },
+    'groups.attachment.read',
+    {
+      purpose: 'viewer',
+      room_id: roomId,
+      event_id: eventId,
+      attachment_id: attachmentId
     }
-    const memberId = member.memberId || (member.name === 'default' ? 'default' : member.name)
-    for (let index = 0; index < picked.length; index++) {
-      const attachment = picked[index]
-      if (attachment.kind === 'pdf') {
-        await requestForBot(member, 'pdf.attach', {
-          session_id: runtime,
-          content_base64: attachment.data,
-          filename: attachment.name || 'attachment.pdf'
-        })
-      } else if (attachment.kind === 'file') {
-        await requestForBot(member, 'file.attach', {
-          session_id: runtime,
-          data_url: attachment.data,
-          name: attachment.name || 'attachment'
-        })
-      } else {
-        await requestForBot(member, 'image.attach_bytes', {
-          session_id: runtime,
-          content_base64: attachment.data,
-          filename: attachment.name || 'attachment.png'
-        })
+  )
+  const stored = result?.attachment
+  if (
+    stored?.attachment_id !== attachmentId ||
+    stored?.kind !== attachment.kind ||
+    stored?.name !== attachment.name ||
+    stored?.size !== attachment.size ||
+    stored?.mime !== attachment.mime ||
+    typeof result?.content_base64 !== 'string'
+  ) {
+    throw new Error('This attachment failed its integrity check.')
+  }
+  const dataUrl = `data:${attachment.mime};base64,${result.content_base64}`
+  cacheGroupAttachmentData(cacheKey, dataUrl)
+  return dataUrl
+}
+
+function downloadGroupAttachment(dataUrl, name) {
+  if (typeof document === 'undefined') return false
+  const link = document.createElement('a')
+  link.href = dataUrl
+  link.download = String(name || 'attachment')
+  link.style.display = 'none'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  return true
+}
+
+function GroupAttachmentDisplay({ room, entry, attachment, entryKey, index }) {
+  const [busy, setBusy] = useState(false)
+  const [data, setData] = useState(() => String(attachment?.data || ''))
+  const isImage = attachment?.kind === 'image'
+  const label = String(attachment?.name || (isImage ? 'attached image' : 'attached file'))
+  const canLoad = Boolean(attachment?.attachment_id && (attachment?.connectionId || room?.hostedConnectionId))
+
+  const open = async () => {
+    if (busy || (!data && !canLoad)) return
+    setBusy(true)
+    try {
+      const loaded = data || await loadGroupAttachmentData(room, entry, attachment)
+      if (isImage && !data) {
+        setData(loaded)
+      } else if (!downloadGroupAttachment(loaded, label)) {
+        throw new Error('Download is unavailable in this build.')
       }
-      manifests[index].refs[memberId] = hostedAttachmentRef(eventId, index, memberId)
+    } catch (error) {
+      host.notify?.({
+        kind: 'error',
+        message: String(error?.message || 'This attachment could not be opened.')
+      })
+    } finally {
+      setBusy(false)
     }
+  }
+
+  if (isImage && data) {
+    return jsx('button', {
+      type: 'button',
+      className: 'cursor-pointer rounded-md border border-(--ui-stroke-secondary) p-0',
+      title: `Download ${label}`,
+      'aria-label': `Download ${label}`,
+      onClick: () => void open(),
+      children: jsx('img', {
+        src: data,
+        alt: label,
+        className: 'max-h-40 max-w-60 rounded-md object-contain'
+      })
+    }, `${entryKey}:img:${index}`)
+  }
+
+  return jsxs('button', {
+    type: 'button',
+    className:
+      'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)',
+    title: canLoad || data ? `${isImage ? 'Load preview for' : 'Download'} ${label}` : label,
+    'aria-label': canLoad || data ? `${isImage ? 'Load preview for' : 'Download'} ${label}` : label,
+    'aria-busy': busy || undefined,
+    disabled: busy || (!data && !canLoad),
+    onClick: () => void open(),
+    children: [
+      jsx(Codicon, {
+        name: attachment?.kind === 'pdf' ? 'file-pdf' : isImage ? 'file-media' : 'file',
+        className: 'text-[0.8rem]'
+      }),
+      jsx('span', { className: 'max-w-48 truncate', children: label }),
+      canLoad || data
+        ? jsx('span', {
+            className: 'text-(--ui-text-quaternary)',
+            children: busy ? 'Loading…' : isImage ? 'Preview' : 'Download'
+          })
+        : null
+    ]
+  }, `${entryKey}:img:${index}`)
+}
+
+function attachmentBase64(attachment) {
+  const value = String(attachment?.data || '')
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/i.exec(value)
+  if (!match) throw new Error(`${attachment?.name || 'Attachment'} could not be encoded for upload.`)
+  return { mime: match[1].toLowerCase(), contentBase64: match[2] }
+}
+
+async function stageHostedAttachments(route, roomId, eventId, attachments) {
+  const picked = Array.isArray(attachments) ? attachments : []
+  if (picked.length > 8) throw new Error('A Group Chat message supports at most 8 attachments.')
+  if (!picked.length) return []
+
+  let total = 0
+  const manifests = []
+  for (let index = 0; index < picked.length; index++) {
+    const attachment = picked[index]
+    const encoded = attachmentBase64(attachment)
+    const mime = attachmentMime(attachment).toLowerCase()
+    if (encoded.mime !== mime) throw new Error(`${attachment.name || 'Attachment'} has conflicting MIME metadata.`)
+    total += Math.max(0, Number(attachment.size || 0))
+    if (total > 25_000_000) throw new Error('Attachments exceed the 25MB message limit.')
+    const result = await requestHostedConnection(route, 'groups.attachment.put', {
+      room_id: roomId,
+      upload_id: `${eventId}:upload:${index}`,
+      kind: attachment.kind,
+      name: attachment.name || 'attachment',
+      mime,
+      content_base64: encoded.contentBase64
+    })
+    const stored = result?.attachment
+    if (!stored?.attachment_id) throw new Error(`${attachment.name || 'Attachment'} was not accepted by the room gateway.`)
+    manifests.push({
+      attachment_id: stored.attachment_id,
+      kind: stored.kind,
+      name: stored.name,
+      size: stored.size,
+      mime: stored.mime
+    })
   }
   return manifests
 }
@@ -2224,7 +2375,7 @@ async function sendHostedGroupChat(group, members, sent, thread, attachments) {
   }
   const manifests = room?.continuityMode === 'distributed'
     ? []
-    : await stageSameGatewayHostedAttachments(group, members, sent.id, attachments)
+    : await stageHostedAttachments({ connectionId }, room.roomId, sent.id, attachments)
   return enqueueHostedRoomCommand({
     commandId: sent.id,
     kind: 'send',
@@ -7685,6 +7836,21 @@ function groupChatMemberBots(group, roster, metaByName) {
   return [...local, ...remote]
 }
 
+function groupChatBotsFromDescriptors(descriptors, roster) {
+  const members = []
+  const seen = new Set()
+  for (const descriptor of Array.isArray(descriptors) ? descriptors : []) {
+    const resolved = resolveLegacyMemberDescriptor(descriptor, roster)
+    const key = botRosterKey(resolved)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    members.push(
+      (roster || []).find(bot => !bot?.ghost && botRosterKey(bot) === key) || resolved
+    )
+  }
+  return members
+}
+
 /** A stored member descriptor, resolved against the live roster when its
  *  `name` is not a real slug (#92794). Exact key matches pass through
  *  untouched; only a descriptor whose key matches NO roster row is re-tried
@@ -9425,7 +9591,10 @@ async function runGroupChatRounds(group, members, thread) {
         // carry images today, but flatMap keeps this future-proof) get staged
         // into the member's session so the model sees the pixels, not just
         // the transcript's [attached image: …] marker.
-        const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
+        const deltaImages = delta.flatMap(e => {
+          const transient = e?.id ? groupTransientAttachments.get(String(e.id)) : null
+          return Array.isArray(transient) ? transient : Array.isArray(e.images) ? e.images : []
+        })
 
         // Surface WHO is on turn (runtime-only, like running/epoch) so the
         // room shows "Radar is thinking…" instead of a generic working line —
@@ -14779,28 +14948,30 @@ function updateGroupComposerDraft(key, mutate) {
   return next
 }
 
-function restoreGroupComposerDraft(key, expectedRevision, snapshot) {
-  const current = groupComposerDraftSnapshot(key)
-
-  if (current.revision !== expectedRevision) {
-    return null
-  }
-
-  const restored = {
-    ...snapshot,
-    pendingAttachments: Object.fromEntries(
-      Object.entries(snapshot.pendingAttachments || {}).map(([thread, attachments]) => [
-        thread,
-        [...(attachments || [])]
-      ])
-    ),
-    replies: { ...(snapshot.replies || {}) },
-    revision: current.revision + 1
-  }
-
-  groupComposerDrafts.set(key, restored)
-
-  return restored
+function completeGroupComposerSend(key, before, attachments, thread = null) {
+  const submitted = new Set(Array.isArray(attachments) ? attachments : [])
+  return updateGroupComposerDraft(key, current => {
+    const pending = { ...(current.pendingAttachments || {}) }
+    const slot = thread || 'main'
+    pending[slot] = (pending[slot] || []).filter(item => !submitted.has(item))
+    if (thread) {
+      return {
+        ...current,
+        pendingAttachments: pending,
+        replies: {
+          ...(current.replies || {}),
+          [thread]: current.replies?.[thread] === before.replies?.[thread]
+            ? ''
+            : current.replies?.[thread] || ''
+        }
+      }
+    }
+    return {
+      ...current,
+      main: current.main === before.main ? '' : current.main,
+      pendingAttachments: pending
+    }
+  })
 }
 
 function clearGroupComposerDraft(key) {
@@ -14873,6 +15044,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const [confirmDisband, setConfirmDisband] = useState(false)
   const [confirmRetry, setConfirmRetry] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [sendingComposer, setSendingComposer] = useState(null)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -15247,58 +15419,66 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     const text = draft.trim()
     const images = imagesFor(null)
 
-    if (!text && !images.length) {
+    if ((!text && !images.length) || sendingComposer !== null) {
       return
     }
 
     const before = groupComposerDraftSnapshot(composerKeyRef.current)
-    const cleared = updateComposerDraft(current => ({
-      ...current,
-      main: '',
-      pendingAttachments: { ...(current.pendingAttachments || {}), main: [] }
-    }))
-    // Main composer = START A NEW THREAD with the whole group (Slack shape).
-    // Full descriptors ride into the turn loop: remote members keep their
-    // connection fields so their turns route to their own machines.
-    const minted = sendToGroupChat(group, memberDescriptors(), text, null, images)
-
-    if (minted) {
-      setOpenThreads(prev => ({ ...prev, [minted]: true }))
-    } else {
-      const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
-
-      if (restored) {
-        setComposerDraft(restored)
+    setSendingComposer('main')
+    void (async () => {
+      try {
+        // Main composer = START A NEW THREAD with the whole group (Slack shape).
+        // Hosted uploads and the outbox must both be durable before the draft
+        // clears; local rooms still resolve immediately through the same path.
+        const minted = await Promise.resolve(
+          sendToGroupChat(group, memberDescriptors(), text, null, images)
+        )
+        if (minted) {
+          setComposerDraft(
+            completeGroupComposerSend(composerKeyRef.current, before, images)
+          )
+          setOpenThreads(prev => ({ ...prev, [minted]: true }))
+        }
+      } catch (error) {
+        host.notify?.({
+          kind: 'error',
+          message: String(error?.message || 'The Group Chat could not accept this message.')
+        })
+      } finally {
+        setSendingComposer(null)
       }
-    }
+    })()
   }
 
-  const submitReply = thread => {
+  const submitReply = async thread => {
     const text = (replyDrafts[thread] || '').trim()
     const images = imagesFor(thread)
 
-    if (!text && !images.length) {
+    if ((!text && !images.length) || sendingComposer !== null) {
       return
     }
 
     const before = groupComposerDraftSnapshot(composerKeyRef.current)
-    const cleared = updateComposerDraft(current => ({
-      ...current,
-      pendingAttachments: { ...(current.pendingAttachments || {}), [thread]: [] },
-      replies: { ...(current.replies || {}), [thread]: '' }
-    }))
-    // Reply box = CONTINUE this thread; the member turns it triggers are
-    // scoped to it.
-    const sent = sendToGroupChat(group, memberDescriptors(), text, thread, images)
-
-    if (sent) {
-      setOpenThreads(prev => ({ ...prev, [thread]: true }))
-    } else {
-      const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
-
-      if (restored) {
-        setComposerDraft(restored)
+    setSendingComposer(thread)
+    try {
+      // Reply box = CONTINUE this thread. Preserve the exact draft until the
+      // hosted upload and durable command enqueue both succeed.
+      const sent = await Promise.resolve(
+        sendToGroupChat(group, memberDescriptors(), text, thread, images)
+      )
+      if (sent) {
+        setComposerDraft(
+          completeGroupComposerSend(composerKeyRef.current, before, images, thread)
+        )
+        setOpenThreads(prev => ({ ...prev, [thread]: true }))
       }
+    } catch (error) {
+      host.notify?.({
+        kind: 'error',
+        message: String(error?.message || 'The Group Chat could not accept this reply.')
+      })
+    } finally {
+      setSendingComposer(null)
     }
   }
 
@@ -15467,23 +15647,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                             ? jsx('div', {
                                 className: 'mt-1 flex flex-wrap items-center gap-1.5',
                                 children: entry.images.map((img, imgIndex) =>
-                                  img.kind === 'pdf' || img.kind === 'file'
-                                    ? jsxs('div', {
-                                        className:
-                                          'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)',
-                                        title: img.name || 'attached file',
-                                        children: [
-                                          jsx(Codicon, { name: img.kind === 'pdf' ? 'file-pdf' : 'file', className: 'text-[0.8rem]' }),
-                                          jsx('span', { className: 'max-w-48 truncate', children: img.name || 'attached file' })
-                                        ]
-                                      }, `${entryKey}:img:${imgIndex}`)
-                                    : jsx('img', {
-                                        src: img.data,
-                                        alt: img.name || 'attached image',
-                                        title: img.name || 'attached image',
-                                        className:
-                                          'max-h-40 max-w-60 rounded-md border border-(--ui-stroke-secondary) object-contain'
-                                      }, `${entryKey}:img:${imgIndex}`)
+                                  jsx(GroupAttachmentDisplay, {
+                                    room,
+                                    entry,
+                                    attachment: img,
+                                    entryKey,
+                                    index: imgIndex
+                                  }, `${entryKey}:img:${imgIndex}`)
                                 )
                               })
                             : null
@@ -15580,7 +15750,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             className: 'grid gap-0 px-2 pb-1',
             onSubmit: event => {
               event.preventDefault()
-              submitReply(id)
+              void submitReply(id)
             },
             children: [
               attachmentRow(id),
@@ -15601,8 +15771,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                   jsx(Button, {
                     type: 'submit',
                     size: 'sm',
-                    disabled: !(replyDrafts[id] || '').trim() && !imagesFor(id).length,
-                    children: 'Reply'
+                    disabled:
+                      sendingComposer !== null ||
+                      (!(replyDrafts[id] || '').trim() && !imagesFor(id).length),
+                    children: sendingComposer === id ? 'Sending…' : 'Reply'
                   })
                 ]
               })
@@ -15699,7 +15871,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           className: 'grid gap-0',
           onSubmit: event => {
             event.preventDefault()
-            submit()
+            void submit()
           },
           children: [
             attachmentRow(null),
@@ -15719,8 +15891,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                 jsx(Button, {
                   type: 'submit',
                   size: 'sm',
-                  disabled: !draft.trim() && !imagesFor(null).length,
-                  children: 'New Thread'
+                  disabled:
+                    sendingComposer !== null ||
+                    (!draft.trim() && !imagesFor(null).length),
+                  children: sendingComposer === 'main' ? 'Sending…' : 'New Thread'
                 })
               ]
             })

@@ -207,7 +207,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, stageHostedAttachments, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -987,6 +987,53 @@ test('a hosted-room marker sends through the hosted outbox, never the local driv
   assert.equal(gc.calls.length, 0, 'no member turn starts locally')
   assert.equal(gc.$groupChats.get().Hosted.log.length, 1, 'the optimistic entry stays local until replay')
   assert.equal(gc.$groupChats.get().Hosted.log[0].pending, true)
+})
+
+test('hosted attachments upload once to the room home and return metadata-only manifests', async () => {
+  const gc = load(() => 'must not run', { deferredTimers: true })
+  const calls = []
+  gc.host.requestProfile = async (route, method, params) => {
+    calls.push({ route, method, params })
+    return {
+      attachment: {
+        attachment_id: 'att_11111111111111111111111111111111',
+        kind: params.kind,
+        name: params.name,
+        size: 12,
+        mime: params.mime
+      }
+    }
+  }
+  const manifest = await gc.stageHostedAttachments(
+    { connectionId: 'gateway-a' },
+    'room-hosted',
+    'event-1',
+    [
+      {
+        kind: 'image',
+        name: 'diagram.png',
+        size: 12,
+        mime: 'image/png',
+        data: 'data:image/png;base64,iVBORw0KGgoAAAAA'
+      }
+    ]
+  )
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].method, 'groups.attachment.put')
+  assert.equal(calls[0].params.room_id, 'room-hosted')
+  assert.equal(calls[0].params.upload_id, 'event-1:upload:0')
+  assert.equal(calls[0].params.content_base64, 'iVBORw0KGgoAAAAA')
+  assert.deepEqual(JSON.parse(JSON.stringify(manifest)), [
+    {
+      attachment_id: 'att_11111111111111111111111111111111',
+      kind: 'image',
+      name: 'diagram.png',
+      size: 12,
+      mime: 'image/png'
+    }
+  ])
+  assert.doesNotMatch(JSON.stringify(manifest), /base64|data:|iVBOR/)
 })
 
 test('late renderer callbacks cannot mutate a hosted room mirror', () => {
@@ -2294,7 +2341,7 @@ test('source contract: thread UI — folded rows, per-thread reply box, new-thre
   assert.match(pluginSource, /Open this thread/)
   assert.match(pluginSource, /Collapse thread/)
   assert.match(pluginSource, /Reply in thread…/)
-  assert.match(pluginSource, /children: 'New Thread'/)
+  assert.match(pluginSource, /sendingComposer === 'main' \? 'Sending…' : 'New Thread'/)
   assert.match(pluginSource, /const markKey = `\$\{thread\}::\$\{memberKey\}`/)
 })
 
@@ -2319,6 +2366,17 @@ test('source contract: group chat log lines expose CopyButton on the entry body'
   assert.doesNotMatch(src, /RefreshCw/)
   assert.doesNotMatch(src, /readAloud/)
   assert.doesNotMatch(src, /ActionBarPrimitive\.Reload/)
+})
+
+test('source contract: metadata-only attachments load on demand without a broken image source', () => {
+  const src = groupChatWorkspaceSource()
+  const render = src.slice(src.indexOf('const renderEntry'), src.indexOf('// Threads:'))
+
+  assert.match(pluginSource, /function GroupAttachmentDisplay\(/)
+  assert.match(pluginSource, /'groups\.attachment\.read'/)
+  assert.match(pluginSource, /purpose: 'viewer'/)
+  assert.match(render, /jsx\(GroupAttachmentDisplay/)
+  assert.doesNotMatch(render, /src: img\.data/)
 })
 
 test('source contract: group chat message bodies opt back into selectable text', () => {

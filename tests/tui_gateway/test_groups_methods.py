@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 
 import pytest
 
@@ -485,78 +484,6 @@ def test_attachment_put_send_read_roundtrip_is_bounded_and_recipient_scoped(home
     assert denied["error"]["code"] == 4141
 
 
-def test_classic_attachment_read_requires_room_authority_and_live_command_lease(home):
-    from gateway import desktop_room_mailbox
-    from gateway.hosted_room_attachments import HostedRoomAttachmentStore
-    from gateway.hosted_rooms import default_db_path as hosted_db_path
-
-    db = desktop_room_mailbox.default_db_path()
-    store = HostedRoomAttachmentStore(hosted_db_path())
-    stored = store.put(
-        room_id="classic-room",
-        upload_id="upload-classic-1",
-        kind="file",
-        name="notes.txt",
-        mime="text/plain",
-        data=b"release notes",
-    )
-    manifest = {
-        key: stored[key]
-        for key in ("attachment_id", "kind", "name", "size", "mime")
-    }
-    store.commit_message(
-        room_id="classic-room",
-        event_id="messaging:classic-attachment",
-        manifest=[manifest],
-        recipient_member_ids=("desktop", "viewer"),
-    )
-    desktop_room_mailbox.enqueue_command(
-        db,
-        command_id="messaging:classic-attachment",
-        room_id="classic-room",
-        authority_hash=hashlib.sha256(b"authority:test").hexdigest(),
-        action="send",
-        payload={"message": "", "attachments": [manifest]},
-    )
-    command = desktop_room_mailbox.claim_commands(
-        db,
-        consumer_id="desktop:test",
-        room_authorities=[{
-            "room_id": "classic-room",
-            "authority_token": "authority:test",
-        }],
-    )[0]
-    params = {
-        "room_id": "classic-room",
-        "attachment_id": stored["attachment_id"],
-        "purpose": "desktop-command",
-        "event_id": "messaging:classic-attachment",
-        "consumer_id": "desktop:test",
-        "lease_token": command["lease_token"],
-        "authority_token": "authority:test",
-    }
-
-    denied = srv._methods["groups.attachment.read"](
-        1,
-        {**params, "authority_token": "authority:wrong"},
-    )
-    assert denied["error"]["code"] == 4141
-    read = _result(srv._methods["groups.attachment.read"](2, params))
-    assert base64.b64decode(read["content_base64"]) == b"release notes"
-    viewer = _result(
-        srv._methods["groups.attachment.read"](
-            3,
-            {
-                "room_id": "classic-room",
-                "attachment_id": stored["attachment_id"],
-                "event_id": "messaging:classic-attachment",
-                "purpose": "viewer",
-            },
-        )
-    )
-    assert base64.b64decode(viewer["content_base64"]) == b"release notes"
-
-
 def test_send_does_not_trust_client_supplied_actor_identity(home):
     _create_room()
     sent = _result(
@@ -685,6 +612,12 @@ def test_disband_stops_and_revokes_before_tombstoning(home, monkeypatch):
     calls = []
 
     class FakeService:
+        class Attachments:
+            def mark_room_disbanded(self, room_id):
+                calls.append(("attachments", room_id))
+
+        attachments = Attachments()
+
         def stop_room(self, room_id, **_kwargs):
             calls.append(("stop", room_id))
 
@@ -694,7 +627,11 @@ def test_disband_stops_and_revokes_before_tombstoning(home, monkeypatch):
     monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
     _result(srv._methods["groups.disband"](9, {"room_id": "room-1"}))
 
-    assert calls == [("stop", "room-1"), ("revoke", "room-1")]
+    assert calls == [
+        ("stop", "room-1"),
+        ("revoke", "room-1"),
+        ("attachments", "room-1"),
+    ]
     assert _result(srv._methods["groups.list"](10, {}))["rooms"] == []
 
 

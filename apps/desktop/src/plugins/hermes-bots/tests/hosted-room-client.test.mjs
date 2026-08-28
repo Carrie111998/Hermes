@@ -108,34 +108,25 @@ test('named Bot routes use the multiplex profile path and creation errors stay a
 function attachmentManifest() {
   return [
     {
+      attachment_id: 'att_11111111111111111111111111111111',
       kind: 'image',
       name: 'diagram.png',
       size: 2048,
-      mime: 'image/png',
-      refs: {
-        research: 'stage:research:image-1',
-        builder: 'stage:builder:image-1'
-      }
+      mime: 'image/png'
     },
     {
+      attachment_id: 'att_22222222222222222222222222222222',
       kind: 'pdf',
       name: 'brief.pdf',
       size: 4096,
-      mime: 'application/pdf',
-      refs: {
-        research: 'stage:research:pdf-1',
-        builder: 'stage:builder:pdf-1'
-      }
+      mime: 'application/pdf'
     },
     {
+      attachment_id: 'att_33333333333333333333333333333333',
       kind: 'file',
       name: 'notes.txt',
       size: 128,
-      mime: 'text/plain',
-      refs: {
-        research: 'stage:research:file-1',
-        builder: 'stage:builder:file-1'
-      }
+      mime: 'text/plain'
     }
   ]
 }
@@ -210,7 +201,7 @@ test('capability classification distinguishes old, disabled, transient, and driv
   assert.equal(capable.roomLink.enabled, true)
   assert.equal(capable.roomLink.catalog.installationId, 'install:stable-home')
   assert.deepEqual(capable.limits, {
-    attachments: false,
+    attachments: true,
     automaticFailover: false,
     crossGatewayMembers: true,
     stagedAttachmentManifest: true
@@ -477,7 +468,7 @@ test('replay buffers sequence gaps and a tombstone preserves history while closi
   })
 })
 
-test('replay preserves safe attachment metadata without exposing staged member refs', () => {
+test('replay preserves opaque attachment ids in the renderer attachment shape', () => {
   const replayed = reduceHostedRoomEvents(createHostedRoomReplayState({ roomId: 'room-1' }), [
     event(
       1,
@@ -488,11 +479,7 @@ test('replay preserves safe attachment metadata without exposing staged member r
     )
   ])
 
-  assert.deepEqual(replayed.messages[0].attachments, [
-    { kind: 'image', name: 'diagram.png', size: 2048, mime: 'image/png' },
-    { kind: 'pdf', name: 'brief.pdf', size: 4096, mime: 'application/pdf' },
-    { kind: 'file', name: 'notes.txt', size: 128, mime: 'text/plain' }
-  ])
+  assert.deepEqual(replayed.messages[0].images, attachmentManifest())
   assert.doesNotMatch(JSON.stringify(replayed.messages[0]), /stage:|refs/)
 })
 
@@ -641,7 +628,7 @@ test('persisted command outbox accepts each supported command and enqueue is ide
   assert.deepEqual(outbox.commands[0].payload.attachments, attachmentManifest())
 })
 
-test('send attachment manifests reject raw transport data, local paths, malformed refs, and oversized metadata', () => {
+test('send attachment manifests reject raw transport data, local paths, malformed ids, and oversized metadata', () => {
   const enqueue = attachments =>
     reduceHostedRoomOutbox(createHostedRoomOutbox(), {
       type: 'enqueue',
@@ -673,13 +660,20 @@ test('send attachment manifests reject raw transport data, local paths, malforme
   localPath[0].path = '/Users/david/Desktop/diagram.png'
   assert.throws(() => enqueue(localPath), /path/i)
 
-  const pathRef = attachmentManifest()
-  pathRef[0].refs.research = '/tmp/diagram.png'
-  assert.throws(() => enqueue(pathRef), /staged reference/i)
+  const badId = attachmentManifest()
+  badId[0].attachment_id = 'file:diagram.png'
+  assert.throws(() => enqueue(badId), /server-minted id/i)
 
-  const fileRef = attachmentManifest()
-  fileRef[0].refs.research = 'file:diagram.png'
-  assert.throws(() => enqueue(fileRef), /staged reference/i)
+  const duplicateIds = attachmentManifest()
+  duplicateIds[1].attachment_id = duplicateIds[0].attachment_id
+  assert.throws(() => enqueue(duplicateIds), /unique/i)
+
+  const oversizedTotal = attachmentManifest().map((attachment, index) => ({
+    ...attachment,
+    attachment_id: `att_${String(index).padStart(32, '0')}`,
+    size: 9_000_000
+  }))
+  assert.throws(() => enqueue(oversizedTotal), /25MB/i)
 
   assert.throws(
     () =>
@@ -701,14 +695,15 @@ test('send attachment manifests reject raw transport data, local paths, malforme
     () =>
       enqueue([
         {
+          attachment_id: 'att_44444444444444444444444444444444',
           kind: 'pdf',
           name: 'report.pdf',
           size: 10,
           mime: 'application/pdf',
-          refs: {}
+          content_base64: 'AAAA'
         }
       ]),
-    /member refs/i
+    /base64/i
   )
 })
 
