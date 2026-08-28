@@ -12,3 +12,7 @@ export const COMMON_ROUTE_WARMUP_LOADERS = [
   loadSettingsView,
   loadSkillsView
 ] as const
+
+export function shouldWarmCommonRoutes(gatewayOpen: boolean, auxiliaryWindow: boolean): boolean {
+  return gatewayOpen && !auxiliaryWindow
+}

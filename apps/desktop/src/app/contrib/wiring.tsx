@@ -150,7 +150,7 @@ import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
-import { COMMON_ROUTE_WARMUP_LOADERS, loadCronView, loadSettingsView } from './route-loaders'
+import { COMMON_ROUTE_WARMUP_LOADERS, loadCronView, loadSettingsView, shouldWarmCommonRoutes } from './route-loaders'
 import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
@@ -196,7 +196,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const currentCwd = useStore($currentCwd)
 
   useEffect(() => {
-    if (gatewayState !== 'open') {
+    // Secondary/HUD/browser windows do not own normal navigation. Preloading
+    // the full primary route set there wastes CPU and memory without making a
+    // user interaction faster.
+    if (!shouldWarmCommonRoutes(gatewayState === 'open', isAuxiliaryWindow())) {
       return
     }
 
