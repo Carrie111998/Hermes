@@ -7491,6 +7491,7 @@ async function ensureGroupChatSession(group, member) {
 
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
+const GROUP_AUTO_CONTINUE_RESET_TIMEOUT_MS = 180000
 
 // --- group-turn session-lease helpers (#93602) ------------------------------
 // A member turn is a session-scoped RPC SEQUENCE (resume → attach → submit →
@@ -7577,6 +7578,52 @@ async function submitGroupTurnPrompt(member, runtime, stored, text) {
 
     return fresh
   }
+}
+
+/** A cold session.resume may restart a crash-interrupted turn before the room
+ *  can submit its newer request. That recovery is safe to supersede because
+ *  it is backend-labelled `auto_continue`; an ordinary busy turn is never
+ *  interrupted here. session.interrupt also clears prompts that older room
+ *  loops may have queued behind the stale turn. Wait for the interrupted turn
+ *  to settle, then return a fresh baseline so none of its partial output can
+ *  be mistaken for the reply to the newer request. */
+async function resetAutoContinuedGroupTurn(member, runtime, stored, state) {
+  const autoContinuing = Boolean(state?.auto_continuing || state?.auto_continue)
+
+  if (!autoContinuing) {
+    return state
+  }
+
+  const sessionId = state?.session_id || runtime
+
+  await requestForBot(member, 'session.interrupt', { session_id: sessionId })
+
+  const deadline = Date.now() + GROUP_AUTO_CONTINUE_RESET_TIMEOUT_MS
+
+  while (Date.now() < deadline) {
+    // session.resume is not a read-only probe: a cold resume can mint a new
+    // runtime and synthesize crash recovery. Poll the existing live-session
+    // inventory instead, then resume exactly once below for the clean message
+    // baseline after the interrupted worker has actually settled.
+    const active = await requestForBot(member, 'session.active_list', {
+      current_session_id: sessionId,
+      profile: member.name
+    })
+    const live = (Array.isArray(active?.sessions) ? active.sessions : []).find(
+      row => row?.id === sessionId || (stored && row?.session_key === stored)
+    )
+
+    if (!live || (live.status !== 'working' && live.status !== 'starting')) {
+      return requestForBot(member, 'session.resume', {
+        session_id: stored || sessionId,
+        profile: member.name
+      })
+    }
+
+    await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
+  }
+
+  throw new Error(`Could not reset ${member?.name || 'member'}'s interrupted group turn before the timeout`)
 }
 
 // A member turn that is VISIBLY still working (session reports
@@ -7763,14 +7810,24 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
   // Baseline: how many messages exist before our submit.
   let before = 0
 
+  let pre = null
+
   try {
-    const pre = await requestForBot(member, 'session.resume', {
+    pre = await requestForBot(member, 'session.resume', {
       session_id: stored || runtime,
       profile: member.name
     })
-    before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
   } catch {
     /* lazy session — zero messages */
+  }
+
+  if (pre) {
+    // Fail closed on reset errors. Submitting after we identified an active
+    // crash continuation but could not prove it settled can queue behind, or
+    // be confused with, the stale turn. That is categorically different from
+    // the lazy-session resume miss above, where no competing turn was seen.
+    pre = await resetAutoContinuedGroupTurn(member, runtime, stored, pre)
+    before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
   }
 
   // Stage this delta's attachments into the member's session so the model

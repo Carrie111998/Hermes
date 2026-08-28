@@ -1252,7 +1252,18 @@ def _interrupt_session_turn(
         run_thread_alive = run_thread is not None and run_thread.is_alive()
 
     with session["history_lock"]:
+        auto_continuing = bool(
+            session.get("_auto_continue_scheduled")
+            or session.get("_auto_continue_attempt")
+        )
         session["_turn_cancel_requested"] = True
+        # An explicit interrupt owns the recovery decision. Retire both the
+        # pending/running continuation metadata and its durable crash marker,
+        # otherwise the same cancelled work is auto-started again after the
+        # next Desktop restart.
+        session["_auto_continue_scheduled"] = False
+        session.pop("_auto_continue_attempt", None)
+        session.pop("_auto_continue_prompt", None)
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(
@@ -1269,6 +1280,9 @@ def _interrupt_session_turn(
                 if session.get("running"):
                     session["running"] = False
                     _clear_inflight_turn(session)
+
+    if auto_continuing:
+        _retire_turn_marker(session)
 
     _clear_pending(sid)
     try:
@@ -10472,6 +10486,16 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
+        # Crash-recovery turns are synthesized by session.resume, not by the
+        # person currently driving this client. Expose that distinction so a
+        # newer explicit request can safely supersede the recovery without
+        # treating every ordinary busy session as disposable. The scheduled
+        # bit covers the deferred agent-build window; the attempt bit covers
+        # the running continuation itself.
+        auto_continuing = bool(
+            session.get("_auto_continue_scheduled")
+            or session.get("_auto_continue_attempt")
+        )
         inflight_turn = session.get("inflight_turn")
         turn_started_at = (
             float(inflight_turn["started_at"])
@@ -10497,6 +10521,7 @@ def _live_session_payload(
         "messages": [] if omit_messages else _history_to_messages(history),
         "messages_omitted": omit_messages,
         "running": running,
+        "auto_continuing": auto_continuing,
         "turn_started_at": turn_started_at,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),

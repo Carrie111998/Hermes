@@ -625,6 +625,10 @@ export interface SessionResumeResponse {
     attempt: number
     interrupted_at: number
   }
+  /** True while a crash-recovery continuation is scheduled or running.
+   *  Unlike `running`, this explicitly identifies synthesized work that a
+   *  newer user request may safely supersede. */
+  auto_continuing?: boolean
   hydrating?: boolean
   inflight?: null | {
     assistant?: string

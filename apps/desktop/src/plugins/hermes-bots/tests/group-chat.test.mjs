@@ -23,6 +23,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
   const calls = []
   const clarifyResponds = []
   const approvalResponds = []
+  const interrupts = []
   const requests = []
   const sessions = new Map()
   const runtimeToStored = new Map()
@@ -153,15 +154,26 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           // Same window shape for pending command approvals (#90694 class).
           const approval = approvalUntilResumeCall && approvalUntilResumeCall[profile]
           const pendingApproval = approval && seen <= approval.until ? approval.payload : null
+          const autoContinuing = Boolean(session.autoContinuing)
           return {
             session_id: session.runtime,
             session_key: session.stored,
             message_count: session.messages.length,
             messages: [...session.messages],
-            inflight: busy,
-            running: busy,
+            inflight: busy || autoContinuing,
+            running: busy || autoContinuing,
+            auto_continuing: autoContinuing,
             ...(pendingClarify ? { pending_clarify: pendingClarify } : {}),
             ...(pendingApproval ? { pending_approval: pendingApproval } : {})
+          }
+        }
+        if (method === 'session.active_list') {
+          return {
+            sessions: [...sessions.values()].map(session => ({
+              id: session.runtime,
+              session_key: session.stored,
+              status: session.autoContinuing ? 'working' : 'idle'
+            }))
           }
         }
         if (method === 'prompt.submit') {
@@ -180,6 +192,15 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           const reply = turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
           return {}
+        }
+        if (method === 'session.interrupt') {
+          const session = resolveSession(null, params.session_id)
+          if (!session) {
+            throw new Error(`runtime session not found: ${params.session_id}`)
+          }
+          session.autoContinuing = false
+          interrupts.push({ profile: session.profile, session_id: params.session_id })
+          return { status: 'interrupted' }
         }
         if (method === 'clarify.respond') {
           clarifyResponds.push({ ...params })
@@ -204,7 +225,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, runGroupChatMemberTurnLeased, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -212,7 +233,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
-  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, requests, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
+  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, interrupts, requests, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
@@ -402,6 +423,49 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   const betaSession = gc.sessions.get(betaFirst.stored)
   assert.equal(alphaSession.messages.some(message => String(message.content).includes('BETA_ONLY')), false)
   assert.equal(betaSession.messages.some(message => String(message.content).includes('ALPHA_ONLY')), false)
+})
+
+test('a newer room request resets a crash auto-continuation before submitting', async () => {
+  const gc = load(() => 'fresh reply')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Room', room => {
+    room.roomId = 'r-reset'
+    return room
+  })
+  const ids = await gc.ensureGroupChatSession('Room', member)
+  gc.sessions.get(ids.stored).autoContinuing = true
+
+  const reply = await gc.runGroupChatMemberTurnLeased('Room', member, 'new request', 'thread-new', [])
+
+  assert.equal(reply, 'fresh reply')
+  assert.deepEqual(gc.interrupts, [{ profile: 'research', session_id: ids.runtime }])
+  const interruptIndex = gc.requests.findIndex(request => request.method === 'session.interrupt')
+  const submitIndex = gc.requests.findIndex(request => request.method === 'prompt.submit')
+  assert.ok(interruptIndex >= 0 && interruptIndex < submitIndex, 'stale recovery is interrupted before the new prompt')
+  const settlementMethods = gc.requests.slice(interruptIndex + 1, submitIndex).map(request => request.method)
+  assert.deepEqual(
+    settlementMethods,
+    ['session.active_list', 'session.resume'],
+    'settlement is polled read-only, then resumed once for the clean baseline'
+  )
+})
+
+test('ordinary busy member work is never reset as a stale continuation', async () => {
+  const gc = load(() => 'finished normally', {
+    busyUntilResumeCall: { research: 2 }
+  })
+
+  const reply = await gc.runGroupChatMemberTurnLeased(
+    'Room',
+    { name: 'research', title: '' },
+    'follow-up',
+    'thread-a',
+    []
+  )
+
+  assert.equal(reply, 'finished normally')
+  assert.equal(gc.interrupts.length, 0)
 })
 
 test('recreating a same-name group after disband mints fresh member sessions', async () => {
