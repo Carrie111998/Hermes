@@ -66,34 +66,36 @@ function useProjectActions({
   }
 
   const confirmDelete = async () => {
-    await deleteProject(project.id)
+    await deleteProject(project)
 
     if (scoped) {
       onExitScope?.()
     }
   }
 
-  // Rename / add folder / set active — explicit projects only (auto ones lack a
-  // materialized record). Appearance is handled per-surface (popover vs submenu)
-  // by the caller since its picker chrome differs.
-  const identityItems: ActionItemSpec[] = project.isAuto
-    ? []
-    : [
-        { icon: 'edit', key: 'rename', label: p.menuRename, onSelect: () => openProjectRename(target) },
-        {
-          icon: 'new-folder',
-          key: 'add-folder',
-          label: p.menuAddFolder,
-          onSelect: () => openProjectAddFolder(target)
-        },
-        {
-          disabled: isActive,
-          icon: 'target',
-          key: 'set-active',
-          label: p.menuSetActive,
-          onSelect: () => void setActiveProject(project.id)
-        }
-      ]
+  // Rename / add folder / set active — focused explicit projects only. Auto
+  // projects lack a materialized record, while an all-profiles header can merge
+  // several records and deliberately has no single owner for those mutations.
+  // Appearance is handled per-surface (popover vs submenu) by the caller.
+  const identityItems: ActionItemSpec[] =
+    project.isAuto || project.profileProjects
+      ? []
+      : [
+          { icon: 'edit', key: 'rename', label: p.menuRename, onSelect: () => openProjectRename(target) },
+          {
+            icon: 'new-folder',
+            key: 'add-folder',
+            label: p.menuAddFolder,
+            onSelect: () => openProjectAddFolder(target)
+          },
+          {
+            disabled: isActive,
+            icon: 'target',
+            key: 'set-active',
+            label: p.menuSetActive,
+            onSelect: () => void setActiveProject(project.id)
+          }
+        ]
 
   const pathItems: ActionItemSpec[] = [
     {
@@ -165,6 +167,7 @@ export function ProjectMenu({
   // Open toward the content area: right when the sidebar is on the left, left
   // when the panes are flipped (sidebar on the right).
   const panesFlipped = useStore($panesFlipped)
+  const canTheme = project.profileProjects === undefined && (!project.isAuto || Boolean(project.path))
 
   const { confirmDialog, dangerItem, identityItems, pathItems } = useProjectActions({
     isActive,
@@ -230,24 +233,24 @@ export function ProjectMenu({
           onCloseAutoFocus={event => event.preventDefault()}
           sideOffset={6}
         >
-          {project.isAuto ? (
-            // Inherited (auto) repos can still be themed — the change adopts the
-            // repo as a real project. Rename / add-folder / set-active stay out
-            // until then (they need the materialized record).
-            project.path && (
+          {canTheme ? (
+            project.isAuto ? (
+              // Inherited (auto) repos can still be themed — the change adopts the
+              // repo as a real project. Rename / add-folder / set-active stay out
+              // until then (they need the materialized record).
               <>
                 {appearanceItem}
                 <DropdownMenuSeparator />
               </>
+            ) : (
+              <>
+                {identityItems.slice(0, 1).map(item => renderActionItem(DROPDOWN_KIT, item))}
+                {appearanceItem}
+                {identityItems.slice(1).map(item => renderActionItem(DROPDOWN_KIT, item))}
+                <DropdownMenuSeparator />
+              </>
             )
-          ) : (
-            <>
-              {identityItems.slice(0, 1).map(item => renderActionItem(DROPDOWN_KIT, item))}
-              {appearanceItem}
-              {identityItems.slice(1).map(item => renderActionItem(DROPDOWN_KIT, item))}
-              <DropdownMenuSeparator />
-            </>
-          )}
+          ) : null}
           {pathItems.map(item => renderActionItem(DROPDOWN_KIT, item))}
           <DropdownMenuSeparator />
           {renderActionItem(DROPDOWN_KIT, dangerItem)}
@@ -301,7 +304,7 @@ export function ProjectContextMenu({
     scoped
   })
 
-  const canTheme = !project.isAuto || Boolean(project.path)
+  const canTheme = project.profileProjects === undefined && (!project.isAuto || Boolean(project.path))
 
   const applyAppearance = (patch: { color?: null | string; icon?: null | string }) => {
     void setProjectAppearance(project, patch)

@@ -18,6 +18,7 @@ import {
   ALL_PROJECTS,
   beginSessionMutation,
   createProject,
+  deleteProject,
   endSessionMutation,
   enterProject,
   exitProjectScope,
@@ -83,6 +84,7 @@ const desktopGit = vi.mocked(git.desktopGit)
 
 const hermes = await import('@/hermes')
 const getHermesConfig = vi.mocked(hermes.getHermesConfig)
+const hermesApi = vi.mocked(hermes.hermesApi)
 const notifications = await import('@/store/notifications')
 const notify = vi.mocked(notifications.notify)
 
@@ -170,6 +172,36 @@ describe('projects RPC profile forwarding', () => {
     await fetchProjectSessions('p_123')
 
     expect(request).not.toHaveBeenCalled()
+    setShowAllProfiles(false)
+  })
+
+  it('deletes a merged all-profiles project from every concrete owning profile', async () => {
+    const request = vi.fn(async () => ({ active_id: null, projects: [] }))
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+    hermesApi.mockResolvedValue({ active_id: null, projects: [], scoped_session_ids: [] })
+    setShowAllProfiles(true)
+
+    const project = {
+      id: 'p_default',
+      label: 'Shared',
+      path: '/repos/shared',
+      profileProjects: [
+        { id: 'p_default', isAuto: false, profile: 'default' },
+        { id: 'p_worker', isAuto: false, profile: 'worker' }
+      ],
+      repos: [],
+      sessionCount: 0
+    } satisfies SidebarProjectTree
+
+    $projectTree.set([project])
+
+    await deleteProject(project)
+
+    expect(request).toHaveBeenCalledWith('projects.delete', { id: 'p_default', profile: 'default' })
+    expect(request).toHaveBeenCalledWith('projects.delete', { id: 'p_worker', profile: 'worker' })
+    expect($projectTree.get()).toEqual([])
     setShowAllProfiles(false)
   })
 })

@@ -41,6 +41,13 @@ export interface SidebarWorkspaceTree {
   sessionCount: number
 }
 
+/** The concrete per-profile projects.db row contributing to a merged project. */
+export interface SidebarProjectProfileRef {
+  id: string
+  profile: string
+  isAuto: boolean
+}
+
 /** A project node: human-named (or repo-derived), holds its repo subtree. */
 export interface SidebarProjectTree {
   id: string
@@ -66,6 +73,9 @@ export interface SidebarProjectTree {
   lastActive?: number
   // Up to N most-recent sessions for the overview preview (set by `projects.tree`).
   previewSessions?: SessionInfo[]
+  // Present on the all-profiles REST tree. A shared folder is one visible row,
+  // but mutations still need the exact projects.db id(s) and owning profile(s).
+  profileProjects?: SidebarProjectProfileRef[]
 }
 
 /** Path split into segments, ignoring trailing slashes and mixed separators. */

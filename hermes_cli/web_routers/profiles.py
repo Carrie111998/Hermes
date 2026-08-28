@@ -581,11 +581,18 @@ def _merge_profile_tree(
     which every profile has and which would otherwise put a "Home" on screen per
     profile. Keying on the path rather than the id also folds a profile's
     declared project (``p_<hash>``) together with the auto entry another profile
-    grows for the same folder. Sessions carry the owning profile instead, which
-    is what the row badge and the profile filter read; a group header never
-    claims a single owner.
+    grows for the same folder. Sessions carry the owning profile for row badges;
+    ``profileProjects`` preserves every concrete source record so an action on
+    the merged header can still route to the right profile database(s).
     """
     for project in projects:
+        project["profileProjects"] = [
+            {
+                "id": project["id"],
+                "profile": profile,
+                "isAuto": bool(project.get("isAuto")),
+            }
+        ]
         for lane in (repo for r in project.get("repos") or [] for repo in r.get("groups") or []):
             for session in lane.get("sessions") or []:
                 session["profile"] = profile
@@ -616,6 +623,15 @@ def _merge_profile_tree(
         previews = (existing.get("previewSessions") or []) + (project.get("previewSessions") or [])
         previews.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)
         existing["previewSessions"] = previews[:preview_limit]
+        refs = {
+            (ref["profile"], ref["id"]): ref
+            for ref in existing.get("profileProjects") or []
+        }
+        refs.update({
+            (ref["profile"], ref["id"]): ref
+            for ref in project.get("profileProjects") or []
+        })
+        existing["profileProjects"] = list(refs.values())
 
 
 @sessions_router.get("/api/profiles/projects/tree")
@@ -629,9 +645,10 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     the repo-scan policy, the HERMES_HOME junk filters — through the
     context-local home override the profile-scoped writers already use.
 
-    Projects merge by id across profiles, so a group stands for a checkout
-    rather than a checkout-and-owner, and the profile shows up per row where
-    the filter can act on it.
+    Projects merge by folder across profiles, so a group stands for a checkout
+    rather than a checkout-and-owner. Session rows carry their profile for
+    filtering, while the header carries exact per-profile project references
+    for mutations such as Delete.
 
     Discovery is off. A repo with zero sessions is the same repo in every
     profile, so folding the disk scan in would multiply empty lanes by the

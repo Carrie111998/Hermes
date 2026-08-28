@@ -115,4 +115,27 @@ describe('ProjectMenu', () => {
     // chain rather than getting silently dropped on an intermediate wrapper.
     expect(await screen.findByRole('button', { name: 'No color' })).toBeTruthy()
   }, 15000)
+
+  it('hides unroutable per-profile writes on a merged all-profiles project', async () => {
+    render(
+      <ProjectMenu
+        isActive={false}
+        project={{
+          ...project,
+          profileProjects: [
+            { id: 'p1', isAuto: false, profile: 'default' },
+            { id: 'p2', isAuto: false, profile: 'worker' }
+          ]
+        }}
+      />
+    )
+
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    expect(await screen.findByRole('menuitem', { name: 'Delete…' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Add folder' })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Set active' })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Appearance' })).toBeNull()
+  })
 })

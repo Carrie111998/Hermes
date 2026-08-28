@@ -1118,16 +1118,47 @@ function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[])
 // Optimistic: drop the project from the cached tree + list the instant it's
 // clicked (the entered-scope effect exits if you deleted the project you were
 // inside), reconciling from the server payload. A failed delete restores both.
-export async function deleteProject(id: string): Promise<void> {
+export async function deleteProject(
+  project: string | Pick<SidebarProjectTree, 'id' | 'profileProjects'>
+): Promise<void> {
+  const id = typeof project === 'string' ? project : project.id
+
+  const profileRefs =
+    typeof project === 'string'
+      ? []
+      : (project.profileProjects ?? []).filter(ref => !ref.isAuto && ref.id.trim() && ref.profile.trim())
+
+  const uniqueRefs = [...new Map(profileRefs.map(ref => [`${ref.profile}\u0000${ref.id}`, ref])).values()]
+
+  // Focused-profile trees predate/omit profileProjects because their owner is
+  // already the active scope. The all-profiles tree must provide refs: its
+  // visible id can belong to any contributing profile and is not routable by
+  // itself. A cached focused-list hit is a compatibility rung for an older
+  // backend serving the all-profiles REST shape without refs.
+  if (!uniqueRefs.length) {
+    const focusedProfile = projectProfile()
+    const cachedOnActiveProfile = $projects.get().some(candidate => candidate.id === id)
+
+    const fallbackProfile =
+      focusedProfile ?? (cachedOnActiveProfile ? normalizeProfileKey($activeGatewayProfile.get()) : null)
+
+    if (!fallbackProfile) {
+      throw new Error('This project does not identify the profile that owns it. Refresh Projects and try again.')
+    }
+
+    uniqueRefs.push({ id, isAuto: false, profile: fallbackProfile })
+  }
+
   const snap = snapshotProjects()
+  const deletedIds = new Set([id, ...uniqueRefs.map(ref => ref.id)])
   // Capture membership BEFORE removal — the project's folders (which determine
   // ownership) are gone once it's dropped from the cache.
-  const kickToIntro = openSessionBelongsToProject(id, snap.projects)
+  const kickToIntro = [...deletedIds].some(projectId => openSessionBelongsToProject(projectId, snap.projects))
 
-  $projects.set(snap.projects.filter(project => project.id !== id))
-  $projectTree.set(snap.tree.filter(node => node.id !== id))
+  $projects.set(snap.projects.filter(candidate => !deletedIds.has(candidate.id)))
+  $projectTree.set(snap.tree.filter(node => !deletedIds.has(node.id)))
 
-  if (snap.active === id) {
+  if (snap.active && deletedIds.has(snap.active)) {
     $activeProjectId.set(null)
   }
 
@@ -1137,10 +1168,37 @@ export async function deleteProject(id: string): Promise<void> {
     requestFreshSession()
   }
 
-  await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', projectParams({ id })))
-  })
-  void refreshProjectTree()
+  try {
+    const results = await Promise.allSettled(
+      uniqueRefs.map(ref =>
+        gatewayRequest<ProjectsPayload>('projects.delete', projectParams({ id: ref.id }, ref.profile))
+      )
+    )
+
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+
+    if (failure) {
+      throw failure.reason
+    }
+
+    const payloads = results.flatMap(result => (result.status === 'fulfilled' ? [result.value] : []))
+
+    // A focused tree has one authoritative projects.list payload. In the
+    // all-profiles view each response is only one slice, so applying one would
+    // clobber the merged cache; the cross-profile tree refresh below owns it.
+    if ($profileScope.get() !== ALL_PROFILES && payloads[0]) {
+      applyPayload(payloads[0])
+    }
+  } catch (error) {
+    restoreProjects(snap)
+    // Multiple profile deletes cannot be transactional across separate DBs.
+    // If one slice failed after another succeeded, replace the optimistic
+    // rollback with backend truth before surfacing the error.
+    await refreshProjectTree()
+    throw error
+  }
+
+  await refreshProjectTree()
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
