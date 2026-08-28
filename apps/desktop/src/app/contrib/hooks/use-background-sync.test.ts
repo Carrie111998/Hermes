@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from '@/app/session/hooks/use-message-stream/utils'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, notifySessionsChanged, resetLiveSync } from '@/store/live-sync'
@@ -14,9 +15,12 @@ import {
 } from '@/store/session'
 import {
   $attentionSessionIds,
+  $sessionStates,
+  $sessionTiles,
   $stalledSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
+  publishSessionState,
   SESSION_WATCHDOG_TIMEOUT_MS
 } from '@/store/session-states'
 
@@ -27,6 +31,7 @@ import {
   reconcileActiveTranscript,
   reconcileTileTranscripts as reconcileTileTranscriptsForTest,
   rehydrateLiveSessionStatuses,
+  resetLiveRuntimeTracking,
   resetTypingActivityTracking,
   resolveActiveTranscriptSession,
   useBackgroundSync,
@@ -157,7 +162,9 @@ afterEach(() => {
   setBusy(false)
   vi.clearAllMocks()
   vi.restoreAllMocks()
+  $sessionTiles.set([])
   clearAllSessionStates()
+  resetLiveRuntimeTracking()
   resetTypingActivityTracking()
 })
 
@@ -201,6 +208,20 @@ describe('active transcript refresh', () => {
     })
   })
 
+  it('waits for a bound tile runtime state before persisted reconciliation', async () => {
+    const updateSessionState = vi.fn()
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ storedSessionId: 'stored-without-state', runtimeId: 'runtime-without-state' }],
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
   it('reconciles a workspace TILE transcript when sessions.changed ticks (#94255 review: behavior, not source-grep)', async () => {
     $changeEventsAvailable.set(true)
     // The tile's runtime differs from the active session — it is NOT the main
@@ -210,8 +231,7 @@ describe('active transcript refresh', () => {
     $activeSessionId.set('runtime-something-else')
     $selectedStoredSessionId.set('stored-other')
 
-    const states = new Map<string, ReturnType<typeof createClientSessionState>>()
-    states.set(TILE_RUNTIME_ID, createClientSessionState(TILE_STORED_ID))
+    publishSessionState(TILE_RUNTIME_ID, createClientSessionState(TILE_STORED_ID))
 
     let updaterCallCount = 0
 
@@ -224,11 +244,8 @@ describe('active transcript refresh', () => {
       }
     )
 
-    void updateSessionState
-
     const signatureRef = { current: new Map<string, string>() }
     const requestSequenceRef = { current: 0 }
-    const busyRef = { current: false }
 
     vi.mocked(getLatestSessionMessages).mockImplementation(async (storedId: string) => {
       if (storedId === TILE_STORED_ID) {
@@ -250,7 +267,6 @@ describe('active transcript refresh', () => {
     await act(async () => {
       await reconcileTileTranscriptsForTest({
         tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
-        busyRef,
         requestSequenceRef,
         signatureRef,
         updateSessionState
@@ -262,15 +278,866 @@ describe('active transcript refresh', () => {
     expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
   })
 
-  it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {
+  it('routes duplicate stored-id tiles through their exact owners and reconciles both', async () => {
+    const sharedStoredId = 'shared-stored-tile'
+
+    const ownerA = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'worker',
+      targetProfile: 'worker-a'
+    }
+
+    const ownerB = {
+      connectionId: 'source-b',
+      mode: 'remote' as const,
+      profile: 'worker',
+      targetProfile: 'worker-b'
+    }
+
+    $sessionTiles.set([
+      { ownerRoute: ownerA, runtimeId: 'runtime-owner-a', storedSessionId: sharedStoredId },
+      { ownerRoute: ownerB, runtimeId: 'runtime-owner-b', storedSessionId: sharedStoredId }
+    ])
+    publishSessionState('runtime-owner-a', createClientSessionState(sharedStoredId))
+    publishSessionState('runtime-owner-b', createClientSessionState(sharedStoredId))
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('same persisted answer', sharedStoredId) as never)
+
+    const updateSessionState = vi.fn((runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) =>
+      updater($sessionStates.get()[runtimeId] ?? createClientSessionState(sharedStoredId))
+    )
+
+    await reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(1, sharedStoredId, {
+      connectionId: ownerA.connectionId,
+      profile: ownerA.targetProfile
+    })
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(2, sharedStoredId, {
+      connectionId: ownerB.connectionId,
+      profile: ownerB.targetProfile
+    })
+    expect(updateSessionState.mock.calls.map(([runtimeId]) => runtimeId)).toEqual(['runtime-owner-a', 'runtime-owner-b'])
+  })
+
+  it('lets the newest reconciliation pass finish every tile without an older pass invalidating it', async () => {
+    const storedA = 'stored-overlap-a'
+    const storedB = 'stored-overlap-b'
+    const runtimeA = 'runtime-overlap-a'
+    const runtimeB = 'runtime-overlap-b'
+    let resolveOldA!: (value: ReturnType<typeof transcript>) => void
+    let resolveNewB!: (value: ReturnType<typeof transcript>) => void
+
+    const oldA = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveOldA = resolve
+    })
+
+    const newB = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveNewB = resolve
+    })
+
+    let readCount = 0
+
+    $sessionTiles.set([
+      { runtimeId: runtimeA, storedSessionId: storedA },
+      { runtimeId: runtimeB, storedSessionId: storedB }
+    ])
+    publishSessionState(runtimeA, createClientSessionState(storedA))
+    publishSessionState(runtimeB, createClientSessionState(storedB))
+    vi.mocked(getLatestSessionMessages).mockImplementation(async storedId => {
+      readCount += 1
+
+      if (readCount === 1) {
+        return oldA as never
+      }
+
+      if (readCount === 2) {
+        return transcript('new A', storedA) as never
+      }
+
+      if (readCount === 3) {
+        return newB as never
+      }
+
+      return transcript('old B', storedId) as never
+    })
+
+    const states = new Map<string, ReturnType<typeof createClientSessionState>>()
+
+    const updateSessionState = vi.fn(
+      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+        const next = updater($sessionStates.get()[runtimeId] ?? createClientSessionState(null))
+        states.set(runtimeId, next)
+
+        return next
+      }
+    )
+
+    const requestSequenceRef = { current: 0 }
+    const signatureRef = { current: new Map<string, string>() }
+    const args = { requestSequenceRef, signatureRef, updateSessionState }
+
+    const olderPass = reconcileTileTranscriptsForTest(args)
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(1))
+
+    const newerPass = reconcileTileTranscriptsForTest(args)
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(3))
+
+    resolveOldA(transcript('old A', storedA))
+    await Promise.resolve()
+    resolveNewB(transcript('new B', storedB))
+    await Promise.all([olderPass, newerPass])
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(3)
+    expect(states.get(runtimeA)?.messages.at(-1)?.parts[0]).toMatchObject({ text: 'new A' })
+    expect(states.get(runtimeB)?.messages.at(-1)?.parts[0]).toMatchObject({ text: 'new B' })
+    expect([...signatureRef.current.values()].sort()).toEqual(
+      [
+        sessionMessagesSignature(transcript('new A', storedA).messages as never),
+        sessionMessagesSignature(transcript('new B', storedB).messages as never)
+      ].sort()
+    )
+
+    vi.mocked(getLatestSessionMessages).mockImplementation(async storedId =>
+      transcript(storedId === storedA ? 'new A' : 'new B', storedId) as never
+    )
+    updateSessionState.mockClear()
+    await reconcileTileTranscriptsForTest(args)
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('keeps a busy Bot tile untouched and reconciles its idle sibling through the real sessions.changed hook path', async () => {
+    const tileRuntimeId = 'runtime-hook-busy-bot-tile'
+    const tileStoredId = 'stored-hook-busy-bot-tile'
+    const idleRuntimeId = 'runtime-hook-idle-sibling'
+    const idleStoredId = 'stored-hook-idle-sibling'
+    const refreshSessions = vi.fn(async () => undefined)
+    const refreshMessagingSessions = vi.fn(async () => undefined)
+
+    const updateSessionState = vi.fn(
+      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+        const next = updater(
+          $sessionStates.get()[runtimeId] ??
+            createClientSessionState(runtimeId === idleRuntimeId ? idleStoredId : tileStoredId)
+        )
+
+        publishSessionState(runtimeId, next)
+
+        return next
+      }
+    )
+
+    const requestGateway = vi.fn(async () => ({ sessions: [] })) as never
+    const refreshActiveTranscript = vi.fn(async () => undefined)
+    const refreshCronJobs = vi.fn(async () => undefined)
+    const refreshCurrentModel = vi.fn(async () => undefined)
+    const refreshHermesConfig = vi.fn(async () => undefined)
+
+    $changeEventsAvailable.set(true)
+    $sessionTiles.set([
+      { runtimeId: tileRuntimeId, storedSessionId: tileStoredId },
+      { runtimeId: idleRuntimeId, storedSessionId: idleStoredId }
+    ])
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: true,
+      messages: [
+        { id: 'user-live', parts: [{ text: 'question', type: 'text' }], role: 'user' },
+        {
+          id: 'assistant-stream-live',
+          parts: [{ text: 'streaming answer', type: 'text' }],
+          pending: true,
+          role: 'assistant'
+        }
+      ]
+    })
+    publishSessionState(idleRuntimeId, createClientSessionState(idleStoredId))
+    vi.mocked(getLatestSessionMessages).mockImplementation(async storedId => {
+      if (storedId === tileStoredId) {
+        return {
+          messages: [{ content: 'question', role: 'user', timestamp: 1 }],
+          session_id: tileStoredId
+        } as never
+      }
+
+      return transcript('idle sibling update', idleStoredId) as never
+    })
+
+    renderHook(() =>
+      useBackgroundSync({
+        activeConnectionId: 'local',
+        activeGatewayProfile: 'default',
+        activeIsMessaging: false,
+        activeSessionId: null,
+        activeStoredSessionId: null,
+        freshDraftReady: false,
+        gatewayState: 'open',
+        refreshActiveTranscript,
+        refreshCronJobs,
+        refreshCurrentModel,
+        refreshHermesConfig,
+        refreshMessagingSessions,
+        refreshSessions,
+        requestGateway,
+        updateSessionState
+      })
+    )
+
+    await act(async () => Promise.resolve())
+    refreshSessions.mockClear()
+    refreshMessagingSessions.mockClear()
+    vi.mocked(getLatestSessionMessages).mockClear()
+
+    act(() => notifySessionsChanged())
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(2))
+
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+    expect(refreshMessagingSessions).toHaveBeenCalledTimes(1)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(tileStoredId)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(idleStoredId)
+    expect(updateSessionState).toHaveBeenCalledTimes(2)
+    expect(updateSessionState).toHaveBeenCalledWith(tileRuntimeId, expect.any(Function), tileStoredId)
+    expect(updateSessionState).toHaveBeenCalledWith(idleRuntimeId, expect.any(Function), idleStoredId)
+    expect($sessionStates.get()[tileRuntimeId]).toMatchObject({ awaitingResponse: true, busy: true })
+    expect($sessionStates.get()[tileRuntimeId]?.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'streaming answer'
+    })
+  })
+
+  it('reconciles a tile after an idle active-list row releases stale live ownership', async () => {
+    const tileRuntimeId = 'runtime-hook-recovered-bot-tile'
+    const tileStoredId = 'stored-hook-recovered-bot-tile'
+
+    let activeListCalls = 0
+
+    let resolveRecoveredList!: (value: {
+      sessions: Array<{ id: string; session_key: string; status: 'idle' }>
+    }) => void
+
+    const recoveredList = new Promise<{
+      sessions: Array<{ id: string; session_key: string; status: 'idle' }>
+    }>(resolve => {
+      resolveRecoveredList = resolve
+    })
+
+    const requestGatewayMock = vi.fn(async (method: string) => {
+      if (method !== 'session.active_list') {
+        return {}
+      }
+
+      activeListCalls += 1
+
+      if (activeListCalls === 1) {
+        return {
+          sessions: [{ id: tileRuntimeId, session_key: tileStoredId, status: 'working' }]
+        }
+      }
+
+      return recoveredList
+    })
+
+    const requestGateway = requestGatewayMock as never
+
+    let canonicalState: ReturnType<typeof createClientSessionState> = {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: true,
+      messages: [
+        { id: 'user-canonical', parts: [{ text: 'question', type: 'text' as const }], role: 'user' as const },
+        {
+          id: 'assistant-stream-canonical',
+          parts: [{ text: 'recovered final', type: 'text' as const }],
+          pending: true,
+          role: 'assistant' as const
+        }
+      ],
+      turnLive: true
+    }
+
+    const updateSessionState = vi.fn(
+      (
+        _runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => {
+        canonicalState = updater(canonicalState)
+        publishSessionState(tileRuntimeId, canonicalState)
+
+        return canonicalState
+      }
+    )
+
+    const stable = {
+      refreshActiveTranscript: vi.fn(async () => undefined),
+      refreshCronJobs: vi.fn(async () => undefined),
+      refreshCurrentModel: vi.fn(async () => undefined),
+      refreshHermesConfig: vi.fn(async () => undefined),
+      refreshMessagingSessions: vi.fn(async () => undefined),
+      refreshSessions: vi.fn(async () => undefined)
+    }
+
+    $changeEventsAvailable.set(true)
+    $sessionTiles.set([{ runtimeId: tileRuntimeId, storedSessionId: tileStoredId }])
+    publishSessionState(tileRuntimeId, { ...canonicalState, messages: [] })
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('recovered final answer', tileStoredId) as never)
+
+    renderHook(() =>
+      useBackgroundSync({
+        activeConnectionId: 'local',
+        activeGatewayProfile: 'default',
+        activeIsMessaging: false,
+        activeSessionId: null,
+        activeStoredSessionId: null,
+        freshDraftReady: false,
+        gatewayState: 'open',
+        requestGateway,
+        updateSessionState,
+        ...stable
+      })
+    )
+
+    await waitFor(() =>
+      expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(1)
+    )
+
+    act(() => notifySessionsChanged())
+    await waitFor(() =>
+      expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(2)
+    )
+    expect(getLatestSessionMessages).toHaveBeenCalledOnce()
+
+    resolveRecoveredList({ sessions: [{ id: tileRuntimeId, session_key: tileStoredId, status: 'idle' }] })
+    await act(async () => recoveredList)
+
+    // The first idle response is stale because the safe transcript merge changed
+    // the runtime state after the status request began. The next current poll
+    // performs the authoritative settle and replays the persisted snapshot.
+    expect(canonicalState).toMatchObject({ awaitingResponse: true, busy: true, turnLive: true })
+
+    act(() => notifySessionsChanged())
+    await waitFor(() =>
+      expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(3)
+    )
+    await waitFor(() =>
+      expect(canonicalState).toMatchObject({ awaitingResponse: false, busy: false, turnLive: false })
+    )
+    await waitFor(() =>
+      expect(canonicalState.messages.at(-1)?.parts[0]).toMatchObject({ text: 'recovered final answer' })
+    )
+    expect(vi.mocked(getLatestSessionMessages).mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(updateSessionState).toHaveBeenCalledWith(tileRuntimeId, expect.any(Function), tileStoredId)
+  })
+
+  it('ignores an active-list response from a previous connection with the same profile', async () => {
+    const staleRuntimeId = 'runtime-from-stale-connection'
+    const staleStoredId = 'stored-from-stale-connection'
+
+    let resolveStaleList!: (value: {
+      sessions: Array<{ id: string; session_key: string; status: 'working' }>
+    }) => void
+
+    const staleList = new Promise<{
+      sessions: Array<{ id: string; session_key: string; status: 'working' }>
+    }>(resolve => {
+      resolveStaleList = resolve
+    })
+
+    let activeListCalls = 0
+
+    const requestGatewayMock = vi.fn(async (method: string) => {
+      if (method !== 'session.active_list') {
+        return {}
+      }
+
+      activeListCalls += 1
+
+      return activeListCalls === 1 ? staleList : { sessions: [] }
+    })
+
+    const requestGateway = requestGatewayMock as never
+
+    const stable = {
+      refreshActiveTranscript: vi.fn(async () => undefined),
+      refreshCronJobs: vi.fn(async () => undefined),
+      refreshCurrentModel: vi.fn(async () => undefined),
+      refreshHermesConfig: vi.fn(async () => undefined),
+      refreshMessagingSessions: vi.fn(async () => undefined),
+      refreshSessions: vi.fn(async () => undefined),
+      updateSessionState: vi.fn(
+        (
+          _runtimeId: string,
+          updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+        ) => updater(createClientSessionState(staleStoredId))
+      )
+    }
+
+    const hook = renderHook(
+      ({ connectionId }: { connectionId: string }) =>
+        useBackgroundSync({
+          activeConnectionId: connectionId,
+          activeGatewayProfile: 'default',
+          activeIsMessaging: false,
+          activeSessionId: null,
+          activeStoredSessionId: null,
+          freshDraftReady: false,
+          gatewayState: 'open',
+          requestGateway,
+          ...stable
+        }),
+      { initialProps: { connectionId: 'source-a' } }
+    )
+
+    await waitFor(() =>
+      expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(1)
+    )
+
+    hook.rerender({ connectionId: 'source-b' })
+    await act(async () => Promise.resolve())
+
+    resolveStaleList({
+      sessions: [{ id: staleRuntimeId, session_key: staleStoredId, status: 'working' }]
+    })
+    await act(async () => staleList)
+
+    expect($sessionStates.get()[staleRuntimeId]).toBeUndefined()
+  })
+
+  it('ignores a delayed empty active-list snapshot after the tile starts a newer turn', async () => {
+    const tileRuntimeId = 'runtime-newer-than-active-list'
+    const tileStoredId = 'stored-newer-than-active-list'
+    let activeListCalls = 0
+    let resolveStaleEmptyList!: (value: { sessions: never[] }) => void
+
+    const staleEmptyList = new Promise<{ sessions: never[] }>(resolve => {
+      resolveStaleEmptyList = resolve
+    })
+
+    const requestGatewayMock = vi.fn(async (method: string) => {
+      if (method !== 'session.active_list') {
+        return {}
+      }
+
+      activeListCalls += 1
+
+      if (activeListCalls === 1) {
+        return {
+          sessions: [{ id: tileRuntimeId, session_key: tileStoredId, status: 'working' }]
+        }
+      }
+
+      return staleEmptyList
+    })
+
+    const requestGateway = requestGatewayMock as never
+
+    const updateSessionState = vi.fn(
+      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) =>
+        updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
+    )
+
+    const stable = {
+      refreshActiveTranscript: vi.fn(async () => undefined),
+      refreshCronJobs: vi.fn(async () => undefined),
+      refreshCurrentModel: vi.fn(async () => undefined),
+      refreshHermesConfig: vi.fn(async () => undefined),
+      refreshMessagingSessions: vi.fn(async () => undefined),
+      refreshSessions: vi.fn(async () => undefined)
+    }
+
+    $changeEventsAvailable.set(true)
+    $sessionTiles.set([{ runtimeId: tileRuntimeId, storedSessionId: tileStoredId }])
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: true,
+      turnLive: true
+    })
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('stale persisted answer', tileStoredId) as never)
+
+    renderHook(() =>
+      useBackgroundSync({
+        activeConnectionId: 'local',
+        activeGatewayProfile: 'default',
+        activeIsMessaging: false,
+        activeSessionId: null,
+        activeStoredSessionId: null,
+        freshDraftReady: false,
+        gatewayState: 'open',
+        requestGateway,
+        updateSessionState,
+        ...stable
+      })
+    )
+
+    await waitFor(() =>
+      expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(1)
+    )
+
+    act(() => notifySessionsChanged())
+    await waitFor(() =>
+      expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(2)
+    )
+
+    const newerState = {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: true,
+      streamId: 'newer-stream',
+      turnLive: true,
+      turnStartedAt: Date.now()
+    }
+
+    publishSessionState(tileRuntimeId, newerState)
+    resolveStaleEmptyList({ sessions: [] })
+    await act(async () => staleEmptyList)
+
+    expect($sessionStates.get()[tileRuntimeId]).toBe(newerState)
+    expect(getLatestSessionMessages).toHaveBeenCalledOnce()
+    expect(updateSessionState).toHaveBeenCalledOnce()
+  })
+
+  it('does not replace a tile while it is awaiting its first response', async () => {
+    const tileRuntimeId = 'runtime-awaiting-bot-tile'
+    const tileStoredId = 'stored-awaiting-bot-tile'
+
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: false,
+      messages: [{ id: 'user-live', parts: [{ text: 'question', type: 'text' }], role: 'user' }]
+    })
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [{ content: 'question', role: 'user', timestamp: 1 }],
+      session_id: tileStoredId
+    } as never)
+
+    const updateSessionState = vi.fn(
+      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+        const next = updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
+
+        publishSessionState(runtimeId, next)
+
+        return next
+      }
+    )
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }],
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(tileStoredId)
+    expect(updateSessionState).toHaveBeenCalledOnce()
+    expect($sessionStates.get()[tileRuntimeId]).toMatchObject({ awaitingResponse: true, busy: false })
+    expect($sessionStates.get()[tileRuntimeId]?.messages.at(-1)?.role).toBe('user')
+  })
+
+  it('does not replace a tile while its turn is live after transient busy flags settle', async () => {
+    const tileRuntimeId = 'runtime-live-bot-tile'
+    const tileStoredId = 'stored-live-bot-tile'
+
+    let canonicalState: ReturnType<typeof createClientSessionState> = {
+      ...createClientSessionState(tileStoredId),
+      messages: [
+        { id: 'user-live', parts: [{ text: 'question', type: 'text' }], role: 'user' },
+        {
+          id: 'assistant-stream-live',
+          parts: [{ text: 'streaming answer', type: 'text' }],
+          pending: true,
+          role: 'assistant'
+        }
+      ],
+      turnLive: true
+    }
+
+    publishSessionState(tileRuntimeId, canonicalState)
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [{ content: 'question', role: 'user', timestamp: 1 }],
+      session_id: tileStoredId
+    } as never)
+
+    const updateSessionState = vi.fn(
+      (_runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+        canonicalState = updater(canonicalState)
+        publishSessionState(tileRuntimeId, canonicalState)
+
+        return canonicalState
+      }
+    )
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }],
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(tileStoredId)
+    expect(updateSessionState).toHaveBeenCalledOnce()
+    expect(canonicalState).toMatchObject({ turnLive: true })
+    expect(canonicalState.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'streaming answer'
+    })
+  })
+
+  it('does not replace a tile while it is blocked on user input', async () => {
+    const tileRuntimeId = 'runtime-needs-input-bot-tile'
+    const tileStoredId = 'stored-needs-input-bot-tile'
+
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      busy: false,
+      needsInput: true,
+      messages: [{ id: 'assistant-question', parts: [{ text: 'Choose an option', type: 'text' }], role: 'assistant' }]
+    })
+
+    const updateSessionState = vi.fn()
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }],
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('discards an in-flight tile snapshot when that tile starts streaming', async () => {
+    const tileRuntimeId = 'runtime-tile-starts-streaming'
+    const tileStoredId = 'stored-tile-starts-streaming'
+    let resolveSnapshot!: (value: ReturnType<typeof transcript>) => void
+
+    const snapshot = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveSnapshot = resolve
+    })
+
+    $sessionTiles.set([{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }])
+    publishSessionState(tileRuntimeId, createClientSessionState(tileStoredId))
+    const updateSessionState = vi.fn()
+    const signatureRef = { current: new Map<string, string>() }
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('last accepted answer', tileStoredId) as never)
+    await reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+    const [signatureKey] = signatureRef.current.keys()
+    const lastAcceptedSignature = signatureRef.current.get(signatureKey)
+
+    updateSessionState.mockClear()
+    vi.mocked(getLatestSessionMessages).mockReturnValue(snapshot as never)
+
+    const reconciliation = reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenLastCalledWith(tileStoredId))
+
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: true,
+      messages: [
+        { id: 'user-live', parts: [{ text: 'question', type: 'text' }], role: 'user' },
+        { id: 'assistant-live', parts: [{ text: 'new stream', type: 'text' }], role: 'assistant' }
+      ]
+    })
+    resolveSnapshot(transcript('stale persisted answer', tileStoredId))
+    await reconciliation
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(signatureRef.current.get(signatureKey)).toBe(lastAcceptedSignature)
+  })
+
+  it('discards a snapshot when a complete tile turn starts and finishes during the read', async () => {
+    const tileRuntimeId = 'runtime-tile-completes-during-read'
+    const tileStoredId = 'stored-tile-completes-during-read'
+    let resolveSnapshot!: (value: ReturnType<typeof transcript>) => void
+
+    const snapshot = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveSnapshot = resolve
+    })
+
+    $sessionTiles.set([{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }])
+    publishSessionState(tileRuntimeId, createClientSessionState(tileStoredId))
+    vi.mocked(getLatestSessionMessages).mockReturnValue(snapshot as never)
+    const updateSessionState = vi.fn()
+
+    const reconciliation = reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledWith(tileStoredId))
+
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      awaitingResponse: true,
+      busy: true,
+      messages: [{ id: 'user-new', parts: [{ text: 'new question', type: 'text' }], role: 'user' }]
+    })
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      messages: [
+        { id: 'user-new', parts: [{ text: 'new question', type: 'text' }], role: 'user' },
+        { id: 'assistant-new', parts: [{ text: 'new completed answer', type: 'text' }], role: 'assistant' }
+      ]
+    })
+    resolveSnapshot(transcript('stale pre-turn answer', tileStoredId))
+    await reconciliation
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('discards a late snapshot after the tile closes', async () => {
+    const tileRuntimeId = 'runtime-tile-closes-during-read'
+    const tileStoredId = 'stored-tile-closes-during-read'
+    let resolveSnapshot!: (value: ReturnType<typeof transcript>) => void
+
+    const snapshot = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveSnapshot = resolve
+    })
+
+    $sessionTiles.set([{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }])
+    publishSessionState(tileRuntimeId, createClientSessionState(tileStoredId))
+    const updateSessionState = vi.fn()
+    const signatureRef = { current: new Map<string, string>() }
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('last accepted answer', tileStoredId) as never)
+    await reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+    const [signatureKey] = signatureRef.current.keys()
+
+    updateSessionState.mockClear()
+    vi.mocked(getLatestSessionMessages).mockReturnValue(snapshot as never)
+
+    const reconciliation = reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(2))
+
+    $sessionTiles.set([])
+    resolveSnapshot(transcript('late snapshot', tileStoredId))
+    await reconciliation
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(signatureRef.current.has(signatureKey)).toBe(false)
+  })
+
+  it('discards a late snapshot after the tile owner generation changes', async () => {
+    const tileRuntimeId = 'runtime-tile-generation-rebound'
+    const tileStoredId = 'stored-tile-generation-rebound'
+    let resolveSnapshot!: (value: ReturnType<typeof transcript>) => void
+
+    const snapshot = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveSnapshot = resolve
+    })
+
+    $sessionTiles.set([{ ownerGeneration: 1, storedSessionId: tileStoredId, runtimeId: tileRuntimeId }])
+    publishSessionState(tileRuntimeId, createClientSessionState(tileStoredId))
+    vi.mocked(getLatestSessionMessages).mockReturnValue(snapshot as never)
+    const updateSessionState = vi.fn()
+
+    const reconciliation = reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledWith(tileStoredId))
+
+    $sessionTiles.set([{ ownerGeneration: 2, storedSessionId: tileStoredId, runtimeId: tileRuntimeId }])
+    resolveSnapshot(transcript('old generation snapshot', tileStoredId))
+    await reconciliation
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('discards a late tile snapshot after that runtime becomes the main session', async () => {
+    const tileRuntimeId = 'runtime-tile-promoted-during-read'
+    const tileStoredId = 'stored-tile-promoted-during-read'
+    let resolveSnapshot!: (value: ReturnType<typeof transcript>) => void
+
+    const snapshot = new Promise<ReturnType<typeof transcript>>(resolve => {
+      resolveSnapshot = resolve
+    })
+
+    $sessionTiles.set([{ storedSessionId: tileStoredId, runtimeId: tileRuntimeId }])
+    publishSessionState(tileRuntimeId, createClientSessionState(tileStoredId))
+    vi.mocked(getLatestSessionMessages).mockReturnValue(snapshot as never)
+    const updateSessionState = vi.fn()
+
+    const reconciliation = reconcileTileTranscriptsForTest({
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledWith(tileStoredId))
+
+    $activeSessionId.set(tileRuntimeId)
+    resolveSnapshot(transcript('late tile snapshot', tileStoredId))
+    await reconciliation
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('hydrates the same persisted snapshot after a tile rebinds to a new runtime generation', async () => {
+    const tileStoredId = 'stored-tile-rebound-after-accepted-snapshot'
+    const firstRuntimeId = 'runtime-tile-first-binding'
+    const secondRuntimeId = 'runtime-tile-second-binding'
+    const signatureRef = { current: new Map<string, string>() }
+
+    $sessionTiles.set([{ ownerGeneration: 1, runtimeId: firstRuntimeId, storedSessionId: tileStoredId }])
+    publishSessionState(firstRuntimeId, createClientSessionState(tileStoredId))
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('persisted answer', tileStoredId) as never)
+
+    const updateSessionState = vi.fn(
+      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) =>
+        updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
+    )
+
+    const args = { requestSequenceRef: { current: 0 }, signatureRef, updateSessionState }
+
+    await reconcileTileTranscriptsForTest(args)
+
+    $sessionTiles.set([{ ownerGeneration: 2, runtimeId: secondRuntimeId, storedSessionId: tileStoredId }])
+    publishSessionState(secondRuntimeId, createClientSessionState(tileStoredId))
+    await reconcileTileTranscriptsForTest(args)
+
+    expect(updateSessionState.mock.calls.map(([runtimeId]) => runtimeId)).toEqual([firstRuntimeId, secondRuntimeId])
+    expect(signatureRef.current.size).toBe(1)
+  })
+
+  it('skips the tile update when the persisted signature is unchanged', async () => {
     $changeEventsAvailable.set(true)
 
     const TILE_RUNTIME_ID = 'runtime-tile-2'
     const TILE_STORED_ID = 'stored-tile-2'
 
+    publishSessionState(TILE_RUNTIME_ID, createClientSessionState(TILE_STORED_ID))
+
     const signatureRef = { current: new Map<string, string>() }
 
-    // Pre-seed the signature with what the mock returns → no-change tick.
     const pre = {
       messages: [
         { content: 'q', role: 'user', timestamp: 1 },
@@ -280,26 +1147,23 @@ describe('active transcript refresh', () => {
     }
 
     vi.mocked(getLatestSessionMessages).mockResolvedValue(pre as never)
-
-    // Compute the same signature the reconcile will compute, and pre-seed it.
-    const preSignature = sessionMessagesSignature(pre.messages as never)
-
-    signatureRef.current.set(`tile:${TILE_STORED_ID}`, preSignature)
-
     const updateSessionState = vi.fn()
-    const busyRef = { current: false }
     const requestSequenceRef = { current: 0 }
 
-    await act(async () => {
-      await reconcileTileTranscriptsForTest({
-        tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
-        busyRef,
-        requestSequenceRef,
-        signatureRef,
-        updateSessionState
-      })
-    })
+    const args = {
+      tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
+      requestSequenceRef,
+      signatureRef,
+      updateSessionState
+    }
 
+    await act(async () => reconcileTileTranscriptsForTest(args))
+    expect(updateSessionState).toHaveBeenCalledOnce()
+
+    updateSessionState.mockClear()
+    await act(async () => reconcileTileTranscriptsForTest(args))
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(2)
     expect(updateSessionState).not.toHaveBeenCalled()
   })
 
@@ -624,7 +1488,163 @@ describe('rehydrateLiveSessionStatuses', () => {
     expect($stalledSessionIds.get()).toEqual([])
   })
 
-  it('ignores idle, starting, and malformed live-session rows', () => {
+  it('preserves an accepted optimistic turn while active-list reports starting', () => {
+    const runtimeId = 'runtime-starting-accepted'
+    const storedId = 'stored-starting-accepted'
+
+    const accepted = {
+      ...createClientSessionState(storedId),
+      awaitingResponse: true,
+      busy: true,
+      streamId: 'accepted-stream',
+      turnStartedAt: Date.now() - PRE_TURN_LIVE_SETTLE_GRACE_MS - 1
+    }
+
+    publishSessionState(runtimeId, accepted)
+    rehydrateLiveSessionStatuses(
+      { sessions: [{ id: runtimeId, session_key: storedId, status: 'starting' }] },
+      Date.now(),
+      'starting-accepted-scope',
+      $sessionStates.get()
+    )
+
+    expect($sessionStates.get()[runtimeId]).toBe(accepted)
+  })
+
+  it('does not let a current working row re-arm an interrupted runtime', () => {
+    const runtimeId = 'runtime-interrupted-before-status'
+    const storedId = 'stored-interrupted-before-status'
+
+    const interrupted = {
+      ...createClientSessionState(storedId),
+      interrupted: true
+    }
+
+    publishSessionState(runtimeId, interrupted)
+    rehydrateLiveSessionStatuses(
+      { sessions: [{ id: runtimeId, session_key: storedId, status: 'working' }] },
+      Date.now(),
+      'interrupted-scope',
+      $sessionStates.get()
+    )
+
+    expect($sessionStates.get()[runtimeId]).toBe(interrupted)
+    expect($sessionStates.get()[runtimeId]).toMatchObject({ busy: false, interrupted: true, turnLive: false })
+  })
+
+  it('reaps a turnLive-only runtime when it disappears from active-list', () => {
+    const runtimeId = 'runtime-turn-live-only'
+    const storedId = 'stored-turn-live-only'
+    const scopeKey = 'turn-live-only-scope'
+
+    rehydrateLiveSessionStatuses({
+      sessions: [{ id: runtimeId, session_key: storedId, status: 'working' }]
+    }, Date.now(), scopeKey)
+    publishSessionState(runtimeId, {
+      ...createClientSessionState(storedId),
+      turnLive: true
+    })
+
+    expect(rehydrateLiveSessionStatuses({ sessions: [] }, Date.now(), scopeKey, $sessionStates.get())).toBe(true)
+    expect($sessionStates.get()[runtimeId]).toMatchObject({ busy: false, turnLive: false })
+  })
+
+  it('preserves a fresh optimistic turn across a current idle active-list row', () => {
+    const now = 1_800_000_000_000
+    const runtimeId = 'runtime-fresh-optimistic'
+    const storedId = 'stored-fresh-optimistic'
+
+    const optimistic = {
+      ...createClientSessionState(storedId),
+      awaitingResponse: true,
+      busy: true,
+      streamId: 'pending-stream',
+      turnStartedAt: now - PRE_TURN_LIVE_SETTLE_GRACE_MS + 1
+    }
+
+    publishSessionState(runtimeId, optimistic)
+
+    expect(
+      rehydrateLiveSessionStatuses(
+        { sessions: [{ id: runtimeId, session_key: storedId, status: 'idle' }] },
+        now,
+        'fresh-optimistic-scope',
+        $sessionStates.get()
+      )
+    ).toBe(false)
+    expect($sessionStates.get()[runtimeId]).toBe(optimistic)
+  })
+
+  it('settles an optimistic turn once the pre-start grace expires', () => {
+    const now = 1_800_000_000_000
+    const runtimeId = 'runtime-expired-optimistic'
+    const storedId = 'stored-expired-optimistic'
+
+    publishSessionState(runtimeId, {
+      ...createClientSessionState(storedId),
+      awaitingResponse: true,
+      busy: true,
+      streamId: 'pending-stream',
+      turnStartedAt: now - PRE_TURN_LIVE_SETTLE_GRACE_MS - 1
+    })
+
+    expect(
+      rehydrateLiveSessionStatuses(
+        { sessions: [{ id: runtimeId, session_key: storedId, status: 'idle' }] },
+        now,
+        'expired-optimistic-scope',
+        $sessionStates.get()
+      )
+    ).toBe(true)
+    expect($sessionStates.get()[runtimeId]).toMatchObject({
+      awaitingResponse: false,
+      busy: false,
+      streamId: null,
+      turnLive: false,
+      turnStartedAt: null
+    })
+  })
+
+  it('keeps a stale absence eligible for a later current recovery snapshot', () => {
+    const now = 1_800_000_000_000
+    const runtimeId = 'runtime-stale-absence'
+    const storedId = 'stored-stale-absence'
+    const scopeKey = 'stale-absence-scope'
+
+    rehydrateLiveSessionStatuses(
+      { sessions: [{ id: runtimeId, session_key: storedId, status: 'working' }] },
+      now,
+      scopeKey
+    )
+    const staleRequestState = $sessionStates.get()
+
+    const newerState = {
+      ...createClientSessionState(storedId),
+      awaitingResponse: true,
+      busy: true,
+      streamId: 'newer-stream',
+      turnLive: true,
+      turnStartedAt: now + 1
+    }
+
+    publishSessionState(runtimeId, newerState)
+
+    expect(rehydrateLiveSessionStatuses({ sessions: [] }, now + 2, scopeKey, staleRequestState)).toBe(false)
+    expect($sessionStates.get()[runtimeId]).toBe(newerState)
+
+    const currentRequestState = $sessionStates.get()
+
+    expect(rehydrateLiveSessionStatuses({ sessions: [] }, now + 3, scopeKey, currentRequestState)).toBe(true)
+    expect($sessionStates.get()[runtimeId]).toMatchObject({
+      awaitingResponse: false,
+      busy: false,
+      streamId: null,
+      turnLive: false,
+      turnStartedAt: null
+    })
+  })
+
+  it('keeps idle, starting, and malformed rows out of working state without local turn proof', () => {
     rehydrateLiveSessionStatuses({
       sessions: [
         { id: 'runtime-idle', session_key: 'idle-session', status: 'idle' },

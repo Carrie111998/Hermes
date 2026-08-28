@@ -83,6 +83,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
@@ -126,6 +127,7 @@ import { usePromptActions } from '../session/hooks/use-prompt-actions'
 import type { ComposerSessionCreatedForSend } from '../session/hooks/use-prompt-actions/utils'
 import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
+import { preserveLocalPendingTurnMessages } from '../session/hooks/use-session-actions/utils'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from '../session/workspace-session-target'
@@ -393,23 +395,56 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         return
       }
 
-      const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
+      const stored = resolveActiveTranscriptSession(storedSessionId)
+
+      if (!stored) {
+        return
+      }
+
+      const profileScope = stored.ownerRoute
+        ? {
+            connectionId: stored.ownerRoute.connectionId,
+            profile: stored.ownerRoute.targetProfile ?? stored.ownerRoute.profile
+          }
+        : stored.profile
 
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
+        const stateAtReadStart = $sessionStates.get()[runtimeSessionId]
+
         try {
-          const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
+          const latest = await getLatestSessionMessages(storedSessionId, profileScope)
+
+          if (
+            activeSessionIdRef.current !== runtimeSessionId ||
+            selectedStoredSessionIdRef.current !== storedSessionId
+          ) {
+            return
+          }
+
+          if ($sessionStates.get()[runtimeSessionId] !== stateAtReadStart) {
+            if (index < attempts - 1) {
+              await new Promise(resolve => window.setTimeout(resolve, 250))
+            }
+
+            continue
+          }
+
           const messages = toChatMessages(latest.messages)
+
           updateSessionState(
             runtimeSessionId,
-            state => ({
-              ...state,
+            state => {
               // Post-turn rehydrate reads only the newest tail page — graft it
-              // onto any backfilled older pages instead of dropping them.
-              messages: preserveLocalAssistantErrors(
-                graftRefreshedTailOntoBackfill(messages, state.messages),
-                state.messages
-              )
-            }),
+              // onto any backfilled older pages instead of dropping them, then
+              // retain a local pending/streamed tail until storage commits it.
+              const refreshed = graftRefreshedTailOntoBackfill(messages, state.messages)
+              const withPendingTurn = preserveLocalPendingTurnMessages(refreshed, state.messages)
+
+              return {
+                ...state,
+                messages: preserveLocalAssistantErrors(withPendingTurn, state.messages)
+              }
+            },
             storedSessionId
           )
 
