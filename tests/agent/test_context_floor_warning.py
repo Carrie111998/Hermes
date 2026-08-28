@@ -14,10 +14,16 @@ from agent.context_compressor import (
     ContextCompressor,
     _SMALL_CTX_THRESHOLD_PERCENT,
     _SMALL_CTX_WINDOW_LIMIT,
+    _WARNED_FLOOR_OVERRIDES,
 )
 
 
 class TestSmallContextFloorWarning:
+    @pytest.fixture(autouse=True)
+    def _clear_warned_set(self):
+        """Clear the dedupe set before each test so warnings fire predictably."""
+        _WARNED_FLOOR_OVERRIDES.clear()
+        yield
     def test_floor_still_raises_low_values(self):
         eff = ContextCompressor._effective_threshold_percent(262_144, 0.6)
         assert eff == _SMALL_CTX_THRESHOLD_PERCENT
