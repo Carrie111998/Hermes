@@ -534,7 +534,7 @@ class TestFailureAttribution:
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
-        recover_with_credential_pool(
+        recovered, _ = recover_with_credential_pool(
             agent,
             status_code=403,
             has_retried_429=False,
@@ -542,8 +542,11 @@ class TestFailureAttribution:
         )
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
+        assert recovered is True
         assert failed.last_status == "exhausted"
         assert failed.failure_reason == "billing"
+        swapped = agent._swap_credential.call_args[0][0]
+        assert swapped.id == "cred-0"
 
     def test_unclassified_403_records_no_billing_reason(self, tmp_path, monkeypatch):
         """An unclassified 403 stays transient — no billing verdict is invented."""
