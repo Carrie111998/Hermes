@@ -10,8 +10,9 @@ description: >-
   semantic search (12-50x cheaper than raw file reads) plus a local Hebbian
   synapse graph that learns which code moves together from real usage. Indexes
   and queries locally, with no telemetry and no calls home; the one outbound
-  request is the embedding model the vector store fetches on the first build,
-  which air-gapped installs can pre-seed.
+  request is NeuralMind fetching its MiniLM embedding model the first time it
+  embeds on a machine with no cached copy, which air-gapped installs can
+  pre-seed via NEURALMIND_ONNX_MODEL_DIR.
 source: https://github.com/dfrostar/neuralmind
 
 # neuralmind-mcp is a PyPI console-script entry point, not a git-cloned
@@ -33,12 +34,19 @@ auth:
 # only rebuilds that project's own index.
 #
 # On the network claim, stated precisely rather than absolutely: no tool here
-# opens a network connection at query time, and none sends telemetry. The one
-# exception is the *first* `neuralmind_build` on a machine with no cached
-# embedding model, where the vector store downloads that model. Later builds
-# are offline, and the cache can be pre-seeded for air-gapped installs (see
-# docs/use-cases/air-gapped.md in the source repo). Note this is a property of
-# the server, not something this catalog's CI verifies.
+# opens a network connection at query time, and none sends telemetry.
+#
+# The one exception is the first embed on a machine with no cached model —
+# typically the first `neuralmind_build`. NeuralMind's own embedder
+# (neuralmind/onnx_embedder.py) then fetches the all-MiniLM-L6-v2 ONNX archive
+# over HTTPS, pinned by SHA256, into ~/.cache/neuralmind/onnx_models/. It looks
+# in $NEURALMIND_ONNX_MODEL_DIR and the local caches first, so pre-seeding
+# either one makes even that request go away — which is how air-gapped installs
+# run it. Every later build and every query is offline.
+#
+# Stated this precisely because "makes no network calls" would be wrong: that
+# fetch is NeuralMind's own code, not a dependency's. Note also that this is a
+# property of the server, not something this catalog's CI verifies.
 tools:
   default_enabled:
     - neuralmind_wakeup
