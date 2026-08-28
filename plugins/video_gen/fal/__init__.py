@@ -204,7 +204,8 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
             "1080p": "2K", "2k": "2K", "4k": "4K", "2160p": "4K",
         },
         "durations": (5, 15),
-        "audio": False,  # audio is native/always-on; no generate_audio key
+        "audio": False,  # no generate_audio TOGGLE — audio is always on
+        "audio_native": True,  # native audio in every generation (fal docs)  # audio is native/always-on; no generate_audio key
         "negative": False,
         "seed": False,
     },
@@ -234,7 +235,8 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         # `prompt_expansion_mode` is in the schema's required array (with a
         # "balanced" default) — always send it.
         "static_payload": {"prompt_expansion_mode": "balanced"},
-        "audio": False,  # audio is native/always-on; no generate_audio key
+        "audio": False,  # no generate_audio TOGGLE — audio is always on
+        "audio_native": True,  # native audio in every generation (fal docs)  # audio is native/always-on; no generate_audio key
         "negative": False,
         "seed": True,
         # Unlike base H3, Max declares `seed` on both endpoints.
@@ -270,7 +272,8 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "aspect_ratios": ("16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16"),
         "resolutions": ("480p", "720p", "1080p"),
         "durations": (1, 15),
-        "audio": False,  # audio is native; no generate_audio key
+        "audio": False,  # no generate_audio TOGGLE — audio is always on
+        "audio_native": True,  # native audio in every generation (fal docs)  # audio is native; no generate_audio key
         "negative": False,
         "seed": False,
     },
@@ -287,7 +290,8 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "aspect_ratios": ("16:9", "9:16"),
         "resolutions": None,
         "durations": (3, 10),
-        "audio": False,  # audio is native; no generate_audio key
+        "audio": False,  # no generate_audio TOGGLE — audio is always on
+        "audio_native": True,  # native audio in every generation (fal docs)  # audio is native; no generate_audio key
         "negative": False,
         "seed": False,
     },
@@ -322,7 +326,8 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "aspect_ratios": None,
         "resolutions": None,
         "durations": None,
-        "audio": False,
+        "audio": False,  # no generate_audio TOGGLE — audio is always on
+        "audio_native": True,  # native audio in every generation (fal docs)
         "negative": False,
         "seed": True,
     },
@@ -839,6 +844,11 @@ class FALVideoGenProvider(VideoGenProvider):
                 "max_duration": hi,
                 "min_duration": lo,
                 "supports_audio": bool(family.get("audio")),
+                # Always-on native audio (no toggle): surfaces as a
+                # description line, not a param. Verified per-family
+                # against fal model pages (H3, Grok 1.5, Happy Horse,
+                # Gemini Omni Flash all return native audio every run).
+                "audio_always_on": bool(family.get("audio_native")),
                 "supports_negative_prompt": bool(family.get("negative")),
                 # Explicit per-family key (contract-tested); absent would
                 # mean a catalog bug, so fail closed here.

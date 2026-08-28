@@ -113,6 +113,29 @@ class TestFleetCapabilityCoverage(unittest.TestCase):
                     meta.get("text_endpoint") or meta.get("image_endpoint"),
                     f"{fam} declares no endpoint",
                 )
+                # Audio truth model: "audio" means a generate_audio TOGGLE
+                # exists; "audio_native" means audio is ALWAYS ON with no
+                # toggle. A family may have neither (silent model) but
+                # never both — that would be contradictory.
+                self.assertFalse(
+                    meta.get("audio") and meta.get("audio_native"),
+                    f"{fam}: audio toggle and always-on are mutually "
+                    "exclusive",
+                )
+
+    def test_always_on_audio_surfaces_in_description_not_param(self):
+        """Maintainer catch (H3 has audio!): families whose audio is
+        always-on (no API toggle) must TELL the model about the audio in
+        the description rather than advertise a dead `audio` param."""
+        schema = TestDynamicParamGating._schema_with(
+            TestDynamicParamGating(), {
+                "modalities": ["text", "image"],
+                "supports_audio": False, "audio_always_on": True,
+                "supports_negative_prompt": False, "supports_seed": False,
+                "supports_upscale": False, "max_reference_images": 0,
+            })
+        self.assertNotIn("audio", schema["parameters"]["properties"])
+        self.assertIn("always on", schema["description"])
 
     def test_declaration_matches_implementation(self):
         """supports_seed / supports_upscale: declaration ⇄ implementation,

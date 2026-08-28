@@ -564,6 +564,12 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
                 "Enable native audio generation (affects pricing tier)."
             ),
         }
+    elif caps.get("audio_always_on"):
+        parts.append(
+            "- audio: native stereo audio is generated with every video "
+            "(always on; no toggle) — describe the desired sound in the "
+            "prompt"
+        )
     if caps.get("supports_seed"):
         properties["seed"] = {
             "type": "integer",
