@@ -12,7 +12,7 @@ Defense against context-window overflow operates at three levels:
    in-context content is replaced with a preview + file path reference.
 
    The canonical home is ALWAYS host-side:
-   ``$HERMES_HOME/cache/spillover/{tool_use_id}.txt`` — alongside the other
+   ``$HERMES_HOME/cache/spillover/{digest-only-id}.txt`` — alongside the other
    Hermes-owned caches. Remote backends use a translated path when mounted,
    otherwise they receive a sandbox temp copy.
 
@@ -52,6 +52,7 @@ _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
 _spillover_prune_lock = threading.Lock()
+_spillover_publish_lock = threading.Lock()
 _spillover_pruned_once = False
 
 
@@ -126,20 +127,30 @@ def _is_host_side_env(env) -> bool:
 
 
 def _write_to_spillover(content, filename: str):
-    """Atomically publish sanitized content to host spillover."""
+    """Atomically publish sanitized content without same-name aliasing."""
     temporary_path = None
+    safe_content = sanitize_tool_result_for_sink(content)
+    if not isinstance(filename, str) or not filename:
+        filename = "tool_result.txt"
+    if os.path.basename(filename) != filename or _UNSAFE_RESULT_FILENAME_CHARS.search(filename):
+        filename = _safe_result_filename(filename)
     try:
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
-        path = spill_dir / filename
-        fd, temporary_path = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=spill_dir
-        )
-        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream:
-            stream.write(sanitize_tool_result_for_sink(content))
-        os.replace(temporary_path, path)
-        temporary_path = None
-    except OSError as exc:
+        with _spillover_publish_lock:
+            path = spill_dir / filename
+            if path.exists():
+                path = spill_dir / (
+                    f"{path.stem}_{uuid.uuid4().hex[:16]}{path.suffix}"
+                )
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=spill_dir
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream:
+                stream.write(safe_content)
+            os.replace(temporary_path, path)
+            temporary_path = None
+    except Exception as exc:
         logger.warning("Spillover write failed for %s: %s", filename, exc)
         return None
     finally:
@@ -195,21 +206,16 @@ def _resolve_storage_dir(env) -> str:
 
 
 def _safe_result_filename(tool_use_id: str) -> str:
-    """Return a single safe filename for a tool result id."""
-    raw_id = str(tool_use_id or "tool_result")
-    safe_stem = _UNSAFE_RESULT_FILENAME_CHARS.sub("_", raw_id).strip("._-")
-    changed = safe_stem != raw_id
+    """Return a digest-only filename that never exposes a caller-supplied id."""
+    raw_id = tool_use_id if isinstance(tool_use_id, str) else "tool_result"
+    digest = hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"tool_result_{digest}.txt"
 
-    if not safe_stem:
-        safe_stem = "tool_result"
-        changed = True
 
-    if changed or len(safe_stem) > _MAX_RESULT_FILENAME_STEM:
-        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
-        safe_stem = safe_stem[:_MAX_RESULT_FILENAME_STEM].rstrip("._-") or "tool_result"
-        safe_stem = f"{safe_stem}_{digest}"
-
-    return f"{safe_stem}.txt"
+def _safe_result_id_label(tool_use_id: str) -> str:
+    """Return a short non-reusable correlation label for logs."""
+    raw_id = tool_use_id if isinstance(tool_use_id, str) else "tool_result"
+    return hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
 def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
@@ -343,8 +349,8 @@ def maybe_persist_tool_result(
     if _is_host_side_env(env):
         if host_path is not None:
             logger.info(
-                "Persisted large tool result: %s (%s, %d chars -> %s)",
-                tool_name, tool_use_id, content_length, host_path,
+                "Persisted large tool result: %s (correlation=%s, %d chars -> %s)",
+                tool_name, _safe_result_id_label(tool_use_id), content_length, host_path,
             )
             return _build_persisted_message(preview, has_more, content_length, host_path)
     elif env is not None:
@@ -355,8 +361,8 @@ def maybe_persist_tool_result(
             visible = _sandbox_visible_spillover_path(host_path, env)
             if visible is not None:
                 logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
-                    tool_name, tool_use_id, content_length, visible, host_path,
+                    "Persisted large tool result: %s (correlation=%s, %d chars -> %s [host: %s])",
+                    tool_name, _safe_result_id_label(tool_use_id), content_length, visible, host_path,
                 )
                 return _build_persisted_message(preview, has_more, content_length, visible)
         # Fallback: write into the sandbox temp dir (pre-existing containers
@@ -366,12 +372,12 @@ def maybe_persist_tool_result(
         try:
             if _write_to_sandbox(safe_content, remote_path, env):
                 logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, content_length, remote_path,
+                    "Persisted large tool result: %s (correlation=%s, %d chars -> %s)",
+                    tool_name, _safe_result_id_label(tool_use_id), content_length, remote_path,
                 )
                 return _build_persisted_message(preview, has_more, content_length, remote_path)
         except Exception as exc:
-            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+            logger.warning("Sandbox write failed for correlation=%s: %s", _safe_result_id_label(tool_use_id), exc)
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
@@ -434,8 +440,8 @@ def enforce_turn_budget(
             total_size += len(replacement)
             tool_messages[idx]["content"] = replacement
             logger.info(
-                "Budget enforcement: persisted tool result %s (%d chars)",
-                tool_use_id, size,
+                "Budget enforcement: persisted tool result correlation=%s (%d chars)",
+                _safe_result_id_label(tool_use_id), size,
             )
 
     return tool_messages

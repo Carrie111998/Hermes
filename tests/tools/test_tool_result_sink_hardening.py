@@ -1,6 +1,8 @@
 """Causal regressions for every non-model tool-result sink."""
 
 import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 from model_tools import _emit_post_tool_call_hook
@@ -93,3 +95,61 @@ def test_post_tool_hook_sanitizes_error_message():
             status="error",
         )
     assert seen[0]["error_message"] != OPAQUE
+
+
+def test_file_mutation_footer_redacts_retained_error_preview():
+    from run_agent import AIAgent
+
+    raw = "lowercasecredential1234567890abcde"
+    footer = AIAgent._format_file_mutation_failure_footer({
+        "settings.json": {"tool": "patch", "error_preview": raw},
+    })
+    assert raw not in footer
+    assert "redacted" in footer.lower()
+
+
+def test_sink_policy_closes_lowercase_nested_url_and_binary_gaps():
+    sentinel = "lowercasecredential1234567890abcde"
+    value = {
+        "message": sentinel,
+        "nested": [{"value": sentinel}],
+        "callback": f"https://example.test/callback?state={sentinel}",
+    }
+    for candidate in (value, sentinel.encode(), bytearray(sentinel.encode()), memoryview(sentinel.encode())):
+        safe = sanitize_tool_result_for_sink(candidate)
+        assert sentinel not in safe
+        assert "redacted" in safe.lower()
+
+
+def test_sink_serializer_is_total_for_hostile_and_recursive_values():
+    class Explosive:
+        def __str__(self):
+            raise RuntimeError("str-bomb")
+
+        def __repr__(self):
+            raise RuntimeError("repr-bomb")
+
+    recursive = []
+    recursive.append(recursive)
+    for candidate in (Explosive(), {"value": Explosive()}, recursive, float("nan")):
+        safe = sanitize_tool_result_for_sink(candidate)
+        assert isinstance(safe, str)
+        assert "bomb" not in safe
+
+
+def test_same_filename_publication_has_unique_atomic_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from tools import tool_result_storage as storage
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        paths = list(pool.map(
+            lambda index: storage._write_to_spillover(
+                f"race-result-{index}-opaque-r3-123456", "same-id.txt"
+            ),
+            range(12),
+        ))
+    assert all(paths)
+    assert len(set(paths)) == 12
+    spill_dir = Path(paths[0]).parent
+    assert not list(spill_dir.glob("*.tmp"))
+    assert all("same-id" in Path(path).name for path in paths)

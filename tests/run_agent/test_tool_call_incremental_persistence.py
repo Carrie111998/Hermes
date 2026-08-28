@@ -614,3 +614,29 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_sequential_display_uses_sink_safe_result(capsys):
+    agent = _make_agent()
+    agent.quiet_mode = False
+    agent.tool_progress_mode = "all"
+    sentinel = "lowercasecredential1234567890abcde"
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call(name="web_search", call_id="display-safe")],
+    )
+    messages: list = []
+
+    with (
+        patch("run_agent.handle_function_call", return_value=sentinel),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    output = capsys.readouterr().out
+    assert sentinel not in output
+    assert "redacted" in output.lower()
+    assert sentinel in messages[-1]["content"]
