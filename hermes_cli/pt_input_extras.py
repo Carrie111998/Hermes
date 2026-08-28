@@ -50,7 +50,7 @@ def _clear_vt100_prefix_cache() -> None:
 def install_canonical_space_binding(key_bindings) -> None:
     """Insert an ASCII space even when parser data retains escape bytes."""
 
-    @key_bindings.add(" ", eager=True)
+    @key_bindings.add(" ")
     def insert_ascii_space(event):
         event.current_buffer.insert_text(" " * event.arg)
 

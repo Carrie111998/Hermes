@@ -15,16 +15,21 @@ the raw byte would.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import set_app
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.input import DummyInput
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import BufferControl, Layout, Window
+from prompt_toolkit.output import DummyOutput
 
 from hermes_cli.pt_input_extras import (
     install_canonical_space_binding,
@@ -62,6 +67,21 @@ def _parse_presses(byte_seq: str):
 def _parse(byte_seq: str):
     """Return the logical keys parsed from a terminal byte sequence."""
     return [kp.key for kp in _parse_presses(byte_seq)]
+
+
+def _dispatch(key_bindings, key_press, buffer):
+    """Dispatch one parsed key through prompt_toolkit's real key processor."""
+    app = Application(
+        layout=Layout(Window(BufferControl(buffer=buffer))),
+        key_bindings=key_bindings,
+        input=DummyInput(),
+        output=DummyOutput(),
+    )
+    cast(Any, app).timeoutlen = None
+    processor = app.key_processor
+    with set_app(app):
+        processor.feed(key_press)
+        processor.process_keys()
 
 
 # ---------------------------------------------------------------------------
@@ -387,12 +407,26 @@ def test_space_binding_inserts_canonical_space(byte_seq):
     assert len(presses) == 1
     assert presses[0].data == byte_seq
 
-    bindings = key_bindings.get_bindings_for_keys((presses[0].key,))
-    assert len(bindings) == 1
+    buffer = Buffer()
+    _dispatch(key_bindings, presses[0], buffer)
+    assert buffer.text == " "
+
+
+def test_specialized_space_binding_takes_precedence():
+    """A mode-specific Space handler must override canonical insertion."""
+    key_bindings = KeyBindings()
+    install_canonical_space_binding(key_bindings)
+    toggled = []
+
+    @key_bindings.add("space", filter=Condition(lambda: True))
+    def clarify_toggle(_event):
+        toggled.append(True)
 
     buffer = Buffer()
-    cast(Any, bindings[0].handler)(SimpleNamespace(current_buffer=buffer, arg=1))
-    assert buffer.text == " "
+    _dispatch(key_bindings, _parse_presses(" ")[0], buffer)
+
+    assert toggled == [True]
+    assert buffer.text == ""
 
 
 # ---------------------------------------------------------------------------
