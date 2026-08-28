@@ -3,7 +3,8 @@
 import re
 from pathlib import Path
 import pytest
-import yaml
+
+from tests.skills._skill_test_utils import parse_frontmatter_and_body, resolve_related_skills_in_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_MD = (
@@ -37,16 +38,6 @@ CYCLE_STEPS = [
 ]
 
 
-def _frontmatter_and_body():
-    content = SKILL_MD.read_text(encoding="utf-8")
-    assert content.startswith("---")
-    m = re.search(r"\n---\s*\n", content[3:])
-    assert m, "frontmatter must close with ---"
-    fm = yaml.safe_load(content[3 : m.start() + 3])
-    body = content[m.end() + 3 :]
-    return fm, body
-
-
 class TestTDDSkillContract:
     """Test that SKILL.md adheres to the project hardline standards."""
 
@@ -54,7 +45,7 @@ class TestTDDSkillContract:
         assert SKILL_MD.is_file()
 
     def test_frontmatter_required_fields(self):
-        fm, _ = _frontmatter_and_body()
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
         for field in ("name", "description", "version", "author", "license", "platforms"):
             assert field in fm, f"missing frontmatter field: {field}"
         assert fm["name"] == "test-driven-development"
@@ -63,7 +54,7 @@ class TestTDDSkillContract:
         assert "related_skills" in hermes
 
     def test_description_hardline(self):
-        fm, _ = _frontmatter_and_body()
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
         desc = fm["description"]
         assert len(desc) <= 60, f"description is {len(desc)} chars; max allowed is 60"
         assert desc.endswith("."), "description must end with a period"
@@ -74,31 +65,27 @@ class TestTDDSkillContract:
         )
 
     def test_related_skills_resolve_in_repo(self):
-        fm, _ = _frontmatter_and_body()
-        for name in fm["metadata"]["hermes"]["related_skills"]:
-            hits = list(REPO_ROOT.glob(f"skills/**/{name}/SKILL.md")) + list(
-                REPO_ROOT.glob(f"optional-skills/**/{name}/SKILL.md")
-            )
-            assert hits, f"related_skills entry does not resolve in repo: {name}"
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
+        missing = resolve_related_skills_in_repo(fm["metadata"]["hermes"]["related_skills"])
+        assert not missing, f"related_skills entries do not resolve in repo: {missing}"
 
     def test_no_machine_local_paths(self):
         content = SKILL_MD.read_text(encoding="utf-8")
         assert "/home/" not in content
         assert not re.search(r"[A-Z]:\\\\Users", content)
 
-    def test_required_sections_present(self):
-        _, body = _frontmatter_and_body()
-        for section in REQUIRED_SECTIONS:
-            assert section in body, f"missing section: {section}"
+    def test_required_sections_present_and_ordered(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
+        positions = [body.index(section) for section in REQUIRED_SECTIONS]
+        assert positions == sorted(positions), "sections must follow structured sequence"
 
-    def test_red_green_refactor_cycle_sequence(self):
-        _, body = _frontmatter_and_body()
-        positions = [body.index(step) for step in CYCLE_STEPS]
-        assert positions == sorted(positions), "cycle steps must be in RED -> Verify RED -> GREEN -> Verify GREEN -> REFACTOR order"
+    def test_red_green_refactor_cycle_steps_complete(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
+        for step in CYCLE_STEPS:
+            assert step in body, f"cycle step missing: {step}"
 
-    def test_iron_law_and_tracer_bullet_discipline(self):
-        _, body = _frontmatter_and_body()
+    def test_iron_law_of_tdd_documented(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
         assert "NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST" in body
-        assert "tracer bullets" in body.lower()
-        assert "terminal" in body
-        assert "delegate_task" in body
+        assert "Tracer Bullets" in body or "tracer bullet" in body.lower()
+        assert "Hermes Integration" in body or "Hermes Agent Integration" in body

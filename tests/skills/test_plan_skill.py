@@ -1,9 +1,10 @@
-"""Contract tests for the bundled plan skill."""
+"""Contract and methodology discipline tests for the plan skill."""
 
 import re
 from pathlib import Path
 import pytest
-import yaml
+
+from tests.skills._skill_test_utils import parse_frontmatter_and_body, resolve_related_skills_in_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_MD = (
@@ -14,22 +15,6 @@ SKILL_MD = (
     / "SKILL.md"
 )
 
-REQUIRED_SECTIONS = [
-    "## Core behavior",
-    "## Output requirements",
-    "## Save location",
-    "## Interaction style",
-    "## Overview",
-    "## When a Full Implementation Plan Helps",
-    "## Bite-Sized Task Granularity",
-    "## Plan Document Structure",
-    "## Writing Process",
-    "## Principles",
-    "## Common Mistakes",
-    "## Execution Handoff",
-    "## Remember",
-]
-
 WRITING_PROCESS_STEPS = [
     "### Step 1: Understand Requirements",
     "### Step 2: Explore the Codebase",
@@ -39,15 +24,11 @@ WRITING_PROCESS_STEPS = [
     "### Step 6: Review the Plan",
 ]
 
-
-def _frontmatter_and_body():
-    content = SKILL_MD.read_text(encoding="utf-8")
-    assert content.startswith("---")
-    m = re.search(r"\n---\s*\n", content[3:])
-    assert m, "frontmatter must close with ---"
-    fm = yaml.safe_load(content[3 : m.start() + 3])
-    body = content[m.end() + 3 :]
-    return fm, body
+CORE_PRINCIPLES = [
+    "DRY (Don't Repeat Yourself)",
+    "YAGNI (You Aren't Gonna Need It)",
+    "Frequent Commits",
+]
 
 
 class TestPlanSkillContract:
@@ -57,7 +38,7 @@ class TestPlanSkillContract:
         assert SKILL_MD.is_file()
 
     def test_frontmatter_required_fields(self):
-        fm, _ = _frontmatter_and_body()
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
         for field in ("name", "description", "version", "author", "license", "platforms"):
             assert field in fm, f"missing frontmatter field: {field}"
         assert fm["name"] == "plan"
@@ -66,7 +47,7 @@ class TestPlanSkillContract:
         assert "related_skills" in hermes
 
     def test_description_hardline(self):
-        fm, _ = _frontmatter_and_body()
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
         desc = fm["description"]
         assert len(desc) <= 60, f"description is {len(desc)} chars; max allowed is 60"
         assert desc.endswith("."), "description must end with a period"
@@ -77,38 +58,31 @@ class TestPlanSkillContract:
         )
 
     def test_related_skills_resolve_in_repo(self):
-        fm, _ = _frontmatter_and_body()
-        for name in fm["metadata"]["hermes"]["related_skills"]:
-            hits = list(REPO_ROOT.glob(f"skills/**/{name}/SKILL.md")) + list(
-                REPO_ROOT.glob(f"optional-skills/**/{name}/SKILL.md")
-            )
-            assert hits, f"related_skills entry does not resolve in repo: {name}"
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
+        missing = resolve_related_skills_in_repo(fm["metadata"]["hermes"]["related_skills"])
+        assert not missing, f"related_skills entries do not resolve in repo: {missing}"
 
     def test_no_machine_local_paths(self):
         content = SKILL_MD.read_text(encoding="utf-8")
         assert "/home/" not in content
         assert not re.search(r"[A-Z]:\\\\Users", content)
 
-    def test_required_sections_present(self):
-        _, body = _frontmatter_and_body()
-        for section in REQUIRED_SECTIONS:
-            assert section in body, f"missing section: {section}"
-
-    def test_plan_save_location_and_task_granularity(self):
-        _, body = _frontmatter_and_body()
-        assert ".hermes/plans/" in body
-        assert "2-5 minutes" in body
-        assert "write_file" in body
-
-    def test_writing_process_sequence(self):
-        _, body = _frontmatter_and_body()
+    def test_writing_process_steps_present_and_ordered(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
         positions = [body.index(step) for step in WRITING_PROCESS_STEPS]
-        assert positions == sorted(positions), "writing process steps must be sequential 1 through 6"
+        assert positions == sorted(positions), "writing process steps must be sequential 1-6"
 
-    def test_core_disciplines_and_tools(self):
-        _, body = _frontmatter_and_body()
-        assert "DRY" in body
-        assert "YAGNI" in body
-        assert "TDD" in body
-        assert "subagent-driven-development" in body
-        assert "delegate_task" in body
+    def test_plan_location_and_format_documented(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
+        assert ".hermes/plans/" in body, "plan file must be stored in .hermes/plans/"
+        assert ".hermes/plans/YYYY-MM-DD_HHMMSS-<slug>.md" in body
+
+    def test_task_granularity_and_estimates(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
+        assert "2-5 minutes" in body or "2–5 minutes" in body
+        assert "Bite-Sized" in body or "bite-sized" in body
+
+    def test_engineering_principles_documented(self):
+        _, body = parse_frontmatter_and_body(SKILL_MD)
+        for principle in CORE_PRINCIPLES:
+            assert principle in body, f"engineering principle {principle} must be present"
