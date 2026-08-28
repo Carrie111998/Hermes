@@ -1,9 +1,8 @@
-"""Augmentations to prompt_toolkit's input-parsing tables.
+"""Augmentations to prompt_toolkit's input parsing and key bindings.
 
-Imported once at CLI startup. Each helper installs a small mapping into
-prompt_toolkit's `ANSI_SEQUENCES` so byte sequences emitted by modern
-keyboard protocols (Kitty / xterm `modifyOtherKeys`) decode to existing
-key tuples Hermes already binds.
+Imported once at CLI startup. Helpers install parser mappings or bindings so
+byte sequences emitted by modern keyboard protocols (Kitty / xterm
+`modifyOtherKeys`) behave like their legacy equivalents.
 
 Kept in a standalone module — separate from `cli.py` — so the registrations
 can be unit-tested without importing the whole CLI runtime.
@@ -46,6 +45,14 @@ def _clear_vt100_prefix_cache() -> None:
         _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
     except Exception:
         pass
+
+
+def install_canonical_space_binding(key_bindings) -> None:
+    """Insert an ASCII space even when parser data retains escape bytes."""
+
+    @key_bindings.add(" ", eager=True)
+    def insert_ascii_space(event):
+        event.current_buffer.insert_text(" " * event.arg)
 
 
 def install_shift_enter_alias() -> int:

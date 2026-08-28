@@ -15,13 +15,21 @@ the raw byte would.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Any, cast
+
 import pytest
 
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
-from hermes_cli.pt_input_extras import install_modify_other_keys_aliases
+from hermes_cli.pt_input_extras import (
+    install_canonical_space_binding,
+    install_modify_other_keys_aliases,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -41,15 +49,19 @@ def _ensure_alias_installed():
     _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
 
 
-def _parse(byte_seq: str):
-    """Feed bytes through prompt_toolkit's VT100 parser and return the
-    list of KeyPress objects."""
+def _parse_presses(byte_seq: str):
+    """Feed bytes through the parser without discarding raw key data."""
     out = []
     parser = Vt100Parser(out.append)
     for ch in byte_seq:
         parser.feed(ch)
     parser.flush()
-    return [kp.key for kp in out]
+    return out
+
+
+def _parse(byte_seq: str):
+    """Return the logical keys parsed from a terminal byte sequence."""
+    return [kp.key for kp in _parse_presses(byte_seq)]
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +376,23 @@ def test_shift_space_inserts_space():
     """Shift+Space must insert a space, not leak escape text (#86866)."""
     assert _parse("\x1b[32;2u") == [" "]
     assert _parse("\x1b[27;2;32~") == [" "]
+
+
+@pytest.mark.parametrize("byte_seq", [" ", "\x1b[32;2u", "\x1b[27;2;32~"])
+def test_space_binding_inserts_canonical_space(byte_seq):
+    """Space insertion must ignore the parser's preserved source bytes."""
+    key_bindings = KeyBindings()
+    install_canonical_space_binding(key_bindings)
+    presses = _parse_presses(byte_seq)
+    assert len(presses) == 1
+    assert presses[0].data == byte_seq
+
+    bindings = key_bindings.get_bindings_for_keys((presses[0].key,))
+    assert len(bindings) == 1
+
+    buffer = Buffer()
+    cast(Any, bindings[0].handler)(SimpleNamespace(current_buffer=buffer, arg=1))
+    assert buffer.text == " "
 
 
 # ---------------------------------------------------------------------------

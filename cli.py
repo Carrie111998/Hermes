@@ -17819,6 +17819,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Key bindings for the input area
         kb = KeyBindings()
 
+        from hermes_cli.pt_input_extras import install_canonical_space_binding
+
+        install_canonical_space_binding(kb)
+
         _multiline_shortcuts_enabled = _cli_multiline_shortcuts_enabled(self.config or CLI_CONFIG)
 
         from prompt_toolkit.keys import Keys as _IgnoreKeys
