@@ -58,7 +58,6 @@ matching profile from the available roster.
 You will be given:
   - The original task title and body
   - The list of available profiles (each with name + description)
-  - The fallback "default_assignee" used when no profile fits
 
 Output a single JSON object with this exact shape:
 
@@ -69,7 +68,7 @@ Output a single JSON object with this exact shape:
       {
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
-        "assignee": "<profile name from the roster, or null for default>",
+        "assignee": "<EXACT profile name from the roster>",
         "parents": [<int>, ...]
       },
       ...
@@ -85,8 +84,19 @@ Rules:
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
-    DESCRIPTION (not just the name). When nothing matches well, use null
-    and the system will route to the default_assignee.
+    DESCRIPTION (not just the name).
+  - Every child MUST have a non-null assignee equal to an EXACT profile name
+    from the roster. Null, blank, generic "default", or invented names are
+    invalid output.
+  - Route each child to the single best matching named profile based on its
+    main deliverable. For example: code implementation/debugging -> backend;
+    test/runtime/soak execution -> tester; independent audit/acceptance ->
+    reviewer; plan/specification only -> planner.
+  - A task being complex, cross-cutting, uncertain, or dependent on another
+    task is not a reason to avoid specialist routing.
+  - Before returning JSON, verify that implementation, testing, review, and
+    planning tasks use their matching specialist profiles and are not all
+    assigned to one catch-all profile.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
@@ -98,12 +108,12 @@ return:
     "rationale": "<one sentence>",
     "title": "<tightened title>",
     "body":  "<concrete spec for a single worker>",
-    "assignee": "<profile name from the roster, or null for default>"
+    "assignee": "<EXACT profile name from the roster>"
   }
 
 In that case the task stays as one work item, just with a tightened spec and
-a concrete assignee. If no profile fits, use null and the system will route to
-the default_assignee.
+a concrete assignee. Pick the single best matching exact profile name from the
+roster.
 
 No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
@@ -114,10 +124,8 @@ Title: {title}
 Body:
 {body}
 
-Available profiles (assignees you may pick from):
+Available profiles (assignees you must pick from):
 {roster}
-
-Default assignee (used when no profile fits a task): {default_assignee}
 """
 
 
@@ -308,7 +316,6 @@ def decompose_task(
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
         roster=_format_roster(roster),
-        default_assignee=default_assignee,
     )
 
     try:
