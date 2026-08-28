@@ -129,6 +129,79 @@ def test_spares_chip_live_in_another_store_copy(tmp_path) -> None:
     assert _load(stale)["isArchived"] is False
 
 
+def test_three_store_archive_policy_changes_only_eligible_false_copy(tmp_path) -> None:
+    paths = [
+        _write_record(
+            tmp_path / name,
+            "chip1",
+            cli_session_id="cli-shared",
+            is_archived=archived,
+        )
+        for name, archived in (("a", True), ("b", False), ("c", True))
+    ]
+    before = [_load(path) for path in paths]
+
+    result = _worker(*(tmp_path / name for name in ("a", "b", "c"))).run_once()
+
+    assert result["archived"] == 1
+    after = [_load(path) for path in paths]
+    assert [record["isArchived"] for record in after] == [True, True, True]
+    for old, new in zip(before, after, strict=True):
+        old.pop("isArchived")
+        new.pop("isArchived")
+        assert new == old
+
+
+@pytest.mark.parametrize("archives", ((False, True, False), (False, True, True)))
+def test_manual_archive_conflicts_remain_byte_identical(tmp_path, archives) -> None:
+    paths = [
+        _write_record(
+            tmp_path / name,
+            "manual1",
+            cli_session_id="cli-manual",
+            title="My ongoing design conversation",
+            is_archived=archived,
+        )
+        for name, archived in zip(("a", "b", "c"), archives, strict=True)
+    ]
+    before = [path.read_bytes() for path in paths]
+
+    result = _worker(*(tmp_path / name for name in ("a", "b", "c"))).run_once()
+
+    assert result["archived"] == 0
+    assert [path.read_bytes() for path in paths] == before
+
+
+def test_group_without_valid_activity_is_skipped(tmp_path) -> None:
+    path = _write_record(tmp_path / "a", "chip1")
+    data = _load(path)
+    data["lastActivityAt"] = None
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    result = _worker(tmp_path / "a").run_once()
+
+    assert result["archived"] == 0
+    assert _load(path)["isArchived"] is False
+
+
+def test_group_identity_is_namespaced_by_identifier_type(tmp_path) -> None:
+    cli_path = _write_record(
+        tmp_path / "a", "cli-copy", cli_session_id="same-identifier"
+    )
+    session_path = _write_record(tmp_path / "a", "session-copy")
+    session_data = _load(session_path)
+    session_data.pop("cliSessionId")
+    session_data["sessionId"] = "same-identifier"
+    session_data["lastActivityAt"] = int((NOW - 600) * 1000)
+    session_path.write_text(json.dumps(session_data), encoding="utf-8")
+
+    result = _worker(tmp_path / "a").run_once()
+
+    assert result["archived"] == 1
+    assert _load(cli_path)["isArchived"] is True
+    assert _load(session_path)["isArchived"] is False
+
+
 def test_spares_user_permission_modes(tmp_path) -> None:
     for index, mode in enumerate(("default", "acceptEdits", "plan", "auto")):
         _write_record(tmp_path / "a", f"user{index}", permission_mode=mode)
@@ -163,6 +236,48 @@ def test_archives_bypass_record_with_worktree_cwd_regardless_of_title(
     assert _load(path)["isArchived"] is True
 
 
+@pytest.mark.parametrize(
+    "verb",
+    (
+        "Amend",
+        "Answer",
+        "Apply",
+        "Attach",
+        "Auto-recover",
+        "Clear",
+        "Commit",
+        "Compact",
+        "Cut",
+        "Emit",
+        "Escalate",
+        "Give",
+        "Install",
+        "Instrument",
+        "Make",
+        "Re-home",
+        "Re-land",
+        "Re-measure",
+        "Report",
+        "Root-cause",
+        "Share",
+    ),
+)
+def test_archives_observed_chip_title_verbs_without_worktree_cwd(
+    tmp_path, verb
+) -> None:
+    path = _write_record(
+        tmp_path / "a",
+        verb.lower(),
+        title=f"{verb} the automation task",
+        cwd="C:\\Users\\diego",
+    )
+
+    result = _worker(tmp_path / "a").run_once()
+
+    assert result["archived"] == 1
+    assert _load(path)["isArchived"] is True
+
+
 def test_never_touches_tagged_mirror_records(tmp_path) -> None:
     for index, title in enumerate(
         ("[Codex] Fix the importer", "[Hermes] Verify gateway", "[Bridge] abc123")
@@ -182,6 +297,59 @@ def test_skips_already_archived_without_rewrite(tmp_path) -> None:
 
     assert result["archived"] == 0
     assert path.stat().st_mtime == before
+
+
+def test_archiver_retries_from_fresh_bytes_and_preserves_concurrent_field(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_record(tmp_path / "a", "chip1")
+    actual_read = Path.read_bytes
+    calls = {"target": 0}
+
+    def racing_read(candidate: Path) -> bytes:
+        if candidate == path:
+            calls["target"] += 1
+            if calls["target"] == 2:
+                concurrent = json.loads(actual_read(path).decode("utf-8"))
+                concurrent["desktopField"] = {"must": "survive"}
+                path.write_text(json.dumps(concurrent), encoding="utf-8")
+        return actual_read(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read)
+
+    result = _worker(tmp_path / "a").run_once()
+
+    assert result["archived"] == 1
+    assert _load(path)["desktopField"] == {"must": "survive"}
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_archiver_conflict_exhaustion_leaves_latest_target_untouched(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_record(tmp_path / "a", "chip1")
+    actual_read = Path.read_bytes
+    calls = {"target": 0}
+
+    def always_racing_read(candidate: Path) -> bytes:
+        if candidate == path:
+            calls["target"] += 1
+            if calls["target"] % 2 == 0:
+                concurrent = json.loads(actual_read(path).decode("utf-8"))
+                concurrent["revision"] = calls["target"]
+                path.write_text(json.dumps(concurrent), encoding="utf-8")
+        return actual_read(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", always_racing_read)
+
+    result = _worker(tmp_path / "a").run_once()
+
+    record = _load(path)
+    assert result["archived"] == 0
+    assert result["skipped"] == 1
+    assert record["isArchived"] is False
+    assert record["revision"] > 0
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
 
 
 def test_lookback_bounds_the_scan(tmp_path) -> None:
@@ -397,12 +565,12 @@ def db(tmp_path):
         database.close()
 
 
-def test_serve_runtime_wires_idle_chip_archiver_when_configured(
+def test_serve_runtime_wires_idle_chip_archiver_to_convergence_roots(
     db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sentinel = Path("C:/sentinel-registry")
     monkeypatch.setattr(
-        "session_bridge.cli.discover_ccd_registry_roots", lambda: (sentinel,)
+        "session_bridge.cli.discover_ccd_convergence_roots", lambda: (sentinel,)
     )
     coordinator = _serve_runtime_coordinator(db, monkeypatch, archive_idle_chips=True)
     archiver = coordinator._idle_chip_archiver

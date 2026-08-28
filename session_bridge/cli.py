@@ -81,6 +81,7 @@ from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
 from .mirror_float import (
     ClaudeMirrorFloatWorker,
     IdleChipArchiveWorker,
+    discover_ccd_convergence_roots,
     discover_ccd_registry_roots,
 )
 from .mirror import (
@@ -3591,7 +3592,7 @@ class ProductionBackend:
             )
             idle_chip_archiver = (
                 IdleChipArchiveWorker(
-                    registry_roots=discover_ccd_registry_roots(),
+                    registry_roots=discover_ccd_convergence_roots(),
                     idle_seconds=float(
                         effective_config.claude_visibility.idle_chip_archive_seconds
                     ),

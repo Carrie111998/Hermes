@@ -14,6 +14,7 @@ from session_bridge.claude_visibility import (
 )
 from session_bridge.mirror_float import (
     ClaudeMirrorFloatWorker,
+    discover_ccd_convergence_roots,
     discover_ccd_registry_roots,
 )
 from session_bridge.models import (
@@ -313,6 +314,90 @@ def test_float_update_preserves_manual_unarchive(db, tmp_path) -> None:
     # recency rule's) unarchived state must survive subsequent cycles.
     assert record["lastActivityAt"] == 5_000_000
     assert record["isArchived"] is False
+
+
+def test_float_update_retries_and_preserves_concurrent_archive_change(
+    db, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    identity, _ = _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    record_path = registry / f"local_{identity.claude_uuid}.json"
+    record_path.write_text(
+        json.dumps(
+            {
+                "sessionId": f"local_{identity.claude_uuid}",
+                "cliSessionId": identity.claude_uuid,
+                "lastActivityAt": 1_000,
+                "isArchived": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    actual_read = Path.read_bytes
+    calls = {"target": 0}
+
+    def racing_read(path: Path) -> bytes:
+        if path == record_path:
+            calls["target"] += 1
+            if calls["target"] == 2:
+                concurrent = json.loads(actual_read(path).decode("utf-8"))
+                concurrent["isArchived"] = True
+                concurrent["desktopField"] = "preserved"
+                path.write_text(json.dumps(concurrent), encoding="utf-8")
+        return actual_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read)
+
+    result = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert result["floated"] == 1
+    assert record["lastActivityAt"] == 5_000_000
+    assert record["isArchived"] is True
+    assert record["desktopField"] == "preserved"
+    assert not list(registry.glob(f".{record_path.name}.*.tmp"))
+
+
+def test_create_collision_never_overwrites_concurrent_destination(
+    db, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    identity, _ = _seed_visible_mirror(db, store, tmp_path)
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    destination = registry / f"local_{identity.claude_uuid}.json"
+    concurrent = {
+        "sessionId": f"local_{identity.claude_uuid}",
+        "cliSessionId": identity.claude_uuid,
+        "lastActivityAt": 123,
+        "desktopOwned": True,
+    }
+    from session_bridge import mirror_float
+
+    actual_publish = mirror_float._publish_record_create_only
+
+    def publish_after_desktop(path: Path, record) -> bool:
+        path.write_text(json.dumps(concurrent), encoding="utf-8")
+        return actual_publish(path, record)
+
+    monkeypatch.setattr(
+        "session_bridge.mirror_float._publish_record_create_only",
+        publish_after_desktop,
+    )
+
+    result = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+
+    assert result["registered"] == 0
+    assert json.loads(destination.read_text(encoding="utf-8")) == concurrent
+    assert not list(registry.glob(f".{destination.name}.*.tmp"))
 
 
 def test_registry_record_title_falls_back_to_cwd_not_uuid(db, tmp_path) -> None:
@@ -687,6 +772,86 @@ def test_discover_registry_roots_skips_harness_without_account(tmp_path) -> None
     (tmp_path / "Claude-3p").mkdir()
 
     assert discover_ccd_registry_roots((tmp_path / "Claude-3p",)) == ()
+
+
+def test_convergence_roots_include_populated_non_current_accounts(tmp_path) -> None:
+    current = _make_harness(tmp_path / "Claude", "acct-current", "ws-current", 2)
+    other = (
+        tmp_path
+        / "Claude"
+        / "claude-code-sessions"
+        / "acct-other"
+        / "ws-other"
+    )
+    other.mkdir(parents=True)
+    (other / "local_other.json").write_text("{}", encoding="utf-8")
+
+    assert discover_ccd_registry_roots((tmp_path / "Claude",)) == (current,)
+    assert discover_ccd_convergence_roots((tmp_path / "Claude",)) == (
+        current,
+        other,
+    )
+
+
+def test_convergence_roots_exclude_empty_and_backup_residue(tmp_path) -> None:
+    current = _make_harness(tmp_path / "Claude", "acct-current", "ws-current", 1)
+    sessions = tmp_path / "Claude" / "claude-code-sessions"
+    (sessions / "acct-empty" / "ws-empty").mkdir(parents=True)
+    for account, workspace in (
+        ("acct-backup", "ws.junction-backup-20260828"),
+        ("acct-recovery-backup", "ws"),
+        ("acct.real-20260828", "ws"),
+        ("acct-ok", "recovery-backup-20260828"),
+        ("acct-ok", "ws.real-20260828"),
+    ):
+        leaf = sessions / account / workspace
+        leaf.mkdir(parents=True, exist_ok=True)
+        (leaf / "local_decoy.json").write_text("{}", encoding="utf-8")
+
+    assert discover_ccd_convergence_roots((tmp_path / "Claude",)) == (current,)
+
+
+def test_convergence_roots_exclude_reparse_points_before_resolving(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = _make_harness(tmp_path / "Claude", "acct-current", "ws-current", 1)
+    sessions = tmp_path / "Claude" / "claude-code-sessions"
+    account_reparse = sessions / "acct-reparse"
+    account_reparse.mkdir()
+    account_leaf = account_reparse / "ws"
+    account_leaf.mkdir()
+    (account_leaf / "local_a.json").write_text("{}", encoding="utf-8")
+    workspace_reparse = sessions / "acct-other" / "ws-reparse"
+    workspace_reparse.mkdir(parents=True)
+    (workspace_reparse / "local_b.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "session_bridge.mirror_float._is_reparse_point",
+        lambda path: path in {account_reparse, workspace_reparse},
+    )
+
+    assert discover_ccd_convergence_roots((tmp_path / "Claude",)) == (current,)
+
+
+def test_convergence_roots_dedupe_resolved_aliases(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _make_harness(tmp_path / "Claude", "acct-a", "ws-a", 1)
+    second = (
+        tmp_path / "Claude" / "claude-code-sessions" / "acct-b" / "ws-b"
+    )
+    second.mkdir(parents=True)
+    (second / "local_b.json").write_text("{}", encoding="utf-8")
+    actual_resolve = Path.resolve
+
+    def resolve_alias(path: Path, *args, **kwargs) -> Path:
+        if path == second:
+            return actual_resolve(first, *args, **kwargs)
+        return actual_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_alias)
+
+    assert discover_ccd_convergence_roots((tmp_path / "Claude",)) == (first,)
 
 
 def test_worker_registers_record_in_every_harness(db, tmp_path) -> None:

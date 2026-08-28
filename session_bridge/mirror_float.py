@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, MutableMapping
 
 from .models import Provider, canonical_session_id
 
@@ -79,6 +79,41 @@ def _account_uuid(user_data_dir: Path) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _has_backup_marker(path: Path) -> bool:
+    name = path.name.casefold()
+    return any(marker.casefold() in name for marker in _BACKUP_MARKERS)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Check the Windows reparse attribute without following the target."""
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, OSError):
+        return path.is_symlink()
+    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _resolved_key(path: Path) -> str:
+    try:
+        path = path.resolve()
+    except OSError:
+        pass
+    return os.path.normcase(str(path))
+
+
+def _regular_registry_record_count(root: Path) -> int:
+    try:
+        return sum(
+            1
+            for entry in os.scandir(root)
+            if entry.name.startswith("local_")
+            and entry.name.endswith(".json")
+            and entry.is_file(follow_symlinks=False)
+        )
+    except OSError:
+        return 0
+
+
 def discover_ccd_registry_roots(
     user_data_dirs: Iterable[Path] | None = None,
 ) -> tuple[Path, ...]:
@@ -107,16 +142,12 @@ def discover_ccd_registry_roots(
         leaves = [
             leaf
             for leaf in account_dir.iterdir()
-            if leaf.is_dir()
-            and not any(marker in leaf.name for marker in _BACKUP_MARKERS)
+            if leaf.is_dir() and not _has_backup_marker(leaf)
         ]
         if not leaves:
             continue
         leaf = max(leaves, key=lambda path: len(list(path.glob("local_*.json"))))
-        try:
-            key = os.path.normcase(str(leaf.resolve()))
-        except OSError:
-            key = os.path.normcase(str(leaf))
+        key = _resolved_key(leaf)
         if key in seen:
             continue
         seen.add(key)
@@ -124,19 +155,119 @@ def discover_ccd_registry_roots(
     return tuple(roots)
 
 
-def _atomic_write_record(path: Path, record: Mapping[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
-    last_error: OSError | None = None
-    for _attempt in range(_REPLACE_ATTEMPTS):
+def discover_ccd_convergence_roots(
+    user_data_dirs: Iterable[Path] | None = None,
+) -> tuple[Path, ...]:
+    """Resolve every populated real account leaf whose policy should converge."""
+    candidates = (
+        tuple(user_data_dirs) if user_data_dirs is not None else _ccd_user_data_dirs()
+    )
+    accepted: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for user_data_dir in candidates:
+        sessions = user_data_dir / "claude-code-sessions"
         try:
-            os.replace(temporary, path)
-            return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(_REPLACE_RETRY_SECONDS)
-    temporary.unlink(missing_ok=True)
+            accounts = sorted(sessions.iterdir(), key=lambda path: path.name.casefold())
+        except OSError:
+            continue
+        for account in accounts:
+            if (
+                _has_backup_marker(account)
+                or _is_reparse_point(account)
+                or not account.is_dir()
+            ):
+                continue
+            try:
+                leaves = sorted(
+                    account.iterdir(), key=lambda path: path.name.casefold()
+                )
+            except OSError:
+                continue
+            for leaf in leaves:
+                if (
+                    _has_backup_marker(leaf)
+                    or _is_reparse_point(leaf)
+                    or not leaf.is_dir()
+                    or _regular_registry_record_count(leaf) == 0
+                ):
+                    continue
+                key = _resolved_key(leaf)
+                if key in seen:
+                    continue
+                seen.add(key)
+                accepted.append((key, leaf))
+    accepted.sort(key=lambda entry: entry[0])
+    return tuple(leaf for _key, leaf in accepted)
+
+
+def _temporary_record_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+
+
+def _serialized_record(record: Mapping[str, Any]) -> bytes:
+    return json.dumps(record, separators=(",", ":")).encode("utf-8")
+
+
+def _atomic_write_record(path: Path, record: Mapping[str, Any]) -> None:
+    temporary = _temporary_record_path(path)
+    temporary.write_bytes(_serialized_record(record))
+    last_error: OSError | None = None
+    try:
+        for _attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as exc:
+                last_error = exc
+                time.sleep(_REPLACE_RETRY_SECONDS)
+    finally:
+        temporary.unlink(missing_ok=True)
     raise last_error if last_error is not None else OSError("replace failed")
+
+
+def _publish_record_create_only(path: Path, record: Mapping[str, Any]) -> bool:
+    """Atomically publish a complete record only while its name is absent."""
+    temporary = _temporary_record_path(path)
+    temporary.write_bytes(_serialized_record(record))
+    try:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class _RecordWriteConflict(Exception):
+    """The live record changed during every bounded update attempt."""
+
+
+def _optimistic_transform_record(
+    path: Path,
+    transform: Callable[[MutableMapping[str, Any]], bool],
+) -> bool:
+    """Best-effort fresh-byte update; never knowingly replaces changed bytes."""
+    for _attempt in range(_REPLACE_ATTEMPTS):
+        original = path.read_bytes()
+        try:
+            parsed = json.loads(original.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("registry record unreadable") from None
+        if not isinstance(parsed, dict):
+            raise ValueError("registry record is not an object")
+        if not transform(parsed):
+            return False
+        temporary = _temporary_record_path(path)
+        temporary.write_bytes(_serialized_record(parsed))
+        try:
+            if path.read_bytes() != original:
+                continue
+            os.replace(temporary, path)
+            return True
+        finally:
+            temporary.unlink(missing_ok=True)
+    raise _RecordWriteConflict
 
 
 class _MirrorFloatSkip(Exception):
@@ -232,7 +363,14 @@ class ClaudeMirrorFloatWorker:
             examined += 1
             try:
                 mirror_floated, mirror_registered = self._float_one(row, registry_index)
-            except (_MirrorFloatSkip, OSError, TypeError, ValueError, KeyError):
+            except (
+                _MirrorFloatSkip,
+                _RecordWriteConflict,
+                OSError,
+                TypeError,
+                ValueError,
+                KeyError,
+            ):
                 skipped += 1
                 continue
             floated += int(mirror_floated)
@@ -339,30 +477,37 @@ class ClaudeMirrorFloatWorker:
                     "sessionPermissionUpdates": [],
                 }
                 path = root / f"{record_id}.json"
-                self._write_record(path, record)
-                index[claude_uuid] = path
-                registered = True
+                published = self._publish_record(path, record)
+                if path.exists():
+                    index[claude_uuid] = path
+                registered = registered or published
                 continue
-            try:
-                record = json.loads(existing.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                raise _MirrorFloatSkip("registry record unreadable") from None
-            recorded_ms = record.get("lastActivityAt")
-            if (
-                not isinstance(recorded_ms, (int, float))
-                or isinstance(recorded_ms, bool)
-                or not math.isfinite(float(recorded_ms))
-            ):
-                recorded_ms = 0
-            if activity_ms - float(recorded_ms) < self._min_interval_seconds * 1000:
+
+            def advance_activity(record: MutableMapping[str, Any]) -> bool:
+                recorded_ms = record.get("lastActivityAt")
+                if (
+                    not isinstance(recorded_ms, (int, float))
+                    or isinstance(recorded_ms, bool)
+                    or not math.isfinite(float(recorded_ms))
+                ):
+                    recorded_ms = 0
+                if (
+                    activity_ms - float(recorded_ms)
+                    < self._min_interval_seconds * 1000
+                ):
+                    return False
+                record["lastActivityAt"] = activity_ms
+                return True
+
+            if not _optimistic_transform_record(existing, advance_activity):
+                # False means either no update was due or every fresh-byte retry
+                # conflicted. In both cases the current target remains authoritative.
                 continue
-            record["lastActivityAt"] = activity_ms
-            self._write_record(existing, record)
             floated = True
         return registered, floated
 
-    def _write_record(self, path: Path, record: Mapping[str, Any]) -> None:
-        _atomic_write_record(path, record)
+    def _publish_record(self, path: Path, record: Mapping[str, Any]) -> bool:
+        return _publish_record_create_only(path, record)
 
     def _load_registry_index(self) -> dict[Path, dict[str, Path]]:
         indexes: dict[Path, dict[str, Path]] = {}
@@ -419,22 +564,23 @@ _AUTOMATION_CWD_PATTERN = re.compile(
 # as the user's unless its cwd is an automation workspace.
 _CHIP_TITLE_VERBS = frozenset(
     """
-    add adjudicate archive audit backfill bound bump cap capture check clean
-    classify close compile confirm correct decide dedupe delete deploy
-    deregister detect diagnose disable dismiss document drain eliminate enable
-    enforce enrich establish evaluate expire extend falsify-check find finish
-    fix flush gate guard harden hunt identify implement improve inspect
-    integrate investigate isolate judge kill land limit lock measure merge
+    add adjudicate amend answer apply archive attach audit auto-recover backfill
+    bound bump cap capture check clean classify clear close commit compact compile
+    confirm correct cut decide dedupe delete deploy deregister detect diagnose
+    disable dismiss document drain eliminate emit enable enforce enrich escalate
+    establish evaluate expire extend falsify-check find finish fix flush gate
+    give guard harden hunt identify implement improve inspect install instrument
+    integrate investigate isolate judge kill land limit lock make measure merge
     migrate monitor normalize observe patch pin plan probe protect prove prune
-    publish purge quarantine quiet raise re-arm reap rebuild recheck reconcile
-    record recover reduce refactor refresh register reindex relaunch release
-    remove rename repair replace requeue rerun rescan reschedule reset resolve
-    restart restore resume retire retry review rewrite rotate route run save
-    scan schedule scope seal search seed separate settle ship silence simplify
-    soak-verify stabilize stage standardize stop strip surface survey sweep
-    switch sync teach teardown test throttle tighten trace track triage tune
-    unarchive unblock unify unpin unstick unwedge update upgrade validate
-    verify watch wire wrap write
+    publish purge quarantine quiet raise re-arm re-home re-land re-measure reap
+    rebuild recheck reconcile record recover reduce refactor refresh register
+    reindex relaunch release remove rename repair replace report requeue rerun
+    rescan reschedule reset resolve restart restore resume retire retry review
+    rewrite root-cause rotate route run save scan schedule scope seal search seed
+    separate settle share ship silence simplify soak-verify stabilize stage
+    standardize stop strip surface survey sweep switch sync teach teardown test
+    throttle tighten trace track triage tune unarchive unblock unify unpin unstick
+    unwedge update upgrade validate verify watch wire wrap write
     """.split()
 )
 
@@ -517,8 +663,9 @@ class IdleChipArchiveWorker:
         mtime_floor = wall_now - self._lookback_seconds
         examined = archived = skipped = 0
 
-        records: list[tuple[Path, dict[str, Any]]] = []
-        group_last_ms: dict[str, float] = {}
+        records: list[tuple[Path, dict[str, Any], tuple[str, str]]] = []
+        group_last_ms: dict[tuple[str, str], float] = {}
+        group_paths: dict[tuple[str, str], list[Path]] = {}
         for root in self._registry_roots:
             try:
                 entries = list(os.scandir(root))
@@ -532,9 +679,7 @@ class IdleChipArchiveWorker:
                 try:
                     if entry.stat().st_mtime < mtime_floor:
                         continue
-                    data = json.loads(
-                        Path(entry.path).read_text(encoding="utf-8")
-                    )
+                    data = json.loads(Path(entry.path).read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     skipped += 1
                     continue
@@ -542,33 +687,41 @@ class IdleChipArchiveWorker:
                     skipped += 1
                     continue
                 examined += 1
-                records.append((Path(entry.path), data))
-                key = data.get("cliSessionId") or data.get("sessionId") or entry.name
-                activity = data.get("lastActivityAt")
-                if isinstance(activity, (int, float)) and not isinstance(
-                    activity, bool
-                ):
-                    group_last_ms[key] = max(
-                        group_last_ms.get(key, 0.0), float(activity)
-                    )
+                path = Path(entry.path)
+                key = self._group_key(data, entry.name)
+                records.append((path, data, key))
+                group_paths.setdefault(key, []).append(path)
+                activity = self._activity_ms(data)
+                if activity is not None:
+                    group_last_ms[key] = max(group_last_ms.get(key, activity), activity)
 
         idle_floor_ms = (wall_now - self._idle_seconds) * 1000
-        for path, data in records:
-            if data.get("isArchived"):
+        for path, data, key in records:
+            if data.get("isArchived") or not self._is_chip(data):
                 continue
-            if not self._is_chip(data):
+            if key not in group_last_ms or group_last_ms[key] >= idle_floor_ms:
                 continue
-            key = data.get("cliSessionId") or data.get("sessionId") or path.name
-            if group_last_ms.get(key, 0.0) >= idle_floor_ms:
+            # Re-read every copy immediately before each mutation. Do not cache
+            # this across copies: Desktop may advance another store between writes.
+            fresh_activity = self._fresh_group_activity(group_paths[key])
+            if fresh_activity is None or fresh_activity >= idle_floor_ms:
                 continue
-            updated = dict(data)
-            updated["isArchived"] = True
+
+            def archive_if_still_eligible(
+                current: MutableMapping[str, Any],
+            ) -> bool:
+                if current.get("isArchived") or not self._is_chip(current):
+                    return False
+                if self._group_key(current, path.name) != key:
+                    return False
+                return current.__setitem__("isArchived", True) is None
+
             try:
-                _atomic_write_record(path, updated)
-            except OSError:
+                changed = _optimistic_transform_record(path, archive_if_still_eligible)
+            except (_RecordWriteConflict, OSError, ValueError):
                 skipped += 1
                 continue
-            archived += 1
+            archived += int(changed)
 
         return {
             "examined": examined,
@@ -576,6 +729,43 @@ class IdleChipArchiveWorker:
             "skipped": skipped,
             "throttled": 0,
         }
+
+    @staticmethod
+    def _group_key(data: Mapping[str, Any], filename: str) -> tuple[str, str]:
+        cli_session_id = data.get("cliSessionId")
+        if isinstance(cli_session_id, str) and cli_session_id:
+            return ("cliSessionId", cli_session_id)
+        session_id = data.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            return ("sessionId", session_id)
+        return ("filename", filename)
+
+    @staticmethod
+    def _activity_ms(data: Mapping[str, Any]) -> float | None:
+        value = data.get("lastActivityAt")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            return None
+        return float(value)
+
+    @classmethod
+    def _fresh_group_activity(cls, paths: Iterable[Path]) -> float | None:
+        latest: float | None = None
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            if not isinstance(data, dict):
+                return None
+            activity = cls._activity_ms(data)
+            if activity is None:
+                return None
+            latest = activity if latest is None else max(latest, activity)
+        return latest
 
     @staticmethod
     def _is_chip(data: Mapping[str, Any]) -> bool:
