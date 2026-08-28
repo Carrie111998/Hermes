@@ -137,8 +137,17 @@ def _get_service_pids(all_profiles: bool = False) -> set:
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
-    # systemd always lists every hermes-gateway* unit regardless of scope.
+    # When all_profiles=False, only include PIDs belonging to the current profile.
     if supports_systemd_services():
+        # Determine the current profile's service name pattern
+        current_profile = None
+        if not all_profiles:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                current_profile = get_active_profile_name()
+            except Exception:
+                pass
+        
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
                 result = subprocess.run(
@@ -159,6 +168,21 @@ def _get_service_pids(all_profiles: bool = False) -> set:
                     if not parts or not parts[0].endswith(".service"):
                         continue
                     svc = parts[0]
+                    
+                    # When not all_profiles, skip services that don't match current profile
+                    if current_profile and not all_profiles:
+                        # Service name format: hermes-gateway-<profile>.service or hermes-gateway.service (default)
+                        expected_suffix = f"-{current_profile}.service"
+                        is_default_profile = current_profile == "default"
+                        if is_default_profile:
+                            # Default profile: only accept hermes-gateway.service (no suffix)
+                            if svc != "hermes-gateway.service":
+                                continue
+                        else:
+                            # Named profile: only accept hermes-gateway-<profile>.service
+                            if not svc.endswith(expected_suffix):
+                                continue
+                    
                     try:
                         show = subprocess.run(
                             scope_args + ["show", svc, "--property=MainPID", "--value"],
