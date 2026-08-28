@@ -1348,9 +1348,16 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         # been spawned inside a job object (Electron/Tauri parent), and
         # without breakaway the respawned gateway would die when that job
         # tears down. See _subprocess_compat.windows_detach_flags().
+        # Keep a stderr trace for the respawned gateway: with both streams
+        # in DEVNULL, a gateway that dies on startup leaves no evidence at
+        # all (#48820 — reproduced 4x, zero trace each time).
+        _respawn_stderr = os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+            "hermes", "logs", "gateway-respawn-stderr.log",
+        )
         _popen_kwargs = {{
             "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            "stderr": open(_respawn_stderr, "ab"),
         }}
         # Anchor the respawned gateway at the stable working dir and overlay
         # the env (VIRTUAL_ENV / PYTHONPATH / HERMES_HOME) the windowless

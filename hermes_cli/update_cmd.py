@@ -6825,6 +6825,38 @@ def _refresh_bootstrap_cache_scripts(branch: str = "main") -> None:
     except Exception as exc:
         logger.debug("Could not refresh bootstrap-cache scripts after update: %s", exc)
 
+def _verify_windows_gateway_relaunch(previous_pids, timeout_s=25):
+    """Wait for a fresh gateway pid to appear in gateway_state.json and be alive.
+
+    The relaunch helpers only verify that a watcher was spawned — not that
+    the gateway itself came up. A respawned Windows gateway has been
+    observed dying within seconds with zero trace anywhere (#48820,
+    reproduced 4x). Polling the state file for a pid that is (a) not one of
+    the pre-update pids and (b) actually present in the process table turns
+    that silent death into a visible warning instead of a misleading
+    "✓ Restarting Windows gateway profile(s)".
+    """
+    state_path = get_hermes_home() / "gateway_state.json"
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+            pid = state.get("pid")
+            if isinstance(pid, int) and pid > 0 and pid not in previous_pids:
+                try:
+                    from gateway.status import _pid_exists
+
+                    if _pid_exists(pid):
+                        return True, pid
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _time.sleep(2)
+    return False, None
+
+
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
@@ -6963,6 +6995,29 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         print(
             f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
+
+    # Verify the respawn actually came up instead of trusting the spawn
+    # call. Silent-death gateways (#48820) print a misleading ✓ otherwise.
+    if relaunched or unmapped_relaunched:
+        previous_pids = set()
+        for _old_pid in profiles.values():
+            if isinstance(_old_pid, int):
+                previous_pids.add(_old_pid)
+        for _entry in unmapped:
+            _old_pid = _entry.get("pid")
+            if isinstance(_old_pid, int):
+                previous_pids.add(_old_pid)
+        _alive, _new_pid = _verify_windows_gateway_relaunch(previous_pids)
+        if _alive:
+            print(f"  ✓ Respawned gateway verified alive (pid {_new_pid})")
+        else:
+            print()
+            print(
+                "  ⚠ Respawned gateway did not come up within 25s — it may have"
+            )
+            print("    died on startup (silent-death class, see #48820).")
+            print("    Relaunch manually with:")
+            print("      wscript <hermes_home>\\gateway-service\\Hermes_Gateway.vbs")
 
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
