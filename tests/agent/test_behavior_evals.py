@@ -80,14 +80,32 @@ def test_successful_lint_and_typecheck_after_latest_change_are_true():
         assert evaluate_code_change_verification(messages)["result"] == "true", command
 
 
-def test_mutating_eslint_fix_is_not_verification_evidence():
+def test_any_mutating_eslint_segment_invalidates_verification_evidence():
+    commands = (
+        "npx eslint --fix src/app.js",
+        "npx eslint src/app.js; npx eslint --fix src/app.js",
+        "npx eslint --fix src/app.js; pytest -q",
+        "eslint src/app.js && eslint --fix src/app.js",
+        "pytest -q || npx eslint src/app.js --fix",
+    )
+    for command in commands:
+        messages = [
+            _assistant(1, "write_file", "write", '{"path":"src/app.js"}'),
+            _result(2, "write_file", "write", '{"verified":true}'),
+            _assistant(3, "terminal", "lint", json.dumps({"command": command})),
+            _result(4, "terminal", "lint", '{"exit_code":0}'),
+        ]
+        assert evaluate_code_change_verification(messages)["result"] == "false", command
+
+
+def test_eslint_fix_dry_run_remains_non_mutating_verification():
     messages = [
         _assistant(1, "write_file", "write", '{"path":"src/app.js"}'),
         _result(2, "write_file", "write", '{"verified":true}'),
-        _assistant(3, "terminal", "lint", '{"command":"npx eslint --fix src/app.js"}'),
+        _assistant(3, "terminal", "lint", '{"command":"npx eslint --fix-dry-run src/app.js"}'),
         _result(4, "terminal", "lint", '{"exit_code":0}'),
     ]
-    assert evaluate_code_change_verification(messages)["result"] == "false"
+    assert evaluate_code_change_verification(messages)["result"] == "true"
 
 
 def test_change_after_successful_test_requires_reverification():

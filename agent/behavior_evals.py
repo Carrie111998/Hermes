@@ -39,7 +39,7 @@ _TEST_COMMAND_RE = re.compile(
     r"(?:(?:python(?:3(?:\.\d+)?)?|py)\s+-m\s+|uv\s+run\s+)?mypy\b|"
     r"(?:(?:python(?:3(?:\.\d+)?)?|py)\s+-m\s+|uv\s+run\s+)?flake8\b|"
     r"(?:(?:python(?:3(?:\.\d+)?)?|py)\s+-m\s+|uv\s+run\s+)?black\s+--check\b|"
-    r"(?:npx\s+)?eslint\b(?![^;&|\n]*--fix)|"
+    r"(?:npx\s+)?eslint\b|"
     r"scripts[/\\]run_tests\.sh\b|"
     r"npm\s+(?:test\b|run\s+(?:test|lint|build|typecheck)\b)|"
     r"pnpm\s+(?:test\b|run\s+(?:test|lint|build|typecheck)\b)|"
@@ -53,6 +53,11 @@ _TEST_COMMAND_RE = re.compile(
     r"mvn\s+(?:test|verify)\b|"
     r"gradle\w*\s+(?:test|check|build)\b"
     r")",
+    re.IGNORECASE,
+)
+_MUTATING_ESLINT_RE = re.compile(
+    r"(?:^|[;&|()]\s*)(?:npx\s+)?eslint\b[^;&|\n]*"
+    r"(?:^|\s)--fix(?:\s|=|$)",
     re.IGNORECASE,
 )
 _PATCH_PATH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.MULTILINE)
@@ -260,7 +265,7 @@ def evaluate_code_change_verification(
 
         if tool == "terminal":
             command = str(call["arguments"].get("command") or "")
-            if _TEST_COMMAND_RE.search(command):
+            if _TEST_COMMAND_RE.search(command) and not _MUTATING_ESLINT_RE.search(command):
                 verifications.append({
                     "command": command,
                     "success": _terminal_succeeded(message.get("content")),
