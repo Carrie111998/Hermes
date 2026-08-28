@@ -419,10 +419,24 @@ The contract is deliberately narrow:
   session**. Its rendered bytes are frozen on compression and recovered from
   the already-persisted full system prompt after a process restart/resume;
   plugin state is not re-read for an existing session.
-- `max_chars` is capped at 4,000 characters. All plugin sections together,
-  including their audit headings, are capped at 8,000 characters and 32
-  sections. Empty, non-string, oversized, aggregate-over-budget, or raising
-  sections are skipped with a warning; prompt construction continues.
+- `max_chars` defaults to 4,000 characters per section. All plugin sections
+  together, including their audit headings, default to 8,000 characters and
+  32 sections. Empty, non-string, oversized, aggregate-over-budget, or raising
+  sections are skipped with a warning; prompt construction continues. Skipped
+  sections are also reported per-plugin by `/plugins` so an over-budget drop
+  is visible without reading logs.
+- Plugins that legitimately pin large always-on context can be given more
+  room in `config.yaml` (the built-in defaults apply when unset):
+
+  ```yaml
+  plugins:
+    system_prompt_section_max_chars: 16000   # per-section cap (default 4000)
+    system_prompt_section_total_chars: 65536 # aggregate budget (default 8000)
+    system_prompt_section_max_sections: 32   # section count (default 32)
+  ```
+
+  Sections persisted under a raised cap survive resume; every extra character
+  is charged on every turn of every session, so raise these deliberately.
 - Every accepted section is named in the prompt and logged at session start
   with its plugin, position, and character count.
 

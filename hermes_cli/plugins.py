@@ -555,11 +555,60 @@ def _classify_entrypoint_value_kind(value: str) -> str:
 
 # System-prompt sections are deliberately more constrained than lifecycle
 # hooks. They become high-trust prompt bytes and are charged on every turn.
+# The constants below are the built-in defaults; users who install plugins
+# that legitimately pin large always-on context (#92774) can raise them in
+# config.yaml (mirroring memory.memory_char_limit / memory.user_char_limit):
+#
+#   plugins:
+#     system_prompt_section_max_chars: 16000
+#     system_prompt_section_total_chars: 65536
+#     system_prompt_section_max_sections: 32
 SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
 DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS = 4_000
 MAX_SYSTEM_PROMPT_SECTION_CHARS = 4_000
 MAX_SYSTEM_PROMPT_SECTIONS = 32
 MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS = 8_000
+
+
+def _configured_section_limit(key: str, default: int) -> int:
+    """Resolve one ``plugins.<key>`` system-prompt-section limit from config.
+
+    Follows the ``memory.memory_char_limit`` precedent: read the raw user
+    config, accept any positive integer, and fall back to the built-in
+    default on a missing/invalid value. Never raises — a malformed config
+    value must not break plugin loading or prompt construction.
+    """
+    try:
+        raw = cfg_get(load_config_readonly(), "plugins", key, default=None)
+        if raw is None or isinstance(raw, bool):
+            return default
+        value = int(raw)
+        return value if value >= 1 else default
+    except Exception:
+        return default
+
+
+def system_prompt_section_max_chars() -> int:
+    """Effective per-section character cap (config-overridable)."""
+    return _configured_section_limit(
+        "system_prompt_section_max_chars", MAX_SYSTEM_PROMPT_SECTION_CHARS
+    )
+
+
+def system_prompt_section_total_chars() -> int:
+    """Effective aggregate character budget for all sections (config-overridable)."""
+    return _configured_section_limit(
+        "system_prompt_section_total_chars", MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS
+    )
+
+
+def system_prompt_section_max_sections() -> int:
+    """Effective section-count budget (config-overridable)."""
+    return _configured_section_limit(
+        "system_prompt_section_max_sections", MAX_SYSTEM_PROMPT_SECTIONS
+    )
+
+
 _SYSTEM_PROMPT_SECTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SYSTEM_PROMPT_SECTION_HEADING_PREFIX = "## Plugin Context: "
 PLUGIN_SECTIONS_START = "<!-- hermes-plugin-sections:start -->"
@@ -3405,13 +3454,17 @@ class PluginContext:
         content: Union[str, Callable[[Mapping[str, Any]], str]],
         *,
         position: str = "after_memory",
-        max_chars: int = DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS,
+        max_chars: Optional[int] = None,
     ) -> PluginRegistration:
         """Register bounded context that is frozen into each new session prompt.
 
         Callables receive a read-only session-info mapping. The rendered full
         system prompt is already persisted by core and restored verbatim, so no
         parallel plugin-section state is needed for process restarts.
+
+        ``max_chars`` defaults to the effective per-section cap —
+        ``plugins.system_prompt_section_max_chars`` in config.yaml, or
+        4,000 characters when unset.
         """
         if not is_valid_system_prompt_section_id(id):
             raise ValueError(
@@ -3425,14 +3478,18 @@ class PluginContext:
                 "system prompt section position must be one of: "
                 + ", ".join(sorted(SYSTEM_PROMPT_SECTION_POSITIONS))
             )
+        section_cap = system_prompt_section_max_chars()
+        if max_chars is None:
+            max_chars = min(DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS, section_cap)
         if (
             isinstance(max_chars, bool)
             or not isinstance(max_chars, int)
-            or not 0 < max_chars <= MAX_SYSTEM_PROMPT_SECTION_CHARS
+            or not 0 < max_chars <= section_cap
         ):
             raise ValueError(
                 "system prompt section max_chars must be between 1 and "
-                f"{MAX_SYSTEM_PROMPT_SECTION_CHARS}"
+                f"{section_cap} (raise plugins.system_prompt_section_max_chars "
+                "in config.yaml for larger sections)"
             )
         existing = self._manager._system_prompt_sections.get(id)
         if existing is not None:
@@ -3744,6 +3801,9 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
+        # Sections dropped by the most recent render, for user-visible
+        # surfacing (``hermes plugins`` / startup) instead of log-only skips.
+        self._dropped_prompt_sections: List[Dict[str, str]] = []
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
@@ -5899,15 +5959,19 @@ class PluginManager:
         """Render all registered sections deterministically and fail open."""
         frozen_info = types.MappingProxyType(dict(session_info))
         rendered: List[RenderedPluginSystemPromptSection] = []
+        self._dropped_prompt_sections = []
+        max_sections = system_prompt_section_max_sections()
+        total_budget = system_prompt_section_total_chars()
         total_chars = len(PLUGIN_SECTIONS_START) + len(PLUGIN_SECTIONS_END) + 2
         for section_id in sorted(self._system_prompt_sections):
             section = self._system_prompt_sections[section_id]
-            if len(rendered) >= MAX_SYSTEM_PROMPT_SECTIONS:
-                logger.warning(
-                    "Plugin system prompt section %s exceeded the section-count "
-                    "budget (%d) and was skipped",
-                    section.id,
-                    MAX_SYSTEM_PROMPT_SECTIONS,
+            if len(rendered) >= max_sections:
+                self._record_dropped_prompt_section(
+                    section,
+                    "Plugin system prompt section %s (%s) exceeded the "
+                    "section-count budget (%d) and was skipped — raise "
+                    "plugins.system_prompt_section_max_sections in config.yaml"
+                    % (section.id, section.plugin, max_sections),
                 )
                 continue
             try:
@@ -5944,25 +6008,23 @@ class PluginManager:
                 )
                 continue
             if len(text) > section.max_chars:
-                logger.warning(
+                self._record_dropped_prompt_section(
+                    section,
                     "Plugin system prompt section %s (%s) exceeded max_chars "
-                    "(%d > %d) and was skipped",
-                    section.id,
-                    section.plugin,
-                    len(text),
-                    section.max_chars,
+                    "(%d > %d) and was skipped"
+                    % (section.id, section.plugin, len(text), section.max_chars),
                 )
                 continue
             rendered_chars = len(format_system_prompt_section(section.id, text))
             if rendered:
                 rendered_chars += 2  # canonical ``\n\n`` separator
-            if total_chars + rendered_chars > MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS:
-                logger.warning(
+            if total_chars + rendered_chars > total_budget:
+                self._record_dropped_prompt_section(
+                    section,
                     "Plugin system prompt section %s (%s) exceeded the aggregate "
-                    "session budget (%d chars) and was skipped",
-                    section.id,
-                    section.plugin,
-                    MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS,
+                    "session budget (%d chars) and was skipped — raise "
+                    "plugins.system_prompt_section_total_chars in config.yaml"
+                    % (section.id, section.plugin, total_budget),
                 )
                 continue
             rendered.append(
@@ -5982,6 +6044,30 @@ class PluginManager:
                 len(text),
             )
         return rendered
+
+    def _record_dropped_prompt_section(
+        self, section: PluginSystemPromptSection, message: str
+    ) -> None:
+        """Log a skipped section AND keep it queryable for user-visible surfacing.
+
+        Silent truncation of high-trust prompt bytes is indistinguishable from
+        a broken plugin (#92774), so every budget/size skip is retained on the
+        manager for ``dropped_prompt_section_reports()`` consumers in addition
+        to the log warning.
+        """
+        logger.warning("%s", message)
+        self._dropped_prompt_sections.append(
+            {"id": section.id, "plugin": section.plugin, "reason": message}
+        )
+
+    def dropped_prompt_section_reports(self) -> List[Dict[str, str]]:
+        """Return sections dropped by the most recent prompt-section render.
+
+        Each entry has ``id``, ``plugin``, and a human-readable ``reason``
+        (including which config.yaml knob would prevent the drop). Empty when
+        the last render kept every registered section.
+        """
+        return list(self._dropped_prompt_sections)
 
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
@@ -6056,12 +6142,17 @@ class PluginManager:
 
     def list_plugins(self) -> List[Dict[str, Any]]:
         """Return a list of info dicts for all discovered plugins."""
+        drops_by_plugin: Dict[str, int] = {}
+        for report in self._dropped_prompt_sections:
+            plugin_id = report.get("plugin", "")
+            drops_by_plugin[plugin_id] = drops_by_plugin.get(plugin_id, 0) + 1
         result: List[Dict[str, Any]] = []
         for key, loaded in sorted(self._plugins.items()):
+            plugin_key = loaded.manifest.key or loaded.manifest.name
             result.append(
                 {
                     "name": loaded.manifest.name,
-                    "key": loaded.manifest.key or loaded.manifest.name,
+                    "key": plugin_key,
                     "kind": loaded.manifest.kind,
                     "version": loaded.manifest.version,
                     "description": loaded.manifest.description,
@@ -6072,6 +6163,10 @@ class PluginManager:
                     "middleware": len(loaded.middleware_registered),
                     "commands": len(loaded.commands_registered),
                     "error": loaded.error,
+                    "prompt_sections_dropped": (
+                        drops_by_plugin.get(plugin_key, 0)
+                        or drops_by_plugin.get(loaded.manifest.name, 0)
+                    ),
                 }
             )
         return result

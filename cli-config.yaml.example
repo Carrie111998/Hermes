@@ -1191,6 +1191,21 @@ platform_toolsets:
   google_chat: [hermes-google_chat]
 
 # =============================================================================
+# Plugin Settings
+# =============================================================================
+# Budgets for plugin system prompt sections (register_system_prompt_section).
+# Sections become always-on prompt bytes charged on every turn of every
+# session, so the defaults are deliberately small. Raise them only for
+# trusted plugins that legitimately pin large always-on context (e.g.
+# user-curated reference files). Over-budget sections are skipped with a
+# warning and reported by /plugins.
+#
+# plugins:
+#   system_prompt_section_max_chars: 4000    # per-section cap
+#   system_prompt_section_total_chars: 8000  # all sections + headings combined
+#   system_prompt_section_max_sections: 32   # section count budget
+
+# =============================================================================
 # Gateway Platform Settings
 # =============================================================================
 # Optional per-platform messaging settings.

@@ -182,3 +182,51 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
     assert b"CHANGED" not in resumed_prompt
     assert outputs[0]["calls"] == outputs[1]["calls"] == 1
     assert outputs[1]["rebuilt_equal"] is True
+
+
+def test_restore_honors_raised_configured_section_cap():
+    """#92774: sections persisted under a raised cap must survive resume."""
+    from pathlib import Path
+
+    from agent.system_prompt import _restore_plugin_prompt_sections
+    from hermes_cli.plugins import (
+        RenderedPluginSystemPromptSection,
+        format_system_prompt_sections,
+    )
+
+    big = RenderedPluginSystemPromptSection(
+        id="example.pinned",
+        content="R" * 43_000,
+        position="after_memory",
+        plugin="persisted-prompt",
+    )
+    framed = format_system_prompt_sections([big])
+    prompt = f"System.\n\n{framed}\n\nConversation started: now"
+
+    # Default caps: an oversized persisted frame is rejected wholesale.
+    assert _restore_plugin_prompt_sections(prompt) == ()
+
+    # With the config knob raised, the same persisted bytes restore intact.
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "plugins:\n  system_prompt_section_max_chars: 65536\n"
+    )
+    restored = _restore_plugin_prompt_sections(prompt)
+    assert [item.id for item in restored] == ["example.pinned"]
+    assert restored[0].content == big.content
+
+    # Lowering the config below the built-in default never rejects
+    # default-sized frames.
+    small = RenderedPluginSystemPromptSection(
+        id="example.small",
+        content="s" * 3_000,
+        position="after_memory",
+        plugin="persisted-prompt",
+    )
+    framed_small = format_system_prompt_sections([small])
+    prompt_small = f"System.\n\n{framed_small}\n\nConversation started: now"
+    (home / "config.yaml").write_text(
+        "plugins:\n  system_prompt_section_max_chars: 100\n"
+    )
+    restored_small = _restore_plugin_prompt_sections(prompt_small)
+    assert [item.id for item in restored_small] == ["example.small"]
