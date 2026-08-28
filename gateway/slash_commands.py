@@ -5025,6 +5025,7 @@ class GatewaySlashCommandsMixin:
                     current_session_id=current_entry.session_id,
                     on_session_selected=_on_session_selected,
                     metadata=metadata,
+                    picker_user_id=source.user_id,
                 )
                 if result.success:
                     return None  # Picker rendered; no text reply needed

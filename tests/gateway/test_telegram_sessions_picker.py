@@ -18,6 +18,7 @@ adapter-only behavior:
 """
 
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -141,6 +142,7 @@ class TestSendSessionsPicker:
             current_session_id="current",
             on_session_selected=callback,
             metadata=None,
+            picker_user_id="777",
         )
 
         assert result.success is True
@@ -151,7 +153,35 @@ class TestSendSessionsPicker:
         ]
         assert [s["id"] for s in state["sessions"]] == ["s1", "s2"]
         assert state["on_session_selected"] is callback
-        assert state["current_session_id"] == "current"
+        assert state["creator_user_id"] == "777"
+
+    @pytest.mark.asyncio
+    async def test_failed_new_picker_keeps_previous_picker_state(self):
+        adapter = _make_adapter()
+        old_key = TelegramAdapter._sessions_picker_key("12345", 101, "")
+        old_callback = AsyncMock()
+        adapter._sessions_picker_state[old_key] = {
+            "sessions": [{"id": "old", "title": "Old"}],
+            "on_session_selected": old_callback,
+            "thread_id": "",
+            "creator_user_id": "777",
+            "created_at": time.monotonic(),
+        }
+        adapter._send_message_with_thread_fallback = AsyncMock(
+            side_effect=RuntimeError("send failed")
+        )
+
+        result = await adapter.send_sessions_picker(
+            chat_id="12345",
+            sessions=[{"id": "new", "title": "New", "preview": ""}],
+            current_session_id="current",
+            on_session_selected=AsyncMock(),
+            picker_user_id="777",
+        )
+
+        assert result.success is False
+        assert old_key in adapter._sessions_picker_state
+        assert adapter._sessions_picker_state[old_key]["on_session_selected"] is old_callback
 
     @pytest.mark.asyncio
     async def test_session_picker_button_labels_are_page_numbers(self, monkeypatch):
@@ -203,8 +233,8 @@ class TestSendSessionsPicker:
         line = TelegramAdapter._format_session_preview_line(
             {"id": "s1", "title": "Research", "preview": "investigate MCP"}, 1
         )
-        assert line.startswith("1\\.")
-        assert "*Research*" in line
+        assert line.startswith("1. **")
+        assert "**Research**" in line
         assert "investigate MCP" in line
         # All on one line — no newlines
         assert "\n" not in line
@@ -214,21 +244,21 @@ class TestSendSessionsPicker:
         line = TelegramAdapter._format_session_preview_line(
             {"id": "s2", "title": "Solo", "preview": ""}, 2
         )
-        assert line.startswith("2\\.")
-        assert "*Solo*" in line
+        assert line.startswith("2. **")
+        assert "**Solo**" in line
         assert " — " not in line
 
         # No preview, no title → "(untitled)" fallback
         line = TelegramAdapter._format_session_preview_line(
             {"id": "s3", "title": "", "preview": ""}, 3
         )
-        assert "*(untitled)*" in line
+        assert "**(untitled)**" in line
 
         # No preview but has title → just title
         line = TelegramAdapter._format_session_preview_line(
             {"id": "s4", "title": "Coding", "preview": ""}, 4
         )
-        assert "*Coding*" in line
+        assert "**Coding**" in line
         assert " — " not in line
 
         # Long preview → truncated to 50 chars + "..." (47 chars + "...")
@@ -239,13 +269,12 @@ class TestSendSessionsPicker:
         assert line.count("x") == 47
         assert line.endswith("...")
 
-        # Markdown special chars in title → escaped
+        # Markdown special chars remain standard Markdown here; the adapter
+        # escapes them once when formatting the complete message.
         line = TelegramAdapter._format_session_preview_line(
             {"id": "s6", "title": "A*B_C`D", "preview": "safe"}, 6
         )
-        assert "\\*" in line
-        assert "\\_" in line
-        assert "\\`" in line
+        assert "A*B_C`D" in line
 
     @pytest.mark.asyncio
     async def test_send_sessions_picker_returns_error_on_empty_sessions(self):
@@ -350,11 +379,12 @@ class TestSendSessionsPicker:
             on_session_selected=AsyncMock(),
         )
 
-        # The state still has the full list so the callback can index it.
+        # State and rendered buttons use the same filtered list, so callback
+        # indexes cannot drift when the current session is omitted.
         state = adapter._sessions_picker_state[
             TelegramAdapter._sessions_picker_key("12345", 101, "")
         ]
-        assert len(state["sessions"]) == 3
+        assert [s["id"] for s in state["sessions"]] == ["s1", "s2"]
         # The rendered keyboard only has the 2 non-current buttons + Cancel.
         # Buttons are numbered 1 and 2 (page-relative); the "current"
         # session was filtered out and gets no number.
@@ -369,6 +399,76 @@ class TestSendSessionsPicker:
         # The captured rows: 1 row of 2 buttons + 1 cancel row (no
         # pagination needed for 2 items).
         assert len(captured_rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_filtered_button_index_selects_the_visible_session(self):
+        adapter = _make_adapter()
+        msg = SimpleNamespace(message_id=101)
+        adapter._bot.send_message = AsyncMock(return_value=msg)
+        callback = AsyncMock(return_value="Resumed")
+
+        await adapter.send_sessions_picker(
+            chat_id="12345",
+            sessions=[
+                {"id": "current", "title": "Current", "preview": ""},
+                {"id": "s1", "title": "S1", "preview": ""},
+                {"id": "s2", "title": "S2", "preview": ""},
+            ],
+            current_session_id="current",
+            on_session_selected=callback,
+            picker_user_id="777",
+        )
+
+        query = _make_query(chat_id=12345, msg_id=101, user_id="777")
+        await adapter._handle_sessions_picker_callback(
+            query, "se:0", "12345", 101, ""
+        )
+        callback.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_non_creator_cannot_use_picker(self):
+        adapter = _make_adapter()
+        msg = SimpleNamespace(message_id=101)
+        adapter._bot.send_message = AsyncMock(return_value=msg)
+        callback = AsyncMock(return_value="Resumed")
+
+        await adapter.send_sessions_picker(
+            chat_id="12345",
+            sessions=[{"id": "s1", "title": "S1", "preview": ""}],
+            current_session_id="current",
+            on_session_selected=callback,
+            picker_user_id="777",
+        )
+
+        query = _make_query(chat_id=12345, msg_id=101, user_id="999")
+        await adapter._handle_sessions_picker_callback(
+            query, "se:0", "12345", 101, ""
+        )
+        callback.assert_not_awaited()
+        answer_text = query.answer.call_args.kwargs.get("text", "")
+        assert "creator" in answer_text.lower()
+        assert TelegramAdapter._sessions_picker_key("12345", 101, "") in adapter._sessions_picker_state
+
+    @pytest.mark.asyncio
+    async def test_expired_picker_is_rejected_on_callback(self):
+        adapter = _make_adapter()
+        callback = AsyncMock()
+        key = TelegramAdapter._sessions_picker_key("12345", 101, "")
+        adapter._sessions_picker_state[key] = {
+            "sessions": [{"id": "s1", "title": "S1"}],
+            "on_session_selected": callback,
+            "thread_id": "",
+            "creator_user_id": "777",
+            "created_at": time.monotonic() - adapter._SESSIONS_PICKER_TTL_SECONDS - 1,
+        }
+
+        query = _make_query(chat_id=12345, msg_id=101, user_id="777")
+        await adapter._handle_sessions_picker_callback(
+            query, "se:0", "12345", 101, ""
+        )
+        callback.assert_not_awaited()
+        assert key not in adapter._sessions_picker_state
+        assert "expired" in query.answer.call_args.kwargs["text"].lower()
 
 
 class TestSessionsPickerCallback:
@@ -631,9 +731,13 @@ class TestSessionsPickerCallback:
             on_session_selected=AsyncMock(),
         )
 
-        # Stale gone, fresh survives, new entry stored
+        # Stale and superseded same-lane state are gone; the new entry is stored.
         assert key not in adapter._sessions_picker_state
         assert (
             TelegramAdapter._sessions_picker_key("12345", 100, "")
+            not in adapter._sessions_picker_state
+        )
+        assert (
+            TelegramAdapter._sessions_picker_key("12345", 200, "")
             in adapter._sessions_picker_state
         )

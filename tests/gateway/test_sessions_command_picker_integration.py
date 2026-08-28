@@ -166,6 +166,7 @@ async def test_sessions_command_uses_picker_when_adapter_supports_it(tmp_path):
     assert kwargs["current_session_id"] == "current-session"
     # Thread metadata threaded through so the picker lands in the same topic
     assert kwargs["metadata"] == {"thread_id": "42"}
+    assert kwargs["picker_user_id"] == "777"
     # The runner callback is a closure that captures session_key + source
     assert callable(kwargs["on_session_selected"])
 

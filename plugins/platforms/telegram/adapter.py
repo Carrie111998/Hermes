@@ -6629,54 +6629,28 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _format_session_preview_line(session: Dict[str, Any], number: int) -> str:
-        """Render one session's title + preview as a single body line.
+        """Render one session's title and preview as standard Markdown.
 
-        Format: ``{number}. *Title* — preview`` (one line, no wrap).
-        Earlier v3 dropped title entirely; that lost primary identity.
-        Earlier v1 wrapped title + preview on two lines; that looked
-        cluttered when 8 of them stack up. Single-line with a separator
-        keeps both visible and scannable. Preview is truncated to ~50
-        chars to keep each row readable on mobile.
-
-        The number corresponds 1:1 with the button below — but the
-        body line is also self-describing (title + preview) so a user
-        who loses the number still knows what they're tapping.
+        ``format_message`` is the single MarkdownV2 conversion boundary;
+        this helper must not pre-escape text or punctuation.
         """
-        title = (session.get("title") or "").strip()
-        title = re.sub(r"\s+", " ", title)
+        title = re.sub(r"\s+", " ", (session.get("title") or "").strip())
         if not title:
-            title = (session.get("preview") or "").strip()[:40]
-            title = re.sub(r"\s+", " ", title) or "(untitled)"
-        preview = (session.get("preview") or "").strip()
-        preview = re.sub(r"\s+", " ", preview)
-        # Escape MarkdownV2 special chars in title and preview
-        esc = lambda s: s.replace("*", "\\*").replace("`", "\\`").replace("_", "\\_")
-        title_md = esc(title)
+            title = re.sub(
+                r"\s+", " ", (session.get("preview") or "").strip()[:40]
+            ) or "(untitled)"
+        preview = re.sub(r"\s+", " ", (session.get("preview") or "").strip())
         if preview and preview != title:
             if len(preview) > 50:
                 preview = preview[:47] + "..."
-            preview_md = esc(preview)
-            return f"{number}\\. *{title_md}* — {preview_md}"
-        return f"{number}\\. *{title_md}*"
+            return str(number) + ". **" + title + "** — " + preview
+        return str(number) + ". **" + title + "**"
 
     def _build_sessions_keyboard(
         self, sessions: list, page: int, current_session_id: str = ""
     ) -> Tuple[Any, str]:
-        """Build the paginated /sessions inline keyboard.
-
-        Returns ``(keyboard, page_info)`` so the caller can embed ``page_info``
-        in the rendered message body. Buttons are numbered 1..N (per page)
-        in a 4-column grid — the body shows matching numbered previews so
-        the user maps preview → number → button. This avoids the
-        title-in-body + title-in-button duplication that looked cluttered.
-
-        ``current_session_id`` is filtered out of the rendered list — the
-        session you're already on doesn't need a button to resume itself.
-        The runner's `_resume_session_by_id` still surfaces the translated
-        "already on" message if a button is somehow tapped anyway.
-        """
-        if current_session_id:
-            sessions = [s for s in sessions if s.get("id") != current_session_id]
+        """Build the paginated /sessions inline keyboard."""
+        sessions = self._filter_current(sessions, current_session_id)
         page_rows, meta = self._format_choice_page(
             sessions, page, self._SESSIONS_PAGE_SIZE
         )
@@ -6685,16 +6659,12 @@ class TelegramAdapter(BasePlatformAdapter):
         start = meta["start"]
 
         rows: List[List[Any]] = []
-        # 4-up grid: pack buttons 4 per row for compactness on mobile.
-        # The button label is just the 1-based page-relative number; the
-        # for-loop emits groups of 4 contiguous rows.
         button_grid: List[Any] = []
         for i, _session in enumerate(page_rows):
             abs_idx = start + i
-            page_num = i + 1  # 1-based within page
             button_grid.append(
                 InlineKeyboardButton(
-                    str(page_num), callback_data=f"se:{abs_idx}"
+                    str(i + 1), callback_data="se:" + str(abs_idx)
                 )
             )
         for j in range(0, len(button_grid), 4):
@@ -6704,21 +6674,34 @@ class TelegramAdapter(BasePlatformAdapter):
             nav: List[Any] = []
             if page > 0:
                 nav.append(
-                    InlineKeyboardButton("◀ Prev", callback_data=f"sg:{page - 1}")
+                    InlineKeyboardButton(
+                        "◀ Prev", callback_data="sg:" + str(page - 1)
+                    )
                 )
             nav.append(
                 InlineKeyboardButton(
-                    f"{page + 1}/{total_pages}", callback_data="sp:noop"
+                    str(page + 1) + "/" + str(total_pages), callback_data="sp:noop"
                 )
             )
             if page < total_pages - 1:
                 nav.append(
-                    InlineKeyboardButton("Next ▶", callback_data=f"sg:{page + 1}")
+                    InlineKeyboardButton(
+                        "Next ▶", callback_data="sg:" + str(page + 1)
+                    )
                 )
             rows.append(nav)
 
         rows.append([InlineKeyboardButton("✗ Cancel", callback_data="sx")])
         return InlineKeyboardMarkup(rows), meta["page_info"]
+
+    def _clear_sessions_picker_state_for_lane(
+        self, chat_id: str, thread_id: Optional[str]
+    ) -> None:
+        normalized_chat = str(chat_id)
+        normalized_thread = str(thread_id or "")
+        for key in list(self._sessions_picker_state):
+            if key[0] == normalized_chat and key[2] == normalized_thread:
+                self._sessions_picker_state.pop(key, None)
 
     async def send_sessions_picker(
         self,
@@ -6727,46 +6710,28 @@ class TelegramAdapter(BasePlatformAdapter):
         current_session_id: str,
         on_session_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        picker_user_id: Optional[str] = None,
     ) -> "SendResult":
-        """Send an interactive inline-keyboard picker for /sessions.
-
-        Callback data stores only indexes (``se:<n>`` / ``sg:<page>`` /
-        ``sx``) to stay under Telegram's 64-byte callback_data limit; the
-        full session ids live in adapter state for the lifetime of the
-        picker. The runner-bound ``on_session_selected`` callback is called
-        with the picked session id string and is responsible for the IDOR
-        guard + session switch (see gateway/slash_commands.py).
-        """
+        """Send an interactive inline-keyboard picker for /sessions."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        if not sessions:
+        picker_sessions = self._filter_current(sessions, current_session_id)
+        if not picker_sessions:
             return SendResult(success=False, error="No sessions")
 
-        # Amortized TTL sweep — bounds the closure leak from abandoned
-        # pickers (user opened /sessions but never tapped).
         self._evict_stale_sessions_picker_state()
+        thread_id = metadata.get("thread_id") if metadata else None
 
         try:
-            keyboard, page_info = self._build_sessions_keyboard(
-                sessions, 0, current_session_id=current_session_id
-            )
-            # Render the message body as a numbered list of previews;
-            # buttons below show just the matching numbers. The user
-            # maps preview → number → button. Visual separation: body
-            # shows previews (read), buttons show numbers (tap).
+            keyboard, page_info = self._build_sessions_keyboard(picker_sessions, 0)
             page_rows_for_body, _ = self._format_choice_page(
-                self._filter_current(sessions, current_session_id), 0,
-                self._SESSIONS_PAGE_SIZE,
+                picker_sessions, 0, self._SESSIONS_PAGE_SIZE
             )
-            body_lines = [f"🗂 *Sessions*{page_info}", ""]
+            body_lines = ["🗂 *Sessions*" + page_info, ""]
             for idx, session in enumerate(page_rows_for_body, start=1):
                 body_lines.append(self._format_session_preview_line(session, idx))
-            body_lines.extend([
-                "",
-                "_Tap the matching number below to resume._",
-            ])
+            body_lines.extend(["", "_Tap the matching number below to resume._"])
             text = self.format_message("\n".join(body_lines))
-            thread_id = metadata.get("thread_id") if metadata else None
             reply_to_id = self._reply_to_message_id_for_send(
                 None, metadata, reply_to_mode=self._reply_to_mode
             )
@@ -6785,17 +6750,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 ),
                 **self._link_preview_kwargs(),
             )
-
-            self._sessions_picker_state[self._sessions_picker_key(
-                chat_id, msg.message_id, thread_id,
-            )] = {
-                "msg_id": msg.message_id,
-                "sessions": list(sessions),
-                "current_session_id": current_session_id,
-                "on_session_selected": on_session_selected,
-                "thread_id": str(thread_id or ""),
-                "created_at": time.monotonic(),
-            }
+            key = self._sessions_picker_key(chat_id, msg.message_id, thread_id)
+            self._clear_sessions_picker_state_for_lane(chat_id, thread_id)
+            self._sessions_picker_state[key] = dict(
+                msg_id=msg.message_id,
+                sessions=list(picker_sessions),
+                on_session_selected=on_session_selected,
+                thread_id=str(thread_id or ""),
+                creator_user_id=str(picker_user_id or ""),
+                created_at=time.monotonic(),
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
@@ -6813,30 +6777,26 @@ class TelegramAdapter(BasePlatformAdapter):
         msg_id: int,
         thread_id: str,
     ) -> None:
-        """Handle /sessions inline keyboard callbacks (se:/sg:/sx:).
-
-        Validates the incoming callback's msg_id matches the stored picker
-        state before doing anything — so a stale click on an old keyboard
-        (after a new /sessions has replaced it) is rejected without invoking
-        the runner. Authorization is re-checked against the gateway's
-        ``_is_user_authorized`` policy at the adapter level (mirrors the
-        approval / choice picker gates), and the runner callback does the
-        full IDOR-side IDOR guard via ``_resume_target_allowed``.
-        """
-        state = self._sessions_picker_state.get(
-            self._sessions_picker_key(chat_id, msg_id, thread_id)
-        )
+        """Handle /sessions inline-keyboard callbacks."""
+        key = self._sessions_picker_key(chat_id, msg_id, thread_id)
+        state = self._sessions_picker_state.get(key)
         if not state:
             await query.answer(text="Session picker expired — use /sessions again.")
             return
 
-        # Authorization gate: refuse taps from someone the gateway hasn't
-        # already authorized to drive this chat. Mirrors the approval /
-        # choice picker pattern so a co-member in a shared group can't flip
-        # another user's session.
+        created_at = state.get("created_at", time.monotonic())
+        if time.monotonic() - created_at > self._SESSIONS_PICKER_TTL_SECONDS:
+            self._sessions_picker_state.pop(key, None)
+            await query.answer(text="Session picker expired — use /sessions again.")
+            return
+
         query_message = getattr(query, "message", None)
         query_chat = getattr(query_message, "chat", None)
         caller_id = str(getattr(query.from_user, "id", ""))
+        creator_id = str(state.get("creator_user_id") or "")
+        if creator_id and caller_id != creator_id:
+            await query.answer(text="⛔ Only the picker creator can use it.")
+            return
         if not self._is_callback_user_authorized(
             caller_id,
             chat_id=getattr(query_message, "chat_id", None),
@@ -6856,9 +6816,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         if data == "sx":
-            self._sessions_picker_state.pop(
-                self._sessions_picker_key(chat_id, msg_id, thread_id), None
-            )
+            self._sessions_picker_state.pop(key, None)
             try:
                 await query.edit_message_text(
                     text="Session picker cancelled.", reply_markup=None
@@ -6875,21 +6833,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Invalid page.")
                 return
             sessions = state.get("sessions", [])
-            current_session_id = state.get("current_session_id", "")
-            keyboard, page_info = self._build_sessions_keyboard(
-                sessions, page, current_session_id=current_session_id
-            )
-            # Rebuild the message body so the preview lines match the
-            # new page — same shape as send_sessions_picker emits.
+            keyboard, page_info = self._build_sessions_keyboard(sessions, page)
             page_rows_for_body, _ = self._format_choice_page(
-                self._filter_current(sessions, current_session_id), page,
-                self._SESSIONS_PAGE_SIZE,
+                sessions, page, self._SESSIONS_PAGE_SIZE
             )
-            body_lines = [f"🗂 *Sessions*{page_info}", ""]
+            body_lines = ["🗂 *Sessions*" + page_info, ""]
             for idx, session in enumerate(page_rows_for_body, start=1):
-                body_lines.append(
-                    self._format_session_preview_line(session, idx)
-                )
+                body_lines.append(self._format_session_preview_line(session, idx))
             body_lines.extend(["", "_Tap the matching number below to resume._"])
             await query.edit_message_text(
                 text=self.format_message("\n".join(body_lines)),
@@ -6911,35 +6861,49 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             session_id = str(sessions[idx].get("id") or "")
             callback = state.get("on_session_selected")
-            self._sessions_picker_state.pop(
-                self._sessions_picker_key(chat_id, msg_id, thread_id), None
-            )
+            self._sessions_picker_state.pop(key, None)
             if not session_id or not callable(callback):
                 await query.answer(text="Session picker expired.")
                 return
 
             try:
                 result_text = await callback(session_id)
-            except Exception as exc:
-                logger.error(
-                    "Sessions picker callback failed: %s", exc
-                )
-                result_text = f"Error resuming session: {exc}"
+            except Exception:
+                logger.exception("Sessions picker callback failed")
+                result_text = "Error resuming session. Please try /sessions again."
 
+            formatted = self.format_message(result_text)
+            edited = False
             try:
                 await query.edit_message_text(
-                    text=self.format_message(result_text),
+                    text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
                     reply_markup=None,
                 )
+                edited = True
             except Exception:
                 try:
                     await query.edit_message_text(
                         text=result_text, parse_mode=None, reply_markup=None
                     )
+                    edited = True
                 except Exception:
                     pass
-            await query.answer(text="Session resumed.")
+            if not edited and self._bot:
+                try:
+                    await self._send_message_with_thread_fallback(
+                        chat_id=normalize_telegram_chat_id(chat_id),
+                        text=result_text,
+                        parse_mode=None,
+                        **self._thread_kwargs_for_send(
+                            chat_id,
+                            state.get("thread_id"),
+                            None,
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Failed to send session picker result", exc_info=True)
+            await query.answer()
             return
 
         await query.answer()
