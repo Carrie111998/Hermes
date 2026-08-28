@@ -147,3 +147,83 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     assert "Code did not move" in out
     assert "✓ Code updated!" not in out
     assert "checkout main" in out
+
+
+def _make_fork_sync_advances_head_side_effect(pre_sha="abc123", post_sha="def456"):
+    """Simulate a fork where origin/main == HEAD but upstream/main is ahead.
+
+    The fork sync path runs ``git pull --ff-only upstream main`` which
+    advances HEAD from pre_sha to post_sha. After that, the main pull's
+    ``merge --ff-only origin/main`` is a no-op (HEAD already == origin/main).
+
+    The "Code did not move" guard must NOT false-positive here — the sync
+    already moved HEAD, which is itself proof of an update.
+    """
+    calls = {"n": 0}
+
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+
+        # rev-list HEAD..origin/main --count → 0 (fork matches origin)
+        if "rev-list" in joined:
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+
+        # rev-parse HEAD: first call (pre-sync) returns pre_sha, subsequent
+        # calls (post-sync) return post_sha.
+        if joined.endswith("rev-parse HEAD"):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+
+        # Everything else (merge, checkout, fetch, etc.) succeeds quietly.
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return side_effect
+
+
+def test_update_succeeds_when_fork_sync_advances_head(monkeypatch, tmp_path, capsys):
+    """When the fork sync advances HEAD, the update must succeed.
+
+    Regression for the false-positive "Code did not move" guard: when a
+    fork trails upstream, the sync path pulls from upstream and advances
+    HEAD. The subsequent ``merge --ff-only origin/main`` is a no-op because
+    HEAD already equals origin/main. The guard must compare against the
+    PRE-sync SHA, not the post-sync SHA, or every fork-trailing update
+    reports a spurious no-op.
+    """
+    from hermes_cli import update_cmd
+
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    # Patch as a fork with an upstream remote that will sync.
+    monkeypatch.setattr(
+        hermes_main, "_get_origin_url",
+        lambda *a, **k: "git@github.com:learhy/hermes-agent.git",
+    )
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: True)
+    monkeypatch.setattr(
+        hermes_main, "_has_upstream_remote", lambda *a, **k: True
+    )
+    # The sync advances HEAD from pre_sha to post_sha.
+    sync_calls = {"n": 0}
+
+    def _sync_side_effect(git_cmd, cwd):
+        sync_calls["n"] += 1
+
+    monkeypatch.setattr(
+        hermes_main, "_sync_with_upstream_if_needed", _sync_side_effect
+    )
+
+    _patch_update_deps(
+        monkeypatch, tmp_path, _make_fork_sync_advances_head_side_effect()
+    )
+
+    hermes_main.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "Code did not move" not in out
+    assert sync_calls["n"] >= 1
