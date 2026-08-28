@@ -57,7 +57,7 @@ import {
 } from './data'
 import { EditProfileDialog } from './edit-profile-dialog'
 import { $groupChats, $groupChatWorkspace, $groupNeedsYou } from './group-chat'
-import { disbandGroupChat, GroupChatWorkspace, openGroupChat } from './group-chat-view'
+import { disbandGroupChat, GroupChatSettingsDialog, GroupChatWorkspace, openGroupChat } from './group-chat-view'
 import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-membership'
 import { $groupMainTabsRev, shouldRenderGroupChatInPane } from './group-panes'
 import { $showHiddenBots, isBotHidden, isBotPinned } from './hidden-bots'
@@ -251,6 +251,7 @@ export function BotsPane() {
   // it is not part of the shared RosterRow model, so it rides as an extra here.
   const [deleting, setDeleting] = useState<null | (RosterRow & { path?: string })>(null)
   const [deletingGroup, setDeletingGroup] = useState<null | { members: GroupMember[]; name: string }>(null)
+  const [editingGroup, setEditingGroup] = useState<null | { members: GroupMember[]; name: string }>(null)
   const [grouping, setGrouping] = useState<null | RosterRow>(null)
   const [query, setQuery] = useState('')
   const [rowKindFilter, setRowKindFilter] = useState<RosterKindFilter>('all')
@@ -546,6 +547,7 @@ export function BotsPane() {
       needsYou={Boolean(groupNeedsYou[row.name])}
       onDisband={setDeletingGroup}
       onOpen={openGroupChat}
+      onSettings={setEditingGroup}
     />
   )
 
@@ -878,6 +880,14 @@ export function BotsPane() {
         }}
         open={Boolean(editing)}
       />
+      {editingGroup ? (
+        <GroupChatSettingsDialog
+          group={editingGroup.name}
+          members={editingGroup.members}
+          onClose={() => setEditingGroup(null)}
+          open
+        />
+      ) : null}
       {grouping ? <GroupDialog bot={grouping} onClose={() => setGrouping(null)} /> : null}
       <ConfirmDialog
         busyLabel="Deleting…"
