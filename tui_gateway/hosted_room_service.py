@@ -442,6 +442,7 @@ class HostedRoomService:
         with self._policy_lock:
             self.peer_routes[key] = rotated_route
             self._peer_route_status[key] = "ready"
+        self._clear_blocked_artifact_retries(room_id, member_id)
 
     def _refresh_peer_attachment_catalog(
         self,
@@ -683,6 +684,7 @@ class HostedRoomService:
                     room_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     execution_generation INTEGER NOT NULL,
+                    member_id TEXT NOT NULL,
                     attempts INTEGER NOT NULL,
                     next_attempt_at REAL NOT NULL,
                     blocked INTEGER NOT NULL DEFAULT 0,
@@ -735,15 +737,26 @@ class HostedRoomService:
             )
             conn.execute(
                 """INSERT INTO hosted_room_artifact_retries
-                   (room_id, task_id, execution_generation, attempts,
+                   (room_id, task_id, execution_generation, member_id, attempts,
                     next_attempt_at, blocked, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(room_id, task_id, execution_generation) DO UPDATE SET
                     attempts=excluded.attempts,
                     next_attempt_at=excluded.next_attempt_at,
                     blocked=excluded.blocked,
                     updated_at=excluded.updated_at""",
-                (*key, attempts, now + delay, int(permanent), now),
+                (
+                    *key,
+                    str(
+                        task.get("payload", {}).get("target_member_id")
+                        or task.get("payload", {}).get("target_profile")
+                        or "unknown"
+                    ),
+                    attempts,
+                    now + delay,
+                    int(permanent),
+                    now,
+                ),
             )
 
     def _clear_artifact_retry(self, task: Mapping[str, Any]) -> None:
@@ -752,6 +765,14 @@ class HostedRoomService:
                 """DELETE FROM hosted_room_artifact_retries
                    WHERE room_id=? AND task_id=? AND execution_generation=?""",
                 self._artifact_retry_key(task),
+            )
+
+    def _clear_blocked_artifact_retries(self, room_id: str, member_id: str) -> None:
+        with self._artifact_retry_connection() as conn:
+            conn.execute(
+                """DELETE FROM hosted_room_artifact_retries
+                   WHERE room_id=? AND member_id=? AND blocked=1""",
+                (room_id, member_id),
             )
 
     def _import_terminal_artifacts(
