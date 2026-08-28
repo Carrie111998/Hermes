@@ -194,10 +194,6 @@
           "description": "free"
         },
         {
-          "id": "inclusionai/ring-2.6-1t:free",
-          "description": "free"
-        },
-        {
           "id": "nvidia/nemotron-3.5-lightning:free",
           "description": "free"
         }

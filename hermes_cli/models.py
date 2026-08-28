@@ -143,7 +143,6 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
     ("nvidia/nemotron-3-ultra-550b-a55b:free", "free"),
     ("inclusionai/ling-3.0-flash:free",        "free"),
-    ("inclusionai/ring-2.6-1t:free",           "free"),
     ("nvidia/nemotron-3.5-lightning:free",     "free"),
 ]
 
