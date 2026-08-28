@@ -27,29 +27,20 @@ MEMBERS = [
 MEMBER_IDS = tuple(member["member_id"] for member in MEMBERS)
 
 
-def _refs(
-    overrides: dict[str, str | None] | None = None,
-) -> dict[str, str | None]:
-    refs: dict[str, str | None] = {member_id: None for member_id in MEMBER_IDS}
-    if overrides:
-        refs.update(overrides)
-    return refs
-
-
 def _attachment(
     kind: str,
     name: str,
     mime: str,
     *,
     size: int = 128,
-    refs: dict[str, str | None] | None = None,
+    attachment_id: str = "att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 ) -> dict:
     return {
+        "attachment_id": attachment_id,
         "kind": kind,
         "name": name,
         "size": size,
         "mime": mime,
-        "refs": refs if refs is not None else _refs(),
     }
 
 
@@ -60,31 +51,21 @@ def _attachment_manifest() -> list[dict]:
             "diagram.png",
             "image/png",
             size=2048,
-            refs=_refs({
-                "member-research": "stage:image:research",
-                "member-build": "stage:image:build",
-            }),
+            attachment_id="att_11111111111111111111111111111111",
         ),
         _attachment(
             "pdf",
             "release.pdf",
             "application/pdf",
             size=4096,
-            refs=_refs({
-                "member-research": "stage:pdf:research",
-                "member-build": "stage:pdf:build",
-            }),
+            attachment_id="att_22222222222222222222222222222222",
         ),
         _attachment(
             "file",
             "notes.txt",
             "text/plain",
             size=512,
-            refs=_refs({
-                "member-research": "stage:file:research",
-                "member-build": "stage:file:build",
-                "member-review": "stage:file:review",
-            }),
+            attachment_id="att_33333333333333333333333333333333",
         ),
     ]
 
@@ -604,18 +585,15 @@ def test_valid_image_pdf_and_file_manifest_is_normalized():
         "file",
     ]
     assert payload["attachments"][0] == {
+        "attachment_id": "att_11111111111111111111111111111111",
         "kind": "image",
         "name": "diagram.png",
         "size": 2048,
         "mime": "image/png",
-        "refs": _refs({
-            "member-research": "stage:image:research",
-            "member-build": "stage:image:build",
-        }),
     }
 
 
-def test_prompts_include_only_the_current_members_refs_and_queued_media_note(
+def test_prompts_include_safe_metadata_and_tasks_carry_attachment_ids(
     room_db: tuple[Path, dict],
 ):
     db, room = room_db
@@ -631,10 +609,8 @@ def test_prompts_include_only_the_current_members_refs_and_queued_media_note(
     assert research.member.member_id == "member-research"
     assert "User (user): Review the upload." in research_prompt
     assert "User (user): Review the upload. diagram.png" not in research_prompt
-    assert "stage:image:research" in research_prompt
-    assert "stage:pdf:research" in research_prompt
-    assert "stage:file:research" in research_prompt
-    assert "stage:image:build" not in research_prompt
+    assert "att_11111111111111111111111111111111" not in research_prompt
+    assert research.payload["attachments"] == _attachment_manifest()
     assert "Queued image/PDF attachments are staged separately" in research_prompt
     assert 'Queued image "diagram.png"' in research_prompt
     assert 'Queued PDF "release.pdf"' in research_prompt
@@ -652,11 +628,104 @@ def test_prompts_include_only_the_current_members_refs_and_queued_media_note(
     build = _next_task(room, db)
     build_prompt = build.payload["prompt"]
     assert build.member.member_id == "member-build"
-    assert "stage:image:build" in build_prompt
-    assert "stage:pdf:build" in build_prompt
-    assert "stage:file:build" in build_prompt
-    assert "stage:image:research" not in build_prompt
+    assert "att_11111111111111111111111111111111" not in build_prompt
+    assert build.payload["attachments"] == _attachment_manifest()
     assert build.identity.task_id != research.identity.task_id
+
+
+def test_large_attachment_backlog_advances_in_bounded_lossless_batches(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    expected_ids: list[str] = []
+    for message_index in range(25):
+        manifest = [
+            _attachment(
+                "file",
+                f"part-{message_index}-{file_index}.bin",
+                "application/octet-stream",
+                size=1,
+                attachment_id=f"att_{message_index * 8 + file_index:032x}",
+            )
+            for file_index in range(8)
+        ]
+        expected_ids.extend(item["attachment_id"] for item in manifest)
+        _append_user(
+            db,
+            event_id=f"user-batch-{message_index}",
+            text=f"Batch {message_index}",
+            attachments=manifest,
+        )
+
+    observed_ids: list[str] = []
+    tasks: list[discussion.DiscussionTaskPlan] = []
+    while len(observed_ids) < len(expected_ids):
+        task = _next_task(room, db)
+        assert task.member.profile == "research"
+        attachments = task.payload["attachments"]
+        assert len(attachments) <= 16
+        assert sum(item["size"] for item in attachments) <= 50_000_000
+        observed_ids.extend(item["attachment_id"] for item in attachments)
+        tasks.append(task)
+        publication = discussion.plan_publication(
+            room,
+            _events(db),
+            task,
+            status="settled",
+            result={"text": "First batch reviewed." if len(tasks) == 1 else "(pass)"},
+            local_profiles=LOCAL_PROFILES,
+        )
+        assert publication.terminal_kind == "turn.settled"
+        _append_publication(db, publication)
+
+    assert observed_ids == expected_ids
+    assert len(tasks) == 13
+    assert len({task.identity.task_id for task in tasks}) == len(tasks)
+    assert tasks[0].seen_through_seq < tasks[-1].seen_through_seq
+    assert "First batch reviewed." not in tasks[1].payload["prompt"]
+
+    next_member = _next_task(room, db)
+    assert next_member.member.profile == "build"
+    assert len(next_member.payload["attachments"]) == 16
+
+
+def test_attachment_backlog_is_also_chunked_by_task_bytes(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    for message_index in range(3):
+        manifest = [
+            _attachment(
+                "file",
+                f"chunk-{message_index}-{file_index}.bin",
+                "application/octet-stream",
+                size=10_000_000,
+                attachment_id=f"att_{message_index * 2 + file_index:032x}",
+            )
+            for file_index in range(2)
+        ]
+        _append_user(
+            db,
+            event_id=f"user-bytes-{message_index}",
+            text=f"Byte batch {message_index}",
+            attachments=manifest,
+        )
+
+    first = _next_task(room, db)
+    assert sum(item["size"] for item in first.payload["attachments"]) == 40_000_000
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "(pass)"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, publication)
+
+    second = _next_task(room, db)
+    assert second.member.profile == "research"
+    assert sum(item["size"] for item in second.payload["attachments"]) == 20_000_000
 
 
 def test_attachment_manifest_changes_the_deterministic_task_id(
@@ -714,40 +783,18 @@ def test_attachment_task_reconstructs_after_driver_reopen(
         local_profiles=LOCAL_PROFILES,
     )
     assert reconstructed == task
-    assert "stage:image:research" in reconstructed.payload["prompt"]
+    assert reconstructed.payload["attachments"] == _attachment_manifest()
+    assert "att_11111111111111111111111111111111" not in reconstructed.payload["prompt"]
 
 
-def test_attachment_refs_require_every_member_and_reject_unknown_members():
-    missing = _refs()
-    missing.pop("member-review")
-    unknown = _refs()
-    unknown["member-remote"] = "stage:file:remote"
-
-    with pytest.raises(
-        discussion.DiscussionValidationError, match="missing member ids"
-    ):
+def test_attachment_manifest_requires_frozen_member_ids():
+    with pytest.raises(discussion.DiscussionValidationError, match="frozen room member"):
         discussion.validate_user_payload(
             {
                 "text": "Review.",
                 "thread_id": "thread-1",
-                "attachments": [
-                    _attachment("file", "notes.txt", "text/plain", refs=missing)
-                ],
+                "attachments": [_attachment("file", "notes.txt", "text/plain")],
             },
-            member_ids=MEMBER_IDS,
-        )
-    with pytest.raises(
-        discussion.DiscussionValidationError, match="unknown member ids"
-    ):
-        discussion.validate_user_payload(
-            {
-                "text": "Review.",
-                "thread_id": "thread-1",
-                "attachments": [
-                    _attachment("file", "notes.txt", "text/plain", refs=unknown)
-                ],
-            },
-            member_ids=MEMBER_IDS,
         )
 
 
@@ -782,29 +829,20 @@ def test_attachment_manifest_requires_every_exact_metadata_field():
         )
 
 
-@pytest.mark.parametrize(
-    "unsafe_ref",
-    [
-        "data:image/png;base64,AAAA",
-        "base64:AAAA",
-        "file:secret",
-        "path:secret",
-        "/tmp/secret",
-        "../secret",
-        "folder/secret",
-        "C:\\secret",
-    ],
-)
-def test_attachment_manifest_rejects_unsafe_refs(unsafe_ref: str):
-    refs = _refs({"member-research": unsafe_ref})
-
-    with pytest.raises(discussion.DiscussionValidationError, match="safe opaque ref"):
+@pytest.mark.parametrize("attachment_id", ["", "att_short", "file:secret", "../secret"])
+def test_attachment_manifest_rejects_non_opaque_ids(attachment_id: str):
+    with pytest.raises(discussion.DiscussionValidationError, match="attachment_id"):
         discussion.validate_user_payload(
             {
                 "text": "Review.",
                 "thread_id": "thread-1",
                 "attachments": [
-                    _attachment("file", "notes.txt", "text/plain", refs=refs)
+                    _attachment(
+                        "file",
+                        "notes.txt",
+                        "text/plain",
+                        attachment_id=attachment_id,
+                    )
                 ],
             },
             member_ids=MEMBER_IDS,
@@ -839,15 +877,6 @@ def test_attachment_manifest_rejects_unsafe_refs(unsafe_ref: str):
             _attachment("pdf", "release.pdf", "application/octet-stream"),
             "pdf kind requires application/pdf",
         ),
-        (
-            _attachment(
-                "file",
-                "notes.txt",
-                "text/plain",
-                refs=_refs({"member-research": "r" * 257}),
-            ),
-            "safe opaque ref",
-        ),
     ],
 )
 def test_attachment_metadata_is_bounded(attachment: dict, match: str):
@@ -864,7 +893,12 @@ def test_attachment_metadata_is_bounded(attachment: dict, match: str):
 
 def test_attachment_count_is_bounded():
     attachments = [
-        _attachment("file", f"notes-{index}.txt", "text/plain")
+        _attachment(
+            "file",
+            f"notes-{index}.txt",
+            "text/plain",
+            attachment_id=f"att_{index:032x}",
+        )
         for index in range(discussion.MAX_ATTACHMENTS + 1)
     ]
 
@@ -879,22 +913,20 @@ def test_attachment_count_is_bounded():
         )
 
 
-def test_attachment_manifest_total_metadata_is_bounded():
-    maximum_ref = "r" * discussion.MAX_ATTACHMENT_REF_CHARS
-    member_ids = tuple(f"member-{profile}" for profile in LOCAL_PROFILES)
-    refs: dict[str, str | None] = {member_id: maximum_ref for member_id in member_ids}
+def test_attachment_manifest_total_bytes_are_bounded():
     attachments = [
         _attachment(
             "file",
-            "\U0001f9ea" * discussion.MAX_ATTACHMENT_NAME_CHARS,
+            f"attachment-{index}.bin",
             "application/octet-stream",
-            refs=refs,
+            size=4_000_000,
+            attachment_id=f"att_{index:032x}",
         )
-        for _index in range(discussion.MAX_ATTACHMENTS)
+        for index in range(discussion.MAX_ATTACHMENTS)
     ]
 
     with pytest.raises(
-        discussion.DiscussionValidationError, match="manifest is too large"
+        discussion.DiscussionValidationError, match="message byte limit"
     ):
         discussion.validate_user_payload(
             {
@@ -902,8 +934,22 @@ def test_attachment_manifest_total_metadata_is_bounded():
                 "thread_id": "thread-1",
                 "attachments": attachments,
             },
-            member_ids=member_ids,
+            member_ids=MEMBER_IDS,
         )
+
+
+def test_attachment_only_user_payload_is_accepted():
+    payload = discussion.validate_user_payload(
+        {
+            "text": "",
+            "thread_id": "thread-1",
+            "attachments": [_attachment("file", "notes.txt", "text/plain")],
+        },
+        member_ids=MEMBER_IDS,
+    )
+
+    assert payload["text"] == ""
+    assert len(payload["attachments"]) == 1
 
 
 @pytest.mark.parametrize(

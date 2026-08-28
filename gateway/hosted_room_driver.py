@@ -46,7 +46,12 @@ TASK_STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({"settled", "failed", "cancelled"})
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
-_TASK_PAYLOAD_FIELDS = frozenset({"target_profile", "prompt", "source_event_seq"})
+_TASK_PAYLOAD_REQUIRED_FIELDS = frozenset({
+    "target_profile",
+    "prompt",
+    "source_event_seq",
+})
+_TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({"attachments"})
 _LEASE_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -208,8 +213,8 @@ def _authority_epoch(value: Any) -> int:
 def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
     if not isinstance(value, dict):
         raise DriverValidationError("payload must be an object")
-    unknown = set(value) - _TASK_PAYLOAD_FIELDS
-    missing = _TASK_PAYLOAD_FIELDS - set(value)
+    unknown = set(value) - _TASK_PAYLOAD_REQUIRED_FIELDS - _TASK_PAYLOAD_OPTIONAL_FIELDS
+    missing = _TASK_PAYLOAD_REQUIRED_FIELDS - set(value)
     if unknown:
         raise DriverValidationError(
             f"unknown payload fields: {', '.join(sorted(unknown))}"
@@ -240,6 +245,13 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
         "prompt": prompt,
         "source_event_seq": source_event_seq,
     }
+    if "attachments" in value:
+        from gateway.hosted_room_attachments import validate_task_manifest
+
+        attachments = validate_task_manifest(value["attachments"])
+        if not attachments:
+            raise DriverValidationError("attachments must not be empty when present")
+        normalized["attachments"] = attachments
     encoded = json.dumps(
         normalized,
         ensure_ascii=True,
