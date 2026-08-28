@@ -40,6 +40,10 @@ export interface PreviewPin {
 
 /** What the in-page engine reports back after a placement or a re-attach. */
 export interface PinEngineReport {
+  /** Whether annotation mode is on. The engine owns this, not the panel: a
+   *  navigation resets it, and the panel would otherwise show a toggle that no
+   *  longer reflects the page. */
+  armed: boolean
   pins: PreviewPin[]
   url: string
 }

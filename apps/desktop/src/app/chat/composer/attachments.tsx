@@ -43,6 +43,7 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
     file: FileText,
     folder: FolderOpen,
     image: ImageIcon,
+    pins: MessageCode,
     review: MessageCode,
     terminal: Terminal,
     url: Link
@@ -56,11 +57,16 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
 
   // A review card's detail is its resolved-comment JSON, not a previewable
   // path — clicking it should do nothing rather than toast a bogus failure.
+  // A pins card's detail is the serialised batch, for the same reason.
   const canPreview =
-    attachment.kind !== 'folder' && attachment.kind !== 'terminal' && attachment.kind !== 'review' && !isUploading
+    attachment.kind !== 'folder' &&
+    attachment.kind !== 'terminal' &&
+    attachment.kind !== 'review' &&
+    attachment.kind !== 'pins' &&
+    !isUploading
 
   const detail =
-    attachment.kind !== 'review' && attachment.detail && attachment.detail !== attachment.label
+    attachment.kind !== 'review' && attachment.kind !== 'pins' && attachment.detail && attachment.detail !== attachment.label
       ? attachment.detail
       : undefined
 

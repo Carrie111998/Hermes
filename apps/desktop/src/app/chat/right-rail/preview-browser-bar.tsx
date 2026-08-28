@@ -38,6 +38,10 @@ interface PreviewBrowserBarProps {
   onReload: () => void
   onToggleConsole: () => void
   onToggleDevTools: () => void
+  /** Opens the annotation panel. Like the console toggle, this acts on THIS
+   *  page, so it belongs beside its address rather than on the shared strip. */
+  onTogglePins: () => void
+  pinsOpen: boolean
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
@@ -103,6 +107,8 @@ export function PreviewBrowserBar({
   onReload,
   onToggleConsole,
   onToggleDevTools,
+  onTogglePins,
+  pinsOpen,
   url
 }: PreviewBrowserBarProps) {
   const { t } = useI18n()
@@ -206,6 +212,12 @@ export function PreviewBrowserBar({
           text={url}
         />
       </div>
+      <PaneStripGlyph
+        active={pinsOpen}
+        icon={<Codicon name="comment-draft" size="0.8125rem" />}
+        label="Comments"
+        onSelect={onTogglePins}
+      />
       {onPopIn ? (
         <PaneStripGlyph
           icon={<Codicon name="screen-normal" size="0.8125rem" />}

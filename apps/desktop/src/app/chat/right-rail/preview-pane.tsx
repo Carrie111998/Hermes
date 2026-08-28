@@ -31,6 +31,7 @@ import { canOpenBrowserWindow, isBrowserWindow } from '@/store/windows'
 
 import { ArtifactPreview } from './preview-artifact'
 import { PreviewBrowserBar } from './preview-browser-bar'
+import { PreviewPinPanel } from './preview-pin-panel'
 import {
   clampConsoleHeight,
   compactUrl,
@@ -235,6 +236,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const previewServerRestart = useStore($previewServerRestart)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
+  // Annotation mode is per-pane and deliberately not persisted: a review
+  // session is a thing you start, not a mode you leave on.
+  const [pinPanelOpen, setPinPanelOpen] = useState(false)
   const [currentUrl, setCurrentUrl] = useState(target.url)
   const liveUrlRef = useRef(currentUrl)
   liveUrlRef.current = currentUrl
@@ -1043,8 +1047,14 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onReload={reloadPreview}
             onToggleConsole={() => consoleState.setOpen(open => !open)}
             onToggleDevTools={toggleDevTools}
+            onTogglePins={() => setPinPanelOpen(open => !open)}
+            pinsOpen={pinPanelOpen}
             url={currentUrl}
           />
+        )}
+
+        {isWebPreview && !isRemoteHtml && (
+          <PreviewPinPanel open={pinPanelOpen} url={currentUrl} />
         )}
 
         <div

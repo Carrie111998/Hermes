@@ -81,7 +81,7 @@ describe('placing pins', () => {
   it('gives every pin a distinct id', () => {
     placePin('#save')
     placePin('#note')
-    const ids = run({ verb: 'state' }).pins.map(pin => pin.id)
+    const ids = run({ verb: 'state' }).pins.map((pin: Record<string, unknown>) => pin.id)
     expect(new Set(ids).size).toBe(2)
   })
 

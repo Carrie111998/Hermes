@@ -4,6 +4,7 @@ import type { QuickModelOption } from '@/app/chat/composer/types'
 import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
+import { pinCommentBlock } from '@/lib/preview-pins/pin-block'
 import { normalize } from '@/lib/text'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
@@ -220,6 +221,18 @@ export function attachmentDisplayText(attachment: ComposerAttachment): string | 
   // A malformed payload falls through to the refText (the pasted URL).
   if (attachment.kind === 'review' && attachment.detail) {
     const block = reviewCommentBlock(attachment.detail)
+
+    if (block) {
+      return block
+    }
+  }
+
+  // A batch of preview pins: expand to the open comments with what each is
+  // fastened to, so "address my comments" carries the places as well as the
+  // words. Same fall-through contract as `review` — a malformed payload, or a
+  // batch whose pins are all resolved, drops to the refText.
+  if (attachment.kind === 'pins' && attachment.detail) {
+    const block = pinCommentBlock(attachment.detail)
 
     if (block) {
       return block
