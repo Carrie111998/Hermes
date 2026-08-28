@@ -953,6 +953,10 @@ check_node() {
     if command -v node &> /dev/null && command -v npm &> /dev/null \
         && node_satisfies_build "$(node --version)"; then
         if npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
+            # `node` on PATH may be the managed Node's symlink (install_node
+            # links it into the command link dir), so node-gyp must use the
+            # managed headers, not the host-derived npm_config_nodedir.
+            point_node_gyp_at_managed_node
             log_success "Node.js $(node --version) found"
             HAS_NODE=true
             return 0
