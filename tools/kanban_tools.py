@@ -1101,6 +1101,40 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        if (
+            task
+            and task.goal_mode
+            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+        ):
+            conn.close()
+            return tool_error(
+                f"goal_mode tasks can only block with kind in "
+                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                f"If the task is actually finished or cannot proceed for "
+                f"another reason, call kanban_complete instead — the "
+                f"completion judge will evaluate it."
+            )
+        if kind == "capability":
+            command = args.get("command")
+            stderr = args.get("stderr")
+            if not isinstance(command, str) or not command.strip() or not isinstance(stderr, str):
+                conn.close()
+                return tool_error(
+                    "capability blocks require command and stderr from a "
+                    "current failing tool invocation. Run the bounded command "
+                    "first; use its literal argv and redacted stderr, or "
+                    "complete with the factual no-op/result."
+                )
+            command = _truncate_utf8(
+                redact_sensitive_text(command, force=True), 1200
+            )
+            stderr = _truncate_utf8(
+                redact_sensitive_text(stderr, force=True), 2400
+            )
+            reason = (
+                f"{reason}\n\nReproduced command: {command}\n"
+                f"stderr: {stderr}"
+            )
         generated_leaf = bool(
             task
             and (task.created_by or "").strip().lower()
@@ -1114,19 +1148,6 @@ def _handle_block(args: dict, **kw) -> str:
                 "decomposer. Make the role-owned decision and complete with "
                 "factual evidence; use kind='capability' only for a newly "
                 "reproduced external access or credential failure."
-            )
-        if (
-            task
-            and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
-        ):
-            conn.close()
-            return tool_error(
-                f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
-                f"If the task is actually finished or cannot proceed for "
-                f"another reason, call kanban_complete instead — the "
-                f"completion judge will evaluate it."
             )
         try:
             ok = kb.block_task(
@@ -2150,12 +2171,26 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
             },
-            "reason": {
+        "reason": {
                 "type": "string",
                 "description": (
                     "What you need answered or what stopped you, in one or "
                     "two sentences. Don't paste the whole conversation; the "
                     "human has the board and can ask follow-ups via comments."
+                ),
+            },
+            "command": {
+                "type": "string",
+                "description": (
+                    "Required for kind='capability': literal command or tool "
+                    "operation that just failed in this run."
+                ),
+            },
+            "stderr": {
+                "type": "string",
+                "description": (
+                    "Required for kind='capability': its current stderr or "
+                    "tool error, with secrets omitted."
                 ),
             },
             "kind": {
