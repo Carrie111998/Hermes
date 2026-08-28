@@ -359,6 +359,50 @@ class TestEnsureTccAnchor:
         assert marker.read_text(encoding="utf-8") == tcc._marker_value(source)
         assert not list(venv_bin.glob(".tcc-anchor-source.*"))
 
+    def test_libpython_refresh_failure_leaves_existing_dylib_intact(self, tmp_path, monkeypatch):
+        # If a refresh's hardlink AND copy fallback both fail (disk
+        # full/EPERM/interrupted), the venv's EXISTING libpython must
+        # survive untouched — the same atomic-write guarantee
+        # _copy_alias/_write_marker already give the alias and marker
+        # writes. Losing it here reintroduces the #95425 dyld crash for an
+        # already-installed anchor, not just a fresh one.
+        store_bin = _build_store(tmp_path, with_libpython=True)
+        venv_dir = tmp_path / "venv"
+        dst_lib = venv_dir / "lib"
+        dst_lib.mkdir(parents=True)
+        dst = dst_lib / "libpython3.11.dylib"
+        dst.write_bytes(b"existing working dylib")
+
+        monkeypatch.setattr(
+            tcc.os, "link",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("no hardlinks across this fs")),
+        )
+        monkeypatch.setattr(
+            tcc.shutil, "copy2",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        tcc._provision_libpython(venv_dir, store_bin / "python3.11", refresh=True)
+
+        assert dst.is_file()
+        assert dst.read_bytes() == b"existing working dylib"
+        # No leftover staging file either.
+        assert not list(dst_lib.glob(".libpython3.11.dylib.tcc-*"))
+
+    def test_libpython_refresh_success_atomically_replaces_dylib(self, tmp_path, monkeypatch):
+        store_bin = _build_store(tmp_path, with_libpython=True)
+        src_dylib = store_bin.parent / "lib" / "libpython3.11.dylib"
+        venv_dir = tmp_path / "venv"
+        dst_lib = venv_dir / "lib"
+        dst_lib.mkdir(parents=True)
+        dst = dst_lib / "libpython3.11.dylib"
+        dst.write_bytes(b"stale dylib")
+
+        tcc._provision_libpython(venv_dir, store_bin / "python3.11", refresh=True)
+
+        assert dst.read_bytes() == src_dylib.read_bytes()
+        assert not list(dst_lib.glob(".libpython3.11.dylib.tcc-*"))
+
     def test_store_root_marker_tracks_managed_uv_constant(self):
         # The repair-generation store marker must stay derived from
         # managed_uv's directory constant, not drift as a hardcoded string.
