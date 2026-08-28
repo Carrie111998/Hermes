@@ -55,11 +55,16 @@ test('corrupt or non-object policy file defaults to encryption ON', () => {
   }
 })
 
-test('truthy-but-not-true values do NOT enable encryption', () => {
-  // Strict === true coercion: a hand-edited "on": 1 or "yes" must not turn
-  // keychain prompts back on.
-  for (const bad of ['{"on":1}', '{"on":"yes"}', '{"on":"true"}']) {
-    assert.equal(readSecretStoragePolicy(fakeIo(bad)).on, false)
+test('malformed policy objects default to encryption ON instead of plaintext', () => {
+  for (const bad of [
+    '{"on":1,"migrated":true}',
+    '{"on":"yes","migrated":true}',
+    '{"on":"true","migrated":true}',
+    '{"on":false}',
+    '{"on":false,"migrated":true,"future":false}',
+    '{"on":false,"migrated":null}'
+  ]) {
+    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: true, migrated: false })
   }
 })
 

@@ -9244,14 +9244,14 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   // Whether the OS keyring (safeStorage) can encrypt the saved token. When
   // false the renderer knows to offer the plain-text opt-in in Settings →
-  // Gateway. With keychain encryption opted out (the default) this reports
-  // true WITHOUT touching safeStorage — probing is itself a keychain touch
-  // that raises the macOS password dialog (see probeSecureTokenStorage).
+  // Gateway. With keychain encryption explicitly opted out this reports true
+  // WITHOUT touching safeStorage — probing is itself a keychain touch that
+  // raises the macOS password dialog (see probeSecureTokenStorage).
   const secureTokenStorage = probeSecureTokenStorage()
 
-  // Whether the currently saved token is stored in plain text (the keyring-less
-  // opt-in path). The env override supplies its token from the environment, not
-  // the saved block, so it never reports as plain text here.
+  // Whether the currently saved token is stored in plain text (the explicit
+  // keyring-less opt-out path). The env override supplies its token from the
+  // environment, not the saved block, so it never reports as plain text here.
   const remoteTokenPlainText = !envOverride && block.token?.encoding === 'plain'
 
   let remoteOauthConnected = false

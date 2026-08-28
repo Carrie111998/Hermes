@@ -46,16 +46,24 @@ export interface SecretStoragePolicyIo {
  * Normalize whatever is on disk into a policy. Anything unreadable,
  * unparseable, or hand-mangled is the secure default: encryption ON,
  * migration not yet attempted. A persisted `on: false` is honored only after
- * the user has explicitly selected the plaintext escape hatch. `on` uses
- * strict `=== true` — a truthy-but-not-true value must not silently enable
- * keychain prompts (mirrors the allowPlainText coercion rule in hardening.ts).
+ * user has explicitly selected the plaintext escape hatch. The persisted
+ * object must contain exactly the two boolean fields this module writes;
+ * malformed field types, missing fields, and unknown fields all fall back to
+ * the secure default rather than silently selecting plaintext.
  */
 export function readSecretStoragePolicy(io: SecretStoragePolicyIo): SecretStoragePolicy {
   try {
     const parsed = JSON.parse(io.readText())
 
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return { on: parsed.on === true, migrated: parsed.migrated === true }
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed).length === 2 &&
+      typeof parsed.on === 'boolean' &&
+      typeof parsed.migrated === 'boolean'
+    ) {
+      return { on: parsed.on, migrated: parsed.migrated }
     }
   } catch {
     // fall through to default
