@@ -1600,8 +1600,13 @@ class GatewaySlashCommandsMixin:
         )
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
-        """Handle /restart command - drain active work, then restart the gateway."""
+        """Handle /restart [force] — optionally skip the active-work drain wait."""
         from gateway.run import _hermes_home
+        restart_arg = event.get_command_args().strip().lower()
+        if restart_arg not in {"", "force"}:
+            return "Usage: /restart [force]"
+        force = restart_arg == "force"
+
         # Defensive idempotency check: if the previous gateway process
         # recorded this same /restart (same platform + update_id) and the new
         # process is seeing it *again*, this is a re-delivery caused by PTB's
@@ -1703,11 +1708,16 @@ class GatewaySlashCommandsMixin:
 
         _under_service = is_gateway_supervisor_process()
         _in_container = is_container_restart_context()
+        restart_kwargs = {"force": True} if force else {}
         if _under_service or _in_container:
-            self.request_restart(detached=False, via_service=True)
+            self.request_restart(
+                detached=False, via_service=True, **restart_kwargs
+            )
         else:
-            self.request_restart(detached=True, via_service=False)
-        if active_agents:
+            self.request_restart(
+                detached=True, via_service=False, **restart_kwargs
+            )
+        if active_agents and not force:
             return t("gateway.draining", count=active_agents)
         return EphemeralReply(t("gateway.restart.restarting"))
 
