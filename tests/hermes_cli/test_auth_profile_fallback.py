@@ -222,6 +222,50 @@ def test_provider_state_fallback_respects_profile_source_suppression(profile_env
     assert get_provider_auth_state("xai-oauth") is None
 
 
+def test_root_only_suppression_blocks_all_profile_global_fallbacks(profile_env):
+    """A root deny-list cannot disappear when a named profile omits it."""
+    from hermes_cli.auth import get_provider_auth_state, read_credential_pool
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "xai-oauth": [
+                    _fallback_entry("global-device", "device_code"),
+                    _fallback_entry("global-manual", "manual"),
+                ],
+            },
+            providers={
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "synthetic-access-value",
+                        "refresh_token": "synthetic-refresh-value",
+                    },
+                    "auth_mode": "oauth_device_code",
+                },
+            },
+            suppressed_sources={"xai-oauth": ["device_code"]},
+        ),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(pool={}, providers={}),
+    )
+
+    # Provider-slice fallback keeps the unsuppressed positive control only.
+    assert [entry["id"] for entry in read_credential_pool("xai-oauth")] == [
+        "global-manual"
+    ]
+
+    # Whole-pool merge applies the same union-of-denials policy.
+    merged = read_credential_pool()
+    assert isinstance(merged, dict)
+    assert [entry["id"] for entry in merged["xai-oauth"]] == ["global-manual"]
+
+    # Singleton/provider-state fallback cannot resurrect the root device login.
+    assert get_provider_auth_state("xai-oauth") is None
+
+
 
 def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_env):
     from hermes_cli.auth import get_provider_auth_state
