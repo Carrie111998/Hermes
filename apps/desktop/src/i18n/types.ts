@@ -6,6 +6,7 @@
 // fall back to English while new keys remain type-checked.
 
 import type { TipId } from '@/lib/tips/catalog'
+import type { ProviderUsageState } from '@/types/hermes'
 
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
 
@@ -2500,7 +2501,10 @@ export interface Translations {
         loading: string
         refresh: string
         resetsAt: (when: string) => string
-        states: Record<string, string>
+        // Exhaustive on purpose: the panel renders `states[snapshot.state]`
+        // with no fallback, so a state added on the Python side would paint a
+        // blank line in three locales. This turns that into a build failure.
+        states: Record<ProviderUsageState, string>
         title: string
         windows: Record<string, string>
       }

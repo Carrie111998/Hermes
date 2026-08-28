@@ -14,12 +14,12 @@ const EMPTY: ContextBreakdownEntry = { breakdown: null, loading: false }
 /**
  * Per-session context breakdown, shared by every surface that shows the gauge.
  *
- * There are two of them now — the statusbar item and the composer row — and
- * the composer is mounted once per open tile, so a per-caller `useState` meant
- * N identical `session.context_breakdown` RPCs on every turn end. The call is
- * not free on the backend either: it rebuilds the system prompt from disk and
- * walks the transcript. One store, one in-flight request per session, every
- * subscriber reading the same answer.
+ * Today that is the statusbar item alone, refetched on every turn end and every
+ * session switch. The store rather than a per-caller `useState` because the RPC
+ * is not free on the backend — it rebuilds the system prompt from disk and walks
+ * the transcript — so a second gauge must not double it: one in-flight request
+ * per session, every subscriber reading the same answer, and the numbers survive
+ * a remount.
  */
 export const $contextBreakdownBySession = atom<Record<string, ContextBreakdownEntry>>({})
 
@@ -34,8 +34,17 @@ function patch(sessionId: string, entry: Partial<ContextBreakdownEntry>): void {
   })
 }
 
-export function contextBreakdownFor(sessionId: null | string): ContextBreakdownEntry {
-  return (sessionId && $contextBreakdownBySession.get()[sessionId]) || EMPTY
+/** The entry for a session, or a stable empty one.
+ *
+ *  Keyed by the session it describes, so switching sessions drops the previous
+ *  numbers instead of painting them under the new session's name. `bySession`
+ *  is a parameter so a React caller can pass the snapshot it is already
+ *  subscribed to rather than reading the atom a second time. */
+export function contextBreakdownFor(
+  sessionId: null | string,
+  bySession: Record<string, ContextBreakdownEntry> = $contextBreakdownBySession.get()
+): ContextBreakdownEntry {
+  return (sessionId && bySession[sessionId]) || EMPTY
 }
 
 export async function refreshContextBreakdown(sessionId: string, request: GatewayRequest): Promise<void> {

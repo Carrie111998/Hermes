@@ -82,6 +82,9 @@ FRONTEND_POLLED_RPCS = [
     "process.list",          # background process status — process registry scan
     "setup.runtime_check",   # runtime readiness — resolve_runtime_provider() I/O
     "setup.status",          # provider configured check — config/credential scan
+    # Refetched on every turn end and every session switch, and it rebuilds the
+    # whole system prompt off disk before walking the transcript twice.
+    "session.context_breakdown",
 ]
 
 

@@ -37,7 +37,12 @@ function windowFigure(window: ProviderUsageWindow): string {
   }
 
   if (window.unit === 'percent') {
-    return used === null ? '' : `${Math.round(used)}%`
+    // used_percent, not the raw `used`: the backend already derived and clamped
+    // it from that same field, and the bar below renders it. One number, one
+    // clamp, one place it can be wrong.
+    const percent = window.used_percent ?? null
+
+    return percent === null ? '' : `${Math.round(percent)}%`
   }
 
   if (remaining !== null && limit !== null) {

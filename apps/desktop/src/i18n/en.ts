@@ -2947,13 +2947,10 @@ export const en: Translations = {
         title: 'Plan Usage',
         windows: {
           '5h': '5-hour window',
-          '24h': 'Daily window',
           '7d': 'Weekly window',
-          chat: 'Chat',
-          completions: 'Completions',
           credits: 'Credits',
-          period: 'Billing period',
-          premium_interactions: 'Premium requests'
+          key_limit: 'API key limit',
+          period: 'Billing period'
         }
       },
       accountUsage: 'Plans',

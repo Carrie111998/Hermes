@@ -3110,13 +3110,10 @@ export const zh: Translations = {
         title: '套餐用量',
         windows: {
           '5h': '5 小时窗口',
-          '24h': '每日窗口',
           '7d': '每周窗口',
-          chat: '对话',
-          completions: '补全',
           credits: '额度',
-          period: '账单周期',
-          premium_interactions: '高级请求'
+          key_limit: 'API 密钥额度',
+          period: '账单周期'
         }
       },
       accountUsage: '套餐',

@@ -13,7 +13,7 @@ metadata:
     # matches everything — comes last.
     tags: [report, deck, spreadsheet, invoice, letter, resume, herwork, workspace, productivity]
     category: productivity
-    related_skills: [docx, powerpoint, xlsx, pdf, ocr-and-documents, obsidian, arabic-rtl-documents]
+    related_skills: [docx, powerpoint, xlsx, pdf, ocr-and-documents, obsidian]
 ---
 
 # HerWork Mode

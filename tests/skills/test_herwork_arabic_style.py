@@ -155,14 +155,20 @@ def test_shape_arabic_replaces_forms_the_font_has_no_glyph_for(arabic_style):
     except FileNotFoundError:
         pytest.skip("Cairo font not installed on this machine")
 
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+
+    text = "تقرير المبيعات للربع الثالث"
     supported = pdfmetrics.getFont(arabic_style.FONT).face.charToGlyph
-    shaped = arabic_style.shape_arabic("تقرير المبيعات للربع الثالث")
+    shaped = arabic_style.shape_arabic(text)
 
     uncovered = [character for character in shaped if ord(character) not in supported]
 
     assert not uncovered, f"would render as .notdef boxes: {uncovered}"
     # The fold is to the canonical letter, not a drop: nothing may vanish.
-    assert len(shaped) == len(arabic_style.shape_arabic("تقرير المبيعات للربع الثالث"))
+    # Compare against the PRE-fold string — comparing shape_arabic to itself
+    # would be an assertion that cannot fail.
+    assert len(shaped) == len(get_display(arabic_reshaper.reshape(text)))
     assert "ﺍ" not in shaped and "ﺕ" not in shaped
 
 

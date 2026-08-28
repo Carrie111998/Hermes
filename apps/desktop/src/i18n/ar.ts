@@ -2267,13 +2267,10 @@ export const ar = defineLocale({
         title: 'استهلاك الخطط',
         windows: {
           '5h': 'نافذة 5 ساعات',
-          '24h': 'النافذة اليومية',
           '7d': 'النافذة الأسبوعية',
-          chat: 'المحادثة',
-          completions: 'الإكمالات',
           credits: 'الرصيد',
-          period: 'دورة الفوترة',
-          premium_interactions: 'الطلبات المميّزة'
+          key_limit: 'حد مفتاح الـAPI',
+          period: 'دورة الفوترة'
         }
       },
       accountUsage: 'الخطط',

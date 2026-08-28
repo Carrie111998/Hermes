@@ -277,9 +277,9 @@ def test_the_cache_file_is_written_atomically(tmp_path):
         provider_usage._store({"demo": _usage("demo")})
 
     assert json.loads(cache_file.read_text())["demo"]["usage"]["provider"] == "demo"
-    # atomic_write_text names its scratch file ".tmp_*", and glob skips
+    # atomic_json_write names its scratch file ".{stem}_*.tmp", and glob skips
     # dotfiles — match the real prefix or the assertion can never fail.
-    assert not list(cache_file.parent.glob(".tmp_*"))
+    assert not list(cache_file.parent.glob(".provider_usage_cache_*"))
 
 
 # ── Payload ────────────────────────────────────────────────────────────────

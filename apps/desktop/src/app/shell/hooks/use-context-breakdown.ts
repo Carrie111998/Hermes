@@ -3,6 +3,7 @@ import { useEffect } from 'react'
 
 import {
   $contextBreakdownBySession,
+  contextBreakdownFor,
   type GatewayRequest,
   refreshContextBreakdown
 } from '@/store/context-breakdown'
@@ -28,8 +29,8 @@ interface ContextBreakdownOptions {
  *
  *  Refetches when the focused session changes and when a turn ends (the
  *  transcript just grew). The result lives in a shared per-session store, so
- *  the statusbar gauge and the composer row — which is mounted once per open
- *  tile — collapse onto one request instead of one each. */
+ *  a second gauge on screen reads the same answer instead of issuing its own
+ *  request, and the numbers survive a remount. */
 export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }: ContextBreakdownOptions): {
   breakdown: ContextBreakdown | null
   loading: boolean
@@ -46,9 +47,7 @@ export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }
     void refreshContextBreakdown(sessionId, requestGateway)
   }, [busy, enabled, requestGateway, sessionId])
 
-  const entry = sessionId ? bySession[sessionId] : undefined
+  const { breakdown, loading } = contextBreakdownFor(sessionId, bySession)
 
-  // Keyed by the session it describes, so switching sessions drops the
-  // previous numbers instead of painting them under the new session's name.
-  return { breakdown: entry?.breakdown ?? null, loading: entry?.loading ?? false }
+  return { breakdown, loading }
 }

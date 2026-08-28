@@ -66,9 +66,20 @@ _DEFAULT_TIMEOUT = 8.0
 # so its presence, not its contents, is the signal. Detection stays honest
 # about it even though no bundled plugin reports Copilot usage: detection and
 # reporting are separate sets, and `usage_providers()` is what the panel reads.
+#
+# An entry is a path pattern (`~` and `$VAR` are expanded) or a callable that
+# resolves one. The callable exists because Hermes' own home is NOT an env var
+# read: get_hermes_home() honours a context-local profile override that
+# `$HERMES_HOME` misses, so a literal `~/.hermes/...` makes Anthropic
+# file-detection silently never fire under a non-default profile.
 _CREDENTIAL_FILES = {
-    "anthropic": ("~/.claude/.credentials.json", "~/.hermes/.anthropic_oauth.json"),
-    "openai-codex": ("~/.codex/auth.json",),
+    "anthropic": (
+        "~/.claude/.credentials.json",
+        lambda: _hermes_home() / ".anthropic_oauth.json",
+    ),
+    # CODEX_HOME is what hermes_cli/auth.py and codex_models.py both honour;
+    # the tilde form is the default it falls back to.
+    "openai-codex": ("$CODEX_HOME/auth.json", "~/.codex/auth.json"),
     "qwen-oauth": ("~/.qwen/oauth_creds.json",),
     "copilot": ("$GH_CONFIG_DIR/hosts.yml", "~/.config/gh/hosts.yml"),
 }
@@ -166,15 +177,27 @@ def _has_env_credential(provider: str, registry: Dict[str, Any]) -> bool:
     return any(get_env_prefer_dotenv(var).strip() for var in env_vars)
 
 
+def _hermes_home() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home())
+
+
 def _has_credential_file(provider: str) -> bool:
     for candidate in _CREDENTIAL_FILES.get(provider, ()):
-        expanded = os.path.expandvars(candidate)
-        if "$" in expanded:  # the env var is unset — that path doesn't exist
-            continue
         try:
-            if Path(expanded).expanduser().is_file():
+            if callable(candidate):
+                path = Path(candidate())
+            else:
+                expanded = os.path.expandvars(candidate)
+                if "$" in expanded:  # the env var is unset — no such path
+                    continue
+                path = Path(expanded).expanduser()
+            if path.is_file():
                 return True
-        except OSError:
+        except Exception:
+            # A resolver that raises must not take the whole sweep down with
+            # it — this provider just goes undetected by the file heuristic.
             continue
     return False
 
@@ -230,13 +253,14 @@ def _reset_detect_memo() -> None:
 
 
 def _cache_path() -> Path:
-    try:
-        from hermes_cli.main import get_hermes_home
+    from hermes_constants import get_hermes_home
 
-        home = Path(get_hermes_home())
-    except Exception:
-        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "provider_usage_cache.json"
+    # hermes_constants is the single source of truth for this path — it honours
+    # the context-local profile override, which a bare HERMES_HOME read does
+    # not, so a hand-rolled fallback lands the cache in the wrong profile's
+    # home. Every sibling disk cache (agent/model_metadata.py, agent/models_dev.py)
+    # resolves it the same way, with the same function-local import.
+    return Path(get_hermes_home()) / "provider_usage_cache.json"
 
 
 def _read_cache() -> Dict[str, Any]:
@@ -252,14 +276,14 @@ def _read_cache() -> Dict[str, Any]:
 def _write_cache(data: Dict[str, Any]) -> None:
     path = _cache_path()
     try:
-        from utils import atomic_write_text
+        from utils import atomic_json_write
 
-        path.parent.mkdir(parents=True, exist_ok=True)
         # The shared writer, not a bare os.replace: ~/.hermes is symlinked into
         # a dotfiles repo on plenty of machines, and a plain rename replaces the
         # symlink with a regular file (#16743). It also carries the EXDEV copy
-        # fallback and the Windows contended-rename retry.
-        atomic_write_text(path, json.dumps(data))
+        # fallback, the Windows contended-rename retry, the parent mkdir, and it
+        # preserves the target's mode and owner across the swap.
+        atomic_json_write(path, data, indent=None)
     except Exception as exc:
         logger.debug("provider usage cache write failed: %s", exc)
 

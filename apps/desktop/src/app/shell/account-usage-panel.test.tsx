@@ -1,5 +1,5 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $providerUsage, _resetProviderUsageForTests, refreshProviderUsage } from '@/store/provider-usage'
 import type { ProviderUsageSnapshot } from '@/types/hermes'
@@ -91,15 +91,15 @@ describe('AccountUsagePanel', () => {
 })
 
 describe('refreshProviderUsage', () => {
-  function stubGateway(request: ReturnType<typeof vi.fn>) {
+  // The store only issues the RPC when it believes it is inside the desktop
+  // shell, so every case here needs the marker present.
+  beforeEach(() => {
     Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: {} })
-
-    return request
-  }
+  })
 
   it('keeps the previous numbers when the call fails', async () => {
     seed([claude])
-    const request = stubGateway(vi.fn().mockRejectedValue(new Error('socket closed')))
+    const request = vi.fn().mockRejectedValue(new Error('socket closed'))
     const { $gateway } = await import('@/store/gateway')
     $gateway.set({ request } as never)
 
@@ -112,7 +112,7 @@ describe('refreshProviderUsage', () => {
   })
 
   it('passes the force flag through as the refresh param', async () => {
-    const request = stubGateway(vi.fn().mockResolvedValue({ providers: [claude] }))
+    const request = vi.fn().mockResolvedValue({ providers: [claude] })
     const { $gateway } = await import('@/store/gateway')
     $gateway.set({ request } as never)
 

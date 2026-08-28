@@ -12,6 +12,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from utils import safe_json_loads
+
 _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
 
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
@@ -93,24 +95,17 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
 def _file_tool_names() -> frozenset:
     """The live "file" toolset's tool names.
 
-    Resolved from the registry, falling back to the toolset's own static
-    definition — never to a hand-copied literal, which is what actually goes
-    stale when a file tool is added or renamed.
+    Resolved from the registry — never from a hand-copied literal, which is
+    what actually goes stale when a file tool is added or renamed.
+    ``include_registry=False`` already expands the toolset's static definition
+    and its nested includes, so there is nothing weaker to fall back to.
     """
     try:
-        from toolsets import TOOLSETS, resolve_toolset
+        from toolsets import resolve_toolset
+
+        return frozenset(resolve_toolset(_FILE_TOOLSET, include_registry=False) or ())
     except Exception:
         return frozenset()
-
-    try:
-        names = frozenset(resolve_toolset(_FILE_TOOLSET, include_registry=False) or ())
-    except Exception:
-        names = frozenset()
-
-    if names:
-        return names
-
-    return frozenset((TOOLSETS.get(_FILE_TOOLSET) or {}).get("tools") or ())
 
 
 def _raw_arguments(call: Any) -> str:
@@ -130,10 +125,7 @@ def _call_arguments(call: Any) -> Dict[str, Any]:
         return raw
     if not isinstance(raw, str) or not raw.strip():
         return {}
-    try:
-        decoded = json.loads(raw)
-    except Exception:
-        return {}
+    decoded = safe_json_loads(raw, {})
     return decoded if isinstance(decoded, dict) else {}
 
 

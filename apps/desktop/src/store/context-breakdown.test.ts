@@ -22,8 +22,8 @@ afterEach(() => {
 
 describe('refreshContextBreakdown', () => {
   it('collapses concurrent callers onto one backend call', async () => {
-    // The statusbar gauge and one composer row per open tile all want the same
-    // session's breakdown at the same moment (turn end). One RPC, not N.
+    // Every surface showing the gauge wants the same session's breakdown at the
+    // same moment (turn end). One RPC, not one each.
     const request = vi.fn().mockResolvedValue(breakdown)
 
     await Promise.all([

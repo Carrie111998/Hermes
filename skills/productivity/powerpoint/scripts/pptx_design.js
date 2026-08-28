@@ -72,7 +72,7 @@ function loadSpec(specPath) {
   return spec;
 }
 
-function makeTextHelpers(pptx, isArabic, C) {
+function makeTextHelpers(isArabic, C) {
   const rtl = {
     fontFace: C.arabicFont, color: C.ink, align: 'right', rtlMode: true,
     margin: 0, fit: 'shrink', valign: 'mid', breakLine: false,
@@ -84,7 +84,6 @@ function makeTextHelpers(pptx, isArabic, C) {
   return {
     rtl,
     ltr,
-    main: isArabic ? rtl : ltr,
     addMain(slide, text, opts = {}) { slide.addText(String(text || ''), { ...(isArabic ? rtl : ltr), ...opts }); },
     addArabic(slide, text, opts = {}) { slide.addText(String(text || ''), { ...rtl, ...opts }); },
     addLatin(slide, text, opts = {}) { slide.addText(String(text || ''), { ...ltr, ...opts }); },
@@ -133,7 +132,7 @@ function addNotes(slide, notes) {
   if (notes) slide.addNotes(String(notes));
 }
 
-function buildCover(slide, item, assetsDir, T, isArabic, C, pptx) {
+function buildCover({ slide, item, assetsDir, T, isArabic, C, pptx }) {
   slide.background = { color: C.ink };
   const image = resolveAsset(assetsDir, item.image);
   if (image) {
@@ -148,7 +147,7 @@ function buildCover(slide, item, assetsDir, T, isArabic, C, pptx) {
   if (item.caption) T.addMain(slide, item.caption, { x: isArabic ? 7.3 : 0.62, y: 6.42, w: 5.45, h: 0.28, fontSize: 10, color: 'F6F3EE' });
 }
 
-function buildCards(slide, item, T, isArabic, C, pptx) {
+function buildCards({ slide, item, T, isArabic, C, pptx }) {
   addKicker(slide, T, item.kicker, isArabic, C);
   addTitle(slide, T, item.title, isArabic);
   addSummary(slide, T, item.summary, isArabic, C);
@@ -170,7 +169,7 @@ function buildCards(slide, item, T, isArabic, C, pptx) {
   addSource(slide, T, item.source, isArabic, C);
 }
 
-function buildData(slide, item, T, isArabic, C, pptx) {
+function buildData({ slide, item, T, isArabic, C, pptx }) {
   addKicker(slide, T, item.kicker, isArabic, C);
   addTitle(slide, T, item.title, isArabic);
   addSummary(slide, T, item.summary, isArabic, C);
@@ -195,7 +194,7 @@ function buildData(slide, item, T, isArabic, C, pptx) {
   addSource(slide, T, item.source, isArabic, C);
 }
 
-function buildSplit(slide, item, T, isArabic, C, pptx) {
+function buildSplit({ slide, item, T, isArabic, C, pptx }) {
   addKicker(slide, T, item.kicker, isArabic, C);
   addTitle(slide, T, item.title, isArabic);
   addSummary(slide, T, item.summary, isArabic, C);
@@ -229,7 +228,7 @@ function main(argv) {
   pptx.lang = isArabic ? 'ar-SA' : 'en-US';
   pptx.rtlMode = isArabic;
   pptx.theme = { headFontFace: isArabic ? C.arabicFont : C.latinFont, bodyFontFace: isArabic ? C.arabicFont : C.latinFont, lang: pptx.lang };
-  const T = makeTextHelpers(pptx, isArabic, C);
+  const T = makeTextHelpers(isArabic, C);
   addMaster(pptx, C, T, isArabic);
   const assetsDir = path.dirname(path.resolve(specPath));
   const builders = { cover: buildCover, cards: buildCards, data: buildData, split: buildSplit };
@@ -237,7 +236,7 @@ function main(argv) {
     const builder = builders[item.type];
     if (!builder) fail(`Slide ${index + 1} has unsupported type: ${item.type}. Use cover, cards, data, or split.`);
     const slide = pptx.addSlide('HERMES_DESIGN_MASTER');
-    builder(slide, item, assetsDir, T, isArabic, C, pptx);
+    builder({ slide, item, assetsDir, T, isArabic, C, pptx });
     addNotes(slide, item.notes);
   });
   return pptx.writeFile({ fileName: outputPath }).then(() => {

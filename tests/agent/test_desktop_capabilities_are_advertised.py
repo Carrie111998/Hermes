@@ -94,21 +94,85 @@ def test_the_fence_check_is_not_satisfied_by_an_accidental_substring():
     assert "py" in _HINT and "```py" not in _HINT  # "copyable" contains "py"
 
 
-def test_artifact_promotion_is_named_in_the_desktop_hint():
+def _artifact_kinds() -> set:
+    """The kinds ``detectArtifact`` can promote a fence into.
+
+    Parsed from the union, so adding one is what trips the test.
+    """
+    union = re.search(
+        r"export type ArtifactKind =([^\n]+)", _source(_ARTIFACT_DETECT)
+    )
+    assert union, "ArtifactKind not found — artifact-detect.ts changed shape"
+
+    return set(re.findall(r"'([a-z0-9-]+)'", union.group(1)))
+
+
+# Kinds with no ```<kind> fence of their own, so the strict check below cannot
+# apply. An entry here is a decision someone has to write down, which is the
+# point — it must not become the easy way to silence this test.
+_UNADVERTISED_KINDS = {
+    # There is no ```code fence: 'code' is the kind ANY language promotes into
+    # past the line threshold, and the hint says so in prose ("any code fence
+    # past roughly 48 lines"), which the threshold test below pins.
+    "code",
+}
+
+
+def test_the_artifact_kind_union_is_not_empty():
+    """Guard the guard: a regex that silently matches nothing proves nothing."""
+    assert _artifact_kinds(), "parsed zero artifact kinds — the regex rotted"
+
+
+def test_every_artifact_kind_is_named_in_the_desktop_hint():
     """A fence that promotes to a card behaves differently from one that does not.
 
     A model that does not know long fences become artifact cards truncates them
     to protect the conversation — which is the opposite of what it should do.
+    Asserted per kind, not as a single "artifact" mention: the word would stay
+    in that hint forever while a newly added kind went unadvertised. And in the
+    FENCED form, for the same reason the fence test uses it — a bare substring
+    check would pass a kind named `chart` on the strength of "widget, chart, or
+    visualization" already being in the hint for unrelated reasons.
     """
-    kinds = set(
-        re.findall(r"export type ArtifactKind =([^\n]+)", _source(_ARTIFACT_DETECT))
-    )
-    assert kinds, "ArtifactKind not found — artifact-detect.ts changed shape"
-
     assert "artifact" in _HINT, (
         "substantial html/svg/code fences promote to artifact cards and the hint "
         "never says so"
     )
+
+    unnamed = sorted(
+        kind
+        for kind in _artifact_kinds() - _UNADVERTISED_KINDS
+        if f"```{kind}" not in _HINT
+    )
+
+    assert not unnamed, (
+        f"detectArtifact promotes ```{{{','.join(unnamed)}}} fences into artifact "
+        "cards but the hint never names them, so the model cannot know what "
+        "happens to such a fence. Name each as ```<kind> in "
+        "PLATFORM_HINTS['desktop'] in agent/prompt_builder.py, or add it to "
+        "_UNADVERTISED_KINDS with a reason."
+    )
+
+
+def test_the_promotion_threshold_the_hint_quotes_is_the_real_one():
+    """The hint says "roughly 48 lines". 48 is a constant someone can tune.
+
+    Nobody re-reads a prompt when adjusting a threshold, and neither the TS
+    contract test (which samples at 60 lines) nor the fence tests notice: they
+    would all stay green while the sentence the model acts on became false.
+    """
+    match = re.search(r"const CODE_MIN_LINES = (\d+)", _source(_ARTIFACT_DETECT))
+    assert match, "CODE_MIN_LINES not found — artifact-detect.ts changed shape"
+
+    assert match.group(1) in _HINT, (
+        f"code fences promote at {match.group(1)} lines, but the desktop hint quotes a "
+        "different number. Update the sentence in PLATFORM_HINTS['desktop']."
+    )
+
+    # SVG_MIN_CHARS has no counterpart to pin: the hint describes it as "small"
+    # vs "large standalone graphic" on purpose, because a character count is not
+    # something a model can usefully apply while writing. The behaviour is
+    # pinned instead, in artifact-detect.prompt-contract.test.ts.
 
 
 def test_mermaid_is_exempt_from_artifact_promotion():
