@@ -24,10 +24,23 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stub_verified_cua_installer():
+    """Unit tests must not fetch the live trycua installer."""
+    from hermes_cli import tools_config
+
+    def _write(dest_path, *, is_windows):
+        Path(dest_path).write_bytes(b"# stub cua installer\n")
+
+    with patch.object(tools_config, "_write_verified_cua_installer", side_effect=_write):
+        yield
 
 
 def _runtime_manifest(version="0.20.0", *, omit=None):
@@ -1739,22 +1752,25 @@ class TestUnattendedRefreshPreflights:
         assert ok is True
 
     def test_windows_unattended_command_passes_noautostart(self):
-        """The unattended Windows command must invoke install.ps1 with
-        -NoAutoStart — Register-CuaDriverAutostart is the only branch that
-        self-elevates (UAC)."""
+        """The unattended Windows command must invoke the verified install.ps1
+        with -NoAutoStart — Register-CuaDriverAutostart is the only branch
+        that self-elevates (UAC)."""
         ok, popen, _, _, _ = self._run(120, system="Windows")
         assert ok is True
         cmd = popen.call_args.args[0]
         joined = " ".join(cmd)
+        assert "-File" in cmd
         assert "-NoAutoStart" in joined
-        assert "scriptblock" in joined
+        assert "| iex" not in joined
 
-    def test_windows_explicit_command_keeps_plain_oneliner(self):
-        """Explicit installs keep upstream's documented `irm | iex` shape
-        (autostart re-registration included — human present for UAC)."""
+    def test_windows_explicit_command_runs_verified_file(self):
+        """Explicit installs run the digest-checked script as -File so
+        autostart re-registration stays available (human present for UAC)
+        without piping an unpinned remote script."""
         ok, popen, _, _, _ = self._run(None, system="Windows")
         assert ok is True
         cmd = popen.call_args.args[0]
         joined = " ".join(cmd)
+        assert "-File" in cmd
         assert "-NoAutoStart" not in joined
-        assert "| iex" in joined
+        assert "| iex" not in joined
