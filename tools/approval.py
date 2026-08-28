@@ -2252,6 +2252,11 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
 
 
 def _iter_shell_command_starts(command: str):
+    # This scanner also has direct callers that run before the public approval
+    # detectors. Enforce the recursion bound here as well so none can enter the
+    # nested parameter-expansion parser with an over-limit command.
+    if _command_parser_limit_exceeded(command):
+        return
     starts = [0]
 
     def scan_parameter_expansion(

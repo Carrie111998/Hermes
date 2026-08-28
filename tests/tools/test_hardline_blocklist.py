@@ -17,6 +17,7 @@ from tools.approval import (
     detect_hardline_command,
     disable_session_yolo,
     enable_session_yolo,
+    _iter_shell_command_starts,
     reset_current_session_key,
     set_current_session_key,
 )
@@ -740,6 +741,7 @@ def test_excessive_parameter_expansion_nesting_fails_closed(
     result = check_all_command_guards(command, "local")
     assert result["approved"] is False
     assert result.get("hardline") is True
+    assert list(_iter_shell_command_starts(command)) == []
 
 
 def test_valid_quoted_grep_passes_yolo_and_approvals_off_guards(
