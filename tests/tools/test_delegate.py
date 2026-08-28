@@ -42,6 +42,7 @@ def _make_mock_parent(depth=0):
     parent.provider = "openrouter"
     parent.api_mode = "chat_completions"
     parent.model = "anthropic/claude-sonnet-4"
+    parent.service_tier = None
     parent.platform = "cli"
     parent.providers_allowed = None
     parent.providers_ignored = None
@@ -295,6 +296,47 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    @patch("tools.delegate_tool._load_config", return_value={"reasoning_effort": ""})
+    @patch("run_agent.AIAgent")
+    def test_child_inherits_parent_service_tier(self, MockAgent, mock_cfg):
+        parent = _make_mock_parent(depth=0)
+        parent.service_tier = "priority"
+        MockAgent.return_value = MagicMock()
+
+        _build_child_agent(
+            task_index=0,
+            goal="test priority inheritance",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+        self.assertEqual(MockAgent.call_args[1]["service_tier"], "priority")
+
+    @patch("tools.delegate_tool._load_config", return_value={"reasoning_effort": ""})
+    @patch("run_agent.AIAgent")
+    def test_child_inherits_explicit_standard_service_tier(self, MockAgent, mock_cfg):
+        """An explicit standard parent tier must not leak a config default."""
+        parent = _make_mock_parent(depth=0)
+        parent.service_tier = None
+        MockAgent.return_value = MagicMock()
+
+        _build_child_agent(
+            task_index=0,
+            goal="test standard tier inheritance",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+        self.assertIsNone(MockAgent.call_args[1]["service_tier"])
 
     def test_child_gets_dedicated_session_db_not_parents_handle(self):
         """#81267: children must not share the parent's SessionDB object.
