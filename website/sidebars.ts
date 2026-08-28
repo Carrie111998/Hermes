@@ -601,6 +601,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/optional/software-development/software-development-code-wiki',
                     'user-guide/skills/optional/software-development/software-development-grill-me',
+                    'user-guide/skills/optional/software-development/software-development-hermes-diagnostic-fidelity',
                     'user-guide/skills/optional/software-development/software-development-rest-graphql-debug',
                     'user-guide/skills/optional/software-development/software-development-subagent-driven-development',
                   ],
