@@ -564,8 +564,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nemotron-3.5-lightning-free",
         "muse-spark-1.2-contributor-free",
     ],
-    # OpenCode free tier — keyless (no OpenCode account needed). Synced
-    # against live GET /zen/v1/models + anonymous probes (2026-08-21);
+    # OpenCode free tier — keyless (no OpenCode account needed). Offline floor
+    # for provider_model_ids("opencode-free"), which refreshes the rotating
+    # catalog from live GET /zen/v1/models and caches it. Last probe-sync:
+    # 2026-08-21;
     # deepseek-v4-flash-free delisted (promo ended, now 401s).
     # big-pickle + mimo-v2.5-free delisted (UA-gated: the relay 429s
     # FreeUsageLimitError for every client except User-Agent
@@ -4098,11 +4100,44 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             pass
 
-    # OpenCode Free: curated keyless list only. models.dev's cost.input==0
-    # filter lags reality (deepseek-v4-flash-free stayed "free" there after
-    # its promo ended and the relay began 401ing keyless requests), so the
-    # curated list — synced against anonymous live probes — is authoritative.
+    # OpenCode Free: discover the relay's current keyless catalog directly.
+    # models.dev's cost.input==0 filter lags reality, while an in-repo snapshot
+    # cannot remove a delisted promotion until the next Hermes release. The
+    # outer cached_provider_model_ids() layer gives this the same TTL +
+    # stale-while-revalidate behavior as other provider catalogs. Keep the
+    # curated list only as the offline floor.
     if normalized == "opencode-free":
+        try:
+            live = fetch_api_models(
+                None,
+                _OPENCODE_ZEN_FREE_BASE_URL,
+                headers=opencode_zen_free_headers(),
+            )
+        except Exception:
+            live = None
+        if live is not None:
+            curated_extras = {
+                model.lower()
+                for model in _PROVIDER_MODELS.get(normalized, [])
+                if model.lower() in _OPENCODE_KEYLESS_EXTRA_SLUGS
+            }
+            free_models: list[str] = []
+            seen: set[str] = set()
+            for model in live:
+                bare = normalize_opencode_model_id(normalized, model).strip()
+                key = bare.lower()
+                # A live Zen listing proves availability, but not that an
+                # unsuffixed model accepts anonymous requests. Only suffix
+                # markers plus separately probe-verified curated extras are
+                # safe to expose through this keyless provider.
+                if not key or (
+                    not key.endswith("-free") and key not in curated_extras
+                ):
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    free_models.append(bare)
+            return free_models
         return list(_PROVIDER_MODELS.get(normalized, []))
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
@@ -5490,7 +5525,7 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
     - ``provider_id`` is ``opencode-free`` (the dedicated keyless provider —
       EVERY model on it routes anonymously; that is the provider's contract), or
     - ``provider_id`` is any other OpenCode-family provider and ``model_id``
-      is in the VERIFIED keyless catalog (``_PROVIDER_MODELS["opencode-free"]``)
+      is in the last live (or offline curated) keyless catalog
       — heals a free-model selection made under opencode-zen/opencode-go,
       whose keys the free tier rejects.
 
@@ -5504,7 +5539,7 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
         return None
     if family != "opencode-free":
         bare = normalize_opencode_model_id(provider_id, model_id).strip().lower()
-        if bare not in {m.lower() for m in _PROVIDER_MODELS.get("opencode-free", [])}:
+        if bare not in _known_opencode_free_model_ids():
             return None
     normalized = normalize_opencode_model_id(provider_id, model_id)
     api_mode = opencode_model_api_mode("opencode-zen", normalized)
@@ -5519,6 +5554,35 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
         "default_headers": opencode_zen_free_headers(),
         "source": "opencode-zen-free-keyless",
     }
+
+
+def _known_opencode_free_model_ids() -> set[str]:
+    """Return the cache-only keyless catalog used by runtime routing.
+
+    Runtime resolution must not block on a catalog HTTP call. Prefer the
+    same-fingerprint disk cache populated by ``cached_provider_model_ids`` and
+    fall back to the release snapshot when the cache is absent or corrupt.
+    """
+    fallback = {
+        str(model).strip().lower()
+        for model in _PROVIDER_MODELS.get("opencode-free", [])
+        if str(model).strip()
+    }
+    try:
+        entry = _load_provider_models_cache().get("opencode-free")
+        fingerprint = _credential_fingerprint("opencode-free")
+        if (
+            _cache_entry_valid(entry, fingerprint)
+            and time.time() - entry["at"] < _PROVIDER_MODELS_STALE_SERVE_MAX
+        ):
+            return {
+                str(model).strip().lower()
+                for model in entry["models"]
+                if str(model).strip()
+            }
+    except Exception:
+        pass
+    return fallback
 
 
 def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str]) -> str:
