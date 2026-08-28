@@ -1,5 +1,5 @@
-import type { SecretStoragePolicy } from './secret-storage-policy'
 import type { StoredTokenSecret } from './native-token-store'
+import type { SecretStoragePolicy } from './secret-storage-policy'
 
 type SafeStorage = {
   encryptString(value: string): Buffer
@@ -28,6 +28,7 @@ export function createDesktopSecretStorage({
   function encryptDesktopSecret(value: unknown, options: object = {}) {
     if (!getPolicy().on) {
       const raw = String(value || '')
+
       return raw ? { encoding: 'plain', value: raw } : null
     }
 

@@ -154,9 +154,9 @@ import type { RosterProfileMetadata } from './connection-registry'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
-import { createDesktopSecretStorage } from './desktop-secret-storage'
 import { formatDesktopLogLine } from './desktop-log-line'
 import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import { createDesktopSecretStorage } from './desktop-secret-storage'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,

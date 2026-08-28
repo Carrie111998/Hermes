@@ -10,7 +10,9 @@ function storageFixture(available = true) {
     encryptString: (_value: string) => Buffer.from('opaque-ciphertext'),
     decryptString: (value: Buffer) => (value.toString() === 'opaque-ciphertext' ? 'secret-value' : '')
   }
+
   const getPolicy = () => ({ on: true, migrated: false })
+
   const codec = createDesktopSecretStorage({
     getPolicy,
     safeStorage,
@@ -19,12 +21,15 @@ function storageFixture(available = true) {
     safeStorageEncoding: 'safeStorage',
     encryptStrict: (value, api, options = {}) => {
       const allowPlainText = (options as { allowPlainText?: boolean }).allowPlainText === true
+
       if (!(api as typeof safeStorage).isEncryptionAvailable()) {
         if (allowPlainText) {
           return { encoding: 'plain', value }
         }
+
         throw new Error('secure storage unavailable')
       }
+
       return { encoding: 'safeStorage', value: api.encryptString(value).toString('base64') }
     }
   })
