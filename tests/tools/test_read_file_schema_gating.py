@@ -1,5 +1,6 @@
-"""read_file schema diet (#95681): anydoc-gated extraction line +
-PDF-coverage teaching moved to the response-time warning.
+"""read_file schema diet (#95681): static unconditional format list
+(anydoc bundled in core) + PDF-coverage teaching moved to the
+response-time warning.
 
 Maintainer-directed: the schema advertised anydoc-gated formats
 unconditionally ("convert too when the optional anydoc converter is
@@ -15,59 +16,52 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from tools.file_tools import READ_FILE_SCHEMA, _read_file_schema_overrides
 
 
-class TestReadFileSchemaGating(unittest.TestCase):
-    def _desc(self, anydoc_present: bool) -> str:
-        import importlib.util as ilu
+class TestReadFileSchemaStatic(unittest.TestCase):
+    """Gate DROPPED by maintainer decision: anydoc is a core dependency
+    (bundled), so format support is stated unconditionally — a missing
+    converter is a broken install handled by read_extract's teaching
+    error, not a schema variant."""
 
-        real = ilu.find_spec
+    def test_formats_stated_unconditionally(self):
+        from tools.file_tools import READ_FILE_SCHEMA
 
-        def fake(name, *a, **kw):
-            if name == "anydoc":
-                class _Spec:  # truthy stand-in
-                    pass
-                return _Spec() if anydoc_present else None
-            return real(name, *a, **kw)
-
-        with patch("importlib.util.find_spec", side_effect=fake):
-            return _read_file_schema_overrides()["description"]
-
-    def test_anydoc_absent_hides_gated_formats(self):
-        desc = self._desc(False)
-        for token in ("PDF", "OpenDocument", "RTF", "EPUB", "anydoc"):
-            self.assertNotIn(token, desc, token)
-        # Always-supported extractions still advertised.
-        for token in (".ipynb", ".docx", ".xlsx"):
+        desc = READ_FILE_SCHEMA["description"]
+        for token in (".ipynb", ".docx", ".pptx", ".doc/.ppt/.xls",
+                      "PDF (text layer)", "OpenDocument", "RTF", "EPUB"):
             self.assertIn(token, desc, token)
-
-    def test_anydoc_present_advertises_formats_without_caveat(self):
-        desc = self._desc(True)
-        for token in ("PDF (text layer)", ".doc/.ppt/.xls", "OpenDocument",
-                      "RTF", "EPUB"):
-            self.assertIn(token, desc, token)
-        # The availability caveat and install mechanics are gone either way.
+        # No availability hedging, no install mechanics, no gate.
         self.assertNotIn("when the optional", desc)
         self.assertNotIn("auto-installed", desc)
+        self.assertNotIn("anydoc", desc)
+
+    def test_no_dynamic_override_registered(self):
+        from tools.file_tools import READ_FILE_SCHEMA  # noqa: F401
+        import tools.file_tools as ft
+
+        self.assertFalse(hasattr(ft, "_read_file_schema_overrides"))
 
     def test_coverage_warning_teaching_left_to_the_warning(self):
         """The response-time warning owns the recovery curriculum."""
-        for desc in (self._desc(True), self._desc(False),
-                     READ_FILE_SCHEMA["description"]):
-            self.assertNotIn("EXTRACTION COVERAGE WARNING", desc)
-            self.assertNotIn("pdftoppm", desc)
-        # And the warning itself still carries it (single source).
+        from tools.file_tools import READ_FILE_SCHEMA
+
+        desc = READ_FILE_SCHEMA["description"]
+        self.assertNotIn("EXTRACTION COVERAGE WARNING", desc)
+        self.assertNotIn("NEEDS OCR", desc)
+        self.assertNotIn("pdftoppm", desc)
         import inspect
         from tools import read_extract
 
         src = inspect.getsource(read_extract)
-        self.assertIn("EXTRACTION COVERAGE WARNING", src)
+        self.assertIn("NEEDS OCR", src)
         self.assertIn("pdftoppm", src)
         self.assertIn("vision_analyze", src)
 
     def test_binary_note_stays_last(self):
-        desc = self._desc(True)
+        from tools.file_tools import READ_FILE_SCHEMA
+
+        desc = READ_FILE_SCHEMA["description"]
         self.assertLess(desc.find("EPUB"), desc.find("Cannot read images/binary"))
 
     def test_missing_anydoc_error_teaches_install(self):
@@ -75,8 +69,6 @@ class TestReadFileSchemaGating(unittest.TestCase):
 
         err = _anydoc_missing_error("x.epub")
         self.assertIn("firecrawl-anydoc", err)
-        self.assertIn("anydoc", err)
-        # Distinct from the generic unsupported-type error.
         self.assertNotEqual(err, "Unsupported document type: 'x.epub'")
 
 

@@ -2648,14 +2648,13 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    # Base description covers the always-true surface. The document-
-    # extraction line is appended dynamically (_read_file_schema_overrides):
-    # anydoc-gated formats are advertised only when the converter is
-    # actually importable, and the PDF coverage teaching moved to the
-    # response-time EXTRACTION COVERAGE WARNING itself (read_extract.py) —
-    # the warning arrives exactly when pages are missing, with the page
-    # map and the recovery commands; the schema no longer pre-teaches it.
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Cannot read images/binary — use vision_analyze for images.",
+    # Document formats are stated unconditionally: firecrawl-anydoc is a
+    # core dependency (bundled), so its absence is a broken install, not a
+    # configuration — the teaching error in read_extract handles that rare
+    # case with the pip-install fix. PDF/scanned-page coverage teaching
+    # lives in the response-time NEEDS-OCR warning (read_extract.py), which
+    # arrives exactly when pages are missing; the schema doesn't pre-teach it.
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB. Cannot read images/binary — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2807,48 +2806,7 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-def _read_file_schema_overrides():
-    """Append the document-extraction line, capability-gated (#95681).
-
-    The always-supported extractions (.ipynb/.docx/.xlsx — stdlib/bundled)
-    are stated unconditionally; the anydoc-gated formats (PDF, legacy
-    Office, OpenDocument, RTF, EPUB) are advertised ONLY when the
-    converter is importable RIGHT NOW. Availability is probed with
-    find_spec — cheap and side-effect-free at schema-build time (the
-    lazy installer must never run here). When anydoc is absent the
-    formats simply aren't advertised; attempting one anyway gets the
-    teaching error from read_extract (install command included), and a
-    mid-session install is picked up at the next compaction's tool
-    refresh (#97073).
-    """
-    import importlib.util
-
-    base = READ_FILE_SCHEMA["description"]
-    extract_line = (
-        " Jupyter notebooks (.ipynb), Word (.docx), and Excel (.xlsx) "
-        "auto-extract to readable text"
-    )
-    try:
-        anydoc_present = importlib.util.find_spec("anydoc") is not None
-    except Exception:  # noqa: BLE001 — broken meta-path finder etc.
-        anydoc_present = False
-    if anydoc_present:
-        extract_line += (
-            "; PDF (text layer), legacy Office (.doc/.ppt/.xls), "
-            "OpenDocument, RTF, and EPUB convert too"
-        )
-    extract_line += "."
-    # Insert before the trailing binary note so the can't-do stays last.
-    marker = " Cannot read images/binary"
-    if marker in base:
-        head, tail = base.split(marker, 1)
-        description = head + extract_line + marker + tail
-    else:  # pragma: no cover — marker is part of the static schema above
-        description = base + extract_line
-    return {"description": description}
-
-
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000, dynamic_schema_overrides=_read_file_schema_overrides)
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
