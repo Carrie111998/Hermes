@@ -1017,6 +1017,224 @@ def redact_sensitive_text(
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Registry-fed exact-value pass (user pattern file).
+    # Masks exact registered secrets and registered KEY=value / KEY: value
+    # forms from the user pattern file (default
+    # $HERMES_HOME/state/redaction/redact_patterns.json — ~/.hermes
+    # fallback, overridable via security.redact_patterns / HERMES_REDACT_PATTERNS).
+    # Fail-safe: a missing or unreadable file is a no-op — the built-in
+    # families above still run. Sentinel: non-reusable for file content
+    # (issue #35519 semantics) so a masked value can never be written back
+    # over the real one.
+    # URL-boundary semantics follow Hermes (D160 convergence): registered
+    # key-forms in URL query/fragment positions are masked only where Hermes
+    # has determined masking is safe (redact_url_credentials=True — e.g. the
+    # compaction/persistence boundary); live navigation URLs pass through.
+    # Registered exact values (literals) remain unconditional everywhere.
+    text = _redact_registry_patterns(
+        text, file_read=file_read, url_credentials=redact_url_credentials)
+
+    return text
+
+
+_PATTERNS_CACHE: dict = {"mtime": None, "path": None, "lit_re": None,
+                         "key_re": None, "query_re": None,
+                         "lit_masks": {}, "default_mask": None,
+                         "broken": False}
+
+
+# D188: length-driven default mask — 2 visible head + 2 visible tail chars,
+# 12-char floor (values shorter than 12 are fully masked; at least 8 chars
+# always stay hidden). PII-shaped values (phones ~12, most emails 13+) stay
+# partially visible for troubleshooting; short secrets never show fragments.
+_DEFAULT_MASK = {"head": 2, "tail": 2, "floor": 12}
+
+
+def _default_patterns_path() -> str:
+    """Default pattern-file path, resolved like every other Hermes home path:
+    ``$HERMES_HOME`` (set for profiles and relocated installs) with
+    ``~/.hermes`` as the fallback. Never hardcode ``~/.hermes`` — profile
+    sessions remap HOME (D157) and would silently no-op on the wrong path.
+    """
+    home = os.environ.get("HERMES_HOME") or "~/.hermes"
+    return os.path.join(os.path.expanduser(home),
+                        "state", "redaction", "redact_patterns.json")
+
+
+def _resolve_mask(spec):
+    """Map a mask spec to (kind, params). Fail-safe: any unknown name or
+    malformed object falls back to the length-driven default — a typo can
+    never crash, unmask, or fully expose a value."""
+    if spec is None:
+        return "default", _DEFAULT_MASK
+    if isinstance(spec, str):
+        if spec == "full":
+            return "full", None
+        return "default", _DEFAULT_MASK
+    if isinstance(spec, dict):
+        try:
+            head = max(0, int(spec.get("head", _DEFAULT_MASK["head"])))
+            tail = max(0, int(spec.get("tail", _DEFAULT_MASK["tail"])))
+            floor = max(1, int(spec.get("floor", _DEFAULT_MASK["floor"])))
+        except (TypeError, ValueError):
+            return "default", _DEFAULT_MASK
+        if head + tail >= floor:      # would display the whole value — refuse
+            return "default", _DEFAULT_MASK
+        return "custom", {"head": head, "tail": tail, "floor": floor}
+    return "default", _DEFAULT_MASK
+
+
+def _apply_mask(value: str, spec, file_read: bool) -> str:
+    """Mask one matched value. File content always gets the non-reusable
+    sentinel (issue #35519 — a masked value must never be writable back
+    over the real file); tool output uses the resolved mask style."""
+    if file_read:
+        return _mask_token_nonreusable(value)
+    kind, params = _resolve_mask(spec)
+    if kind == "full":
+        return "***"
+    return mask_secret(value, head=params["head"], tail=params["tail"],
+                       floor=params["floor"])
+
+
+def _mask_key_match(m, default_mask, file_read, *, prefix_group=0):
+    """Mask one key-form match. prefix_group=0 for the plain pass (groups
+    1..8: key, quote, ws, sep, ws2, dq, sq, unquoted); prefix_group=1 for the
+    query pass (group 1 = the '?'/'&' prefix, groups 2..9 shifted by one).
+    The g+6/g+7/g+8 offsets read dq/sq/unquoted so one body serves both
+    passes; the prefix is re-emitted verbatim; quoted values are bounded
+    by their quotes; the unquoted value is already bounded by the pass's
+    regex."""
+    g = prefix_group
+    prefix = m.group(1) if prefix_group else ""
+    if m.group(g + 6) is not None:
+        q, val = '"', m.group(g + 6)
+    elif m.group(g + 7) is not None:
+        q, val = "'", m.group(g + 7)
+    else:
+        q, val = "", m.group(g + 8) or ""
+    if not val:
+        return m.group(0)      # empty value — nothing to mask
+    return (prefix + m.group(g + 1) + (m.group(g + 2) or "") + m.group(g + 3)
+            + m.group(g + 4) + m.group(g + 5) + q
+            + _apply_mask(val, default_mask, file_read) + q)
+
+
+def _redact_registry_patterns(text: str, *, file_read: bool,
+                              url_credentials: bool = False) -> str:
+    """Exact-value + registered-key masking from the user patterns file.
+
+    The file is JSON — hand-written or generated by companion tooling; no
+    external tooling is required:
+      {"mask": {"head": 2, "tail": 2, "floor": 12},   # optional default style
+       "literals": ["exact-value",
+                    {"value": "...", "mask": "full"}],   # per-entry style
+       "key_patterns": {"PIN": true}}
+    Path resolution: ``security.redact_patterns`` in config.yaml (bridged
+    to the env var at startup) -> ``HERMES_REDACT_PATTERNS`` env override ->
+    the default path (``$HERMES_HOME/state/redaction/`` with
+    ``~/.hermes`` fallback — profile/relocation safe).
+    Mask styles: absent/unknown -> length-driven default (2+2 visible,
+    floor 12, shorter values fully masked); "full" -> nothing visible;
+    {"head", "tail", "floor"} -> custom. Loaded lazily and cached by mtime
+    so rotations are picked up without restart. Any failure degrades to a
+    no-op — this pass enhances the built-in pattern families; it is never
+    a required boundary by itself.
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        path = _Path(os.environ.get(
+            "HERMES_REDACT_PATTERNS",
+            _default_patterns_path()))
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        _PATTERNS_CACHE["mtime"] = None
+        _PATTERNS_CACHE["path"] = None
+        _PATTERNS_CACHE["lit_re"] = None
+        _PATTERNS_CACHE["key_re"] = None
+        _PATTERNS_CACHE["query_re"] = None
+        _PATTERNS_CACHE["lit_masks"] = {}
+        _PATTERNS_CACHE["broken"] = False
+        return text
+    if not (_PATTERNS_CACHE.get("mtime") == mtime
+            and _PATTERNS_CACHE.get("path") == str(path)
+            and (_PATTERNS_CACHE.get("lit_re") is not None
+                 or _PATTERNS_CACHE.get("broken"))):
+        try:
+            data = _json.loads(path.read_text())
+        except OSError:
+            # stat worked but read failed — keep the last-good set active and
+            # retry on the next mtime change (same fail-safe as broken JSON).
+            _PATTERNS_CACHE["mtime"] = mtime
+            _PATTERNS_CACHE["path"] = str(path)
+            _PATTERNS_CACHE["broken"] = True
+        except ValueError:
+            # Broken file: keep the last-good pattern set ACTIVE (never unmask
+            # known secrets) and pin the cache to the broken file's mtime so we
+            # don't re-parse it on every call. A repaired file has a new mtime
+            # and reloads automatically.
+            _PATTERNS_CACHE["mtime"] = mtime
+            _PATTERNS_CACHE["path"] = str(path)
+            _PATTERNS_CACHE["broken"] = True
+        else:
+            lit_masks = {}
+            lit_values = []
+            for item in data.get("literals", []) or []:
+                if isinstance(item, dict):
+                    v = item.get("value")
+                    if not isinstance(v, str) or not v:
+                        continue
+                    lit_values.append(v)
+                    if "mask" in item:
+                        lit_masks[v] = item["mask"]
+                elif isinstance(item, str) and item:
+                    lit_values.append(item)
+            # Longest-first: Python re alternation is first-match, not longest —
+            # a shorter literal that prefixes a longer one must never win (D188).
+            lit_values = sorted(set(lit_values), key=len, reverse=True)
+            keys = list((data.get("key_patterns") or {}).keys())
+            _PATTERNS_CACHE["lit_re"] = (
+                re.compile("|".join(re.escape(l) for l in lit_values))
+                if lit_values else None)
+            _key_alt = "|".join(re.escape(k) for k in keys)
+            _PATTERNS_CACHE["key_re"] = (
+                re.compile(r"(?i)(?<![?&#])\b(" + _key_alt + r")(['\"]?)(\s*)([=:])(\s*)"
+                           + r"(?:\"([^\"\n]*)\"|'([^'\n]*)'|([^\s\"',;}{}\])]+))")
+                if keys else None)
+            # Query-position pass (D160): a registered key directly after '?'
+            # or '&' is a URL query parameter — the unquoted value is bounded
+            # at the next '&' / '#' so each parameter matches independently
+            # (a later registered key in the same query is never swallowed
+            # into the mask; non-secret params like state=keep survive). The
+            # plain pass above skips query-position keys via (?<![?&#]).
+            _PATTERNS_CACHE["query_re"] = (
+                re.compile(r"(?i)([?&#])(" + _key_alt + r")(['\"]?)(\s*)([=:])(\s*)"
+                           + r"(?:\"([^\"\n]*)\"|'([^'\n]*)'|([^&#\s\"',;}{}\])]+))")
+                if keys else None)
+            _PATTERNS_CACHE["lit_masks"] = lit_masks
+            _PATTERNS_CACHE["default_mask"] = data.get("mask")
+            _PATTERNS_CACHE["broken"] = False
+            _PATTERNS_CACHE["mtime"] = mtime
+            _PATTERNS_CACHE["path"] = str(path)
+    if _PATTERNS_CACHE["lit_re"] is not None:
+        def _lit(m):
+            spec = _PATTERNS_CACHE["lit_masks"].get(m.group(0))
+            if spec is None:
+                spec = _PATTERNS_CACHE["default_mask"]
+            return _apply_mask(m.group(0), spec, file_read)
+        text = _PATTERNS_CACHE["lit_re"].sub(_lit, text)
+    if _PATTERNS_CACHE["query_re"] is not None and url_credentials:
+        def _kq(m):
+            return _mask_key_match(m, _PATTERNS_CACHE["default_mask"], file_read,
+                                   prefix_group=1)
+        text = _PATTERNS_CACHE["query_re"].sub(_kq, text)
+    if _PATTERNS_CACHE["key_re"] is not None:
+        def _k(m):
+            return _mask_key_match(m, _PATTERNS_CACHE["default_mask"], file_read,
+                                   prefix_group=0)
+        text = _PATTERNS_CACHE["key_re"].sub(_k, text)
     return text
 
 
