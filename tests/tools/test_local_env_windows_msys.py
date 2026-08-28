@@ -105,6 +105,21 @@ class TestWindowsToMsysPath:
         )
         assert _windows_to_msys_path(r"C:\Users\NVIDIA") == "/mnt/c/Users/NVIDIA"
 
+    def test_failed_bash_resolution_is_cached(self, monkeypatch):
+        calls = 0
+
+        def fail_to_find_bash():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("Git Bash not found")
+
+        monkeypatch.setattr(local_mod, "_resolved_bash_path", None)
+        monkeypatch.setattr(local_mod, "_find_bash", fail_to_find_bash)
+
+        assert _windows_to_msys_path(r"C:\Users\NVIDIA") == "/c/Users/NVIDIA"
+        assert _windows_to_msys_path(r"D:\Projects") == "/d/Projects"
+        assert calls == 1
+
 
 # ---------------------------------------------------------------------------
 # _bash_safe_path / _quote_bash_path — shell-script interpolation

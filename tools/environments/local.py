@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 # The selected shell is cached so path translation stays consistent for the
 # whole environment.  In particular, WSL bash uses /mnt/<drive>, while Git
 # Bash uses /<drive>.
-_resolved_bash_path: str | None = None
+_BASH_RESOLUTION_FAILED = object()
+_resolved_bash_path: str | object | None = None
 
 
 def _is_wsl_bash_path(path: str | None) -> bool:
@@ -54,12 +55,20 @@ def _uses_wsl_bash() -> bool:
     global _resolved_bash_path
     if not _IS_WINDOWS:
         return False
+    if _resolved_bash_path is _BASH_RESOLUTION_FAILED:
+        return False
     if _resolved_bash_path is None:
         try:
             _resolved_bash_path = _find_bash()
         except (OSError, RuntimeError):
+            # Path translation is called from several command-wrapping paths.
+            # Cache a failed resolution so a broken installation does not
+            # spawn the full candidate-probe sequence for every translation.
+            _resolved_bash_path = _BASH_RESOLUTION_FAILED
             return False
-    return _is_wsl_bash_path(_resolved_bash_path)
+    return isinstance(_resolved_bash_path, str) and _is_wsl_bash_path(
+        _resolved_bash_path
+    )
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -135,6 +144,11 @@ def _windows_to_msys_path(cwd: str) -> str:
 
     Git Bash uses ``/c/Users/x`` and WSL bash uses ``/mnt/c/Users/x`` so
     ``builtin cd`` resolves the same host directory in either backend.
+
+    On Windows, the first drive-qualified path may resolve the bash backend
+    when no shell has been selected yet; subsequent translations use the
+    process-cached result. Callers that need a strictly pure mapper should
+    resolve the backend first.
 
     No-ops on non-Windows hosts or for paths that aren't drive-qualified
     native Windows paths. Returns the input unchanged when no translation
@@ -875,8 +889,7 @@ def _find_bash() -> str:
             _resolved_bash_path = candidate
             if _is_wsl_bash_path(candidate):
                 logger.warning(
-                    "Git Bash child-process probe failed; using WSL bash at %s "
-                    "with /mnt path mapping",
+                    "Resolved WSL bash at %s; using /mnt path mapping",
                     candidate,
                 )
             return candidate
