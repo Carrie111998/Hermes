@@ -96,6 +96,8 @@ def _(rid, params: dict) -> dict:
             "persistent_process": os.getenv("HERMES_DESKTOP") != "1",
             "authority_gateway_id": local_authority_gateway_id(),
             "features": [
+                "attachment_ids",
+                "attachment_same_gateway_delivery",
                 "authority_epoch",
                 "coordinator_fencing",
                 "room_identity",
@@ -111,6 +113,8 @@ def _(rid, params: dict) -> dict:
                 "groups.create",
                 "groups.state",
                 "groups.send",
+                "groups.attachment.put",
+                "groups.attachment.read",
                 "groups.log",
                 "groups.disband",
                 "groups.stop",
@@ -120,6 +124,58 @@ def _(rid, params: dict) -> dict:
             "max_log_limit": MAX_LOG_LIMIT,
         },
     )
+
+
+@method("groups.attachment.put")
+def _(rid, params: dict) -> dict:
+    """Store one bounded attachment on the room's authority gateway."""
+
+    try:
+        from gateway.hosted_room_attachments import decode_content_base64
+
+        service = get_hosted_room_service()
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        attachment = service.put_attachment(
+            room_id=params.get("room_id"),
+            upload_id=params.get("upload_id"),
+            kind=params.get("kind"),
+            name=params.get("name"),
+            mime=params.get("mime"),
+            data=decode_content_base64(params.get("content_base64")),
+        )
+        return _ok(rid, {"attachment": attachment})
+    except Exception as exc:
+        return _err(rid, 4140, str(exc))
+
+
+@method("groups.attachment.read")
+def _(rid, params: dict) -> dict:
+    """Read committed bytes for a Group Chat viewer."""
+
+    try:
+        from gateway.hosted_room_attachments import encode_content_base64
+
+        if str(params.get("purpose") or "").strip().casefold() != "viewer":
+            raise ValueError("hosted attachment reads are viewer-only over RPC")
+        service = get_hosted_room_service()
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        stored = service.read_attachment(
+            room_id=params.get("room_id"),
+            attachment_id=params.get("attachment_id"),
+            recipient_member_id="viewer",
+            event_id=params.get("event_id"),
+        )
+        return _ok(
+            rid,
+            {
+                "attachment": stored.attachment,
+                "content_base64": encode_content_base64(stored.data),
+            },
+        )
+    except Exception as exc:
+        return _err(rid, 4141, str(exc))
 
 
 @method("groups.list")

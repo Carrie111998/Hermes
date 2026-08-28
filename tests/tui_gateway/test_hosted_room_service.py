@@ -21,6 +21,9 @@ from tui_gateway.hosted_room_service import HostedRoomService
 class _FakeRPC:
     def __init__(self) -> None:
         self.sessions = {}
+        self.approvals = []
+        self.calls = []
+        self.fail_attachment_profiles = set()
 
     def resolve_exact(self, *, profile, title, source):
         return self.sessions.get((profile, title))
@@ -44,8 +47,63 @@ class _FakeRPC:
         execution_generation,
         on_terminal,
     ):
+        self.calls.append(("submit", {"profile": profile, "prompt": prompt}))
         on_terminal({"status": "settled", "text": f"reply from {profile}"})
         return {"accepted": True}
+
+    def stage_attachment(
+        self,
+        *,
+        profile,
+        session_id,
+        source,
+        attachment,
+        data,
+        execution_generation,
+    ):
+        self.calls.append((
+            "stage_attachment",
+            {
+                "profile": profile,
+                "attachment": dict(attachment),
+                "data": data,
+                "execution_generation": execution_generation,
+            },
+        ))
+        if profile in self.fail_attachment_profiles:
+            raise RuntimeError("attachment staging unavailable")
+        return {
+            "attached": True,
+            **(
+                {"ref_text": f"@file:attachments/{attachment['name']}"}
+                if attachment["kind"] == "file"
+                else {}
+            ),
+        }
+
+    def begin_attachment_staging(
+        self, *, profile, session_id, source, execution_generation
+    ):
+        self.calls.append((
+            "begin_attachment_staging",
+            {"profile": profile, "execution_generation": execution_generation},
+        ))
+
+    def commit_attachment_staging(
+        self, *, profile, session_id, source, execution_generation
+    ):
+        self.calls.append((
+            "commit_attachment_staging",
+            {"profile": profile, "execution_generation": execution_generation},
+        ))
+
+    def rollback_attachment_staging(
+        self, *, profile, session_id, source, execution_generation
+    ):
+        self.calls.append((
+            "rollback_attachment_staging",
+            {"profile": profile, "execution_generation": execution_generation},
+        ))
 
     def history(self, *, profile, session_id, source):
         return []
@@ -145,6 +203,135 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     ]
     assert events[1]["payload"]["text"] == "reply from ops"
     assert service.status("room-1")["working"] is False
+
+
+def test_attachment_send_freezes_roster_stages_bytes_and_logs_metadata_only(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _FakeRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-1",
+        kind="image",
+        name="diagram.png",
+        mime="image/png",
+        data=b"\x89PNG\r\n\x1a\nimage",
+    )
+    manifest = {
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-attachment-1",
+        payload={
+            "text": "@ops inspect",
+            "thread_id": "thread-1",
+            "attachments": [manifest],
+        },
+    )
+    _wait_for(lambda: any(method == "stage_attachment" for method, _ in rpc.calls))
+    _wait_for(
+        lambda: any(
+            event["kind"] == "message.member" for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    stage_index = next(index for index, call in enumerate(rpc.calls) if call[0] == "stage_attachment")
+    submit_index = next(index for index, call in enumerate(rpc.calls) if call[0] == "submit")
+    assert stage_index < submit_index
+    assert rpc.calls[stage_index][1]["data"] == b"\x89PNG\r\n\x1a\nimage"
+    user_event = service._events("room-1")[0]
+    assert user_event["payload"]["attachments"] == [manifest]
+    assert "PNG" not in repr(user_event)
+    assert "base64" not in repr(user_event)
+    try:
+        service.read_attachment(
+            room_id="room-1",
+            attachment_id=stored["attachment_id"],
+            recipient_member_id="late-member",
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - ownership must fail closed
+        raise AssertionError("late member unexpectedly received historic attachment")
+
+
+def test_partial_attachment_failure_never_submits_text_only_and_other_member_continues(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _FakeRPC()
+    rpc.fail_attachment_profiles.add("default")
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-1",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=b"release notes",
+    )
+    manifest = {
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-attachment-1",
+        payload={
+            "text": "Inspect this",
+            "thread_id": "thread-1",
+            "attachments": [manifest],
+        },
+    )
+    _wait_for(
+        lambda: any(
+            event["kind"] == "message.member" for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    events = service._events("room-1")
+    failed = next(event for event in events if event["kind"] == "turn.failed")
+    assert failed["payload"]["member_id"] == "default"
+    assert any(
+        event["kind"] == "message.member" and event["payload"]["member_id"] == "ops"
+        for event in events
+    )
+    assert not any(
+        method == "submit" and params["profile"] == "default"
+        for method, params in rpc.calls
+    )
 
 
 def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path):

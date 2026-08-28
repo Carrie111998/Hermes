@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -68,12 +69,14 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
     assert "groups.send" in result["methods"]
     assert "groups.retry" in result["methods"]
     assert "groups.approve" in result["methods"]
+    assert "groups.attachment.put" in result["methods"]
+    assert "groups.attachment.read" in result["methods"]
     advertised = [
         str(value).lower() for value in (*result["features"], *result["methods"])
     ]
     assert not any(
         token in value
-        for token in ("attachment", "desktop", "messaging", "peer", "roomlink")
+        for token in ("desktop", "messaging", "peer", "roomlink")
         for value in advertised
     )
 
@@ -117,6 +120,64 @@ def test_create_list_send_and_log_roundtrip(home):
         "text": "hello",
         "thread_id": "thread-1",
     }
+
+
+def test_attachment_put_send_read_roundtrip_is_recipient_scoped(home):
+    _create_room()
+    encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+    put_params = {
+        "room_id": "room-1",
+        "upload_id": "upload-1",
+        "kind": "image",
+        "name": "diagram.png",
+        "mime": "image/png",
+        "content_base64": encoded,
+    }
+    stored = _result(
+        srv._methods["groups.attachment.put"](1, put_params)
+    )["attachment"]
+    manifest = {
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }
+
+    sent = _result(
+        srv._methods["groups.send"](
+            2,
+            {
+                "room_id": "room-1",
+                "event_id": "event-attachment-1",
+                "payload": {
+                    "text": "Review this image",
+                    "thread_id": "thread-1",
+                    "attachments": [manifest],
+                },
+            },
+        )
+    )
+    assert sent["event"]["payload"]["attachments"] == [manifest]
+    read = _result(
+        srv._methods["groups.attachment.read"](
+            3,
+            {
+                "room_id": "room-1",
+                "attachment_id": stored["attachment_id"],
+                "purpose": "viewer",
+                "event_id": "event-attachment-1",
+            },
+        )
+    )
+    assert base64.b64decode(read["content_base64"]) == b"\x89PNG\r\n\x1a\nimage"
+    denied = srv._methods["groups.attachment.read"](
+        4,
+        {
+            "room_id": "room-1",
+            "attachment_id": stored["attachment_id"],
+            "purpose": "member",
+            "event_id": "event-attachment-1",
+        },
+    )
+    assert denied["error"]["code"] == 4141
 
 
 def test_groups_list_returns_bounded_pages(home):
