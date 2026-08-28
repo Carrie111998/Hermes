@@ -30,7 +30,9 @@ The reference fleet looks like this:
 - one shared Kanban board for durable cross-profile work and review;
 - one dedicated, authenticated browser profile granted to the specialists
   that need it;
-- an explicit approval gate before any outbound account action;
+- browser authority granted selectively, with the terminal-command
+  approval system gating destructive shell commands and read-only vs
+  outbound-mutation kept apart by policy;
 - platform-native process supervision with post-restart verification.
 
 ## Reference architecture
@@ -38,7 +40,7 @@ The reference fleet looks like this:
 ```mermaid
 flowchart LR
   subgraph human["Human operator"]
-    H["Approval decisions<br/>(approvals.mode)"]
+    H["Approval decisions<br/>(terminal-command approvals)"]
     V["Kanban review, dashboard, logs"]
   end
 
@@ -241,10 +243,16 @@ Practical rules for the fleet:
   accounts, run two browser profiles (two `--user-data-dir`s or two CDP
   ports), not one shared one.
 - **Session naming.** `browser_exec`'s `session=<name>` argument isolates
-  harness state per name (own daemon, log, and on cloud backends own
-  browser) — useful so parallel subagents don't clobber one shared
-  connection. It isolates *sessions*, not *authority*: the cookies underneath
-  are still shared.
+  harness state per name (own daemon, log, and state) on **every** backend,
+  and on **cloud backends** it additionally gets its own browser — so parallel
+  subagents or simultaneous chats stop clobbering one shared connection.
+  It isolates *sessions*, not *authority*: on a **local or CDP** backend all
+  named sessions still drive the **same underlying browser instance** (same
+  `--user-data-dir`, same CDP endpoint), so they share its cookies, logins,
+  and storage. A deliberately shared CDP endpoint is therefore *not* a
+  cookie boundary between sessions — for separate identities you still need
+  separate browser profiles (separate `--user-data-dir`/port or CDP endpoint)
+  as above.
 - **Windows note.** Real-profile browsing requires the source browser to be
   **fully quit** (Chrome's "continue running background apps" keeps a
   `chrome.exe` alive that holds the profile lock). See
@@ -259,32 +267,49 @@ must**. The supported split:
 | Activity | Classification | How to keep it bounded |
 |---|---|---|
 | Reading pages, scraping, summarizing, searching | **Read-only research** | Any profile; clean sessions; no approval needed |
-| Posting, replying, deleting, purchasing, sending on an account | **Outbound mutation** | Browser authority + human approval gate |
-| Editing shared state (files, Kanban rows, repos) | **Outbound mutation (local)** | Kanban review, checkpoints, approval on dangerous commands |
+| Posting, replying, deleting, purchasing, sending on an account | **Outbound mutation (account)** | Restrict who holds browser authority (previous section) + a human-in-the-loop policy you enforce |
+| Editing shared state (files, Kanban rows, repos) | **Outbound mutation (local)** | Kanban review, checkpoints, and the terminal-command approval system |
 
-Wire the gate with the existing approval system rather than by convention:
+**What the built-in approval system does — and does not — cover.**
+Hermes ships a dangerous-**terminal-command** approval system
+([Security → Dangerous Command Approval](/user-guide/security#dangerous-command-approval)): it detects
+destructive shell commands and prompts before they run. That is a
+**terminal-command** gate — it does not see or stop a browser form
+submission, a click, or an account action taken through `browser_exec` /
+the CDP tools. There is **no supported, enforced approval gate for browser
+account mutations** in core: the browser tools execute whatever the agent
+does. So do not rely on `approvals.mode` to hold a browser back.
 
 ```yaml
-# ~/.hermes/config.yaml — per profile
+# ~/.hermes/config.yaml — per profile. GATES TERMINAL COMMANDS ONLY.
 approvals:
-  mode: smart        # smart | manual | off
+  mode: smart        # smart | manual | off — which dangerous commands prompt
   timeout: 300
-  cron_mode: deny    # unattended jobs never auto-approve destructive commands
+  cron_mode: deny    # unattended cron jobs never auto-approve a dangerous command
 ```
 
-- `approvals.mode: manual` makes **every** dangerous operation wait for a
-  human; `smart` approves known-safe patterns and prompts the rest.
-- For the *account-action* side (browser posts, sends), the supported
-  boundary is policy + capability: restrict which profiles hold browser
-  authority (previous section), and require the human-in-the-loop pattern for
-  anything that acts on an account.
-- **Unattended automation** (cron, Kanban workers) should run with
-  `cron_mode: deny` so a scheduled job that hits a dangerous command blocks
-  instead of guessing.
+- `approvals.mode: manual` makes **every** dangerous terminal command wait
+  for a human; `smart` auto-approves known-safe command patterns and prompts
+  the rest; `off` disables the prompts (trusted CI/containers only).
+- `cron_mode: deny` (and `single_query_mode: deny`) make unattended jobs
+  **block** a dangerous terminal command instead of guessing — useful for
+  scheduled local work. Again, these act on shell commands, not browser
+  actions.
+- **The browser account-action boundary is operator policy, not a core
+  gate.** Keep read-only researchers on clean sessions and grant real-profile
+  / dedicated-CDP authority only to the specialist whose job is "act on the
+  web" (previous section). Anything that must act on an account is bounded
+  by that capability grant plus the human-in-the-loop pattern *you* run —
+  for example, the agent drafts the outbound message and a human sends it,
+  or the operator reviews the CDP session live — not by a Hermes approval
+  prompt. The field fleet in the [issue](https://github.com/NousResearch/hermes-agent/issues/97236)
+  ran exactly that: an explicit operator-side gate on outbound account
+  actions, layered on top of Hermes's terminal-command approvals.
 
-The principle: **read autonomy, gated writes.** A specialist may read
+The principle: **read autonomy, granted writes.** A specialist may read
 anything its browser can reach; it may *write* only where you granted it
-capability **and** the action clears the approval gate.
+browser authority, and the terminal-command approval system still holds the
+destructive shell commands on every backend.
 
 ## Supervision and post-restart verification
 
@@ -365,8 +390,10 @@ moving:
 Until these land, the supported way to keep specialists from clobbering each
 other in a shared browser is the operator pattern above: **separate browser
 profiles per identity** (distinct `--user-data-dir`/port or CDP endpoint),
-**`browser_exec session=<name>`** for per-task harness isolation, and a
-human approval gate for outbound account actions.
+**`browser_exec session=<name>`** for per-task harness isolation, and the
+operator-side human-in-the-loop policy for outbound account actions (the
+built-in approval system only gates terminal commands — it is not a browser
+account-action gate).
 
 ## Related pages
 
