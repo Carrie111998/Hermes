@@ -60,18 +60,20 @@ class TestCollectKanbanNotifications:
         kb.create_board("second-board")
 
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts, agent_texts = _collect_kanban_notifications(_session())
 
         assert texts == []
+        assert agent_texts == []
         spy_connect.assert_not_called()
 
     def test_done_reopen_notifies_once_per_event_until_archive(self):
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        first = _collect_kanban_notifications(_session())
+        first, first_agent = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
+        assert first_agent == first
         assert tid in first[0]
         assert "done" in first[0]
         assert "shipped the fix" in first[0]
@@ -80,7 +82,7 @@ class TestCollectKanbanNotifications:
         first_cursor = rows[0]["last_event_id"]
 
         # The retained subscription must not replay the completed event.
-        assert _collect_kanban_notifications(_session()) == []
+        assert _collect_kanban_notifications(_session()) == ([], [])
 
         conn = kb.connect()
         try:
@@ -93,16 +95,17 @@ class TestCollectKanbanNotifications:
         finally:
             conn.close()
 
-        reopened = _collect_kanban_notifications(_session())
+        reopened, reopened_agent = _collect_kanban_notifications(_session())
 
         assert len(reopened) == 2
+        assert reopened_agent == reopened
         assert "ready" in reopened[0]
         assert "review corrections" in reopened[1]
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["chat_id"] == SESSION_KEY
         assert rows[0]["last_event_id"] > first_cursor
-        assert _collect_kanban_notifications(_session()) == []
+        assert _collect_kanban_notifications(_session()) == ([], [])
 
         conn = kb.connect()
         try:
@@ -111,7 +114,7 @@ class TestCollectKanbanNotifications:
             conn.close()
 
         # Archive is notification-terminal and removes the retained route.
-        assert _collect_kanban_notifications(_session()) == []
+        assert _collect_kanban_notifications(_session()) == ([], [])
         assert _sub_rows(tid) == []
 
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
@@ -124,8 +127,8 @@ class TestCollectKanbanNotifications:
             conn.close()
 
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            first = _collect_kanban_notifications(_session())
-            second = _collect_kanban_notifications(_session())
+            first, _ = _collect_kanban_notifications(_session())
+            second, _ = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
         assert "blocked" in first[0]
@@ -146,7 +149,7 @@ class TestCollectKanbanNotifications:
         _complete(tid)
 
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts, _agent = _collect_kanban_notifications(_session())
 
         assert texts == []
         spy_connect.assert_not_called()
@@ -160,7 +163,7 @@ class TestCollectKanbanNotifications:
         _complete(tid)
 
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts, _agent = _collect_kanban_notifications(_session())
 
         assert texts == []
         spy_connect.assert_not_called()
@@ -177,18 +180,19 @@ class TestCollectKanbanNotifications:
 
         monkeypatch.setattr(kb, "count_notify_subs", fail_probe)
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts, agent_texts = _collect_kanban_notifications(_session())
 
         assert len(texts) == 1
         assert tid in texts[0]
+        assert agent_texts == texts
         spy_connect.assert_called_once()
 
     def test_no_session_key_is_a_noop(self):
         tid = _create_subscribed_task()
         _complete(tid)
 
-        assert _collect_kanban_notifications({"session_key": ""}) == []
-        assert _collect_kanban_notifications({"session_key": None}) == []
+        assert _collect_kanban_notifications({"session_key": ""}) == ([], [])
+        assert _collect_kanban_notifications({"session_key": None}) == ([], [])
         assert len(_sub_rows(tid)) == 1
 
     def test_profile_scoped_session_reads_the_shared_board(self, tmp_path):
@@ -218,7 +222,7 @@ class TestCollectKanbanNotifications:
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
         try:
-            texts = _collect_kanban_notifications(session)
+            texts, _agent = _collect_kanban_notifications(session)
         finally:
             reset_hermes_home_override(token)
 

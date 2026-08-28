@@ -31,6 +31,7 @@ from hermes_constants import (
     reset_hermes_home_override,
     set_hermes_home_override,
 )
+from hermes_cli import kanban_gate_events as _gate_events
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
@@ -10795,11 +10796,21 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
 # the cursor advances past them and they can't wedge a later completed/blocked
 # event behind an unclaimed row.
+#
+# The human plan/deploy gate kinds come from the canonical vocabulary rather
+# than a second literal, so this surface cannot drift from the gateway. They
+# are DISPLAYED here and never turned into an agent turn — see
+# ``_KANBAN_PASSIVE_KINDS`` and the poller below. (G11.)
+_KANBAN_GATE_KINDS = _gate_events.PLAN_GATE_NOTIFY_KINDS
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked",
+    *_KANBAN_GATE_KINDS,
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
+# Claimed and shown to the human, but never appended to ``_kanban_pending`` and
+# so never passed to ``_run_prompt_submit``. A human gate must not start a turn.
+_KANBAN_PASSIVE_KINDS = frozenset(_KANBAN_GATE_KINDS)
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
@@ -10914,6 +10925,13 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     who = getattr(task, "assignee", None) or ""
     tag = f"@{who} " if who else ""
     payload = getattr(ev, "payload", None) or {}
+    if kind in _KANBAN_GATE_KINDS:
+        # One renderer for both surfaces. It sanitizes every event-derived
+        # value, so a hostile or malformed payload cannot reach the UI raw.
+        return _gate_events.render_gate_event(
+            kind, payload, task_id=task_id,
+            board_slug=board_slug, assignee=who,
+        )
     if kind == "completed":
         handoff = ""
         summary = payload.get("summary")
@@ -10956,23 +10974,28 @@ def _collect_kanban_notifications(session: dict) -> list:
     notifier, so a subscription is delivered exactly once even if a gateway
     and a TUI poll the same board DB.
 
-    Returns the list of formatted notification texts (may be empty).
+    Returns ``(display_texts, agent_texts)``. Both are formatted notification
+    lines; ``display_texts`` is everything the human should see, ``agent_texts``
+    is the subset that may become an agent turn. Human plan/deploy gate events
+    appear only in the first list — they are shown and audited, never submitted
+    as a prompt (G11).
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
-        return []
+        return [], []
     try:
         from hermes_cli import kanban_db as _kb
     except Exception:
-        return []
+        return [], []
     texts: list = []
+    agent_texts: list = []
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         try:
             boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
         except Exception:
-            return []
+            return [], []
     # Poll each resolved DB path once — multiple slugs can point at the same
     # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
     # notifier).
@@ -11031,8 +11054,11 @@ def _collect_kanban_notifications(session: dict) -> list:
                 task = _kb.get_task(conn, sub["task_id"])
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
-                    if text:
-                        texts.append(text)
+                    if not text:
+                        continue
+                    texts.append(text)
+                    if getattr(ev, "kind", "") not in _KANBAN_PASSIVE_KINDS:
+                        agent_texts.append(text)
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
@@ -11050,7 +11076,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                         pass
         finally:
             conn.close()
-    return texts
+    return texts, agent_texts
 
 
 def _notification_poller_loop(
@@ -11095,20 +11121,30 @@ def _notification_poller_loop(
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:
-                _kanban_texts = _collect_kanban_notifications(session)
+                _kanban_texts, _kanban_agent_texts = (
+                    _collect_kanban_notifications(session)
+                )
             except Exception as _kb_exc:
                 print(
                     f"[tui_gateway] kanban notification poll failed: "
                     f"{type(_kb_exc).__name__}: {_kb_exc}",
                     file=sys.stderr,
                 )
-                _kanban_texts = []
+                _kanban_texts, _kanban_agent_texts = [], []
             if _kanban_texts:
+                # Every notification is DISPLAYED to the human, gate events
+                # included — this is the Desktop/TUI delivery path.
                 for _kb_text in _kanban_texts:
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+            if _kanban_agent_texts:
+                # Only agent-actionable events may become a turn. Human
+                # plan/deploy gate text never reaches _kanban_pending, so it can
+                # never reach _run_prompt_submit (G11). Events are
+                # cursor-claimed (never re-queued), so buffer them until the
+                # session is idle instead of dropping the agent turn.
+                session.setdefault("_kanban_pending", []).extend(
+                    _kanban_agent_texts
+                )
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []

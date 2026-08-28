@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import sqlite3
 import time
 from contextvars import Context
@@ -21,16 +20,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from hermes_cli import kanban_gate_events as _gate_events
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
-
-
-_LOCAL_PATH_RE = re.compile(
-    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
-    r"[A-Za-z]:\\[^\s,;]+)"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -56,12 +50,10 @@ _LOCAL_PATH_RE = re.compile(
 # having already tried. So these are passive ``notify`` only: claimed and
 # delivered so a person sees and can audit them, never a wake, never a
 # dispatch, never a promotion. (G11.)
-PLAN_GATE_NOTIFY_KINDS: tuple[str, ...] = (
-    "plan_awaiting_approval",
-    "plan_approved",
-    "plan_rejected",
-    "gate_release_refused",
-)
+# Defined in hermes_cli.kanban_gate_events so the gateway and the Desktop/TUI
+# surface share one vocabulary and one safe renderer. Re-exported here because
+# this module's own derivation below reads it.
+PLAN_GATE_NOTIFY_KINDS = _gate_events.PLAN_GATE_NOTIFY_KINDS
 
 # "status" covers dashboard drag-drop and ``_set_status_direct()`` writes —
 # surface those transitions to subscribers too. ``review_requested`` wakes the
@@ -106,40 +98,14 @@ if not set(WAKE_KINDS).isdisjoint(PLAN_GATE_NOTIFY_KINDS):  # pragma: no cover
     )
 
 
-_GATE_EMOJI = {
-    "plan_awaiting_approval": "⏳",
-    "plan_approved": "✅",
-    "plan_rejected": "🚫",
-    "gate_release_refused": "⛔",
-}
-
-
-def _gate_plan_ref(payload: dict) -> str:
-    """``project/revision`` for an operator, or ``?`` for a legacy row."""
-    project = str(payload.get("project_id") or "?")
-    revision = payload.get("revision")
-    return f"{project} r{revision}" if revision is not None else project
-
-
-def _gate_operator(payload: dict) -> str:
-    """Who decided. Never a nonce or any other attestation secret."""
-    return str(payload.get("operator") or "an operator")
-
-
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
-    """Return a mobile-friendly review reason safe for external delivery."""
-    from agent.redact import redact_sensitive_text
+    """Return a mobile-friendly review reason safe for external delivery.
 
-    reason = redact_sensitive_text(
-        "" if value is None else str(value),
-        force=True,
-        redact_url_credentials=True,
-    )
-    reason = _LOCAL_PATH_RE.sub("[local path]", reason)
-    reason = " ".join(reason.split())
-    if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
-    return reason
+    One implementation, shared with the Desktop/TUI surface: secret redaction,
+    local-path redaction, control-character removal, whitespace collapse, and a
+    bound. See ``hermes_cli.kanban_gate_events.safe_display_value``.
+    """
+    return _gate_events.safe_display_value(value, limit=limit)
 
 
 def _resolve_auto_decompose_settings(
@@ -660,6 +626,14 @@ class GatewayKanbanWatchersMixin:
                     # exists on the board.
                     wake_handoff = ""
                     wake_review_detail = ""
+                    # Batch-level, and needed BEFORE the per-event send below:
+                    # a non-push adapter may only skip its doomed passive send
+                    # when a wake self-post will actually replace it.
+                    batch_wake_kinds = (
+                        {ev.kind for ev in d["events"] if ev.kind in WAKE_KINDS}
+                        if wake_agent
+                        else set()
+                    )
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -777,43 +751,22 @@ class GatewayKanbanWatchersMixin:
                                 f" — needs a human decision{rc}{reason}"
                             )
                         elif kind in PLAN_GATE_NOTIFY_KINDS:
-                            # A human plan/deploy gate. Rendered for a person
-                            # and deliberately NOT in WAKE_KINDS: the decision
-                            # this event reports is one no agent may make, so
-                            # handing an agent a turn here would point it at the
+                            # A human plan/deploy gate. Rendered for a person by
+                            # the shared renderer — which sanitizes EVERY
+                            # event-derived value, not just free text — and
+                            # deliberately NOT in WAKE_KINDS: the decision this
+                            # event reports is one no agent may make, so handing
+                            # an agent a turn here would point it at the
                             # boundary it is forbidden to cross. (G11.)
-                            payload = ev.payload or {}
-                            if kind == "plan_awaiting_approval":
-                                detail = t(
-                                    "gateway.kanban.gate.plan_awaiting_approval",
-                                    plan=_gate_plan_ref(payload),
-                                )
-                            elif kind == "plan_approved":
-                                detail = t(
-                                    "gateway.kanban.gate.plan_approved",
-                                    plan=_gate_plan_ref(payload),
-                                    operator=_gate_operator(payload),
-                                    landing=str(payload.get("landing_status")
-                                                or "todo"),
-                                )
-                            elif kind == "plan_rejected":
-                                detail = t(
-                                    "gateway.kanban.gate.plan_rejected",
-                                    plan=_gate_plan_ref(payload),
-                                    operator=_gate_operator(payload),
-                                )
-                            else:
-                                detail = t(
-                                    "gateway.kanban.gate.gate_release_refused",
-                                    gate=str(payload.get("gate_state") or "?"),
-                                    via=str(payload.get("via") or "?"),
-                                )
-                            reason = _safe_review_reason(payload.get("reason"))
-                            suffix = f": {reason}" if reason else ""
-                            msg = (
-                                f"{_GATE_EMOJI[kind]} {board_tag}{tag}"
-                                f"Kanban {sub['task_id']} — {detail}{suffix}"
+                            msg = _gate_events.render_gate_event(
+                                kind, ev.payload,
+                                task_id=sub["task_id"],
+                                board_slug=board_slug,
+                                assignee=who or "",
+                                translate=t,
                             )
+                            if not msg:
+                                continue
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -847,7 +800,8 @@ class GatewayKanbanWatchersMixin:
                         # creator is woken via the self-post below instead.
                         from gateway.wake import adapter_supports_push
 
-                        if not adapter_supports_push(adapter) and wake_agent:
+                        if (not adapter_supports_push(adapter) and wake_agent
+                                and batch_wake_kinds):
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
                                 "channel; skipping text ping for %s, relying "
@@ -963,11 +917,7 @@ class GatewayKanbanWatchersMixin:
                         # structurally absent from it (G11), so no gate event
                         # can hand a turn to an agent here.
                         _WAKE_KINDS = WAKE_KINDS
-                        _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
-                        )
+                        _wake_kinds = batch_wake_kinds
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
